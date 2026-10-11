@@ -1,15 +1,13 @@
 //! Schema-pinned move inventory, generated from fresh context/store migration heads.
 //!
-//! This module is intentionally path-importable until the move API wires it into
-//! mc-store. See docs/designs/mc-move-deviations.md for the standalone test harness.
 //! New schema objects must be reviewed here before any exporter reads row data.
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-pub const INVENTORY_VERSION: u32 = 1;
+pub const INVENTORY_VERSION: u32 = 3;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 95;
-pub const STORE_SCHEMA_VERSION: u32 = 63;
+pub const STORE_SCHEMA_VERSION: u32 = 65;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +76,18 @@ pub struct TableInventory {
 }
 
 impl TableInventory {
+    /// The classified owner coordinate used by write guards and imported-row
+    /// validation. Provider records spell it `session`; the facade ledger uses
+    /// `identity_scope`. Neither may silently fall back to a nonexistent column.
+    pub fn session_column(&self) -> Option<&'static str> {
+        if !matches!(self.rows, RowSelector::Predicate(_)) {
+            return None;
+        }
+        ["session_id", "identity_scope", "session"]
+            .into_iter()
+            .find(|column| self.columns.contains(column))
+    }
+
     pub fn shipped_columns(&self) -> Vec<&'static str> {
         if self.class != Class::Ship {
             return Vec::new();
@@ -109,6 +119,94 @@ macro_rules! table {
 /// Stable table order for the v1 stream; each store half is filtered from this
 /// explicit list. Schema discovery is validation only and never grants shipping.
 pub const TABLES: &[TableInventory] = &[
+    table!(
+        Module,
+        "mc_move_tag_epochs",
+        NotSession,
+        RowSelector::None,
+        &["session_id"],
+        &["session_id", "generation"],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Module,
+        "cortexkit_fence",
+        NotSession,
+        RowSelector::None,
+        &["id"],
+        &["id", "epoch"],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Module,
+        "mc_move_fences",
+        NotSession,
+        RowSelector::None,
+        &["session_id"],
+        &["session_id", "cut_id", "phase"],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Module,
+        "mc_move_cuts",
+        NotSession,
+        RowSelector::None,
+        &["cut_id"],
+        &[
+            "cut_id",
+            "session_id",
+            "binding",
+            "manifest_digest",
+            "state",
+            "result",
+            "file_path",
+            "discard_table"
+        ],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Module,
+        "mc_move_installs",
+        NotSession,
+        RowSelector::None,
+        &["cut_id"],
+        &[
+            "cut_id",
+            "session_id",
+            "manifest_digest",
+            "table_index",
+            "file_offset",
+            "rows_remaining",
+            "last_source_key",
+            "complete",
+            "prior_generation",
+            "shipped_generation",
+            "tag_count",
+            "max_tag_number"
+        ],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Module,
+        "mc_move_key_map",
+        NotSession,
+        RowSelector::None,
+        &["cut_id", "table_name", "source_key"],
+        &["cut_id", "table_name", "source_key", "destination_key"],
+        &[],
+        None,
+        None
+    ),
     // BEGIN FRESH-MIGRATION CENSUS
     // context.db: 106 tables observed after fresh migration.
     table!(
@@ -1976,7 +2074,34 @@ pub const TABLES: &[TableInventory] = &[
         None,
         Some(RenderInput::Workspace)
     ),
-    // store.db: 32 tables observed after fresh migration.
+    // store.db: 39 tables observed after fresh migration.
+    // Provider state cannot be rebuilt: it includes allocated versions and tags,
+    // frozen catalog admission, and answers that the runner may not have applied.
+    // Select every project/harness coordinate of this opaque host session. Both
+    // the route project_root and the caller harness are preserved primary-key
+    // components, not a project-global render-input predicate.
+    table!(
+        Module,
+        "mc_provider_sessions_v1",
+        Ship,
+        RowSelector::Predicate("session = ?1"),
+        &["project_root", "session", "harness"],
+        &["project_root", "session", "harness", "record"],
+        &[],
+        Some(KeyPolicy::Preserve),
+        None
+    ),
+    table!(
+        Module,
+        "mc_provider_catalogs_v1",
+        Ship,
+        RowSelector::Predicate("session = ?1"),
+        &["project_root", "session"],
+        &["project_root", "session", "catalog"],
+        &[],
+        Some(KeyPolicy::Preserve),
+        None
+    ),
     table!(
         Module,
         "mc_tags",

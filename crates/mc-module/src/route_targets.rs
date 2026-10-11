@@ -195,6 +195,16 @@ pub fn route_targets(config: &RouteTargetConfig) -> Vec<String> {
     targets
 }
 
+/// A real test caller opens MC's incoming tool route, not one of MC's consumed
+/// runner/gateway routes. Keep the wire construction here without advertising
+/// a production self-consume edge.
+#[cfg(test)]
+pub(crate) fn catalog_provider_target_for_test() -> RouteTarget {
+    RouteTarget::ToolProvider {
+        module_id: crate::DEFAULT_MODULE_ID.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -485,7 +495,8 @@ mod tests {
         let scratch_parent = std::env::temp_dir().join("magic-context/mc-module-host-runner");
         fs::create_dir_all(&scratch_parent).unwrap();
         let dir = tempfile::tempdir_in(scratch_parent).unwrap();
-        let root = dir.path();
+        let canonical_root = fs::canonicalize(dir.path()).unwrap();
+        let root = canonical_root.as_path();
         let dev_binaries = root.join("bin");
         fs::create_dir_all(&dev_binaries).unwrap();
         for (source_name, dev_name) in [("ck-subc", "ckdev-subc"), ("ck-mc", "ckdev-mc")] {
@@ -503,7 +514,7 @@ mod tests {
                     )
                 });
         }
-        for name in ["config/cortexkit", "data", "runtime", "project"] {
+        for name in ["config/cortexkit", "data", "runtime", "state", "project"] {
             fs::create_dir_all(root.join(name)).unwrap();
         }
         fs::write(
@@ -533,8 +544,14 @@ mod tests {
             .env("HOME", root.join("config"))
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("OPENCODE_DB", root.join("opencode.db"))
             .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
-            .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+            .env(
+                "MAGIC_CONTEXT_STORAGE_DIR",
+                root.join("data/cortexkit/magic-context"),
+            )
             .output()
             .unwrap();
         assert!(
@@ -550,9 +567,14 @@ mod tests {
                 .env("XDG_CONFIG_HOME", root.join("config"))
                 .env("XDG_DATA_HOME", root.join("data"))
                 .env("XDG_RUNTIME_DIR", root.join("runtime"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .env("OPENCODE_DB", root.join("opencode.db"))
                 .env("HOME", root.join("config"))
                 .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
-                .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+                .env(
+                    "MAGIC_CONTEXT_STORAGE_DIR",
+                    root.join("data/cortexkit/magic-context"),
+                )
                 .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
                 .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
                 .env_remove(subc_os::LAUNCH_NONCE_FD_ENV)
@@ -620,7 +642,10 @@ mod tests {
         assert!(registered.not_ready.is_none(), "{registered:?}");
         assert_eq!(registered.self_signals, Some(vec![]));
         assert!(
-            registered.capabilities.is_none(),
+            registered
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.requires.is_empty()),
             "no required runner capability"
         );
         let identity = BindIdentity::new(
@@ -659,6 +684,28 @@ mod tests {
                 "store did not open: {health}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for process in [&module.0, &daemon.0] {
+            let output = Command::new("lsof")
+                .args(["-p", &process.id().to_string(), "-Fn"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "lsof could not inspect the isolated host process"
+            );
+            let files = String::from_utf8(output.stdout).unwrap();
+            for path in files
+                .lines()
+                .filter_map(|line| line.strip_prefix('n'))
+                .filter(|path| path.contains(".db") || path.contains(".sqlite"))
+            {
+                assert!(
+                    Path::new(path).starts_with(root),
+                    "host process opened a database outside its throwaway root: {path}"
+                );
+                println!("lsof isolated host {}: {path}", process.id());
+            }
         }
         let transformed = call(
             &consumer,

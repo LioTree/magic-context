@@ -577,8 +577,16 @@ fn spawn_daemon(
         // real `~/.local/share/cortexkit/run/logs/subc.log` and interleaves test boots
         // with production ones. Sharing the module's data home mirrors production layout.
         .env("XDG_DATA_HOME", data_home)
+        .env("XDG_STATE_HOME", data_home.parent().unwrap().join("state"))
+        .env(
+            "OPENCODE_DB",
+            data_home.parent().unwrap().join("opencode.db"),
+        )
         .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
-        .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+        .env(
+            "MAGIC_CONTEXT_STORAGE_DIR",
+            data_home.join("cortexkit/magic-context"),
+        )
         .env("HOME", config_dir)
         .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
@@ -615,8 +623,20 @@ fn spawn_module_with_differential(
         .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
         .env_remove(subc_os::LAUNCH_NONCE_FD_ENV)
         .env("XDG_DATA_HOME", data_home)
+        .env("XDG_STATE_HOME", data_home.parent().unwrap().join("state"))
+        .env(
+            "XDG_RUNTIME_DIR",
+            data_home.parent().unwrap().join("runtime"),
+        )
+        .env(
+            "OPENCODE_DB",
+            data_home.parent().unwrap().join("opencode.db"),
+        )
         .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
-        .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+        .env(
+            "MAGIC_CONTEXT_STORAGE_DIR",
+            data_home.join("cortexkit/magic-context"),
+        )
         .env(
             "XDG_CONFIG_HOME",
             data_home.parent().unwrap().join("config"),
@@ -649,7 +669,45 @@ fn spawn_module_with_differential(
             }
         });
     }
+    assert_module_database_isolation(child.id(), data_home);
     ModuleProcess { child }
+}
+
+fn assert_module_database_isolation(pid: u32, data_home: &Path) {
+    let root = fs::canonicalize(data_home.parent().unwrap()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = Command::new("lsof")
+            .args(["-p", &pid.to_string(), "-Fn"])
+            .output()
+            .unwrap();
+        let files = String::from_utf8(output.stdout).unwrap();
+        let databases = files
+            .lines()
+            .filter_map(|line| line.strip_prefix('n'))
+            .filter(|path| path.contains(".db"))
+            .collect::<Vec<_>>();
+        for path in &databases {
+            assert!(
+                Path::new(path).starts_with(&root),
+                "module opened a database outside its throwaway root: {path}"
+            );
+        }
+        if databases.iter().any(|path| path.ends_with("context.db"))
+            && databases.iter().any(|path| path.ends_with("store.db"))
+        {
+            println!(
+                "lsof real-daemon module {pid}: {} isolated database handles",
+                databases.len()
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lsof did not observe context/store startup for {pid}: {files}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(unix)]
@@ -1095,7 +1153,13 @@ fn workspace_root() -> PathBuf {
 }
 
 fn subconscious_root(workspace: &Path) -> PathBuf {
-    fs::canonicalize(workspace.parent().unwrap().join("subconscious")).unwrap()
+    // Isolated task worktrees need not have a sibling checkout. The caller may
+    // provide an owned source clone; locked_daemon_source still validates/exports
+    // only Cargo.lock's exact revision, never the clone's working files.
+    let source = std::env::var_os("MC_TEST_SUBCONSCIOUS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.parent().unwrap().join("subconscious"));
+    fs::canonicalize(source).unwrap()
 }
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -1131,10 +1195,11 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
     write_empty_config(&config);
     provision_context_store(&workspace, &config, &data);
     let environment = temp.0.join("child-environment.txt");
+    let module_pid = temp.0.join("module.pid");
     let launcher = temp.0.join("launch-mc.sh");
     // Record presence, not the secret. exec preserves the actual inherited pipe
     // and makes the observed environment the environment of ck-mc itself.
-    fs::write(&launcher, format!("#!/bin/sh\nif [ -z \"${{SUBC_LAUNCH_NONCE+x}}\" ]; then echo env_absent; else echo env_present; fi > '{}'\nif [ -n \"${{SUBC_LAUNCH_NONCE_FD+x}}\" ]; then echo fd_present; else echo fd_absent; fi >> '{}'\nexec '{}' \"$@\"\n", environment.display(), environment.display(), module_bin.display())).unwrap();
+    fs::write(&launcher, format!("#!/bin/sh\necho $$ > '{}'\nif [ -z \"${{SUBC_LAUNCH_NONCE+x}}\" ]; then echo env_absent; else echo env_present; fi > '{}'\nif [ -n \"${{SUBC_LAUNCH_NONCE_FD+x}}\" ]; then echo fd_present; else echo fd_absent; fi >> '{}'\nexec '{}' \"$@\"\n", module_pid.display(), environment.display(), environment.display(), module_bin.display())).unwrap();
     fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(
         config.join("cortexkit/subc.jsonc"),
@@ -1203,6 +1268,12 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
         .env("XDG_CONFIG_HOME", &config)
         .env("XDG_DATA_HOME", &data)
         .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", data.parent().unwrap().join("state"))
+        .env("OPENCODE_DB", data.parent().unwrap().join("opencode.db"))
+        .env(
+            "MAGIC_CONTEXT_STORAGE_DIR",
+            data.join("cortexkit/magic-context"),
+        )
         .output()
         .unwrap();
     assert!(
@@ -1211,6 +1282,12 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
         String::from_utf8_lossy(&provenance.stderr)
     );
     let provenance: Value = serde_json::from_slice(&provenance.stdout).unwrap();
+    let pid = fs::read_to_string(module_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_module_database_isolation(pid, &data);
     assert_eq!(
         provenance["modules"][0]["module_declared"]["build"]["launch_nonce_source"], "fd",
         "{provenance}"
@@ -1352,6 +1429,18 @@ impl Drop for StopSupervisedModule<'_> {
             .env("XDG_CONFIG_HOME", &self.daemon.config_dir)
             .env("XDG_RUNTIME_DIR", &self.daemon.runtime_dir)
             .env("XDG_DATA_HOME", &self.data_home)
+            .env(
+                "XDG_STATE_HOME",
+                self.data_home.parent().unwrap().join("state"),
+            )
+            .env(
+                "OPENCODE_DB",
+                self.data_home.parent().unwrap().join("opencode.db"),
+            )
+            .env(
+                "MAGIC_CONTEXT_STORAGE_DIR",
+                self.data_home.join("cortexkit/magic-context"),
+            )
             .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
             .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
             .env_remove(subc_os::LAUNCH_NONCE_FD_ENV)
@@ -1507,8 +1596,14 @@ fn provision_context_store(workspace: &Path, config: &Path, data: &Path) {
         .env("HOME", config)
         .env("XDG_CONFIG_HOME", config)
         .env("XDG_DATA_HOME", data)
+        .env("XDG_STATE_HOME", data.parent().unwrap().join("state"))
+        .env("XDG_RUNTIME_DIR", data.parent().unwrap().join("runtime"))
+        .env("OPENCODE_DB", data.parent().unwrap().join("opencode.db"))
         .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
-        .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+        .env(
+            "MAGIC_CONTEXT_STORAGE_DIR",
+            data.join("cortexkit/magic-context"),
+        )
         .output()
         .expect("bun must be installed to provision the host-schema store");
     assert!(

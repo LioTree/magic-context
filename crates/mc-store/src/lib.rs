@@ -21,8 +21,15 @@ pub mod context_boundaries;
 pub use context_boundaries::ResolvedContextBoundary;
 pub mod context_writes;
 mod historian_claim;
+mod move_fences;
 pub mod move_inventory;
 pub mod private_permissions;
+mod provider_records;
+pub use provider_records::ProviderSessionKey;
+#[cfg(feature = "test-support")]
+mod provider_fixture_tests;
+#[cfg(feature = "test-support")]
+pub use provider_fixture_tests::create_test_v63_store;
 pub mod single_store_domain;
 pub mod single_store_schema;
 
@@ -3228,6 +3235,14 @@ const MIGRATIONS: &[Migration] = &[
             include_str!("migrations/store_063_pass_trace_ring.sql"),
         ),
     },
+    Migration {
+        version: 64,
+        statements: include_str!("migrations/store_064_move.sql"),
+    },
+    Migration {
+        version: 65,
+        statements: include_str!("migrations/store_065_provider_records.sql"),
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -5946,6 +5961,8 @@ pub enum ModuleStateSyncError {
 #[derive(Debug)]
 pub enum McStoreError {
     Store(StoreError),
+    /// A durable move fence owns this session.
+    SessionMoving,
     /// The on-disk row_version moved under us (a concurrent writer committed first).
     /// The caller re-loads and re-steps.
     CasConflict {
@@ -6068,6 +6085,7 @@ pub enum McStoreError {
 impl std::fmt::Display for McStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            McStoreError::SessionMoving => write!(f, "session_moving"),
             McStoreError::Store(e) => write!(f, "store: {e}"),
             McStoreError::CasConflict { expected, found } => {
                 write!(f, "cas conflict: expected {expected:?}, found {found}")
@@ -6175,7 +6193,11 @@ impl std::fmt::Display for McStoreError {
 impl std::error::Error for McStoreError {}
 impl From<StoreError> for McStoreError {
     fn from(e: StoreError) -> Self {
-        McStoreError::Store(e)
+        if e.to_string().contains("session_moving") {
+            McStoreError::SessionMoving
+        } else {
+            McStoreError::Store(e)
+        }
     }
 }
 
@@ -7959,6 +7981,7 @@ impl McStore {
             tracing::error!("mc-store: refusing to open: {error}");
             return Err(error);
         }
+        inner.with_conn(move_fences::install_writer_guards)?;
         // An empty store just took migration 61 through the ordinary chain. Stamp its marker so
         // the module can write the matching context.db flag; the suffix tells it this was a
         // fresh install rather than a migrated store whose context.db flag went missing.
@@ -8108,6 +8131,10 @@ impl McStore {
                 conn.execute(
                     "DELETE FROM mc_transform_session_roots AS roots
                       WHERE roots.observed_at < ?1
+                        AND NOT EXISTS (
+                            SELECT 1 FROM mc_move_fences AS fence
+                             WHERE fence.session_id = roots.session_id
+                        )
                         AND NOT EXISTS (
                             SELECT 1 FROM mc_cache_state AS cache
                              WHERE cache.session_id = roots.session_id
@@ -8469,6 +8496,7 @@ impl McStore {
         session_id: &str,
         project_path: &str,
     ) -> Result<usize, McStoreError> {
+        self.check_session_not_moving(session_id)?;
         // The session's history rows in context.db first, then every store.db cache row.
         let mut deleted = self.context_write(
             &[
