@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { LiveConfigReader } from "@magic-context/core/config/live-snapshot";
 import { MURAL_MODEL_DEPRECATION_WARNING } from "@magic-context/core/config/mural-model-deprecation";
 import { getProtectedTokensTierOverrides } from "@magic-context/core/config/project-security";
 import { REMOVED_AGENT_CONFIG_WARNING } from "@magic-context/core/config/removed-agent-config";
@@ -20,6 +21,7 @@ import { loadPiConfig, loadPiConfigDetailed } from "./index";
 const tempRoots: string[] = [];
 const originalHome = process.env.HOME;
 const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+const originalConfigPath = process.env.MAGIC_CONTEXT_CONFIG_PATH;
 
 function makeTempRoot(prefix: string): string {
 	const path = createTestTempDirFromPath(join(tmpdir(), prefix));
@@ -68,6 +70,9 @@ function writeUserConfig(
 }
 
 afterEach(() => {
+	if (originalConfigPath === undefined)
+		delete process.env.MAGIC_CONTEXT_CONFIG_PATH;
+	else process.env.MAGIC_CONTEXT_CONFIG_PATH = originalConfigPath;
 	setWindowOverlayPath(undefined);
 	if (originalHome === undefined) {
 		delete process.env.HOME;
@@ -86,6 +91,79 @@ afterEach(() => {
 });
 
 describe("loadPiConfig", () => {
+	it("Pi config override wins over XDG and preserves project user-only restrictions", () => {
+		const cwd = makeTempRoot("mc-pi-override-cwd-");
+		const home = makeTempRoot("mc-pi-override-home-");
+		withHome(home);
+		writeUserConfig(home, '{"cache_ttl":"1h"}');
+		const file = join(home, "selected.settings");
+		process.env.MAGIC_CONTEXT_CONFIG_PATH = file;
+		writeConfig(
+			file,
+			'{"cache_ttl":"15m","compaction":{"enabled":false},"language":"en"}',
+		);
+		writeProjectConfig(
+			cwd,
+			'{"cache_ttl":"30m","compaction":{"enabled":true},"language":"tr"}',
+		);
+		const loaded = loadPiConfigDetailed({ cwd }, false);
+		expect(loaded.loadedFromPaths).toContain(file);
+		expect(loaded.config.cache_ttl).toBe("30m");
+		expect(loaded.config.compaction?.enabled).toBe(false);
+		expect(loaded.config.language).toBe("en");
+		expect(loaded.warnings.join("\n")).toContain("user-level");
+	});
+
+	it("Pi config override refuses relative and blank paths", () => {
+		const cwd = makeTempRoot("mc-pi-invalid-override-");
+		withHome(cwd);
+		for (const value of ["relative.jsonc", "", "   "]) {
+			process.env.MAGIC_CONTEXT_CONFIG_PATH = value;
+			expect(() => loadPiConfigDetailed({ cwd }, false)).toThrow(
+				"MAGIC_CONTEXT_CONFIG_PATH must be an absolute path",
+			);
+		}
+	});
+
+	it("Pi missing config override has one warning and no XDG or legacy fallback", () => {
+		const cwd = makeTempRoot("mc-pi-missing-override-");
+		withHome(cwd);
+		writeUserConfig(cwd, '{"cache_ttl":"1h"}');
+		writeConfig(
+			join(cwd, ".pi", "agent", "magic-context.jsonc"),
+			'{"cache_ttl":"20m"}',
+		);
+		process.env.MAGIC_CONTEXT_CONFIG_PATH = join(cwd, "absent.jsonc");
+		const loaded = loadPiConfigDetailed({ cwd }, false);
+		expect(loaded.config.cache_ttl).toBe(
+			MagicContextConfigSchema.parse({}).cache_ttl,
+		);
+		expect(loaded.loadedFromPaths).toEqual([]);
+		expect(
+			loaded.warnings.filter((warning) =>
+				warning.includes("MAGIC_CONTEXT_CONFIG_PATH"),
+			),
+		).toHaveLength(1);
+	});
+
+	it("Pi live reload follows the config override rather than XDG", () => {
+		const cwd = makeTempRoot("mc-pi-live-override-");
+		withHome(cwd);
+		const xdg = writeUserConfig(cwd, '{"cache_ttl":"1h"}');
+		const file = join(cwd, "selected.jsonc");
+		process.env.MAGIC_CONTEXT_CONFIG_PATH = file;
+		const load = () => loadPiConfigDetailed({ cwd }, false).config;
+		const reader = new LiveConfigReader(cwd, load(), load);
+		const initial = reader.poll();
+		writeConfig(xdg, '{"cache_ttl":"40m"}');
+		expect(reader.poll()).toBe(initial);
+		writeConfig(file, '{"cache_ttl":"15m"}');
+		expect(reader.poll().effective.cache_ttl).toBe("15m");
+		writeConfig(file, '{"cache_ttl":"30m"}');
+		expect(reader.poll().effective.cache_ttl).toBe("30m");
+		expect(reader.current().generation).toBe(3);
+	});
+
 	it("recovers a leading invalid symbol and returns a located file-parse warning", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");

@@ -23,15 +23,17 @@ export type FallbackAdmissibility =
     | { admissible: true; view: MessageLike[] }
     | { admissible: false; reason: "covered_range_changed" | "fit_unproven"; detail: string };
 
+export interface ProviderUsageInput {
+    messages: readonly MessageLike[];
+    inputTokens: number;
+    model: string;
+    envelope: string;
+}
+
 /** Record only provider input usage attributed to this exact served request, including cache tokens. */
 export function recordProviderUsage<P>(
     record: RunnerRecord<MessageLike, P>,
-    input: {
-        messages: readonly MessageLike[];
-        inputTokens: number;
-        model: string;
-        envelope: string;
-    },
+    input: ProviderUsageInput,
 ): void {
     if (!Number.isSafeInteger(input.inputTokens) || input.inputTokens <= 0) {
         throw new Error("Provider input usage must be a positive integer");
@@ -122,9 +124,7 @@ export function isFallbackAdmissible<P>(
             if (!compacted || ordinal >= to) {
                 const entry = entries.get(id);
                 tail.push(
-                    compacted &&
-                        entry &&
-                        sourceDigest(entry.ingest) === sourceDigest(JSON.stringify(message))
+                    entry && sourceDigest(entry.ingest) === sourceDigest(JSON.stringify(message))
                         ? entry.served
                         : message,
                 );

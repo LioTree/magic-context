@@ -32,7 +32,12 @@ export interface Entry<M> {
     ingest: string;
     served: M;
     op_version: number;
-    hook: { answers: readonly HookAnswer[]; unavailable?: true };
+    hook: {
+        answers: readonly HookAnswer[];
+        unavailable?: true;
+        /** Applied ops per subject, or unavailable for all subjects when any failed; absent in older records. */
+        outcomes?: readonly HookOutcome[];
+    };
     ingested: boolean;
     race: boolean;
 }
@@ -455,7 +460,13 @@ export function finishEntry<M>(
             ingest: admitted.ingest,
             served: unavailable ? admitted.message : apply(admitted.message, answers),
             op_version: functions.current,
-            hook: unavailable ? { answers: [], unavailable: true } : { answers },
+            hook: {
+                answers,
+                ...(unavailable ? { unavailable: true as const } : {}),
+                outcomes: unavailable
+                    ? outcomes.map(({ subject }) => ({ subject, unavailable: true as const }))
+                    : outcomes,
+            },
             ingested: outcomes.length > 0 && !unavailable,
             race: candidate.race,
         },

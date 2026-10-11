@@ -2,6 +2,7 @@ import { existsSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs"
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { removeJsoncValue } from "../shared/jsonc-edit";
+import { detectConfigFile } from "../shared/jsonc-parser";
 import {
     ensureStorageDirectorySync,
     writeStorageFileAtomicSync,
@@ -82,6 +83,39 @@ export function cortexKitUserConfigBasePath(): string {
     return join(configHome(), "cortexkit", CONFIG_FILE_BASENAME);
 }
 
+/** Select the user file even when a host uses a private XDG_CONFIG_HOME for its own settings. */
+export function magicContextConfigPathOverride(): string | undefined {
+    const value = process.env.MAGIC_CONTEXT_CONFIG_PATH;
+    if (value === undefined) return undefined;
+    const path = value.trim();
+    if (!path || !isAbsolute(path)) {
+        throw new Error(
+            "MAGIC_CONTEXT_CONFIG_PATH must be an absolute path to a user config file (not blank)",
+        );
+    }
+    return path;
+}
+
+/** Resolve an exact override even when missing, so reload can observe its later creation. */
+export function resolveMagicContextUserConfig() {
+    const override = magicContextConfigPathOverride();
+    if (override === undefined)
+        return {
+            ...detectConfigFile(cortexKitUserConfigBasePath()),
+            overridden: false,
+            warning: undefined,
+        };
+    const present = existsSync(override);
+    return {
+        path: override,
+        format: present ? ("jsonc" as const) : ("none" as const),
+        overridden: true,
+        warning: present
+            ? undefined
+            : `[user config] MAGIC_CONTEXT_CONFIG_PATH file not found: ${override}; continuing without user config (no XDG or legacy fallback).`,
+    };
+}
+
 /** `<root>/.cortexkit/magic-context` (no extension — for detectConfigFile). */
 export function cortexKitProjectConfigBasePath(directory: string): string {
     return join(directory, ".cortexkit", CONFIG_FILE_BASENAME);
@@ -110,12 +144,14 @@ function legacySourcesForBase(basePath: string, label: string): LegacyConfigSour
  * these (they are user-scope files, not project files).
  */
 function userScopeConfigPaths(): Set<string> {
+    const override = magicContextConfigPathOverride();
     return new Set<string>([
         // The CortexKit user target, both extensions: the bare-root project
         // source produces `.jsonc` AND `.json`, so exclude both or a stray
         // `~/.config/cortexkit/magic-context.json` would still be eaten.
         `${cortexKitUserConfigBasePath()}.jsonc`,
         `${cortexKitUserConfigBasePath()}.json`,
+        ...(override ? [override] : []),
         join(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.jsonc`),
         join(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.json`),
         join(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.jsonc`),
@@ -566,16 +602,18 @@ export function migrateMagicContextConfigLocations(
     logger?: ConfigMigrationLogger,
 ): string[] {
     const warnings: string[] = [];
+    const override = magicContextConfigPathOverride();
     const legacy = resolveLegacyConfigSources(directory);
     try {
-        warnings.push(
-            ...migrateConfigFile({
-                scope: "user",
-                targetPath: resolveCortexKitUserConfigPath(),
-                legacySources: legacy.user,
-                logger,
-            }).warnings,
-        );
+        if (override === undefined)
+            warnings.push(
+                ...migrateConfigFile({
+                    scope: "user",
+                    targetPath: resolveCortexKitUserConfigPath(),
+                    legacySources: legacy.user,
+                    logger,
+                }).warnings,
+            );
         warnings.push(
             ...migrateConfigFile({
                 scope: "project",

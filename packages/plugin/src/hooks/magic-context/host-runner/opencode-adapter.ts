@@ -26,6 +26,13 @@ import { storeAheadOfBinaryFailure } from "../store-ahead-refusal";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
 import {
+    type FallbackAdmissibility,
+    type FallbackInputs,
+    isFallbackAdmissible,
+    type ProviderUsageInput,
+    recordProviderUsage,
+} from "./fallback-admissibility";
+import {
     type FrozenProviderPlan,
     freezeProviderPlan,
     type HostHookSubject,
@@ -62,7 +69,11 @@ import {
     sourceDigest,
 } from "./record";
 
-export type { FallbackAdmissibility, FallbackInputs } from "./fallback-admissibility";
+export type {
+    FallbackAdmissibility,
+    FallbackInputs,
+    ProviderUsageInput,
+} from "./fallback-admissibility";
 export { isFallbackAdmissible, recordProviderUsage } from "./fallback-admissibility";
 
 type Legacy = ReturnType<typeof createRustModeTransform>;
@@ -332,6 +343,8 @@ interface Session {
 }
 export interface OpenCodeProviderOptions {
     now?: () => number;
+    /** Await newly saved hook ops/unavailability before serving messages; context.db owns their replay. */
+    onOutcome?: (messageId: string, subject: Subject, outcome: HookOutcome) => Promise<void>;
     resolveOrdinals?: typeof resolveOrdinalsForModule;
     persisted?: typeof hasRawSessionMessageById;
     sync?: (sessionId: string, state: ModuleStateSyncState, passComplete: boolean) => Promise<void>;
@@ -1355,6 +1368,14 @@ export function createOpenCodeProviderTransform(
                 admissions.map((a) => ({ ...a, unserved_subjects: [] })),
             );
             save(id, s, admissions, scan.elided);
+            if (options.onOutcome) {
+                for (const { entry } of admissions) {
+                    for (const outcome of entry.hook.outcomes ?? []) {
+                        const notification = structuredClone(outcome);
+                        await options.onOutcome(entry.id, notification.subject, notification);
+                    }
+                }
+            }
             // A final append without a subscribed hook still ends the pass. Signal
             // completion after every append is recorded, not in the pre-ingest sync.
             if (scan.appends.length && !completedHook) await sync(id, s, true);
@@ -1468,6 +1489,7 @@ export function createOpenCodeProviderTransform(
                 !s.record.pipeline_exit
             );
         },
+        /** Reload saved messages after restart, without checking a new request's sources or model fit. */
         recoverOutput(id: string, output: { messages: unknown[] }): boolean {
             try {
                 sessions.delete(id);
@@ -1482,6 +1504,33 @@ export function createOpenCodeProviderTransform(
         ordinals(id: string): ReadonlyMap<string, number> | undefined {
             const s = hydrate(id);
             return s?.metadata.active && !s.record.pipeline_exit ? s.record.ids : undefined;
+        },
+        isFallbackAdmissible(id: string, input: FallbackInputs): FallbackAdmissibility {
+            const s = hydrate(id);
+            if (deps.rustPipeline !== "provider" || !s?.metadata.active || s.record.pipeline_exit) {
+                return {
+                    admissible: false,
+                    reason: "covered_range_changed",
+                    detail: "No active provider record for this session",
+                };
+            }
+            return isFallbackAdmissible(s.record, input);
+        },
+        /** Save input-token usage for the caller's exact served request without exposing the internal record. */
+        recordProviderUsage(id: string, usage: ProviderUsageInput): void {
+            if (busy.has(id)) throw new Error("Provider pass already in flight");
+            const s = hydrate(id);
+            if (deps.rustPipeline !== "provider" || !s?.metadata.active || s.record.pipeline_exit)
+                throw new Error("No active provider record for this session");
+            const previous = s.record.measured_usage;
+            try {
+                recordProviderUsage(s.record, usage);
+                save(id, s);
+            } catch (error) {
+                s.record.measured_usage = previous;
+                sessions.delete(id);
+                throw error;
+            }
         },
         bootstrapDeclines: () => declines,
         hasRecord: (id: string) => hydrate(id) !== undefined,

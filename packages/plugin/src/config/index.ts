@@ -18,10 +18,10 @@ import { setWindowOverlayPath } from "../shared/window-geometry";
 import { isCompactionEnabled, migrateLegacyAgentEnabledInMemory } from "./agent-disable";
 import {
     cortexKitProjectConfigBasePath,
-    cortexKitUserConfigBasePath,
     type LegacyConfigSource,
     resolveLegacyConfigSources,
     resolveLegacyConfigSourcesForHarness,
+    resolveMagicContextUserConfig,
 } from "./migrate-config-location";
 import { migrateDreamerV2 } from "./migrate-dreamer-v2";
 import { migrateLegacyExperimental } from "./migrate-experimental";
@@ -73,10 +73,6 @@ export interface MagicContextPluginConfig extends MagicContextConfig {
 // reads THIS harness's own legacy file as a non-destructive fallback rather than
 // silently using schema defaults (which would re-enable features the user's real
 // config disabled). See resolveLegacyReadFallback.
-function getUserConfigBasePath(): string {
-    return cortexKitUserConfigBasePath();
-}
-
 function getProjectConfigBasePath(directory: string): string {
     return cortexKitProjectConfigBasePath(directory);
 }
@@ -714,7 +710,7 @@ export function loadPluginConfigDetailed(
     directory: string,
     applyRuntimeGlobals = true,
 ): LoadResultDetailed {
-    const userDetected = detectConfigFile(getUserConfigBasePath());
+    const userDetected = resolveMagicContextUserConfig();
     const projectDetected = detectConfigFile(getProjectConfigBasePath(directory));
     // Both-harness sources drive the GC-suppression signal; this-harness sources
     // (OpenCode) drive the non-destructive read fallback when the base is absent.
@@ -726,7 +722,7 @@ export function loadPluginConfigDetailed(
     // instead of falling to schema defaults that would silently re-enable
     // features the user disabled.
     const userLegacyFallback =
-        userDetected.format === "none"
+        !userDetected.overridden && userDetected.format === "none"
             ? resolveLegacyReadFallback(harnessLegacy.user)
             : { source: null };
     const projectLegacyFallback =
@@ -740,6 +736,7 @@ export function loadPluginConfigDetailed(
     // harness's legacy exists we fell to defaults → keep GC suppressed so a
     // default-config start can't reap the other harness's embedding vectors.
     const legacyUserUnmigrated =
+        !userDetected.overridden &&
         userDetected.format === "none" &&
         !userLegacyFallback.source &&
         legacySources.user.some((source) => existsSync(source.path));
@@ -762,6 +759,7 @@ export function loadPluginConfigDetailed(
               : null;
 
     const allWarnings: string[] = [];
+    if (userDetected.warning) allWarnings.push(userDetected.warning);
     const removedConfigWarnings: string[] = [];
     const userRaw = stripRemovedAgentConfig(userLoaded?.config ?? {}, removedConfigWarnings);
 

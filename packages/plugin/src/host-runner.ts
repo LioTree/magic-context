@@ -4,6 +4,7 @@ export {
     type FallbackAdmissibility,
     type FallbackInputs,
     isFallbackAdmissible,
+    type ProviderUsageInput,
     recordProviderUsage,
 } from "./hooks/magic-context/host-runner/fallback-admissibility";
 export type { OpenCodeProviderOptions } from "./hooks/magic-context/host-runner/opencode-adapter";
