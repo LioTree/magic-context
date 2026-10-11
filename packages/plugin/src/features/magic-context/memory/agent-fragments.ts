@@ -122,7 +122,11 @@ function categoryAttribute(category: string | null | undefined): string {
 }
 
 /** The memory's text was replaced. */
-export function renderUpdatedFragmentLine(id: number, category: string | null, text: string): string {
+export function renderUpdatedFragmentLine(
+    id: number,
+    category: string | null,
+    text: string,
+): string {
     return `  <updated id="${id}"${categoryAttribute(category)}>${escapeXmlContent(text)}</updated>`;
 }
 

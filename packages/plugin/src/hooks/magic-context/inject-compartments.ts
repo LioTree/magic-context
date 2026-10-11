@@ -12,17 +12,6 @@ import {
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
 import {
-    CATEGORY_PRIORITY,
-    V2_MEMORY_CATEGORIES,
-} from "../../features/magic-context/memory/constants";
-import { compareMemorySelectionPriority } from "../../features/magic-context/memory/memory-selection";
-import {
-    getMaxMemoryIdForProjects,
-    getMemoriesByProject,
-    getMemoriesByProjects,
-} from "../../features/magic-context/memory/storage-memory";
-import type { Memory } from "../../features/magic-context/memory/types";
-import {
     loadAgentFragmentsAfter,
     maxAgentFragmentId,
     renderStaleFragmentMarker,
@@ -40,6 +29,17 @@ import {
     writeHardProjection,
     writeSoftProjection,
 } from "../../features/magic-context/memory/applied-projection";
+import {
+    CATEGORY_PRIORITY,
+    V2_MEMORY_CATEGORIES,
+} from "../../features/magic-context/memory/constants";
+import { compareMemorySelectionPriority } from "../../features/magic-context/memory/memory-selection";
+import {
+    getMaxMemoryIdForProjects,
+    getMemoriesByProject,
+    getMemoriesByProjects,
+} from "../../features/magic-context/memory/storage-memory";
+import type { Memory } from "../../features/magic-context/memory/types";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
 import {
     type MuralPool,
@@ -2616,7 +2616,12 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         userMemories = options.memoryEnabled === false ? [] : safeGetActiveUserMemories(options.db);
         // Capture revisions and the mural's rows/cues in this same read snapshot,
         // so the text, the image and their manifest describe one memory state.
-        if (projectPath && options.memoryEnabled !== false && options.muralEnabled && !options.mural)
+        if (
+            projectPath &&
+            options.memoryEnabled !== false &&
+            options.muralEnabled &&
+            !options.mural
+        )
             muralPool = readMuralPool(options.db, projectPath);
         foldRevisions = readMemoryRevisions(options.db, [
             ...memories.map((memory) => memory.id),
@@ -3053,7 +3058,10 @@ interface RenderM1Result {
 }
 
 /** New compartments past the m[0] watermark, at full fidelity. */
-function renderNewCompartmentsBlock(options: M0M1RenderOptions, markers: M0SnapshotMarkers): string {
+function renderNewCompartmentsBlock(
+    options: M0M1RenderOptions,
+    markers: M0SnapshotMarkers,
+): string {
     const newCompartments = withCompartmentDates(
         options.db,
         options.sessionId,

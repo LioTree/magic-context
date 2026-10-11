@@ -1,8 +1,6 @@
 import { sessionLog } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
-import { CATEGORY_DEFAULT_TTL } from "./constants";
-import { embedTextForProject } from "./embedding";
 import {
     recordAgentFragment,
     renderAddedFragmentLine,
@@ -10,6 +8,8 @@ import {
     renderSupersededFragmentLine,
     renderUpdatedFragmentLine,
 } from "./agent-fragments";
+import { CATEGORY_DEFAULT_TTL } from "./constants";
+import { embedTextForProject } from "./embedding";
 import { invalidateMemory } from "./embedding-cache";
 import { checkMemoryRevision } from "./lifecycle-check-ledger";
 import { MAX_STAGE2_ATTEMPTS } from "./lifecycle-constants";
@@ -413,7 +413,10 @@ function agentMutationFragment(
                 : renderAddedFragmentLine(canonical.id, category, finalText),
         );
     return {
-        memoryIds: [...sources.map((source) => source.id).filter((id) => id !== canonical.id), canonical.id],
+        memoryIds: [
+            ...sources.map((source) => source.id).filter((id) => id !== canonical.id),
+            canonical.id,
+        ],
         currentId: canonical.id,
         lines,
         visibleTexts: survivorChanged ? [{ id: canonical.id, text: finalText }] : [],

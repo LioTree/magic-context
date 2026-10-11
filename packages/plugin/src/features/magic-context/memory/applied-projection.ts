@@ -271,7 +271,10 @@ export function readCueMemoryIds(db: Database, sessionId: string): Set<number> {
         .prepare(
             "SELECT memory_id, projected_metadata_json FROM memory_applied_rows WHERE session_id=? AND harness=?",
         )
-        .all(sessionId, getHarness()) as Array<{ memory_id: number; projected_metadata_json: string }>;
+        .all(sessionId, getHarness()) as Array<{
+        memory_id: number;
+        projected_metadata_json: string;
+    }>;
     for (const row of rows) {
         try {
             const metadata = JSON.parse(row.projected_metadata_json) as {
@@ -295,7 +298,10 @@ export function readCueMemoryIds(db: Database, sessionId: string): Set<number> {
  * Returns undefined when the session has no non-legacy applied tuple; callers
  * then judge visibility from the served bytes.
  */
-export function readFullyVisibleMemoryIds(db: Database, sessionId: string): Set<number> | undefined {
+export function readFullyVisibleMemoryIds(
+    db: Database,
+    sessionId: string,
+): Set<number> | undefined {
     if (!tablesPresent(db)) return undefined;
     const harness = getHarness();
     const snapshot = db

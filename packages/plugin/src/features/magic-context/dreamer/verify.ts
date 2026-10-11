@@ -27,11 +27,8 @@ import {
     readGitHead,
     recordMemoryVerifications,
 } from "../memory";
+import { proposeMemoryMutation, recordAutomatedMemoryEdit } from "../memory/lifecycle-applier";
 import { computeNormalizedHash } from "../memory/normalize-hash";
-import {
-    proposeMemoryMutation,
-    recordAutomatedMemoryEdit,
-} from "../memory/lifecycle-applier";
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
 import { readFailedChildMessages } from "./failed-invocation-evidence";
