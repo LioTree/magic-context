@@ -8,7 +8,9 @@ export {
     BridgeRefusalError,
     type BridgeRefusalReason,
     type BridgeRunInput,
+    type BridgeStepKind,
     type BridgeView,
+    StepBudgetExceededError,
 } from "./hooks/magic-context/host-runner/bridge-types";
 export {
     type FallbackAdmissibility,

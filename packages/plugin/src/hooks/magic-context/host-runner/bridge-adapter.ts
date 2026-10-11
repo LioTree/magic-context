@@ -1,15 +1,20 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { isAbsolute, join } from "node:path";
 import { loadPluginConfigDetailed } from "../../../config";
+import { resolveProjectIdentityForSession } from "../../../features/magic-context/memory/project-identity";
 import { createScheduler } from "../../../features/magic-context/scheduler";
+import { recordSessionProjectIdentity } from "../../../features/magic-context/session-project-storage";
 import { openBridgeDatabase } from "../../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../../features/magic-context/storage-meta";
 import { createTagger } from "../../../features/magic-context/tagger";
 import type { PluginContext } from "../../../plugin/types";
+import { sessionLog } from "../../../shared/logger";
 import { resolveHistorianModel } from "../../../shared/model-resolution";
 import { SubcModuleTransport } from "../module-transport";
 import { hasRawMessageProvider } from "../read-session-chunk";
 import { createRustModeTransform } from "../rust-mode-transform";
 import type { TransformDeps } from "../transform";
+import { BridgeStep } from "./bridge-step";
 import {
     type BridgeAdapterOptions,
     type BridgeFallbackInputs,
@@ -48,15 +53,19 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
     );
     let legacy: ReturnType<typeof createRustModeTransform> | undefined;
     let provider: ReturnType<typeof createOpenCodeProviderTransform>;
+    let deps: TransformDeps;
     const listeners = new Set<BridgeOutcomeListener>();
+    const observerFailures = new Set<string>();
+    const observations = new Set<Promise<void>>();
+    const observingSession = new AsyncLocalStorage<string>();
     try {
         const historian = resolveHistorianModel(config, "opencode");
-        const deps: TransformDeps = {
+        deps = {
             db,
             client: v2 ? undefined : (options.openCodeClient as PluginContext["client"]),
             directory: options.projectRoot,
-            projectPath: options.projectRoot,
             rustModeProjectRoot: options.projectRoot,
+            allowHomeProject: config.allow_home_project,
             storeGeneration: v2 ? "v2" : "v1",
             // The calling integration owns bridge opt-in; transform_mode/rust_pipeline only select the in-tree plugin renderer.
             transformMode: "rust",
@@ -95,7 +104,25 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
         });
         provider = createOpenCodeProviderTransform(deps, legacy, {
             onOutcome: async (...args) => {
-                for (const listener of [...listeners]) await listener(...args);
+                const observing = Promise.all(
+                    [...listeners].map(async (listener) => {
+                        try {
+                            await listener(...args);
+                        } catch (error) {
+                            const id = observingSession.getStore();
+                            if (id && !observerFailures.has(id)) {
+                                observerFailures.add(id);
+                                sessionLog(id, "bridge outcome observer failed", error);
+                            }
+                        }
+                    }),
+                ).then(() => {});
+                observations.add(observing);
+                try {
+                    await observing;
+                } finally {
+                    observations.delete(observing);
+                }
             },
             fullRequest: async (_id, _messages, _output, _meta, _namespace, reason) => {
                 throw new BridgeRefusalError(reason ?? "bootstrap_declined");
@@ -110,11 +137,13 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
     let disposed = false;
     let disposal: Promise<void> | undefined;
     const runs = new Set<Promise<void>>();
+    const activeSessions = new Set<string>();
     function assertOpen() {
         if (disposed) throw new Error("Bridge adapter is disposed");
     }
     return {
         async run({ sessionId: id, messages, kind }: BridgeRunInput): Promise<BridgeView> {
+            const startedAt = performance.now();
             assertOpen();
             if (kind !== "model")
                 throw new Error(
@@ -122,18 +151,36 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                 );
             if (v2 && !hasRawMessageProvider(id))
                 throw new BridgeRefusalError("raw_history_provider_missing");
+            if (activeSessions.has(id)) throw new Error("Bridge pass already in flight");
+            // Transport follows symlinks to bind a real filesystem directory, but a
+            // non-git project's memory key hashes the path string supplied by the host.
+            // Save that key in session_projects before the module looks up memories;
+            // hashing the transport's resolved path (e.g. /private/var instead of /var)
+            // would otherwise select a different memory pool.
+            const projectIdentity = resolveProjectIdentityForSession(
+                options.projectRoot,
+                config.allow_home_project,
+            );
+            deps.projectPath = projectIdentity;
+            recordSessionProjectIdentity(db, id, projectIdentity, harness);
+            const meta = getOrCreateSessionMeta(db, id, harness);
+            const stepKind = provider.classifyStep(id, messages, meta);
+            const pass = new BridgeStep(stepKind, startedAt);
             const output = { messages: [] as unknown[] };
-            const running = provider.run(
-                id,
-                messages,
-                output,
-                getOrCreateSessionMeta(db, id, harness),
+            activeSessions.add(id);
+            const running = observingSession.run(id, () =>
+                provider.runBudgeted(id, messages, output, meta, pass),
             );
             runs.add(running);
             try {
                 await running;
-                return output.messages as BridgeView;
+                return { messages: output.messages as BridgeView["messages"], kind: stepKind };
+            } catch (error) {
+                if (error instanceof Error) Object.assign(error, { kind: stepKind });
+                throw error;
             } finally {
+                pass.dispose();
+                activeSessions.delete(id);
                 runs.delete(running);
             }
         },
@@ -148,6 +195,7 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
         },
         recordProviderUsage(id: string, usage: ProviderUsageInput): void {
             assertOpen();
+            if (activeSessions.has(id)) throw new Error("Bridge pass already in flight");
             provider.recordProviderUsage(id, usage);
         },
         onOutcome(listener: BridgeOutcomeListener): () => void {
@@ -163,11 +211,13 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             disposed = true;
             disposal = (async () => {
                 await Promise.allSettled([...runs]);
+                await Promise.allSettled([...observations]);
                 try {
                     await provider.dispose();
                     legacy?.dispose();
                 } finally {
                     listeners.clear();
+                    observerFailures.clear();
                     try {
                         transport.close();
                     } finally {

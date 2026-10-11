@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { drainSingleStoreEmbeddingWatermarks } from "../../../features/magic-context/memory/single-store-embedding-drain";
 import { computeHardCacheExpired } from "../../../features/magic-context/scheduler";
@@ -8,6 +9,7 @@ import {
     commitHostRunnerPass,
     createHostRunnerState,
     type HostRunnerKey,
+    type HostRunnerPass,
     type HostRunnerState,
     type HostRunnerView,
     loadHostRunnerRecord,
@@ -25,6 +27,8 @@ import type { createRustModeTransform, HistorianHostRunnerSeam } from "../rust-m
 import { storeAheadOfBinaryFailure } from "../store-ahead-refusal";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
+import type { BridgeStep } from "./bridge-step";
+import type { BridgeStepKind } from "./bridge-types";
 import {
     type FallbackAdmissibility,
     type FallbackInputs,
@@ -382,7 +386,50 @@ export function createOpenCodeProviderTransform(
     const projectRoot = deps.rustModeProjectRoot ?? deps.directory ?? process.cwd();
     const configuredModule = deps.rustModeModuleClient;
     if (!configuredModule) throw new Error("Provider pipeline requires a module client");
-    const moduleClient = configuredModule;
+    const passContext = new AsyncLocalStorage<BridgeStep>();
+    const checkpoint = () => passContext.getStore()?.check();
+    const stage = <T>(work: Promise<T>): Promise<T> => passContext.getStore()?.wait(work) ?? work;
+    const write = (work: () => void): void => {
+        const pass = passContext.getStore();
+        if (pass) pass.write(work);
+        else work();
+    };
+    const afterCommit = (work: () => void): void => {
+        const pass = passContext.getStore();
+        if (pass) pass.afterCommit(work);
+        else work();
+    };
+    const moduleClient = new Proxy(configuredModule, {
+        get(target, name) {
+            if (name === "call")
+                return async (args: Parameters<typeof target.call>[0]) => {
+                    checkpoint();
+                    const pass = passContext.getStore();
+                    const result = await stage(
+                        target.call({
+                            ...args,
+                            signal: pass
+                                ? AbortSignal.any([
+                                      pass.signal,
+                                      ...(args.signal ? [args.signal] : []),
+                                  ])
+                                : args.signal,
+                        }),
+                    );
+                    checkpoint();
+                    return result;
+                };
+            if (name === "stateSyncCapabilities" && target.stateSyncCapabilities) {
+                const capabilities = target.stateSyncCapabilities.bind(target);
+                return (...args: Parameters<typeof capabilities>) => {
+                    checkpoint();
+                    return stage(capabilities(...args));
+                };
+            }
+            const value = Reflect.get(target, name);
+            return typeof value === "function" ? value.bind(target) : value;
+        },
+    });
     const key = (sessionId: string): HostRunnerKey => ({ session_id: sessionId, harness });
     const log = (id: string, text: string) => sessionLog(id, `provider pipeline: ${text}`);
     function registerProjection(id: string): void {
@@ -452,8 +499,8 @@ export function createOpenCodeProviderTransform(
     ): void {
         s.metadata.newestMid = admissions.at(-1)?.entry.id ?? s.metadata.newestMid;
         const state = stateFor(s);
-        commitHostRunnerPass(deps.db, key(id), {
-            state,
+        const pass: HostRunnerPass = {
+            state: { ...state },
             replace_retired_rollback: s.replaceRecord,
             elided,
             truncate_after: s.pendingDescent,
@@ -468,7 +515,8 @@ export function createOpenCodeProviderTransform(
                 race: e.race ? 1 : 0,
                 created_at: now(),
             })),
-        });
+        };
+        write(() => commitHostRunnerPass(deps.db, key(id), pass));
         s.replaceRecord = undefined;
         s.state = state;
         s.pendingDescent = undefined;
@@ -482,7 +530,9 @@ export function createOpenCodeProviderTransform(
             now,
             bootstrapBudgetMs: OPENCODE_PROVIDER_BOOTSTRAP_BUDGET_MS,
             persistFence: async (fence) => {
-                commitHostRunnerFence(deps.db, key(id), fence.request_id, fence.newest);
+                write(() =>
+                    commitHostRunnerFence(deps.db, key(id), fence.request_id, fence.newest),
+                );
                 s.state.issued_request_id = fence.request_id;
                 s.state.issued_newest = fence.newest;
             },
@@ -567,7 +617,8 @@ export function createOpenCodeProviderTransform(
         return s;
     }
     async function sync(id: string, s: Session, passComplete: boolean): Promise<void> {
-        if (options.sync) return options.sync(id, s.sync, passComplete);
+        checkpoint();
+        if (options.sync) return stage(options.sync(id, s.sync, passComplete));
         const chain = deps.resolveHistorianRun?.();
         const models = [
             chain?.model ?? deps.historianModel,
@@ -582,42 +633,45 @@ export function createOpenCodeProviderTransform(
             meta.lastTodoState,
             meta.systemPromptHash,
         ]);
-        const syncResult = await syncModuleState({
-            client: {
-                ...moduleClient,
-                call: async (args) => {
-                    const body = args.body as Record<string, unknown>;
-                    return moduleClient.call({
-                        ...args,
-                        body:
-                            args.method === "state_sync"
-                                ? {
-                                      ...body,
-                                      params: {
-                                          ...part(body.params),
-                                          pass_complete: passComplete,
-                                          historian_model_chain: [...new Set(models)],
-                                      },
-                                  }
-                                : body,
-                    });
+        const syncResult = await stage(
+            syncModuleState({
+                client: {
+                    ...moduleClient,
+                    call: async (args) => {
+                        const body = args.body as Record<string, unknown>;
+                        return moduleClient.call({
+                            ...args,
+                            body:
+                                args.method === "state_sync"
+                                    ? {
+                                          ...body,
+                                          params: {
+                                              ...part(body.params),
+                                              pass_complete: passComplete,
+                                              historian_model_chain: [...new Set(models)],
+                                          },
+                                      }
+                                    : body,
+                        });
+                    },
                 },
-            },
-            state: s.sync,
-            pass: {
-                db: deps.db,
-                sessionId: id,
-                projectPath: deps.projectPath ?? projectRoot,
-                nowMs: now(),
-            },
-            projectRoot,
-            force: !s.metadata.active,
-            options: {
-                authority: true,
-                knownWatermarksUnchanged:
-                    s.syncSignature === signature && !deps.rustMemorySyncRequestedSessions?.has(id),
-            },
-        });
+                state: s.sync,
+                pass: {
+                    db: deps.db,
+                    sessionId: id,
+                    projectPath: deps.projectPath ?? projectRoot,
+                    nowMs: now(),
+                },
+                projectRoot,
+                force: !s.metadata.active,
+                options: {
+                    authority: true,
+                    knownWatermarksUnchanged:
+                        s.syncSignature === signature &&
+                        !deps.rustMemorySyncRequestedSessions?.has(id),
+                },
+            }),
+        );
         if (syncResult.status === "retry_busy")
             throw new EmergencyFailClosedError("Provider state sync is still applying");
         s.syncSignature = signature;
@@ -638,7 +692,11 @@ export function createOpenCodeProviderTransform(
                 },
             });
         }
-        await drainSingleStoreEmbeddingWatermarks(deps.db);
+        checkpoint();
+        // Rebuilding search embeddings can change data for other sessions. Keep that
+        // maintenance outside cancellable bridge requests, because those writes cannot
+        // roll back with this pass's queued history and view records.
+        if (!passContext.getStore()) await drainSingleStoreEmbeddingWatermarks(deps.db);
     }
     function checkFailure(result: ProviderResult<unknown>): void {
         if (result.status === "unavailable") {
@@ -681,7 +739,7 @@ export function createOpenCodeProviderTransform(
     function exit(id: string, s: Session, reason: ExitReason): void {
         if (s.record.pipeline_exit) return;
         const value = { reason, reseed_full_request: s.record.ordinal_divergence > 0 };
-        commitHostRunnerExit(deps.db, key(id), JSON.stringify(value));
+        write(() => commitHostRunnerExit(deps.db, key(id), JSON.stringify(value)));
         commitExit(s.record, reason);
         s.state.pipeline_exit_json = JSON.stringify(value);
         log(
@@ -761,6 +819,7 @@ export function createOpenCodeProviderTransform(
         inputs: StepInputs,
         messages: MessageLike[],
     ): Promise<boolean> {
+        checkpoint();
         checkFailure(result);
         if (result.status === "unavailable") {
             const error = part(result.error ?? {});
@@ -854,28 +913,35 @@ export function createOpenCodeProviderTransform(
             s.metadata.flush = flush(id);
         }
         const state = stateFor(s);
-        commitHostRunnerAnswer(deps.db, key(id), {
+        const accepted = {
             request_id: result.request_id,
             issued_newest: s.state.issued_newest ?? -1,
-            state,
+            state: { ...state },
             ingested_through:
                 a.answer !== "compaction_message" || applied
                     ? result.page.messages.at(-1)?.ordinal
                     : undefined,
             view: applied ? viewRow(s) : undefined,
             hard_materialized_at: hardMaterializedAt,
-        });
+        };
+        write(() => commitHostRunnerAnswer(deps.db, key(id), accepted));
         s.state = state;
         if (applied) {
-            registerProjection(id);
-            deps.historyRefreshSessions.delete(id);
-            deps.pendingMaterializationSessions.delete(id);
-            deps.rustMemorySyncRequestedSessions?.delete(id);
+            afterCommit(() => {
+                registerProjection(id);
+                deps.historyRefreshSessions.delete(id);
+                deps.pendingMaterializationSessions.delete(id);
+                deps.rustMemorySyncRequestedSessions?.delete(id);
+            });
             log(
                 id,
                 `applied view ${s.record.view.version} reason=${inputs.prefix_rebuilding?.reason ?? "pressure"}`,
             );
             if (coverage) {
+                // Native markers commit a second database, which cannot roll back with
+                // a cancelled bridge view. The bridge records coverage but leaves raw
+                // host-history trimming to a separate post-publication integration step.
+                if (passContext.getStore()) return applied;
                 if (options.marker) await options.marker(id, coverage);
                 else {
                     const { defaultCompactionMarkerStrategy } = await import(
@@ -962,6 +1028,39 @@ export function createOpenCodeProviderTransform(
             estimate: { request_tokens: usage?.inputTokens ?? 0 },
         };
     }
+    function rebuildReason(
+        id: string,
+        s: Session,
+        messages: MessageLike[],
+        meta: SessionMeta,
+        reverted = false,
+    ): string | undefined {
+        return reverted || s.record.view.state === "invalidated"
+            ? "revert"
+            : model(id, messages) !== s.metadata.model
+              ? "model_switch"
+              : manifest(messages) !== s.metadata.manifest
+                ? "manifest_change"
+                : deps.historyRefreshSessions.has(id) ||
+                    deps.rustMemorySyncRequestedSessions?.has(id) ||
+                    flush(id) !== s.metadata.flush
+                  ? "flush"
+                  : providerCold(meta, now())
+                    ? "cold"
+                    : undefined;
+    }
+    function classifyStep(id: string, messages: MessageLike[], meta: SessionMeta): BridgeStepKind {
+        const s = hydrate(id);
+        if (!s?.metadata.active || String(s.record.pipeline_exit?.reason) === "rollback")
+            return "bootstrap";
+        const scan = scanWindow(
+            s.record,
+            messages.filter((m) => !isMagicContextHead(m)).map(providerIncoming),
+        );
+        return rebuildReason(id, s, messages, meta, scan.revert_through !== undefined)
+            ? "rebuild"
+            : "ordinary";
+    }
     async function bootstrap(
         id: string,
         s: Session | undefined,
@@ -969,23 +1068,26 @@ export function createOpenCodeProviderTransform(
         meta: SessionMeta,
         reentry?: Session,
     ): Promise<Session | undefined> {
+        checkpoint();
         const visible = messages.filter(
             (m) => !isMagicContextHead(m) && providerIncoming(m).classify() !== "marker",
         );
         if (!s || reentry) {
             const memo = legacy.getState(id);
-            const resolved = await (options.resolveOrdinals ?? resolveOrdinalsForModule)({
-                sessionId: id,
-                messages: visible,
-                generation: memo.moduleGeneration,
-                memoGeneration: memo.idOrdinalMemoGeneration,
-                memo: memo.idOrdinalMemo,
-                memoAnchor: memo.ordinalMemoAnchor,
-                memoStoredCount: memo.ordinalMemoStoredCount,
-                memoCanonicalCount: memo.ordinalMemoCanonicalCount,
-                memoCheckpoints: memo.ordinalMemoCheckpoints,
-                provisionalBase: memo.ordinalContinuationBase ?? undefined,
-            });
+            const resolved = await stage(
+                (options.resolveOrdinals ?? resolveOrdinalsForModule)({
+                    sessionId: id,
+                    messages: visible,
+                    generation: memo.moduleGeneration,
+                    memoGeneration: memo.idOrdinalMemoGeneration,
+                    memo: memo.idOrdinalMemo,
+                    memoAnchor: memo.ordinalMemoAnchor,
+                    memoStoredCount: memo.ordinalMemoStoredCount,
+                    memoCanonicalCount: memo.ordinalMemoCanonicalCount,
+                    memoCheckpoints: memo.ordinalMemoCheckpoints,
+                    provisionalBase: memo.ordinalContinuationBase ?? undefined,
+                }),
+            );
             // The full-request resolver deliberately lends ordinals to wire-only
             // synthetics. Bootstrap admits only distinct, persisted identities.
             const persisted = options.persisted ?? hasRawSessionMessageById;
@@ -1074,10 +1176,12 @@ export function createOpenCodeProviderTransform(
                 replaceRecord: reentry?.state.pipeline_exit_json ?? undefined,
             };
             s.client = client(id, s);
-            const declaration = await s.client.declare({
-                preset: r.plan.preset,
-                params: r.plan.params,
-            });
+            const declaration = await stage(
+                s.client.declare({
+                    preset: r.plan.preset,
+                    params: r.plan.params,
+                }),
+            );
             checkFailure(declaration);
             if (declaration.status !== "answered") return reentry;
             r.plan = freezeProviderPlan(declaration.answer, {
@@ -1162,10 +1266,12 @@ export function createOpenCodeProviderTransform(
         }
         if ((s.metadata.retryAt ?? 0) > now()) return s;
         if (!s.metadata.setup) {
-            const setup = await s.client.setup(s.record, {
-                ...inputs(id, messages, meta),
-                composition: {},
-            });
+            const setup = await stage(
+                s.client.setup(s.record, {
+                    ...inputs(id, messages, meta),
+                    composition: {},
+                }),
+            );
             checkFailure(setup);
             if (setup.status !== "answered") return s;
             if (setup.answer.answer === "refuse") {
@@ -1209,9 +1315,16 @@ export function createOpenCodeProviderTransform(
             prefix_rebuilding: { reason: "pipeline_switch" },
         };
         const pending = s;
-        const result = await s.client.bootstrap(s.record, controls, async (page) => {
-            await answer(id, pending, page, controls, messages);
-        });
+        const result = await stage(
+            s.client.bootstrap(
+                s.record,
+                controls,
+                async (page) => {
+                    await answer(id, pending, page, controls, messages);
+                },
+                passContext.getStore()?.signal,
+            ),
+        );
         checkFailure(result);
         return s;
     }
@@ -1223,6 +1336,7 @@ export function createOpenCodeProviderTransform(
         meta: SessionMeta,
         conflictRetry = 0,
     ): Promise<void> {
+        checkpoint();
         // A legacy handoff preserves its original exception type. In particular,
         // BUSY must still be eligible for the legacy wrapper's LKG recovery.
         const existing = hydrate(id);
@@ -1237,7 +1351,7 @@ export function createOpenCodeProviderTransform(
                     reseed_full_request: existing.record.ordinal_divergence > 0,
                     switch_generation: (existing.metadata.switchGeneration ?? 1) + 1,
                 };
-                commitHostRunnerExit(deps.db, key(id), JSON.stringify(value));
+                write(() => commitHostRunnerExit(deps.db, key(id), JSON.stringify(value)));
                 existing.state.pipeline_exit_json = JSON.stringify(value);
                 existing.record.pipeline_exit = value as unknown as RecordState["pipeline_exit"];
                 log(
@@ -1267,7 +1381,9 @@ export function createOpenCodeProviderTransform(
                     return fallback(id, s, messages, output, meta);
                 }
                 publishMessages(output, assemble(s.record));
-                void historian?.pump(id);
+                afterCommit(() => {
+                    void historian?.pump(id);
+                });
                 return;
             }
             const incoming = messages.filter((m) => !isMagicContextHead(m)).map(providerIncoming);
@@ -1329,7 +1445,9 @@ export function createOpenCodeProviderTransform(
                             { ...subject, subject_ordinal: candidate.ordinal },
                             admitted.ingest,
                             complete ? true : undefined,
+                            passContext.getStore()?.signal,
                         );
+                        checkpoint();
                         completedHook ||= complete;
                         checkFailure(result);
                         if (ordinalConflict(result)) {
@@ -1382,7 +1500,16 @@ export function createOpenCodeProviderTransform(
                 for (const { entry } of admissions) {
                     for (const outcome of entry.hook.outcomes ?? []) {
                         const notification = structuredClone(outcome);
-                        await options.onOutcome(entry.id, notification.subject, notification);
+                        const pass = passContext.getStore();
+                        if (pass)
+                            pass.afterCommit(() => {
+                                void options.onOutcome?.(
+                                    entry.id,
+                                    notification.subject,
+                                    notification,
+                                );
+                            });
+                        else await options.onOutcome(entry.id, notification.subject, notification);
                     }
                 }
             }
@@ -1394,20 +1521,7 @@ export function createOpenCodeProviderTransform(
                 mid: s.metadata.newestMid ?? "empty",
             };
             for (const event of scan.events) log(id, `host-side prefix event ${event}`);
-            const reason: string | undefined =
-                s.record.view.state === "invalidated"
-                    ? "revert"
-                    : controls.model !== s.metadata.model
-                      ? "model_switch"
-                      : manifest(messages) !== s.metadata.manifest
-                        ? "manifest_change"
-                        : deps.historyRefreshSessions.has(id) ||
-                            deps.rustMemorySyncRequestedSessions?.has(id) ||
-                            flush(id) !== s.metadata.flush
-                          ? "flush"
-                          : providerCold(meta, now())
-                            ? "cold"
-                            : undefined;
+            const reason = rebuildReason(id, s, messages, meta);
             const setup = s.metadata.setup;
             const share = setup?.answer === "ready" ? Number(setup.call_when?.share ?? 0.9) : 0.9;
             const usage = controls.previous_usage;
@@ -1427,9 +1541,16 @@ export function createOpenCodeProviderTransform(
                 // Continuation pages may not apply views. This same bounded paging
                 // lane is also needed when several frozen-raw appends exceed 3 MiB.
                 const pending = s;
-                await s.client.bootstrap(s.record, controls, async (page) => {
-                    await answer(id, pending, page, controls, messages);
-                });
+                await stage(
+                    s.client.bootstrap(
+                        s.record,
+                        controls,
+                        async (page) => {
+                            await answer(id, pending, page, controls, messages);
+                        },
+                        passContext.getStore()?.signal,
+                    ),
+                );
             }
             if (s.record.pipeline_exit) return fallback(id, s, messages, output, meta);
             else {
@@ -1444,6 +1565,7 @@ export function createOpenCodeProviderTransform(
                         "Provider-proven emergency wall without a fold",
                     );
                 }
+                checkpoint();
                 publishMessages(
                     output,
                     assemble(
@@ -1451,10 +1573,18 @@ export function createOpenCodeProviderTransform(
                         scan.passthrough.map((p) => p.read()),
                     ),
                 );
-                void historian?.pump(id);
+                afterCommit(() => {
+                    void historian?.pump(id);
+                });
             }
         } catch (error) {
+            const pass = passContext.getStore();
+            if (pass?.signal.aborted) {
+                sessions.delete(id);
+                throw pass.signal.reason;
+            }
             if (error instanceof StepOrdinalConflict && conflictRetry === 0) {
+                passContext.getStore()?.reset();
                 sessions.delete(id);
                 const held = hydrate(id);
                 if (held) {
@@ -1491,6 +1621,28 @@ export function createOpenCodeProviderTransform(
     }
     return {
         run,
+        classifyStep,
+        async runBudgeted(
+            id: string,
+            messages: MessageLike[],
+            output: { messages: unknown[] },
+            meta: SessionMeta,
+            pass: BridgeStep,
+        ): Promise<void> {
+            await passContext.run(pass, async () => {
+                try {
+                    await run(id, messages, output, meta);
+                    pass.check();
+                    pass.commit(deps.db);
+                } catch (error) {
+                    sessions.delete(id);
+                    throw error;
+                }
+            });
+            // Observer work starts only after durable publication and must not inherit
+            // the finished model request's cancellation signal or staged-write queue.
+            pass.publish();
+        },
         isProviderSession(id: string): boolean {
             const s = hydrate(id);
             return (

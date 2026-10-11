@@ -22,7 +22,23 @@ export interface BridgeRunInput {
     kind: "model";
 }
 
-export type BridgeView = MessageLike[];
+export type BridgeStepKind = "ordinary" | "bootstrap" | "rebuild";
+
+export interface BridgeView {
+    messages: MessageLike[];
+    kind: BridgeStepKind;
+}
+
+export class StepBudgetExceededError extends Error {
+    readonly code = "step_budget_exceeded";
+    constructor(
+        readonly budget_ms: number,
+        readonly kind: BridgeStepKind,
+    ) {
+        super(`Bridge ${kind} step exceeded its ${budget_ms} ms budget`);
+        this.name = "StepBudgetExceededError";
+    }
+}
 
 export type BridgeFallbackInputs = Omit<FallbackInputs, "messages"> & {
     /** Complete raw host window in append order; the facade applies provider normalization. */

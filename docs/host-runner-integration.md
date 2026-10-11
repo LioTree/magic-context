@@ -25,8 +25,9 @@ const adapter = await createBridgeAdapter({
 const unsubscribe = adapter.onOutcome(async (messageId, subject, outcome) => {
     // Observe committed ops/unavailability; context.db remains the replay owner.
 });
-const view = await adapter.run({ sessionId, messages: rawHostWindow, kind: "model" });
-// Send this view, not the unchecked rawHostWindow.
+const { messages: view, kind } = await adapter.run({ sessionId, messages: rawHostWindow, kind: "model" });
+// Send this view, including its synthetic user head, not the unchecked rawHostWindow.
+// Log kind: "ordinary", "bootstrap", or "rebuild".
 unsubscribe();
 await adapter.dispose();
 ```
@@ -48,10 +49,112 @@ whether the selected model, system/tool fingerprint or persisted source state ha
 changed. Idle-cache time and token pressure can also require a rebuilt history
 view, using the same rules as the in-tree provider path.
 `run` owns `SessionMeta`, publication, normalization through `providerIncoming`,
-and the bootstrap/rebuild record; it returns a `Promise<MessageLike[]>` view.
+and the bootstrap/rebuild record; it returns `Promise<{ messages: MessageLike[],
+kind: "ordinary" | "bootstrap" | "rebuild" }>`.
 Supply the complete raw host window in append order with its real identities,
 not just the new tail or a previous provider projection. No private type or
 mutable output parameter is needed.
+
+### Head placement and project identity
+
+The OpenCode provider's head is **inside `messages`**, not a system contribution.
+Its first two entries, m[0] and m[1], are id-less synthetic **user** messages, just
+as in the in-tree plugin. m[0] carries project docs, the user profile,
+`<session-history>` and `<project-memory>`; m[1] carries incremental history and
+memory corrections when present. Send both entries at the head of the provider
+window. Do not filter them out, turn them into system text, persist them as raw
+host history, or add a second memory injection. `run` does not drop a separate
+system field: there is no such head field on the OpenCode provider answer.
+
+Pass `projectRoot` **exactly as the host spells it; do not realpath it first**.
+The shared identity resolver uses `git:<root-commit>` for repositories with
+history and `dir:<MD5-prefix of path.resolve(root)>` otherwise. A trailing slash
+does not change the key, but symlink spellings and macOS `/var` versus
+`/private/var` can. Transport still binds a realpath for filesystem authority.
+Before provider rendering the bridge records the host-resolved identity in
+`session_projects` under its instance's harness. ck-mc prefers that binding to
+recomputing the identity from the canonical route. Host watermarks and all
+project-scoped module reads use that identity; docs use the equivalent bound
+filesystem directory. Re-keying existing directory memories is not part of this
+API. Seed/write memories using the same host spelling and shared resolver.
+
+Setup's `answer: "ready"` inserts placeholders; the bootstrap's final status pass
+renders the real head even with **zero compartments** (stored history summaries)
+and no historian execution (background model calls that create those summaries).
+Memory and profile injection need `memory.enabled` (default true),
+`memory.injection_budget_tokens` (default 4,000) and
+`memory.user_profile_budget_tokens`; docs need `dreamer.inject_docs` (default true). The provider lane requires
+`compaction.enabled` (default true); disabling it refuses setup, rather than
+silently serving a memory-less provider window.
+
+The TS facade's `configPath` does not configure an independently launched ck-mc.
+At this pin ck-mc reads its user tier from
+`$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` (or `.json`) plus the project's
+`.cortexkit` tier; it does **not** read `MAGIC_CONTEXT_CONFIG_PATH`.
+`MAGIC_CONTEXT_STORAGE_DIR` selects storage, not head settings. An env-only
+launch still gets the default enabled head, but explicit overrides must be
+installed in ck-mc's isolated XDG config tier as well. Staged ck-mc `cc8617ec`
+has identical Rust provider/identity/render/config code to `245aa977`; it does
+not need rebuilding for this fix.
+
+### Whole-step budgets and cancellation
+
+The facade classifies the pass using the provider adapter's own bootstrap and
+rebuild checks (source revert, model/system/tool manifest, explicit refresh and
+idle cache). `kind: "model"` remains the input; it is not a budget hint.
+
+| Result/error `kind` | Whole-pass budget |
+| --- | --- |
+| `ordinary` | 5,000 ms |
+| `bootstrap` | 30,000 ms |
+| `rebuild` | 30,000 ms |
+
+The budget starts on entry to `run` and covers preflight, all provider/ck-mc calls,
+assembly and the final host-record commit. Individual RPC limits can refuse
+earlier. At the deadline `run` rejects with `StepBudgetExceededError`, carrying
+`{ code: "step_budget_exceeded", budget_ms, kind }`. Errors from other pass
+failures also carry the classified `kind`. The caller may then use
+`isFallbackAdmissible`; timeout itself never authorizes unchecked raw history.
+
+Bridge host-record writes are staged until a single final atomic transaction.
+Cancellation is checked between asynchronous stages, before each record write,
+and immediately before COMMIT, including a clock check when synchronous SQLite
+work prevents the timer from running. An expired transaction rolls back whole;
+no outcomes, served state, request fences or usage from an unserved timed-out
+pass are published. Request fences associate a fresh RPC ID with its lineage and
+newest ordinal, preventing stale replies from overwriting a newer view. A retry
+reloads the prior durable record. Transport receives
+the cancellation signal; a remotely finishing ck-mc reply is discarded and
+cannot resume host writes. Session/project binding and module state-sync are
+independent authority metadata, not proof that a provider step was served.
+
+Bridge `onOutcome` is a fire-and-forget notification **after successful commit
+and publication**, outside the step budget. It emits nothing for cancelled
+passes, is not awaited by `run`, and has no ordering guarantee relative to
+`run`'s resolution. Observer failures are isolated and logged once per session.
+`dispose` drains outstanding notifications before closing handles.
+
+### Raw host-history markers and open items
+
+Budgeted bridge passes **do not invoke the native raw-history marker writer**.
+That writer commits OpenCode's own database independently of `context.db`; it
+cannot safely trim raw history inside a transaction that might roll back the
+bridge view at the deadline. Coverage is still committed in the bridge's durable
+view. Marker advancement is an optimization, never a condition for serving a
+step.
+
+Without markers, OpenCode keeps handing the full raw history to each step. The
+returned compacted view stays correct, but per-step host work grows with the
+session. The bridge integration must also **keep OpenCode's native
+auto-compaction declined while Magic Context owns compaction**; the facade does
+not install the host's compaction-decline hook on the integration's behalf.
+
+Open follow-up: add bridge marker advancement as a separate step **after view
+publication**, outside the step budget and idempotent on retry. Commit
+`context.db` coverage first, then advance the `opencode.db` marker. A crash
+between these writes must leave an untrimmed host (safe), never a trimmed host
+whose coverage Magic Context has not recorded. The native in-tree marker path
+is unchanged.
 
 The store is an independently owned handle opened by the shared storage module,
 with the ordinary WAL/NORMAL policy, foreign keys, 5-second busy timeout, private
@@ -88,7 +191,7 @@ v2's host-history registration lifecycle.
 rejects new calls immediately, drains in-flight passes and stops the historian,
 then closes the module connection and its store handle exactly once. Methods
 other than repeated disposal refuse after disposal. Observers can unsubscribe;
-they are awaited after durable commit, as described below.
+the bridge dispatches them after durable commit, as described above.
 
 ### Refused provider handoffs
 
@@ -187,10 +290,12 @@ outcomes are superseded by the durable replacement in `host_runner_views`; cover
 messages are not re-hooked. A lineage descent/revert can deliberately re-admit a
 changed suffix.
 
-`OpenCodeProviderOptions.onOutcome(messageId, subject, outcome)` is optional and
-awaited for newly committed outcomes, after the pass commit and before publication
-or `run()` returning. It observes/mirrors the record; it never replaces persistence.
-An observer failure refuses that pass's publication but leaves the frozen outcomes
+The low-level native `OpenCodeProviderOptions.onOutcome(messageId, subject, outcome)`
+is optional and awaited for newly committed outcomes, after the pass commit and
+before publication or `run()` returning. The supported bridge instead dispatches
+observers after publication, without awaiting them, as described above. Both
+observe/mirror the record; neither replaces persistence.
+On the native path an observer failure refuses publication but leaves the frozen outcomes
 committed. Notifications are not an exactly-once delivery queue and are not re-sent
 on replay; a process can die after commit but before observation. Bridges must not
 depend on a separate mirror to reconstruct the served view. The SIGKILL fixture

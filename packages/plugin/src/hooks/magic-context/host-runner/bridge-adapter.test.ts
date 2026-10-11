@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { statSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { mkdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SubcClient } from "@cortexkit/subc-client";
+import { computeNormalizedHash } from "../../../features/magic-context/memory/normalize-hash";
+import { resolveProjectIdentity } from "../../../features/magic-context/memory/project-identity";
 import { runMigrations } from "../../../features/magic-context/migrations";
 import { createScheduler } from "../../../features/magic-context/scheduler";
 import * as storage from "../../../features/magic-context/storage-db";
@@ -10,6 +12,7 @@ import {
     initializeDatabase,
     LATEST_SUPPORTED_VERSION,
 } from "../../../features/magic-context/storage-db";
+import * as runnerStorage from "../../../features/magic-context/storage-host-runner";
 import { getOrCreateSessionMeta } from "../../../features/magic-context/storage-meta";
 import { createTagger } from "../../../features/magic-context/tagger";
 import {
@@ -24,6 +27,7 @@ import { setRawMessageProvider } from "../read-session-chunk";
 import { createRustModeTransform } from "../rust-mode-transform";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
+import { defaultCompactionMarkerStrategy } from "../transform-postprocess-phase";
 import { createOpenCodeProviderTransform } from "./opencode-adapter";
 
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -40,6 +44,10 @@ function message(id: string): MessageLike {
         },
         parts: [{ id: `${id}-text`, type: "text", text: id }],
     } as MessageLike;
+}
+function firstText(row: MessageLike | undefined): string | undefined {
+    const block = row?.parts[0] as { text?: unknown } | undefined;
+    return typeof block?.text === "string" ? block.text : undefined;
 }
 function fixture(version = LATEST_SUPPORTED_VERSION) {
     const scratch = createTestTempDir("mc-bridge-constructor-");
@@ -90,10 +98,23 @@ function canonicalRows(rows: MessageLike[]) {
     });
     cleanups.push(unregister);
 }
+function recordSnapshot(path: string) {
+    const db = new Database(path);
+    try {
+        return [
+            "host_runner_state",
+            "host_runner_entries",
+            "host_runner_ids",
+            "host_runner_views",
+        ].map((table) => db.prepare(`SELECT * FROM ${table} WHERE session_id='session'`).all());
+    } finally {
+        db.close();
+    }
+}
 function fakeModule() {
     const calls: Record<string, any>[] = [];
     const binds: any[] = [];
-    const close = spyOn({ close() {} }, "close");
+    const close = mock(() => {});
     let version = 1;
     let reply: ((wire: Record<string, any>) => unknown) | undefined;
     const answer = (wire: Record<string, any>) => {
@@ -181,6 +202,295 @@ function fakeModule() {
 }
 
 describe("supported bridge constructor", () => {
+    test("bridge commits view coverage without invoking the native raw-history marker writer", async () => {
+        const options = fixture();
+        const wire = fakeModule();
+        const rows = [message("first")];
+        canonicalRows(rows);
+        wire.setReply((call) => {
+            if (call.method !== "compaction.step") return;
+            const p = call.params;
+            return {
+                answer: "compaction_message",
+                request_id: p.request_id,
+                compaction: {
+                    compaction_id: "covered",
+                    version: 2,
+                    range: { from: 1, to: 2 },
+                    replacement: p.messages.map((entry: any) => entry.message),
+                },
+                coverage: { end_mid: "first", ordinal: 1 },
+            };
+        });
+        const marker = spyOn(defaultCompactionMarkerStrategy, "applyDeferred").mockImplementation(
+            () => {
+                throw new Error("Native marker would commit a second database");
+            },
+        );
+        cleanups.push(() => marker.mockRestore());
+        const adapter = await createBridgeAdapter(options);
+        cleanups.push(() => adapter.dispose());
+        const result = await adapter.run({ sessionId: "session", messages: rows, kind: "model" });
+        expect(firstText(result.messages[0])).toBe("first");
+        expect(marker).not.toHaveBeenCalled();
+        const db = new Database(options.dbPath);
+        try {
+            const view = db
+                .prepare(
+                    "SELECT coverage_json FROM host_runner_views WHERE session_id='session' ORDER BY version DESC LIMIT 1",
+                )
+                .get() as { coverage_json: string };
+            expect(JSON.parse(view.coverage_json)).toEqual({ end_mid: "first", ordinal: 1 });
+        } finally {
+            db.close();
+        }
+    });
+    test("ordinary pass budget rejects at five seconds with no late writes or observers and permits a clean retry", async () => {
+        const options = fixture();
+        const wire = fakeModule();
+        const rows = [message("first")];
+        canonicalRows(rows);
+        const adapter = await createBridgeAdapter(options);
+        cleanups.push(() => adapter.dispose());
+        await adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" });
+        const before = recordSnapshot(options.dbPath);
+        const outcomes: unknown[] = [];
+        adapter.onOutcome(async (...args) => {
+            outcomes.push(args);
+        });
+        let release!: (answer: unknown) => void;
+        let hooks = 0;
+        wire.setReply((call) => {
+            if (call.method !== "transform.hook") return;
+            const p = call.params;
+            return new Promise((resolve) => {
+                if (++hooks < 3)
+                    setTimeout(
+                        () =>
+                            resolve({
+                                answer: "ops",
+                                ops: [{ op: "prepend", block: 0, text: `§${p.subject_ordinal}§ ` }],
+                            }),
+                        1800,
+                    );
+                else release = resolve;
+            });
+        });
+        rows.push(message("second"), message("third"), message("fourth"));
+        const started = performance.now();
+        await expect(
+            adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" }),
+        ).rejects.toMatchObject({
+            code: "step_budget_exceeded",
+            budget_ms: 5000,
+            kind: "ordinary",
+        });
+        expect(performance.now() - started).toBeGreaterThanOrEqual(4900);
+        expect(performance.now() - started).toBeLessThan(6500);
+        expect(recordSnapshot(options.dbPath)).toEqual(before);
+        expect(outcomes).toEqual([]);
+        release({});
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(recordSnapshot(options.dbPath)).toEqual(before);
+        wire.setReply(undefined);
+        const retried = await adapter.run({
+            sessionId: "session",
+            messages: rows.slice(),
+            kind: "model",
+        });
+        expect(retried.kind).toBe("ordinary");
+        expect(firstText(retried.messages[1])).toBe("§2§ second");
+        expect(outcomes).toHaveLength(3);
+    });
+    test("rebuild budget survives five seconds and rejects at thirty without a served view", async () => {
+        const options = fixture();
+        const wire = fakeModule();
+        const rows = [message("first")];
+        canonicalRows(rows);
+        const adapter = await createBridgeAdapter(options);
+        cleanups.push(() => adapter.dispose());
+        await adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" });
+        const before = recordSnapshot(options.dbPath);
+        rows[0] = {
+            ...rows[0],
+            info: { ...rows[0]!.info, model: { providerID: "openai", modelID: "other" } },
+        } as MessageLike;
+        let release!: (answer: unknown) => void;
+        wire.setReply((call) =>
+            call.method === "compaction.step"
+                ? new Promise((resolve) => {
+                      release = resolve;
+                  })
+                : undefined,
+        );
+        let settled = false;
+        const started = performance.now();
+        const pass = adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" });
+        void pass.then(
+            () => {
+                settled = true;
+            },
+            () => {
+                settled = true;
+            },
+        );
+        await new Promise((resolve) => setTimeout(resolve, 5200));
+        expect(settled).toBe(false);
+        await expect(pass).rejects.toMatchObject({
+            code: "step_budget_exceeded",
+            budget_ms: 30000,
+            kind: "rebuild",
+        });
+        expect(performance.now() - started).toBeGreaterThanOrEqual(29900);
+        expect(performance.now() - started).toBeLessThan(32000);
+        expect(recordSnapshot(options.dbPath)).toEqual(before);
+        release({ answer: "noop", request_id: "late" });
+        wire.setReply(undefined);
+        const retried = await adapter.run({
+            sessionId: "session",
+            messages: rows.slice(),
+            kind: "model",
+        });
+        expect(retried.kind).toBe("rebuild");
+    }, 40000);
+    test("pre-commit cancel check prevents late writes when an atomic commit straddles the deadline", async () => {
+        const options = fixture();
+        fakeModule();
+        const rows = [message("first")];
+        canonicalRows(rows);
+        const adapter = await createBridgeAdapter(options);
+        cleanups.push(() => adapter.dispose());
+        await adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" });
+        const before = recordSnapshot(options.dbPath);
+        const original = runnerStorage.commitHostRunnerPass;
+        const delayed = spyOn(runnerStorage, "commitHostRunnerPass").mockImplementation(
+            (...args) => {
+                original(...args);
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5100);
+            },
+        );
+        cleanups.push(() => delayed.mockRestore());
+        const outcomes: unknown[] = [];
+        adapter.onOutcome(async (...args) => {
+            outcomes.push(args);
+        });
+        rows.push(message("second"));
+        await expect(
+            adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" }),
+        ).rejects.toMatchObject({ code: "step_budget_exceeded", kind: "ordinary" });
+        expect(delayed).toHaveBeenCalledTimes(1);
+        expect(recordSnapshot(options.dbPath)).toEqual(before);
+        expect(outcomes).toEqual([]);
+        delayed.mockRestore();
+        await adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" });
+        expect(outcomes).toHaveLength(1);
+    }, 10000);
+    test("committed observers do not delay run and failures do not poison the record", async () => {
+        const options = fixture();
+        fakeModule();
+        const rows = [message("first")];
+        canonicalRows(rows);
+        const adapter = await createBridgeAdapter(options);
+        cleanups.push(() => adapter.dispose());
+        await adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" });
+        let release!: () => void;
+        adapter.onOutcome(async () => {
+            await new Promise<void>((resolve) => {
+                release = resolve;
+            });
+            throw new Error("observer offline");
+        });
+        rows.push(message("second"));
+        const result = await adapter.run({
+            sessionId: "session",
+            messages: rows.slice(),
+            kind: "model",
+        });
+        expect(firstText(result.messages[1])).toBe("§2§ second");
+        expect(release).toBeFunction();
+        release();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(
+            (await adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" }))
+                .messages,
+        ).toEqual(result.messages);
+    });
+    for (const v2 of [false, true]) {
+        test(`preserves host project identity and memory head before provider rendering (${v2 ? "v2" : "v1"})`, async () => {
+            const options = fixture();
+            const target = join(options.storageDir, "target");
+            mkdirSync(target);
+            const link = join(options.storageDir, "project-link");
+            symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+            options.projectRoot = `${link}/`;
+            if (v2) options.openCodeClient = { session: { hook: async () => {} } };
+            const identity = resolveProjectIdentity(link);
+            expect(identity).not.toBe(resolveProjectIdentity(realpathSync(link)));
+            const db = new Database(options.dbPath);
+            cleanups.push(() => {
+                db.close();
+            });
+            const text = "The bridge preserves the original project memory pool.";
+            const inserted = db
+                .prepare(
+                    "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'ARCHITECTURE', ?, ?, 0, 0, 0, 0)",
+                )
+                .run(identity, text, computeNormalizedHash(text));
+            const wire = fakeModule();
+            wire.setReply((call) => {
+                if (call.method !== "compaction.step") return;
+                const p = call.params;
+                const owner = db
+                    .prepare(
+                        "SELECT project_path, harness FROM session_projects WHERE session_id=?",
+                    )
+                    .get("session") as { project_path: string; harness: string } | null;
+                expect(owner).toEqual({
+                    project_path: identity,
+                    harness: v2 ? "opencode2" : "opencode",
+                });
+                const fact = db
+                    .prepare(
+                        "SELECT content FROM memories WHERE project_path=? AND status='active'",
+                    )
+                    .get(owner?.project_path ?? "") as { content: string } | null;
+                const head = (body: string) => ({
+                    info: { role: "user" },
+                    parts: [{ type: "text", text: body }],
+                });
+                return {
+                    answer: "compaction_message",
+                    request_id: p.request_id,
+                    compaction: {
+                        compaction_id: "head",
+                        version: 2,
+                        range: { from: 1, to: 2 },
+                        replacement: [
+                            head(`<project-memory>\n${fact?.content ?? ""}\n</project-memory>`),
+                            head("<memory-updates></memory-updates>"),
+                            ...p.messages.map((entry: any) => entry.message),
+                        ],
+                    },
+                };
+            });
+            const rows = [message("first")];
+            canonicalRows(rows);
+            const adapter = await createBridgeAdapter(options);
+            cleanups.push(() => adapter.dispose());
+            const { messages: view } = await adapter.run({
+                sessionId: "session",
+                messages: rows,
+                kind: "model",
+            });
+            expect(view[0]?.info.role).toBe("user");
+            expect(firstText(view[0])).toContain(text);
+            expect(firstText(view[1])).toBe("<memory-updates></memory-updates>");
+            expect(
+                wire.calls.find((call) => call.method === "state_sync" && call.acked_watermarks)
+                    ?.acked_watermarks.memory_id,
+            ).toBe(Number(inserted.lastInsertRowid));
+        });
+    }
     test("opens current fence with normal storage policies and disposes owned handles once", async () => {
         const options = fixture();
         const wire = fakeModule();
@@ -334,8 +644,10 @@ describe("supported bridge constructor", () => {
             messages: rows.slice(),
             kind: "model",
         });
-        expect(first[0]?.parts[0]?.text).toBe("first");
-        expect(served[1]?.parts[0]?.text).toBe("§2§ second");
+        expect(first.kind).toBe("bootstrap");
+        expect(served.kind).toBe("ordinary");
+        expect(firstText(first.messages[0])).toBe("first");
+        expect(firstText(served.messages[1])).toBe("§2§ second");
         expect(outcomes).toEqual([
             [
                 "second",
@@ -351,7 +663,9 @@ describe("supported bridge constructor", () => {
         const db = new Database(":memory:");
         initializeDatabase(db);
         runMigrations(db);
-        cleanups.push(() => db.close());
+        cleanups.push(() => {
+            db.close();
+        });
         const transport = new SubcModuleTransport(
             options.connectionFile,
             undefined,
@@ -391,7 +705,7 @@ describe("supported bridge constructor", () => {
         const out = { messages: [] as unknown[] };
         await native.run("session", rows.slice(0, 1), out, getOrCreateSessionMeta(db, "session"));
         await native.run("session", rows.slice(), out, getOrCreateSessionMeta(db, "session"));
-        expect(served).toEqual(out.messages);
+        expect(served.messages as unknown[]).toEqual(out.messages);
     });
     test("refuses bootstrap decline instead of running a legacy full request", async () => {
         const options = fixture();
@@ -489,7 +803,11 @@ describe("supported bridge constructor", () => {
         cleanups.push(() => adapter.dispose());
         const view = await adapter.run({ sessionId: "session", messages: rows, kind: "model" });
         const identity = { model: "openai/gpt-5.6", envelope: "system-hash-1:tools-hash-1" };
-        adapter.recordProviderUsage("session", { ...identity, messages: view, inputTokens: 100 });
+        adapter.recordProviderUsage("session", {
+            ...identity,
+            messages: view.messages,
+            inputTokens: 100,
+        });
         const input = { ...identity, messages: rows, contextWindow: 1000 };
         expect(adapter.isFallbackAdmissible("session", input).admissible).toBe(true);
         for (const change of [
