@@ -59,7 +59,11 @@ import {
     type RunnerRecord,
     type Subject,
     scanWindow,
+    sourceDigest,
 } from "./record";
+
+export type { FallbackAdmissibility, FallbackInputs } from "./fallback-admissibility";
+export { isFallbackAdmissible, recordProviderUsage } from "./fallback-admissibility";
 
 type Legacy = ReturnType<typeof createRustModeTransform>;
 type RecordState = RunnerRecord<MessageLike, FrozenProviderPlan>;
@@ -313,6 +317,8 @@ interface Metadata {
     switchGeneration?: number;
     reentry?: boolean;
     fullRequestNamespace?: string;
+    sourceDigests?: [string, string][];
+    measuredUsage?: RecordState["measured_usage"];
 }
 interface Session {
     record: RecordState;
@@ -412,7 +418,12 @@ export function createOpenCodeProviderTransform(
             next_ordinal: r.next_ordinal,
             cursor: r.after_ordinal,
             served_through_ordinal: r.served_through_ordinal,
-            setup_json: JSON.stringify({ ...s.metadata, gap: r.history_gap_from }),
+            setup_json: JSON.stringify({
+                ...s.metadata,
+                gap: r.history_gap_from,
+                sourceDigests: [...r.source_digests],
+                measuredUsage: r.measured_usage,
+            }),
             unserved_json: JSON.stringify(r.unserved_subjects),
             ordinal_divergence: r.ordinal_divergence,
             last_not_applied_json: r.last_not_applied ? JSON.stringify(r.last_not_applied) : null,
@@ -482,6 +493,8 @@ export function createOpenCodeProviderTransform(
             ordinal_divergence: stored.state.ordinal_divergence,
             ancestry: JSON.parse(stored.state.ancestry_json),
             ids: stored.ids,
+            source_digests: new Map(metadata.sourceDigests ?? []),
+            measured_usage: metadata.measuredUsage,
             elided: stored.elided,
             unserved_subjects: JSON.parse(stored.state.unserved_json),
             pipeline_exit: stored.state.pipeline_exit_json
@@ -505,6 +518,10 @@ export function createOpenCodeProviderTransform(
             };
         }
         record.entries = stored.entries.map((e) => {
+            // Old stores retain JSON for uncompressed messages. Deleted source bodies
+            // cannot reconstruct the hashes needed to validate a compacted range.
+            if (!record.source_digests.has(e.message_id))
+                record.source_digests.set(e.message_id, sourceDigest(e.ingest_json));
             const result = hydrateEntry(
                 {
                     id: e.message_id,

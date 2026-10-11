@@ -4,19 +4,18 @@ import { resolveTrustedContextLimit } from "./event-resolvers";
 import {
     estimateAppendedWireTokens,
     estimateFinalWireInputTokens,
-    wireContentBytes,
 } from "./final-wire-token-estimate";
+import { type LkgReplayMeasure, measureLkgReplay } from "./lkg-fit-measure";
 import { measuredLkgPrefix } from "./lkg-measured-request";
 import { getSlot } from "./lkg-slot";
 import type { MessageLike } from "./transform-operations";
 
-/**
- * The local tokenizer is telemetry-grade and can materially undercount a new
- * provider tokenizer. Four bytes of request content per context token is an
- * independent, conservative risk budget for sending an array the transform did
- * not just build (a last-known-good replay or the raw full-history fallback).
- */
-export const RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN = 4;
+export {
+    type LkgReplayMeasure,
+    measureLkgReplay,
+    RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN,
+} from "./lkg-fit-measure";
+
 type ReplayModel = { providerID: string; modelID: string } | null | undefined;
 
 /**
@@ -44,73 +43,6 @@ export function lkgReplayLimit(args: {
     if (trusted !== undefined && trusted > 0) return trusted;
     const detected = getOverflowState(db, sessionId, args.modelKey).detectedContextLimit;
     return detected > 0 ? detected : undefined;
-}
-
-/**
- * Where a replay candidate stands against a limit, with what the measurement saw:
- * the wire byte proxy (null when it could not be computed), whether the token
- * estimator ran, and whether its estimate was trusted.
- */
-export type LkgReplayMeasure = (
-    | { fit: "under"; tokens: number }
-    | { fit: "over"; tokens: number | null; proxyTokens: number | null }
-    | { fit: "unproven"; tokens: number | null }
-) & {
-    proxy: { bytes: number; aborted: boolean } | null;
-    estimatorRan: boolean;
-    trusted: boolean;
-};
-
-/**
- * Measure `messages` against `limit`. Over when the four-bytes-per-token proxy or
- * a trusted token estimate exceeds the limit (the proxy runs first, so an array
- * the proxy already proves over is never tokenized); under only when the proxy is
- * under and a trusted, finite, positive estimate is at or under the limit;
- * unproven otherwise (the estimate is untrusted, unusable or failed).
- *
- * The proxy counts only what the provider request carries (`wireContentBytes`):
- * OpenCode keeps fields for itself, such as an edit tool's whole file before and
- * after the edit, and a base64 image is billed by its size, so a byte count of
- * the whole stored messages would refuse replays that fit.
- */
-export function measureLkgReplay(args: {
-    messages: readonly MessageLike[];
-    limit: number;
-    estimate: () => ReturnType<typeof estimateFinalWireInputTokens>;
-    /** Provider-measured input of this exact prefix; `messages` is only its tail. */
-    measuredInputTokens?: number;
-}): LkgReplayMeasure {
-    const baseline = args.measuredInputTokens ?? 0;
-    const tailLimit = Math.max(0, args.limit - baseline);
-    const proxy = wireContentBytes(
-        args.messages,
-        tailLimit * RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN,
-        RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN,
-    );
-    const skipped = { proxy, estimatorRan: false, trusted: false };
-    if (proxy === null) return { fit: "unproven", tokens: null, ...skipped };
-    const proxyTokens = baseline + Math.ceil(proxy.bytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN);
-    if (proxy.aborted || proxyTokens > args.limit) {
-        return { fit: "over", tokens: null, proxyTokens, ...skipped };
-    }
-    let estimate: ReturnType<typeof estimateFinalWireInputTokens>;
-    try {
-        estimate = args.estimate();
-    } catch {
-        return { fit: "unproven", tokens: null, ...skipped };
-    }
-    const seen = { proxy, estimatorRan: true, trusted: estimate.trusted };
-    const tokens = baseline + estimate.tokens;
-    if (!estimate.trusted || !Number.isFinite(tokens) || tokens <= 0 || estimate.tokens < 0) {
-        return {
-            fit: "unproven",
-            tokens: Number.isFinite(estimate.tokens) ? estimate.tokens : null,
-            ...seen,
-        };
-    }
-    return tokens > args.limit
-        ? { fit: "over", tokens, proxyTokens, ...seen }
-        : { fit: "under", tokens, ...seen };
 }
 
 export type LkgReplayFit =

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Deterministic runner-record transitions. There is no transport or storage here.
  * The adapter persists each transition before calling its commit function, and
@@ -82,6 +84,10 @@ export interface RunnerRecord<M, P = unknown> {
     view: View<M>;
     entries: Entry<M>[];
     ids: Map<string, number>;
+    /** Hashes of the original input JSON remain after compaction deletes its message bodies. */
+    source_digests: Map<string, string>;
+    /** Provider input counts are bound to the sent messages, selected model, system text and tools. */
+    measured_usage?: ProviderMeasuredUsage;
     elided: Set<string>;
     hole_ids: Set<string>;
     unserved_subjects: Subject[];
@@ -97,6 +103,20 @@ export interface RunnerRecord<M, P = unknown> {
     pipeline_exit?: { reason: ExitReason; reseed_full_request: boolean };
     history_gap_from?: number;
     counters: RecordCounters;
+}
+
+export interface ProviderMeasuredUsage {
+    input_tokens: number;
+    model: string;
+    envelope: string;
+    lineage_id: string;
+    view_version: number;
+    message_digests: readonly string[];
+}
+
+/** Hash the original input JSON so transformed output cannot hide later source edits. */
+export function sourceDigest(ingest: string): string {
+    return createHash("sha256").update(ingest).digest("hex");
 }
 
 function ordinal(value: number): boolean {
@@ -130,6 +150,7 @@ export function createRecord<M, P>(input: {
         view: { ...input.initial, state: "applied" },
         entries: [],
         ids: new Map(),
+        source_digests: new Map(),
         elided: new Set(),
         hole_ids: new Set(),
         unserved_subjects: [],
@@ -274,6 +295,7 @@ export function descend<M>(record: RunnerRecord<M>, through: number, lineage: st
     for (const [id, held] of record.ids) {
         if (held > through) {
             record.ids.delete(id);
+            record.source_digests.delete(id);
             record.hole_ids.delete(id);
         }
     }
@@ -465,6 +487,7 @@ export function commitEntries<M>(
         if ("exit" in admission) continue;
         record.entries.push(admission.entry);
         record.ids.set(admission.entry.id, admission.entry.ordinal);
+        record.source_digests.set(admission.entry.id, sourceDigest(admission.entry.ingest));
         record.ordinal_divergence += Number(admission.entry.race);
         for (const subject of admission.unserved_subjects) {
             if (!record.unserved_subjects.some((held) => sameSubject(held, subject)))
