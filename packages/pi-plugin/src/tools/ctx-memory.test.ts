@@ -202,8 +202,9 @@ describe("createCtxMemoryTool", () => {
 	});
 
 	// Curate is proposals only and a dreamer save is an automated insert, exactly as
-	// in OpenCode: no dreamer edit changes a row, writes a mutation-log row or
-	// records an agent fragment, so none of them can reach a busting SOFT.
+	// in OpenCode: no dreamer update, merge or archive changes a row, and no dreamer
+	// action writes a mutation-log row or records an agent fragment, so no dreamer
+	// action can reach a busting SOFT.
 	it("routes dreamer update, merge and archive to proposals and writes no log row or fragment", async () => {
 		const db = createTestDb();
 		try {

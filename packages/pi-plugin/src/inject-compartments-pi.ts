@@ -432,7 +432,7 @@ function safeGetActiveUserMemoriesPi(db: ContextDatabase): UserMemory[] {
 export interface PiM0M1State {
 	/** Test hook before writer admission, before any m[1] render reads. */
 	beforeCacheCommitForTest?: () => void;
-	/** Runs after a HARD fold's frozen read and before its mural resolves. */
+	/** Runs after a HARD fold reads its m[0] inputs and before its mural resolves. */
 	afterM0InputsReadForTest?: () => void;
 	/** These delivery fields are scoped to one context pass, never persisted. */
 	freezePrefixForPass?: boolean;
