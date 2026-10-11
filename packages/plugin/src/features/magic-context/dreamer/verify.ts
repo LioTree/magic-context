@@ -17,7 +17,6 @@ import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import {
-    archiveMemory,
     clearMemoryVerifications,
     getMemoryById,
     hasMemoryClassifiedAtColumn,
@@ -29,7 +28,10 @@ import {
     recordMemoryVerifications,
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
-import { queueMemoryMutation } from "../storage-memory-mutation-log";
+import {
+    proposeMemoryMutation,
+    recordAutomatedMemoryEdit,
+} from "../memory/lifecycle-applier";
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
 import { readFailedChildMessages } from "./failed-invocation-evidence";
@@ -70,9 +72,10 @@ import {
  * SMALLER than map because deeper reads replay more prompt tokens. No max-turns;
  * a batch that fails to emit a manifest banks nothing and is retried next run.
  *
- * Apply is cache-NEUTRAL: update/archive route through queueMemoryMutation,
- * never bumping the project memory epoch — the dreamer
- * must never bust the prompt cache.
+ * Apply is cache-NEUTRAL: an update changes the row with undo history and no
+ * mutation-log row, an archive becomes a pending proposal, and neither bumps the
+ * project memory epoch. Prompts see an update only at their next natural HARD
+ * fold; the dreamer must never bust the prompt cache.
  */
 
 // A 14-day Gemini fit predicts ~1.73M prompt tokens for 20 memories, including
@@ -534,12 +537,12 @@ async function verifyOneBatch(
  * remain silent for the per-memory gate to select next run; unknown ids are never written.
  * - verified: re-record the (normalized) backing files with verified_at = now
  *   (banks the per-memory verify progress).
- * - update: rewrite the memory content via the cache-neutral mutation log, then
- *   clear old file mappings and embeddings so the new content is mapped and
- *   verified again next cycle.
- * - archive: archive + queue an archive mutation (m[1] delta). Skipped when the
- *   memory is no longer primary-mutable (already archived/superseded), so a stale
- *   manifest can't fight a concurrent change.
+ * - update: rewrite the memory content with an undo-history row (no mutation-log
+ *   row), then clear old file mappings and embeddings so the new content is mapped
+ *   and verified again next cycle.
+ * - archive: record a pending archive proposal; the row stays live. Skipped when
+ *   the memory is no longer primary-mutable (already archived/superseded), so a
+ *   stale manifest can't fight a concurrent change.
  * - skip/refusal: count the verdict for progress without changing the memory.
  * Directive-shaped PROJECT_RULES and unsafe content-loss rewrites are refused
  * before either the local or MODULE authority write path is built.
@@ -743,21 +746,26 @@ async function applyParsedVerifyManifest(
                 if (verifiedHead) recordVerifiedCommit(args.db, memory, now, verifiedHead);
                 verified += 1;
             } else if (w.kind === "update") {
+                // A gated content correction applies directly with undo history. It
+                // writes no mutation-log row, so it reaches prompts only at the next
+                // natural HARD fold.
                 rewriteMemoryContent(args.db, memory, w.content, w.hash);
-                queueMemoryMutation(args.db, {
-                    projectPath: args.projectIdentity,
-                    mutationType: "update",
-                    targetMemoryId: w.id,
-                    category: memory.category,
-                    newContent: w.content,
+                recordAutomatedMemoryEdit(args.db, {
+                    writer: "verify",
+                    before: memory,
+                    reason: "verify_update",
                 });
                 updated += 1;
             } else {
-                archiveMemory(args.db, w.id, w.reason);
-                queueMemoryMutation(args.db, {
+                // "The files refute this memory" is a model-judged retirement, so it
+                // waits for review instead of archiving the row.
+                proposeMemoryMutation(args.db, {
                     projectPath: args.projectIdentity,
-                    mutationType: "archive",
-                    targetMemoryId: w.id,
+                    key: `verify-archive:${w.id}:${memory.normalizedHash}`,
+                    writer: "verify",
+                    operation: "archive",
+                    targetIds: [w.id],
+                    proposal: { reason: w.reason },
                 });
                 archived += 1;
             }

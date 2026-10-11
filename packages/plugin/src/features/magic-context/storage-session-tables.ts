@@ -84,6 +84,7 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
     { table: "host_runner_state", harnessScoped: true },
     { table: "memory_check_attempts", harnessScoped: true },
     { table: "memory_stage_attempts", harnessScoped: true },
+    { table: "memory_agent_fragments", harnessScoped: true },
     { table: "memory_applied_rows", harnessScoped: true },
     { table: "memory_applied_snapshots", harnessScoped: true },
 ];

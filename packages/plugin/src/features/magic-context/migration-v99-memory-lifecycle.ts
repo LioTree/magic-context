@@ -10,11 +10,12 @@ export function installMemoryLifecycleSchema(db: Database): void {
         ensureColumn(db, "memories", "verify_commit", "TEXT");
     }
     if (db.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_mutation_log'").get()) {
-        ensureColumn(
-            db,
-            "memory_mutation_log",
-            "adoption_class",
-            "TEXT NOT NULL DEFAULT 'live' CHECK(adoption_class IN ('live','deferred'))",
+        // The applier operation an agent multi-row change (merge, batch archive) belongs
+        // to, so its rows are recognisable as one all-or-nothing change. NULL for every
+        // other row, including rows written before this column existed.
+        ensureColumn(db, "memory_mutation_log", "operation_id", "TEXT");
+        db.exec(
+            "CREATE INDEX IF NOT EXISTS idx_memory_mutation_log_operation ON memory_mutation_log(project_path, operation_id, id)",
         );
     }
     db.exec(`
@@ -185,23 +186,12 @@ export function installMemoryLifecycleSchema(db: Database): void {
             session_id TEXT NOT NULL,
             harness TEXT NOT NULL DEFAULT 'opencode',
             project_path TEXT NOT NULL,
-            applied_epoch INTEGER NOT NULL,
-            applied_mutation_cursor INTEGER NOT NULL,
-            max_memory_id INTEGER NOT NULL,
             generation INTEGER NOT NULL,
-            source_generation INTEGER NOT NULL,
-            m0_bytes TEXT NOT NULL,
-            m1_bytes TEXT NOT NULL,
-            mural_payload TEXT NOT NULL,
-            mural_hash TEXT NOT NULL,
-            applied_revisions_json TEXT NOT NULL,
-            selection_metadata_json TEXT NOT NULL,
-            activity_expiry_clocks_json TEXT NOT NULL,
-            policy_budget_identity_json TEXT NOT NULL,
-            text_cue_search_manifest_json TEXT NOT NULL,
-            admission_ledger_json TEXT NOT NULL,
-            correction_receipts_json TEXT NOT NULL,
-            correction_cursors_json TEXT NOT NULL,
+            m0_sha256 TEXT NOT NULL,
+            hard_memory_block TEXT NOT NULL,
+            fragment_watermark INTEGER NOT NULL,
+            committed_fragments_json TEXT NOT NULL,
+            legacy INTEGER NOT NULL DEFAULT 0 CHECK(legacy IN (0,1)),
             PRIMARY KEY(session_id,harness,project_path)
         );
         CREATE TABLE IF NOT EXISTS memory_applied_rows (
@@ -214,6 +204,20 @@ export function installMemoryLifecycleSchema(db: Database): void {
             projected_metadata_json TEXT NOT NULL,
             PRIMARY KEY(session_id,harness,project_path,memory_id)
         );
+        CREATE TABLE IF NOT EXISTS memory_agent_fragments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            harness TEXT NOT NULL DEFAULT 'opencode',
+            project_path TEXT NOT NULL,
+            operation_key TEXT NOT NULL,
+            memory_ids_json TEXT NOT NULL,
+            current_id INTEGER,
+            lines TEXT NOT NULL,
+            visible_texts_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(session_id,harness,operation_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_agent_fragments_session ON memory_agent_fragments(session_id,harness,project_path,id);
     `);
     ensureColumn(db, "memory_history", "after_text", "TEXT");
     ensureColumn(db, "memory_history", "before_json", "TEXT");

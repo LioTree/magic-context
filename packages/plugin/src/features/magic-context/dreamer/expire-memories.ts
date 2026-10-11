@@ -1,7 +1,7 @@
 import type { Database } from "../../../shared/sqlite";
 
-import { archiveMemory } from "../memory";
-import { queueMemoryMutation } from "../storage-memory-mutation-log";
+import { archiveMemory, getMemoryById } from "../memory";
+import { recordAutomatedMemoryEdit } from "../memory/lifecycle-applier";
 import { type LeaseAcquisition, leaseOwnershipMatches, runLeaseGuardedWrite } from "./lease";
 import {
     DreamerModuleFailureError,
@@ -159,13 +159,17 @@ export async function archiveExpiredMemories(args: {
             args.now,
         ).filter((id) => selectedIds.has(id));
         for (const id of stillExpired) {
+            // Expiry was declared when the memory was written, so archiving it is a
+            // grounded automated edit: undo history, no mutation-log row. Prompts
+            // drop the row at their next natural HARD fold.
+            const before = getMemoryById(args.db, id);
             archiveMemory(args.db, id, EXPIRED_ARCHIVE_REASON);
-            queueMemoryMutation(args.db, {
-                projectPath: args.projectIdentity,
-                mutationType: "archive",
-                targetMemoryId: id,
-                queuedAt: args.now,
-            });
+            if (before)
+                recordAutomatedMemoryEdit(args.db, {
+                    writer: "expire",
+                    before,
+                    reason: EXPIRED_ARCHIVE_REASON,
+                });
         }
         return stillExpired.length;
     });

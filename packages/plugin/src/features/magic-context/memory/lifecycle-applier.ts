@@ -3,6 +3,13 @@ import type { Database } from "../../../shared/sqlite";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
 import { CATEGORY_DEFAULT_TTL } from "./constants";
 import { embedTextForProject } from "./embedding";
+import {
+    recordAgentFragment,
+    renderAddedFragmentLine,
+    renderRemovedFragmentLine,
+    renderSupersededFragmentLine,
+    renderUpdatedFragmentLine,
+} from "./agent-fragments";
 import { invalidateMemory } from "./embedding-cache";
 import { checkMemoryRevision } from "./lifecycle-check-ledger";
 import { MAX_STAGE2_ATTEMPTS } from "./lifecycle-constants";
@@ -56,6 +63,8 @@ export interface AdmissionRequest {
     conflictTargetId?: number;
     factId?: number;
     classificationAnchor?: { toolCallPartId: string; saveOrdinal: number };
+    /** Harness of `input.sourceSessionId`, for an agent save's m[1] fragment. */
+    sourceHarness?: string;
 }
 export function resolveExpiresAt(category: MemoryInput["category"]): number | null {
     const ttl = CATEGORY_DEFAULT_TTL[category];
@@ -203,6 +212,19 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
                 });
             }
             if (target) linkConflict(db, request.key, memory.id, target.id);
+            // An agent's own save surfaces in its session's m[1] as a fragment; historian
+            // admissions are automated and wait for the next HARD fold.
+            if (request.operation === "agent_save" && !match && request.input.sourceSessionId)
+                recordAgentFragment(db, {
+                    sessionId: request.input.sourceSessionId,
+                    harness: request.sourceHarness,
+                    projectPath: request.input.projectPath,
+                    operationKey: request.key,
+                    memoryIds: [memory.id],
+                    currentId: memory.id,
+                    lines: [renderAddedFragmentLine(memory.id, memory.category, memory.content)],
+                    visibleTexts: [{ id: memory.id, text: memory.content }],
+                });
             if (request.operation === "agent_save" && request.classificationAnchor) {
                 db.prepare(
                     "INSERT OR IGNORE INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal) SELECT project_path,id,revision,?,?,? FROM memories WHERE id=?",
@@ -228,7 +250,8 @@ export interface ProposalRequest {
     projectPath: string;
     sourceSessionId?: string;
     key?: string;
-    writer: "curate";
+    /** Automated writers whose retirements and ungrounded edits wait for review. */
+    writer: "curate" | "verify";
     operation: "update" | "archive" | "merge";
     targetIds: number[];
     proposal: unknown;
@@ -263,6 +286,42 @@ export function proposeMemoryMutation(db: Database, request: ProposalRequest): A
         .immediate();
 }
 
+/**
+ * Record an automated writer's direct edit of one memory (a verify content
+ * correction, an expiry archive) as undo history. The caller has already changed
+ * the row inside the same transaction. Automated edits write no mutation-log row
+ * and no agent fragment: they reach a prompt only at the next natural HARD fold.
+ */
+export function recordAutomatedMemoryEdit(
+    db: Database,
+    input: {
+        writer: "verify" | "expire";
+        before: Memory;
+        reason: string;
+    },
+): void {
+    const revision = getMemoryRevision(db, input.before.id);
+    if (revision === null) return;
+    const after = getMemoryById(db, input.before.id);
+    const key = `${input.writer}:${input.before.id}:${revision}`;
+    db.prepare(
+        "INSERT OR IGNORE INTO memory_history(memory_id,revision,previous_text,after_text,before_json,after_json,applied_at,reason,evidence_json,source_ids_json,decision_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+    ).run(
+        input.before.id,
+        revision,
+        input.before.content,
+        after?.content ?? input.before.content,
+        JSON.stringify(input.before),
+        JSON.stringify(after),
+        Date.now(),
+        input.reason,
+        "[]",
+        JSON.stringify([input.before.id]),
+        key,
+    );
+    db.prepare("UPDATE memories SET revision=revision+1 WHERE id=?").run(input.before.id);
+}
+
 export interface AgentMemoryMutation {
     key: string;
     projectPath: string;
@@ -272,6 +331,8 @@ export interface AgentMemoryMutation {
     category?: MemoryInput["category"];
     reason?: string;
     sourceSessionId: string;
+    /** The harness of that session; defaults to this process's harness. */
+    sourceHarness?: string;
 }
 export class MemoryContentDuplicateError extends Error {
     constructor(readonly memoryId: number) {
@@ -304,6 +365,59 @@ function clearAgentMutationDerivedData(db: Database, memory: Memory): void {
     if (db.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_verifications'").get())
         db.prepare("DELETE FROM memory_verifications WHERE memory_id=?").run(memory.id);
     invalidateMemory(memory.projectPath, memory.id);
+}
+
+/**
+ * The m[1] lines an agent operation shows its own session (see agent-fragments.ts).
+ * A merge shows every superseded source and, when the survivor is new or its text
+ * changed, the survivor's text; an archive shows each removal.
+ */
+function agentMutationFragment(
+    operation: AgentMemoryMutation["operation"],
+    sources: readonly Memory[],
+    canonical: Memory | null,
+    survivorExisted: boolean,
+    category: string,
+    finalText: string | undefined,
+): {
+    memoryIds: number[];
+    currentId: number | null;
+    lines: string[];
+    visibleTexts: Array<{ id: number; text: string }>;
+} {
+    if (operation === "archive")
+        return {
+            memoryIds: sources.map((source) => source.id),
+            currentId: null,
+            lines: sources.map((source) => renderRemovedFragmentLine(source.id)),
+            visibleTexts: [],
+        };
+    if (!canonical || finalText === undefined)
+        return { memoryIds: [], currentId: null, lines: [], visibleTexts: [] };
+    if (operation === "update")
+        return {
+            memoryIds: [canonical.id],
+            currentId: canonical.id,
+            lines: [renderUpdatedFragmentLine(canonical.id, category, finalText)],
+            visibleTexts: [{ id: canonical.id, text: finalText }],
+        };
+    const lines = sources
+        .filter((source) => source.id !== canonical.id)
+        .map((source) => renderSupersededFragmentLine(source.id, canonical.id));
+    const original = sources.find((source) => source.id === canonical.id);
+    const survivorChanged = !survivorExisted || original?.content !== finalText;
+    if (survivorChanged)
+        lines.push(
+            survivorExisted && original
+                ? renderUpdatedFragmentLine(canonical.id, category, finalText)
+                : renderAddedFragmentLine(canonical.id, category, finalText),
+        );
+    return {
+        memoryIds: [...sources.map((source) => source.id).filter((id) => id !== canonical.id), canonical.id],
+        currentId: canonical.id,
+        lines,
+        visibleTexts: survivorChanged ? [{ id: canonical.id, text: finalText }] : [],
+    };
 }
 
 /** Agent tool calls authorize immediate changes; automated curation remains a proposal. */
@@ -405,6 +519,7 @@ export function applyAgentMemoryMutation(
                         projectPath: normalizeStoredProjectPath(source.projectPath),
                         mutationType: "archive",
                         targetMemoryId: source.id,
+                        operationId: request.key,
                     });
                 }
             } else {
@@ -427,6 +542,7 @@ export function applyAgentMemoryMutation(
                         targetMemoryId: canonical.id,
                         category,
                         newContent: content!,
+                        operationId: request.key,
                     });
                 }
                 const mergedFrom = new Set(sources.map((source) => source.id));
@@ -449,6 +565,7 @@ export function applyAgentMemoryMutation(
                             mutationType: "superseded",
                             targetMemoryId: source.id,
                             supersededById: canonical.id,
+                            operationId: request.key,
                         });
                         supersededIds.push(source.id);
                     }
@@ -486,6 +603,20 @@ export function applyAgentMemoryMutation(
                     request.key,
                 );
             }
+            recordAgentFragment(db, {
+                sessionId: request.sourceSessionId,
+                harness: request.sourceHarness,
+                projectPath: normalizeStoredProjectPath(request.projectPath),
+                operationKey: request.key,
+                ...agentMutationFragment(
+                    request.operation,
+                    sources,
+                    canonical,
+                    duplicate !== null,
+                    category,
+                    content,
+                ),
+            });
             const receipt = record({
                 state: "applied",
                 reason: request.operation,
@@ -501,8 +632,10 @@ export function applyAgentMemoryMutation(
         .immediate();
 }
 
-// Before edits can apply, each renderer must replay the memory bytes it already served.
-// Reading new canonical text on a deferred pass would silently change the cached prompt.
+// Historian revisions stay off until the historian's second turn is wired to call this.
+// When on, a revision is an automated edit: it changes canonical rows and writes history,
+// but no mutation-log row and no agent fragment, so it reaches a prompt only at that
+// session's next natural HARD fold.
 const MEMORY_PROJECTION_READY = false;
 export async function applyHistorianRevision(
     db: Database,
@@ -627,6 +760,10 @@ function resolveRevisionFailure(
         adoptionClass: memoryAdoptionClass(request.operation),
     });
 }
+/**
+ * Commit a gated historian revision. Automated edits write no mutation-log row:
+ * nothing between HARD folds renders them (see agent-fragments.ts).
+ */
 function commitMemoryRevision(
     db: Database,
     decision: RevisionDecision,
@@ -681,16 +818,6 @@ function commitMemoryRevision(
                 computeNormalizedHash(decision.finalText),
             );
             db.prepare("UPDATE memories SET revision=revision+1 WHERE id=?").run(source.id);
-            const mutation = queueMemoryMutation(db, {
-                projectPath: decision.projectPath,
-                mutationType: "update",
-                targetMemoryId: source.id,
-                category: survivor.category,
-                newContent: decision.finalText,
-            });
-            db.prepare("UPDATE memory_mutation_log SET adoption_class='live' WHERE id=?").run(
-                mutation.id,
-            );
         } else {
             archiveMemory(db, source.id, decision.action);
             db.prepare("DELETE FROM memory_embeddings WHERE memory_id=?").run(source.id);
@@ -700,15 +827,6 @@ function commitMemoryRevision(
             db.prepare(
                 "INSERT INTO memory_successor_links(source_id,successor_id,decision_key) VALUES(?,?,?)",
             ).run(source.id, survivorId, decision.key);
-            const mutation = queueMemoryMutation(db, {
-                projectPath: decision.projectPath,
-                mutationType: "superseded",
-                targetMemoryId: source.id,
-                supersededById: survivorId,
-            });
-            db.prepare("UPDATE memory_mutation_log SET adoption_class='live' WHERE id=?").run(
-                mutation.id,
-            );
         }
     }
     for (const clause of splitMemoryClauses(decision.finalText)) {

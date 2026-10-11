@@ -22,8 +22,30 @@ import {
     getMemoriesByProjects,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
+import {
+    loadAgentFragmentsAfter,
+    maxAgentFragmentId,
+    renderStaleFragmentMarker,
+} from "../../features/magic-context/memory/agent-fragments";
+import {
+    type AppliedProjection,
+    clearServedRecoveryTexts,
+    hasAppliedSnapshot,
+    readAppliedProjection,
+    readFullyVisibleMemoryIds,
+    readMemoryRevisions,
+    readServedTextVisibleMemoryIds,
+    recordServedRecoveryTexts,
+    servedRecoveryTextsFor,
+    writeHardProjection,
+    writeSoftProjection,
+} from "../../features/magic-context/memory/applied-projection";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
-import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
+import {
+    type MuralPool,
+    type MuralWireOptions,
+    readMuralPool,
+} from "../../features/magic-context/mural/resolve-mural";
 import { isNoContentCompartment } from "../../features/magic-context/no-content-compartment";
 import {
     GLOBAL_USER_PROFILE_PROJECT_PATH,
@@ -215,31 +237,52 @@ function findVisibleReanchorIndex(
 }
 
 /**
- * Return the set of project-memory ids currently rendered in the cached
- * m[0]+m[1] prompt pair for this session, if any. Used by ctx_search
- * to hard-filter memories the agent already sees in context — retrieving
- * them from search wastes tokens and pushes high-signal raw-history hits
- * further down the ranking.
+ * Return the set of project-memory ids whose CURRENT text is shown in full in
+ * the m[0]+m[1] prompt pair this session is serving. Used by ctx_search to
+ * hard-filter memories the agent already sees in context. A memory whose text
+ * changed since it was served is not visible, so search returns its current
+ * text; cues and stale-memory markers never hide a memory.
  *
- * Returns null when no cache exists or the JSON payload is malformed
- * (callers should treat null as "don't filter" — the worst case is a
- * redundant memory result, not a correctness issue).
+ * Returns null when nothing is known to be visible (callers then don't filter —
+ * the worst case is a redundant memory result, not a correctness issue).
  */
 export function getVisibleMemoryIds(db: Database, sessionId: string): Set<number> | null {
     try {
+        // A fresh recovery pair served by this process is described by neither
+        // session_meta nor the projection; judge visibility by what it showed.
+        const recovery = servedRecoveryTextsFor(sessionId);
+        if (recovery) {
+            const visible = readServedTextVisibleMemoryIds(db, recovery);
+            return visible.size > 0 ? visible : null;
+        }
+        const projected = readFullyVisibleMemoryIds(db, sessionId);
+        if (projected !== undefined) return projected.size > 0 ? projected : null;
         const row = db
-            .prepare("SELECT memory_block_ids FROM session_meta WHERE session_id = ?")
-            .get(sessionId) as { memory_block_ids: string | null } | null;
+            .prepare(
+                "SELECT memory_block_ids, cached_m0_bytes, cached_m1_bytes FROM session_meta WHERE session_id = ?",
+            )
+            .get(sessionId) as {
+            memory_block_ids: string | null;
+            cached_m0_bytes: Buffer | Uint8Array | null;
+            cached_m1_bytes: Buffer | Uint8Array | null;
+        } | null;
         if (!row?.memory_block_ids) return null;
         const parsed = JSON.parse(row.memory_block_ids) as unknown;
         if (!Array.isArray(parsed)) return null;
         const ids = new Set<number>();
         for (const value of parsed) {
-            if (typeof value === "number" && Number.isFinite(value)) {
-                ids.add(value);
-            }
+            if (typeof value === "number" && Number.isFinite(value)) ids.add(value);
         }
-        return ids.size > 0 ? ids : null;
+        if (ids.size === 0) return null;
+        // No applied tuple (a cache from before projections, or a legacy tuple):
+        // keep only ids whose current text is still what the cached pair shows.
+        // Without cached bytes the id list is all there is.
+        if (!row.cached_m0_bytes) return ids;
+        const texts = [row.cached_m0_bytes, row.cached_m1_bytes].flatMap((bytes) =>
+            bytes ? [decodeM0Bytes(bytes) ?? ""] : [],
+        );
+        const visible = readServedTextVisibleMemoryIds(db, texts, ids);
+        return visible.size > 0 ? visible : null;
     } catch {
         return null;
     }
@@ -1012,6 +1055,8 @@ export interface M0M1RenderOptions {
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
     beforePhase3ForTest?: () => void;
+    /** Runs after the HARD fold's read snapshot and before the mural resolves. */
+    afterM0InputsReadForTest?: () => void;
     /** Runs before writer admission, not between m[1] rendering and its writes. */
     beforeCacheCommitForTest?: () => void;
     /**
@@ -2453,9 +2498,33 @@ function resolveMuralForM0(
     modelKey: string,
     budgetTokens: number,
     mode: "persist" | "read-only" = "persist",
+    capturedPool?: MuralPool,
 ): MuralWireOptions | undefined {
     if (options.memoryEnabled === false || !options.muralEnabled) return undefined;
-    return resolveMuralWire(options.db, projectPath, modelKey, true, budgetTokens, mode);
+    return resolveMuralWire(
+        options.db,
+        projectPath,
+        modelKey,
+        true,
+        budgetTokens,
+        mode,
+        capturedPool,
+    );
+}
+
+/** Rows drawn as mural cues, taken from the fold's captured pool. */
+function cueMemoriesFor(
+    mural: MuralWireOptions | undefined,
+    pools: ReadonlyArray<readonly Memory[] | undefined>,
+): Memory[] {
+    const ids = mural?.enabled && mural.supportsVision && mural.dataUrl ? mural.cueMemoryIds : [];
+    if (!ids || ids.length === 0) return [];
+    const byId = new Map<number, Memory>();
+    for (const pool of pools) for (const memory of pool ?? []) byId.set(memory.id, memory);
+    return ids.flatMap((id) => {
+        const memory = byId.get(id);
+        return memory ? [memory] : [];
+    });
 }
 
 export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
@@ -2466,6 +2535,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     let facts: SessionFact[] = [];
     let memories: Memory[] = [];
     let userMemories: UserMemory[] = [];
+    let muralPool: MuralPool | undefined;
+    let foldRevisions = new Map<number, number>();
+    let foldFragmentWatermark = 0;
     let workspace = resolveWorkspaceRenderContext({
         db: options.db,
         projectPath,
@@ -2542,6 +2614,16 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
                   )
             : [];
         userMemories = options.memoryEnabled === false ? [] : safeGetActiveUserMemories(options.db);
+        // Capture revisions and the mural's rows/cues in this same read snapshot,
+        // so the text, the image and their manifest describe one memory state.
+        if (projectPath && options.memoryEnabled !== false && options.muralEnabled && !options.mural)
+            muralPool = readMuralPool(options.db, projectPath);
+        foldRevisions = readMemoryRevisions(options.db, [
+            ...memories.map((memory) => memory.id),
+            ...(muralPool?.memories ?? []).map((memory) => memory.id),
+        ]);
+        // Every agent fragment up to here is already in the rows this snapshot read.
+        foldFragmentWatermark = maxAgentFragmentId(options.db, options.sessionId);
         options.db.exec("COMMIT");
     } catch (error) {
         try {
@@ -2551,6 +2633,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         }
         throw error;
     }
+    options.afterM0InputsReadForTest?.();
 
     compartments = withCompartmentDates(
         options.db,
@@ -2584,7 +2667,14 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         options.memoryEnabled === false
             ? undefined
             : (options.mural ??
-              resolveMuralForM0(options, projectPath, snapshotMarkers.modelKey, memoryBudget));
+              resolveMuralForM0(
+                  options,
+                  projectPath,
+                  snapshotMarkers.modelKey,
+                  memoryBudget,
+                  "persist",
+                  muralPool,
+              ));
     let decayPressureMultiplier = 1;
     let m0Text = renderM0({
         projectDocs: docs.renderedBlock,
@@ -2769,6 +2859,26 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             projectIdentity: snapshotMarkers.projectIdentity,
         });
 
+        writeHardProjection(options.db, {
+            sessionId: options.sessionId,
+            projectPath,
+            m0Text: m0Bytes.toString("utf8"),
+            hardMemoryBlock: serializeHardMemoryBlock(
+                rendered.hardMemory ?? { updateLines: [], newMemories: "" },
+            ),
+            fragmentWatermark: foldFragmentWatermark,
+            revisions: new Map([
+                ...foldRevisions,
+                // Delta rows are read under this writer, so their revisions are too.
+                ...readMemoryRevisions(
+                    options.db,
+                    (rendered.deltaMemories ?? []).map((memory) => memory.id),
+                ),
+            ]),
+            textMemories: trimmed.renderOrder,
+            cueMemories: cueMemoriesFor(mural, [muralPool?.memories, memories]),
+            deltaMemories: rendered.deltaMemories ?? [],
+        });
         steps.mark("persistCachedM0");
         // v2 path persists the rendered-memory identity itself. `memory_block_ids`
         // / `memory_block_count` are otherwise written ONLY by the dead legacy v1
@@ -2931,6 +3041,113 @@ interface RenderM1Result {
     text: string;
     memoryUpdateCount: number;
     renderedMemoryIds: number[];
+    /**
+     * Tokens of this m[1] without its <memory-updates> block. The refold backstop
+     * measures this surface, so memory corrections never authorize a HARD fold.
+     */
+    pressureTokens: number;
+    /** The memory blocks a HARD fold rendered, which later SOFT passes replay. */
+    hardMemory?: HardMemoryBlock;
+    /** Rows the HARD fold admitted to <new-memories>. */
+    deltaMemories?: Memory[];
+}
+
+/** New compartments past the m[0] watermark, at full fidelity. */
+function renderNewCompartmentsBlock(options: M0M1RenderOptions, markers: M0SnapshotMarkers): string {
+    const newCompartments = withCompartmentDates(
+        options.db,
+        options.sessionId,
+        readNewCompartments(options.db, options.sessionId, markers.maxCompartmentSeq).filter(
+            (c) => !isNoContentCompartment(c),
+        ),
+        options.temporalAwareness,
+    );
+    return newCompartments.length > 0
+        ? `<new-compartments>\n${newCompartments
+              .map((compartment) => renderCompartmentAtTier(compartment, 1))
+              .join("\n\n")}\n</new-compartments>`
+        : "";
+}
+
+/** The current user profile, when its global version moved since the m[0] baseline. */
+function renderNewUserProfileBlock(options: M0M1RenderOptions, markers: M0SnapshotMarkers): string {
+    if (
+        options.memoryEnabled === false ||
+        getGlobalUserProfileVersion(options.db) === markers.projectUserProfileVersion
+    )
+        return "";
+    return renderUserProfileBlock(
+        trimUserMemoriesToBudget(
+            safeGetActiveUserMemories(options.db),
+            Math.max(
+                1,
+                Math.floor(
+                    (options.userProfileBudgetTokens ?? DEFAULT_USER_PROFILE_BUDGET_TOKENS) * 0.25,
+                ),
+            ),
+        ),
+        "new-user-profile",
+    );
+}
+
+/**
+ * The m[1] of a busting SOFT pass. It reads no memory rows and no mutation log:
+ * new compartments and the user profile render as usual, the HARD fold's memory
+ * blocks replay byte for byte, and this session's newer agent fragments are
+ * appended (see composeSoftMemoryUpdates). Memory changes by anyone else, and
+ * by automated writers, reach the prompt only at the next HARD fold.
+ */
+function renderSoftM1(
+    options: M0M1RenderOptions,
+    markers: M0SnapshotMarkers,
+    projection: AppliedProjection,
+    m0Text: string,
+): { result: RenderM1Result; projection: AppliedProjection } {
+    if (!markers || markers.maxCompartmentSeq === undefined) {
+        throw new RenderM1InvalidMarkersError(options.sessionId);
+    }
+    const compartmentsBlock = renderNewCompartmentsBlock(options, markers);
+    const profileBlock = renderNewUserProfileBlock(options, markers);
+    const hard = parseHardMemoryBlock(projection.hardMemoryBlock);
+    const assemble = (updatesBlock: string): string => {
+        const blocks = [updatesBlock, compartmentsBlock, hard.newMemories, profileBlock].filter(
+            (block) => block.length > 0,
+        );
+        return blocks.length === 0
+            ? M1_EMPTY_PLACEHOLDER
+            : `<session-history-since>\n${blocks.join("\n")}\n</session-history-since>`;
+    };
+    const independent = assemble("");
+    const pressureTokens = independent === M1_EMPTY_PLACEHOLDER ? 0 : estimateTokens(independent);
+    const memory =
+        options.memoryEnabled === false
+            ? {
+                  // Memory off appends nothing new; what was already served stays.
+                  block: renderMemoryUpdatesFromLines([
+                      ...hard.updateLines,
+                      ...projection.committed.flatMap((fragment) => fragment.lines),
+                  ]),
+                  projection,
+              }
+            : composeSoftMemoryUpdates({
+                  db: options.db,
+                  sessionId: options.sessionId,
+                  projection,
+                  memoryBudgetTokens:
+                      options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+                  historyBudgetTokens: options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+                  independentTokens: pressureTokens,
+                  m0Tokens: () => estimateTokens(m0Text),
+              });
+    return {
+        result: {
+            text: assemble(memory.block),
+            memoryUpdateCount: memoryUpdatesLines(memory.block).length,
+            renderedMemoryIds: [],
+            pressureTokens,
+        },
+        projection: memory.projection,
+    };
 }
 
 function renderM1WithMetadata(
@@ -2977,21 +3194,8 @@ function renderM1WithMetadata(
     });
     if (memoryUpdates.block) blocks.push(memoryUpdates.block);
 
-    const newCompartments = withCompartmentDates(
-        options.db,
-        options.sessionId,
-        readNewCompartments(options.db, options.sessionId, markers.maxCompartmentSeq).filter(
-            (c) => !isNoContentCompartment(c),
-        ),
-        options.temporalAwareness,
-    );
-    if (newCompartments.length > 0) {
-        blocks.push(
-            `<new-compartments>\n${newCompartments
-                .map((compartment) => renderCompartmentAtTier(compartment, 1))
-                .join("\n\n")}\n</new-compartments>`,
-        );
-    }
+    const compartmentsBlock = renderNewCompartmentsBlock(options, markers);
+    if (compartmentsBlock) blocks.push(compartmentsBlock);
 
     const forcedMemoryIds = new Set(memoryUpdates.forcedMemoryIds);
     const newMemories = eligibleMemories.filter(
@@ -3026,43 +3230,213 @@ function renderM1WithMetadata(
     );
     if (newMemoriesBlock) blocks.push(newMemoriesBlock);
 
-    const currentUserProfileVersion = getGlobalUserProfileVersion(options.db);
-    if (
-        options.memoryEnabled !== false &&
-        currentUserProfileVersion !== markers.projectUserProfileVersion
-    ) {
-        const profileBlock = renderUserProfileBlock(
-            trimUserMemoriesToBudget(
-                safeGetActiveUserMemories(options.db),
-                Math.max(
-                    1,
-                    Math.floor(
-                        (options.userProfileBudgetTokens ?? DEFAULT_USER_PROFILE_BUDGET_TOKENS) *
-                            0.25,
-                    ),
-                ),
-            ),
-            "new-user-profile",
-        );
-        if (profileBlock) blocks.push(profileBlock);
-    }
+    const profileBlock = renderNewUserProfileBlock(options, markers);
+    if (profileBlock) blocks.push(profileBlock);
 
     // v2 faithful facts: session_facts is retired as a render source. Fresh
     // facts reach the agent as promoted memories via the new-memories block
     // above (maxMemoryId watermark), not via a <session_facts> delta here.
 
     const renderedNewMemoryIds = newMemoriesBlock ? deltaMemories.map((memory) => memory.id) : [];
-    if (blocks.length === 0) {
-        return {
-            text: M1_EMPTY_PLACEHOLDER,
-            memoryUpdateCount: memoryUpdates.count,
-            renderedMemoryIds: renderedNewMemoryIds,
-        };
-    }
+    const text =
+        blocks.length === 0
+            ? M1_EMPTY_PLACEHOLDER
+            : `<session-history-since>\n${blocks.join("\n")}\n</session-history-since>`;
+    const pressureBlocks = blocks.filter((block) => block !== memoryUpdates.block);
     return {
-        text: `<session-history-since>\n${blocks.join("\n")}\n</session-history-since>`,
+        text,
         memoryUpdateCount: memoryUpdates.count,
         renderedMemoryIds: renderedNewMemoryIds,
+        pressureTokens:
+            pressureBlocks.length === 0
+                ? 0
+                : estimateTokens(
+                      `<session-history-since>\n${pressureBlocks.join("\n")}\n</session-history-since>`,
+                  ),
+        hardMemory: {
+            updateLines: memoryUpdatesLines(memoryUpdates.block),
+            newMemories: newMemoriesBlock,
+        },
+        deltaMemories: newMemoriesBlock ? deltaMemories : [],
+    };
+}
+
+/** The header line of a <memory-updates> block. */
+export const MEMORY_UPDATES_HEADER =
+    "These memories changed since the snapshot below — trust these:";
+/** At most this many full correction lines render in one m[1]; markers excluded. */
+export const M1_CORRECTION_RECORD_CAP = 40;
+/** Agent fragments may use this share of the memory text budget. */
+export const M1_CORRECTION_ALLOWANCE_RATIO = 0.25;
+/** Below this many m[0] tokens the m[1]/m[0] ratio is not a meaningful bound. */
+export const M0_DRIFT_RATIO_FLOOR_TOKENS = 500;
+export const M1_DRIFT_RATIO = 0.15;
+/** m[1] may not exceed this share of the history budget. */
+export const M1_ABSOLUTE_CAP_RATIO = 0.2;
+
+/**
+ * The memory part of the m[1] a HARD fold rendered: the lines of its
+ * <memory-updates> block (normally none) and its <new-memories> block. Later
+ * SOFT passes replay both byte for byte and append agent fragments after the lines.
+ */
+export interface HardMemoryBlock {
+    updateLines: string[];
+    newMemories: string;
+}
+
+/** The correction lines inside a rendered <memory-updates> block. */
+export function memoryUpdatesLines(block: string): string[] {
+    if (!block) return [];
+    const open = "<memory-updates>\n";
+    const close = "\n</memory-updates>";
+    const start = block.indexOf(open);
+    const end = block.lastIndexOf(close);
+    if (start < 0 || end < start) return [];
+    const body = block.slice(start + open.length, end).split("\n");
+    return body[0] === MEMORY_UPDATES_HEADER ? body.slice(1) : body;
+}
+
+export function renderMemoryUpdatesFromLines(lines: readonly string[]): string {
+    return lines.length === 0
+        ? ""
+        : `<memory-updates>\n${[MEMORY_UPDATES_HEADER, ...lines].join("\n")}\n</memory-updates>`;
+}
+
+export function serializeHardMemoryBlock(block: HardMemoryBlock): string {
+    return JSON.stringify(block);
+}
+
+export function parseHardMemoryBlock(serialized: string): HardMemoryBlock {
+    try {
+        const parsed = JSON.parse(serialized) as Partial<HardMemoryBlock>;
+        return {
+            updateLines: Array.isArray(parsed.updateLines) ? parsed.updateLines : [],
+            newMemories: typeof parsed.newMemories === "string" ? parsed.newMemories : "",
+        };
+    } catch {
+        return { updateLines: [], newMemories: "" };
+    }
+}
+
+/**
+ * The memory blocks of a cached m[1] written before applied projections existed,
+ * taken byte for byte from the cached text. Upgrading never reconstructs what was
+ * served from current memory rows.
+ */
+export function legacyMemoryBlockFromCachedM1(cachedM1: string): HardMemoryBlock {
+    const updatesStart = cachedM1.indexOf("<memory-updates>\n");
+    const updatesEnd = cachedM1.indexOf("\n</memory-updates>");
+    const updates =
+        updatesStart >= 0 && updatesEnd > updatesStart
+            ? cachedM1.slice(updatesStart, updatesEnd + "\n</memory-updates>".length)
+            : "";
+    const newStart = cachedM1.indexOf("<new-memories>\n");
+    const newEnd = cachedM1.indexOf("\n</new-memories>");
+    return {
+        updateLines: memoryUpdatesLines(updates),
+        newMemories:
+            newStart >= 0 && newEnd > newStart
+                ? cachedM1.slice(newStart, newEnd + "\n</new-memories>".length)
+                : "",
+    };
+}
+
+/** Tokens m[1] may still take before it would cross a refold bound. */
+export function m1PressureHeadroom(args: {
+    independentTokens: number;
+    m0Tokens: number | null;
+    historyBudgetTokens: number;
+}): number {
+    let cap = args.historyBudgetTokens * M1_ABSOLUTE_CAP_RATIO;
+    if (args.m0Tokens !== null && args.m0Tokens >= M0_DRIFT_RATIO_FLOOR_TOKENS)
+        cap = Math.min(cap, args.m0Tokens * M1_DRIFT_RATIO);
+    return Math.max(0, cap - args.independentTokens);
+}
+
+/**
+ * The memory <memory-updates> block of a busting SOFT pass, built without reading
+ * memory rows or the mutation log. It is the replayed HARD lines, every fragment
+ * committed by an earlier SOFT (unchanged), and then this session's newer agent
+ * fragments in order. Each new fragment is all-or-nothing: its full lines when
+ * they fit the correction allowance (a share of the memory budget, header
+ * included), the 40-line cap and the refold headroom; otherwise one stale-memory
+ * marker if that fits; otherwise it and every later fragment wait for a later
+ * pass or the next HARD fold. Committed fragments never move or shrink.
+ * Shared by the OpenCode and Pi renderers.
+ */
+export function composeSoftMemoryUpdates(args: {
+    db: Database;
+    sessionId: string;
+    projection: AppliedProjection;
+    memoryBudgetTokens: number;
+    historyBudgetTokens: number;
+    independentTokens: number;
+    m0Tokens: () => number | null;
+}): { block: string; projection: AppliedProjection; newFragments: number } {
+    const hard = parseHardMemoryBlock(args.projection.hardMemoryBlock);
+    const committed = [...args.projection.committed];
+    const lines = [...hard.updateLines, ...committed.flatMap((fragment) => fragment.lines)];
+    const processedThrough = Math.max(
+        args.projection.fragmentWatermark,
+        ...committed.map((fragment) => fragment.id),
+    );
+    const pending = loadAgentFragmentsAfter(args.db, args.sessionId, processedThrough);
+    if (pending.length > 0) {
+        const headerTokens = estimateTokens(
+            `<memory-updates>\n${MEMORY_UPDATES_HEADER}\n</memory-updates>\n`,
+        );
+        const lineTokens = (items: readonly string[]) =>
+            items.reduce((sum, line) => sum + estimateTokens(`${line}\n`), 0);
+        let used = lines.length === 0 ? 0 : headerTokens + lineTokens(lines);
+        let fullLines =
+            hard.updateLines.length +
+            committed
+                .filter((fragment) => fragment.form === "full")
+                .reduce((sum, fragment) => sum + fragment.lines.length, 0);
+        const budget = Math.min(
+            Math.floor(args.memoryBudgetTokens * M1_CORRECTION_ALLOWANCE_RATIO),
+            m1PressureHeadroom({
+                independentTokens: args.independentTokens,
+                m0Tokens: args.m0Tokens(),
+                historyBudgetTokens: args.historyBudgetTokens,
+            }),
+        );
+        for (const fragment of pending) {
+            const header = lines.length === 0 ? headerTokens : 0;
+            const fullCost = header + lineTokens(fragment.lines);
+            if (
+                used + fullCost <= budget &&
+                fullLines + fragment.lines.length <= M1_CORRECTION_RECORD_CAP
+            ) {
+                committed.push({
+                    id: fragment.id,
+                    form: "full",
+                    lines: fragment.lines,
+                    visibleTexts: fragment.visibleTexts,
+                });
+                lines.push(...fragment.lines);
+                used += fullCost;
+                fullLines += fragment.lines.length;
+                continue;
+            }
+            const marker = renderStaleFragmentMarker(fragment);
+            const markerCost = header + estimateTokens(`${marker}\n`);
+            if (used + markerCost > budget) {
+                sessionLog(
+                    args.sessionId,
+                    `m[1] memory fragments from #${fragment.id} wait for a later pass: no room even for a stale-memory marker`,
+                );
+                break;
+            }
+            committed.push({ id: fragment.id, form: "marker", lines: [marker], visibleTexts: [] });
+            lines.push(marker);
+            used += markerCost;
+        }
+    }
+    return {
+        block: renderMemoryUpdatesFromLines(lines),
+        projection: { ...args.projection, committed },
+        newFragments: committed.length - args.projection.committed.length,
     };
 }
 
@@ -3284,6 +3658,32 @@ function replayCachedM1(state: M0M1State): string {
     return decodeM0Bytes(state.cachedM1Bytes) ?? M1_EMPTY_PLACEHOLDER;
 }
 
+/**
+ * The applied tuple for a cached pair that has none: one written before applied
+ * projections existed, or by a build that did not record one. Its memory blocks are
+ * the cached m[1] bytes, never a reconstruction from memory rows. A session with no
+ * tuple at all cannot have committed fragments yet, so every fragment it has is
+ * pending; one whose tuple belongs to another baseline already shows its fragments
+ * in those cached bytes, so only newer fragments are pending.
+ */
+function legacyProjection(
+    db: Database,
+    sessionId: string,
+    projectPath: string | undefined,
+    row: CachedM0M1Row,
+): AppliedProjection {
+    const cachedM1 = row.cached_m1_bytes ? (decodeM0Bytes(row.cached_m1_bytes) ?? "") : "";
+    return {
+        generation: 0,
+        hardMemoryBlock: serializeHardMemoryBlock(legacyMemoryBlockFromCachedM1(cachedM1)),
+        fragmentWatermark: hasAppliedSnapshot(db, sessionId, projectPath)
+            ? maxAgentFragmentId(db, sessionId)
+            : 0,
+        committed: [],
+        legacy: true,
+    };
+}
+
 function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
     const steps = new WriteTransactionSteps();
     options.beforeCacheCommitForTest?.();
@@ -3305,10 +3705,13 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             const sibling = readCachedM0M1Row(options.db, options.sessionId);
             if (!sibling) throw new RenderM1InvalidMarkersError(options.sessionId);
             applyCachedRowToState(options.state, sibling);
+            const replayed = replayCachedM1(options.state);
             return {
-                text: replayCachedM1(options.state),
+                text: replayed,
                 memoryUpdateCount: 0,
                 renderedMemoryIds: [],
+                // A sibling's bytes are measured whole.
+                pressureTokens: replayed === M1_EMPTY_PLACEHOLDER ? 0 : estimateTokens(replayed),
             };
         }
 
@@ -3320,8 +3723,25 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             parseMemoryBlockIds(row.memory_block_ids),
             markers.maxMemoryId,
         );
-        const rendered = renderM1WithMetadata(options, markers, renderedM0Ids);
-        const visibleMemoryIds = [...new Set([...renderedM0Ids, ...rendered.renderedMemoryIds])];
+        const m0Text = decodeM0Bytes(row.cached_m0_bytes) ?? "";
+        const soft = renderSoftM1(
+            options,
+            markers,
+            readAppliedProjection(options.db, options.sessionId, options.projectPath, m0Text) ??
+                legacyProjection(options.db, options.sessionId, options.projectPath, row),
+            m0Text,
+        );
+        const rendered = soft.result;
+        // Ids shown in full: the served manifest, plus agent fragments shown in full.
+        const visibleMemoryIds = [
+            ...new Set([
+                ...parseMemoryBlockIds(row.memory_block_ids),
+                ...renderedM0Ids,
+                ...soft.projection.committed.flatMap((fragment) =>
+                    fragment.visibleTexts.map((shown) => shown.id),
+                ),
+            ]),
+        ];
         const m1Bytes = Buffer.from(rendered.text, "utf8");
         const visibleIdsJson = JSON.stringify(visibleMemoryIds);
         const baselineEndMessageId = getLastCompartmentEndMessageId(options.db, options.sessionId);
@@ -3345,6 +3765,12 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
                 withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
                 options.sessionId,
             );
+        writeSoftProjection(options.db, {
+            sessionId: options.sessionId,
+            projectPath: options.projectPath,
+            m0Text,
+            projection: soft.projection,
+        });
         steps.mark("sessionMeta");
         options.db.exec("COMMIT");
         steps.mark("commit");
@@ -4061,6 +4487,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
                 text: materialized.m1Text,
                 memoryUpdateCount: 0,
                 renderedMemoryIds: [],
+                pressureTokens: 0,
             };
             rematerialized = true;
         } catch (error) {
@@ -4131,12 +4558,13 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
 
     let m0Text = decodeM0Bytes(options.state.cachedM0Bytes) ?? M0_EMPTY_BODY;
     let m1Text: string;
-    let memoryUpdateCount = 0;
+    // Tokens of the freshly rendered m[1] without its <memory-updates> block; null
+    // when this pass replays stored bytes.
+    let m1PressureTokens: number | null = null;
     let m1Recomputed = m1Render !== null;
 
     if (m1Render) {
         m1Text = m1Render.text;
-        memoryUpdateCount = m1Render.memoryUpdateCount;
     } else if (contentionExhausted && freshFallbackRenderedMemoryIds) {
         const freshM1 = renderM1WithMetadata(
             { ...options },
@@ -4144,7 +4572,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
             freshFallbackRenderedMemoryIds,
         );
         m1Text = freshM1.text;
-        memoryUpdateCount = freshM1.memoryUpdateCount;
+        m1PressureTokens = freshM1.pressureTokens;
         m1Recomputed = true;
     } else if (contentionExhausted) {
         m1Text = replayCachedM1(options.state);
@@ -4152,7 +4580,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         try {
             const refreshed = softRefreshCachedM1(options);
             m1Text = refreshed.text;
-            memoryUpdateCount = refreshed.memoryUpdateCount;
+            m1PressureTokens = refreshed.pressureTokens;
             m1Recomputed = true;
             m0Text = decodeM0Bytes(options.state.cachedM0Bytes) ?? M0_EMPTY_BODY;
         } catch (error) {
@@ -4169,7 +4597,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
             );
             m0Text = fresh.m0Bytes.toString("utf8");
             m1Text = delta.text;
-            memoryUpdateCount = delta.memoryUpdateCount;
+            m1PressureTokens = delta.pressureTokens;
             m1Recomputed = true;
             contentionExhausted = true;
         }
@@ -4184,28 +4612,28 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
     // Runs only on cache-busting passes where m[1] was freshly recomputed; defer
     // passes replay persisted bytes and must never live-read/refold.
     //
-    // Three independent triggers (any one folds):
-    //   1. memoryUpdateCount > 40 — supersede-delta drift (size-independent).
-    //   2. m[1]/m[0] SIZE RATIO — m[1] grew past 15% of the m[0] baseline. Gated
+    // Two independent triggers (either one folds), both measured on the m[1]
+    // surface WITHOUT its <memory-updates> block:
+    //   1. m[1]/m[0] SIZE RATIO — m[1] grew past 15% of the m[0] baseline. Gated
     //      by M0_DRIFT_RATIO_FLOOR so a tiny early m[0] (M0_EMPTY_BODY ~35 chars)
     //      doesn't make 15% trivially exceeded and refold every pass.
-    //   3. m[1] ABSOLUTE CAP — when m[0] is small the ratio test is suppressed, so
+    //   2. m[1] ABSOLUTE CAP — when m[0] is small the ratio test is suppressed, so
     //      m[1] could otherwise grow without bound. Fold once m[1] alone exceeds a
     //      fixed share of the history budget, independent of m[0] size. estimateTokens
     //      here is fine: this whole branch is rare (cache-busting + m1Recomputed).
-    // Small-m[0] floor in TOKENS (not chars): below this the ratio test is
-    // suppressed because a small m[0] makes the 15% ratio trivially exceeded.
-    const M0_DRIFT_RATIO_FLOOR_TOKENS = 500;
-    const M1_DRIFT_RATIO = 0.15;
-    const M1_ABSOLUTE_CAP_RATIO = 0.2;
+    // Memory corrections (agent fragments and stale-memory markers) render inside
+    // their own allowance and are never the reason for a fold: a fold re-reads
+    // current memory rows and would publish automated edits early. The old
+    // "more than 40 corrections" trigger is gone for the same reason.
     const m1AbsoluteBudget =
         (options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS) * M1_ABSOLUTE_CAP_RATIO;
     // Token counts (NOT char lengths): the documented intent is "m[1] exceeds
     // ~15% of m[0] tokens". XML-heavy / non-Latin content makes char length
     // diverge sharply from token count, so the ratio must compare tokens on both
     // sides. Computed once; this branch is rare (cache-busting + m1Recomputed).
-    const m1HasContent = m1Text !== M1_EMPTY_PLACEHOLDER;
-    const m1Tokens = m1HasContent ? estimateTokens(m1Text) : 0;
+    const m1Tokens =
+        m1PressureTokens ?? (m1Text === M1_EMPTY_PLACEHOLDER ? 0 : estimateTokens(m1Text));
+    const m1HasContent = m1Tokens > 0;
     const m0Tokens = estimateTokens(m0Text);
     const m1OverAbsoluteCap = m1HasContent && m1Tokens > m1AbsoluteBudget;
     if (
@@ -4213,8 +4641,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         !contentionExhausted &&
         m1Recomputed &&
         options.isCacheBustingPass &&
-        (memoryUpdateCount > 40 ||
-            m1OverAbsoluteCap ||
+        (m1OverAbsoluteCap ||
             (m1HasContent &&
                 m0Tokens >= M0_DRIFT_RATIO_FLOOR_TOKENS &&
                 m1Tokens > m0Tokens * M1_DRIFT_RATIO))
@@ -4260,6 +4687,11 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
           : contentionExhausted
             ? contentionReplayBoundary
             : readCachedBaselineState(options.db, options.sessionId).boundary;
+    // Search visibility follows the pair actually served: a fresh, non-persisted
+    // recovery pair is remembered in-process; any persisted pair clears it.
+    if (contentionExhausted && freshFallbackRenderedMemoryIds !== null)
+        recordServedRecoveryTexts(options.sessionId, [m0Text, m1Text]);
+    else clearServedRecoveryTexts(options.sessionId);
     const preparedMessages: MessageLike[] = [];
     const muralForWire = options.state.cachedM0MuralDataUrl
         ? {

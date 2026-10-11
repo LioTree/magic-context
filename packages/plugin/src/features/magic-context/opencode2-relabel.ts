@@ -125,7 +125,7 @@ export const V87_HARNESS_AGGREGATE_RULES: ReadonlyArray<{
     },
     {
         record: "memory_applied",
-        tables: ["memory_applied_snapshots", "memory_applied_rows"],
+        tables: ["memory_applied_snapshots", "memory_applied_rows", "memory_agent_fragments"],
     },
 ];
 
