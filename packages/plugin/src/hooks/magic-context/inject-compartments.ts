@@ -3673,6 +3673,16 @@ function legacyProjection(
     row: CachedM0M1Row,
 ): AppliedProjection {
     const cachedM1 = row.cached_m1_bytes ? (decodeM0Bytes(row.cached_m1_bytes) ?? "") : "";
+    return legacyProjectionFromCachedM1(db, sessionId, projectPath, cachedM1);
+}
+
+/** The legacy applied tuple for cached m[1] text; shared by the OpenCode and Pi renderers. */
+export function legacyProjectionFromCachedM1(
+    db: Database,
+    sessionId: string,
+    projectPath: string | undefined,
+    cachedM1: string,
+): AppliedProjection {
     return {
         generation: 0,
         hardMemoryBlock: serializeHardMemoryBlock(legacyMemoryBlockFromCachedM1(cachedM1)),

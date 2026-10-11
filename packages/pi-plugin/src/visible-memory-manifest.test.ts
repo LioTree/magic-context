@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { applyMemoryAdmission } from "@magic-context/core/features/magic-context/memory/lifecycle-applier";
 import {
 	archiveMemory,
 	insertMemory,
@@ -16,7 +17,10 @@ import {
 	encodeCachedM0UpgradeIdentity,
 	withCachedM0MemoryIds,
 } from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
-import { renderMemoryBlockV2 } from "@magic-context/core/hooks/magic-context/inject-compartments";
+import {
+	getVisibleMemoryIds,
+	renderMemoryBlockV2,
+} from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { createTestTempDirFromPath } from "@magic-context/core/shared/test-temp-dir";
 import {
@@ -156,11 +160,21 @@ describe("Pi visible-memory manifest", () => {
 					"UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?",
 				)
 				.run(legacyIdentity, f.state.sessionId);
-			const delta = insertMemory(f.db, {
-				projectPath: f.state.projectIdentity,
-				category: "ARCHITECTURE",
-				content: "metadata adoption delta",
-			});
+			// A busting SOFT shows memory only through this session's agent
+			// fragments, so the refreshed delta comes from an agent save.
+			const delta = {
+				id: applyMemoryAdmission(f.db, {
+					key: "pi-metadata-adoption-save",
+					operation: "agent_save",
+					input: {
+						projectPath: f.state.projectIdentity,
+						category: "ARCHITECTURE",
+						content: "metadata adoption delta",
+						sourceSessionId: f.state.sessionId,
+						sourceType: "agent",
+					},
+				}).memoryId!,
+			};
 			const refreshed = f.serveWithResult(true);
 			expect(refreshed.result.m0Materialized).toBe(false);
 			expect(f.manifest()).toEqual({ ids: [baseline.id, delta.id], count: 2 });
@@ -177,24 +191,40 @@ describe("Pi visible-memory manifest", () => {
 		}
 	});
 
-	it("includes additive m[1] memories and replaces rather than accumulates refreshed ids", () => {
+	// A busting SOFT shows this session's agent save as a fragment. Fragments
+	// already shown never move, so another writer archiving the row changes no
+	// bytes; search stops treating the archived row as visible.
+	it("shows this session's agent save in m[1] and keeps those bytes when another writer archives it", () => {
 		const f = fixture();
 		try {
 			f.serve();
-			const visible = insertMemory(f.db, {
-				projectPath: f.state.projectIdentity,
-				category: "ARCHITECTURE",
-				content: "visible additive memory",
-			});
+			const visible = {
+				id: applyMemoryAdmission(f.db, {
+					key: "pi-visible-save",
+					operation: "agent_save",
+					input: {
+						projectPath: f.state.projectIdentity,
+						category: "ARCHITECTURE",
+						content: "visible additive memory",
+						sourceSessionId: f.state.sessionId,
+						sourceType: "agent",
+					},
+				}).memoryId!,
+			};
 			const first = f.serve(true);
 			expect(JSON.stringify(first)).toContain(
-				`#${visible.id}: visible additive memory`,
+				`<added id=\\"${visible.id}\\" category=\\"ARCHITECTURE\\">visible additive memory</added>`,
 			);
 			expect(f.manifest()).toEqual({ ids: [visible.id], count: 1 });
+			expect(
+				getVisibleMemoryIds(f.db, f.state.sessionId)?.has(visible.id),
+			).toBe(true);
 			expect(f.serve(true)).toEqual(first);
 			archiveMemory(f.db, visible.id);
-			expect(JSON.stringify(f.serve(true))).not.toContain(`#${visible.id}:`);
-			expect(f.manifest()).toEqual({ ids: [], count: 0 });
+			expect(f.serve(true)).toEqual(first);
+			expect(
+				getVisibleMemoryIds(f.db, f.state.sessionId)?.has(visible.id) ?? false,
+			).toBe(false);
 		} finally {
 			f.close();
 		}
@@ -224,7 +254,9 @@ describe("Pi visible-memory manifest", () => {
 		}
 	});
 
-	it("keeps forced m[1] replacements below the baseline watermark visible on repeated refresh", () => {
+	// Busting SOFT passes no longer force successor rows into m[1]: another
+	// writer's supersession or archive reaches this session at its next HARD fold.
+	it("leaves another writer's supersession below the baseline watermark out of repeated refresh bytes", () => {
 		const f = fixture();
 		try {
 			const original = insertMemory(f.db, {
@@ -265,13 +297,8 @@ describe("Pi visible-memory manifest", () => {
 				return messages.slice(0, 2);
 			};
 			const first = refresh();
-			expect(JSON.stringify(first)).toContain(
-				`#${replacement.id}: replacement B`,
-			);
-			expect(f.manifest()).toEqual({
-				ids: [original.id, replacement.id],
-				count: 2,
-			});
+			expect(JSON.stringify(first)).not.toContain(`#${replacement.id}:`);
+			expect(f.manifest()).toEqual({ ids: [original.id], count: 1 });
 			expect(refresh()).toEqual(first);
 			archiveMemory(f.db, replacement.id);
 			queueMemoryMutation(f.db, {
@@ -279,7 +306,7 @@ describe("Pi visible-memory manifest", () => {
 				mutationType: "archive",
 				targetMemoryId: replacement.id,
 			});
-			expect(JSON.stringify(refresh())).not.toContain(`#${replacement.id}:`);
+			expect(refresh()).toEqual(first);
 			expect(f.manifest()).toEqual({ ids: [original.id], count: 1 });
 		} finally {
 			f.close();
@@ -342,13 +369,16 @@ describe("Pi visible-memory manifest", () => {
 				content: "not served during defer",
 			});
 			const defer = capture();
-			// Captured from the unmodified renderer before the manifest fix.
+			// The fold hash was captured from the unmodified renderer before the
+			// manifest fix, so HARD bytes are unchanged. A busting SOFT no longer
+			// admits other writers' new memories, so the refresh and the defer after
+			// it serve the fold's bytes.
 			expect({ fold, refresh, defer }).toEqual({
 				fold: "41805f680c01aa6870c79ee455a0f08f6a7d30fb5766d90862364cbcf2e7d778",
 				refresh:
-					"74d4559ec633d643b6f6cb33f59f3dbf4c374785ad300b85a2c0cf9916c6e9e6",
+					"41805f680c01aa6870c79ee455a0f08f6a7d30fb5766d90862364cbcf2e7d778",
 				defer:
-					"74d4559ec633d643b6f6cb33f59f3dbf4c374785ad300b85a2c0cf9916c6e9e6",
+					"41805f680c01aa6870c79ee455a0f08f6a7d30fb5766d90862364cbcf2e7d778",
 			});
 			expect(defer).toBe(refresh);
 			expect(f.row()).toEqual(before);
