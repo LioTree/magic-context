@@ -253,6 +253,98 @@ tools never borrow that count. The constructor regression test proves the matchi
 control admits without local envelope bounds and each changed identity refuses.
 
 
+## Reproducing
+
+`packages/e2e-tests/src/bridge-memory.test.ts` is an opt-in, real-module fixture.
+The v1 case runs **OpenCode 1.18.35** with `serve --pure` (no in-tree plugin), a
+loopback mock Anthropic provider and a real `createOpencodeClient` from the v1 SDK.
+It creates a session and completes two real user/assistant turns, verifies their
+four IDs in the private `opencode.db`, then seeds an active `ARCHITECTURE` memory
+in `context.db` **before constructing the bridge adapter**. No v1 raw-history
+provider is registered: bootstrap must resolve those IDs from the canonical host
+store. The fixture sends the adapter's complete returned projection to a fake
+HTTP provider on both bootstrap and an ordinary pass of the same raw window,
+asserting the memory is in `messages[0]`, with role `user`, and both turns remain.
+It also asserts zero compartments (stored conversation summaries), so summaries
+created by historian model calls cannot be the source of the injected memory.
+The two existing v2 cases instead register a canonical raw-history reader and
+exercise symlink and macOS `/var` versus `/private/var` project spellings.
+
+Seed order matters: setup's `ready` response contains `replacement: []`; the
+bootstrap's final status pass materializes the real head. A memory added **after**
+that head is materialized appears only on the next rebuild, by design. Ordinary
+passes replay the frozen head, not a freshly queried memory list. At this pin the
+v1 fixture's bootstrap already renders the seeded head; the no-new-tail ordinary
+pass exposed a separate wire error: its state-sync barrier used nested `params`
+instead of the module's flat envelope and ck-mc refused it with
+`missing field shadow_generation`. Both the seed's pass-complete/model-chain
+fields and the no-tail barrier must be top-level state-sync fields.
+
+Run locally with copied native binaries, niced, using a fresh scratch tree for
+each invocation. Resolve the OpenCode binary before replacing `HOME`; it may be
+on `PATH` or at `~/.opencode/bin/opencode`. This example uses the staged schema-100
+fixture that accompanies the pinned ck-mc rather than any live store:
+
+```sh
+OPENCODE_BIN="$(command -v opencode || printf '%s/.opencode/bin/opencode' "$HOME")"
+mkdir -p "$TMPDIR/magic-context"
+ROOT="$(mktemp -d "$TMPDIR/magic-context/bridge-memory.XXXXXX")"
+mkdir -p "$ROOT/bin" "$ROOT/home" "$ROOT/config" "$ROOT/data" \
+  "$ROOT/cache" "$ROOT/state" "$ROOT/runtime"
+cp "$HOME/.local/share/cortexkit/bin/staging/ckdev-mc.cc8617ec" "$ROOT/bin/ck-mc"
+cp "$HOME/.local/share/cortexkit/bin/ck-subc" "$ROOT/bin/ck-subc"
+cp "$HOME/.local/share/cortexkit/bin/staging/ckdev-mc.cc8617ec.context-v100.db" \
+  "$ROOT/context-v100.db"
+env HOME="$ROOT/home" XDG_DATA_HOME="$ROOT/data" \
+  XDG_CONFIG_HOME="$ROOT/config" XDG_CACHE_HOME="$ROOT/cache" \
+  XDG_STATE_HOME="$ROOT/state" XDG_RUNTIME_DIR="$ROOT/runtime" \
+  OPENCODE_DB="$ROOT/data/opencode/opencode.db" \
+  MAGIC_CONTEXT_STORAGE_DIR="$ROOT/data/cortexkit/magic-context" \
+  MC_BRIDGE_MEMORY_E2E=1 MC_BRIDGE_MEMORY_ROOT="$ROOT" \
+  MC_BRIDGE_MEMORY_BIN="$ROOT/bin/ck-mc" \
+  MC_BRIDGE_MEMORY_SUBC_BIN="$ROOT/bin/ck-subc" \
+  MC_BRIDGE_MEMORY_DB="$ROOT/context-v100.db" \
+  MC_BRIDGE_MEMORY_OPENCODE_BIN="$OPENCODE_BIN" \
+  nice -n 10 bun test packages/e2e-tests/src/bridge-memory.test.ts
+```
+
+The v1 case further isolates each HOME/XDG root under `$ROOT/v1/`. Its facade
+`configPath` (also `MAGIC_CONTEXT_CONFIG_PATH`) is
+`$ROOT/v1/config/selected.jsonc`. Separately, `stack.writeModuleConfig(config)`
+writes `$ROOT/v1/data/module-config/cortexkit/magic-context.jsonc` in **ck-mc's**
+private XDG config tier, not the facade's tier or the user's daemon configuration.
+Both files explicitly enable memory, set injection/profile budgets to 4,000/1,000
+tokens, enable compaction, and disable historian, dreamer and embeddings. The
+private daemon has its own empty modules config and launches no supervised
+modules. The fixture copies ck-mc; it never modifies the staged executable or
+connects to the live subc daemon.
+
+For this non-git project, the persisted binding is
+`session_projects(session_id=<real SDK session ID>, harness='opencode',
+project_path='dir:<MD5-prefix of path.resolve(projectRoot)>')`, using the host's
+spelling `$ROOT/v1/project`. Transport binds `{ project_root: realpath(projectRoot),
+harness: 'opencode', session: <same SDK session ID> }` with
+`consumerIdentity: null`. Both processes use
+`$ROOT/v1/data/cortexkit/magic-context/context.db`. The v2 cases use harness
+`opencode2`, not `opencode`.
+
+The test captures `lsof -nP -p <pid> -Fn` for the bridge, OpenCode, private daemon
+and ck-mc **while they are running** and rejects every database/WAL/SHM path
+outside the throwaway root. It additionally compares canonical paths to prove
+the bridge and ck-mc hold the **same** `context.db`, and OpenCode holds the expected
+`opencode.db`. For a manual run, use the printed bridge/module PIDs:
+
+```sh
+lsof -nP -p "$BRIDGE_PID" -Fn
+lsof -nP -p "$CK_MC_PID" -Fn
+# Both must list n<canonical ROOT>/v1/data/cortexkit/magic-context/context.db.
+# Any database path outside ROOT is an isolation failure: stop the fixture.
+```
+
+`$ROOT/v1/requests.json`, `opencode.log` and `lsof-{bridge,opencode,daemon,module}.txt`
+remain available after teardown as reproduction evidence. Never substitute live
+OpenCode/CortexKit databases or configs for these throwaway inputs.
+
 ## Adapter-owned record access
 
 The adapter is multi-session. Bridges call

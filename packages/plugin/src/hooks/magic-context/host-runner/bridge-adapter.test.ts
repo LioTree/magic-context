@@ -202,6 +202,34 @@ function fakeModule() {
 }
 
 describe("supported bridge constructor", () => {
+    test("state-sync barriers use the flat module envelope on bootstrap and no-tail ordinary passes", async () => {
+        const options = fixture();
+        const wire = fakeModule();
+        const rows = [message("first")];
+        canonicalRows(rows);
+        const adapter = await createBridgeAdapter(options);
+        cleanups.push(() => adapter.dispose());
+        expect(
+            (await adapter.run({ sessionId: "session", messages: rows, kind: "model" })).kind,
+        ).toBe("bootstrap");
+        const seed = wire.calls.find((call) => call.method === "state_sync");
+        expect(seed?.params).toBeUndefined();
+        expect(seed?.pass_complete).toBe(true);
+        expect(seed?.historian_model_chain).toEqual(["openai/bridge-historian"]);
+        const before = wire.calls.length;
+        expect(
+            (await adapter.run({ sessionId: "session", messages: rows, kind: "model" })).kind,
+        ).toBe("ordinary");
+        const barrier = wire.calls.slice(before).find((call) => call.method === "state_sync");
+        expect(barrier).toMatchObject({
+            session_id: "session",
+            shadow_generation: 0,
+            expected_shadow_seq: 1,
+            pass_complete: true,
+            historian_model_chain: ["openai/bridge-historian"],
+        });
+        expect(barrier?.params).toBeUndefined();
+    });
     test("bridge commits view coverage without invoking the native raw-history marker writer", async () => {
         const options = fixture();
         const wire = fakeModule();

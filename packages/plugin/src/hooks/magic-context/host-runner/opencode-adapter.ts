@@ -645,11 +645,8 @@ export function createOpenCodeProviderTransform(
                                 args.method === "state_sync"
                                     ? {
                                           ...body,
-                                          params: {
-                                              ...part(body.params),
-                                              pass_complete: passComplete,
-                                              historian_model_chain: [...new Set(models)],
-                                          },
+                                          pass_complete: passComplete,
+                                          historian_model_chain: [...new Set(models)],
                                       }
                                     : body,
                         });
@@ -682,13 +679,11 @@ export function createOpenCodeProviderTransform(
                 method: "state_sync",
                 body: {
                     method: "state_sync",
-                    params: {
-                        session_id: id,
-                        shadow_generation: s.sync.moduleGeneration,
-                        expected_shadow_seq: s.sync.lastAckedSeq,
-                        pass_complete: true,
-                        historian_model_chain: [...new Set(models)],
-                    },
+                    session_id: id,
+                    shadow_generation: s.sync.moduleGeneration,
+                    expected_shadow_seq: s.sync.lastAckedSeq,
+                    pass_complete: true,
+                    historian_model_chain: [...new Set(models)],
                 },
             });
         }
