@@ -76,6 +76,7 @@ import {
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { installHostRunnerSchema } from "./storage-host-runner";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
+import { StoreVersionMismatchError } from "./store-version-mismatch";
 import {
     loadToolDefinitionMeasurements,
     setDatabase as setToolDefinitionDatabase,
@@ -2726,6 +2727,45 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         throw new Error(
             `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
         );
+    }
+}
+
+/** An independently owned bridge handle must not close a host's cached connection or migrate implicitly. */
+export function openBridgeDatabase(dbPath: string, allowMigration = false): Database {
+    const dbDir = dirname(dbPath);
+    ensureSecureStorageDir(dbDir);
+    tightenStorageTree(dbDir);
+    if (!existsSync(dbPath) && shouldEnforcePrivateStoragePermissions()) {
+        try {
+            writeStorageFileSync(dbPath, new Uint8Array(), { flag: "wx" });
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
+    }
+    const db = new Database(dbPath);
+    try {
+        installBootBusyTimeout(db, dbPath, BOOT_SQLITE_BUSY_TIMEOUT_MS);
+        const version = getPersistedSchemaVersion(db);
+        if (
+            version > LATEST_SUPPORTED_VERSION ||
+            (version !== LATEST_SUPPORTED_VERSION && !allowMigration)
+        ) {
+            throw new StoreVersionMismatchError(version, LATEST_SUPPORTED_VERSION);
+        }
+        initializeDatabase(db);
+        if (allowMigration) runMigrations(db);
+        const finalVersion = getPersistedSchemaVersion(db);
+        if (finalVersion !== LATEST_SUPPORTED_VERSION) {
+            throw new StoreVersionMismatchError(finalVersion, LATEST_SUPPORTED_VERSION);
+        }
+        ensureContextStoreUuid(db);
+        tightenStorageTree(dbDir);
+        pathByDatabase.set(db, dbPath);
+        persistenceByDatabase.set(db, true);
+        return db;
+    } catch (error) {
+        closeQuietly(db);
+        throw error;
     }
 }
 

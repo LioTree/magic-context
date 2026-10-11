@@ -84,8 +84,9 @@ export function cortexKitUserConfigBasePath(): string {
 }
 
 /** Select the user file even when a host uses a private XDG_CONFIG_HOME for its own settings. */
-export function magicContextConfigPathOverride(): string | undefined {
-    const value = process.env.MAGIC_CONTEXT_CONFIG_PATH;
+export function magicContextConfigPathOverride(
+    value = process.env.MAGIC_CONTEXT_CONFIG_PATH,
+): string | undefined {
     if (value === undefined) return undefined;
     const path = value.trim();
     if (!path || !isAbsolute(path)) {
@@ -97,8 +98,8 @@ export function magicContextConfigPathOverride(): string | undefined {
 }
 
 /** Resolve an exact override even when missing, so reload can observe its later creation. */
-export function resolveMagicContextUserConfig() {
-    const override = magicContextConfigPathOverride();
+export function resolveMagicContextUserConfig(configPath?: string) {
+    const override = magicContextConfigPathOverride(configPath);
     if (override === undefined)
         return {
             ...detectConfigFile(cortexKitUserConfigBasePath()),
@@ -143,8 +144,8 @@ function legacySourcesForBase(basePath: string, label: string): LegacyConfigSour
  * plus the user legacy sources. A project-scope migration must NEVER move any of
  * these (they are user-scope files, not project files).
  */
-function userScopeConfigPaths(): Set<string> {
-    const override = magicContextConfigPathOverride();
+function userScopeConfigPaths(configPath?: string): Set<string> {
+    const override = magicContextConfigPathOverride(configPath);
     return new Set<string>([
         // The CortexKit user target, both extensions: the bare-root project
         // source produces `.jsonc` AND `.json`, so exclude both or a stray
@@ -173,11 +174,14 @@ function userScopeConfigPaths(): Set<string> {
  * original aside, leaving the user on schema defaults (the config-eats-itself
  * bug). A project migration must never touch a user-scope file.
  */
-export function resolveLegacyConfigSources(directory: string): {
+export function resolveLegacyConfigSources(
+    directory: string,
+    configPath?: string,
+): {
     user: LegacyConfigSource[];
     project: LegacyConfigSource[];
 } {
-    const userPaths = userScopeConfigPaths();
+    const userPaths = userScopeConfigPaths(configPath);
     return {
         user: [
             ...legacySourcesForBase(

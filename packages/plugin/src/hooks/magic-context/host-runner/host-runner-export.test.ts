@@ -50,11 +50,12 @@ test("host-runner subpath import in a clean process has no database, logger or g
             assert.equal(typeof loaded.isFallbackAdmissible, 'function');
             assert.equal(typeof loaded.recordProviderUsage, 'function');
             assert.equal(typeof loaded.loadOpenCodeProviderAdapter, 'function');
+            assert.equal(typeof loaded.createBridgeAdapter, 'function');
             assert.equal(typeof loaded.record.createRecord, 'function');
             assert.deepEqual(Reflect.ownKeys(globalThis), globals);
             assert.deepEqual(process.eventNames().map(name => [name, process.listenerCount(name)]), listeners);
             assert.equal(process._getActiveHandles().length, handles);
-            console.log('HOST_RUNNER_IMPORT_PURE: 7 checks passed');
+            console.log('HOST_RUNNER_IMPORT_PURE: 8 checks passed');
         `,
         );
         const child = Bun.spawnSync(
@@ -85,7 +86,7 @@ test("host-runner subpath import in a clean process has no database, logger or g
             exit: 0,
             stderr: "",
         });
-        expect(child.stdout.toString()).toContain("HOST_RUNNER_IMPORT_PURE: 7 checks passed");
+        expect(child.stdout.toString()).toContain("HOST_RUNNER_IMPORT_PURE: 8 checks passed");
     } finally {
         cleanup();
     }

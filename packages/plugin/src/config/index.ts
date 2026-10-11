@@ -709,12 +709,13 @@ function combinedOutcome(args: {
 export function loadPluginConfigDetailed(
     directory: string,
     applyRuntimeGlobals = true,
+    configPath?: string,
 ): LoadResultDetailed {
-    const userDetected = resolveMagicContextUserConfig();
+    const userDetected = resolveMagicContextUserConfig(configPath);
     const projectDetected = detectConfigFile(getProjectConfigBasePath(directory));
     // Both-harness sources drive the GC-suppression signal; this-harness sources
     // (OpenCode) drive the non-destructive read fallback when the base is absent.
-    const legacySources = resolveLegacyConfigSources(directory);
+    const legacySources = resolveLegacyConfigSources(directory, configPath);
     const harnessLegacy = resolveLegacyConfigSourcesForHarness(directory, "opencode");
 
     // When the CortexKit base is absent (migration refused on a differing

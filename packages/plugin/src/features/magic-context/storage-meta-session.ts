@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { cancelAutoSearchWork } from "../../shared/auto-search-lifecycle";
-import { getHarness } from "../../shared/harness";
+import { getHarness, type HarnessId } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import {
     type Database,
@@ -101,7 +101,11 @@ export function readSessionMeta(db: Database, sessionId: string): SessionMeta {
     return findSessionMeta(db, sessionId) ?? getDefaultSessionMeta(sessionId);
 }
 
-export function getOrCreateSessionMeta(db: Database, sessionId: string): SessionMeta {
+export function getOrCreateSessionMeta(
+    db: Database,
+    sessionId: string,
+    harness: HarnessId = getHarness(),
+): SessionMeta {
     const existing = findSessionMeta(db, sessionId);
     if (existing) return existing;
 
@@ -118,7 +122,6 @@ export function getOrCreateSessionMeta(db: Database, sessionId: string): Session
     // their served mode above: correcting them now would flip prompt bytes
     // mid-session. Pi-compatible hosts must never open an OpenCode store.
     const defaults = getDefaultSessionMeta(sessionId);
-    const harness = getHarness();
     const fallbackSubagent =
         harness === "opencode"
             ? resolveIsSubagentFromOpenCodeDb(sessionId)
@@ -130,7 +133,12 @@ export function getOrCreateSessionMeta(db: Database, sessionId: string): Session
     }
     // OC2's flag is part of the INSERT, so even a concurrent reader cannot
     // observe a provisional primary row. Leave the v1 event/fallback path alone.
-    ensureSessionMetaRow(db, sessionId, harness === "opencode2" && fallbackSubagent === true);
+    ensureSessionMetaRow(
+        db,
+        sessionId,
+        harness === "opencode2" && fallbackSubagent === true,
+        harness,
+    );
     if (harness === "opencode" && fallbackSubagent === true) {
         db.prepare("UPDATE session_meta SET is_subagent = 1 WHERE session_id = ?").run(sessionId);
     }

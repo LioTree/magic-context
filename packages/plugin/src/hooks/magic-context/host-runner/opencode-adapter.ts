@@ -356,6 +356,7 @@ export interface OpenCodeProviderOptions {
         output: { messages: unknown[] },
         meta: SessionMeta,
         namespace?: string,
+        reason?: ExitReason | "bootstrap_declined" | "provider_disabled" | "rollback",
     ) => Promise<void>;
 }
 
@@ -700,7 +701,16 @@ export function createOpenCodeProviderTransform(
             (s?.record.pipeline_exit?.reseed_full_request
                 ? `${id}:full-request:${s.record.lineage_id}`
                 : undefined);
-        if (options.fullRequest) return options.fullRequest(id, messages, output, meta, namespace);
+        if (options.fullRequest)
+            return options.fullRequest(
+                id,
+                messages,
+                output,
+                meta,
+                namespace,
+                s?.record.pipeline_exit?.reason ??
+                    (deps.rustPipeline !== "provider" ? "provider_disabled" : "bootstrap_declined"),
+            );
         if (!namespace) return legacy.run(id, messages, output, meta);
         // A race's runner ordinals cannot enter the canonical full-request namespace.
         // Re-route all module calls, not host storage or the real OpenCode session id.
@@ -1538,10 +1548,11 @@ export function createOpenCodeProviderTransform(
             for (const [id, projection] of providerProjections) {
                 if (projection.owner === projectionOwner) providerProjections.delete(id);
             }
-            void historian?.stop();
+            const stopped = historian?.stop();
             for (const fresh of reseeded.values()) fresh.dispose();
             sessions.clear();
             projectionTokens.clear();
+            return stopped ?? Promise.resolve();
         },
     };
 }
