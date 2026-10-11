@@ -28,7 +28,12 @@ subtraction cannot be made exact. The redesign deletes the recompute.
      the memory was written).
    - dreamer verify `archive`: a pending proposal in `memory_tool_proposals`; the
      row stays live.
-   - curate: proposals only (unchanged from S1).
+   - curate: proposals only (update, merge and archive), in OpenCode and Pi.
+   - dreamer saves (a curate `write`) and retrospective learnings: inserted with
+     `source_type = 'dreamer'`, no log row and no fragment.
+   - The Rust module's `memory.set_verification` follows the same rules: a gated
+     `update` applies with history and a new revision and no log row; `archive` is a
+     pending `verify` proposal.
 5. **Agent `ctx_memory` edits apply immediately** through the shared applier
    (save, update, merge, archive) and record one immutable, pre-rendered fragment
    (`memory_agent_fragments`) for the session that made them. That session's next
@@ -78,9 +83,10 @@ subtraction cannot be made exact. The redesign deletes the recompute.
 | "Every mutation-log row carries the applier's adoption class"; projection withholds `deferred` rows on SOFT | No adoption class. SOFT reads no log at all. Applier receipts still carry an `adoptionClass` field for TS/Rust receipt parity; nothing reads it. |
 | Design §7 B2 projected revision pool, persisted admission ledger, A1/A2/A3 dependency withholding, per-operation correction budget | Deleted. SOFT = fold memory blocks + own agent fragments. `dependent_A3_waits_for_hard` is not built: no SOFT renders automated or foreign changes, so there is nothing to withhold. |
 | Additive memories (historian promotions, other sessions' saves) ride the next priced SOFT via the `maxMemoryId` watermark | They wait for the next HARD fold. Only this session's own agent saves appear on SOFT (as fragments). |
-| B3 one revision-qualified text/mural manifest | TS captures the mural pool in the fold's read snapshot and records cue ids in `memory_applied_rows`. Pi records cue ids but resolves its mural from live rows after its frozen read (not captured in one snapshot). |
+| B3 one revision-qualified text/mural manifest | OpenCode and Pi read the mural pool in the same snapshot as the fold's m[0] memories, resolve the mural from that pool, and record cue ids in `memory_applied_rows`. A SOFT never resolves a mural (the frozen image replays). |
 | B4 search returns current prose "with revision and pending-head-adoption status" | Unlabelled current text (operator ruling 3). |
-| Writer enumeration (all writers routed through the applier) | Routed: TS agent tools, Pi primary-agent tools, TS verify update/archive, TS expiry, historian revision commit (still disabled by `MEMORY_PROJECTION_READY = false`; when enabled it writes no log row). Not routed in this slice: Pi dreamer/curate paths (still apply directly with log rows; cache-safe because SOFT never reads them), dreamer retrospective learnings (direct insert), the Rust module's `memory.set_verification` archive (not yet a pending proposal), and dashboard writers (Tauri, outside this slice's fence). |
+| Writer enumeration (all writers routed through the applier) | Routed: OpenCode and Pi agent tools; OpenCode and Pi curate (proposals); dreamer saves (no fragment); verify update and archive and expiry archive (shared TS dreamer code, used by both OpenCode and Pi); the Rust `memory.set_verification` update and archive; historian revision commit (still disabled by `MEMORY_PROJECTION_READY = false`; when enabled it writes no log row). Retrospective learnings insert directly as `dreamer` rows with no log row or fragment; they cannot reach a SOFT, which reads no memory rows, and appear at the next HARD fold. They are model-written new rules that pass text gates (no raw quotes, dates, frustration markers or near-transcription) rather than grounded evidence, so ruling 4 could make them proposals later; this slice leaves them as inserts. Dashboard writers (Tauri; status, category and content edits, undo) stay in slice 11: content edits write mutation-log rows that no SOFT reads, and status/category edits still bump the eager workspace epoch. Rust's own agent merge/update/archive paths still write log rows that Rust SOFT does not read. |
+| Dreamer save provenance | An `agent_save` with `sourceType: "dreamer"` keeps `source_type = 'dreamer'` and records no fragment; before, the applier stamped every save `agent` and recorded a fragment for the dreamer's own child session. |
 | Rust applied projection | Read gate only (operator ruling). `compose_soft_m1` replays the memory blocks of the m1 body being served and reads no memory rows or mutation log; the row renderer `compose_m1_from_store` has no production caller (a HARD resets m1 to the placeholder). Agent fragments land in S4; `rust_soft_renders_no_agent_fragments_yet` pins the gap. The memory watermarks still feed the m1 revision digest, so a memory change opens one execute-band SOFT (which now renders unchanged memory bytes and records the revision even when m1 stays empty). |
 
 ## Tests
@@ -102,9 +108,17 @@ registered for OpenCode (`hooks/magic-context/memory-projection.test.ts`) and Pi
 - `current_revision_search_survives_old_prompt_exclusion`.
 - `a pre-projection cached pair replays its memory bytes and appends only new fragments`.
 
-TS only: `cue_visibility_does_not_hide_full_text`, `retired_rows_are_history_only`
-(`memory/applied-projection.test.ts`). Pi: `routes primary write, update, merge and
-archive through the shared applier`. Rust: `soft_m1_reads_no_memory_rows_or_mutation_log`
+TS only: `cue_visibility_does_not_hide_full_text`, `retired_rows_are_history_only`,
+`dreamer saves record no agent fragment; agent saves do`
+(`memory/applied-projection.test.ts`), `writes an automated dreamer row with no
+mutation-log row and no agent fragment` (retrospective learnings), and the verify and
+expiry tests (`dreamer/verify.test.ts`, `dreamer/task-executor.test.ts`; Pi runs the same
+dreamer code). Pi: `routes primary write, update, merge and archive through the shared
+applier`, `routes dreamer update, merge and archive to proposals and writes no log row
+or fragment`, `resolves the mural from the fold's captured pool, not live rows`. Rust:
+`verification_and_mapping_facades_are_fenced_hash_guarded_and_idempotent` (verify
+update moves no m1 signal, writes history and no log row; archive is a `verify`
+proposal and the row stays live), `soft_m1_reads_no_memory_rows_or_mutation_log`
 (tables renamed away; the row renderer fails as the positive control),
 `rust_soft_renders_no_agent_fragments_yet`, and
 `public_memory_{update,insert}_waits_for_hard_and_a_genuine_hard_shows_it`.
