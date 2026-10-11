@@ -27,7 +27,7 @@ use crate::injection::{
 };
 use crate::m0_compose::{trim_memories_to_budget, trim_user_profile_to_budget};
 use crate::m1_compose::{
-    compose_m1_from_store, m1_revision_signal_parts_for_pass_timed, M1RevisionReadTimings,
+    compose_soft_m1, m1_revision_signal_parts_for_pass_timed, M1RevisionReadTimings,
     M1RevisionSignal,
 };
 use crate::memory_render::{render_m0, workspace_source_names, M0Inputs, M1_PLACEHOLDER};
@@ -3990,17 +3990,17 @@ fn apply_additive_only(
             let mut additive_meta = meta.clone();
             additive_meta.folded_compartment_seq = m1_signal.max_compartment_seq;
             additive_meta.coverage_ordinal = None;
-            let m1 = compose_m1_from_store(
+            // A busting SOFT replays the memory blocks it is serving and reads no memory
+            // rows or mutation log; memory changes reach the prompt at the next HARD fold.
+            let m1 = compose_soft_m1(
                 store,
                 ctx.project_path,
-                ctx.note_project_path,
                 &req.session_id,
                 &additive_meta,
-                meta.expiry_cutoff_ms,
                 ctx.memory_enabled,
-                ctx.memory_budget_tokens,
                 ctx.user_profile_budget_tokens,
                 ctx.temporal_awareness,
+                &served_m1_payload(&core),
                 mc_tokenizer::estimate_tokens,
             )?;
             let profile_rendered = m1.profile_rendered;
@@ -5164,11 +5164,6 @@ fn apply_once(
     let compartment_seq_changed_since_meta = loaded.meta.initialized
         && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
     *boundary_divergence_detected = boundary_divergence_recut.is_some();
-    // Pre-gate memory-off sessions stored an ungated digest and have no durable gate marker.
-    // The next natural bust adopts the gated digest; the mismatch does not authorize a bust now.
-    let memory_gate_digest_transition = !ctx.memory_enabled
-        && !loaded.meta.memory_disabled
-        && current_m1_digest != applied_m1_revision;
     let external_revision_changed = loaded.meta.initialized
         && loaded.meta.m1_external_revision != 0
         && m1_signal.external_revision != loaded.meta.m1_external_revision;
@@ -6699,17 +6694,17 @@ fn apply_once(
                 // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
                 // the m1 unit stays stable; a new compartment extends coverage → advance the
                 // boundary anchor in this same commit.
-                let m1 = compose_m1_from_store(
+                // The memory blocks replay what this session is serving; nothing here reads
+                // memory rows or the mutation log (see `compose_soft_m1`).
+                let m1 = compose_soft_m1(
                     store,
                     ctx.project_path,
-                    ctx.note_project_path,
                     &req.session_id,
                     &meta,
-                    meta.expiry_cutoff_ms,
                     ctx.memory_enabled,
-                    ctx.memory_budget_tokens,
                     ctx.user_profile_budget_tokens,
                     ctx.temporal_awareness,
+                    &served_m1_payload(&core),
                     mc_tokenizer::estimate_tokens,
                 )?;
                 let m0_tokens = core
@@ -6993,9 +6988,10 @@ fn apply_once(
                         meta.expiry_cutoff_ms,
                         Some(&mut m1_revision_read_timings),
                     )?;
-                    if m1_has_content || memory_gate_digest_transition {
-                        meta.m1_revision = applied_m1_signal.revision;
-                    }
+                    // A busting SOFT renders no memory rows, so a memory-only revision change
+                    // has nothing left to wait for: record it even when m1 stayed empty, or
+                    // every later execute-band pass would reopen a SOFT for the same change.
+                    meta.m1_revision = applied_m1_signal.revision;
                     meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
                     if m1.profile_rendered {
                         meta.m1_user_profile_version = loaded.meta.user_profile_version;
@@ -10265,6 +10261,15 @@ fn compose_hard_fold_m0(
 /// The m1 placeholder unit (a HARD resets m1 to it; m1 is never fully empty).
 fn render_m1_placeholder() -> FrozenUnit {
     synth_region("m1", M1_PLACEHOLDER.to_string())
+}
+
+/// The m1 body the session is serving now (empty when no m1 unit is frozen yet).
+fn served_m1_payload(core: &CoreState) -> String {
+    core.frozen_units
+        .iter()
+        .find(|unit| unit.key == "m1")
+        .map(|unit| unit.frozen_payload.clone())
+        .unwrap_or_default()
 }
 
 /// The m1 delta unit from a composed body (an empty delta composes to the placeholder
@@ -26998,7 +27003,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pending_in_session_delta_is_consumed_on_execute_but_deferred_passes_replay() {
+    fn pending_in_session_memory_change_is_consumed_on_execute_without_rendering_it() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -27015,7 +27020,8 @@ pub(crate) mod tests {
         let consumed =
             transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
         assert_eq!(consumed.action, "SOFT");
-        assert!(m1_bytes(&consumed).contains("pending rule"));
+        // A busting SOFT reads no memory rows: the update waits for the next HARD fold.
+        assert!(!m1_bytes(&consumed).contains("pending rule"));
         let consumed_bytes = serde_json::to_vec(&consumed.ck_messages).unwrap();
 
         let defer_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 10, 100);
@@ -27027,16 +27033,17 @@ pub(crate) mod tests {
                 serde_json::to_vec(&deferred.ck_messages).unwrap(),
                 consumed_bytes
             );
-            assert!(m1_bytes(&deferred).contains("pending rule"));
+            assert!(!m1_bytes(&deferred).contains("pending rule"));
         }
     }
 
     #[test]
-    fn in_session_memory_mutations_ride_the_next_bust_and_defers_replay_them() {
+    fn in_session_memory_mutations_open_the_next_bust_without_rendering_and_defers_replay() {
         // An update, an archive and a merge each append to context.db's
         // memory_mutation_log and change no memory id. The mutation-log head is the only
-        // revision input that moves, so it alone must open the next execute-band pass as a
-        // SOFT carrying <memory-updates>; the defers after it replay those bytes exactly.
+        // revision input that moves, so it still opens the next execute-band pass as a SOFT,
+        // but that SOFT reads no mutation log: it renders no <memory-updates> (the change
+        // waits for the next HARD fold), and the defers after it replay its bytes exactly.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -27099,8 +27106,8 @@ pub(crate) mod tests {
             let soft = transform(&s, &execute_req, &ctx).unwrap();
             assert_eq!(soft.action, "SOFT", "{marker}");
             let m1 = m1_bytes(&soft);
-            assert!(m1.contains("<memory-updates>"), "{marker}: {m1}");
-            assert!(m1.contains(marker), "{marker}: {m1}");
+            assert!(!m1.contains("<memory-updates>"), "{marker}: {m1}");
+            assert!(!m1.contains(marker), "{marker}: {m1}");
             let served = serde_json::to_vec(&soft.ck_messages).unwrap();
             for _ in 0..3 {
                 let deferred = transform(&s, &defer_req, &ctx).unwrap();
@@ -27323,7 +27330,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn compaction_off_additive_changes_defer_then_ride_m1_and_fold_on_hard() {
+    fn compaction_off_additive_changes_defer_then_fold_on_hard() {
         let dir = tempfile::tempdir().unwrap();
         let project_dir = dir.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -27385,8 +27392,9 @@ pub(crate) mod tests {
         let soft = transform(&s, &execute_request, &ctx).unwrap();
         assert_eq!(soft.action, "SOFT");
         assert_eq!(m0_bytes(&soft), first_m0);
-        assert!(m1_bytes(&soft).contains("<new-memories>"));
-        assert!(m1_bytes(&soft).contains("Deferred memory B"));
+        // A busting SOFT reads no memory rows; the new memory folds in at the HARD below.
+        assert!(!m1_bytes(&soft).contains("<new-memories>"));
+        assert!(!m1_bytes(&soft).contains("Deferred memory B"));
         assert!(!m0_bytes(&soft).contains("Deferred docs B"));
         assert_eq!(&*soft.messages()[2], &request.messages[0].ck);
         let soft_bytes = serde_json::to_vec(soft.messages()).unwrap();
@@ -34878,8 +34886,10 @@ pub(crate) mod tests {
         }
     }
 
+    /// A busting SOFT reads no memory rows or mutation log, so a memory update waits for the
+    /// next HARD fold; a genuine HARD trigger (here a render-config change) shows it in m0.
     #[test]
-    fn public_memory_update_rides_soft_not_hard() {
+    fn public_memory_update_waits_for_hard_and_a_genuine_hard_shows_it() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let memory_id = s
@@ -34904,16 +34914,20 @@ pub(crate) mod tests {
         );
         assert_eq!(soft.action, "SOFT", "public update port should not HARD");
         assert_eq!(m0_bytes(&soft), m0_bytes(&before));
-        assert!(
-            m1_bytes(&soft).contains("<memory-updates>"),
-            "{}",
-            m1_bytes(&soft)
+        assert_eq!(m1_bytes(&soft), m1_bytes(&before));
+        let hard = run(
+            &s,
+            &req("ses", "cfg1", vec![item("m1msg", 1, "raw")]),
+            &spine(),
         );
-        assert!(m1_bytes(&soft).contains("corrected"), "{}", m1_bytes(&soft));
+        assert_eq!(hard.action, "HARD");
+        assert!(m0_bytes(&hard).contains("corrected"), "{}", m0_bytes(&hard));
     }
 
+    /// A busting SOFT reads no memory rows, so a new memory waits for the next HARD fold;
+    /// a genuine HARD trigger (here a render-config change) shows it in m0.
     #[test]
-    fn public_memory_insert_rides_soft_not_hard() {
+    fn public_memory_insert_waits_for_hard_and_a_genuine_hard_shows_it() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
@@ -34940,15 +34954,17 @@ pub(crate) mod tests {
         );
         assert_eq!(soft.action, "SOFT", "public insert port should not HARD");
         assert_eq!(m0_bytes(&soft), m0_bytes(&before));
-        assert!(
-            m1_bytes(&soft).contains("<new-memories>"),
-            "{}",
-            m1_bytes(&soft)
+        assert_eq!(m1_bytes(&soft), m1_bytes(&before));
+        let hard = run(
+            &s,
+            &req("ses", "cfg1", vec![item("m1msg", 1, "raw")]),
+            &spine(),
         );
+        assert_eq!(hard.action, "HARD");
         assert!(
-            m1_bytes(&soft).contains("a durable rule"),
+            m0_bytes(&hard).contains("a durable rule"),
             "{}",
-            m1_bytes(&soft)
+            m0_bytes(&hard)
         );
     }
 
@@ -35027,7 +35043,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn new_memory_rides_m1_soft_and_m0_stays_frozen() {
+    fn new_memory_waits_for_hard_while_soft_replays_served_memory() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
@@ -35048,18 +35064,17 @@ pub(crate) mod tests {
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &spine(),
         );
-        assert_eq!(soft.action, "SOFT", "a new store memory rides a SOFT");
+        assert_eq!(
+            soft.action, "SOFT",
+            "a new store memory still prices a SOFT"
+        );
         assert_eq!(
             m0_bytes(&soft),
             m0_bytes(&before),
             "m0 frozen across the SOFT"
         );
-        assert!(
-            m1_bytes(&soft).contains("<new-memories>"),
-            "{}",
-            m1_bytes(&soft)
-        );
-        assert!(m1_bytes(&soft).contains("a durable rule"));
+        // A busting SOFT reads no memory rows: the new memory waits for the next HARD fold.
+        assert_eq!(m1_bytes(&soft), m1_bytes(&before), "{}", m1_bytes(&soft));
         assert!(soft.committed);
 
         // defer after: the store is unchanged → digest stable → pure SOFT+ replay, no write
@@ -35079,7 +35094,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn in_m0_memory_update_rides_m1_as_a_supersede_delta() {
+    fn in_m0_memory_update_waits_for_hard_while_soft_replays_served_memory() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         // a memory is in the m0 baseline (seeded before bootstrap → in the manifest)
@@ -35106,17 +35121,13 @@ pub(crate) mod tests {
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &spine(),
         );
-        assert_eq!(r.action, "SOFT", "an in-m0 memory mutation rides a SOFT");
         assert_eq!(
-            m0_bytes(&r),
-            m0_bytes(&before),
-            "m0 frozen (the supersede rides m1)"
+            r.action, "SOFT",
+            "an in-m0 memory mutation still prices a SOFT"
         );
-        assert!(
-            m1_bytes(&r).contains("corrected"),
-            "memory-updates delta: {}",
-            m1_bytes(&r)
-        );
+        assert_eq!(m0_bytes(&r), m0_bytes(&before), "m0 frozen");
+        // A busting SOFT reads no mutation log: the correction waits for the next HARD fold.
+        assert_eq!(m1_bytes(&r), m1_bytes(&before), "{}", m1_bytes(&r));
     }
 
     #[test]
@@ -35337,7 +35348,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn frozen_expiry_cutoff_survives_a_wall_clock_advance_on_recompose() {
+    fn soft_recompose_renders_no_new_memory_whatever_the_wall_clock() {
         // Resume-determinism guard for the frozen expiry cutoff: a memory live under the
         // FROZEN cutoff must keep rendering even when a later SOFT recomposes at a
         // wall-clock past its expiry (e.g. after a restart). A live-clock bug (using now_ms
@@ -35360,8 +35371,8 @@ pub(crate) mod tests {
             .unwrap();
         s.arm_soft_refresh("ses").unwrap();
 
-        // a SOFT recompose at wall-clock 2000 — the cutoff stays FROZEN at 500, so the
-        // memory is live and renders. A bug using now_ms=2000 would expire + drop it.
+        // a SOFT recompose at wall-clock 2000 reads no memory rows at all, whatever the
+        // cutoff: the new memory waits for the next HARD fold, which judges its expiry.
         let soft = transform(
             &s,
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
@@ -35370,8 +35381,8 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(soft.action, "SOFT");
         assert!(
-            m1_bytes(&soft).contains("still valid"),
-            "frozen cutoff (500) keeps the memory live at wall-clock 2000: {}",
+            !m1_bytes(&soft).contains("still valid"),
+            "a SOFT renders no new memory rows: {}",
             m1_bytes(&soft)
         );
     }
@@ -41653,7 +41664,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn coalesced_memory_delta_and_reduction_one_soft() {
+    fn memory_change_and_reduction_open_one_soft_that_renders_only_the_reduction() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
@@ -41665,9 +41676,10 @@ pub(crate) mod tests {
         let items = vec![item("a", 1, "raw"), item("t2", 2, "OUT")];
         let r = run(&s, &req("ses", "cfg0", items.clone()), &d);
         assert_eq!(r.action, "SOFT");
+        // A busting SOFT reads no memory rows: the new memory waits for the next HARD fold.
         assert!(
-            m1_bytes(&r).contains("a rule"),
-            "m1 delta rendered: {}",
+            !m1_bytes(&r).contains("a rule"),
+            "no memory delta rendered: {}",
             m1_bytes(&r)
         );
         assert_eq!(
@@ -41768,11 +41780,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pressure_refold_keeps_ready_notes_out_of_m1_and_ready() {
+    fn memory_corrections_make_no_pressure_and_a_hard_keeps_ready_notes_out_of_m1() {
         // Ready smart notes reach the agent through the host's deferred-notes reminder
-        // and `ctx_note read`, never through m1. A pressure refold with a ready note in
-        // the store must therefore leave m1 empty and must not claim the note: it stays
-        // `ready`, so the host mirror keeps announcing it.
+        // and `ctx_note read`, never through m1. Memory corrections no longer count as m1
+        // pressure (a busting SOFT reads no mutation log), so 41 of them leave an
+        // execute-band pass SOFT. A HARD fold with a ready note in the store must leave m1
+        // empty and must not claim the note: it stays `ready`, so the host mirror keeps
+        // announcing it.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -41815,20 +41829,25 @@ pub(crate) mod tests {
         ));
         add_pressure_memory_updates(&s, &memory_ids);
 
-        let pressure = transform(
+        let soft = transform(
             &s,
             &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
             &pctx("git:proj", "/nonexistent-docs", 0),
         )
         .unwrap();
+        assert_ne!(soft.action, "HARD", "memory corrections made pressure");
+        assert!(!m1_bytes(&soft).contains("updated rule"));
+
+        let pressure = transform(
+            &s,
+            &with_usage(req("ses", "cfg1", messages.clone()), 70, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
         assert_eq!(pressure.action, "HARD");
-        assert_eq!(
-            pressure.materialize_reason.as_deref(),
-            Some("pressure_refold")
-        );
         assert!(
             m0_bytes(&pressure).contains("updated rule 1"),
-            "folded m0 must carry the memory deltas that caused the pressure"
+            "the HARD fold reads the corrected rows"
         );
         assert!(!m1_bytes(&pressure).contains("ready note announced"));
         assert!(!m1_bytes(&pressure).contains("<new-notes>"));
@@ -41836,7 +41855,7 @@ pub(crate) mod tests {
 
         let stable = transform(
             &s,
-            &with_usage(req("ses", "cfg0", messages), 10, 100),
+            &with_usage(req("ses", "cfg1", messages), 10, 100),
             &pctx("git:proj", "/nonexistent-docs", 0),
         )
         .unwrap();
@@ -42080,20 +42099,18 @@ pub(crate) mod tests {
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
-        let memory_ids = seed_pressure_memory(&s);
+        seed_pressure_memory(&s);
         let messages = vec![item("a", 1, "raw")];
         run(&s, &req("ses", "cfg0", messages.clone()), &spine());
-        add_pressure_memory_updates(&s, &memory_ids);
-        let pressure = transform(
+        // Memory corrections no longer produce SOFT pressure (a busting SOFT reads no
+        // mutation log), so a render-config HARD freezes the m1 unit this test rewrites.
+        let folded = transform(
             &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
+            &with_usage(req("ses", "cfg1", messages.clone()), 70, 100),
             &pctx("git:proj", "/nonexistent-docs", 0),
         )
         .unwrap();
-        assert_eq!(
-            pressure.materialize_reason.as_deref(),
-            Some("pressure_refold")
-        );
+        assert_eq!(folded.action, "HARD");
 
         // Rewrite the frozen m1 into the pre-fix full-body shape the old binary froze.
         let loaded = s.load("ses").unwrap();
@@ -42104,14 +42121,14 @@ pub(crate) mod tests {
             .frozen_units
             .iter_mut()
             .find(|unit| unit.key == "m1")
-            .expect("refold froze an m1 unit");
+            .expect("the HARD froze an m1 unit");
         m1.frozen_payload = legacy_body.to_string();
         s.commit("ses", loaded.row_version, &core, &loaded.meta)
             .unwrap();
 
         let replay = transform(
             &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 10, 100),
+            &with_usage(req("ses", "cfg1", messages.clone()), 10, 100),
             &pctx("git:proj", "/nonexistent-docs", 0),
         )
         .unwrap();

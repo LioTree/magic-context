@@ -32988,7 +32988,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_merge_renders_a_budget_trimmed_target_then_defer_replays_bytes() {
+    // The merge is stored at once; a busting SOFT reads no mutation log, so the Rust
+    // prompt shows it at the next HARD fold (agent fragments are not rendered in Rust yet).
+    async fn facade_merge_of_a_budget_trimmed_target_waits_for_hard_and_defer_replays_bytes() {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
         let (handler, store, _dir, project) = handler_with_store_and_resolver(
             Arc::new(ProducerState::default()),
@@ -33054,13 +33056,10 @@ mod tests {
             .and_then(|message| message["content"][0]["kind"]["text"].as_str())
             .unwrap();
         assert!(
-            transition_m1.contains("merged correction"),
+            !transition_m1.contains("merged correction"),
             "{transition_m1}"
         );
-        assert!(
-            transition_m1.contains(&format!("<superseded id=\"{source}\" by=\"{canonical}\"/>")),
-            "{transition_m1}"
-        );
+        assert!(!transition_m1.contains("<superseded"), "{transition_m1}");
         let stable = call_transform_request(&handler, request).await;
         assert_eq!(stable["action"], "SOFT+");
         assert_eq!(transition["ck_messages"], stable["ck_messages"]);
@@ -33473,7 +33472,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_cache_mutations_drive_soft_memory_deltas_through_public_path() {
+    // A busting SOFT reads no memory rows or mutation log, and the Rust renderer has no
+    // agent fragments yet (see `m1_compose::tests::rust_soft_renders_no_agent_fragments_yet`),
+    // so facade memory edits are stored at once but reach the prompt at the next HARD fold.
+    async fn facade_memory_edits_store_at_once_and_wait_for_hard_in_rust() {
         let producer = Arc::new(ProducerState::default());
         let project_root = "/repo/cache-project";
         let scope = "pm_a5ee3bf8/parent-session/epoch-1";
@@ -33527,10 +33529,8 @@ mod tests {
 
         let update_delta = call_transform_request_on_channel(&handler, 8, boot_req.clone()).await;
         assert_eq!(update_delta["action"], "SOFT");
-        assert!(synthetic_text(&update_delta, 1).contains("<memory-updates>"));
-        assert!(synthetic_text(&update_delta, 1).contains(&format!(
-            "<updated id=\"{memory_id}\" category=\"CONSTRAINTS\">updated rule</updated>"
-        )));
+        assert!(!synthetic_text(&update_delta, 1).contains("<memory-updates>"));
+        assert!(!synthetic_text(&update_delta, 1).contains("updated rule"));
 
         handler.bind_route(9, binding(additive_project_root, additive_scope));
         store
@@ -33578,8 +33578,8 @@ mod tests {
         );
         let add_delta = call_transform_request_on_channel(&handler, 9, add_req).await;
         assert_eq!(add_delta["action"], "SOFT");
-        assert!(synthetic_text(&add_delta, 1).contains("<new-memories>"));
-        assert!(synthetic_text(&add_delta, 1).contains("new additive memory"));
+        assert!(!synthetic_text(&add_delta, 1).contains("<new-memories>"));
+        assert!(!synthetic_text(&add_delta, 1).contains("new additive memory"));
     }
 
     #[tokio::test(flavor = "current_thread")]

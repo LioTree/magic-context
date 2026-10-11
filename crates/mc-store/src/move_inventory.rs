@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Section-inventory protocol version serialized in move manifests.
-pub const INVENTORY_VERSION: u32 = 4;
+pub const INVENTORY_VERSION: u32 = 5;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 100;
 pub const STORE_SCHEMA_VERSION: u32 = 68;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
@@ -1030,7 +1030,7 @@ pub const TABLES: &[TableInventory] = &[
             "category",
             "new_content",
             "queued_at",
-            "adoption_class"
+            "operation_id"
         ],
         &[],
         None,
@@ -2705,26 +2705,40 @@ pub const TABLES: &[TableInventory] = &[
             "session_id",
             "harness",
             "project_path",
-            "applied_epoch",
-            "applied_mutation_cursor",
-            "max_memory_id",
             "generation",
-            "source_generation",
-            "m0_bytes",
-            "m1_bytes",
-            "mural_payload",
-            "mural_hash",
-            "applied_revisions_json",
-            "selection_metadata_json",
-            "activity_expiry_clocks_json",
-            "policy_budget_identity_json",
-            "text_cue_search_manifest_json",
-            "admission_ledger_json",
-            "correction_receipts_json",
-            "correction_cursors_json"
+            "m0_sha256",
+            "hard_memory_block",
+            "fragment_watermark",
+            "committed_fragments_json",
+            "legacy"
         ],
         &[],
         Some(KeyPolicy::Preserve),
+        None
+    ),
+    // A session's agent memory fragments. Their ids are referenced by the
+    // session's applied snapshot (its fragment watermark and committed list), so a
+    // move keeps them or refuses rather than renumbering.
+    table!(
+        Context,
+        "memory_agent_fragments",
+        Ship,
+        RowSelector::Predicate("session_id = ?1"),
+        &["id"],
+        &[
+            "id",
+            "session_id",
+            "harness",
+            "project_path",
+            "operation_key",
+            "memory_ids_json",
+            "current_id",
+            "lines",
+            "visible_texts_json",
+            "created_at"
+        ],
+        &[],
+        Some(KeyPolicy::PreserveOrRefuseCollision),
         None
     ),
     table!(
@@ -3858,6 +3872,7 @@ mod tests {
             "memory_check_attempts",
             "memory_applied_snapshots",
             "memory_applied_rows",
+            "memory_agent_fragments",
         ] {
             let definition = entry(Store::Context, table).unwrap();
             assert_eq!(definition.class, Class::Ship, "{table}");
@@ -3915,7 +3930,11 @@ mod tests {
                     "host_runner_views",
                     "host_runner_state"
                 ],
-                vec!["memory_applied_snapshots", "memory_applied_rows"]
+                vec![
+                    "memory_applied_snapshots",
+                    "memory_applied_rows",
+                    "memory_agent_fragments"
+                ]
             ]
         );
         for table in &groups[0] {
@@ -4169,7 +4188,7 @@ mod tests {
             .unwrap();
         assert_bun_succeeded(&output);
         let session_tables: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(session_tables.len(), 45);
+        assert_eq!(session_tables.len(), 46);
         for table in session_tables {
             assert!(matches!(
                 entry(Store::Context, &table).unwrap().class,

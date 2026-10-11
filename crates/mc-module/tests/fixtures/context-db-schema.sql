@@ -395,6 +395,19 @@ CREATE TABLE memory_activity_ledger (
             committed_at INTEGER NOT NULL,
             UNIQUE(publication_id,compartment_id)
         );
+CREATE TABLE memory_agent_fragments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            harness TEXT NOT NULL DEFAULT 'opencode',
+            project_path TEXT NOT NULL,
+            operation_key TEXT NOT NULL,
+            memory_ids_json TEXT NOT NULL,
+            current_id INTEGER,
+            lines TEXT NOT NULL,
+            visible_texts_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(session_id,harness,operation_key)
+        );
 CREATE TABLE memory_applied_rows (
             session_id TEXT NOT NULL,
             harness TEXT NOT NULL DEFAULT 'opencode',
@@ -409,23 +422,12 @@ CREATE TABLE memory_applied_snapshots (
             session_id TEXT NOT NULL,
             harness TEXT NOT NULL DEFAULT 'opencode',
             project_path TEXT NOT NULL,
-            applied_epoch INTEGER NOT NULL,
-            applied_mutation_cursor INTEGER NOT NULL,
-            max_memory_id INTEGER NOT NULL,
             generation INTEGER NOT NULL,
-            source_generation INTEGER NOT NULL,
-            m0_bytes TEXT NOT NULL,
-            m1_bytes TEXT NOT NULL,
-            mural_payload TEXT NOT NULL,
-            mural_hash TEXT NOT NULL,
-            applied_revisions_json TEXT NOT NULL,
-            selection_metadata_json TEXT NOT NULL,
-            activity_expiry_clocks_json TEXT NOT NULL,
-            policy_budget_identity_json TEXT NOT NULL,
-            text_cue_search_manifest_json TEXT NOT NULL,
-            admission_ledger_json TEXT NOT NULL,
-            correction_receipts_json TEXT NOT NULL,
-            correction_cursors_json TEXT NOT NULL,
+            m0_sha256 TEXT NOT NULL,
+            hard_memory_block TEXT NOT NULL,
+            fragment_watermark INTEGER NOT NULL,
+            committed_fragments_json TEXT NOT NULL,
+            legacy INTEGER NOT NULL DEFAULT 0 CHECK(legacy IN (0,1)),
             PRIMARY KEY(session_id,harness,project_path)
         );
 CREATE TABLE memory_check_attempts (
@@ -540,7 +542,7 @@ CREATE TABLE memory_mutation_log (
       category TEXT,
       new_content TEXT,
       queued_at INTEGER NOT NULL
-    , adoption_class TEXT NOT NULL DEFAULT 'live' CHECK(adoption_class IN ('live','deferred')));
+    , operation_id TEXT);
 CREATE TABLE memory_pending_facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_path TEXT NOT NULL,
@@ -1310,6 +1312,8 @@ CREATE INDEX idx_m0_mutation_log_session ON m0_mutation_log(session_id);
 CREATE INDEX idx_memories_project_category_hash ON memories(project_path, category, normalized_hash);
 CREATE INDEX idx_memories_project_status_category ON memories(project_path, status, category);
 CREATE INDEX idx_memories_project_status_expires ON memories(project_path, status, expires_at);
+CREATE INDEX idx_memory_agent_fragments_session ON memory_agent_fragments(session_id,harness,project_path,id);
+CREATE INDEX idx_memory_mutation_log_operation ON memory_mutation_log(project_path, operation_id, id);
 CREATE INDEX idx_memory_mutation_log_project
       ON memory_mutation_log(project_path, id);
 CREATE INDEX idx_memory_mutation_log_target

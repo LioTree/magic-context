@@ -364,7 +364,7 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     ),
     (
         "memory_mutation_log",
-        "17c675a535e7b8ea1589c769c0cd82c7f1524a32b7b8a471154dfb8f97b6a83f",
+        "3df65a4de3a311e953e06adbe65c53f168c51e9847322130b5adff823ff6bb91",
     ),
     (
         "memory_pending_facts",

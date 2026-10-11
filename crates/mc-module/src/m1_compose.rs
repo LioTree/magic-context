@@ -12,6 +12,13 @@
 //!    advance the boundary anchor). Runs ONLY on a bust opportunity — never on a defer (a
 //!    defer replays the frozen m1 verbatim; re-composing from the now-possibly-mutated store
 //!    on a defer would change bytes on a defer, violating the deferred-work invariant).
+//!  - [`compose_soft_m1`] is what a busting SOFT actually runs. It recomposes compartments
+//!    and the user profile but reads no memory rows and no mutation log: the memory blocks
+//!    of the m1 body the session is serving are replayed byte for byte, so automated
+//!    writers, other sessions and agent edits reach the prompt only at the next HARD fold.
+//!    `compose_m1_from_store`, which renders memory blocks from rows, has no production
+//!    caller any more (a HARD fold resets m1 to the placeholder); it stays as the fold-time
+//!    renderer the byte-parity fixtures pin.
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -331,6 +338,67 @@ pub struct M1Composition {
     pub profile_rendered: bool,
 }
 
+/// Where an m1 body's `<memory-updates>` and `<new-memories>` blocks come from.
+#[derive(Debug, Clone, Copy)]
+enum M1MemorySource<'a> {
+    /// Render memory corrections and additions from memory rows and the mutation log.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Rows,
+    /// Replay the memory blocks of the m1 body the session currently serves.
+    Served(&'a str),
+}
+
+/// The `<memory-updates>` and `<new-memories>` blocks of a served m1 body, verbatim.
+/// Missing blocks are empty, so a placeholder body replays as no memory blocks.
+fn served_memory_blocks(served: &str) -> (String, String) {
+    let block = |open: &str, close: &str| {
+        served
+            .find(open)
+            .and_then(|start| {
+                served[start..]
+                    .find(close)
+                    .map(|end| served[start..start + end + close.len()].to_string())
+            })
+            .unwrap_or_default()
+    };
+    (
+        block("<memory-updates>\n", "\n</memory-updates>"),
+        block("<new-memories>\n", "\n</new-memories>"),
+    )
+}
+
+/// The m1 of a busting SOFT. New compartments and a pending user-profile delta render as
+/// in [`compose_m1_from_store`], but the memory blocks are those of `served_m1`, the body
+/// this session is serving now: nothing here loads memory rows or the mutation log. The
+/// Rust renderer does not yet append the session's own agent fragments the way the
+/// OpenCode and Pi renderers do, so agent edits also wait for the next HARD fold here.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_soft_m1(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    meta: &ModuleMeta,
+    memory_enabled: bool,
+    user_profile_budget_tokens: f64,
+    temporal_awareness: bool,
+    served_m1: &str,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<M1Composition, M1ComposeError> {
+    compose_m1(
+        store,
+        project_path,
+        session_id,
+        meta,
+        0,
+        memory_enabled,
+        0.0,
+        user_profile_budget_tokens,
+        temporal_awareness,
+        estimate_tokens,
+        M1MemorySource::Served(served_m1),
+    )
+}
+
 /// EXPENSIVE bust-only: compose the m1 delta body from the store against the watermarks
 /// the last HARD froze in `meta`. `now_ms` is the frozen expiry cutoff (same as the m0
 /// compose). Reads compartments + memories; never call on a defer. `_note_project_path`
@@ -339,6 +407,7 @@ pub struct M1Composition {
 /// Every id m1 renders, and every id in `meta.rendered_memory_ids`, is a `context.db`
 /// memory id, whatever the harness.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn compose_m1_from_store(
     store: &McStore,
     project_path: &str,
@@ -351,6 +420,35 @@ pub fn compose_m1_from_store(
     user_profile_budget_tokens: f64,
     temporal_awareness: bool,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<M1Composition, M1ComposeError> {
+    compose_m1(
+        store,
+        project_path,
+        session_id,
+        meta,
+        now_ms,
+        memory_enabled,
+        memory_budget_tokens,
+        user_profile_budget_tokens,
+        temporal_awareness,
+        estimate_tokens,
+        M1MemorySource::Rows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compose_m1(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    meta: &ModuleMeta,
+    now_ms: i64,
+    memory_enabled: bool,
+    memory_budget_tokens: f64,
+    user_profile_budget_tokens: f64,
+    temporal_awareness: bool,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+    memory_source: M1MemorySource<'_>,
 ) -> Result<M1Composition, M1ComposeError> {
     // --- new compartments (seq past the folded watermark) at P1 + coverage extension ---
     // Store-only ordering deliberately allows sparse ordinal gaps; transform has
@@ -391,118 +489,125 @@ pub fn compose_m1_from_store(
         _ => None,
     };
 
-    let (mutations, memory_updates_block, new_memories_block) = if memory_enabled {
-        // Resolve membership from the calling project. The sorted union's first member is not
-        // necessarily the caller, so using it as `own_identity` would hide own private categories.
-        let membership = store.resolve_workspace_membership(project_path)?;
-        let paths = membership
-            .as_ref()
-            .map(|workspace| workspace.union_identities.clone())
-            .unwrap_or_else(|| vec![project_path.to_string()]);
+    let (mutations, memory_updates_block, new_memories_block) =
+        if let M1MemorySource::Served(served) = memory_source {
+            // Replayed corrections are bytes the session already serves, so they add nothing
+            // to the correction count the refold backstop reads: it stays 0.
+            let (updates, additions) = served_memory_blocks(served);
+            (Vec::new(), updates, additions)
+        } else if memory_enabled {
+            // Resolve membership from the calling project. The sorted union's first member is not
+            // necessarily the caller, so using it as `own_identity` would hide own private categories.
+            let membership = store.resolve_workspace_membership(project_path)?;
+            let paths = membership
+                .as_ref()
+                .map(|workspace| workspace.union_identities.clone())
+                .unwrap_or_else(|| vec![project_path.to_string()]);
 
-        // Rendered ids are context.db ids, the same ids the mutation log targets.
-        let baseline_module_ids = meta.rendered_memory_ids.clone();
+            // Rendered ids are context.db ids, the same ids the mutation log targets.
+            let baseline_module_ids = meta.rendered_memory_ids.clone();
 
-        // --- memory-updates (corrections to in-m0 memories, past the cursor) ---
-        // The store also returns visibility-transition markers for rows omitted from m0 and
-        // resolves supersede chains to their terminal target.
-        let pending_mutations = store.memory_mutations_for_render(
-            &paths,
-            meta.memory_mutation_cursor,
-            &baseline_module_ids,
-        )?;
-        let baseline_ids: HashSet<i64> = baseline_module_ids.iter().copied().collect();
+            // --- memory-updates (corrections to in-m0 memories, past the cursor) ---
+            // The store also returns visibility-transition markers for rows omitted from m0 and
+            // resolves supersede chains to their terminal target.
+            let pending_mutations = store.memory_mutations_for_render(
+                &paths,
+                meta.memory_mutation_cursor,
+                &baseline_module_ids,
+            )?;
+            let baseline_ids: HashSet<i64> = baseline_module_ids.iter().copied().collect();
 
-        // Read through the exact m0 visibility, lifecycle, and frozen-expiry predicate. Existing
-        // merge targets and newly-visible rows may be below the folded numeric watermark.
-        let eligible_memories =
-            load_render_eligible_memories(store, membership.as_ref(), project_path, now_ms)?;
-        let eligible_ids: HashSet<i64> = eligible_memories.iter().map(|memory| memory.id).collect();
-        let mut forced_ids = pending_mutations
-            .iter()
-            .filter_map(|mutation| {
-                if mutation.mutation_type == "superseded" {
-                    mutation.superseded_by_id
-                } else if mutation.visibility_changed
-                    && !baseline_ids.contains(&mutation.target_memory_id)
-                {
-                    Some(mutation.target_memory_id)
-                } else {
-                    None
-                }
-            })
-            .filter(|id| !baseline_ids.contains(id) && eligible_ids.contains(id))
-            .collect::<Vec<_>>();
-        forced_ids.sort_unstable();
-        forced_ids.dedup();
-        if forced_ids.len() > MAX_MERGE_REPLACEMENTS_PER_DELTA {
-            tracing::warn!(
-                "mc-module: m1 forced-memory cap exceeded session={} memories={} cap={}",
-                session_id,
-                forced_ids.len(),
-                MAX_MERGE_REPLACEMENTS_PER_DELTA
-            );
-            forced_ids.truncate(MAX_MERGE_REPLACEMENTS_PER_DELTA);
-        }
-        let forced_ids: HashSet<i64> = forced_ids.into_iter().collect();
-
-        // Numeric additions are limited to 25% of the m1 memory budget. Terminal merge
-        // replacements and visibility grants correct the rendered baseline, so they are emitted
-        // outside that additive limit and only once.
-        let additive_candidates = eligible_memories
-            .iter()
-            .filter(|memory| memory.id > meta.max_memory_id)
-            .filter(|memory| !forced_ids.contains(&memory.id))
-            .cloned()
-            .collect();
-        let source_name_by_id = membership
-            .as_ref()
-            .map(|workspace| workspace_source_names(&eligible_memories, workspace))
-            .unwrap_or_default();
-        let mut delta_memories = trim_memories_to_budget(
-            additive_candidates,
-            None,
-            &source_name_by_id,
-            (memory_budget_tokens.max(1.0) * 0.25).floor().max(1.0),
-            estimate_tokens,
-        );
-        delta_memories.extend(
-            eligible_memories
+            // Read through the exact m0 visibility, lifecycle, and frozen-expiry predicate. Existing
+            // merge targets and newly-visible rows may be below the folded numeric watermark.
+            let eligible_memories =
+                load_render_eligible_memories(store, membership.as_ref(), project_path, now_ms)?;
+            let eligible_ids: HashSet<i64> =
+                eligible_memories.iter().map(|memory| memory.id).collect();
+            let mut forced_ids = pending_mutations
                 .iter()
-                .filter(|memory| forced_ids.contains(&memory.id))
-                .cloned(),
-        );
+                .filter_map(|mutation| {
+                    if mutation.mutation_type == "superseded" {
+                        mutation.superseded_by_id
+                    } else if mutation.visibility_changed
+                        && !baseline_ids.contains(&mutation.target_memory_id)
+                    {
+                        Some(mutation.target_memory_id)
+                    } else {
+                        None
+                    }
+                })
+                .filter(|id| !baseline_ids.contains(id) && eligible_ids.contains(id))
+                .collect::<Vec<_>>();
+            forced_ids.sort_unstable();
+            forced_ids.dedup();
+            if forced_ids.len() > MAX_MERGE_REPLACEMENTS_PER_DELTA {
+                tracing::warn!(
+                    "mc-module: m1 forced-memory cap exceeded session={} memories={} cap={}",
+                    session_id,
+                    forced_ids.len(),
+                    MAX_MERGE_REPLACEMENTS_PER_DELTA
+                );
+                forced_ids.truncate(MAX_MERGE_REPLACEMENTS_PER_DELTA);
+            }
+            let forced_ids: HashSet<i64> = forced_ids.into_iter().collect();
 
-        let mut resolvable_ids: HashSet<i64> =
-            baseline_ids.intersection(&eligible_ids).copied().collect();
-        resolvable_ids.extend(delta_memories.iter().map(|memory| memory.id));
-        let mutations = pending_mutations
-            .into_iter()
-            .filter_map(|mut mutation| {
-                if !baseline_ids.contains(&mutation.target_memory_id) {
-                    return None;
-                }
-                if mutation.mutation_type == "superseded" {
-                    return Some(mutation);
-                }
-                if !eligible_ids.contains(&mutation.target_memory_id) {
-                    mutation.mutation_type = "delete".to_string();
-                    mutation.new_content = None;
-                    return Some(mutation);
-                }
-                if mutation.visibility_changed && mutation.new_content.is_none() {
-                    return None;
-                }
-                Some(mutation)
-            })
-            .collect::<Vec<_>>();
-        let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
-        let new_memories_block =
-            render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
-        (mutations, memory_updates_block, new_memories_block)
-    } else {
-        (Vec::new(), String::new(), String::new())
-    };
+            // Numeric additions are limited to 25% of the m1 memory budget. Terminal merge
+            // replacements and visibility grants correct the rendered baseline, so they are emitted
+            // outside that additive limit and only once.
+            let additive_candidates = eligible_memories
+                .iter()
+                .filter(|memory| memory.id > meta.max_memory_id)
+                .filter(|memory| !forced_ids.contains(&memory.id))
+                .cloned()
+                .collect();
+            let source_name_by_id = membership
+                .as_ref()
+                .map(|workspace| workspace_source_names(&eligible_memories, workspace))
+                .unwrap_or_default();
+            let mut delta_memories = trim_memories_to_budget(
+                additive_candidates,
+                None,
+                &source_name_by_id,
+                (memory_budget_tokens.max(1.0) * 0.25).floor().max(1.0),
+                estimate_tokens,
+            );
+            delta_memories.extend(
+                eligible_memories
+                    .iter()
+                    .filter(|memory| forced_ids.contains(&memory.id))
+                    .cloned(),
+            );
+
+            let mut resolvable_ids: HashSet<i64> =
+                baseline_ids.intersection(&eligible_ids).copied().collect();
+            resolvable_ids.extend(delta_memories.iter().map(|memory| memory.id));
+            let mutations = pending_mutations
+                .into_iter()
+                .filter_map(|mut mutation| {
+                    if !baseline_ids.contains(&mutation.target_memory_id) {
+                        return None;
+                    }
+                    if mutation.mutation_type == "superseded" {
+                        return Some(mutation);
+                    }
+                    if !eligible_ids.contains(&mutation.target_memory_id) {
+                        mutation.mutation_type = "delete".to_string();
+                        mutation.new_content = None;
+                        return Some(mutation);
+                    }
+                    if mutation.visibility_changed && mutation.new_content.is_none() {
+                        return None;
+                    }
+                    Some(mutation)
+                })
+                .collect::<Vec<_>>();
+            let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
+            let new_memories_block =
+                render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
+            (mutations, memory_updates_block, new_memories_block)
+        } else {
+            (Vec::new(), String::new(), String::new())
+        };
 
     // Profile rows and their version arrive together through state sync. Render the block only
     // after a version change, and leave the applied version behind when trimming leaves no body
@@ -1751,6 +1856,112 @@ mod tests {
             "{}",
             revoke.body
         );
+    }
+
+    /// The acceptance gate for the Rust renderer: a busting SOFT composes m1 without loading
+    /// memory rows or the mutation log. With both tables renamed away the SOFT still composes,
+    /// replays the served memory blocks byte for byte and renders the new compartment; the
+    /// row renderer, as the positive control, fails on the same store.
+    #[test]
+    fn soft_m1_reads_no_memory_rows_or_mutation_log() {
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
+        let project = "git:proj";
+        store
+            .replace_compartments("ses", &[comp(1, 1, 10, "m10"), comp(2, 11, 20, "m20")])
+            .unwrap();
+        store
+            .insert_memory(insert_input(
+                project,
+                "CONSTRAINTS",
+                "row only a fold reads",
+                1,
+            ))
+            .unwrap();
+        let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
+        let updates = "<memory-updates>\nserved correction line\n</memory-updates>";
+        let additions = "<new-memories>\nserved addition line\n</new-memories>";
+        let served =
+            format!("<session-history-since>\n{updates}\n{additions}\n</session-history-since>");
+        store
+            .with_context_conn_for_test(|tx| {
+                tx.execute_batch(
+                    "ALTER TABLE memories RENAME TO memories_hidden_for_gate;
+                     ALTER TABLE memory_mutation_log RENAME TO memory_mutation_log_hidden_for_gate;",
+                )
+            })
+            .unwrap();
+        let soft = compose_soft_m1(
+            store,
+            project,
+            "ses",
+            &meta,
+            true,
+            4_000.0,
+            true,
+            &served,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(soft.body.contains(updates), "{}", soft.body);
+        assert!(soft.body.contains(additions), "{}", soft.body);
+        assert!(soft.body.contains("<new-compartments>"), "{}", soft.body);
+        assert!(
+            !soft.body.contains("row only a fold reads"),
+            "{}",
+            soft.body
+        );
+        assert_eq!(soft.memory_update_count, 0);
+        assert!(compose_m1_from_store(
+            store,
+            project,
+            project,
+            "ses",
+            &meta,
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .is_err());
+    }
+
+    /// Interim gap until the Rust renderer gains agent fragments: OpenCode and Pi append a
+    /// session's own agent memory edits to its next busting m1, but a Rust SOFT replays only
+    /// the served memory blocks, so the same edit waits for the next HARD fold here.
+    #[test]
+    fn rust_soft_renders_no_agent_fragments_yet() {
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
+        let project = "git:proj";
+        store
+            .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
+            .unwrap();
+        store
+            .with_context_conn_for_test(|tx| {
+                tx.execute(
+                    "INSERT INTO memory_agent_fragments(session_id,harness,project_path,operation_key,memory_ids_json,current_id,lines,visible_texts_json,created_at) VALUES('ses','opencode',?1,'op','[1]',1,'  <updated id=\"1\">agent fragment line</updated>','[]',0)",
+                    [project],
+                )
+            })
+            .unwrap();
+        let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
+        let soft = compose_soft_m1(
+            store,
+            project,
+            "ses",
+            &meta,
+            true,
+            4_000.0,
+            true,
+            M1_PLACEHOLDER,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(!soft.body.contains("agent fragment line"), "{}", soft.body);
+        assert_eq!(soft.body, M1_PLACEHOLDER);
     }
 
     #[test]
