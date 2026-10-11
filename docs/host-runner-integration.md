@@ -256,16 +256,24 @@ control admits without local envelope bounds and each changed identity refuses.
 ## Reproducing
 
 `packages/e2e-tests/src/bridge-memory.test.ts` is an opt-in, real-module fixture.
-The v1 case runs **OpenCode 1.18.35** with `serve --pure` (no in-tree plugin), a
+The v1 cases run **OpenCode 1.18.35** with `serve --pure` (no in-tree plugin), a
 loopback mock Anthropic provider and a real `createOpencodeClient` from the v1 SDK.
-It creates a session and completes two real user/assistant turns, verifies their
-four IDs in the private `opencode.db`, then seeds an active `ARCHITECTURE` memory
-in `context.db` **before constructing the bridge adapter**. No v1 raw-history
+Both v1 cases seed an active `ARCHITECTURE` memory in `context.db` **before
+OpenCode, ck-mc or the adapter starts**. The existing-history case creates a
+session and completes two real user/assistant turns, verifies their four IDs in
+the private `opencode.db`, then constructs the bridge adapter. No v1 raw-history
 provider is registered: bootstrap must resolve those IDs from the canonical host
 store. The fixture sends the adapter's complete returned projection to a fake
 HTTP provider on both bootstrap and an ordinary pass of the same raw window,
 asserting the memory is in `messages[0]`, with role `user`, and both turns remain.
-It also asserts zero compartments (stored conversation summaries), so summaries
+The first-turn case instead constructs the adapter before any prompt, persists
+one real user message with the SDK's `noReply: true`, and bootstraps with no
+assistant history. It then completes that same user ID through OpenCode and
+runs an ordinary pass over the user/assistant pair. Both provider requests must
+contain the seeded memory in `messages[0]`. The raw bridge answer and the sent
+request are captured separately: these tests send the projection directly to the
+mock HTTP provider, not through an external bridge plugin's OpenCode conversion.
+Both cases assert zero compartments (stored conversation summaries), so summaries
 created by historian model calls cannot be the source of the injected memory.
 The two existing v2 cases instead register a canonical raw-history reader and
 exercise symlink and macOS `/var` versus `/private/var` project spellings.
@@ -308,7 +316,8 @@ env HOME="$ROOT/home" XDG_DATA_HOME="$ROOT/data" \
   nice -n 10 bun test packages/e2e-tests/src/bridge-memory.test.ts
 ```
 
-The v1 case further isolates each HOME/XDG root under `$ROOT/v1/`. Its facade
+The v1 cases further isolate each HOME/XDG root under `$ROOT/v1/` (existing
+history) or `$ROOT/v1-first-turn/` (first user turn). The existing-history facade
 `configPath` (also `MAGIC_CONTEXT_CONFIG_PATH`) is
 `$ROOT/v1/config/selected.jsonc`. Separately, `stack.writeModuleConfig(config)`
 writes `$ROOT/v1/data/module-config/cortexkit/magic-context.jsonc` in **ck-mc's**
@@ -341,8 +350,11 @@ lsof -nP -p "$CK_MC_PID" -Fn
 # Any database path outside ROOT is an isolation failure: stop the fixture.
 ```
 
-`$ROOT/v1/requests.json`, `opencode.log` and `lsof-{bridge,opencode,daemon,module}.txt`
-remain available after teardown as reproduction evidence. Never substitute live
+Each v1 root's `requests.json`, `bridge-views.json`, `opencode.log` and
+`lsof-{bridge,opencode,daemon,module}.txt` remain available after teardown as
+reproduction evidence. `bridge-views.json` preserves the adapter's returned
+`{ messages, kind }`, including the id-less synthetic text parts, before the
+fixture converts them to HTTP provider messages. Never substitute live
 OpenCode/CortexKit databases or configs for these throwaway inputs.
 
 ## Adapter-owned record access

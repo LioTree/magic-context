@@ -7,7 +7,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { openBridgeDatabase } from "../../plugin/src/features/magic-context/storage-db";
-import { createBridgeAdapter } from "../../plugin/src/host-runner";
+import { createBridgeAdapter, type BridgeView } from "../../plugin/src/host-runner";
 import { setRawMessageProvider } from "../../plugin/src/hooks/magic-context/read-session-chunk";
 import type { MessageLike } from "../../plugin/src/hooks/magic-context/transform-operations";
 import { MockProvider } from "./mock-provider/server";
@@ -153,7 +153,10 @@ for (const linked of [false, true]) {
 }, 60000);
 }
 
-(enabled ? test : test.skip)("OpenCode 1 v1 SDK bridge sends seeded project memory on bootstrap and ordinary passes from canonical opencode.db", async () => {
+for (const firstTurn of [false, true]) {
+(enabled ? test : test.skip)(firstTurn
+    ? "OpenCode 1 v1 SDK bridge sends seeded project memory on the first user turn without assistant history and after one reply"
+    : "OpenCode 1 v1 SDK bridge sends seeded project memory on bootstrap and ordinary passes from canonical opencode.db", async () => {
     const suppliedRoot = process.env.MC_BRIDGE_MEMORY_ROOT;
     const ckMcBin = process.env.MC_BRIDGE_MEMORY_BIN;
     const ckSubcBin = process.env.MC_BRIDGE_MEMORY_SUBC_BIN;
@@ -162,7 +165,7 @@ for (const linked of [false, true]) {
     expect(taskRoot).toContain("/magic-context/");
     for (const binary of [ckMcBin, ckSubcBin]) expect(realpathSync(binary).startsWith(`${taskRoot}/`)).toBe(true);
     const opencodeBin = process.env.MC_BRIDGE_MEMORY_OPENCODE_BIN ?? Bun.which("opencode") ?? join(process.env.HOME!, ".opencode", "bin", "opencode");
-    const root = join(suppliedRoot, "v1");
+    const root = join(suppliedRoot, firstTurn ? "v1-first-turn" : "v1");
     const dirs = Object.fromEntries(["home", "config", "data", "cache", "state", "runtime", "project"].map((name) => [name, join(root, name)]));
     for (const dir of Object.values(dirs)) mkdirSync(dir, { recursive: true });
     const project = dirs.project;
@@ -194,6 +197,10 @@ for (const linked of [false, true]) {
     let db: ReturnType<typeof openBridgeDatabase> | undefined;
     let hostLog = "";
     try {
+        // Seed before either host starts: ordinary passes replay the bootstrap's frozen head.
+        db = openBridgeDatabase(join(storageDir, "context.db"), true);
+        const identity = resolveProjectIdentity(project);
+        db.prepare("INSERT INTO memories (project_path, category, content, normalized_hash, status, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'ARCHITECTURE', ?, ?, 'active', 0, 0, 0, 0)").run(identity, memory, computeNormalizedHash(memory));
         expect(execFileSync(opencodeBin, ["--version"], { encoding: "utf8", env: process.env }).trim()).toBe("1.18.35");
         const { baseURL } = await mock.start();
         mock.setDefault({ text: "real stored reply", usage: { input_tokens: 1000, output_tokens: 20 } });
@@ -226,43 +233,73 @@ for (const linked of [false, true]) {
         const created = await client.session.create({ query: { directory: project }, body: { title: "v1 bridge memory proof" } });
         expect(created.error).toBeUndefined();
         const session = created.data!.id;
-        for (const text of ["first real turn", "second real turn"]) {
-            const reply = await client.session.prompt({ path: { id: session }, query: { directory: project }, body: { model, parts: [{ type: "text", text }] } });
+        const constructAdapter = async () => {
+            stack = await HermeticSubcStack.start({ dataDir: dirs.data, ckMcBin, ckSubcBin, startProducer: false, historianRunner: null });
+            stack.writeModuleConfig(config);
+            return createBridgeAdapter({ openCodeClient: client, projectRoot: project, storageDir, configPath, connectionFile: stack.connectionFile });
+        };
+        if (firstTurn) adapter = await constructAdapter();
+        for (const text of firstTurn ? ["first real turn"] : ["first real turn", "second real turn"]) {
+            const reply = await client.session.prompt({ path: { id: session }, query: { directory: project }, body: { model, noReply: firstTurn, parts: [{ type: "text", text }] } });
             expect(reply.error).toBeUndefined();
             expect(reply.data?.info.error).toBeUndefined();
         }
         const messages = await client.session.messages({ path: { id: session }, query: { directory: project } });
         expect(messages.error).toBeUndefined();
         const rows = messages.data!;
-        expect(rows.map((row) => row.info.role)).toEqual(["user", "assistant", "user", "assistant"]);
-        expect(mock.requests()).toHaveLength(2);
+        expect(rows.map((row) => row.info.role)).toEqual(firstTurn ? ["user"] : ["user", "assistant", "user", "assistant"]);
+        expect(mock.requests()).toHaveLength(firstTurn ? 0 : 2);
         const canonical = new Database(opencodeDb, { readonly: true });
         try {
             expect(canonical.prepare("SELECT id FROM message WHERE session_id=?").all(session).map((row) => (row as { id: string }).id).sort()).toEqual(rows.map((row) => row.info.id).sort());
         } finally { canonical.close(); }
-        // Bootstrap stores the project-memory text in messages[0]. Ordinary passes
-        // reuse that stored text; memories inserted afterward wait for a rebuild.
-        // Seed before adapter construction to exercise the initial composition.
-        db = openBridgeDatabase(join(storageDir, "context.db"), true);
-        const identity = resolveProjectIdentity(project);
-        db.prepare("INSERT INTO memories (project_path, category, content, normalized_hash, status, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'ARCHITECTURE', ?, ?, 'active', 0, 0, 0, 0)").run(identity, memory, computeNormalizedHash(memory));
-        stack = await HermeticSubcStack.start({ dataDir: dirs.data, ckMcBin, ckSubcBin, startProducer: false, historianRunner: null });
-        stack.writeModuleConfig(config);
-        adapter = await createBridgeAdapter({ openCodeClient: client, projectRoot: project, storageDir, configPath, connectionFile: stack.connectionFile });
+        adapter ??= await constructAdapter();
         mock.reset();
         mock.setDefault({ text: "bridge view received", usage: { input_tokens: 1000, output_tokens: 20 } });
         // The v1 SDK's user info.summary holds title/body/diffs; MessageLike's
         // info.summary is a boolean marking assistant compaction summaries.
         // Cast only the type: rewriting the SDK rows would no longer test real host input.
-        const rawWindow = rows as unknown as MessageLike[];
+        let rawWindow = rows as unknown as MessageLike[];
+        const requests: ReturnType<MockProvider["requests"]> = [];
+        const views: BridgeView[] = [];
         for (let pass = 0; pass < 2; pass++) {
             const result = await adapter.run({ sessionId: session, messages: rawWindow, kind: "model" });
+            views.push(result);
             expect(result.kind).toBe(pass ? "ordinary" : "bootstrap");
             await sendProviderView(baseURL, result.messages);
+            requests.push(mock.requests().at(-1)!);
+            if (firstTurn && !pass) {
+                // Reuse the persisted user ID so the real host completes that turn, not a second prompt.
+                const reply = await client.session.prompt({ path: { id: session }, query: { directory: project }, body: {
+                    model, messageID: rows[0].info.id, parts: [{ type: "text", text: "first real turn" }],
+                } });
+                expect(reply.error).toBeUndefined();
+                expect(reply.data?.info.error).toBeUndefined();
+                const completed = await client.session.messages({ path: { id: session }, query: { directory: project } });
+                expect(completed.error).toBeUndefined();
+                expect(completed.data!.map((row) => row.info.role)).toEqual(["user", "assistant"]);
+                rawWindow = completed.data! as unknown as MessageLike[];
+            }
         }
-        const requests = mock.requests();
         writeFileSync(join(root, "requests.json"), JSON.stringify(requests, null, 2));
+        writeFileSync(join(root, "bridge-views.json"), JSON.stringify(views, null, 2));
         expect(requests).toHaveLength(2);
+        expect(views[0].messages).toHaveLength(firstTurn ? 3 : 6);
+        expect(views[1].messages).toHaveLength(firstTurn ? 4 : 6);
+        expect(views[1].messages.slice(0, 2)).toEqual(views[0].messages.slice(0, 2));
+        for (const view of views) {
+            for (const head of view.messages.slice(0, 2)) {
+                expect(head.info).toEqual({ role: "user", sessionID: session });
+                expect(head.parts).toEqual([{ type: "text", text: expect.any(String), synthetic: true }]);
+            }
+        }
+        const contextDb = realpathSync(join(storageDir, "context.db"));
+        const pids = JSON.parse(readFileSync(join(dirs.data, "cortexkit", "rust-e2e-pids.json"), "utf8")).pids as { role: string; pid: number }[];
+        const inventories = new Map([{ role: "bridge", pid: process.pid }, { role: "opencode", pid: host.pid! }, ...pids].map(({ role, pid }) => [role, databaseInventory(root, taskRoot, role, pid)]));
+        expect(inventories.get("bridge")).toContain(contextDb);
+        expect(inventories.get("module")).toContain(contextDb);
+        expect(inventories.get("opencode")).toContain(realpathSync(opencodeDb));
+        console.log(`v1 ${firstTurn ? "first-turn" : "history"} bootstrap returned ${views[0].messages.length} messages; head: ${JSON.stringify(views[0].messages.slice(0, 2))}`);
         for (const { body } of requests) {
             expect(body.system).toBeUndefined();
             expect(body.messages?.[0].role).toBe("user");
@@ -271,16 +308,10 @@ for (const linked of [false, true]) {
             expect(body.messages?.[0].content).toContain(memory);
             expect(body.messages?.[1].content).toContain("<session-history-since>");
             expect(JSON.stringify(body.messages)).toContain("first real turn");
-            expect(JSON.stringify(body.messages)).toContain("second real turn");
+            if (!firstTurn) expect(JSON.stringify(body.messages)).toContain("second real turn");
         }
         expect(db.prepare("SELECT project_path FROM session_projects WHERE session_id=? AND harness='opencode'").get(session)).toEqual({ project_path: identity });
         expect(db.prepare("SELECT COUNT(*) AS n FROM compartments WHERE session_id=?").get(session)).toEqual({ n: 0 });
-        const contextDb = realpathSync(join(storageDir, "context.db"));
-        const pids = JSON.parse(readFileSync(join(dirs.data, "cortexkit", "rust-e2e-pids.json"), "utf8")).pids as { role: string; pid: number }[];
-        const inventories = new Map([{ role: "bridge", pid: process.pid }, { role: "opencode", pid: host.pid! }, ...pids].map(({ role, pid }) => [role, databaseInventory(root, taskRoot, role, pid)]));
-        expect(inventories.get("bridge")).toContain(contextDb);
-        expect(inventories.get("module")).toContain(contextDb);
-        expect(inventories.get("opencode")).toContain(realpathSync(opencodeDb));
         console.log(`Bun ${Bun.version}; OpenCode 1.18.35; v1 session=${session} harness=opencode project=${project} identity=${identity}; captured ${requests.length} bridge provider requests`);
     } finally {
         writeFileSync(join(root, "opencode.log"), hostLog);
@@ -298,3 +329,4 @@ for (const linked of [false, true]) {
         }
     }
 }, 60000);
+}
