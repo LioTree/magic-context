@@ -4,6 +4,7 @@ import { runMigrations } from "../migrations";
 import { resolveMemoriesByIdsForSearch } from "../search";
 import { initializeDatabase } from "../storage-db";
 import { readFullyVisibleMemoryIds, writeHardProjection } from "./applied-projection";
+import { applyMemoryAdmission } from "./lifecycle-applier";
 import { archiveMemory, insertMemory } from "./storage-memory";
 
 function store() {
@@ -45,6 +46,41 @@ describe("applied projection visibility", () => {
                 deltaMemories: [],
             });
             expect([...(readFullyVisibleMemoryIds(db, "ses") ?? [])]).toEqual([shown.id]);
+        } finally {
+            db.close();
+        }
+    });
+
+    // A dreamer save is an automated insert: it keeps its dreamer provenance and
+    // records no fragment, so no session's busting SOFT can show it. An agent save
+    // by the same session does record one.
+    test("dreamer saves record no agent fragment; agent saves do", () => {
+        const db = store();
+        try {
+            for (const [key, sourceType] of [
+                ["dreamer-save", "dreamer"],
+                ["agent-save", "agent"],
+            ] as const)
+                applyMemoryAdmission(db, {
+                    key,
+                    operation: "agent_save",
+                    input: {
+                        projectPath,
+                        category: "ARCHITECTURE",
+                        content: `Saved by the ${sourceType}.`,
+                        sourceSessionId: "ses",
+                        sourceType,
+                    },
+                });
+            expect(
+                db.prepare("SELECT content, source_type FROM memories ORDER BY id").all(),
+            ).toEqual([
+                { content: "Saved by the dreamer.", source_type: "dreamer" },
+                { content: "Saved by the agent.", source_type: "agent" },
+            ]);
+            expect(db.prepare("SELECT operation_key FROM memory_agent_fragments").all()).toEqual([
+                { operation_key: "agent-save" },
+            ]);
         } finally {
             db.close();
         }

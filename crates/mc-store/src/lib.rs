@@ -17424,48 +17424,43 @@ fn set_memory_verification_tx(
                     "DELETE FROM memory_verifications WHERE memory_id = ?1",
                     params![update.memory_id],
                 )?;
-                append_memory_mutation_tx(
+                // A gated verify correction is an automated edit: undo history and a new
+                // revision, but no mutation-log row, so prompts see it only at their next
+                // natural HARD fold (the TypeScript verify writes the same records).
+                record_automated_memory_edit_tx(
                     tx,
-                    MemoryMutationAppend {
-                        project_path: project,
-                        mutation_type: "update",
-                        target_memory_id: update.memory_id,
-                        superseded_by_id: None,
-                        category: Some(&memory.category),
-                        new_content: Some(content),
-                        queued_at: now_ms,
-                    },
+                    update.memory_id,
+                    &memory.content,
+                    content,
+                    "verify_update",
+                    now_ms,
                 )?;
             }
             "archive" => {
-                let metadata = merge_archive_reason(
-                    memory.metadata_json.as_deref(),
-                    update
-                        .archive_reason
-                        .as_deref()
-                        .unwrap_or("verified archive"),
-                );
-                tx.execute(
-                    "UPDATE memories
-                        SET status = 'archived', metadata_json = ?1, updated_at = ?2
-                      WHERE id = ?3",
-                    params![metadata, now_ms, update.memory_id],
-                )?;
-                tx.execute(
-                    "DELETE FROM memory_verifications WHERE memory_id = ?1",
+                // "The files refute this memory" is a model-judged retirement: it waits as
+                // a pending proposal and the row stays live, as the TypeScript verify does.
+                let revision: i64 = tx.query_row(
+                    "SELECT revision FROM memories WHERE id = ?1",
                     params![update.memory_id],
+                    |row| row.get(0),
                 )?;
-                append_memory_mutation_tx(
-                    tx,
-                    MemoryMutationAppend {
-                        project_path: project,
-                        mutation_type: "archive",
-                        target_memory_id: update.memory_id,
-                        superseded_by_id: None,
-                        category: None,
-                        new_content: None,
-                        queued_at: now_ms,
-                    },
+                tx.execute(
+                    "INSERT OR IGNORE INTO memory_tool_proposals
+                        (project_path, source_session_id, proposal_key, writer, operation,
+                         target_ids_json, expected_revisions_json, proposal_json, reason, created_at)
+                     VALUES (?1, NULL, ?2, 'verify', 'archive', ?3, ?4, ?5, 'MEMORY_PENDING_PROPOSAL', ?6)",
+                    params![
+                        project,
+                        format!("verify-archive:{}:{}", update.memory_id, memory.normalized_hash),
+                        serde_json::json!([update.memory_id]).to_string(),
+                        serde_json::json!([{ "id": update.memory_id, "revision": revision }])
+                            .to_string(),
+                        serde_json::json!({
+                            "reason": update.archive_reason.as_deref().unwrap_or("verified archive")
+                        })
+                        .to_string(),
+                        now_ms,
+                    ],
                 )?;
             }
             _ => {
@@ -17479,6 +17474,44 @@ fn set_memory_verification_tx(
         accepted.push(update.memory_id);
     }
     Ok(VerificationApplyResult { accepted, rejected })
+}
+
+/// Record an automated writer's direct content edit as undo history and advance the
+/// memory's revision. The caller has already changed the row in this transaction.
+fn record_automated_memory_edit_tx(
+    tx: &rusqlite::Connection,
+    memory_id: i64,
+    previous_text: &str,
+    after_text: &str,
+    reason: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let revision: i64 = tx.query_row(
+        "SELECT revision FROM memories WHERE id = ?1",
+        params![memory_id],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO memory_history
+            (memory_id, revision, previous_text, after_text, applied_at, reason,
+             evidence_json, source_ids_json, decision_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', ?7, ?8)",
+        params![
+            memory_id,
+            revision,
+            previous_text,
+            after_text,
+            now_ms,
+            reason,
+            serde_json::json!([memory_id]).to_string(),
+            format!("{reason}:{memory_id}:{revision}"),
+        ],
+    )?;
+    tx.execute(
+        "UPDATE memories SET revision = revision + 1 WHERE id = ?1",
+        params![memory_id],
+    )?;
+    Ok(())
 }
 
 fn set_memory_mapping_tx(

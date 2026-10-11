@@ -42,7 +42,11 @@ import {
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import type { Memory } from "@magic-context/core/features/magic-context/memory/types";
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
-import type { MuralWireOptions } from "@magic-context/core/features/magic-context/mural/resolve-mural";
+import {
+	type MuralPool,
+	type MuralWireOptions,
+	readMuralPool,
+} from "@magic-context/core/features/magic-context/mural/resolve-mural";
 import { isNoContentCompartment } from "@magic-context/core/features/magic-context/no-content-compartment";
 import {
 	type ContextDatabase,
@@ -389,6 +393,11 @@ interface FrozenM0Inputs {
 	memories: Memory[];
 	userProfile: UserMemory[];
 	workspace: WorkspaceRenderContext;
+	/**
+	 * The mural's rows and cues, read in the same snapshot as the m[0] memories,
+	 * so text and image describe one memory state. Undefined when no mural renders.
+	 */
+	muralPool?: MuralPool;
 }
 
 /**
@@ -423,6 +432,8 @@ function safeGetActiveUserMemoriesPi(db: ContextDatabase): UserMemory[] {
 export interface PiM0M1State {
 	/** Test hook before writer admission, before any m[1] render reads. */
 	beforeCacheCommitForTest?: () => void;
+	/** Runs after a HARD fold's frozen read and before its mural resolves. */
+	afterM0InputsReadForTest?: () => void;
 	/** These delivery fields are scoped to one context pass, never persisted. */
 	freezePrefixForPass?: boolean;
 	allowFreshContentionFallback?: boolean;
@@ -727,6 +738,7 @@ function resolveMuralForM0Pi(
 	modelKey: string,
 	budgetTokens: number,
 	mode: "persist" | "read-only" = "persist",
+	capturedPool?: MuralPool,
 ): MuralWireOptions | undefined {
 	if (state.memoryEnabled === false) return undefined;
 	if (state.mural) return state.mural;
@@ -738,6 +750,7 @@ function resolveMuralForM0Pi(
 		true,
 		budgetTokens,
 		mode,
+		capturedPool,
 	);
 }
 
@@ -1573,6 +1586,13 @@ function readFrozenM0InputsPi(
 			: [];
 		const userProfile =
 			state.memoryEnabled === false ? [] : safeGetActiveUserMemoriesPi(db);
+		const muralPool =
+			memPath &&
+			state.memoryEnabled !== false &&
+			state.muralEnabled === true &&
+			!state.mural
+				? readMuralPool(db, memPath)
+				: undefined;
 		const projectState = memPath ? getProjectState(db, memPath) : undefined;
 		const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
 		const markers: PiM0SnapshotMarkers = {
@@ -1628,7 +1648,15 @@ function readFrozenM0InputsPi(
 				state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
 			),
 		};
-		return { docs, markers, compartments, memories, userProfile, workspace };
+		return {
+			docs,
+			markers,
+			compartments,
+			memories,
+			userProfile,
+			workspace,
+			muralPool,
+		};
 	});
 	return read.deferred();
 }
@@ -1664,6 +1692,7 @@ function renderFreshM0PiNonPersisted(
 		frozen.markers.modelKey,
 		memoryBudget,
 		"read-only",
+		frozen.muralPool,
 	);
 	rememberPiMural(state.sessionId, mural);
 	let dpm = 1;
@@ -1750,11 +1779,17 @@ export function materializeM0Pi(
 	// this fold's model key. Baked-in cachedMuralBySession replays on defer.
 	const memoryBudget =
 		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
+	state.afterM0InputsReadForTest?.();
+	// The mural draws from the pool read with the m[0] memories, never from live
+	// rows, so a write after the frozen read cannot give text and image different
+	// memory states.
 	const mural = resolveMuralForM0Pi(
 		state,
 		db,
 		snapshotMarkers.modelKey,
 		memoryBudget,
+		"persist",
+		frozen.muralPool,
 	);
 	const frozenMuralDataUrl =
 		mural?.enabled && mural.supportsVision ? (mural.dataUrl ?? null) : null;
@@ -1898,7 +1933,9 @@ export function materializeM0Pi(
 		// agent fragment up to this writer's watermark is already in the rows this
 		// fold rendered, so later SOFT passes append only newer fragments.
 		const memoriesById = new Map(
-			snapshotMemories.map((memory) => [memory.id, memory] as const),
+			[...(frozen.muralPool?.memories ?? []), ...snapshotMemories].map(
+				(memory) => [memory.id, memory] as const,
+			),
 		);
 		const pick = (ids: readonly number[] | undefined) =>
 			(ids ?? []).flatMap((id) => {

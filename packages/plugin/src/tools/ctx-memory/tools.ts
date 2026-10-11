@@ -511,6 +511,10 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         category,
                         content,
                         sourceSessionId: toolContext.sessionID,
+                        // A dreamer save is an automated insert: it writes no fragment.
+                        ...(toolContext.agent === DREAMER_AGENT
+                            ? { sourceType: "dreamer" as const }
+                            : {}),
                     },
                 });
                 if (receipt.state !== "applied") return `${receipt.reason}: memory was not saved.`;

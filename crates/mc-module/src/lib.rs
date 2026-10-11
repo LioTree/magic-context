@@ -32402,9 +32402,29 @@ mod tests {
         let after_update =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
         assert_eq!(update_body["accepted"], json!([updated_id]));
-        assert_ne!(
+        // A gated verify correction is an automated edit: it changes the row and records
+        // undo history but writes no mutation-log row, so it opens no SOFT and reaches
+        // prompts only at their next natural HARD fold.
+        assert_eq!(
             after_update, before_update,
-            "content updates advance the m1 mutation signal"
+            "an automated content update must not move the m1 mutation signal"
+        );
+        let (history, log_rows, revision): (i64, i64, i64) = store
+            .with_context_conn_for_test(|tx| {
+                tx.query_row(
+                    "SELECT
+                        (SELECT COUNT(*) FROM memory_history WHERE memory_id = ?1 AND after_text = 'updated by verifier'),
+                        (SELECT COUNT(*) FROM memory_mutation_log WHERE target_memory_id = ?1),
+                        (SELECT revision FROM memories WHERE id = ?1)",
+                    [updated_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!((history, log_rows, revision), (1, 0, 2));
+        assert_eq!(
+            store.get_memory_full(updated_id).unwrap().unwrap().content,
+            "updated by verifier"
         );
 
         let before_archive =
@@ -32416,9 +32436,34 @@ mod tests {
         assert!(matches!(archive, HandlerOutcome::Response(_)));
         let after_archive =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        assert!(
-            after_archive > before_archive,
-            "archives advance the m1 mutation signal"
+        // A verify archive is a model-judged retirement: a pending proposal, the row
+        // stays live, and nothing moves the prompt.
+        assert_eq!(
+            after_archive, before_archive,
+            "a verify archive must not move the m1 mutation signal"
+        );
+        assert_eq!(
+            store.get_memory_full(archived_id).unwrap().unwrap().status,
+            "active"
+        );
+        let proposals: Vec<(String, String, String)> = store
+            .with_context_conn_for_test(|tx| {
+                let mut statement = tx.prepare(
+                    "SELECT writer, operation, target_ids_json FROM memory_tool_proposals",
+                )?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>();
+                rows
+            })
+            .unwrap();
+        assert_eq!(
+            proposals,
+            vec![(
+                "verify".to_string(),
+                "archive".to_string(),
+                format!("[{archived_id}]")
+            )]
         );
 
         let mapping = call_facade(&handler, "memory.set_mapping", json!({

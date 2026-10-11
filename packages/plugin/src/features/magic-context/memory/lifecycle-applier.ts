@@ -203,7 +203,13 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
             } else {
                 memory = insertMemory(db, {
                     ...request.input,
-                    sourceType: request.operation === "agent_save" ? "agent" : "historian",
+                    // A dreamer save keeps its provenance; every other save is the agent's.
+                    sourceType:
+                        request.operation !== "agent_save"
+                            ? "historian"
+                            : request.input.sourceType === "dreamer"
+                              ? "dreamer"
+                              : "agent",
                     importance: request.operation === "agent_save" ? 50 : request.input.importance,
                     expiresAt:
                         request.operation === "agent_save"
@@ -212,9 +218,15 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
                 });
             }
             if (target) linkConflict(db, request.key, memory.id, target.id);
-            // An agent's own save surfaces in its session's m[1] as a fragment; historian
-            // admissions are automated and wait for the next HARD fold.
-            if (request.operation === "agent_save" && !match && request.input.sourceSessionId)
+            // An agent's own save surfaces in its session's m[1] as a fragment. Historian
+            // admissions and dreamer saves are automated: no fragment, so they wait for
+            // the next HARD fold.
+            if (
+                request.operation === "agent_save" &&
+                !match &&
+                request.input.sourceSessionId &&
+                request.input.sourceType !== "dreamer"
+            )
                 recordAgentFragment(db, {
                     sessionId: request.input.sourceSessionId,
                     harness: request.sourceHarness,
