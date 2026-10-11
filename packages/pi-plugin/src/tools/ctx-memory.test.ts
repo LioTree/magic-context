@@ -295,6 +295,75 @@ describe("createCtxMemoryTool", () => {
 		}
 	});
 
+	// Primary-agent edits share OpenCode's applier: each one writes undo history
+	// and exactly one fragment for the session that made it, which that session's
+	// next busting m[1] shows.
+	it("routes primary write, update, merge and archive through the shared applier", async () => {
+		const db = createTestDb();
+		try {
+			const primary = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const ctx = fakeContext("ses-routed") as never;
+			const run = async (params: Record<string, unknown>) => {
+				const result = await primary.execute(
+					"call",
+					params as never,
+					new AbortController().signal,
+					undefined,
+					ctx,
+				);
+				expect(result.isError).toBeUndefined();
+				return Number(result.content[0]?.text?.match(/ID:\s*(\d+)/)?.[1]);
+			};
+			const first = await run({
+				action: "write",
+				category: "ARCHITECTURE",
+				content: "First routed fact.",
+			});
+			const second = await run({
+				action: "write",
+				category: "ARCHITECTURE",
+				content: "Second routed fact.",
+			});
+			await run({
+				action: "update",
+				ids: [first],
+				content: "First fact, edited.",
+			});
+			const merged = await run({
+				action: "merge",
+				ids: [first, second],
+				content: "Both facts, merged.",
+			});
+			await run({ action: "archive", ids: [merged] });
+			const fragments = db
+				.prepare(
+					"SELECT session_id, lines FROM memory_agent_fragments ORDER BY id",
+				)
+				.all() as Array<{ session_id: string; lines: string }>;
+			expect(fragments.map((fragment) => fragment.session_id)).toEqual(
+				Array(5).fill("ses-routed"),
+			);
+			expect(fragments[2]?.lines).toBe(
+				`  <updated id="${first}" category="ARCHITECTURE">First fact, edited.</updated>`,
+			);
+			expect(fragments[4]?.lines).toBe(`  <removed id="${merged}"/>`);
+			expect(
+				(
+					db.prepare("SELECT COUNT(*) AS n FROM memory_history").get() as {
+						n: number;
+					}
+				).n,
+			).toBeGreaterThanOrEqual(4);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("refuses a curate user-profile archive without a surviving successor", async () => {
 		const db = createTestDb();
 		try {

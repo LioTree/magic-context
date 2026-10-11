@@ -32,6 +32,7 @@
  * versa).
  */
 
+import { randomUUID } from "node:crypto";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
 	curateCategoryForMemoryCategory,
@@ -65,6 +66,14 @@ import {
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { invalidateMemory } from "@magic-context/core/features/magic-context/memory/embedding-cache";
+import {
+	type AgentMemoryMutation,
+	type ApplierReceipt,
+	applyAgentMemoryMutation,
+	applyMemoryAdmission,
+	getMemoryRevision,
+	MemoryContentDuplicateError,
+} from "@magic-context/core/features/magic-context/memory/lifecycle-applier";
 import { computeNormalizedHash } from "@magic-context/core/features/magic-context/memory/normalize-hash";
 import {
 	normalizeStoredProjectPath,
@@ -390,6 +399,27 @@ export function createCtxMemoryTool(
 	deps: CtxMemoryToolDeps,
 ): ToolDefinition<typeof PrimaryParamsSchema | typeof DreamerParamsSchema> {
 	const dreamerAllowed = deps.allowDreamerActions === true;
+	/**
+	 * A primary agent's update, merge or archive applies immediately through the
+	 * shared applier: revision-checked, with undo history and the fragment that
+	 * shows the change in this session's next busting m[1]. Returns the error
+	 * text to report when the change was refused.
+	 */
+	const applyPrimaryAgentMutation = (
+		mutation: AgentMemoryMutation,
+	): ApplierReceipt | string => {
+		let receipt: ApplierReceipt;
+		try {
+			receipt = applyAgentMemoryMutation(deps.db, mutation);
+		} catch (error) {
+			if (error instanceof MemoryContentDuplicateError)
+				return `Error: ${error.message}`;
+			throw error;
+		}
+		return receipt.state === "applied"
+			? receipt
+			: `Error: ${receipt.reason}; memory is unchanged.`;
+	};
 	const resolveProject =
 		deps.resolveProjectIdentity ?? resolveProjectIdentityForSession;
 	return {
@@ -593,6 +623,36 @@ export function createCtxMemoryTool(
 					return err("Error: 'category' is required when action is 'write'.");
 				}
 
+				// A primary agent's save goes through the shared applier, which also
+				// records the fragment that shows it in this session's next busting m[1].
+				if (!dreamerAllowed) {
+					const receipt = applyMemoryAdmission(deps.db, {
+						key: randomUUID(),
+						operation: "agent_save",
+						input: {
+							projectPath: projectIdentity,
+							category: rawCategory,
+							content,
+							sourceSessionId: sessionId,
+							sourceType: "agent",
+						},
+					});
+					if (receipt.state !== "applied")
+						return err(`${receipt.reason}: memory was not saved.`);
+					if (!receipt.inserted)
+						return ok(
+							`Memory already exists [ID: ${receipt.memoryId}] in ${rawCategory} (seen count incremented).`,
+						);
+					queueEmbedding({
+						deps,
+						projectIdentity,
+						memoryId: receipt.memoryId!,
+						content,
+					});
+					return ok(
+						`Saved memory [ID: ${receipt.memoryId}] in ${rawCategory}.`,
+					);
+				}
 				const existing = getMemoryByHash(
 					deps.db,
 					projectIdentity,
@@ -712,6 +772,30 @@ export function createCtxMemoryTool(
 					);
 				}
 
+				if (!dreamerAllowed) {
+					const receipt = applyPrimaryAgentMutation({
+						key: randomUUID(),
+						projectPath: targetIdentity,
+						operation: "update",
+						sourceSessionId: sessionId,
+						targets: [
+							{
+								id: memory.id,
+								revision: getMemoryRevision(deps.db, memory.id)!,
+							},
+						],
+						content,
+						category: targetCategory,
+					});
+					if (typeof receipt === "string") return err(receipt);
+					queueEmbedding({
+						deps,
+						projectIdentity: targetIdentity,
+						memoryId: memory.id,
+						content,
+					});
+					return ok(`Updated memory [ID: ${memory.id}] in ${targetCategory}.`);
+				}
 				runImmediateTransaction(deps.db, () => {
 					updateMemoryContentInCurrentTransaction(
 						deps.db,
@@ -877,6 +961,30 @@ export function createCtxMemoryTool(
 					? "permanent"
 					: "active";
 
+				if (!dreamerAllowed) {
+					const receipt = applyPrimaryAgentMutation({
+						key: randomUUID(),
+						projectPath: projectIdentity,
+						operation: "merge",
+						sourceSessionId: sessionId,
+						targets: sourceMemories.map((memory) => ({
+							id: memory.id,
+							revision: getMemoryRevision(deps.db, memory.id)!,
+						})),
+						content,
+						category,
+					});
+					if (typeof receipt === "string") return err(receipt);
+					queueEmbedding({
+						deps,
+						projectIdentity,
+						memoryId: receipt.memoryId!,
+						content,
+					});
+					return ok(
+						`Merged memories [${ids.join(", ")}] into canonical memory [ID: ${receipt.memoryId}] in ${category}; superseded [${(receipt.supersededIds ?? []).join(", ")}].`,
+					);
+				}
 				let canonicalMemory!: Memory;
 				deps.db
 					.transaction(() => {
@@ -1004,6 +1112,24 @@ export function createCtxMemoryTool(
 						projectIdentity: targetIdentityForStoredPath(memory.projectPath),
 					};
 				});
+				const reasonSuffix = params.reason ? ` (${params.reason})` : "";
+				const idList = archiveIds.join(", ");
+				const plural = archiveIds.length > 1 ? "memories" : "memory";
+				if (!dreamerAllowed) {
+					const receipt = applyPrimaryAgentMutation({
+						key: randomUUID(),
+						projectPath: projectIdentity,
+						operation: "archive",
+						sourceSessionId: sessionId,
+						targets: archiveIds.map((id) => ({
+							id,
+							revision: getMemoryRevision(deps.db, id)!,
+						})),
+						reason: params.reason,
+					});
+					if (typeof receipt === "string") return err(receipt);
+					return ok(`Archived ${plural} [ID: ${idList}]${reasonSuffix}.`);
+				}
 				runImmediateTransaction(deps.db, () => {
 					for (const target of targets) {
 						archiveMemory(deps.db, target.memoryId, params.reason);
@@ -1024,9 +1150,6 @@ export function createCtxMemoryTool(
 						}
 					}
 				});
-				const reasonSuffix = params.reason ? ` (${params.reason})` : "";
-				const idList = archiveIds.join(", ");
-				const plural = archiveIds.length > 1 ? "memories" : "memory";
 				return ok(`Archived ${plural} [ID: ${idList}]${reasonSuffix}.`);
 			}
 
