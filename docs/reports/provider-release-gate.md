@@ -56,7 +56,7 @@ Toolchain: Cargo `1.99.0 (5f94df478 2026-08-27)`, rustc `1.99.0 (b940084d7 2026-
 - Mac `nice -n 10 cargo test --locked -j 4 -p mc-module --test real_daemon -- --test-threads=1 --nocapture`: **5 passed, 2 ignored** (85.28 s); the ignored cases require private sync/planning captures. `MC_TEST_SUBCONSCIOUS_ROOT` points to a task-owned clone of Cargo.lock's exact revision, not the parent/sibling checkout. The test still exports/validates only that committed revision. Its ck-mc startups reported **10–12 isolated database handles** through lsof.
 - Mac niced no-Broca host-runner test: **1 passed**, with lsof proof; niced `real_daemon_store_ahead`: **1 passed**, using the same prebuilt lock-pinned debug daemon/CLI.
 - Final `cargo fmt --check`: passed.
-- Final `cargo clippy --locked --workspace --all-targets -- -D warnings`: passed, all four workspace crates and test/integration targets (default feature set). The existing fault-only `AtomicUsize::fetch_update` deprecation warnings on rustc 1.99 were not rewritten as unrelated product changes.
+- Final `cargo clippy --locked --workspace --all-targets -- -D warnings`: passed, all four workspace crates and test/integration targets (default feature set). At the initial delivery, existing fault-only `AtomicUsize::fetch_update` deprecation warnings on rustc1.99 were not rewritten outside scope; the explicit follow-up below replaces those calls and passes fault-enabled strict clippy.
 - Exact v64 SQL comparison against the exported `90488bd9f2` constant: **1 passed**. Migration v65 SQL is the unmodified blob from S3.
 - AFT inspection was partial: its local diagnostic build did not complete and Linux-only conformance modules are unlinked on the Mac analyzer. The authoritative Linux cargo check, test compilation and all-targets clippy gates passed; partial IDE coverage is not presented as clean diagnostics.
 
@@ -105,3 +105,64 @@ Amendment reruns on Linux8c: `cargo check --locked -p mc-store -p mc-module --al
 ## Placement and rollback limits
 
 This is executable/source compatibility evidence on synthetic isolated data produced by master, not a production snapshot, a live Broca canary, a release-size claim or a placement authorization. Only ck-mc needs deployment for this provider surface; no context migration or host dist rebuild is required. A later v66–v68 migration train can apply its unchanged private-store migrations over these identical v64/v65 layouts. Rollback needs the paired pre-upgrade private-store/context backup and stopped writers: an old max63 executable cannot open a store already advanced to65. The live-store backup/drain/swap/canary work remains outside this task.
+
+## Closure of independent review 78cfca2e
+
+The independent report was cherry-picked from `78cfca2e` onto this task branch and is retained unchanged in `provider-release-review.md`: its placement block applies to candidate da10df31. The follow-up changes below close the specified findings without changing the schema95/private65 or SDK/role-pin boundary.
+
+### Runner admission
+
+`handle_provider_value` now checks the verified bind harness against `RUNNER_BIND_HARNESS` before declaration decoding, catalog lookup or state allocation. A body harness is only a conversation coordinate; it cannot grant admission. The release has no host provider lane. `route_unbound` matches the migration branch's refusal shape, with a runner-only reason rather than its host-or-runner allowance.
+
+Permanent `compatibility::review_runner_admission_requires_runner_bind` exercises every new method under OpenCode, OpenCode2, Claude Code and Broca binds with bodies claiming either `runner` or `broca`, plus malformed bodies. All must refuse before decoding; the test verifies no callbacks or provider rows were created. Positive runner calls exercise all four methods and preserve distinct body-harness records/compaction IDs.
+
+### Executable death matrix
+
+`crash_cuts.rs` adds independent process-death/restart cases for SetupRecorded, MessagesIngested, WaitAnswered, WaitWorkDurable and HookStateRecorded. Each waits for the real executable marker, snapshots actual private rows, kills the process and restarts the same isolated root. Assertions cover Setup ID/input retention, transcript cursor equality, version/tag high-water marks, replay/application without duplicate views, and stale request/tag fencing. Wait cases page from a persisted prefix; hook recovery observes only the delivered replacement tag and retains the burned undelivered tag.
+
+Wait markers record a durable answer/work boundary, not a transport-delivery acknowledgment. Parking the background task can stop the executable's executor before a Wait frame flushes. The tests therefore accept either an exact committed Wait reply or a killed/unknown outcome, and require the same persisted state and recovery in both cases. This is not a waived timeout. Initial tiny-message workloads correctly produced no replacement because no real reduction was eligible; the final cases publish actual schema95 history to create concrete rebuild work before testing reserved view recovery.
+
+### Fault-enabled lint
+
+All six fault-helper atomic calls now use `try_update` with identical orderings and decrement closures. No fault budget, production path or default feature was changed. Fault-enabled strict workspace clippy passed on Cargo/rustc/Clippy1.99.
+
+Positive narrow gates before mutation: new crash cases **5/5**, admission **1/1**, module library **1726 passed/22 ignored**, and `cargo clippy --locked --workspace --all-targets --features drive-fault -- -D warnings` passed. Mutations and restored complete/local gates are recorded below.
+
+### Follow-up mutation evidence
+
+For every control, the specific source was staged in its live state and the full working diff was empty. The labelled mutation produced the nonempty diff below; the exact conformance test reached the selected marker (or actual admission reply) and failed on the intended assertion. Each run had **0 passed, 1 failed, 23 filtered**: no other test failed, but filtered tests are not counted as green. `git checkout -- <path> && touch <path>` then restored the staged source and a subsequent full `git diff --stat` was empty. The restored complete **24/24** run passed afterward. No `NON-VACUITY BREAK` remains in product sources.
+
+| Control | Exact red test | Captured behavioral failure | Nonempty working diff / after restore |
+| --- | --- | --- | --- |
+| Disable runner-bind admission | `compatibility::review_runner_admission_requires_runner_bind` | `transform.declare admitted bind opencode from body runner` with real subscriptions returned | `providers/mod.rs`: +2/-1 / empty |
+| Clear Setup before its saved cut | `crash_cuts::setup_recorded_survives_process_death` | `SetupRecorded lost the Setup inputs` | `providers/compaction.rs`: +2/-0 / empty |
+| Remove ingested lineage before its saved cut | `crash_cuts::messages_ingested_survive_process_death` | `persisted lineage cursor` absent | `providers/compaction.rs`: +2/-0 / empty |
+| Clear active wait-request ID before saving Wait | `crash_cuts::wait_answered_survives_process_death` | `WaitAnswered lost the active request fence`; Null instead of `wait-old` | `providers/compaction.rs`: +2/-1 / empty |
+| Skip completed wait-work commit before marker | `crash_cuts::wait_work_durable_survives_process_death` | persisted `wait_request` remained active rather than cleared by completed work | `providers/compaction.rs`: +1/-1 / empty |
+| Decrement reserved hook-tag high-water before saving | `crash_cuts::hook_state_recorded_survives_process_death` | `HookStateRecorded lost the reserved tag number`; 0 instead of 1 | `providers/step_transform.rs`: +2/-0 / empty |
+| Skip final step-answer commit before existing marker | `compaction::kill_mid_request_retry_skips_reserved_version_preserves_cursor_and_fences_stale` | stored `ready` instead of `compaction_message` | `providers/compaction.rs`: +1/-1 / empty |
+
+This closes the named admission and six-cut process-death matrix, not a universal mutation proof for every possible conformance clause or production traffic shape. The historical independent review remains an accurate account of its da10df31 candidate.
+
+### Restored follow-up gates
+
+All Linux lines ran foreground on **Linux8c**, one heavy job at a time, with Cargo/rustc1.99.0, rustfmt1.10.0-stable and Clippy0.1.99; throwaway XDG/config/state/runtime/store roots and lsof checks remain in force.
+
+- `cargo check --locked -p mc-store -p mc-module --all-targets`: passed.
+- `cargo test --locked -p mc-store -p mc-core --lib`: **248 store +22 core passed**, three private-clone/performance cases ignored.
+- `cargo test --locked -p mc-module --lib --features drive-fault`: **1726 passed, 22 ignored**; includes the renamed atomic fault-budget operations.
+- Nine retained module integration targets (boundary counter, cold flip, fleet logging, nonce scan, protection golden, scope stamps, serde fidelity, tag allocation, temporal switch): **15 passed**.
+- Complete `cargo test --locked -p mc-module --test broca_conformance --features drive-fault -- --include-ignored --test-threads=2 --nocapture`: **24 passed, 0 failed, 0 ignored**, 16.24 s. The separate pinned-master debug baseline was rebuilt in a distinct target directory. Shared fixture bytes, declared/catalog tools, legacy host CK bytes, context95 compatibility and all newly permanent cases passed.
+- `cargo fmt --check`: passed.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings`: passed.
+- `cargo clippy --locked --workspace --all-targets --features drive-fault -- -D warnings`: passed, with no deprecated-atomic warnings waived.
+
+Comment review clarified bind identity versus body data and the Wait transport race; those edits changed no behavior. Local daemon gates and final cleanliness checks follow. The first AFT diagnostic inspection was partial while local analysis was still running, and Linux-only test modules are not linked by the Mac analyzer. A subsequent authoritative scoped Rust diagnostic snapshot for `providers/mod.rs` and `lib.rs` reported **0 errors and 0 warnings for both files**, examining297 entries/236 inputs; checkout call-graph categories remained unavailable. The authoritative Linux target checks are recorded separately.
+
+Local follow-up reruns on the same Cargo/rustc1.99 toolchain used `nice -n10`, four top-level build jobs and the task-owned exact subconscious source clone; no operator checkout or installed daemon was used:
+
+- `cargo test --locked -j4 -p mc-module --test real_daemon -- --test-threads=1 --nocapture`: **5 passed, 2 ignored**,5.03 s. The ignored cases need private sync/planning captures. lsof observed8–11 database handles below the owning throwaway roots.
+- `cargo test --locked -j4 -p mc-module --lib route_targets::tests::a_host_runner_starts_and_serves_without_broca_through_real_subc -- --ignored --exact --nocapture`: **1 passed**,2.91 s, with module/daemon lsof isolation.
+- `cargo test --locked -j4 -p mc-module --test real_daemon_store_ahead -- --nocapture`: **1 passed**,2.27 s, using task-built lock-pinned debug daemon/CLI paths; candidate max65 still refuses fixture66 on health and transform.
+
+The follow-up did not change manifests, lockfile, role/SDK pins, context schema, private-store migrations, host codecs, memory writers, ARCHITECTURE.md or STRUCTURE.md. No live-store access, placement, dist rebuild or release-artifact build occurred. The requested local `train/provider-release` ref is advanced to the follow-up HEAD together with the assigned task branch. Final source/comment review and whitespace/staged-scope checks completed before commit; temporary mutation/source-export scratch was removed.

@@ -427,3 +427,102 @@ async fn existing_writers_pending_publication_and_revert_recover_on_context95() 
     assert_eq!(context_status, Some(1));
     rig.assert_context_95();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_runner_admission_requires_runner_bind() {
+    let rig = Rig::start(None, false).await;
+    let session = "route-admission";
+    for bind_harness in ["opencode", "opencode2", "claude-code", "broca"] {
+        let identity =
+            subc_protocol::BindIdentity::new(rig.dir.path().join("project"), bind_harness, session);
+        for body_harness in ["runner", "broca"] {
+            let mut setup_request = setup(session);
+            setup_request["harness"] = json!(body_harness);
+            let mut hook_request = super::hooks::post_assistant(session);
+            hook_request["harness"] = json!(body_harness);
+            let mut step_request = step(
+                session,
+                "admission",
+                &[],
+                0,
+                &json!({"compaction_id":"unallocated","version":1}),
+            );
+            step_request["harness"] = json!(body_harness);
+            for (method, params) in [
+                (
+                    "transform.declare",
+                    json!({"harness":body_harness,"params":{}}),
+                ),
+                ("transform.hook", hook_request),
+                ("compaction.setup", setup_request),
+                ("compaction.step", step_request),
+            ] {
+                let result = rig
+                    .try_call(&identity, json!({"method":method,"params":params}))
+                    .await;
+                let failure = result.expect_err(&format!(
+                    "{method} admitted bind {bind_harness} from body {body_harness}"
+                ));
+                assert_eq!(
+                    failure.code(),
+                    Some("route_unbound"),
+                    "{method}: {failure:?}"
+                );
+                let malformed = rig
+                    .try_call(&identity, json!({"method":method,"params":null}))
+                    .await
+                    .expect_err("non-runner bind must be refused before decoding");
+                assert_eq!(malformed.code(), Some("route_unbound"));
+            }
+        }
+    }
+    assert!(
+        rig.script.callbacks().is_empty(),
+        "unadmitted calls reached the runner"
+    );
+    assert!(
+        rig.store()
+            .provider_records_for_session(rig.dir.path().join("project").to_str().unwrap(), session)
+            .unwrap()
+            .is_empty(),
+        "unadmitted calls allocated provider state"
+    );
+    let identity = rig.identity(session);
+    let mut ids = Vec::new();
+    for body_harness in ["broca", "runner"] {
+        let mut request = setup(session);
+        request["harness"] = json!(body_harness);
+        let ready = rig.method(&identity, "compaction.setup", request).await;
+        assert_eq!(ready["answer"], "ready");
+        ids.push(ready["initial"]["compaction_id"].clone());
+        let declared = rig
+            .method(&identity, "transform.declare", json!({"params":{}}))
+            .await;
+        assert!(!declared["subscriptions"].as_array().unwrap().is_empty());
+        let mut hook = super::hooks::post_assistant(session);
+        hook["harness"] = json!(body_harness);
+        assert_eq!(
+            rig.method(&identity, "transform.hook", hook).await["answer"],
+            "ops"
+        );
+        let mut request = step(session, "admitted", &[], 0, &ready["initial"]);
+        request["harness"] = json!(body_harness);
+        assert_eq!(
+            rig.method(&identity, "compaction.step", request).await["answer"],
+            "noop"
+        );
+    }
+    assert_ne!(
+        ids[0], ids[1],
+        "body harness coordinates must stay distinct under the admitted runner bind"
+    );
+    let mut harnesses = rig
+        .store()
+        .provider_records_for_session(rig.dir.path().join("project").to_str().unwrap(), session)
+        .unwrap()
+        .into_iter()
+        .map(|(harness, _)| harness)
+        .collect::<Vec<_>>();
+    harnesses.sort();
+    assert_eq!(harnesses, vec!["broca", "runner"]);
+}

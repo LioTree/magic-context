@@ -3,6 +3,8 @@
 
 mod compaction;
 mod compatibility;
+#[cfg(feature = "drive-fault")]
+mod crash_cuts;
 mod fixture;
 mod harness;
 mod hooks;

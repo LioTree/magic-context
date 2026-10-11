@@ -15827,7 +15827,7 @@ fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
 // not route through these gates.
 //
 // Additionally, the fault self-disarms after MC_DRIVE_FAULT_COUNT firings (default 1)
-// via a fetch_update claim on DRIVE_FAULT_REMAINING. This prevents the fault from
+// via a try_update claim on DRIVE_FAULT_REMAINING. This prevents the fault from
 // corrupting a recovery pass in the fence+recover drive arc — the only other disarm
 // would be a restart, which injects a variable the arc must not contain. Total WARN
 // lines in logs will equal exactly N, so miscounts are visible.
@@ -15902,7 +15902,7 @@ fn drive_fault() -> Option<DriveFault> {
 fn claim_drive_fault() -> bool {
     use std::sync::atomic::Ordering;
     matches!(
-        DRIVE_FAULT_REMAINING.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)),
+        DRIVE_FAULT_REMAINING.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)),
         Ok(previous) if previous > 0
     )
 }
@@ -15984,7 +15984,7 @@ fn respond_transform(
     // selects an arm; must run before ck_messages is taken for the streaming placeholder.
     //
     // The fault fires at most N times (MC_DRIVE_FAULT_COUNT, default 1) then self-disarms
-    // permanently via a fetch_update claim on DRIVE_FAULT_REMAINING. This is critical for the
+    // permanently via a try_update claim on DRIVE_FAULT_REMAINING. This is critical for the
     // fence+recover drive arc: a recovery pass must NOT be corrupted, and the only other
     // disarm is a restart (which injects a variable the arc must not contain). The claim
     // uses checked_sub so concurrent responses cannot underflow or double-fire past N —
@@ -23127,11 +23127,11 @@ mod tests {
     fn drive_fault_count_one_fires_once_then_clean() {
         // Simulate count=1: claim one firing, then verify subsequent claims are no-ops.
         // We test the claim logic directly by manipulating DRIVE_FAULT_REMAINING and
-        // checking the fetch_update guard condition.
+        // checking the try_update guard condition.
         DRIVE_FAULT_REMAINING.store(1, std::sync::atomic::Ordering::Relaxed);
 
         // First claim: should fire (Ok(1) with prev=1 > 0).
-        let result = DRIVE_FAULT_REMAINING.fetch_update(
+        let result = DRIVE_FAULT_REMAINING.try_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |n| n.checked_sub(1),
@@ -23144,7 +23144,7 @@ mod tests {
         );
 
         // Second claim: should NOT fire (Err(0) — checked_sub returns None).
-        let result = DRIVE_FAULT_REMAINING.fetch_update(
+        let result = DRIVE_FAULT_REMAINING.try_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |n| n.checked_sub(1),
@@ -23164,12 +23164,12 @@ mod tests {
         DRIVE_FAULT_REMAINING.store(3, std::sync::atomic::Ordering::Relaxed);
 
         for i in 1..=3 {
-            let result = DRIVE_FAULT_REMAINING.fetch_update(
+            let result = DRIVE_FAULT_REMAINING.try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
                 |n| n.checked_sub(1),
             );
-            // fetch_update returns Ok(prev) where prev is the value BEFORE the update.
+            // try_update returns Ok(prev) where prev is the value BEFORE the update.
             // With count=3, calls return Ok(3), Ok(2), Ok(1) — all > 0.
             assert!(
                 result.is_ok() && result.unwrap() > 0,
@@ -23178,7 +23178,7 @@ mod tests {
         }
 
         // Fourth claim: exhausted.
-        let result = DRIVE_FAULT_REMAINING.fetch_update(
+        let result = DRIVE_FAULT_REMAINING.try_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |n| n.checked_sub(1),
@@ -23203,7 +23203,7 @@ mod tests {
         let mut fired = 0usize;
         let mut clean = 0usize;
         for _ in 0..7 {
-            match DRIVE_FAULT_REMAINING.fetch_update(
+            match DRIVE_FAULT_REMAINING.try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
                 |n| n.checked_sub(1),

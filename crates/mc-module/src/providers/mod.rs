@@ -110,6 +110,12 @@ impl McHandler {
                 )
             }
         };
+        // Provider calls require "runner" in the route's bind identity.
+        // A harness string inside request JSON only names the conversation;
+        // caller-supplied body data cannot authorize access to these methods.
+        if binding.harness != session_resolver::RUNNER_BIND_HARNESS {
+            return error("route_unbound", "provider operations require a runner bind");
+        }
         if method == "transform.declare" {
             return match declaration(params).and_then(|d| bytes(&d)) {
                 Ok(bytes) => HandlerOutcome::Response(bytes),
