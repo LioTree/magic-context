@@ -434,8 +434,23 @@ describe("runVerify disposition", () => {
                 remaining: 0,
                 complete: true,
             });
-            expect(getMemoryById(db, constraint.id)?.status).toBe("archived");
-            expect(getMemoryById(db, projectRuleCodeFact.id)?.status).toBe("archived");
+            // A verify archive is a model-judged retirement: it waits as a pending
+            // proposal and the rows stay live until someone approves it.
+            expect(getMemoryById(db, constraint.id)?.status).toBe("active");
+            expect(getMemoryById(db, projectRuleCodeFact.id)?.status).toBe("active");
+            expect(
+                db
+                    .prepare(
+                        "SELECT writer, operation, target_ids_json FROM memory_tool_proposals ORDER BY id",
+                    )
+                    .all(),
+            ).toEqual(
+                [constraint.id, projectRuleCodeFact.id].map((id) => ({
+                    writer: "verify",
+                    operation: "archive",
+                    target_ids_json: JSON.stringify([id]),
+                })),
+            );
         } finally {
             closeQuietly(db);
         }
@@ -1013,7 +1028,11 @@ describe("applyVerifyManifest", () => {
                 skipped: 0,
                 refused: 0,
             });
-            expect(getMemoryById(db, archived.id)?.status).toBe("archived");
+            // The archive verdict becomes a pending proposal; the row stays live.
+            expect(getMemoryById(db, archived.id)?.status).toBe("active");
+            expect(db.prepare("SELECT target_ids_json FROM memory_tool_proposals").all()).toEqual([
+                { target_ids_json: JSON.stringify([archived.id]) },
+            ]);
             expect(getMemoryById(db, silent.id)?.status).toBe("active");
             const silentState = getMemoryVerifications(db, [silent.id]).get(silent.id);
             expect(silentState?.files).toEqual(["src/old.ts"]);

@@ -124,7 +124,10 @@ function refreshAtAdmission<Markers>(
 /** These fixtures use real sibling writes, then compare persisted bytes to an independent live render. */
 export function registerLockedDeltaRegressions<Markers>(driver: LockedDeltaDriver<Markers>): void {
     for (const change of ["importance", "reinforcement", "verification"] as const) {
-        test(`${driver.host} m[1] reads memory ${change} under its writer`, () => {
+        // A busting SOFT reads no memory rows: rows another writer adds or reweights
+        // after the HARD fold wait for the next HARD fold. The HARD renderer, which
+        // reads rows under its writer, still sees the change.
+        test(`${driver.host} busting m[1] leaves another writer's memory ${change} for the next HARD fold`, () => {
             const f = driver.create(`${driver.host}-${change}`);
             try {
                 const sample = insertMemory(f.db, {
@@ -163,11 +166,11 @@ export function registerLockedDeltaRegressions<Markers>(driver: LockedDeltaDrive
                     else if (change === "reinforcement") updateMemorySeenCount(f.sibling, b.id);
                     else updateMemoryVerification(f.sibling, b.id, "verified");
                 });
+                expect(persistedDelta(f)).not.toContain("candidate A");
+                expect(persistedDelta(f)).not.toContain("candidate B");
                 const fresh = driver.render(f, options, markers);
                 expect(fresh).toContain("candidate B");
                 expect(fresh).not.toContain("candidate A");
-                expect(persistedDelta(f)).toBe(fresh);
-                expect(persistedDelta(f)).not.toBe(before);
             } finally {
                 f.close();
             }
@@ -212,7 +215,9 @@ export function registerLockedDeltaRegressions<Markers>(driver: LockedDeltaDrive
         }
     });
 
-    test(`${driver.host} m[1] uses the baseline cutoff for a newly expired additive memory`, () => {
+    // An additive memory written after the HARD fold is not a busting SOFT's to
+    // admit; the HARD renderer still judges its expiry at the baseline cutoff.
+    test(`${driver.host} busting m[1] leaves an additive memory for the next HARD fold, which uses the baseline cutoff`, () => {
         const f = driver.create(`${driver.host}-expiry`);
         const realNow = Date.now;
         let now = 1000;
@@ -232,9 +237,9 @@ export function registerLockedDeltaRegressions<Markers>(driver: LockedDeltaDrive
                 });
                 now = 3000;
             });
+            expect(persistedDelta(f)).not.toContain("eligible at the baseline cutoff");
             const fresh = driver.render(f, options, markers);
             expect(fresh).toContain("eligible at the baseline cutoff");
-            expect(persistedDelta(f)).toBe(fresh);
         } finally {
             Date.now = realNow;
             f.close();

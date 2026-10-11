@@ -4,20 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { replaceAllCompartments } from "../../features/magic-context/compartment-storage";
 import { insertMemory } from "../../features/magic-context/memory";
-import { supersededMemory } from "../../features/magic-context/memory/storage-memory";
+import { applyAgentMemoryMutation } from "../../features/magic-context/memory/lifecycle-applier";
 import { indexMessagesAfterOrdinal } from "../../features/magic-context/message-index";
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
 import * as searchModule from "../../features/magic-context/search";
 import { MAX_UNIFIED_SEARCH_LIMIT } from "../../features/magic-context/search";
-import { getOrCreateSessionMeta, queueMemoryMutation } from "../../features/magic-context/storage";
+import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
-import {
-    injectM0M1,
-    materializeM0,
-    renderMemoryBlockV2,
-} from "../../hooks/magic-context/inject-compartments";
-import { estimateTokens } from "../../hooks/magic-context/read-session-formatting";
+import { injectM0M1, materializeM0 } from "../../hooks/magic-context/inject-compartments";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -162,7 +157,7 @@ describe("createCtxSearchTools", () => {
         );
     });
 
-    it("hides a forced m[1] memory using the persisted visible manifest", async () => {
+    it("hides a memory this session's agent edit shows in full in m[1]", async () => {
         const dir = createTestTempDirFromPath(join(tmpdir(), "mc-search-m1-"));
         try {
             const projectPath = "git:search-m1";
@@ -173,34 +168,31 @@ describe("createCtxSearchTools", () => {
                 content: "original memory ".repeat(40),
                 importance: 100,
             });
-            const replacement = insertMemory(db, {
-                projectPath,
-                category: "ARCHITECTURE",
-                content: "M1SearchToken replacement ".repeat(40),
-                importance: 1,
-            });
+            const replacement = { id: original.id };
             const options = {
                 db,
                 sessionId,
                 projectPath,
                 projectDirectory: dir,
                 injectDocs: false,
-                memoryInjectionBudgetTokens: estimateTokens(renderMemoryBlockV2([original])) + 2,
             };
             materializeM0({ ...options, state: getOrCreateSessionMeta(db, sessionId) });
-            supersededMemory(db, original.id, replacement.id);
-            queueMemoryMutation(db, {
+            // The agent's own update reaches its m[1] as a full fragment, which makes
+            // the current text visible there.
+            applyAgentMemoryMutation(db, {
+                key: "search-m1-update",
                 projectPath,
-                mutationType: "superseded",
-                targetMemoryId: original.id,
-                supersededById: replacement.id,
+                sourceSessionId: sessionId,
+                operation: "update",
+                targets: [{ id: original.id, revision: 1 }],
+                content: "M1SearchToken replacement ".repeat(40).trim(),
             });
             const refreshed = injectM0M1({
                 ...options,
                 state: getOrCreateSessionMeta(db, sessionId),
                 isCacheBustingPass: true,
             });
-            expect(refreshed.m1Text).toContain(`#${replacement.id}: M1SearchToken`);
+            expect(refreshed.m1Text).toContain(`<updated id="${replacement.id}"`);
             const hidden = insertMemory(db, {
                 projectPath,
                 category: "ARCHITECTURE",

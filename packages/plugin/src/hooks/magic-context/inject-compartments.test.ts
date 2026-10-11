@@ -13,6 +13,10 @@ import { archiveExpiredMemories } from "../../features/magic-context/dreamer/exp
 import { acquireLeaseWithAcquisition } from "../../features/magic-context/dreamer/lease";
 import { leaseKeyFor } from "../../features/magic-context/dreamer/task-registry";
 import {
+    applyAgentMemoryMutation,
+    applyMemoryAdmission,
+} from "../../features/magic-context/memory/lifecycle-applier";
+import {
     archiveMemory,
     getMemoriesByProject,
     insertMemory,
@@ -2769,11 +2773,19 @@ describe("m[0]/m[1] materialization", () => {
                     projectDirectory,
                     isCacheBustingPass: true,
                     beforeCacheCommitForTest: () => {
+                        // A busting SOFT shows memory only through this session's
+                        // agent fragments, so the concurrent memory is an agent save.
                         if (change === "memory")
-                            insertMemory(sibling, {
-                                projectPath: PROJECT_PATH,
-                                category: "ARCHITECTURE",
-                                content: "Concurrent refresh memory",
+                            applyMemoryAdmission(sibling, {
+                                key: "concurrent-refresh-save",
+                                operation: "agent_save",
+                                input: {
+                                    projectPath: PROJECT_PATH,
+                                    category: "ARCHITECTURE",
+                                    content: "Concurrent refresh memory",
+                                    sourceSessionId: SESSION_ID,
+                                    sourceType: "agent",
+                                },
                             });
                         else
                             appendCompartments(sibling, SESSION_ID, [
@@ -3447,11 +3459,13 @@ describe("m[0]/m[1] materialization", () => {
             isCacheBustingPass: true,
         });
         expect(bust.m0Bytes).toEqual(after.m0Bytes);
-        expect(bust.m1Text).toContain("<memory-updates>");
-        expect(bust.m1Text).toContain(`<removed id="${expiring.id}"/>`);
+        // Expiry is an automated edit: a busting SOFT reads no memory rows and shows
+        // no removal for it. The row leaves the prompt at the next natural HARD fold.
+        expect(bust.m1Text).not.toContain("<memory-updates>");
+        expect(bust.m1Text).not.toContain(`id="${expiring.id}"`);
     });
 
-    it("replays byte-identical m[1] on defer and surfaces additive memory on next cache-busting pass", () => {
+    it("replays byte-identical m[1] on defer and shows only this session's agent save on the next cache-busting pass", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
         replaceAllCompartmentState(
@@ -3488,11 +3502,25 @@ describe("m[0]/m[1] materialization", () => {
         });
         const initialM1 = renderedText(first[1]);
 
-        const m1MemoryId = insertMemory(db, {
+        // Another writer's insert (a historian promotion, another session) and this
+        // session's own agent save. Only the agent save has a fragment for this session.
+        const otherWriterId = insertMemory(db, {
             projectPath: PROJECT_PATH,
             category: "ARCHITECTURE",
-            content: "New additive memory appears only after a bust.",
+            content: "Another writer's memory waits for the next HARD fold.",
         }).id;
+        const saved = applyMemoryAdmission(db, {
+            key: "agent-save-1",
+            operation: "agent_save",
+            input: {
+                projectPath: PROJECT_PATH,
+                category: "ARCHITECTURE",
+                content: "New additive memory appears only after a bust.",
+                sourceSessionId: SESSION_ID,
+                sourceType: "agent",
+            },
+        });
+        const m1MemoryId = saved.memoryId!;
 
         const deferOne = [userMessage("m2", "defer one")];
         injectM0M1({
@@ -3529,9 +3557,13 @@ describe("m[0]/m[1] materialization", () => {
             projectDirectory,
             isCacheBustingPass: true,
         });
-        expect(renderedText(bust[1])).toContain("<new-memories>");
-        expect(renderedText(bust[1])).toContain("New additive memory appears only after a bust.");
+        expect(renderedText(bust[1])).not.toContain("<new-memories>");
+        expect(renderedText(bust[1])).toContain(
+            `<added id="${m1MemoryId}" category="ARCHITECTURE">New additive memory appears only after a bust.</added>`,
+        );
+        expect(renderedText(bust[1])).not.toContain("Another writer's memory");
         expect(getVisibleMemoryIds(db, SESSION_ID)?.has(m1MemoryId)).toBe(true);
+        expect(getVisibleMemoryIds(db, SESSION_ID)?.has(otherWriterId) ?? false).toBe(false);
     });
 
     it("resolves direct and chained merge replacements with bounded failure semantics", () => {
@@ -3986,7 +4018,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(reconciled.m1Text).not.toContain("<memory-updates>");
     });
 
-    it("renders memory mutation removals on cache-busting pass and replays them on defer", () => {
+    it("renders this session's agent archive on a cache-busting pass and replays it on defer", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
         replaceAllCompartmentState(
@@ -4020,11 +4052,15 @@ describe("m[0]/m[1] materialization", () => {
             projectDirectory,
             isCacheBustingPass: true,
         });
-        queueMemoryMutation(db, {
+        // Busting SOFT passes read no mutation log; the agent archive reaches this
+        // session's m[1] as its pre-rendered fragment.
+        applyAgentMemoryMutation(db, {
+            key: "agent-archive-1",
             projectPath: PROJECT_PATH,
-            mutationType: "archive",
-            targetMemoryId: memory.id,
-            queuedAt: 10,
+            sourceSessionId: SESSION_ID,
+            operation: "archive",
+            targets: [{ id: memory.id, revision: 1 }],
+            reason: "obsolete",
         });
 
         const bust = [userMessage("m2", "bust")];
@@ -4285,10 +4321,17 @@ describe("m[0]/m[1] materialization", () => {
             isCacheBustingPass: true,
         });
         const baselineM0 = renderedText(first[0]);
-        insertMemory(db, {
-            projectPath: PROJECT_PATH,
-            category: "ARCHITECTURE",
-            content: "docs-hash-only CAS delta memory",
+        // This session's agent save renders only if the SOFT refresh is admitted.
+        applyMemoryAdmission(db, {
+            key: "docs-hash-only-save",
+            operation: "agent_save",
+            input: {
+                projectPath: PROJECT_PATH,
+                category: "ARCHITECTURE",
+                content: "docs-hash-only CAS delta memory",
+                sourceSessionId: SESSION_ID,
+                sourceType: "agent",
+            },
         });
         db.prepare(
             "UPDATE session_meta SET cached_m0_project_docs_hash = ? WHERE session_id = ?",

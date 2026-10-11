@@ -33,7 +33,7 @@ function row(db: Database, id: number) {
 }
 
 describe("immediate agent memory mutations", () => {
-    test("agent update queues a live memory-updates mutation with complete undo history and no epoch", () => {
+    test("agent update logs the mutation, records its session fragment, keeps complete undo history and bumps no epoch", () => {
         const db = store();
         try {
             const memory = insertMemory(db, input);
@@ -67,7 +67,7 @@ describe("immediate agent memory mutations", () => {
             expect(
                 db
                     .prepare(
-                        "SELECT mutation_type,target_memory_id,new_content,adoption_class FROM memory_mutation_log",
+                        "SELECT mutation_type,target_memory_id,new_content,operation_id FROM memory_mutation_log",
                     )
                     .all(),
             ).toEqual([
@@ -75,7 +75,23 @@ describe("immediate agent memory mutations", () => {
                     mutation_type: "update",
                     target_memory_id: memory.id,
                     new_content: "cache_ttl=10m",
-                    adoption_class: "live",
+                    // A single-row change needs no operation group.
+                    operation_id: null,
+                },
+            ]);
+            // The session that made the edit sees it in its next busting m[1].
+            expect(
+                db
+                    .prepare(
+                        "SELECT session_id,operation_key,lines,current_id FROM memory_agent_fragments",
+                    )
+                    .all(),
+            ).toEqual([
+                {
+                    session_id: "session",
+                    operation_key: "operation",
+                    lines: `  <updated id="${memory.id}" category="CONFIG_VALUES">cache_ttl=10m</updated>`,
+                    current_id: memory.id,
                 },
             ]);
             expect(db.prepare("SELECT * FROM project_state").all()).toEqual([]);
@@ -101,6 +117,9 @@ describe("immediate agent memory mutations", () => {
             expect(JSON.parse(journal.after_json)).toEqual([row(db, memory.id)]);
             expect(applyAgentMemoryMutation(db, request(memory.id))).toEqual(receipt);
             expect(db.prepare("SELECT COUNT(*) AS n FROM memory_mutation_log").get()).toEqual({
+                n: 1,
+            });
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_agent_fragments").get()).toEqual({
                 n: 1,
             });
             expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({ n: 1 });
@@ -227,8 +246,18 @@ describe("immediate agent memory mutations", () => {
                 });
             expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({ n: 2 });
             expect(
-                db.prepare("SELECT mutation_type,adoption_class FROM memory_mutation_log").all(),
-            ).toEqual(Array(2).fill({ mutation_type: "superseded", adoption_class: "live" }));
+                db.prepare("SELECT mutation_type,operation_id FROM memory_mutation_log").all(),
+            ).toEqual(Array(2).fill({ mutation_type: "superseded", operation_id: "operation" }));
+            // One fragment carries the whole merge: both supersessions and the new survivor.
+            expect(db.prepare("SELECT lines FROM memory_agent_fragments").all()).toEqual([
+                {
+                    lines: [
+                        `  <superseded id="${first.id}" by="${canonical.id}"/>`,
+                        `  <superseded id="${second.id}" by="${canonical.id}"/>`,
+                        `  <added id="${canonical.id}" category="CONFIG_VALUES">cache_ttl=10m</added>`,
+                    ].join("\n"),
+                },
+            ]);
             const journal = db
                 .prepare("SELECT before_json,after_json FROM memory_journal")
                 .get() as { before_json: string; after_json: string };
@@ -290,8 +319,11 @@ describe("immediate agent memory mutations", () => {
             expect(JSON.parse(history.after_json)).toEqual(row(db, memory.id));
             expect(getMemoryById(db, memory.id)?.metadataJson).toContain("obsolete");
             expect(
-                db.prepare("SELECT mutation_type,adoption_class FROM memory_mutation_log").all(),
-            ).toEqual([{ mutation_type: "archive", adoption_class: "live" }]);
+                db.prepare("SELECT mutation_type,operation_id FROM memory_mutation_log").all(),
+            ).toEqual([{ mutation_type: "archive", operation_id: "operation" }]);
+            expect(db.prepare("SELECT lines FROM memory_agent_fragments").all()).toEqual([
+                { lines: `  <removed id="${memory.id}"/>` },
+            ]);
             for (const table of ["memory_verifications", "memory_embeddings"])
                 expect(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
         } finally {
