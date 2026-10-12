@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { getMemoryById, insertMemory } from "../memory";
-import { proposeMemoryMutation } from "../memory/lifecycle-applier";
+import { applyCurateMemoryMutation } from "../memory/lifecycle-applier";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { getDreamRuns } from "./storage-dream-runs";
@@ -10,12 +10,12 @@ import { leaseKeyFor } from "./task-registry";
 
 for (const transport of ["session", "hidden"] as const) {
     for (const outcome of [
-        "proposal",
+        "applied",
         "authority refusal",
         "tool error",
         "lookalike error",
     ] as const) {
-        test(`curate ${transport}: ${outcome === "proposal" ? "completes a durable proposal without claiming an applied edit" : `rejects ${outcome} as an incomplete memory operation`}`, async () => {
+        test(`curate ${transport}: ${outcome === "applied" ? "completes a durable direct edit" : `rejects ${outcome} as an incomplete memory operation`}`, async () => {
             const db = new Database(":memory:");
             initializeDatabase(db);
             runMigrations(db);
@@ -29,18 +29,18 @@ for (const transport of ["session", "hidden"] as const) {
             const content = "The registry owns startup ordering; proposed clarification.";
             const messages = () => {
                 const output =
-                    outcome === "proposal"
-                        ? `${
-                              proposeMemoryMutation(db, {
+                    outcome === "applied"
+                        ? (() => {
+                              applyCurateMemoryMutation(db, {
                                   projectPath: project,
                                   sourceSessionId: "curate-child",
-                                  key: "curate-proposal",
-                                  writer: "curate",
+                                  key: "curate-direct",
                                   operation: "update",
-                                  targetIds: [memory.id],
-                                  proposal: { content },
-                              }).reason
-                          }: update retained as a pending proposal; memory is unchanged.`
+                                  targets: [{ id: memory.id, revision: 1 }],
+                                  content,
+                              });
+                              return "Updated memory.";
+                          })()
                         : outcome === "authority refusal"
                           ? "Error: MODULE_MEMORY_AUTHORITY; the memory writer is owned by the module."
                           : "Error: MEMORY_PENDING_PROPOSAL was not recorded.";
@@ -114,19 +114,21 @@ for (const transport of ["session", "hidden"] as const) {
                         leaseKey: leaseKeyFor("curate", project),
                     },
                 );
-                expect(JSON.stringify(getMemoryById(db, memory.id))).toBe(before);
                 const proposals = db
                     .prepare("SELECT proposal_json FROM memory_tool_proposals")
                     .all() as { proposal_json: string }[];
                 const recorded = JSON.parse(getDreamRuns(db, project)[0]!.tasks_json)[0];
-                if (outcome === "proposal") {
+                if (outcome === "applied") {
                     expect(result.status).toBe("completed");
                     expect(recorded.status).toBe("completed");
-                    expect(recorded.progress).toContain("1 memory operation proposed (update)");
-                    expect(recorded.progress).not.toContain("applied");
-                    expect(proposals).toHaveLength(1);
-                    expect(JSON.parse(proposals[0]!.proposal_json)).toEqual({ content });
+                    expect(recorded.progress).toContain("1 memory operation applied (update)");
+                    expect(getMemoryById(db, memory.id)?.content).toBe(content);
+                    expect(db.prepare("SELECT previous_text FROM memory_history").all()).toEqual([
+                        { previous_text: memory.content },
+                    ]);
+                    expect(proposals).toHaveLength(0);
                 } else {
+                    expect(JSON.stringify(getMemoryById(db, memory.id))).toBe(before);
                     expect(result.status).toBe("failed");
                     expect(recorded.status).toBe("failed");
                     expect(recorded.error).toContain("no completed ctx_memory tool result");

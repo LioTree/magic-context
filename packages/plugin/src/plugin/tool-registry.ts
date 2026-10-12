@@ -177,6 +177,7 @@ export function createToolRegistry(args: {
                   // enumeration) stays dreamer-only (runtime-gated via
                   // toolContext.agent in tools.ts).
                   allowedActions: [...CTX_MEMORY_ACTIONS],
+                  memoryAuthority: pluginConfig.transform_mode === "rust" ? "module" : "ts",
                   rustToolBackends,
                   agentSaveClassificationAnchor: (location) =>
                       agentSaveClassificationAnchor(location),

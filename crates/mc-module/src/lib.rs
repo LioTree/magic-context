@@ -12963,7 +12963,11 @@ impl McHandler {
                 self.handle_memory_set_verification(channel, &request).await
             }
             "memory.set_mapping" => self.handle_memory_set_mapping(channel, &request).await,
-            "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
+            "ctx_memory" => {
+                self.handle_ctx_memory_facade(channel, &request, false)
+                    .await
+            }
+            "memory.curate" => self.handle_ctx_memory_facade(channel, &request, true).await,
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
             "ctx_reduce" => self.handle_ctx_reduce_facade(channel, &request).await,
@@ -13444,7 +13448,12 @@ impl McHandler {
         mcp_text_result(reply, false)
     }
 
-    async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_ctx_memory_facade(
+        &self,
+        channel: u16,
+        request: &Value,
+        automated: bool,
+    ) -> HandlerOutcome {
         let Some(args) = facade_arguments(request, &["action"]) else {
             return invalid_params_error("ctx_memory arguments must be an object");
         };
@@ -13459,6 +13468,32 @@ impl McHandler {
             return tool_error_result(format!("Error: {error}."));
         }
         let is_mutation = matches!(action, "write" | "update" | "archive" | "merge");
+        if automated && !matches!(action, "update" | "archive" | "merge") {
+            return invalid_params_error("memory.curate requires update, archive or merge");
+        }
+        let expected_revisions: Vec<(i64, i64)> = if automated {
+            let Some(targets) = args.get("expected_revisions").and_then(Value::as_array) else {
+                return invalid_params_error("memory.curate requires expected_revisions");
+            };
+            let Some(targets) = targets
+                .iter()
+                .map(|target| {
+                    Some((
+                        target.get("id")?.as_i64()?,
+                        target.get("revision")?.as_i64()?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return invalid_params_error("invalid expected_revisions");
+            };
+            if targets.iter().map(|(id, _)| *id).collect::<Vec<_>>() != memory_ids(args, action) {
+                return invalid_params_error("expected_revisions must name every target");
+            }
+            targets
+        } else {
+            Vec::new()
+        };
         let facade_scope = match self
             .resolve_facade_scope(channel, Some(args), "memories", is_mutation)
             .await
@@ -13535,7 +13570,11 @@ impl McHandler {
                     memory_project,
                     "memories",
                     conversation_key,
-                    "ctx_memory",
+                    if automated {
+                        "memory.curate"
+                    } else {
+                        "ctx_memory"
+                    },
                     action,
                     command_id.as_deref(),
                     |tx| {
@@ -13635,10 +13674,19 @@ impl McHandler {
                     memory_project,
                     "memories",
                     conversation_key,
-                    "ctx_memory",
+                    if automated {
+                        "memory.curate"
+                    } else {
+                        "ctx_memory"
+                    },
                     action,
                     command_id.as_deref(),
-                    |tx| {
+                    |agent_tx| {
+                        let automated_tx = agent_tx.automated();
+                        let tx = if automated { &automated_tx } else { agent_tx };
+                        if automated {
+                            tx.check_memory_revisions(&expected_revisions)?;
+                        }
                         let memory = tx
                             .update_memory_content(memory_project, id, content, category, now_ms())
                             .map_err(|error| request_context.render_mutation_error(error))?;
@@ -13681,13 +13729,29 @@ impl McHandler {
                     memory_project,
                     "memories",
                     conversation_key,
-                    "ctx_memory",
+                    if automated {
+                        "memory.curate"
+                    } else {
+                        "ctx_memory"
+                    },
                     action,
                     command_id.as_deref(),
-                    |tx| {
+                    |agent_tx| {
+                        let automated_tx = agent_tx.automated();
+                        let tx = if automated { &automated_tx } else { agent_tx };
+                        if automated {
+                            tx.check_memory_revisions(&expected_revisions)?;
+                        }
                         let archived = tx
                             .archive_memories(memory_project, &ids, reason, now_ms())
                             .map_err(|error| request_context.render_mutation_error(error))?;
+                        if automated {
+                            if let Some(successor_id) =
+                                args.get("superseded_by").and_then(Value::as_i64)
+                            {
+                                tx.set_curate_successor(&archived, successor_id)?;
+                            }
+                        }
                         if archived.is_empty() {
                             facade_text_response(
                                 "No active memories needed archiving.".to_string(),
@@ -13739,10 +13803,13 @@ impl McHandler {
                         memory_project,
                         "memories",
                         conversation_key,
-                        "ctx_memory",
+                        if automated { "memory.curate" } else { "ctx_memory" },
                         action,
                         command_id.as_deref(),
-                        |tx| {
+                        |agent_tx| {
+                            let automated_tx = agent_tx.automated();
+                            let tx = if automated { &automated_tx } else { agent_tx };
+                            if automated { tx.check_memory_revisions(&expected_revisions)?; }
                             let (mut memory, superseded_ids) = tx
                                 .merge_memories_canonical(
                                     memory_project,
@@ -32562,6 +32629,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn module_curate_facade_applies_update_merge_archive_without_agent_fragments() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_root = project.to_str().unwrap();
+        let identity = "git:curate-direct";
+        handler.bind_route(7, binding(route_root, "token"));
+        activate_module_authority(&store, "context", identity, route_root, "memories");
+        let first = insert_memory(&store, identity, "CONSTRAINTS", "cache_ttl=5m", 1);
+        let second = insert_memory(&store, identity, "CONSTRAINTS", "cache_ttl=10m", 1);
+        let update = json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-update", "action": "update", "ids": [first], "expected_revisions": [{"id": first, "revision": 1}], "content": "cache_ttl=15m" });
+        assert!(
+            tool_text(call_facade(&handler, "memory.curate", update.clone()).await)
+                .starts_with("Updated memory")
+        );
+        assert!(
+            tool_text(call_facade(&handler, "memory.curate", update).await)
+                .starts_with("Updated memory")
+        );
+        assert_eq!(
+            store.get_memory_full(first).unwrap().unwrap().content,
+            "cache_ttl=15m"
+        );
+        let merged = tool_text(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-merge", "action": "merge", "ids": [first, second], "expected_revisions": [{"id": first, "revision": 2}, {"id": second, "revision": 1}], "content": "cache_ttl=20m" })).await);
+        assert!(merged.starts_with("Merged memories"), "{merged}");
+        assert_eq!(
+            store.get_memory_full(first).unwrap().unwrap().status,
+            "archived"
+        );
+        let canonical: (i64, i64) = store
+            .with_context_conn_for_test(|conn| {
+                conn.query_row(
+                    "SELECT id,revision FROM memories WHERE content='cache_ttl=20m'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        let archive = tool_text(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-archive", "action": "archive", "ids": [canonical.0], "expected_revisions": [{"id": canonical.0, "revision": canonical.1}], "reason": "obsolete" })).await);
+        assert!(archive.starts_with("Archived memory"), "{archive}");
+        assert_eq!(
+            store.get_memory_full(canonical.0).unwrap().unwrap().status,
+            "archived"
+        );
+        store
+            .with_context_conn_for_test(|conn| {
+                for table in [
+                    "memory_mutation_log",
+                    "memory_agent_fragments",
+                    "memory_tool_proposals",
+                ] {
+                    assert_eq!(
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                            .get::<_, i64>(0))?,
+                        0,
+                        "{table}"
+                    );
+                }
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM memory_history WHERE memory_id=?1",
+                        [first],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn verification_and_mapping_facades_are_fenced_hash_guarded_and_idempotent() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
@@ -32661,15 +32802,14 @@ mod tests {
         assert!(matches!(archive, HandlerOutcome::Response(_)));
         let after_archive =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        // A verify archive is a model-judged retirement: a pending proposal, the row
-        // stays live, and nothing moves the prompt.
+        // Archiving changes the stored memory's status but leaves the m1 revision signal unchanged.
         assert_eq!(
             after_archive, before_archive,
             "a verify archive must not move the m1 mutation signal"
         );
         assert_eq!(
             store.get_memory_full(archived_id).unwrap().unwrap().status,
-            "active"
+            "archived"
         );
         let proposals: Vec<(String, String, String)> = store
             .with_context_conn_for_test(|tx| {
@@ -32682,14 +32822,7 @@ mod tests {
                 rows
             })
             .unwrap();
-        assert_eq!(
-            proposals,
-            vec![(
-                "verify".to_string(),
-                "archive".to_string(),
-                format!("[{archived_id}]")
-            )]
-        );
+        assert_eq!(proposals, vec![]);
 
         let mapping = call_facade(&handler, "memory.set_mapping", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,

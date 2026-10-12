@@ -38,14 +38,17 @@ subtraction cannot be made exact. The redesign deletes the recompute.
      the memory was written). Through the module it calls `memory.expire`, which
      rechecks ownership, active status and the declared expiry inside the transaction
      and archives with history and no log row; it is not the agent archive port.
-   - dreamer verify `archive`: a pending proposal in `memory_tool_proposals`; the
-     row stays live.
-   - curate: proposals only (update, merge and archive), in OpenCode and Pi.
+    - dreamer verify `archive`: applies directly with undo history, no log row and
+      no fragment.
+    - curate: update, merge and archive apply directly in OpenCode and Pi. Module-owned
+      rows go through `memory.curate`, with revision checks and no TypeScript fallback.
    - dreamer saves (a curate `write`) and retrospective learnings: inserted with
      `source_type = 'dreamer'`, no log row and no fragment.
    - The Rust module's `memory.set_verification` follows the same rules: a gated
-     `update` applies with history and a new revision and no log row; `archive` is a
-     pending `verify` proposal.
+      `update` and `archive` apply with history, a new revision and no log row.
+    - historian turn two: gated edits and consolidations may apply; explicit `retire`
+      and `promote_rule` decisions are dropped and logged. There is no proposal writer.
+      The proposal tables shipped in schema version 99 remain unchanged for database compatibility.
 5. **Agent `ctx_memory` edits apply immediately** through the shared applier
    (save, update, merge, archive) and record one immutable, pre-rendered fragment
    (`memory_agent_fragments`) for the session that made them. That session's next

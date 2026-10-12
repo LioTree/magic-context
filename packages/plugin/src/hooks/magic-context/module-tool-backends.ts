@@ -6,7 +6,7 @@ export interface ModuleToolBackends {
     backends: RustToolBackends;
 }
 
-/** Memory and note tools write context.db directly; only drop state lives in the module. */
+/** Route automated memory edits and drops through the module so its transaction records their audit trail. */
 export function createModuleToolBackends(options: {
     db: Database;
     moduleClient: RustModeModuleClient | undefined;
@@ -17,6 +17,47 @@ export function createModuleToolBackends(options: {
     if (!moduleClient) return undefined;
     return {
         backends: {
+            curateMemory: async ({ projectRoot, ...request }) => {
+                const response = await moduleClient.call({
+                    sessionId: request.sourceSessionId,
+                    projectRoot,
+                    method: "memory.curate",
+                    body: {
+                        name: "memory.curate",
+                        arguments: {
+                            memory_project: request.projectPath,
+                            command_id: request.key,
+                            action: request.operation,
+                            ids: request.targets.map((target) => target.id),
+                            expected_revisions: request.targets,
+                            content: request.content,
+                            category: request.category,
+                            reason: request.reason,
+                            superseded_by: request.supersededById,
+                        },
+                    },
+                });
+                const result = (response as { result?: unknown }).result ?? response;
+                const text =
+                    (result as { content?: Array<{ text?: string }> }).content
+                        ?.map((part) => part.text ?? "")
+                        .join("\n") ?? "";
+                if ((result as { isError?: boolean }).isError)
+                    throw new Error(text || "Module curate refused");
+                const canonicalId = /canonical memory \[ID: (\d+)\]/.exec(text)?.[1];
+                const superseded = /; superseded \[([\d, ]*)\]/.exec(text)?.[1];
+                if (!/^(Updated memory|Archived memor|Merged memories)/.test(text))
+                    throw new Error(`Invalid module curate response: ${text}`);
+                return {
+                    state: "applied",
+                    reason: request.operation,
+                    adoptionClass: "deferred",
+                    memoryId: canonicalId ? Number(canonicalId) : request.targets[0]!.id,
+                    supersededIds: superseded
+                        ? superseded.split(",").map((id) => Number(id.trim()))
+                        : [],
+                };
+            },
             reduce: ({ sessionId, projectRoot, drop, commandId }) =>
                 moduleClient.call({
                     sessionId,

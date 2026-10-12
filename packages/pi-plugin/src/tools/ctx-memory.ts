@@ -61,10 +61,10 @@ import {
 	type AgentMemoryMutation,
 	type ApplierReceipt,
 	applyAgentMemoryMutation,
+	applyCurateMemoryMutation,
 	applyMemoryAdmission,
 	getMemoryRevision,
 	MemoryContentDuplicateError,
-	proposeMemoryMutation,
 } from "@magic-context/core/features/magic-context/memory/lifecycle-applier";
 import { computeNormalizedHash } from "@magic-context/core/features/magic-context/memory/normalize-hash";
 import {
@@ -724,19 +724,26 @@ export function createCtxMemoryTool(
 					});
 					return ok(`Updated memory [ID: ${memory.id}] in ${targetCategory}.`);
 				}
-				// Curate is proposals only: a dreamer rewrite waits for review and the row
-				// stays unchanged, exactly as in OpenCode.
-				const receipt = proposeMemoryMutation(deps.db, {
+				const receipt = applyCurateMemoryMutation(deps.db, {
+					key: randomUUID(),
 					projectPath: targetIdentity,
 					sourceSessionId: sessionId,
-					writer: "curate",
 					operation: "update",
-					targetIds: [memory.id],
-					proposal: { content, category: params.category },
+					targets: [
+						{ id: memory.id, revision: getMemoryRevision(deps.db, memory.id)! },
+					],
+					content,
+					category: targetCategory,
 				});
-				return ok(
-					`${receipt.reason}: update retained as a pending proposal; memory [ID: ${memory.id}] is unchanged.`,
-				);
+				if (receipt.state !== "applied")
+					return err(`Error: ${receipt.reason}; memory is unchanged.`);
+				queueEmbedding({
+					deps,
+					projectIdentity: targetIdentity,
+					memoryId: memory.id,
+					content,
+				});
+				return ok(`Updated memory [ID: ${memory.id}] in ${targetCategory}.`);
 			}
 
 			if (params.action === "merge") {
@@ -865,18 +872,28 @@ export function createCtxMemoryTool(
 						`Merged memories [${ids.join(", ")}] into canonical memory [ID: ${receipt.memoryId}] in ${category}; superseded [${(receipt.supersededIds ?? []).join(", ")}].`,
 					);
 				}
-				// Curate is proposals only: a dreamer merge waits for review and the rows
-				// stay live, exactly as in OpenCode.
-				const receipt = proposeMemoryMutation(deps.db, {
+				const receipt = applyCurateMemoryMutation(deps.db, {
+					key: randomUUID(),
 					projectPath: projectIdentity,
 					sourceSessionId: sessionId,
-					writer: "curate",
 					operation: "merge",
-					targetIds: ids,
-					proposal: { content, category },
+					targets: sourceMemories.map((memory) => ({
+						id: memory.id,
+						revision: getMemoryRevision(deps.db, memory.id)!,
+					})),
+					content,
+					category,
+				});
+				if (receipt.state !== "applied")
+					return err(`Error: ${receipt.reason}; memories are unchanged.`);
+				queueEmbedding({
+					deps,
+					projectIdentity,
+					memoryId: receipt.memoryId!,
+					content,
 				});
 				return ok(
-					`${receipt.reason}: merge retained as a pending proposal; memories [${ids.join(", ")}] are unchanged.`,
+					`Merged memories [${ids.join(", ")}] into canonical memory [ID: ${receipt.memoryId}] in ${category}; superseded [${(receipt.supersededIds ?? []).join(", ")}].`,
 				);
 			}
 
@@ -930,22 +947,21 @@ export function createCtxMemoryTool(
 					if (typeof receipt === "string") return err(receipt);
 					return ok(`Archived ${plural} [ID: ${idList}]${reasonSuffix}.`);
 				}
-				// Curate is proposals only: a dreamer retirement waits for review and the
-				// rows stay live, exactly as in OpenCode.
-				const receipt = proposeMemoryMutation(deps.db, {
+				const receipt = applyCurateMemoryMutation(deps.db, {
+					key: randomUUID(),
 					projectPath: projectIdentity,
 					sourceSessionId: sessionId,
-					writer: "curate",
 					operation: "archive",
-					targetIds: archiveIds,
-					proposal: {
-						reason: params.reason,
-						supersededBy: curateSuccessor?.id,
-					},
+					targets: archiveIds.map((id) => ({
+						id,
+						revision: getMemoryRevision(deps.db, id)!,
+					})),
+					reason: params.reason,
+					supersededById: curateSuccessor?.id,
 				});
-				return ok(
-					`${receipt.reason}: archive retained as a pending proposal; memories [${archiveIds.join(", ")}] are unchanged.`,
-				);
+				if (receipt.state !== "applied")
+					return err(`Error: ${receipt.reason}; memories are unchanged.`);
+				return ok(`Archived ${plural} [ID: ${idList}]${reasonSuffix}.`);
 			}
 
 			return err("Error: Unknown action.");

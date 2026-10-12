@@ -201,11 +201,9 @@ describe("createCtxMemoryTool", () => {
 		}
 	});
 
-	// Curate is proposals only and a dreamer save is an automated insert, exactly as
-	// in OpenCode: no dreamer update, merge or archive changes a row, and no dreamer
-	// action writes a mutation-log row or records an agent fragment, so no dreamer
-	// action can reach a busting SOFT.
-	it("routes dreamer update, merge and archive to proposals and writes no log row or fragment", async () => {
+	// Like OpenCode, Pi applies automated edits immediately to stored memories, but
+	// keeps them out of the prompt until its next full memory rebuild.
+	it("applies dreamer update, merge and archive directly without log rows or fragments", async () => {
 		const db = createTestDb();
 		try {
 			const ctx = fakeContext("ses-dreamer-routed") as never;
@@ -246,39 +244,46 @@ describe("createCtxMemoryTool", () => {
 				.all();
 			expect(
 				await run({ action: "update", ids: [first.id], content: "Rewritten." }),
-			).toContain("pending proposal");
+			).toContain("Updated memory");
 			expect(
 				await run({
 					action: "merge",
 					ids: [first.id, second.id],
 					content: "Merged.",
 				}),
-			).toContain("pending proposal");
+			).toContain("Merged memories");
+			const successor = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "ARCHITECTURE",
+				content: "Surviving fact.",
+			});
 			expect(
 				await run({
 					action: "archive",
-					ids: [second.id],
-					superseded_by: first.id,
+					ids: [
+						(
+							db
+								.prepare("SELECT id FROM memories WHERE content='Merged.'")
+								.get() as { id: number }
+						).id,
+					],
+					superseded_by: successor.id,
 				}),
-			).toContain("pending proposal");
+			).toContain("Archived memory");
 			expect(
 				db
 					.prepare(
 						"SELECT id, content, status, revision FROM memories ORDER BY id",
 					)
 					.all(),
-			).toEqual(before);
+			).not.toEqual(before);
 			expect(
 				db
 					.prepare(
 						"SELECT writer, operation FROM memory_tool_proposals ORDER BY id",
 					)
 					.all(),
-			).toEqual([
-				{ writer: "curate", operation: "update" },
-				{ writer: "curate", operation: "merge" },
-				{ writer: "curate", operation: "archive" },
-			]);
+			).toEqual([]);
 			expect(
 				await run({
 					action: "write",
@@ -291,7 +296,7 @@ describe("createCtxMemoryTool", () => {
 			expect(count("SELECT COUNT(*) AS n FROM memory_agent_fragments")).toBe(0);
 			expect(
 				count(
-					"SELECT COUNT(*) AS n FROM memories WHERE source_type = 'dreamer'",
+					"SELECT COUNT(*) AS n FROM memories WHERE source_type = 'dreamer' AND content = 'A dreamer-written fact.'",
 				),
 			).toBe(1);
 		} finally {
@@ -1036,12 +1041,11 @@ describe("createCtxMemoryTool", () => {
 				ctx,
 			);
 
-			// The workspace scope still admits the merge, which, as curate, is now a
-			// pending proposal: both sources stay live until it is reviewed.
+			// The category is shared, so the dreamer can consolidate both projects' memories.
 			expect(result.isError).toBeUndefined();
-			expect(result.content[0]?.text).toContain("pending proposal");
-			expect(getMemoryById(db, own.id)?.status).toBe("active");
-			expect(getMemoryById(db, foreignShared.id)?.status).toBe("active");
+			expect(result.content[0]?.text).toContain("Merged memories");
+			expect(getMemoryById(db, own.id)?.status).toBe("archived");
+			expect(getMemoryById(db, foreignShared.id)?.status).toBe("archived");
 		} finally {
 			closeQuietly(db);
 		}
@@ -1193,7 +1197,7 @@ describe("createCtxMemoryTool", () => {
 		}
 	});
 
-	it("keeps dreamer able to propose a merge that includes an archived memory", async () => {
+	it("keeps dreamer able to apply a merge that restores an archived canonical memory", async () => {
 		const db = createTestDb();
 		try {
 			const dreamer = createCtxMemoryTool({
@@ -1230,12 +1234,10 @@ describe("createCtxMemoryTool", () => {
 				ctx,
 			);
 
-			// Curate is proposals only: the merge is accepted for review and no row
-			// changes.
 			expect(result.isError).toBeUndefined();
-			expect(result.content[0]?.text).toContain("pending proposal");
-			expect(getMemoryById(db, archived.id)?.status).toBe("archived");
-			expect(getMemoryById(db, active.id)?.status).toBe("active");
+			expect(result.content[0]?.text).toContain("Merged memories");
+			expect(getMemoryById(db, archived.id)?.status).toBe("active");
+			expect(getMemoryById(db, active.id)?.status).toBe("archived");
 		} finally {
 			closeQuietly(db);
 		}

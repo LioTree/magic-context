@@ -1,6 +1,192 @@
 use mc_store::memory_projection::{text_line, AgentFragment, AppliedProjection, VisibleText};
 use mc_tokenizer::estimate_tokens;
 
+fn assert_automated_memory_change(operation: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+        .unwrap();
+    let id = s
+        .insert_memory(memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "cache_ttl is 5 minutes in config.ts.",
+            0,
+        ))
+        .unwrap();
+    let second = if operation == "curate_merge" {
+        Some(
+            s.insert_memory(memory_input(
+                "git:proj",
+                "CONSTRAINTS",
+                "config.ts declares a 5 minute cache_ttl.",
+                0,
+            ))
+            .unwrap(),
+        )
+    } else {
+        None
+    };
+    if operation == "expiry_archive" {
+        s.with_context_conn_for_test(|conn| {
+            conn.execute("UPDATE memories SET expires_at=1 WHERE id=?1", [id])
+        })
+        .unwrap();
+    }
+    let mut request = req(
+        "ses",
+        "cfg0",
+        vec![item("a", 1, "raw"), item("tail", 2, "tail")],
+    );
+    request.auto_search_enabled = false;
+    let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    let before = transform(&s, &request, &ctx).unwrap();
+    let served_before = serde_json::to_vec(before.messages()).unwrap();
+    assert!(m0_bytes(&before).contains("cache_ttl is 5 minutes"));
+    let corrected = "cache_ttl is 10 minutes in config.ts.";
+    let original_hash = s.get_memory_full(id).unwrap().unwrap().normalized_hash;
+    s.with_facade_command(
+        "/tmp",
+        "git:proj",
+        "memories",
+        "ses",
+        "memory.curate",
+        operation,
+        Some(operation),
+        |agent_tx| {
+            let tx = agent_tx.automated();
+            match operation {
+                "curate_update" => {
+                    tx.update_memory_content("git:proj", id, corrected, None, 2)
+                        .map_err(|e| e.to_string())?;
+                }
+                "curate_merge" => {
+                    tx.merge_memories_canonical(
+                        "git:proj",
+                        &[id, second.unwrap()],
+                        corrected,
+                        Some("ses"),
+                        2,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                "curate_archive" => {
+                    tx.archive_memories("git:proj", &[id], Some("obsolete"), 2)
+                        .map_err(|e| e.to_string())?;
+                }
+                "verify_archive" | "verify_update" => {
+                    let result = tx.set_memory_verification(
+                        "git:proj",
+                        &[mc_store::VerificationUpdate {
+                            memory_id: id,
+                            content_hash_at_prompt: original_hash.clone(),
+                            verification_status: if operation == "verify_update" {
+                                "update"
+                            } else {
+                                "archive"
+                            }
+                            .into(),
+                            updated_content: Some(corrected.into()),
+                            archive_reason: Some("obsolete".into()),
+                        }],
+                        2,
+                    )?;
+                    assert_eq!(result.accepted, vec![id]);
+                }
+                "expiry_archive" => {
+                    assert_eq!(tx.expire_memories("git:proj", &[id], 2)?.accepted, vec![id]);
+                }
+                _ => unreachable!(),
+            }
+            Ok(Vec::new())
+        },
+    )
+    .unwrap();
+    let row = s.get_memory_full(id).unwrap().unwrap();
+    if operation.ends_with("archive") || second.is_some() {
+        assert_eq!(row.status, "archived");
+    } else {
+        assert_eq!(row.content, corrected);
+    }
+    s.with_context_conn_for_test(|conn| {
+        let (previous, snapshot): (String, String) = conn.query_row(
+            "SELECT previous_text,before_json FROM memory_history WHERE memory_id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(previous, "cache_ttl is 5 minutes in config.ts.");
+        assert_eq!(
+            serde_json::from_str::<Value>(&snapshot).unwrap()["status"],
+            "active"
+        );
+        if let Some(second) = second {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT previous_text FROM memory_history WHERE memory_id=?1",
+                    [second],
+                    |row| row.get::<_, String>(0)
+                )?,
+                "config.ts declares a 5 minute cache_ttl."
+            );
+        }
+        for table in [
+            "memory_mutation_log",
+            "memory_agent_fragments",
+            "memory_tool_proposals",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))?,
+                0,
+                "{table}"
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    let deferred = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(
+        serde_json::to_vec(deferred.messages()).unwrap(),
+        served_before
+    );
+    s.arm_soft_refresh("ses").unwrap();
+    let soft = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(soft.action, "SOFT");
+    assert_eq!(serde_json::to_vec(soft.messages()).unwrap(), served_before);
+    request.render_config = "cfg-natural-rebuild".into();
+    let hard = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(hard.action, "HARD");
+    assert!(!m0_bytes(&hard).contains("cache_ttl is 5 minutes"));
+    if !operation.ends_with("archive") {
+        assert!(m0_bytes(&hard).contains(corrected));
+    }
+}
+
+#[test]
+fn module_curate_update_applies_with_history_and_waits_for_hard() {
+    assert_automated_memory_change("curate_update");
+}
+#[test]
+fn module_curate_merge_applies_with_history_and_waits_for_hard() {
+    assert_automated_memory_change("curate_merge");
+}
+#[test]
+fn module_curate_archive_applies_with_history_and_waits_for_hard() {
+    assert_automated_memory_change("curate_archive");
+}
+#[test]
+fn module_verify_archive_applies_with_history_and_waits_for_hard() {
+    assert_automated_memory_change("verify_archive");
+}
+#[test]
+fn module_verify_update_applies_with_history_and_waits_for_hard() {
+    assert_automated_memory_change("verify_update");
+}
+#[test]
+fn module_expiry_archive_applies_with_history_and_waits_for_hard() {
+    assert_automated_memory_change("expiry_archive");
+}
+
 fn edit(s: &McStore, session: &str, id: i64, text: &str, key: &str) -> Result<(), McStoreError> {
     s.with_facade_command(
         "/tmp",

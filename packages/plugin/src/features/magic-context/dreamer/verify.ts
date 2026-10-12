@@ -17,6 +17,7 @@ import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import {
+    archiveMemory,
     clearMemoryVerifications,
     getMemoryById,
     hasMemoryClassifiedAtColumn,
@@ -27,8 +28,9 @@ import {
     readGitHead,
     recordMemoryVerifications,
 } from "../memory";
-import { proposeMemoryMutation, recordAutomatedMemoryEdit } from "../memory/lifecycle-applier";
+import { recordAutomatedMemoryEdit, tsOwnsMemory } from "../memory/lifecycle-applier";
 import { computeNormalizedHash } from "../memory/normalize-hash";
+import { ModuleMemoryAuthorityError } from "../memory/storage-memory";
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
 import { readFailedChildMessages } from "./failed-invocation-evidence";
@@ -537,7 +539,7 @@ async function verifyOneBatch(
  * - update: rewrite the memory content with an undo-history row (no mutation-log
  *   row), then clear old file mappings and embeddings so the new content is mapped
  *   and verified again next cycle.
- * - archive: record a pending archive proposal; the row stays live. Skipped when
+ * - archive: archive directly with undo history and no prompt delta. Skipped when
  *   the memory is no longer primary-mutable (already archived/superseded), so a
  *   stale manifest can't fight a concurrent change.
  * - skip/refusal: count the verdict for progress without changing the memory.
@@ -735,6 +737,8 @@ async function applyParsedVerifyManifest(
         return { verified, updated, archived, skipped, refused };
     }
     runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
+        if (!tsOwnsMemory(args.db, args.projectIdentity))
+            throw new ModuleMemoryAuthorityError(args.projectIdentity);
         for (const w of writes) {
             const memory = getMemoryById(args.db, w.id);
             if (!isPrimaryMutable(memory)) continue;
@@ -754,15 +758,11 @@ async function applyParsedVerifyManifest(
                 });
                 updated += 1;
             } else {
-                // "The files refute this memory" is a model-judged retirement, so it
-                // waits for review instead of archiving the row.
-                proposeMemoryMutation(args.db, {
-                    projectPath: args.projectIdentity,
-                    key: `verify-archive:${w.id}:${memory.normalizedHash}`,
+                archiveMemory(args.db, w.id, w.reason);
+                recordAutomatedMemoryEdit(args.db, {
                     writer: "verify",
-                    operation: "archive",
-                    targetIds: [w.id],
-                    proposal: { reason: w.reason },
+                    before: memory,
+                    reason: w.reason,
                 });
                 archived += 1;
             }

@@ -59,6 +59,8 @@ export interface CtxMemoryToolDeps {
     allowedActions?: CtxMemoryAction[];
     sourceType?: MemorySourceType;
     rustToolBackends?: RustToolBackends;
+    /** Module-owned automated edits are refused if the module callback is unavailable. */
+    memoryAuthority?: "ts" | "module";
     /**
      * Where an agent's save happened, for the historian's agent-memory scoring; null
      * (or absent) when this lane does not score agent saves, so no classification

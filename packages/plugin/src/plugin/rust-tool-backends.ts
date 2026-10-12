@@ -57,6 +57,8 @@ export function toolCallIdFromContext(context: unknown): string | undefined {
 }
 
 export interface RustToolBackends {
+    /** Automated curation saves prior versions for undo without publishing prompt-update lines. */
+    curateMemory?: (args: AgentMemoryMutation & { projectRoot: string }) => Promise<ApplierReceipt>;
     reduce?: (args: {
         sessionId: string;
         projectRoot: string;
@@ -93,3 +95,8 @@ export function isRustAuthorityDrainingError(error: unknown): boolean {
     }
     return error instanceof Error && error.message.includes("authority_draining");
 }
+
+import type {
+    AgentMemoryMutation,
+    ApplierReceipt,
+} from "../features/magic-context/memory/lifecycle-applier";
