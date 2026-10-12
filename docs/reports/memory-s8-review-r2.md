@@ -314,3 +314,78 @@ no production or packaging code changed. The focused S8/S6 gates above were run
 instead of touching unrelated native/provider fixture coverage. A final default
 run of the new review file confirms **0 pass, 10 skip, 0 fail**: no slow subprocess
 or deliberately red witness runs without `MC_S8_REVIEW=1`.
+
+## Owner rulings and follow-up disposition
+
+The findings and red output above describe `f4561f9233`, before the owner's
+follow-up rulings. The current acceptance contract distinguishes one recovery
+bug, one accepted lease limit, and one unsupported clock model:
+
+1. **Renewal race — fixed, not accepted.** Every shared recovery give-up checks
+   the carrier's current ownership lease inside the immediate transaction that
+   would consume attempts and terminate the stage. A matching, unexpired Pi lease
+   vetoes that transaction even when the unknown-visit count has reached three.
+   A veto consumes no attempt, closes no child and emits no release log. OpenCode
+   carriers supply no lease veto and retain their existing recovery behavior.
+2. **Timer starvation — accepted bounded takeover.** Pi renews a 60-second lease
+   every 10 seconds. Blocking its event loop for more than 50 seconds can leave a
+   renewal gap long enough for another process to take over; expiry is not proof
+   that the first process stopped executing. The cost can include an extra send
+   and a consumed fact attempt, but the resolving fence forbids a second canonical
+   application. Each committed expired-lease takeover now emits exactly one line:
+   `Pi RPC lease takeover stage=<stage key> stale_ms=<milliseconds overdue>`.
+   Its expiry and age are read under the release write lock, and the log is emitted
+   after that transaction commits. Repeated recovery of the terminal stage emits
+   nothing more. The starvation witness now requires one application, the original
+   stage remaining lost with no late reply recorded, and that single stage/staleness
+   log. This deliberately replaces the earlier no-takeover assertion.
+3. **Per-process clock skew — unsupported.** Pi owners and observers on one machine
+   share wall time. Giving only the owner's `Date.now()` a -120-second offset models
+   a condition outside that carrier contract. The witness is explicitly skipped as
+   `unsupported witness: per-process clock skew (same-machine Pi processes share wall time)`;
+   it is retained as a model, not treated as a production regression gate.
+
+Retirement and standing-rule promotion proposal behavior is being changed
+separately, outside this follow-up. Its `retire` and `promote_rule` witnesses remain
+excluded here, and this follow-up changes neither action's handling.
+
+### Verification after the rulings
+
+All builds, checks and tests in this follow-up ran on `linux,4c`. Test commands use
+`BUN_JSC_useOMGJIT=0`; opt-in review tests also use `MC_S8_REVIEW=1`.
+
+- Combined S8 review/round-two/ownership suites: **20 pass, 1 skip, 0 fail**, 269
+  assertions, three files, 165.17 s. Only the two separately owned proposal
+  witnesses were filtered. The dormant comparison again passed **43 paired runs**.
+- Final round-two suite, after adding the repository-required `windowsHide: true`
+  to its real owner subprocess: **9 pass, 1 explicit unsupported-clock skip,
+  0 fail**, 92 assertions, 132.94 s. This includes both real elapsed-time cases.
+- S6 state machine, review, applier, deterministic gates, both OpenCode carrier
+  suites, turn-one/continuation runner and Pi projection probe: **100 pass,
+  0 fail**, 502 assertions, eight files. The release veto is optional; no
+  OpenCode lease behavior was introduced.
+- Workspace typecheck passed with **TypeScript 5.9.3**, as did a supplemental strict
+  `tsc --noEmit` check of the rewritten round-two witness source.
+- Repository build and lint passed; **Biome 2.5.1** checked 1,408 core, 287 Pi,
+  137 CLI and six retina files. `cargo fmt --all` passed with rustfmt 1.10.0-stable.
+- Default Pi suite: **1,872 pass, 28 skip, 0 fail**, 1,900 entries across 191 files.
+- Root test run: **8,406 pass, 19 skip, 2 fail**. One failure was the known
+  `onnxruntime-web/webgpu` fixture resolution failure. The other identified the
+  copied review subprocess's missing Windows console flag; that flag was added
+  and the actual `windows-hidden-spawns.test.ts` enumeration then passed **1/1**.
+  The unrelated WASM fixture was not changed.
+
+Two isolated mutation controls were applied to staged live files, with
+`NON-VACUITY BREAK` marking the temporary change, and restored with
+`git checkout -- <path> && touch <path>`. The unstaged diff-stat was empty before
+and after each control:
+
+| Mutation | Red detector | Green companion | Applied diff-stat → restored | Failure |
+| --- | --- | --- | --- | --- |
+| Remove the `canRelease` veto inside `consumeStageAttempts` in `packages/plugin/src/features/magic-context/memory/turn-two.ts` | `witness: a lease renewed before the recovery write lock stays busy at the visit bound` | `legacy foreign stages without lease metadata reach the shared visit bound` | `1 file changed, 1 insertion(+), 1 deletion(-)` → empty | The stored lease expiry was renewed 60 seconds into the future, so the active owner's stage must remain `sending`; the mutant marks it `expired`. 1 pass, 1 fail, 8 filtered. |
+| Suppress the committed takeover log in `releasePiStage` in `packages/pi-plugin/src/pi-historian-turn-two.ts` | `timer starvation takeover logs expiry once, applies once and fences the late owner reply` | `witness: a lease renewed before the recovery write lock stays busy at the visit bound` | `1 file changed, 1 insertion(+), 1 deletion(-)` → empty | Expected one takeover log, received zero; 1 pass, 1 fail, 8 filtered. |
+
+Each control reddened only its named detector; the stated companion actually ran
+and stayed green. No temporary mutation is committed. The final unmutated suite
+above tests restored production code; its expectations were not changed to make
+the mutated code pass.

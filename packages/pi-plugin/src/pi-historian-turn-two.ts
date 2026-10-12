@@ -14,6 +14,7 @@ import {
 } from "@magic-context/core/features/magic-context/memory/turn-two-children";
 import type { TurnTwoExcerptReader } from "@magic-context/core/features/magic-context/memory/turn-two-scoring";
 import { renderCheckInput } from "@magic-context/core/hooks/magic-context/historian-turn-two-carrier";
+import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type {
 	SubagentRunner,
@@ -73,12 +74,13 @@ interface PiStage {
 	child_session_id: string | null;
 	started_at: number;
 	request_json: string;
+	session_id: string;
 }
 
 function openStage(db: Database, key: string): PiStage | null {
 	return db
 		.prepare(
-			"SELECT stage_key,child_session_id,started_at,request_json FROM memory_stage_attempts WHERE stage_key=? AND carrier=? AND stage='turn_two' AND state IN ('reserved','sending','replied')",
+			"SELECT stage_key,child_session_id,started_at,request_json,session_id FROM memory_stage_attempts WHERE stage_key=? AND carrier=? AND stage='turn_two' AND state IN ('reserved','sending','replied')",
 		)
 		.get(key, PI_RPC_CARRIER) as PiStage | null;
 }
@@ -95,6 +97,44 @@ function stageLease(stage: PiStage): { expiresAt: number } | null {
 	} catch {
 		return null;
 	}
+}
+
+function expiredLeaseLog(
+	stage: PiStage,
+): { sessionId: string; line: string } | null {
+	const lease = stageLease(stage);
+	const now = Date.now();
+	if (!lease || lease.expiresAt > now) return null;
+	return {
+		sessionId: stage.session_id,
+		line: `Pi RPC lease takeover stage=${stage.stage_key} stale_ms=${Math.floor(now - lease.expiresAt)}`,
+	};
+}
+
+/** The shared give-up must reread the lease under its own write lock, not reuse Pi recovery's earlier snapshot. */
+function recoveryLeaseFence(db: Database, key: string) {
+	let expiryLog: ReturnType<typeof expiredLeaseLog> = null;
+	return {
+		canRelease: () => {
+			const stage = openStage(db, key);
+			const lease = stage && stageLease(stage);
+			if (
+				stage &&
+				lease &&
+				lease.expiresAt > Date.now() &&
+				carrierAlive(stage.child_session_id)
+			) {
+				expiryLog = null;
+				return false;
+			}
+			expiryLog = stage ? expiredLeaseLog(stage) : null;
+			return true;
+		},
+		onRelease: () => {
+			if (expiryLog) sessionLog(expiryLog.sessionId, expiryLog.line);
+			expiryLog = null;
+		},
+	};
 }
 
 /** Renew only this stage/child UUID while it still owns an open stage; a released send cannot resurrect its lease. */
@@ -127,6 +167,7 @@ function releasePiStage(
 	shouldRelease: (stage: PiStage) => boolean,
 ): number {
 	let releasedChild: string | null = null;
+	let expiryLog: ReturnType<typeof expiredLeaseLog> = null;
 	const count = db
 		.transaction(() => {
 			// Read the lease again after acquiring the write lock, so a concurrent
@@ -151,9 +192,14 @@ function releasePiStage(
 				"UPDATE memory_stage_attempts SET state='lost' WHERE stage_key=? AND state IN ('reserved','sending','replied')",
 			).run(key);
 			releasedChild = stage.child_session_id;
+			expiryLog = expiredLeaseLog(stage);
 			return facts.length;
 		})
 		.immediate();
+	if (expiryLog) {
+		const log = expiryLog as { sessionId: string; line: string };
+		sessionLog(log.sessionId, log.line);
+	}
 	if (releasedChild) {
 		liveCarriers.get(releasedChild)?.cancel();
 		liveChildren.delete(releasedChild);
@@ -347,6 +393,7 @@ const recoverLivePiRpcStage =
 				);
 			});
 			return {
+				...recoveryLeaseFence(db, record.stageKey),
 				check: async () => {
 					throw new Error("Pi RPC check owner unavailable");
 				},
@@ -357,6 +404,7 @@ const recoverLivePiRpcStage =
 		}
 		if (retainedTurnTwoChild(record.childSessionId)?.active) return "busy";
 		return {
+			...recoveryLeaseFence(db, record.stageKey),
 			check: carrier.check,
 			reattach: async () => ({ kind: child.alive ? "unknown" : "gone" }),
 			close: () => closeTurnTwoChild(child.id),

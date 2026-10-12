@@ -194,6 +194,10 @@ export type TurnTwoRecoveryResolver = (record: TurnTwoStageRecord) =>
           reattach(): Promise<TurnTwoReattach>;
           /** Close the stage's hidden child session once none of its facts is in flight. */
           close?(): Promise<void>;
+          /** Called under the give-up write lock; a renewed ownership lease can veto release. */
+          canRelease?(): boolean;
+          /** Called only after the give-up transaction commits, for carrier-specific release logging. */
+          onRelease?(): void;
       })
     | "busy"
     | null;
@@ -356,26 +360,44 @@ export function turnTwoDecisionKey(
 }
 
 /** Consume one attempt of every fact still reserved by `stageKey`. */
-function consumeStageAttempts(db: Database, stageKey: string, reason: string, state: string): void {
-    db.transaction(() => {
-        const facts = db
-            .prepare(
-                "SELECT id,project_path FROM memory_pending_facts WHERE state='in_flight' AND reserved_stage_key=?",
+function consumeStageAttempts(
+    db: Database,
+    stageKey: string,
+    reason: string,
+    state: string,
+    canRelease?: () => boolean,
+): boolean {
+    return db
+        .transaction(() => {
+            if (
+                !db
+                    .prepare(
+                        "SELECT 1 FROM memory_stage_attempts WHERE stage_key=? AND state IN ('reserved','sending','replied')",
+                    )
+                    .get(stageKey)
             )
-            .all(stageKey) as Array<{ id: number; project_path: string }>;
-        for (const fact of facts)
-            resolveFactDecision(db, {
-                key: JSON.stringify([stageKey, fact.id, reason]),
-                projectPath: fact.project_path,
-                factId: fact.id,
-                operation: "turn_two",
-                state: "retryable",
-                reason,
-            });
-        db.prepare(
-            "UPDATE memory_stage_attempts SET state=? WHERE stage_key=? AND state IN ('reserved','sending','replied')",
-        ).run(state, stageKey);
-    }).immediate();
+                return false;
+            if (canRelease && !canRelease()) return false;
+            const facts = db
+                .prepare(
+                    "SELECT id,project_path FROM memory_pending_facts WHERE state='in_flight' AND reserved_stage_key=?",
+                )
+                .all(stageKey) as Array<{ id: number; project_path: string }>;
+            for (const fact of facts)
+                resolveFactDecision(db, {
+                    key: JSON.stringify([stageKey, fact.id, reason]),
+                    projectPath: fact.project_path,
+                    factId: fact.id,
+                    operation: "turn_two",
+                    state: "retryable",
+                    reason,
+                });
+            db.prepare(
+                "UPDATE memory_stage_attempts SET state=? WHERE stage_key=? AND state IN ('reserved','sending','replied')",
+            ).run(state, stageKey);
+            return true;
+        })
+        .immediate();
 }
 
 function readStageRequest(db: Database, stageKey: string): StageRequest | null {
@@ -972,7 +994,17 @@ export async function recoverTurnTwoStages(
     for (const record of stageRecords(db, input.projectPath)) {
         let carrier: Exclude<ReturnType<TurnTwoRecoveryResolver>, "busy"> = null;
         const giveUp = async (reason: string, state: string) => {
-            consumeStageAttempts(db, record.stageKey, reason, state);
+            if (
+                !consumeStageAttempts(
+                    db,
+                    record.stageKey,
+                    reason,
+                    state,
+                    () => carrier?.canRelease?.() ?? true,
+                )
+            )
+                return;
+            carrier?.onRelease?.();
             input.log?.(`turn two: gave up stage ${record.stageKey} (${reason})`);
             await carrier?.close?.().catch(() => undefined);
         };
