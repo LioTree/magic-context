@@ -26971,7 +26971,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pending_in_session_memory_change_is_consumed_on_execute_without_rendering_it() {
+    fn in_session_memory_change_opens_no_execute_band_soft_and_defers_replay() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -26987,8 +26987,9 @@ pub(crate) mod tests {
 
         let consumed =
             transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
-        assert_eq!(consumed.action, "SOFT");
-        // A busting SOFT reads no memory rows: the update waits for the next HARD fold.
+        // A memory change is not m1 work, so even at execute band the pass replays; the
+        // update waits for the next HARD fold.
+        assert_eq!(consumed.action, "SOFT+");
         assert!(!m1_bytes(&consumed).contains("pending rule"));
         let consumed_bytes = serde_json::to_vec(&consumed.ck_messages).unwrap();
 
@@ -27006,12 +27007,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn in_session_memory_mutations_open_the_next_bust_without_rendering_and_defers_replay() {
+    fn in_session_memory_mutations_open_no_bust_and_defers_replay() {
         // An update, an archive and a merge each append to context.db's
-        // memory_mutation_log and change no memory id. The mutation-log head is the only
-        // revision input that moves, so it still opens the next execute-band pass as a SOFT,
-        // but that SOFT reads no mutation log: it renders no <memory-updates> (the change
-        // waits for the next HARD fold), and the defers after it replay its bytes exactly.
+        // memory_mutation_log. None of them is m1 work any more (a busting SOFT renders no
+        // memory rows), so the next execute-band pass replays (SOFT+) with no
+        // <memory-updates>, the change waits for the next HARD fold, and the defers after
+        // it replay the same bytes.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -27072,7 +27073,7 @@ pub(crate) mod tests {
         for (marker, mutate) in mutations {
             mutate(&s);
             let soft = transform(&s, &execute_req, &ctx).unwrap();
-            assert_eq!(soft.action, "SOFT", "{marker}");
+            assert_eq!(soft.action, "SOFT+", "{marker}");
             let m1 = m1_bytes(&soft);
             assert!(!m1.contains("<memory-updates>"), "{marker}: {m1}");
             assert!(!m1.contains(marker), "{marker}: {m1}");
@@ -27358,9 +27359,10 @@ pub(crate) mod tests {
 
         let execute_request = with_usage(request.clone(), 70, 100);
         let soft = transform(&s, &execute_request, &ctx).unwrap();
-        assert_eq!(soft.action, "SOFT");
+        // A memory change is not m1 work, so it opens no SOFT even at execute band; the
+        // new memory folds in at the HARD below.
+        assert_eq!(soft.action, "SOFT+");
         assert_eq!(m0_bytes(&soft), first_m0);
-        // A busting SOFT reads no memory rows; the new memory folds in at the HARD below.
         assert!(!m1_bytes(&soft).contains("<new-memories>"));
         assert!(!m1_bytes(&soft).contains("Deferred memory B"));
         assert!(!m0_bytes(&soft).contains("Deferred docs B"));
@@ -33561,7 +33563,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn legacy_revision_exclusion_escalates_despite_project_memory_churn() {
+    fn legacy_revision_exclusion_recuts_at_once_despite_project_memory_churn() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let request = seed_astro_divergence(&store, "astro-memory-churn", 2_402);
@@ -33585,18 +33587,8 @@ pub(crate) mod tests {
             ))
             .unwrap();
 
-        for expected_count in 1..BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT {
-            let deferred = run(&store, &request, &spine());
-            assert_eq!(deferred.action, "SOFT+");
-            assert_eq!(
-                store
-                    .load("astro-memory-churn")
-                    .unwrap()
-                    .meta
-                    .boundary_divergence_pending_count,
-                expected_count
-            );
-        }
+        // Project memory churn is not m1 work (a busting SOFT renders no memory rows), so
+        // it leaves no pending m1 revision to wait behind: the divergence recuts at once.
         let escalated = run(&store, &request, &spine());
         assert_eq!(escalated.action, "HARD");
         assert_eq!(
@@ -34980,7 +34972,7 @@ pub(crate) mod tests {
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
-            if seed % 3 == 0 {
+            if seed.is_multiple_of(3) {
                 s.insert_memory(memory_input(
                     "git:proj",
                     "ARCHITECTURE",
@@ -34992,7 +34984,7 @@ pub(crate) mod tests {
                 s.update_memory_content("git:proj", id, &format!("update {i}"), None, i)
                     .unwrap();
             }
-            if seed % 4 == 0 {
+            if seed.is_multiple_of(4) {
                 let other = req(
                     "other",
                     &format!("cfg-{i}"),
@@ -35127,7 +35119,9 @@ pub(crate) mod tests {
         let ungated_signal =
             m1_revision_signal_parts_for_pass(&s, "git:proj", "git:proj", "ses", 0, true, 0)
                 .unwrap();
-        assert_ne!(gated_signal.revision, ungated_signal.revision);
+        // The memory slots of the digest are constant zeros now, so the memory-off gate no
+        // longer changes the digest.
+        assert_eq!(gated_signal.revision, ungated_signal.revision);
         let loaded = s.load("ses").unwrap();
         let mut legacy_meta = loaded.meta.clone();
         legacy_meta.m1_revision = ungated_signal.revision;
@@ -35144,14 +35138,14 @@ pub(crate) mod tests {
         assert!(!deferred.committed);
         assert_eq!(m1_bytes(&deferred), M1_PLACEHOLDER);
 
-        // An independently scheduled execute absorbs the gated digest without rendering memory.
+        // The digest's memory slots are constant zeros, so the legacy ungated digest already
+        // equals the gated one: an execute-band pass has nothing to absorb and replays.
         let execute_request = with_usage(off_request.clone(), 70, 100);
         let migrated = transform(&s, &execute_request, &off_ctx).unwrap();
-        assert_eq!(migrated.action, "SOFT");
+        assert_eq!(migrated.action, "SOFT+");
         assert_eq!(m1_bytes(&migrated), M1_PLACEHOLDER);
         let migrated_meta = s.load("ses").unwrap().meta;
         assert_eq!(migrated_meta.m1_revision, gated_signal.revision);
-        assert!(migrated_meta.memory_disabled);
 
         // Later workspace-memory churn is revision-neutral and cannot populate or bust m1.
         s.seed_memory(7, "git:foreign", "CONSTRAINTS", "new shared rule", 70)

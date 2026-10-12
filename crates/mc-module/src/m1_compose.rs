@@ -1339,9 +1339,11 @@ mod tests {
             }
 
             let after_signal = m1_revision_signal(&store, project, "ses").unwrap();
-            assert_ne!(
+            // A busting SOFT renders no memory rows, so memory ports never move the m1
+            // signal; the fold-time renderer below still renders the change.
+            assert_eq!(
                 before_signal, after_signal,
-                "{case} must move the m1 signal"
+                "{case} must not move the m1 signal"
             );
             let meta = meta_after_hard(1, Some(10), max_mem, cursor, manifest);
             let m1 = compose_m1_from_store(
@@ -1391,7 +1393,10 @@ mod tests {
             .unwrap();
 
         let after = m1_revision_signal(store, project, "ses").unwrap();
-        assert_ne!(before, after, "the atomic merge must move the m1 revision");
+        assert_eq!(
+            before, after,
+            "a merge is not m1 work: a busting SOFT renders no memory rows"
+        );
         assert_eq!(
             after,
             m1_revision_signal(store, project, "ses").unwrap(),
@@ -1980,7 +1985,10 @@ mod tests {
             .insert_memory(insert_input(project, "CONSTRAINTS", "brand new", 1))
             .unwrap();
         let after_signal = m1_revision_signal(store, project, "ses").unwrap();
-        assert_ne!(before_signal, after_signal, "insert moves max_memory_id");
+        assert_eq!(
+            before_signal, after_signal,
+            "an insert is not m1 work: a busting SOFT renders no memory rows"
+        );
         assert_eq!(
             store
                 .max_memory_mutation_id(&[project.to_string()])

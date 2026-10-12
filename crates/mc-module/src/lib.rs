@@ -32257,7 +32257,8 @@ mod tests {
         .await;
         let memory_revision_after_update =
             crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
-        assert_ne!(memory_revision_after_update, memory_revision_after_write);
+        // A busting SOFT renders no memory rows, so memory edits never move the m1 revision.
+        assert_eq!(memory_revision_after_update, memory_revision_after_write);
         call_and_replay(
             &handler,
             &store,
@@ -32273,7 +32274,7 @@ mod tests {
         .await;
         let memory_revision_after_archive =
             crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
-        assert_ne!(memory_revision_after_archive, memory_revision_after_update);
+        assert_eq!(memory_revision_after_archive, memory_revision_after_update);
 
         call_and_replay(
             &handler,
@@ -33218,7 +33219,8 @@ mod tests {
         // mirror acknowledges the merge's new row before the next pass, as it does for the
         // rows `insert_memory` created.
         let revision_after = crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap();
-        assert_ne!(revision_before, revision_after);
+        // A busting SOFT renders no memory rows, so the merge does not move the m1 revision.
+        assert_eq!(revision_before, revision_after);
         assert_eq!(
             revision_after,
             crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap(),
@@ -33226,7 +33228,7 @@ mod tests {
         );
 
         let transition = call_transform_request(&handler, request.clone()).await;
-        assert_eq!(transition["action"], "SOFT");
+        assert_eq!(transition["action"], "SOFT+");
         let transition_m1 = transition["ck_messages"]
             .as_array()
             .unwrap()
@@ -33708,7 +33710,8 @@ mod tests {
         );
 
         let update_delta = call_transform_request_on_channel(&handler, 8, boot_req.clone()).await;
-        assert_eq!(update_delta["action"], "SOFT");
+        // Memory edits are not m1 work: the pass replays (SOFT+) and renders nothing new.
+        assert_eq!(update_delta["action"], "SOFT+");
         assert!(!synthetic_text(&update_delta, 1).contains("<memory-updates>"));
         assert!(!synthetic_text(&update_delta, 1).contains("updated rule"));
 
@@ -33757,7 +33760,7 @@ mod tests {
             Some(additive_scope)
         );
         let add_delta = call_transform_request_on_channel(&handler, 9, add_req).await;
-        assert_eq!(add_delta["action"], "SOFT");
+        assert_eq!(add_delta["action"], "SOFT+");
         assert!(!synthetic_text(&add_delta, 1).contains("<new-memories>"));
         assert!(!synthetic_text(&add_delta, 1).contains("new additive memory"));
     }
