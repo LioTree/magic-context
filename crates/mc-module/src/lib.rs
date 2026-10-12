@@ -32703,6 +32703,89 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn noprop_curate_stale_cas_refuses_each_action_and_changes_nothing() {
+        if std::env::var("MC_NOPROP_REVIEW").as_deref() != Ok("1") {
+            return;
+        }
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let root = project.to_str().unwrap();
+        let identity = "git:noprop-cas";
+        handler.bind_route(7, binding(root, "token"));
+        activate_module_authority(&store, "context", identity, root, "memories");
+        let first = insert_memory(&store, identity, "CONSTRAINTS", "Original first.", 1);
+        let second = insert_memory(&store, identity, "CONSTRAINTS", "Original second.", 1);
+        for action in ["update", "archive", "merge"] {
+            let ids = if action == "merge" {
+                vec![first, second]
+            } else {
+                vec![first]
+            };
+            let expected: Vec<Value> = ids
+                .iter()
+                .map(|id| json!({"id": id, "revision": if *id == first { 0 } else { 1 }}))
+                .collect();
+            let body = tool_body(call_facade(&handler, "memory.curate", json!({
+                "memory_project": identity, "command_id": format!("stale-{action}"),
+                "action": action, "ids": ids, "expected_revisions": expected, "content": "Replacement.",
+            })).await);
+            assert_eq!(body["isError"], true, "{action}: {body}");
+            assert!(
+                body["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("stale_revision"),
+                "{action}: {body}"
+            );
+        }
+        let foreign = insert_memory(&store, "git:foreign", "CONSTRAINTS", "Foreign source.", 1);
+        store.with_context_conn_for_test(|conn| {
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS authority_managed(project_path TEXT PRIMARY KEY, context_store_uuid TEXT NOT NULL, marked_at INTEGER NOT NULL)")?;
+            conn.execute("INSERT INTO authority_managed(project_path,context_store_uuid,marked_at) VALUES(?1,'review',1)", [identity])?;
+            Ok(())
+        }).unwrap();
+        let refused = tool_body(call_facade(&handler, "memory.curate", json!({
+            "memory_project": identity, "command_id": "mixed-authority", "action": "merge",
+            "ids": [first, foreign], "expected_revisions": [{"id": first, "revision": 1}, {"id": foreign, "revision": 1}],
+            "content": "Merged foreign source.",
+        })).await);
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(
+            store.get_memory_full(foreign).unwrap().unwrap().status,
+            "active"
+        );
+        assert_eq!(
+            store.get_memory_full(first).unwrap().unwrap().content,
+            "Original first."
+        );
+        assert_eq!(
+            store.get_memory_full(second).unwrap().unwrap().status,
+            "active"
+        );
+        store
+            .with_context_conn_for_test(|conn| {
+                for table in [
+                    "memory_history",
+                    "memory_mutation_log",
+                    "memory_agent_fragments",
+                    "memory_tool_proposals",
+                ] {
+                    assert_eq!(
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                            .get::<_, i64>(0))?,
+                        0,
+                        "{table}"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn verification_and_mapping_facades_are_fenced_hash_guarded_and_idempotent() {
         let producer = Arc::new(ProducerState::default());
         let resolver =

@@ -680,3 +680,232 @@ fn review_crash_between_row_and_fragment_is_atomic() {
     })
     .unwrap();
 }
+
+fn noprop_automated(s: &McStore, kind: u32, step: usize) {
+    let hash = s.get_memory_full(7).unwrap().unwrap().normalized_hash;
+    s.with_facade_command(
+        "/tmp",
+        "git:proj",
+        "memories",
+        "ses",
+        "memory.curate",
+        "review",
+        Some(&format!("noprop:{step}")),
+        |agent_tx| {
+            let tx = agent_tx.automated();
+            match kind {
+                2 => {
+                    tx.archive_memories("git:proj", &[4], Some("obsolete"), 2)
+                        .map_err(|e| e.to_string())?;
+                }
+                3 => {
+                    tx.merge_memories_canonical(
+                        "git:proj",
+                        &[5, 6],
+                        "Merged automated claim.",
+                        Some("ses"),
+                        2,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                4 => {
+                    tx.set_memory_verification(
+                        "git:proj",
+                        &[mc_store::VerificationUpdate {
+                            memory_id: 7,
+                            content_hash_at_prompt: hash,
+                            verification_status: "archive".into(),
+                            updated_content: None,
+                            archive_reason: Some("obsolete".into()),
+                        }],
+                        2,
+                    )?;
+                }
+                _ => {
+                    tx.update_memory_content(
+                        "git:proj",
+                        2,
+                        &format!("Automated claim {step}."),
+                        None,
+                        2,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(Vec::new())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn noprop_randomized_automated_vs_delayed_served_bytes() {
+    if std::env::var("MC_NOPROP_REVIEW").as_deref() != Ok("1") {
+        return;
+    }
+    let mut counts = [0usize; 3];
+    for seed in [0x941aac21u32, 0x287cf89b, 0xb41c137e, 0x1799fdd3] {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let actual = store(dirs[0].path());
+        let delayed = store(dirs[1].path());
+        for s in [&actual, &delayed] {
+            s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+                .unwrap();
+            for text in [
+                "Agent baseline.",
+                "Automated baseline.",
+                "Spare baseline.",
+                "Archive baseline.",
+                "Merge first.",
+                "Merge second.",
+                "Verify baseline.",
+            ] {
+                s.insert_memory(memory_input("git:proj", "CONSTRAINTS", text, 0))
+                    .unwrap();
+            }
+        }
+        let mut request = req(
+            "ses",
+            "cfg0",
+            vec![item("a", 1, "raw"), item("tail", 2, "tail")],
+        );
+        request.auto_search_enabled = false;
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let mut previous = transform(&actual, &request, &ctx).unwrap();
+        assert_eq!(
+            serde_json::to_vec(previous.messages()).unwrap(),
+            serde_json::to_vec(transform(&delayed, &request, &ctx).unwrap().messages()).unwrap()
+        );
+        let mut rng = seed;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        let mut pending = Vec::new();
+        for step in 0..80 {
+            let kind = if step < 3 { step as u32 + 2 } else { 0 };
+            let before = actual.load_agent_fragments("ses", 0).unwrap().len();
+            noprop_automated(&actual, kind, step);
+            assert_eq!(actual.load_agent_fragments("ses", 0).unwrap().len(), before);
+            pending.push((kind, step));
+            if next() % 2 == 0 {
+                let owner = if next() % 2 == 0 { "ses" } else { "foreign" };
+                for s in [&actual, &delayed] {
+                    edit(
+                        s,
+                        owner,
+                        1,
+                        &format!("Agent correction {step} & <quoted>."),
+                        &format!("agent:{step}"),
+                    )
+                    .unwrap();
+                }
+            }
+            let pass = if step == 79 { 2 } else { next() % 3 };
+            counts[pass as usize] += 1;
+            if pass == 2 {
+                for (kind, queued) in pending.drain(..) {
+                    noprop_automated(&delayed, kind, queued);
+                }
+                request.render_config = format!("natural-{seed}-{step}");
+            } else if pass == 1 {
+                actual.arm_soft_refresh("ses").unwrap();
+                delayed.arm_soft_refresh("ses").unwrap();
+            }
+            let served = transform(&actual, &request, &ctx).unwrap();
+            let oracle = transform(&delayed, &request, &ctx).unwrap();
+            assert_eq!(
+                serde_json::to_vec(served.messages()).unwrap(),
+                serde_json::to_vec(oracle.messages()).unwrap(),
+                "seed {seed}, step {step}"
+            );
+            assert_eq!(served.action, ["SOFT+", "SOFT", "HARD"][pass as usize]);
+            if pass == 0 {
+                assert_eq!(
+                    serde_json::to_vec(served.messages()).unwrap(),
+                    serde_json::to_vec(previous.messages()).unwrap()
+                );
+            }
+            if pass == 1 {
+                assert_eq!(m0_bytes(&served), m0_bytes(&previous));
+            }
+            previous = served;
+        }
+        actual
+            .with_context_conn_for_test(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM memory_tool_proposals", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))?,
+                    0
+                );
+                for id in [4, 5, 6, 7] {
+                    assert_eq!(
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM memory_history WHERE memory_id=?1",
+                            [id],
+                            |row| row.get::<_, i64>(0)
+                        )?,
+                        1
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert!(counts.iter().all(|count| *count > 0));
+    println!("noprop Rust differential: 320 passes; defer/SOFT/HARD={counts:?}");
+}
+
+#[test]
+fn noprop_agent_m1_fingerprint_matches_baseline() {
+    if std::env::var("MC_NOPROP_REVIEW").as_deref() != Ok("1") {
+        return;
+    }
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+        .unwrap();
+    let id = s
+        .insert_memory(memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "Agent baseline.",
+            0,
+        ))
+        .unwrap();
+    let mut request = req(
+        "ses",
+        "cfg0",
+        vec![item("a", 1, "raw"), item("tail", 2, "tail")],
+    );
+    request.auto_search_enabled = false;
+    let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    transform(&s, &request, &ctx).unwrap();
+    let mut output = Vec::new();
+    for step in 0..24 {
+        edit(
+            &s,
+            "ses",
+            id,
+            &format!("Agent claim {step} & <quoted>."),
+            &format!("agent:{step}"),
+        )
+        .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
+        let served = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(served.action, "SOFT");
+        assert!(m1_bytes(&served).contains("<updated id=\"1\""));
+        output.push(m1_bytes(&served).to_string());
+    }
+    let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&output).unwrap()));
+    assert_eq!(
+        hash,
+        "31d496e40cc01df9e0d9c19052511472d06b968d9ea41a180362659e988ccae9"
+    );
+    println!("noprop Rust agent m[1] SHA256 {hash}");
+}

@@ -704,6 +704,58 @@ describe("turn two gated edits", () => {
             db.close();
         }
     });
+    if (process.env.MC_NOPROP_REVIEW === "1") {
+        test("noprop merge may drop source tokens when the evidence repeats them", async () => {
+            const db = store();
+            try {
+                const survivor = insertMemory(db, {
+                    projectPath: PROJECT,
+                    category: "CONSTRAINTS",
+                    content: "Keep rule. ",
+                });
+                const source = insertMemory(db, {
+                    projectPath: PROJECT,
+                    category: "CONSTRAINTS",
+                    content: "retry_limit is 17.",
+                });
+                const excerpt = "retry_limit was 17; now use bounded retries.";
+                const published = publish(db, [
+                    { content: "Use bounded retries.", block: { ordinal: 42, parts: [excerpt] } },
+                ]);
+                const stub = stubCarrier(() =>
+                    reply([
+                        {
+                            fact_id: published.factIds[0],
+                            action: "merge",
+                            sources: [
+                                { id: survivor.id, revision: 1 },
+                                { id: source.id, revision: 1 },
+                            ],
+                            survivor_id: survivor.id,
+                            removed: [],
+                            replaced: [{ memory_id: source.id, clause: 1, block: 42, excerpt }],
+                            kept: [{ memory_id: survivor.id, clause: 1 }],
+                            added: [{ text: "Use bounded retries.", block: 42, excerpt }],
+                            final_text: "Keep rule. Use bounded retries.",
+                        },
+                    ]),
+                );
+                await run(db, published.publicationId, stub.carrier);
+                // Repeating retry_limit and 17 in the cited evidence lets the merge omit both from the stored memory.
+                expect(fact(db, published.factIds[0]!)).toMatchObject({
+                    state: "applied",
+                    reason: "merge",
+                });
+                expect(getMemoryById(db, survivor.id)!.content).toBe(
+                    "Keep rule. Use bounded retries.",
+                );
+                expect(stub.checks.length).toBeGreaterThan(0);
+            } finally {
+                db.close();
+            }
+        });
+    }
+
     test("a green edit makes exactly 4 checks and applies once with history, no mutation-log row and fresh FTS", async () => {
         const db = store();
         try {
