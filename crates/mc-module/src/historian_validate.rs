@@ -2458,4 +2458,192 @@ full narrative
         assert_eq!(resolved.compartment_index, 2);
         assert_eq!(resolved.block_indexes, vec![1]);
     }
+
+    #[derive(Debug, Deserialize)]
+    struct AnchorFuzzCorpus {
+        lines: Vec<AnchorFuzzLine>,
+        documents: Vec<AnchorFuzzDocument>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AnchorFuzzLine {
+        line: String,
+        compartments: Vec<(u64, u64)>,
+        blocks: Vec<(u64, u64)>,
+        ts: AnchorGoldenExpect,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AnchorFuzzDocument {
+        document: String,
+        ts: Vec<AnchorFuzzFact>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct AnchorFuzzFact {
+        category: String,
+        content: String,
+        compartment: Option<u64>,
+        range: Option<(u64, u64)>,
+    }
+
+    /// Input both parsers can classify the same way: no character JavaScript and Rust
+    /// treat differently (U+0085 is Rust whitespace only, U+FEFF is JavaScript
+    /// whitespace only, and a `\r` not followed by `\n`, U+2028 and U+2029 end a
+    /// JavaScript `.` match) and no integer longer than 15 digits (TypeScript keeps
+    /// only integers below 2^53). CRLF line endings are portable.
+    fn portable_anchor_input(text: &str) -> bool {
+        let mut digits = 0;
+        let mut characters = text.chars().peekable();
+        while let Some(character) = characters.next() {
+            if character == '\r' && characters.peek() != Some(&'\n') {
+                return false;
+            }
+            if matches!(character, '\u{85}' | '\u{feff}' | '\u{2028}' | '\u{2029}') {
+                return false;
+            }
+            digits = if character.is_ascii_digit() {
+                digits + 1
+            } else {
+                0
+            };
+            if digits > 15 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The parts of the anchor fuzz comparison that disagree with TypeScript, one
+    /// line per disagreeing case, split by what is compared. With `portable_only`,
+    /// cases outside [`portable_anchor_input`] are skipped.
+    fn anchor_fuzz_mismatches(
+        portable_only: bool,
+    ) -> (Vec<String>, Vec<String>, Vec<String>, usize) {
+        let corpus: AnchorFuzzCorpus =
+            serde_json::from_str(include_str!("../testdata/turn-one-anchor-fuzz.json"))
+                .expect("parse turn-one anchor fuzz corpus");
+        assert!(corpus.lines.len() >= 400 && corpus.documents.len() >= 80);
+        let mut parsed_mismatches = Vec::new();
+        let mut resolved_mismatches = Vec::new();
+        let mut compared = 0;
+        for case in &corpus.lines {
+            if portable_only && !portable_anchor_input(&case.line) {
+                continue;
+            }
+            compared += 1;
+            let (origin_compartment_index, source_range, content) =
+                split_fact_anchor_prefix(&case.line);
+            let fact = FactCandidate {
+                category: "PROJECT_RULES".into(),
+                content: content.clone(),
+                origin_compartment_index,
+                source_range,
+            };
+            let resolved =
+                resolve_fact_anchor(&fact, &case.compartments, &case.blocks).map(|resolved| {
+                    AnchorGoldenResolved {
+                        compartment: resolved.compartment_index,
+                        blocks: resolved
+                            .block_indexes
+                            .iter()
+                            .map(|&index| case.blocks[index])
+                            .collect(),
+                    }
+                });
+            let range = source_range.map(|range| (range.start, range.end));
+            if content != case.ts.content
+                || origin_compartment_index != case.ts.compartment
+                || range != case.ts.range
+            {
+                parsed_mismatches.push(format!(
+                    "{:?}: rust content={content:?} compartment={origin_compartment_index:?} range={range:?}; ts content={:?} compartment={:?} range={:?}",
+                    case.line, case.ts.content, case.ts.compartment, case.ts.range
+                ));
+            }
+            if resolved != case.ts.resolved {
+                resolved_mismatches.push(format!(
+                    "{:?}: rust {resolved:?}; ts {:?}",
+                    case.line, case.ts.resolved
+                ));
+            }
+        }
+        let mut document_mismatches = Vec::new();
+        for case in &corpus.documents {
+            if portable_only && !portable_anchor_input(&case.document) {
+                continue;
+            }
+            compared += 1;
+            let facts: Vec<AnchorFuzzFact> = match parse_compartment_output(&case.document) {
+                Ok(parsed) => parsed
+                    .facts
+                    .into_iter()
+                    .map(|fact| AnchorFuzzFact {
+                        category: fact.category,
+                        content: fact.content,
+                        compartment: fact.origin_compartment_index,
+                        range: fact.source_range.map(|range| (range.start, range.end)),
+                    })
+                    .collect(),
+                Err(error) => {
+                    document_mismatches.push(format!("{:?}: rust error {error:?}", case.document));
+                    continue;
+                }
+            };
+            if facts != case.ts {
+                document_mismatches.push(format!(
+                    "{:?}:\n  rust {facts:?}\n  ts   {:?}",
+                    case.document, case.ts
+                ));
+            }
+        }
+        (
+            parsed_mismatches,
+            resolved_mismatches,
+            document_mismatches,
+            compared,
+        )
+    }
+
+    /// Whether an anchor binds, and to which compartment and printed lines, and the
+    /// parsed anchor and fact text, match the TypeScript parser and publisher on every
+    /// portable case of the seeded adversarial corpus generated by
+    /// crates/mc-module/gen/gen-turn-one-anchor-fuzz.ts, for single bullets and for
+    /// whole historian outputs.
+    #[test]
+    fn turn_one_anchor_fuzz_matches_typescript_on_portable_input() {
+        let (parsed, resolved, documents, compared) = anchor_fuzz_mismatches(true);
+        // Most of the corpus is portable; the filter must not empty the comparison.
+        assert!(compared >= 400, "only {compared} portable cases compared");
+        assert!(
+            parsed.is_empty() && resolved.is_empty() && documents.is_empty(),
+            "{} bullet, {} resolution and {} document mismatch(es):\n{}\n{}\n{}",
+            parsed.len(),
+            resolved.len(),
+            documents.len(),
+            parsed.join("\n"),
+            resolved.join("\n"),
+            documents.join("\n")
+        );
+    }
+
+    /// The same comparison over the whole corpus, including non-portable input. It
+    /// fails today because the two parsers classify U+0085, U+FEFF, a lone `\r`,
+    /// U+2028, U+2029 and integers past 2^53 differently, so it documents a known
+    /// defect and runs only with `--ignored` (see docs/reports/memory-s5-review.md).
+    #[test]
+    #[ignore = "review witness: TS/Rust fact-anchor parity gaps, docs/reports/memory-s5-review.md"]
+    fn review_witness_turn_one_anchor_fuzz_matches_typescript_on_all_input() {
+        let (parsed, resolved, documents, _) = anchor_fuzz_mismatches(false);
+        assert!(
+            parsed.is_empty() && resolved.is_empty() && documents.is_empty(),
+            "{} bullet, {} resolution and {} document mismatch(es):\n{}\n{}\n{}",
+            parsed.len(),
+            resolved.len(),
+            documents.len(),
+            parsed.join("\n"),
+            resolved.join("\n"),
+            documents.join("\n")
+        );
+    }
 }
