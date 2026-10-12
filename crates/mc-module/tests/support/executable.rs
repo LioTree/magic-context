@@ -1,17 +1,34 @@
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
-/// Copy a test executable off Cargo's build volume before another process launches it.
-pub fn stage_executable(source: &Path, name: &str, identifier: &str) -> io::Result<PathBuf> {
-    #[cfg(not(target_os = "macos"))]
-    let _ = identifier;
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct ExecutableKey {
+    digest: String,
+    name: String,
+    identifier: String,
+}
 
+struct StageFailure {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+type StageCell = Arc<OnceLock<Result<PathBuf, StageFailure>>>;
+static STAGED_EXECUTABLES: OnceLock<Mutex<HashMap<ExecutableKey, StageCell>>> = OnceLock::new();
+
+/// Publish each binary/name/signing combination once per test process, before it is spawned.
+/// Parallel callers wait for the same initialization, including closure of its write handle.
+/// Keying by source bytes also permits a rebuilt binary at the same source path.
+pub fn stage_executable(source: &Path, name: &str, identifier: &str) -> io::Result<PathBuf> {
     if Path::new(name).file_name().and_then(|part| part.to_str()) != Some(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -21,12 +38,41 @@ pub fn stage_executable(source: &Path, name: &str, identifier: &str) -> io::Resu
 
     let bytes = fs::read(source)?;
     let digest = format!("{:x}", Sha256::digest(&bytes));
+    let key = ExecutableKey {
+        digest,
+        name: name.to_owned(),
+        identifier: identifier.to_owned(),
+    };
+    let cell = STAGED_EXECUTABLES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| io::Error::other("test executable staging registry poisoned"))?
+        .entry(key.clone())
+        .or_insert_with(|| Arc::new(OnceLock::new()))
+        .clone();
+    cell.get_or_init(|| {
+        stage_executable_once(&bytes, &key.digest, name, identifier).map_err(|error| StageFailure {
+            kind: error.kind(),
+            message: error.to_string(),
+        })
+    })
+    .as_ref()
+    .cloned()
+    .map_err(|error| io::Error::new(error.kind, error.message.clone()))
+}
+
+fn stage_executable_once(
+    bytes: &[u8],
+    digest: &str,
+    name: &str,
+    identifier: &str,
+) -> io::Result<PathBuf> {
     let root = Path::new("/tmp/magic-context-exec");
     ensure_private_directory(root)?;
     let directory = root.join(digest);
     ensure_private_directory(&directory)?;
     let destination = directory.join(name);
-    if verified_copy(&destination, &bytes, identifier)? {
+    if verified_copy(&destination, bytes, identifier)? {
         return Ok(destination);
     }
 
@@ -37,9 +83,12 @@ pub fn stage_executable(source: &Path, name: &str, identifier: &str) -> io::Resu
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         set_owner_only(&temporary)?;
+        // Close before signing or publishing: an executable must have no writable
+        // descriptor when another thread receives its path and starts a child.
+        drop(file);
 
         #[cfg(target_os = "macos")]
         sign_executable(&temporary, identifier)?;
@@ -58,7 +107,7 @@ pub fn stage_executable(source: &Path, name: &str, identifier: &str) -> io::Resu
                     ),
                 ));
             }
-            write_signature_record(&destination, &bytes, identifier)?;
+            write_signature_record(&destination, bytes, identifier)?;
         }
 
         Ok(destination.clone())
@@ -67,6 +116,28 @@ pub fn stage_executable(source: &Path, name: &str, identifier: &str) -> io::Resu
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Retry only exec's transient writable-descriptor race, never other spawn errors.
+/// A concurrent fork can briefly inherit a staging writer even after its parent
+/// closes it; cap the wait at 20 attempts with 50 ms between attempts.
+pub fn retry_spawn<T>(spawn: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    retry_spawn_with_backoff(spawn, std::thread::sleep)
+}
+
+pub(super) fn retry_spawn_with_backoff<T>(
+    mut spawn: impl FnMut() -> io::Result<T>,
+    mut backoff: impl FnMut(Duration),
+) -> io::Result<T> {
+    for attempt in 1..=20 {
+        match spawn() {
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
+                backoff(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final spawn attempt always returns its result")
 }
 
 fn ensure_private_directory(path: &Path) -> io::Result<()> {

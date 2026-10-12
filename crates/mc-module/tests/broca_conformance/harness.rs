@@ -287,7 +287,9 @@ impl Rig {
         if let Some(point) = fault {
             command.env("MC_PROVIDER_FAULT_POINT", point);
         }
-        self.module = Some(Process(command.spawn().unwrap()));
+        self.module = Some(Process(
+            executable_staging::retry_spawn(|| command.spawn()).unwrap(),
+        ));
     }
 
     pub async fn wait_ready(&self) {

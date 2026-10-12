@@ -6873,8 +6873,7 @@ fn apply_once(
                         mc_store::ScoreSelector::Latest,
                     )?;
                     let compartments_for_fold = &score_snapshot.compartments;
-                    let coverage_bounds =
-                        coverage_bounds_from_compartments(compartments_for_fold)?;
+                    let coverage_bounds = coverage_bounds_from_compartments(compartments_for_fold)?;
                     let covered_system_messages = covered_system_messages_for_coverage(
                         req,
                         coverage_bounds.map(|(_, end)| end),

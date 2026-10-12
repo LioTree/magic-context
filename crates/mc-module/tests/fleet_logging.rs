@@ -13,14 +13,14 @@ fn module_start_writes_dated_segment_under_resolved_data_dir() {
     let cargo_module = env!("CARGO_BIN_EXE_ck-mc");
     let module = executable_staging::stage_executable(Path::new(cargo_module), "ckdev-mc", "ck-mc")
         .expect("stage ck-mc with a dev process name");
-    let output = Command::new(&module)
+    let mut command = Command::new(&module);
+    command
         .env("XDG_DATA_HOME", root.path())
         .env("SUBC_MODULE_ID", "magic-context")
         .env("CK_LOG", "info")
         .arg("--subc")
-        .arg(root.path().join("missing-connection-file"))
-        .output()
-        .expect("start module");
+        .arg(root.path().join("missing-connection-file"));
+    let output = executable_staging::retry_spawn(|| command.output()).expect("start module");
     assert!(
         !output.status.success(),
         "missing connection file must fail startup"

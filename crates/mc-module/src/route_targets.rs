@@ -568,13 +568,12 @@ mod tests {
                 .stderr(Stdio::inherit());
             command
         };
-        let mut daemon = Process(
-            command(&daemon_binary)
-                .env("SUBC_PORT", "0")
-                .env("SUBC_CGROUP_PLACEMENT", "disabled")
-                .spawn()
-                .unwrap(),
-        );
+        let mut daemon_command = command(&daemon_binary);
+        daemon_command
+            .env("SUBC_PORT", "0")
+            .env("SUBC_CGROUP_PLACEMENT", "disabled");
+        let mut daemon =
+            Process(executable_staging::retry_spawn(|| daemon_command.spawn()).unwrap());
         let connection_file = root.join("runtime/subc-connection.json");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         while !connection_file.is_file() {
@@ -588,13 +587,10 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let mut module = Process(
-            command(&module_binary)
-                .arg("--subc")
-                .arg(&connection_file)
-                .spawn()
-                .unwrap(),
-        );
+        let mut module_command = command(&module_binary);
+        module_command.arg("--subc").arg(&connection_file);
+        let mut module =
+            Process(executable_staging::retry_spawn(|| module_command.spawn()).unwrap());
         let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
             .await
             .unwrap();

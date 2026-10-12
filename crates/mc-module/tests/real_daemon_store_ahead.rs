@@ -193,13 +193,13 @@ async fn a_module_on_a_store_ahead_of_it_refuses_on_health_and_on_transform() {
 
     let mut daemon_command = Command::new(&daemon_bin);
     isolation.apply(&mut daemon_command);
+    daemon_command
+        .env("SUBC_PORT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let _daemon = Process(
-        daemon_command
-            .env("SUBC_PORT", "0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+        executable_staging::retry_spawn(|| daemon_command.spawn())
             .unwrap_or_else(|e| panic!("failed to spawn daemon {}: {e}", daemon_bin.display())),
     );
     assert_dev_process_name(_daemon.0.id());
@@ -207,14 +207,14 @@ async fn a_module_on_a_store_ahead_of_it_refuses_on_health_and_on_transform() {
 
     let mut module_command = Command::new(&module_bin);
     isolation.apply(&mut module_command);
-    let mut module_child = module_command
+    module_command
         .arg("--subc")
         .arg(isolation.connection_file())
         .env(subc_protocol::SUBC_MODULE_ID_ENV, MODULE_ID)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut module_child = executable_staging::retry_spawn(|| module_command.spawn())
         .unwrap_or_else(|e| panic!("failed to spawn module {}: {e}", module_bin.display()));
     assert_dev_process_name(module_child.id());
     // Drain stderr so the module never blocks on a full pipe, and forward it so a failing run

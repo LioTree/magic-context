@@ -242,3 +242,28 @@ The targets after `real_daemon` in Cargo's ordering were explicitly run rather t
 - `real_daemon_store_ahead`: `a_module_on_a_store_ahead_of_it_refuses_on_health_and_on_transform` failed, then failed again in its own exact-name invocation. Its test-owned Cargo build of `subc-core --bins` cannot run because the required sibling subconscious working directory is absent (`No such file or directory` at line 438). This is a fifth unavailable sibling-repository fixture, not a cleared gate.
 
 Receipts for these runs (`bash-94b3e2bf674b1db8` and `bash-7c5080273230a263`) are retained with the other verification logs.
+
+## CI follow-up: formatting and Linux executable-busy race
+
+The task giver reported failures on reconciled tip `8c9cd5e9` in CI run `38317900632`: Rust formatting and an `ExecutableFileBusy` spawn in Broca conformance. This follow-up does not revisit the migration/cache reconciliation or its remaining release findings.
+
+- Applied the requested `cargo fmt --all`. Outside the launcher changes, the only formatter adjustment is a line wrap in `transform.rs`.
+- The shared `tests/support/executable.rs` now has a process-local registry of per-content/name/signing-identifier `OnceLock` cells. Concurrent callers await the same staging result. Rebuilt source bytes at the same path use a different cell; no source-path-only freshness shortcut was introduced.
+- Explicitly close the temporary executable's write descriptor before signing and publication. A returned staging path therefore cannot race its initializer's open writer.
+- All clients of the shared Rust staging helper use the shared spawn retry: Broca conformance, real daemon and store-ahead rigs, fleet logging's output launch, and route-target process tests. Only `ExecutableFileBusy` is retried, up to 20 attempts with 50 ms between attempts (19 waits at most); exhaustion returns the error to the caller's existing loud failure path. Other errors fail immediately.
+- Added eight-thread simultaneous staging/spawning coverage: 64 successful launches must observe one path and one published inode. A separate Linux test first proves an open writer really prevents exec, then verifies successful launch after its release. Deterministic tests assert 20-attempt exhaustion, exact 50 ms backoff, successful transient retry, and no retry for unrelated errors. The original content/permission test also covers rebuilding the same source path.
+
+Verification ran on `linux,4c`, with a throwaway HOME/XDG/TMPDIR under the task root:
+
+| Follow-up check | Result |
+| --- | --- |
+| `cargo fmt --all --check` | Passed; rustfmt 1.10.0-stable. |
+| `cargo test -p mc-module --test executable_staging` | 6 passed, including 64 concurrent real launches and the real open-writer control. |
+| `cargo test -p mc-module --test fleet_logging` | 1 passed. |
+| `cargo test -p mc-module --lib private_permissions_source_test` | 4 passed, including the existing staged-executable source guard. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed; clippy 0.1.99, rustc/cargo 1.99.0. |
+| `cargo test -p mc-module --test broca_conformance --features drive-fault` | Three consecutive runs passed: 14/14, 14/14, 14/14. Each includes the originally reported failing compaction test and the fault/retry test. |
+| Scoped Rust diagnostics | Authoritative reports for four files: 0 errors/warnings. |
+| Sidekick comment review | All 8 changed Rust files reviewed; 3 changed comment blocks examined, none flagged. |
+
+The drive-fault build emitted the existing `Atomic::fetch_update` deprecation warning in `lib.rs`; it is unrelated to this fix and was not changed. No live stores, configuration or sessions were accessed, and no Rust build or full suite ran on the Mac. Raw follow-up stdout/stderr are retained in the task verification directory as `ci-followup.stdout.log` and `ci-followup.stderr.log`.
