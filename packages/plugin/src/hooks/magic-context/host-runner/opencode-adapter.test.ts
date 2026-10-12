@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { MagicContextConfigSchema } from "../../../config/schema/magic-context";
 import { resolveTransformMode } from "../../../config/transform-mode";
 import { runMigrations } from "../../../features/magic-context/migrations";
+import type { ProviderPassMeters } from "../../../features/magic-context/provider-meters";
 import {
     computeHardCacheExpired,
     createScheduler,
@@ -234,6 +235,93 @@ function fixture(host: "v1" | "v2", options: OpenCodeProviderOptions = {}) {
 }
 for (const host of ["v1", "v2"] as const)
     describe(`OpenCode ${host} provider adapter`, () => {
+        test("pass meters count issued hooks, appends, applied rebuilds and historian pumps in the host lane", async () => {
+            const meters: ProviderPassMeters[] = [];
+            const f = fixture(host, { emitMeters: (row) => meters.push(row) });
+            await f.pass([message("A")]);
+            expect(meters.at(-1)!.rebuild_count).toBe(1);
+            expect(meters.at(-1)!.historian_pump_count).toBe(1);
+            const storedView = f.db
+                .prepare(
+                    "SELECT length(CAST(session_id AS BLOB))+length(CAST(harness AS BLOB))+length(CAST(lineage_id AS BLOB))+length(CAST(compaction_id AS BLOB))+length(CAST(version AS BLOB))+length(CAST(range_from AS BLOB))+length(CAST(range_to AS BLOB))+length(CAST(replacement_json AS BLOB))+coalesce(length(CAST(coverage_json AS BLOB)),0)+length(CAST(state AS BLOB))+length(CAST(applied_at AS BLOB)) AS bytes FROM host_runner_views",
+                )
+                .get() as { bytes: number };
+            expect(meters.at(-1)!.host_view_bytes).toBe(storedView.bytes);
+            await f.pass([message("A"), message("B"), message("C", "assistant")]);
+            const row = meters.at(-1)!;
+            expect(row.appended).toBe(2);
+            expect(row.hook_count).toBe(2);
+            expect(row.rebuild_count).toBe(0);
+            expect(row.fallback_count).toBe(0);
+            expect(row.recovery_count).toBe(0);
+            expect(row.retry_count).toBe(0);
+            expect(row.historian_pump_count).toBe(1);
+            expect(row.pass_ms).toBeGreaterThanOrEqual(row.stages.publish!);
+            expect(row.session_id).toBe("session");
+            expect(row.pipeline).toBe("provider");
+            expect(row.partial_fields.length).toBeGreaterThan(0);
+        });
+        test("first post-rebuild hook timeout refuses without publishing an untagged append", async () => {
+            const meters: ProviderPassMeters[] = [];
+            const f = fixture(host, { emitMeters: (row) => meters.push(row) });
+            f.setReply((w) =>
+                w.method === "transform.declare"
+                    ? {
+                          subscriptions: ["pre_user", "post_assistant", "post_tool"].map(
+                              (hook) => ({
+                                  hook,
+                                  ops: ["prepend", "append", "replace"],
+                                  budget_ms: 5,
+                                  on_unavailable: "pass",
+                              }),
+                          ),
+                      }
+                    : undefined,
+            );
+            await f.pass([message("A")]);
+            const switched = message("B", "assistant");
+            (switched.info as any).model.modelID = "rebuild-model";
+            await f.pass([message("A"), switched]);
+            const view = f.stored()!.views.at(-1)!.version;
+            const input = [message("A"), switched, message("C")];
+            const output = {
+                messages: [message("previous", "assistant", "exact frozen bytes")] as unknown[],
+            };
+            const previous = JSON.stringify(output.messages);
+            f.setReply((w) => (w.method === "transform.hook" ? new Promise(() => {}) : undefined));
+            await expect(f.adapter.run("session", input, output, f.meta)).rejects.toThrow(
+                "Provider hook did not complete before its fence: timeout",
+            );
+            expect(JSON.stringify(output.messages)).toBe(previous);
+            expect(f.stored()!.views.at(-1)!.version).toBe(view);
+            expect(f.stored()!.ids.has("C")).toBe(false);
+            expect(f.fallbacks).toHaveLength(0);
+            expect(meters.at(-1)!.pass_kind).toBe("refused");
+            expect(meters.at(-1)!.hook_count).toBe(1);
+            expect(meters.at(-1)!.recovery_count).toBe(1);
+            expect(meters.at(-1)!.historian_pump_count).toBe(0);
+        });
+        test("an active rebuild step crossing its fence refuses instead of publishing the old view", async () => {
+            let clock = 1000;
+            const f = fixture(host, { now: () => clock });
+            await f.pass([message("A")]);
+            const switched = message("B", "assistant");
+            (switched.info as any).model.modelID = "rebuild-model";
+            f.setReply((w) => {
+                if (w.method !== "compaction.step") return undefined;
+                clock += 31_000;
+                return { answer: "noop", request_id: w.params.request_id };
+            });
+            const output = {
+                messages: [message("previous", "assistant", "exact prior view")] as unknown[],
+            };
+            const previous = JSON.stringify(output.messages);
+            await expect(
+                f.adapter.run("session", [message("A"), switched], output, f.meta),
+            ).rejects.toThrow("Provider step did not complete before its fence: late");
+            expect(JSON.stringify(output.messages)).toBe(previous);
+            expect(f.fallbacks).toHaveLength(0);
+        });
         test("bootstrap adopts canonical ordinals once, omits head rows and syncs before pages", async () => {
             const f = fixture(host);
             const head = {
@@ -469,7 +557,8 @@ for (const host of ["v1", "v2"] as const)
             expect(new Set(pages.map((w) => w.params.request_id)).size).toBe(3);
         });
         test("module-ahead ordinal refusal descends once and retries hooks", async () => {
-            const f = fixture(host);
+            const meters: ProviderPassMeters[] = [];
+            const f = fixture(host, { emitMeters: (row) => meters.push(row) });
             await f.pass([message("A")]);
             let refused = false;
             f.setReply((w) => {
@@ -488,10 +577,13 @@ for (const host of ["v1", "v2"] as const)
             expect(hooks[1]!.params.descends_from.through_ordinal).toBe(1);
             expect(hooks[1]!.params.lineage_id).not.toBe(hooks[0]!.params.lineage_id);
             expect((out[1]!.parts[0] as any).text).toBe("§2§ B");
+            expect(meters.at(-1)!.retry_count).toBe(1);
+            expect(meters.at(-1)!.hook_count).toBe(2);
         });
         test("rollback zero-divergence is stable; diverged rollback selects fresh namespace once", async () => {
             for (const diverged of [false, true]) {
-                const f = fixture(host);
+                const meters: ProviderPassMeters[] = [];
+                const f = fixture(host, { emitMeters: (row) => meters.push(row) });
                 await f.pass([message("A"), message("B")]);
                 if (diverged) await f.pass([message("A"), message("X"), message("B")]);
                 f.deps.rustPipeline = "full_request";
@@ -502,6 +594,8 @@ for (const host of ["v1", "v2"] as const)
                 const namespaces = f.fallbacks.map((f) => f.namespace);
                 expect(namespaces[0] !== undefined).toBe(diverged);
                 expect(namespaces[1]).toBe(namespaces[0]);
+                expect(meters.at(-1)!.fallback_count).toBe(1);
+                expect(meters.at(-1)!.pipeline).toBe("full_request");
                 expect(f.stored()!.state.pipeline_exit_json).toContain("rollback");
             }
         });

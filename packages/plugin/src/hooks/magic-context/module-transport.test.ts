@@ -1,3 +1,7 @@
+import {
+    type ProviderPassMeters,
+    withProviderMeters,
+} from "../../features/magic-context/provider-meters";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { SingleStoreMigrationRequiredError } from "./single-store-refusal";
 /// <reference types="bun-types" />
@@ -124,6 +128,82 @@ function deferred<T = void>(): {
 }
 
 describe("SubcModuleTransport", () => {
+    it("provider RPC meters observe initial and reply-page requests without changing returned bytes", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1000);
+        const original = JSON.stringify({ messages: ["café 🦀", "x".repeat(100_000)] });
+        const id = createHash("sha256").update(original).digest("hex");
+        const requests: Uint8Array[] = [];
+        const responses: unknown[] = [];
+        const client = {
+            routeOpen: async () => ({ channel: 7, epoch: 77 }),
+            request: async (_route: RouteHandle, body: Uint8Array) => {
+                requests.push(new Uint8Array(body));
+                const wire = decodedBody(body) as { method: string };
+                const index = wire.method === "reply.page" ? 1 : 0;
+                const reply = {
+                    reply_page: {
+                        id,
+                        index,
+                        total: 2,
+                        bytes: Buffer.byteLength(original),
+                        data: index === 0 ? original.slice(0, 50_000) : original.slice(50_000),
+                    },
+                };
+                responses.push(reply);
+                return reply;
+            },
+            closeRoute: async () => undefined,
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
+            internals.client = client;
+            return client;
+        };
+        const args = {
+            sessionId: "meter",
+            projectRoot: "/fixture",
+            method: "transform" as const,
+            body: { method: "transform", text: "café 🦀" },
+        };
+        const unmetered = await transport.call(args);
+        const outsideRequests = requests
+            .splice(0)
+            .map((bytes) => Buffer.from(bytes).toString("hex"));
+        responses.length = 0;
+        let meters!: ProviderPassMeters;
+        let metered: unknown;
+        await withProviderMeters(
+            "meter",
+            "OpenCode1",
+            "fixture",
+            async () => {
+                metered = await transport.call(args);
+            },
+            (row) => {
+                meters = row;
+            },
+        );
+        expect(JSON.stringify(metered)).toBe(JSON.stringify(unmetered));
+        expect(requests.map((bytes) => Buffer.from(bytes).toString("hex"))).toEqual(
+            outsideRequests,
+        );
+        expect(meters.rpc_count).toBe(2);
+        expect(meters.requests.map((row) => row.method)).toEqual(["transform", "reply.page"]);
+        expect(meters.rpc_request_bytes).toBe(
+            requests.reduce((sum, bytes) => sum + bytes.byteLength, 0),
+        );
+        expect(meters.rpc_response_json_bytes).toBe(
+            responses.reduce(
+                (sum, response) => sum + Buffer.byteLength(JSON.stringify(response)),
+                0,
+            ),
+        );
+        transport.closeSession("meter");
+    });
     it("serializes management dispatch from the call method over the real socket and preserves facade envelopes", async () => {
         const tempDir = createTestTempDirFromPath(join(tmpdir(), "module-dispatch-wire-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);

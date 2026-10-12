@@ -147,6 +147,38 @@ impl McHandler {
         method: &str,
         params: &Value,
     ) -> HandlerOutcome {
+        let started = Instant::now();
+        let hook_count = u64::from(method == "transform.hook");
+        let result = self
+            .handle_provider_value_inner(channel, method, params)
+            .await;
+        let (response_bytes, outcome) = match &result {
+            HandlerOutcome::Response(bytes) => (bytes.len(), "response"),
+            _ => (0, "refused"),
+        };
+        tracing::info!(
+            session_id = params.get("session").and_then(|v| v.as_str()).unwrap_or(""),
+            harness = params.get("harness").and_then(|v| v.as_str()).unwrap_or(""),
+            request_id = params
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            method,
+            hook_count,
+            response_bytes,
+            outcome,
+            module_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "provider module complete"
+        );
+        result
+    }
+
+    async fn handle_provider_value_inner(
+        &self,
+        channel: u16,
+        method: &str,
+        params: &Value,
+    ) -> HandlerOutcome {
         let binding = match self.facade_binding(channel) {
             Ok(binding) => binding,
             Err(_) => {

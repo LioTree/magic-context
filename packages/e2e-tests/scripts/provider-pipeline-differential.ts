@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import {
     existsSync,
     mkdirSync,
+    mkdtempSync,
     readFileSync,
     readdirSync,
     rmSync,
@@ -23,6 +24,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createScheduler } from "../../plugin/src/features/magic-context/scheduler";
 import { runMigrations } from "../../plugin/src/features/magic-context/migrations";
@@ -69,6 +71,7 @@ const DRIVER = String.raw`
 #[test]
 fn provider_pipeline_driver() {
     use std::io::{BufRead, Write};
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).try_init();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         #[derive(Default)]
@@ -347,6 +350,17 @@ export class Driver {
     get wasKilled() {
         return this.killed;
     }
+    get pid() {
+        return this.child.pid;
+    }
+    proveIsolation(): void {
+        const opened = spawnSync("lsof", ["-p", `${process.pid},${this.pid}`, "-Fn"], { encoding: "utf8" });
+        assert.equal(opened.status, 0, `lsof must prove fixture isolation: ${opened.stderr}`);
+        const stores = opened.stdout.split("\n").filter(line => line.startsWith("n") && /\.db(?:-wal|-shm)?(?: \(deleted\))?$/.test(line));
+        assert.ok(stores.length > 0, "lsof must observe the fixture stores");
+        assert.ok(stores.every(line => line.slice(1).startsWith(`${this.directory}/`)), `store outside scratch root: ${stores.join("\n")}`);
+        console.error(`PROVIDER_ISOLATION ${JSON.stringify({ root: this.directory, stores })}`);
+    }
     constructor(
         readonly binary: string,
         readonly directory: string,
@@ -495,6 +509,7 @@ export async function fixture(driver: Driver, host: Host, directory?: string, pr
         protect_bash: protectBash,
         directory: directory ? join(directory, "oracle") : undefined,
     });
+    driver.proveIsolation();
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
@@ -2163,7 +2178,9 @@ const cases: Case[] = [
 ];
 
 export async function runProviderPipelineDifferential(selected: string[] = []) {
-    const work = join(ROOT, "target/provider-pipeline-driver");
+    const scratch = join(tmpdir(), "magic-context", "provider-suite");
+    mkdirSync(scratch, { recursive: true });
+    const work = mkdtempSync(join(scratch, "run-"));
     mkdirSync(join(work, "stores"), { recursive: true });
     let driver: Driver | undefined;
     let checks = 0;

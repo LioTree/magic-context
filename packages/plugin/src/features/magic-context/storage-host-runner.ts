@@ -1,5 +1,10 @@
 import type { Database } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import {
+    recordProviderAdmission,
+    recordProviderHostWrite,
+    withProviderHostWrites,
+} from "./provider-meters";
 import { ensureColumn } from "./storage-schema-helpers";
 
 /** Shared by fresh installs and migration replay; served bytes are deliberately not stored. */
@@ -179,6 +184,10 @@ function writeState(db: Database, key: HostRunnerKey, state: HostRunnerState): v
         key.harness,
         ...STATE_COLUMNS.map((column) => state[column]),
     );
+    recordProviderHostWrite(
+        [key.session_id, key.harness, ...STATE_COLUMNS.map((column) => state[column])],
+        "state",
+    );
 }
 
 function requiredState(db: Database, key: HostRunnerKey): HostRunnerState {
@@ -188,22 +197,24 @@ function requiredState(db: Database, key: HostRunnerKey): HostRunnerState {
 }
 
 function writeTransaction(db: Database, site: string, write: () => void): void {
-    // Do not catch a failed write as unavailability: entries must be durable before serving.
-    try {
-        db.exec("BEGIN IMMEDIATE");
-        const startedAt = performance.now();
-        let committed = false;
+    withProviderHostWrites(() => {
+        // A failed database write must refuse the turn; raw pass-through is unsafe until entries are durable.
         try {
-            write();
-            db.exec("COMMIT");
-            committed = true;
-            logSlowWriteTransaction(`host_runner_${site}`, startedAt);
-        } finally {
-            if (!committed) db.exec("ROLLBACK");
+            db.exec("BEGIN IMMEDIATE");
+            const startedAt = performance.now();
+            let committed = false;
+            try {
+                write();
+                db.exec("COMMIT");
+                committed = true;
+                logSlowWriteTransaction(`host_runner_${site}`, startedAt);
+            } finally {
+                if (!committed) db.exec("ROLLBACK");
+            }
+        } catch (cause) {
+            throw new HostRunnerDurabilityError(site, cause);
         }
-    } catch (cause) {
-        throw new HostRunnerDurabilityError(site, cause);
-    }
+    });
 }
 
 export interface HostRunnerPass {
@@ -301,6 +312,20 @@ export function commitHostRunnerPass(db: Database, key: HostRunnerKey, pass: Hos
                 entry.race,
                 entry.created_at,
             );
+            recordProviderHostWrite([
+                key.session_id,
+                key.harness,
+                state.lineage_id,
+                entry.ordinal,
+                entry.message_id,
+                entry.ingest_json,
+                entry.hook_json,
+                entry.op_version,
+                entry.ingested,
+                entry.race,
+                entry.created_at,
+            ]);
+            recordProviderAdmission(entry.ingest_json, entry.hook_json);
             insertId.run(
                 key.session_id,
                 key.harness,
@@ -308,11 +333,19 @@ export function commitHostRunnerPass(db: Database, key: HostRunnerKey, pass: Hos
                 entry.message_id,
                 entry.ordinal,
             );
+            recordProviderHostWrite([
+                key.session_id,
+                key.harness,
+                state.lineage_id,
+                entry.message_id,
+                entry.ordinal,
+            ]);
         }
         if (next !== state.next_ordinal)
             throw new Error("Append frontier does not match committed state");
         for (const id of pass.elided ?? []) {
             insertId.run(key.session_id, key.harness, state.lineage_id, id, null);
+            recordProviderHostWrite([key.session_id, key.harness, state.lineage_id, id]);
         }
         if (pass.uningested_from !== undefined) {
             db.prepare(`UPDATE host_runner_entries SET ingested = 0
@@ -347,6 +380,7 @@ export function commitHostRunnerFence(
             key.session_id,
             key.harness,
         );
+        recordProviderHostWrite([requestId, newest], "state");
     });
 }
 
@@ -423,6 +457,22 @@ export function commitHostRunnerAnswer(
                 view.state,
                 view.applied_at,
             );
+            recordProviderHostWrite(
+                [
+                    key.session_id,
+                    key.harness,
+                    view.lineage_id,
+                    view.compaction_id,
+                    view.version,
+                    view.range_from,
+                    view.range_to,
+                    view.replacement_json,
+                    view.coverage_json,
+                    view.state,
+                    view.applied_at,
+                ],
+                "view",
+            );
             db.prepare(
                 `DELETE FROM host_runner_entries WHERE session_id = ? AND harness = ? AND ordinal < ?`,
             ).run(key.session_id, key.harness, view.range_to);
@@ -462,6 +512,7 @@ export function commitHostRunnerExit(db: Database, key: HostRunnerKey, exitJson:
         db.prepare(
             `UPDATE host_runner_state SET pipeline_exit_json = ? WHERE session_id = ? AND harness = ?`,
         ).run(exitJson, key.session_id, key.harness);
+        recordProviderHostWrite([exitJson], "state");
     });
 }
 

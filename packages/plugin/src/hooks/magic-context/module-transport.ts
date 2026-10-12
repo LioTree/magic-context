@@ -13,6 +13,7 @@ import {
     StaleRouteHandleError,
     SubcClient,
 } from "@cortexkit/subc-client";
+import { observeProviderRpc, startProviderRpc } from "../../features/magic-context/provider-meters";
 
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
@@ -605,11 +606,15 @@ export class SubcModuleTransport {
                               );
                     timings.encode += performance.now() - encodeStartedAt;
                     const issueStartedAt = performance.now();
-                    const request = ensuredRoute.client.request(ensuredRoute.route, body, {
-                        priority: Priority.Background,
-                        admissionClass: AdmissionClass.Normal,
-                        timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
-                    });
+                    const rpc = startProviderRpc(args.method, body);
+                    const request = observeProviderRpc(
+                        rpc,
+                        ensuredRoute.client.request(ensuredRoute.route, body, {
+                            priority: Priority.Background,
+                            admissionClass: AdmissionClass.Normal,
+                            timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
+                        }),
+                    );
                     timings.issue += performance.now() - issueStartedAt;
                     const waitStartedAt = performance.now();
                     const response = await this.beforeDeadline(
@@ -630,22 +635,23 @@ export class SubcModuleTransport {
                     const pageRoute = ensuredRoute;
                     const assembled = await assembleReplyPages(response, async (id, index) => {
                         if (args.signal?.aborted) throw args.signal.reason;
+                        const pageBody = Buffer.from(
+                            JSON.stringify({
+                                method: "reply.page",
+                                reply_page_id: id,
+                                reply_page_index: index,
+                            }),
+                        );
+                        const rpc = startProviderRpc("reply.page", pageBody);
                         const page = await this.beforeDeadline(
                             Promise.race([
-                                pageRoute.client.request(
-                                    pageRoute.route,
-                                    Buffer.from(
-                                        JSON.stringify({
-                                            method: "reply.page",
-                                            reply_page_id: id,
-                                            reply_page_index: index,
-                                        }),
-                                    ),
-                                    {
+                                observeProviderRpc(
+                                    rpc,
+                                    pageRoute.client.request(pageRoute.route, pageBody, {
                                         priority: Priority.Background,
                                         admissionClass: AdmissionClass.Normal,
                                         timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
-                                    },
+                                    }),
                                 ),
                                 aborted,
                             ]),

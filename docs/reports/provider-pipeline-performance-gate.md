@@ -508,9 +508,10 @@ replacement for implementing/test-driving that collector.
 
 ## Exact instrumentation required before live measurements
 
-**None of the following production emitters is added by this slice.** Implement
-them as a separate slice, with independent counter tests and restored mutations,
-before enabling the canary. Append structured pipeline fields to the existing
+**Original slice status, before the partial instrumentation follow-up below:** none
+of the following production emitters was added by the original slice. Complete
+and independently test them before enabling the canary. Append structured
+pipeline fields to the existing
 pass log and correlate module completion rows by pass id/request id/session/harness.
 Do not sample or round before producing quantiles.
 
@@ -530,7 +531,9 @@ Do not sample or round before producing quantiles.
 The module/host counter accounting needs tests for large replace answers, many
 text blocks, zero-appends after memory publication, retries, no-change sync and
 the combined 20-page bound. Actual write totals and budget components must be
-independent. This report does not claim that production currently emits them.
+independent. The initial implementation did not emit the pass, payload, page or
+ledger fields in this table; the follow-up below distinguishes the implemented
+counters from the still-missing meters.
 
 ## Canary runbook after shipment and instrumentation
 
@@ -654,3 +657,228 @@ land the separate production instrumentation/capture collector; ship; obtain an
 authorized ALF copy and live session id; then run and retain the paired measurement
 and full 24-hour canary. Switching the default to the provider pipeline is not
 authorized by this partial.
+
+## Partial production-meter follow-up (train 3549c434)
+
+**Not a canary sign-off.** The setting stays off by default. This follow-up adds
+real provider-pass/RPC and provider-store diagnostic meters and fixes an unsafe
+hook deadline outcome. It does **not** complete the instrumentation table above,
+prove P2, or replace the live collector. Missing measurements are explicitly
+identified in the host row's `partial_fields` and the module store row's
+`sql_rows_complete=false` / `logical_payload_complete=false`. A collector must
+reject those rows for a gate that requires complete totals.
+
+### Real emission and accounting boundaries
+
+- `opencode-adapter.ts` emits `rust pass: decision=… reason=provider_pipeline …
+  provider_meters={…}` to the normal session log. The pass starts before hydration,
+  includes sync, embedding-watermark drain, hooks, durable writes and actual output
+  publication, and reports unrounded wall-clock milliseconds. Named stages are
+  bootstrap, state sync, hook transport, rebuild and publication; other host work
+  remains in the whole-pass time. Transport time is **not** module-only time.
+- Each row has a fresh pass id, exact session/harness, routing (including
+  full-request exits), append/hook/RPC counts, request ids, applied rebuilds,
+  historian pump calls, retries, fallbacks and recovery notifications. These
+  counters increment at the call/admission/commit points, not by summing successful
+  outcomes. Asynchronous historian pumps run outside the foreground pass context;
+  their later traffic cannot inflate an already-emitted foreground row. Pump calls
+  are not historian fire/no-fire cadence decisions.
+- `SubcModuleTransport` counts actual encoded request payloads at `client.request`,
+  including each `reply.page`. It records failed and unanswered requests as well
+  as answers. Response bytes are the UTF-8 JSON encoding of decoded response
+  objects, including page envelopes, **not** the original wire-frame bytes.
+  Authentication and route-open/close management traffic are outside this metric.
+  The subc client does not expose raw receive-frame lengths here.
+- Host runner transactions stage an independent actual payload-cell ledger and
+  separate ingest/ops budget counters. Only COMMIT merges that ledger into the
+  pass. Rewrites of state/view cells count again; transaction rollback contributes
+  zero. Structural ingest-flag, lineage and pruning updates are not yet covered,
+  so `host_logical_payload_bytes` is explicitly partial, not a complete P3 actual.
+- The module emits `provider module complete` with method, request id,
+  session/harness, issued hook count, exact serialized success-body length and
+  monotonic entry-to-serialization duration (including lock wait). Error envelope
+  bytes are not counted as success bodies. `provider rebuild stages` splits replay,
+  preparation, engine and native encoding under the step's request-id span.
+- Provider-store result rows count before mapping/filtering, including capped reads
+  discarded wholesale. They cover `provider_log` and `policy_index`; they are not
+  sums of effective policy outcomes or the existing policy index's diagnostic
+  `rows_read`. SQL scalar queries contribute one result row. Neither SQLite's
+  internal scan/index visits nor engine/context-domain/state-sync result rows are
+  covered. A safe row-trace API is not available in pinned rusqlite 0.32.1; no
+  unsafe tracing hook or library/schema migration was introduced.
+- Store message, stored answer JSON, inserted tag cells and selected hook-state
+  cells have separate byte counters plus an independent actual payload counter.
+  The fenced admission/hook transaction owns their rollback journal. Duplicate
+  message admissions and ignored tag inserts count zero. Engine/cache-state,
+  policy-part/summary/view writes and expression-based policy/state rewrites are
+  not included, and unjournaled engine tag writes are deliberately excluded.
+
+**Still required before a canary:** complete host/module logical-write coverage;
+engine/context-domain/state-sync SQL row coverage (or an explicit gate contract
+for result-row scope); exact response-wire bytes if requested by the collector;
+combined state-sync/memory-mirror byte/page ledger and its 20-page bound;
+historian fire/no-fire cadence; host-version provenance; physical before/after
+sizes and combined-store hashes; request-timestamp-bound durable event ledger and
+capture continuity. Unknown fields must not be supplied as zero. No live store,
+configuration or ALF session was inspected to fill these gaps.
+
+### Correctness before latency
+
+The first Linux 17k synthetic baseline failed paired equality on the second
+rebuild: the provider output omitted the agent-visible tag prefix `§37517§`
+from `rebuild-1`, while the full request retained it. The requests therefore
+contained different text bytes. A hook can commit its tag remotely after the host's deadline;
+previously the adapter treated that unavailable answer as permission to freeze
+and publish an untagged raw append. That makes the host and module disagree.
+
+An expired/late/aborted hook now throws an explicit `EmergencyFailClosedError`
+before committing/publishing that append. An already-active rebuild step crossing
+its fence also refuses instead of publishing an old view as a successful rebuild.
+Before a provider view is installed, a failed initial bootstrap still routes the
+turn through the existing full-array Rust transform instead of installing a
+provider view. It has not acknowledged provider bytes. Ordinary transport unavailability
+policy is unchanged. Tests on both bindings force a real short hook timer and an
+active step's late fence and assert refusal, no output publication and no hidden
+fallback. The existing unavailable-pass test was not rewritten into its opposite.
+
+### Rebuild diagnosis and before/after numbers
+
+The baseline ran on Linux `ck-motor`, Rust 1.99.0, Bun 1.4.2, optimized test driver,
+with 17,000 base messages, 20 ordinary samples and five attempted rebuild pairs.
+The timing driver alone disables test-only recomputation of every replayed
+summary against its full-policy reference; otherwise those independent test
+assertions would add O(session) work to the measured fast path. Correctness runs
+keep that recomputation enabled. Byte equality failed before all five pairs completed,
+so this is **not** a p50/p95 population and supplies no accepted P2 ratio.
+
+| Measurement (ms unless noted) | Before follow-up, contended Linux | After follow-up |
+| --- | ---: | --- |
+| Message/hook replay, two paired attempts | 150.360–167.148 | 92–110 (first isolated after run) |
+| Request preparation / previous views / drops | 1,933.844–2,033.296 | 1,198–1,588 (first isolated after run) |
+| Engine | 5,879.951–7,274.023 | 4,322–5,522 (first isolated after run) |
+| Native view encoding | 1,336.416–1,474.488 | 1,153–1,350 (first isolated after run) |
+| Same-starting-store full-handler time, two attempts | 7,102.5 / 9,626.5 | Later byte-equal diagnostic pair: 8,200.335 full / 14,667.265 provider |
+| Paired rebuild p50 / ratio | Invalid population: provider and full request differed at tag `§37517§` | Not established; 1.10× not claimed |
+| First post-rebuild hook's 1,500 ms fence | At least one answer missed its fence | 1,493.849 ms module (6.151 ms margin); later 1,621.088 ms; both refuse safely |
+
+The 1,500 ms hook budget does **not** apply to the rebuild's engine/preparation/
+encoding stages: those share the 30,000 ms bootstrap budget. The later isolated
+after runs expose 1,493.849 ms and 1,621.088 ms module-only post-rebuild hook
+outliers, with 75,061 / 75,057 provider result rows. They leave essentially no
+transport margin or exceed the hook fence outright. The earlier Mac 520–630 ms
+summary-refreeze numbers are not substituted for these Linux observations.
+
+Small provider-only reductions avoid decoding the same immutable applied/produced
+view twice, skip a second live-answer load when there are no pending drops, and
+avoid reapplying empty hook operations. They retain both references' descended
+lineages and the same served bytes. Five OpenCode 1 and three OpenCode 2 after
+pairs matched bytes before the first isolated run's OpenCode 2 refusal. A later
+run matched one OpenCode 1 pair (14,667.265 / 8,200.335 ms, ratio ≈1.789) before
+a subsequent hook refused. Neither run forms a complete P2 population; neither
+establishes a timing improvement under equal load. The reviewer requested a
+reviewed design, not further implementation or a larger deadline. The proposal
+is `docs/designs/provider-post-rebuild-hook-cost.md`; it covers bounded immutable
+view descriptors, exact policy prewarm within the rebuild, acknowledgement
+invariants and independent cached/uncached byte/state proofs.
+
+### Isolation, shared hooks and verification status
+
+Synthetic and differential host fixtures now create unique directories under
+`$TMPDIR/magic-context/provider-performance/` and
+`$TMPDIR/magic-context/provider-suite/`. Each driver fixture proves open host/module
+DB paths with `lsof` before use; failures to observe stores or any non-scratch store
+abort the run. The measured baseline's root was
+`/motor-home/tmp/magic-context/provider-performance/run-pMnyYG`; all observed
+`context.db`, `store.db`, WAL and SHM files were beneath it, including oracle arms.
+Only generated overlays of this worktree's sources are compiled. No operator store
+or configuration was opened, and no Rust build was run on the Mac.
+
+Shared production files touched are `crates/mc-store/src/lib.rs` (module export),
+`crates/mc-store/src/provider_log.rs` (row mappers and the tag insertion helper),
+`crates/mc-store/src/provider_log/policy_index.rs` (row mappers), and
+`packages/plugin/src/hooks/magic-context/module-transport.ts` (request/reply-page
+boundary). The shared transport returns the original promise when no pass context
+exists; row hooks do not allocate or lock without their thread-local provider
+context. Tag-byte string conversion is guarded by that context. The full-array
+transform implementation, defaults, migrations, ARCHITECTURE.md and STRUCTURE.md
+are unchanged. Whole full-array served-byte **and stored-state** differential
+verification is still required; the small transport test proves only unchanged
+request/response bytes, not database parity.
+
+Focused Linux evidence before the final retry/step tests: five independent store
+meter tests passed; the real module-completion test passed; 98 plugin meter,
+adapter and transport tests passed. Rust workspace baseline passed its 1,926 module
+unit tests but failed four real-daemon tests because the sibling daemon checkout
+was absent (confirmed known by the reviewer). These are not meter failures.
+TypeScript 5.9.3 plugin typecheck passed locally with reviewer permission after
+Linux refused the queue. Plugin lint (Biome 2.5.1) passed over 1,410 files, with
+59 existing warnings and nine informational findings. Seventeen independent host
+counter neutralizations each reddened exactly its selected test and were restored;
+`provider-meter-mutations.json` retains the names and nonempty/empty diff-stat pairs.
+Final Rust mutations, complete plugin suite, 768-pass Rust parity, 90/90 provider
+suite, 706-pass signed-thinking audit and bounded-policy identity remain required.
+
+After-run and final correctness jobs were refused with
+`queue_wait_exceeded: waiting_on=permits; held_permits=64/64`, first at 16c and
+then at 4c. Recorded holder set at accepted time `1791841407775`:
+`01a131a2-6c0b-7560-a1cb-49d1bc55e203` (8c, since `1791834098006`),
+`01a131dd-2783-768d-b9c7-fd4b1d416fcd` (8c),
+`01a131e5-a80a-7202-8eeb-1d131d6a35f8` (8c),
+`01a1320c-238b-744e-9b60-ef847df6f264` (4c),
+`01a1320d-d5ab-7649-9d23-489d51597288` (8c),
+`01a13210-6283-767e-85a2-de452dfcdf5c` (8c),
+`01a13210-88a8-748d-9ff4-11abeecaf40d` (4c), and
+`01a13210-fca5-736d-b3ea-25e3b2405029` (16c). No runner load average was obtained;
+the rejection happened before the requested command could execute. The reviewer
+permitted local TypeScript-only targeted gates, not local Rust or a full Mac
+plugin suite, and requested queued 4c Rust retries. A clean same-run baseline/after
+measurement must record actual load as well as permit occupancy. No reconciliation
+landing notice has yet been received; its merge and rerun are also pending.
+
+### Final execution update and blocked work
+
+Capacity later freed for 4c jobs. Rust 1.99.0 / Cargo 1.99.0 workspace execution
+passed 1,928 module unit tests (27 ignored), including the 720+48 randomized/HARD
+corpus and bounded-policy summary/identity checks. It then reached the fifth
+missing-sibling daemon test,
+`a_module_on_a_store_ahead_of_it_refuses_on_health_and_on_transform`, which failed
+trying to run `cargo build -p subc-core --bins` in an absent checkout. The four
+previously confirmed daemon tests had been explicitly skipped, not fixed. The
+remaining workspace packages passed separately: core 22, store 338 (5 ignored),
+tokenizer 3 unit + 4 golden + 1 allocation tests. `cargo fmt --check` and workspace
+`cargo clippy --workspace --all-targets -- -D warnings` passed.
+
+The isolated provider differential passed **90/90** on Linux, including both 17k
+bootstrap populations (9,911 / 5,963 ms complete, 4,316 / 4,263 ms slowest page).
+The full plugin suite ran on Linux: 8,411 passed, 19 skipped, 10 failed. Failures
+were the unrelated Node-WASM scratch import of `onnxruntime-web/webgpu` and nine
+worker-bundle checks needing missing ignored `dist/auto-search-worker.js` outputs.
+A subsequent Linux `bun run build` passed (plugin/v2, Pi and CLI bundles, nine TUI
+outputs unchanged). Frozen install checked 1,010 installs / 1,251 packages with no
+changes. No manifests or locks changed. The final three touched plugin test files
+passed **104 tests** locally with reviewer permission. Plugin TypeScript 5.9.3
+typecheck passed again on Linux; final formatting/lint passed locally (1,410 files,
+59 warnings, nine infos). There are **27** restored independent mutation controls:
+17 host/transport and 10 Rust store/module controls, each with exactly one selected
+red test. All remaining tests were explicitly filtered, not claimed green in a
+mutant run. `provider-meter-mutations.json` records each neutralized counter,
+exact failing test, failure summary and nonempty/empty mutation/restoration diff
+stats; it proves those checks detect missing accounting.
+
+A same-allocation archive-baseline/after attempt recorded load averages
+31.25/24.75/22.49 initially and 20.21/20.80/21.44 finally. Baseline byte parity
+failed; the after build exposed cross-arm shared Cargo artifact contamination
+(`provider_meters` absent in the baseline store artifact), so its result was
+rejected. An independent candidate target eliminated that artifact mismatch.
+Its load averages went from 22.72/21.85/21.73 to 9.10/13.62/18.24; the later
+sample-printing run went from 13.62/13.83/16.28 to 19.48/16.02/16.39. Both were
+contended and stopped on an explicit hook refusal. Future before/after arms need
+separate Cargo target directories and clean, contemporaneous permit/load records;
+the earlier refused-job holder list is historical, not a claim about these runs.
+
+**Blocked:** the owner's long-lived ALF session canary and the P2 criterion
+(provider rebuild p50 ≤1.10× the paired full-array baseline), complete production-meter coverage,
+full-array functional stored-state differential, clean before/after timing and
+reconciliation merge/rerun. The 706-pass signed-thinking comparison still needs its
+independent baseline capture. The follow-up design is delivered for review only;
+no cache/prewarm implementation, deadline change or default switch is included.

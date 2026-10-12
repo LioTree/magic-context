@@ -652,3 +652,152 @@ fn views_are_frozen_at_a_version_and_only_application_state_changes() {
         r#"[ {"frozen":true} ]"#
     );
 }
+
+#[test]
+fn meters_count_sql_rows_before_discarding_a_bounded_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    s.inner.with_conn_fenced(|conn| {
+        ensure_lineage_tx(conn, &key().conversation_key(), &lineage("L", 1)).unwrap();
+        for i in 1..=3 {
+            conn.execute("INSERT INTO mc_provider_policy_parts_v1 VALUES (?1,'L',?2,?3,'{\"tag_number\":1}','session')",
+                params![key().conversation_key(), i, format!("m{i}#0")])?;
+        }
+        Ok(())
+    }).unwrap();
+    let meter = crate::provider_meters::ProviderStoreMeter::start("session", "opencode", "read");
+    s.inner
+        .with_conn(|conn| {
+            let index = ProviderPolicyIndex::new(conn, &key().conversation_key(), "L")?;
+            let before = meter.snapshot().sql_result_rows;
+            assert!(index.parts_with_tag_range(3, 10, 1).unwrap().is_some());
+            assert_eq!(meter.snapshot().sql_result_rows, before);
+            // LIMIT 2 steps two rows even though the cap discards the entire result.
+            let rejected = index.parts_with_tag_range(1, 2, 1).unwrap();
+            assert!(rejected.is_none());
+            assert_eq!(meter.snapshot().sql_result_rows - before, 2);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn meters_count_appended_utf8_and_zero_on_duplicate_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let l = lineage("L", 1);
+    let m = message(1);
+    let meter = crate::provider_meters::ProviderStoreMeter::start("session", "opencode", "append");
+    hook(&s, &l, &m, "p", None, false);
+    let written: u64 = s
+        .inner
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT length(message_bytes) FROM mc_provider_messages_v1 WHERE ordinal=1",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(meter.snapshot().appended_message_bytes, written);
+    let before = meter.snapshot().appended_message_bytes;
+    hook(&s, &l, &m, "q", None, false);
+    assert_eq!(meter.snapshot().appended_message_bytes, before);
+}
+
+#[test]
+fn meters_count_answer_and_state_cells_independently_of_message_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let meter = crate::provider_meters::ProviderStoreMeter::start("session", "opencode", "answer");
+    hook(&s, &lineage("L", 1), &message(1), "p", None, false);
+    let (message, answer, state): (u64, u64, u64) = s.inner.with_conn(|conn| {
+        Ok((
+            conn.query_row("SELECT sum(length(message_bytes)) FROM mc_provider_messages_v1", [], |r| r.get(0))?,
+            conn.query_row("SELECT sum(length(CAST(ops_json AS BLOB))+length(CAST(tags_json AS BLOB))) FROM mc_provider_hook_answers_v1", [], |r| r.get(0))?,
+            conn.query_row("SELECT length(CAST(hook_counters_json AS BLOB))+(SELECT length(CAST(policy_json AS BLOB)) FROM mc_provider_hook_answers_v1) FROM mc_provider_conversations_v2", [], |r| r.get(0))?,
+        ))
+    }).unwrap();
+    let actual = meter.snapshot();
+    assert_eq!(actual.answer_json_bytes, answer);
+    assert_eq!(actual.provider_state_bytes, state);
+    assert_eq!(
+        actual.module_logical_payload_bytes,
+        message + answer + state
+    );
+}
+
+#[test]
+fn meters_discard_rolled_back_payload_and_count_the_retry_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let meter = crate::provider_meters::ProviderStoreMeter::start("session", "opencode", "retry");
+    s.inner.with_conn(|conn| conn.execute_batch("CREATE TEMP TRIGGER fail_meter_commit BEFORE UPDATE ON mc_provider_conversations_v2 BEGIN SELECT RAISE(ABORT,'meter rollback'); END;")).unwrap();
+    let l = lineage("L", 1);
+    let m = message(1);
+    let result = s.commit_provider_status_page(
+        &key(),
+        ProviderStatusPage {
+            lineage: &l,
+            messages: std::slice::from_ref(&m),
+            served: None,
+            unserved: &[],
+            newest: Some(1),
+            more: false,
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(meter.snapshot().module_logical_payload_bytes, 0);
+    assert_eq!(meter.snapshot().appended_message_bytes, 0);
+    assert!(meter.snapshot().sql_result_rows > 0);
+    s.inner
+        .with_conn(|conn| conn.execute_batch("DROP TRIGGER fail_meter_commit;"))
+        .unwrap();
+    s.commit_provider_status_page(
+        &key(),
+        ProviderStatusPage {
+            lineage: &l,
+            messages: std::slice::from_ref(&m),
+            served: None,
+            unserved: &[],
+            newest: Some(1),
+            more: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        meter.snapshot().appended_message_bytes,
+        m.message_bytes.len() as u64
+    );
+}
+
+#[test]
+fn meters_count_inserted_tag_cells_but_not_ignored_tags() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let tag = McTagRow {
+        tag_number: 1,
+        block_id: "m#0".into(),
+        kind: "message".into(),
+        token_count: 2,
+        created_at_ms: 10,
+        source_bytes: std::sync::Arc::from("café 🦀".as_bytes()),
+    };
+    let meter = crate::provider_meters::ProviderStoreMeter::start("session", "opencode", "tag");
+    let mut transaction = crate::provider_meters::WriteMeter::begin();
+    s.inner
+        .with_conn_fenced(|conn| insert_tags_tx(conn, "engine", std::slice::from_ref(&tag)))
+        .unwrap();
+    transaction.commit();
+    drop(transaction);
+    let bytes: u64 = s.inner.with_conn(|conn| conn.query_row("SELECT length(CAST(session_id AS BLOB))+length(CAST(tag_number AS BLOB))+length(CAST(block_id AS BLOB))+length(CAST(kind AS BLOB))+length(CAST(token_count AS BLOB))+length(CAST(created_at_ms AS BLOB))+length(source_bytes) FROM mc_tags", [], |r| r.get(0))).unwrap();
+    assert_eq!(meter.snapshot().tag_row_bytes, bytes);
+    assert_eq!(meter.snapshot().module_logical_payload_bytes, bytes);
+    let mut transaction = crate::provider_meters::WriteMeter::begin();
+    s.inner
+        .with_conn_fenced(|conn| insert_tags_tx(conn, "engine", std::slice::from_ref(&tag)))
+        .unwrap();
+    transaction.commit();
+    drop(transaction);
+    assert_eq!(meter.snapshot().tag_row_bytes, bytes);
+}

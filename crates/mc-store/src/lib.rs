@@ -29,6 +29,7 @@ pub mod move_store;
 pub mod private_permissions;
 mod provider_legacy;
 mod provider_log;
+pub mod provider_meters;
 pub mod provider_records;
 pub use provider_records::ProviderSessionKey;
 pub mod score_projection;

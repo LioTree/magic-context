@@ -643,6 +643,14 @@ impl McHandler {
             .await
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
+        let _meters = mc_store::provider_meters::ProviderStoreMeter::start(
+            &key.session,
+            &key.harness,
+            params
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
         let c = store
             .load_provider_conversation(&key.store_key())
             .map_err(transient)?

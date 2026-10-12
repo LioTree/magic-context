@@ -1,5 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { drainSingleStoreEmbeddingWatermarks } from "../../../features/magic-context/memory/single-store-embedding-drain";
+import {
+    currentProviderMeters,
+    meterProviderCall,
+    meterProviderStage,
+    type ProviderPassMeters,
+    withoutProviderMeters,
+    withProviderMeters,
+} from "../../../features/magic-context/provider-meters";
 import { computeHardCacheExpired } from "../../../features/magic-context/scheduler";
 import {
     commitHostRunnerAnswer,
@@ -325,6 +333,7 @@ interface Session {
     replaceRecord?: string;
 }
 export interface OpenCodeProviderOptions {
+    emitMeters?: (meters: ProviderPassMeters) => void;
     now?: () => number;
     resolveOrdinals?: typeof resolveOrdinalsForModule;
     persisted?: typeof hasRawSessionMessageById;
@@ -362,7 +371,10 @@ export function createOpenCodeProviderTransform(
     const projectRoot = deps.rustModeProjectRoot ?? deps.directory ?? process.cwd();
     const configuredModule = deps.rustModeModuleClient;
     if (!configuredModule) throw new Error("Provider pipeline requires a module client");
-    const moduleClient = configuredModule;
+    const moduleClient: typeof configuredModule = {
+        ...configuredModule,
+        call: (args) => meterProviderCall(args.method, () => configuredModule.call(args)),
+    };
     const key = (sessionId: string): HostRunnerKey => ({ session_id: sessionId, harness });
     const log = (id: string, text: string) => sessionLog(id, `provider pipeline: ${text}`);
     function registerProjection(id: string): void {
@@ -665,6 +677,12 @@ export function createOpenCodeProviderTransform(
         output: { messages: unknown[] },
         meta: SessionMeta,
     ): Promise<void> {
+        const meters = currentProviderMeters();
+        if (meters) {
+            meters.fallback_count++;
+            meters.pass_kind = "exit";
+            meters.pipeline = "full_request";
+        }
         const namespace =
             s?.metadata.fullRequestNamespace ??
             (s?.record.pipeline_exit?.reseed_full_request
@@ -705,6 +723,8 @@ export function createOpenCodeProviderTransform(
     }
     const reseeded = new Map<string, Legacy>();
     function recover(id: string, messages: MessageLike[]): void {
+        const meters = currentProviderMeters();
+        if (meters) meters.recovery_count++;
         deps.onRustEngineReconnectRefusal?.({
             sessionId: id,
             projectRoot,
@@ -723,6 +743,11 @@ export function createOpenCodeProviderTransform(
     ): Promise<boolean> {
         checkFailure(result);
         if (result.status === "unavailable") {
+            if (s.metadata.active && ["timeout", "late", "aborted"].includes(result.reason)) {
+                throw new EmergencyFailClosedError(
+                    `Provider step did not complete before its fence: ${result.reason}`,
+                );
+            }
             const error = part(result.error ?? {});
             if (error.code === "invalid_params" && part(error.detail ?? {}).field === "messages") {
                 throw new StepOrdinalConflict("Status conflicts with module-ahead ingest");
@@ -785,6 +810,11 @@ export function createOpenCodeProviderTransform(
         }
         let hardMaterializedAt: number | undefined;
         if (applied) {
+            const meters = currentProviderMeters();
+            if (meters) {
+                meters.rebuild_count++;
+                meters.pass_kind = "rebuild";
+            }
             s.metadata.active = true;
             // SOFT flush/pressure views do not consume the idle HARD trigger.
             const decision =
@@ -1183,6 +1213,27 @@ export function createOpenCodeProviderTransform(
         meta: SessionMeta,
         conflictRetry = 0,
     ): Promise<void> {
+        return withProviderMeters(
+            id,
+            harness === "opencode" ? "OpenCode1" : "OpenCode2",
+            null,
+            () => runPass(id, messages, output, meta, conflictRetry),
+            (meters) => {
+                sessionLog(
+                    id,
+                    `rust pass: decision=${meters.pass_kind} reason=provider_pipeline pipeline=${meters.pipeline} pass_id=${meters.pass_id} elapsed=${meters.pass_ms} ms provider_meters=${JSON.stringify(meters)}`,
+                );
+                options.emitMeters?.(structuredClone(meters));
+            },
+        );
+    }
+    async function runPass(
+        id: string,
+        messages: MessageLike[],
+        output: { messages: unknown[] },
+        meta: SessionMeta,
+        conflictRetry = 0,
+    ): Promise<void> {
         // A legacy handoff preserves its original exception type. In particular,
         // BUSY must still be eligible for the legacy wrapper's LKG recovery.
         const existing = hydrate(id);
@@ -1222,12 +1273,20 @@ export function createOpenCodeProviderTransform(
                     ? s
                     : undefined;
             if (!s?.metadata.active || reentry) {
-                s = await bootstrap(id, s, messages, meta, reentry);
+                const meters = currentProviderMeters();
+                if (meters) meters.pass_kind = "bootstrap";
+                s = await meterProviderStage("bootstrap", () =>
+                    bootstrap(id, s, messages, meta, reentry),
+                );
                 if (!s?.metadata.active || s.record.pipeline_exit) {
                     return fallback(id, s, messages, output, meta);
                 }
-                publishMessages(output, assemble(s.record));
-                void historian?.pump(id);
+                const bootstrapped = s;
+                await meterProviderStage("publish", () =>
+                    publishMessages(output, assemble(bootstrapped.record)),
+                );
+                if (meters) meters.historian_pump_count += historian ? 1 : 0;
+                void withoutProviderMeters(() => historian?.pump(id));
                 return;
             }
             const incoming = messages.filter((m) => !isMagicContextHead(m)).map(providerIncoming);
@@ -1250,11 +1309,13 @@ export function createOpenCodeProviderTransform(
             committedBeforePass = s.record.next_ordinal - 1;
             // Id classification precedes sync; trigger eligibility is after the
             // synchronized chain and the last hook's pass-complete barrier.
-            await sync(id, s, scan.appends.length === 0);
+            await meterProviderStage("state_sync", () => sync(id, s, scan.appends.length === 0));
             const controls = inputs(id, messages, meta);
             const admissions: Admitted[] = [];
             let completedHook = false;
             for (let attempt = 0; attempt < 2; attempt++) {
+                const meters = currentProviderMeters();
+                if (meters && attempt > 0) meters.retry_count++;
                 admissions.length = 0;
                 completedHook = false;
                 let conflict = false;
@@ -1284,14 +1345,27 @@ export function createOpenCodeProviderTransform(
                     const outcomes: HookOutcome[] = [];
                     for (const [j, subject] of subjects.entries()) {
                         const complete = i === scan.appends.length - 1 && j === subjects.length - 1;
-                        const result = await s.client.hook(
-                            s.record,
-                            { ...subject, subject_ordinal: candidate.ordinal },
-                            admitted.ingest,
-                            complete ? true : undefined,
+                        const result = await meterProviderStage("hook_transport", () =>
+                            s.client.hook(
+                                s.record,
+                                { ...subject, subject_ordinal: candidate.ordinal },
+                                admitted.ingest,
+                                complete ? true : undefined,
+                            ),
                         );
                         completedHook ||= complete;
                         checkFailure(result);
+                        // A deadline is not proof that the module did no work. It
+                        // may have committed a tag whose answer is still in flight;
+                        // serving the raw append would lose that tag on this turn.
+                        if (
+                            result.status === "unavailable" &&
+                            ["timeout", "late", "aborted"].includes(result.reason)
+                        ) {
+                            throw new EmergencyFailClosedError(
+                                `Provider hook did not complete before its fence: ${result.reason}`,
+                            );
+                        }
                         if (ordinalConflict(result)) {
                             conflict = true;
                             break;
@@ -1340,7 +1414,8 @@ export function createOpenCodeProviderTransform(
             save(id, s, admissions, scan.elided);
             // A final append without a subscribed hook still ends the pass. Signal
             // completion after every append is recorded, not in the pre-ingest sync.
-            if (scan.appends.length && !completedHook) await sync(id, s, true);
+            if (scan.appends.length && !completedHook)
+                await meterProviderStage("state_sync", () => sync(id, s, true));
             controls.newest = {
                 ordinal: s.record.next_ordinal - 1,
                 mid: s.metadata.newestMid ?? "empty",
@@ -1379,9 +1454,11 @@ export function createOpenCodeProviderTransform(
                 // Continuation pages may not apply views. This same bounded paging
                 // lane is also needed when several frozen-raw appends exceed 3 MiB.
                 const pending = s;
-                await s.client.bootstrap(s.record, controls, async (page) => {
-                    await answer(id, pending, page, controls, messages);
-                });
+                await meterProviderStage("rebuild", () =>
+                    s.client.bootstrap(s.record, controls, async (page) => {
+                        await answer(id, pending, page, controls, messages);
+                    }),
+                );
             }
             if (s.record.pipeline_exit) return fallback(id, s, messages, output, meta);
             else {
@@ -1396,14 +1473,18 @@ export function createOpenCodeProviderTransform(
                         "Provider-proven emergency wall without a fold",
                     );
                 }
-                publishMessages(
-                    output,
-                    assemble(
-                        s.record,
-                        scan.passthrough.map((p) => p.read()),
+                await meterProviderStage("publish", () =>
+                    publishMessages(
+                        output,
+                        assemble(
+                            s.record,
+                            scan.passthrough.map((p) => p.read()),
+                        ),
                     ),
                 );
-                void historian?.pump(id);
+                const meters = currentProviderMeters();
+                if (meters) meters.historian_pump_count += historian ? 1 : 0;
+                void withoutProviderMeters(() => historian?.pump(id));
             }
         } catch (error) {
             if (error instanceof StepOrdinalConflict && conflictRetry === 0) {
@@ -1420,6 +1501,8 @@ export function createOpenCodeProviderTransform(
                     held.pendingDescent = through;
                     save(id, held);
                     busy.delete(id);
+                    const meters = currentProviderMeters();
+                    if (meters) meters.retry_count++;
                     return await run(id, messages, output, meta, conflictRetry + 1);
                 }
             }

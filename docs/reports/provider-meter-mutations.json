@@ -1,0 +1,191 @@
+[
+  {
+    "control": "issued hook count",
+    "expected_red": "provider production meters > RPC admission counts a failed call before a response exists",
+    "captured_output": "(fail) provider production meters > RPC admission counts a failed call before a response exists; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "issued RPC count",
+    "expected_red": "provider production meters > RPC admission counts a failed call before a response exists",
+    "captured_output": "(fail) provider production meters > RPC admission counts a failed call before a response exists; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "request UTF-8 bytes",
+    "expected_red": "provider production meters > RPC byte meters count UTF-8 encoded requests and logical response JSON independently",
+    "captured_output": "(fail) provider production meters > RPC byte meters count UTF-8 encoded requests and logical response JSON independently; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "decoded response JSON bytes",
+    "expected_red": "provider production meters > RPC byte meters count UTF-8 encoded requests and logical response JSON independently",
+    "captured_output": "(fail) provider production meters > RPC byte meters count UTF-8 encoded requests and logical response JSON independently; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "stage elapsed duration",
+    "expected_red": "provider production meters > stage and whole-pass timers include completed awaited work",
+    "captured_output": "(fail) provider production meters > stage and whole-pass timers include completed awaited work; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "whole pass elapsed duration",
+    "expected_red": "provider production meters > stage and whole-pass timers include completed awaited work",
+    "captured_output": "(fail) provider production meters > stage and whole-pass timers include completed awaited work; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "committed appended item count",
+    "expected_red": "provider production meters > host admission and actual writes count persisted cells and rollback contributes zero",
+    "captured_output": "(fail) provider production meters > host admission and actual writes count persisted cells and rollback contributes zero; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "committed ingest budget bytes",
+    "expected_red": "provider production meters > host admission and actual writes count persisted cells and rollback contributes zero",
+    "captured_output": "(fail) provider production meters > host admission and actual writes count persisted cells and rollback contributes zero; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "committed hook ops budget bytes",
+    "expected_red": "provider production meters > host admission and actual writes count persisted cells and rollback contributes zero",
+    "captured_output": "(fail) provider production meters > host admission and actual writes count persisted cells and rollback contributes zero; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "independent actual host bytes",
+    "expected_red": "provider production meters > host admission and actual writes count persisted cells and rollback contributes zero",
+    "captured_output": "(fail) provider production meters > host admission and actual writes count persisted cells and rollback contributes zero; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "host state bytes",
+    "expected_red": "provider production meters > host admission and actual writes count persisted cells and rollback contributes zero",
+    "captured_output": "(fail) provider production meters > host admission and actual writes count persisted cells and rollback contributes zero; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "host view bytes",
+    "expected_red": "OpenCode v1 provider adapter > pass meters count issued hooks, appends, applied rebuilds and historian pumps in the host lane",
+    "captured_output": "(fail) OpenCode v1 provider adapter > pass meters count issued hooks, appends, applied rebuilds and historian pumps in the host lane; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/features/magic-context/provider-meters.ts; during: packages/plugin/src/features/magic-context/provider-meters.ts | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "applied rebuild count",
+    "expected_red": "OpenCode v1 provider adapter > pass meters count issued hooks, appends, applied rebuilds and historian pumps in the host lane",
+    "captured_output": "(fail) OpenCode v1 provider adapter > pass meters count issued hooks, appends, applied rebuilds and historian pumps in the host lane; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts; during: .../plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts     | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "historian pump count",
+    "expected_red": "OpenCode v1 provider adapter > pass meters count issued hooks, appends, applied rebuilds and historian pumps in the host lane",
+    "captured_output": "(fail) OpenCode v1 provider adapter > pass meters count issued hooks, appends, applied rebuilds and historian pumps in the host lane; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts; during: .../plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts   | 5 +++-- |  1 file changed, 3 insertions(+), 2 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "fallback count",
+    "expected_red": "OpenCode v1 provider adapter > rollback zero-divergence is stable; diverged rollback selects fresh namespace once",
+    "captured_output": "(fail) OpenCode v1 provider adapter > rollback zero-divergence is stable; diverged rollback selects fresh namespace once; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts; during: .../plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts     | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "recovery count",
+    "expected_red": "OpenCode v1 provider adapter > first post-rebuild hook timeout refuses without publishing an untagged append",
+    "captured_output": "(fail) OpenCode v1 provider adapter > first post-rebuild hook timeout refuses without publishing an untagged append; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts; during: .../plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts     | 3 ++- |  1 file changed, 2 insertions(+), 1 deletion(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "retry count",
+    "expected_red": "OpenCode v1 provider adapter > module-ahead ordinal refusal descends once and retries hooks",
+    "captured_output": "(fail) OpenCode v1 provider adapter > module-ahead ordinal refusal descends once and retries hooks; 1 fail; all other tests filtered out by the named control.",
+    "applied_evidence": "packages/plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts; during: .../plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts   | 5 +++-- |  1 file changed, 3 insertions(+), 2 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "neutralize Rust sql counter only via selected mutant guard",
+    "expected_red": "provider_log::tests::meters_count_sql_rows_before_discarding_a_bounded_read",
+    "captured_output": "test provider_log::tests::meters_count_sql_rows_before_discarding_a_bounded_read ... FAILED; test result: FAILED. 0 passed; 1 failed; all other tests filtered out",
+    "applied_evidence": "crates/mc-store/src/provider_meters.rs; during: crates/mc-module/src/providers/mod.rs | 7 ++++---; crates/mc-store/src/provider_meters.rs | 15 ++++++++-------; 2 files changed, 12 insertions(+), 10 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "neutralize Rust message counter only via selected mutant guard",
+    "expected_red": "provider_log::tests::meters_count_appended_utf8_and_zero_on_duplicate_admission",
+    "captured_output": "test provider_log::tests::meters_count_appended_utf8_and_zero_on_duplicate_admission ... FAILED; test result: FAILED. 0 passed; 1 failed; all other tests filtered out",
+    "applied_evidence": "crates/mc-store/src/provider_meters.rs; during: crates/mc-module/src/providers/mod.rs | 7 ++++---; crates/mc-store/src/provider_meters.rs | 15 ++++++++-------; 2 files changed, 12 insertions(+), 10 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "neutralize Rust answer counter only via selected mutant guard",
+    "expected_red": "provider_log::tests::meters_count_answer_and_state_cells_independently_of_message_budget",
+    "captured_output": "test provider_log::tests::meters_count_answer_and_state_cells_independently_of_message_budget ... FAILED; test result: FAILED. 0 passed; 1 failed; all other tests filtered out",
+    "applied_evidence": "crates/mc-store/src/provider_meters.rs; during: crates/mc-module/src/providers/mod.rs | 7 ++++---; crates/mc-store/src/provider_meters.rs | 15 ++++++++-------; 2 files changed, 12 insertions(+), 10 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "neutralize Rust state counter only via selected mutant guard",
+    "expected_red": "provider_log::tests::meters_count_answer_and_state_cells_independently_of_message_budget",
+    "captured_output": "test provider_log::tests::meters_count_answer_and_state_cells_independently_of_message_budget ... FAILED; test result: FAILED. 0 passed; 1 failed; all other tests filtered out",
+    "applied_evidence": "crates/mc-store/src/provider_meters.rs; during: crates/mc-module/src/providers/mod.rs | 7 ++++---; crates/mc-store/src/provider_meters.rs | 15 ++++++++-------; 2 files changed, 12 insertions(+), 10 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "neutralize Rust actual counter only via selected mutant guard",
+    "expected_red": "provider_log::tests::meters_count_answer_and_state_cells_independently_of_message_budget",
+    "captured_output": "test provider_log::tests::meters_count_answer_and_state_cells_independently_of_message_budget ... FAILED; test result: FAILED. 0 passed; 1 failed; all other tests filtered out",
+    "applied_evidence": "crates/mc-store/src/provider_meters.rs; during: crates/mc-module/src/providers/mod.rs | 7 ++++---; crates/mc-store/src/provider_meters.rs | 15 ++++++++-------; 2 files changed, 12 insertions(+), 10 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "neutralize Rust tag counter only via selected mutant guard",
+    "expected_red": "provider_log::tests::meters_count_inserted_tag_cells_but_not_ignored_tags",
+    "captured_output": "test provider_log::tests::meters_count_inserted_tag_cells_but_not_ignored_tags ... FAILED; test result: FAILED. 0 passed; 1 failed; all other tests filtered out",
+    "applied_evidence": "crates/mc-store/src/provider_meters.rs; during: crates/mc-module/src/providers/mod.rs | 7 ++++---; crates/mc-store/src/provider_meters.rs | 15 ++++++++-------; 2 files changed, 12 insertions(+), 10 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "neutralize Rust rollback counter only via selected mutant guard",
+    "expected_red": "provider_log::tests::meters_discard_rolled_back_payload_and_count_the_retry_once",
+    "captured_output": "test provider_log::tests::meters_discard_rolled_back_payload_and_count_the_retry_once ... FAILED; test result: FAILED. 0 passed; 1 failed; all other tests filtered out",
+    "applied_evidence": "crates/mc-store/src/provider_meters.rs; during: crates/mc-module/src/providers/mod.rs | 7 ++++---; crates/mc-store/src/provider_meters.rs | 15 ++++++++-------; 2 files changed, 12 insertions(+), 10 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "neutralize Rust hook counter only via selected mutant guard",
+    "expected_red": "providers::tests::meters_module_completion_counts_hooks_even_when_the_hook_refuses",
+    "captured_output": "test providers::tests::meters_module_completion_counts_hooks_even_when_the_hook_refuses ... FAILED; test result: FAILED. 0 passed; 1 failed; all other tests filtered out",
+    "applied_evidence": "crates/mc-module/src/providers/mod.rs; during: crates/mc-module/src/providers/mod.rs | 7 ++++---; crates/mc-store/src/provider_meters.rs | 15 ++++++++-------; 2 files changed, 12 insertions(+), 10 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "neutralize Rust response counter only via selected mutant guard",
+    "expected_red": "providers::tests::meters_module_completion_counts_hooks_even_when_the_hook_refuses",
+    "captured_output": "test providers::tests::meters_module_completion_counts_hooks_even_when_the_hook_refuses ... FAILED; test result: FAILED. 0 passed; 1 failed; all other tests filtered out",
+    "applied_evidence": "crates/mc-module/src/providers/mod.rs; during: crates/mc-module/src/providers/mod.rs | 7 ++++---; crates/mc-store/src/provider_meters.rs | 15 ++++++++-------; 2 files changed, 12 insertions(+), 10 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "neutralize Rust duration counter only via selected mutant guard",
+    "expected_red": "providers::tests::meters_module_duration_includes_waiting_for_the_conversation_lock",
+    "captured_output": "test providers::tests::meters_module_duration_includes_waiting_for_the_conversation_lock ... FAILED; test result: FAILED. 0 passed; 1 failed; all other tests filtered out",
+    "applied_evidence": "crates/mc-module/src/providers/mod.rs; during: crates/mc-module/src/providers/mod.rs | 7 ++++---; crates/mc-store/src/provider_meters.rs | 15 ++++++++-------; 2 files changed, 12 insertions(+), 10 deletions(-); after: empty git diff --stat",
+    "outcome": "reddened"
+  }
+]

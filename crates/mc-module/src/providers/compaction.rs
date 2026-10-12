@@ -262,6 +262,9 @@ fn non_tag_messages(
                         && text.contains("spent tool output") && text.ends_with("\n</system-reminder>")))
             });
         }
+        if ops.is_empty() {
+            continue;
+        }
         let parts = message
             .message
             .get_mut("parts")
@@ -500,7 +503,9 @@ fn execute_host(
     status: &transform::compaction::Status,
     lineage: &ProviderLineage,
 ) -> Result<Option<HostView>, HandlerOutcome> {
+    let started = Instant::now();
     let messages = non_tag_messages(store, &work.key, lineage)?;
+    let replay_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut template: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
         "serializer_profile":"opencode-aisdk","session_id":conversation.engine_namespace,
         "render_config":serde_json::to_string(&setup.setup.request.params).map_err(transient)?,
@@ -577,23 +582,40 @@ fn execute_host(
     status.prefix_rebuilding |= setup.repair_pending;
     let status = &status;
     let mut state = setup.setup.state.clone();
-    state.last_applied = setup
-        .applied
-        .as_ref()
-        .map(|s| load_host_view(store, &work.key, s).map(|v| v.engine))
-        .transpose()?;
     let previous = setup
         .produced
         .as_ref()
         .map(|s| load_host_view(store, &work.key, s))
         .transpose()?;
+    state.last_applied = setup
+        .applied
+        .as_ref()
+        .map(|summary| {
+            // Acknowledged and produced references usually name the same immutable
+            // row. Decode it once, retaining each reference's descended lineage.
+            if let Some(view) = previous
+                .as_ref()
+                .filter(|v| v.engine.version == summary.version)
+            {
+                let mut engine = view.engine.clone();
+                engine.range.lineage_id = summary.range.lineage_id.clone();
+                Ok(engine)
+            } else {
+                load_host_view(store, &work.key, summary).map(|v| v.engine)
+            }
+        })
+        .transpose()?;
     state.last_produced = previous.as_ref().map(|v| v.engine.clone());
-    let live = store
-        .load_provider_hook_answers(&work.key.store_key())
-        .map_err(transient)?;
     let pending = store
         .load_provider_pending_drops(&work.key.store_key())
         .map_err(transient)?;
+    let live = if pending.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .load_provider_hook_answers(&work.key.store_key())
+            .map_err(transient)?
+    };
     let targets = live
         .iter()
         .filter(|a| a.state == "live")
@@ -604,8 +626,11 @@ fn execute_host(
     store
         .append_pending_agent_drops(&conversation.engine_namespace, &targets, now_ms())
         .map_err(transient)?;
+    let prepare_ms = started.elapsed().as_secs_f64() * 1000.0 - replay_ms;
+    let engine_started = Instant::now();
     let output = transform::compaction::step(store, &template, &context, status, &mut state)
         .map_err(transient)?;
+    let engine_ms = engine_started.elapsed().as_secs_f64() * 1000.0;
     // Keep only scalars in Setup. Engine and native bytes are committed together
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
@@ -640,6 +665,10 @@ fn execute_host(
         });
         (wire, coverage)
     };
+    tracing::info!(session_id = %work.key.session, harness = %work.key.harness,
+        replay_ms, prepare_ms, engine_ms,
+        encode_ms = started.elapsed().as_secs_f64() * 1000.0 - replay_ms - prepare_ms - engine_ms,
+        "provider rebuild stages");
     Ok(Some(HostView {
         engine,
         wire,
@@ -971,6 +1000,13 @@ impl McHandler {
         params: &Value,
         request: compact::status::StepStatus,
     ) -> Result<Vec<u8>, HandlerOutcome> {
+        let _span =
+            tracing::info_span!("provider_step", request_id = %request.request_id).entered();
+        let _meters = mc_store::provider_meters::ProviderStoreMeter::start(
+            &work.key.session,
+            &work.key.harness,
+            &request.request_id,
+        );
         if serde_json::to_vec(&json!({"method":"compaction.step","params":params}))
             .map_err(transient)?
             .len()

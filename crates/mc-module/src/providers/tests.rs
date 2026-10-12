@@ -919,3 +919,119 @@ async fn allocated_unsent_work_is_retried_above_its_version_without_runner_rejec
         2
     );
 }
+
+#[test]
+fn meters_module_completion_counts_hooks_even_when_the_hook_refuses() {
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let captured = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || Writer(captured.clone()))
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), Arc::new(Runner::default()));
+        let answer = h
+            .handle_provider_value(
+                7,
+                "transform.declare",
+                &json!({"session":"s","harness":"broca","request_id":"declare","params":{}}),
+            )
+            .await;
+        let HandlerOutcome::Response(bytes) = answer else {
+            panic!("declaration must answer")
+        };
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("hook_count=0"), "{logs}");
+        assert!(
+            logs.contains(&format!("response_bytes={}", bytes.len())),
+            "{logs}"
+        );
+        output.lock().unwrap().clear();
+        let refused = h
+            .handle_provider_value(
+                7,
+                "transform.hook",
+                &json!({"session":"s","harness":"broca","request_id":"hook"}),
+            )
+            .await;
+        assert!(!matches!(refused, HandlerOutcome::Response(_)));
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("hook_count=1"), "{logs}");
+        assert!(logs.contains("request_id=\"hook\""), "{logs}");
+        assert!(logs.contains("module_ms="), "{logs}");
+        assert!(logs.contains("provider module complete"), "{logs}");
+    });
+}
+
+#[test]
+fn meters_module_duration_includes_waiting_for_the_conversation_lock() {
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let captured = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || Writer(captured.clone()))
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), Arc::new(Runner::default()));
+        let held = h.provider_serial.lock_for(&key(&h, "s", "broca")).await;
+        let params = step("s", vec![], None);
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        };
+        let (_, _answer) = tokio::join!(
+            release,
+            h.handle_provider_value(7, "compaction.step", &params)
+        );
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let duration: f64 = logs
+            .split("module_ms=")
+            .last()
+            .expect("module duration field")
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            duration >= 15.0,
+            "module duration omitted the lock wait: {logs}"
+        );
+    });
+}
