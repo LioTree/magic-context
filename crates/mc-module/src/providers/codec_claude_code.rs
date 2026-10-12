@@ -370,12 +370,7 @@ pub(super) fn encode_view(
     // The prefix of every surviving signed block must remain identical, even
     // across a later real user turn. Compare native bytes, not normalized text.
     for (index, entry) in request.messages.iter().enumerate() {
-        if !entry.ck.content.iter().any(|b| {
-            matches!(
-                b.kind,
-                CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
-            )
-        }) {
+        if signed_prefix(&original[index]).is_none() {
             continue;
         }
         if let Some(position) = view.replacement.iter().position(|m| {
@@ -612,6 +607,29 @@ mod tests {
         let raw = r#"{"role":"assistant","content":[{"type":"thinking","thinking":"x","signature":"s"}]}"#;
         let request = request(&[entry(raw, 0), entry(raw, 1)]);
         assert!(encode_view(&view(&request), &request, None).is_ok());
+    }
+
+    #[test]
+    fn opaque_native_thinking_shapes_still_fence_their_signed_prefix() {
+        let request = request(&[
+            entry(r#"{"role":"user","content":"before"}"#, 0),
+            entry(
+                r#"{"role":"assistant","content":[{"type":"thinking","signature":"s","thinking":{"future":"shape"}}]}"#,
+                1,
+            ),
+        ]);
+        assert!(matches!(
+            request.messages[1].ck.content[0].kind,
+            CkKind::Opaque(_)
+        ));
+        let mut output = view(&request);
+        assert!(encode_view(&output, &request, None).is_ok());
+        output.replacement[0].content[0].kind = CkKind::Text {
+            text: "edited".into(),
+        };
+        assert!(
+            matches!(encode_view(&output,&request,None),Err(HandlerOutcome::Error { code,.. }) if code=="signed_prefix_edit")
+        );
     }
 
     // Captures include moving cache markers. Remove just their members with a
