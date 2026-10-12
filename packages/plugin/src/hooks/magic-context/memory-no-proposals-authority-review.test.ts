@@ -78,7 +78,7 @@ if (process.env.MC_NOPROP_REVIEW === "1") {
         }
     });
 
-    test("noprop response parser refuses flagged prefix-shaped failures but is not a typed receipt", async () => {
+    test("noprop response parser refuses unflagged success-shaped text without a typed receipt", async () => {
         const db = new Database(":memory:");
         try {
             const request = {
@@ -105,9 +105,8 @@ if (process.env.MC_NOPROP_REVIEW === "1") {
                         }),
                     },
                 })!.backends.curateMemory!(request);
-            await expect(response(true)).rejects.toThrow("stale_revision");
-            // Without isError, even text saying "refusal" is accepted when it starts with the archive-success prefix.
-            expect(await response(false)).toMatchObject({ state: "applied", memoryId: 7 });
+            await expect(response(true)).rejects.toThrow("Invalid module curate response");
+            await expect(response(false)).rejects.toThrow("Invalid module curate response");
         } finally {
             db.close();
         }

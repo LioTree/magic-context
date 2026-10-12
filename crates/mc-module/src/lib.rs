@@ -12967,7 +12967,7 @@ impl McHandler {
                 self.handle_ctx_memory_facade(channel, &request, false)
                     .await
             }
-            "memory.curate" => self.handle_ctx_memory_facade(channel, &request, true).await,
+            "memory.curate" => self.handle_memory_curate_facade(channel, &request).await,
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
             "ctx_reduce" => self.handle_ctx_reduce_facade(channel, &request).await,
@@ -13448,6 +13448,33 @@ impl McHandler {
         mcp_text_result(reply, false)
     }
 
+    async fn handle_memory_curate_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let outcome = self.handle_ctx_memory_facade(channel, request, true).await;
+        let HandlerOutcome::Response(bytes) = &outcome else {
+            return outcome;
+        };
+        let Ok(Value::Object(mut body)) = serde_json::from_slice::<Value>(bytes) else {
+            return outcome;
+        };
+        if body.contains_key("structuredContent") {
+            return outcome;
+        }
+        // Existing scope and transaction refusals keep their human explanation, but
+        // must also report failure through the machine-readable curation contract.
+        let code = if body.get("isError") == Some(&Value::Bool(true)) {
+            "mutation_refused"
+        } else {
+            "invalid_receipt"
+        };
+        body.insert("isError".into(), Value::Bool(true));
+        body.insert(
+            "structuredContent".into(),
+            serde_json::to_value(MemoryCurateResult::refused(code))
+                .expect("curate receipt is serializable"),
+        );
+        respond(Value::Object(body))
+    }
+
     async fn handle_ctx_memory_facade(
         &self,
         channel: u16,
@@ -13709,10 +13736,16 @@ impl McHandler {
                             }],
                             now_ms(),
                         )?;
-                        facade_text_response(
-                            format!("Updated memory [ID: {rendered_id}] in {}.", memory.category),
-                            false,
-                        )
+                        let text =
+                            format!("Updated memory [ID: {rendered_id}] in {}.", memory.category);
+                        if automated {
+                            mcp_curate_result(
+                                text,
+                                MemoryCurateResult::applied(rendered_id, vec![]),
+                            )
+                        } else {
+                            facade_text_response(text, false)
+                        }
                     },
                 ))
             }
@@ -13753,10 +13786,12 @@ impl McHandler {
                             }
                         }
                         if archived.is_empty() {
-                            facade_text_response(
-                                "No active memories needed archiving.".to_string(),
-                                false,
-                            )
+                            let text = "No active memories needed archiving.".to_string();
+                            if automated {
+                                mcp_curate_result(text, MemoryCurateResult::refused("not_active"))
+                            } else {
+                                facade_text_response(text, false)
+                            }
                         } else {
                             tx.record_agent_fragment(
                                 conversation_key,
@@ -13772,10 +13807,16 @@ impl McHandler {
                                 now_ms(),
                             )?;
                             let rendered_ids = archived;
-                            facade_text_response(
-                                format!("Archived memory IDs [{}].", join_i64s(&rendered_ids)),
-                                false,
-                            )
+                            let text =
+                                format!("Archived memory IDs [{}].", join_i64s(&rendered_ids));
+                            if automated {
+                                mcp_curate_result(
+                                    text,
+                                    MemoryCurateResult::applied(rendered_ids[0], vec![]),
+                                )
+                            } else {
+                                facade_text_response(text, false)
+                            }
                         }
                     },
                 ))
@@ -13849,6 +13890,7 @@ impl McHandler {
                                     join_i64s(&rendered_superseded)
                                 )
                             };
+                            if automated { return mcp_curate_result(text, MemoryCurateResult::applied(memory.id, superseded_ids)); }
                             mcp_memory_result(
                                 text,
                                 false,
@@ -16825,6 +16867,49 @@ fn mcp_text_result(text: String, is_error: bool) -> HandlerOutcome {
         "content": [{ "type": "text", "text": text }],
         "isError": is_error,
     }))
+}
+
+#[derive(serde::Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum MemoryCurateState {
+    Applied,
+    Refused,
+}
+
+#[derive(serde::Serialize)]
+struct MemoryCurateResult {
+    state: MemoryCurateState,
+    memory_id: Option<i64>,
+    superseded_ids: Vec<i64>,
+    error_code: Option<String>,
+}
+
+impl MemoryCurateResult {
+    fn applied(memory_id: i64, superseded_ids: Vec<i64>) -> Self {
+        Self {
+            state: MemoryCurateState::Applied,
+            memory_id: Some(memory_id),
+            superseded_ids,
+            error_code: None,
+        }
+    }
+    fn refused(code: &str) -> Self {
+        Self {
+            state: MemoryCurateState::Refused,
+            memory_id: None,
+            superseded_ids: vec![],
+            error_code: Some(code.into()),
+        }
+    }
+}
+
+fn mcp_curate_result(text: String, receipt: MemoryCurateResult) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": receipt.state == MemoryCurateState::Refused,
+        "structuredContent": receipt,
+    }))
+    .map_err(|error| error.to_string())
 }
 
 fn mcp_memory_result(text: String, is_error: bool, operation: Value) -> Result<Vec<u8>, String> {
@@ -32642,20 +32727,29 @@ mod tests {
         let first = insert_memory(&store, identity, "CONSTRAINTS", "cache_ttl=5m", 1);
         let second = insert_memory(&store, identity, "CONSTRAINTS", "cache_ttl=10m", 1);
         let update = json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-update", "action": "update", "ids": [first], "expected_revisions": [{"id": first, "revision": 1}], "content": "cache_ttl=15m" });
-        assert!(
-            tool_text(call_facade(&handler, "memory.curate", update.clone()).await)
-                .starts_with("Updated memory")
+        let applied = tool_body(call_facade(&handler, "memory.curate", update.clone()).await);
+        assert!(applied["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Updated memory"));
+        assert_eq!(
+            applied["structuredContent"],
+            json!({"state": "applied", "memory_id": first, "superseded_ids": [], "error_code": null})
         );
-        assert!(
-            tool_text(call_facade(&handler, "memory.curate", update).await)
-                .starts_with("Updated memory")
-        );
+        let replay = tool_body(call_facade(&handler, "memory.curate", update).await);
+        assert_eq!(replay["structuredContent"], applied["structuredContent"]);
         assert_eq!(
             store.get_memory_full(first).unwrap().unwrap().content,
             "cache_ttl=15m"
         );
-        let merged = tool_text(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-merge", "action": "merge", "ids": [first, second], "expected_revisions": [{"id": first, "revision": 2}, {"id": second, "revision": 1}], "content": "cache_ttl=20m" })).await);
-        assert!(merged.starts_with("Merged memories"), "{merged}");
+        let merged = tool_body(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-merge", "action": "merge", "ids": [first, second], "expected_revisions": [{"id": first, "revision": 2}, {"id": second, "revision": 1}], "content": "cache_ttl=20m" })).await);
+        assert!(
+            merged["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Merged memories"),
+            "{merged}"
+        );
         assert_eq!(
             store.get_memory_full(first).unwrap().unwrap().status,
             "archived"
@@ -32669,11 +32763,30 @@ mod tests {
                 )
             })
             .unwrap();
-        let archive = tool_text(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-archive", "action": "archive", "ids": [canonical.0], "expected_revisions": [{"id": canonical.0, "revision": canonical.1}], "reason": "obsolete" })).await);
-        assert!(archive.starts_with("Archived memory"), "{archive}");
+        assert_eq!(
+            merged["structuredContent"],
+            json!({"state": "applied", "memory_id": canonical.0, "superseded_ids": [first, second], "error_code": null})
+        );
+        let archive = tool_body(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-archive", "action": "archive", "ids": [canonical.0], "expected_revisions": [{"id": canonical.0, "revision": canonical.1}], "reason": "obsolete" })).await);
+        assert!(
+            archive["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Archived memory"),
+            "{archive}"
+        );
+        assert_eq!(
+            archive["structuredContent"],
+            json!({"state": "applied", "memory_id": canonical.0, "superseded_ids": [], "error_code": null})
+        );
         assert_eq!(
             store.get_memory_full(canonical.0).unwrap().unwrap().status,
             "archived"
+        );
+        let inactive = tool_body(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-inactive", "action": "archive", "ids": [canonical.0], "expected_revisions": [{"id": canonical.0, "revision": canonical.1 + 1}] })).await);
+        assert_eq!(
+            inactive["structuredContent"],
+            json!({"state": "refused", "memory_id": null, "superseded_ids": [], "error_code": "not_active"})
         );
         store
             .with_context_conn_for_test(|conn| {
@@ -32733,6 +32846,11 @@ mod tests {
                 "action": action, "ids": ids, "expected_revisions": expected, "content": "Replacement.",
             })).await);
             assert_eq!(body["isError"], true, "{action}: {body}");
+            assert_eq!(
+                body["structuredContent"],
+                json!({"state": "refused", "memory_id": null, "superseded_ids": [], "error_code": "mutation_refused"}),
+                "{action}: {body}"
+            );
             assert!(
                 body["content"][0]["text"]
                     .as_str()

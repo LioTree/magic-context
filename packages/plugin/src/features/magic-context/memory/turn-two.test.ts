@@ -705,7 +705,7 @@ describe("turn two gated edits", () => {
         }
     });
     if (process.env.MC_NOPROP_REVIEW === "1") {
-        test("noprop merge may drop source tokens when the evidence repeats them", async () => {
+        test("noprop merge refuses source-token loss even when the evidence repeats them", async () => {
             const db = store();
             try {
                 const survivor = insertMemory(db, {
@@ -719,6 +719,7 @@ describe("turn two gated edits", () => {
                     content: "retry_limit is 17.",
                 });
                 const excerpt = "retry_limit was 17; now use bounded retries.";
+                const before = db.prepare("SELECT * FROM memories ORDER BY id").all();
                 const published = publish(db, [
                     { content: "Use bounded retries.", block: { ordinal: 42, parts: [excerpt] } },
                 ]);
@@ -741,15 +742,18 @@ describe("turn two gated edits", () => {
                     ]),
                 );
                 await run(db, published.publicationId, stub.carrier);
-                // Repeating retry_limit and 17 in the cited evidence lets the merge omit both from the stored memory.
                 expect(fact(db, published.factIds[0]!)).toMatchObject({
-                    state: "applied",
-                    reason: "merge",
+                    state: "decided_pending",
+                    reason: "dropped_token",
                 });
-                expect(getMemoryById(db, survivor.id)!.content).toBe(
-                    "Keep rule. Use bounded retries.",
-                );
-                expect(stub.checks.length).toBeGreaterThan(0);
+                expect(db.prepare("SELECT * FROM memories ORDER BY id").all()).toEqual(before);
+                expect(stub.checks).toHaveLength(0);
+                for (const table of [
+                    "memory_history",
+                    "memory_successor_links",
+                    "memory_tool_proposals",
+                ])
+                    expect(count(db, `SELECT COUNT(*) AS n FROM ${table}`)).toBe(0);
             } finally {
                 db.close();
             }
