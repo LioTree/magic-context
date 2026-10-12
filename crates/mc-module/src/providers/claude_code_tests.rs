@@ -256,3 +256,86 @@ async fn cc_hook_pass_is_durable_and_raw_retries_do_not_rewrite_signed_bytes() {
         .iter()
         .all(|a| a.answer.ops_json == "[]" && a.answer.tags.is_empty()));
 }
+
+#[tokio::test]
+async fn cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    let mut b = binding(dir.path(), thalamus());
+    b.config
+        .cache_ttl_by_model
+        .insert("fixture".into(), "5m".into());
+    h.bind_route(7, b.clone());
+    let ready = setup(&h).await;
+    assert_eq!(
+        ready["cache_policy"]["marker_ttl"],
+        json!({"intent":"authored","ttl":"5m"})
+    );
+    assert_eq!(ready["head_slots"], json!([]));
+    b.config
+        .cache_ttl_by_model
+        .insert("fixture".into(), "1h".into());
+    h.bind_route(7, b.clone());
+    assert_eq!(setup(&h).await["cache_policy"], ready["cache_policy"]);
+    let raw = r#"{ "content":"unsigned live text", "role":"user" }"#;
+    let mut bootstrap = step(raw);
+    bootstrap["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+    bootstrap["messages"].as_array_mut().unwrap().push(json!({"mid":"tail","ordinal":1,"message":{"role":"user","content":"live tail"},"raw_message":r#"{"role":"user","content":"live tail"}"#}));
+    bootstrap["newest"] = json!({"mid":"tail","ordinal":1});
+    let first = response(call(&h, "compaction.step", bootstrap.clone()).await);
+    let key = Key::new(&b, "cc", "claude-code").unwrap();
+    let store = h.store.get().unwrap();
+    store
+        .replace_compartments(
+            &key.engine_key(),
+            &[mc_store::StoredCompartment {
+                sequence: 1,
+                start_message: 0,
+                end_message: 0,
+                end_message_id: "m#0".into(),
+                title: "history".into(),
+                content: "idle fold".into(),
+                p1: Some("idle fold".into()),
+                importance: 50,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    let mut status = bootstrap;
+    status["request_id"] = json!("cold");
+    status["prefix_rebuilding"] = json!({"reason":"expired_cache"});
+    if first["answer"] == "compaction_message" {
+        status["last_applied"] = json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
+    }
+    let HandlerOutcome::Response(bytes) = call(&h, "compaction.step", status).await else {
+        panic!("cold rebuild failed")
+    };
+    let answer: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(answer["answer"], "compaction_message");
+    assert_eq!(answer["cache_policy"], ready["cache_policy"]);
+    let row = store
+        .load_provider_view(
+            &key.store_key(),
+            answer["compaction"]["version"].as_u64().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let committed: Value = serde_json::from_str(&row.replacement_json).unwrap();
+    let raw = committed["raw_replacement"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(String::from_utf8(bytes).unwrap().contains(&raw.join(",")));
+    assert_eq!(answer["head_slots"], committed["head_slots"]);
+    assert_eq!(answer["head_slots"].as_array().unwrap().len(), 2);
+    for slot in answer["head_slots"].as_array().unwrap() {
+        let index = slot["index"].as_u64().unwrap() as usize;
+        assert_eq!(slot["bytes_sha256"], sha256_hex(raw[index].as_bytes()));
+        assert_eq!(
+            slot["byte_length"].as_u64().unwrap(),
+            raw[index].len() as u64
+        );
+    }
+}

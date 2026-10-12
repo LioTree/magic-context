@@ -5,6 +5,7 @@ use cortexkit_role_step_transform_provider as hooks;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod cache_policy;
 #[cfg(test)]
 mod claude_code_tests;
 mod codec;

@@ -81,6 +81,8 @@ struct HostSetup {
     invalidated: bool,
     #[serde(default)]
     repair_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_policy: Option<Value>,
 }
 #[derive(Serialize, Deserialize)]
 struct HostView {
@@ -90,6 +92,8 @@ struct HostView {
     coverage: Option<HostCoverage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     raw_replacement: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_slots: Option<Vec<Value>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct HostCoverage {
@@ -629,16 +633,22 @@ fn execute_host(
     let transform::compaction::Answer::Replacement(engine) = output.answer else {
         return Ok(None);
     };
-    let (wire, coverage, raw_replacement) = if let Some(previous) = previous.filter(|p| {
-        status
-            .last_not_applied
-            .is_some_and(|n| !n.structural && n.version == p.engine.version)
-            && p.engine.replacement == engine.replacement
-            && p.engine.range == engine.range
-    }) {
+    let (wire, coverage, raw_replacement, head_slots) = if let Some(previous) =
+        previous.filter(|p| {
+            status
+                .last_not_applied
+                .is_some_and(|n| !n.structural && n.version == p.engine.version)
+                && p.engine.replacement == engine.replacement
+                && p.engine.range == engine.range
+        }) {
         let mut wire = previous.wire;
         wire.version = engine.version;
-        (wire, previous.coverage, previous.raw_replacement)
+        (
+            wire,
+            previous.coverage,
+            previous.raw_replacement,
+            previous.head_slots,
+        )
     } else {
         let (wire, raw_replacement) = if codec == Codec::ClaudeCodeAnthropic {
             let (wire, raw) = super::codec_claude_code::encode_view(
@@ -666,13 +676,17 @@ fn execute_host(
                     ordinal,
                 })
         });
-        (wire, coverage, raw_replacement)
+        let head_slots = raw_replacement
+            .as_ref()
+            .map(|raw| super::cache_policy::head_slots(&engine, raw, setup.setup.state.preset));
+        (wire, coverage, raw_replacement, head_slots)
     };
     Ok(Some(HostView {
         engine,
         wire,
         coverage,
         raw_replacement,
+        head_slots,
     }))
 }
 
@@ -919,6 +933,15 @@ impl McHandler {
                 produced: None,
                 invalidated: false,
                 repair_pending: false,
+                cache_policy: if codec == Codec::ClaudeCodeAnthropic {
+                    Some(super::cache_policy::resolve(
+                        &binding,
+                        &request.model,
+                        chosen,
+                    )?)
+                } else {
+                    None
+                },
             };
             conversation.params_json = serde_json::to_string(&request.params).map_err(transient)?;
             conversation.preset = request.preset.clone();
@@ -926,6 +949,13 @@ impl McHandler {
             fault("SetupRecorded");
             setup
         };
+        if codec == Codec::ClaudeCodeAnthropic && setup.cache_policy.is_none() {
+            setup.cache_policy = Some(super::cache_policy::resolve(
+                &binding,
+                &setup.setup.request.model,
+                chosen,
+            )?);
+        }
         // Setup is an insertion, not an engine opportunity. In particular, it
         // must not seed or mutate frozen full-request state during a switch.
         let high = conversation
@@ -984,6 +1014,7 @@ impl McHandler {
                 wire,
                 coverage: None,
                 raw_replacement: (codec == Codec::ClaudeCodeAnthropic).then(Vec::new),
+                head_slots: (codec == Codec::ClaudeCodeAnthropic).then(Vec::new),
             }
         };
         save_host_view(store, key, &view, "applied")?;
@@ -991,6 +1022,7 @@ impl McHandler {
         setup.applied = Some(ViewSummary::from(&view.engine));
         setup.produced = setup.applied.clone();
         let raw_replacement = view.raw_replacement.clone();
+        let head_slots = view.head_slots.clone();
         let answer = compact::setup::SetupAnswer::Ready {
             request_id: request.request_id,
             initial: view.wire,
@@ -1001,10 +1033,15 @@ impl McHandler {
         save_host_setup(store, key, &mut conversation, &setup)?;
         fault("AnswerRecorded");
         match raw_replacement {
-            Some(raw) => super::codec_claude_code::answer_bytes(
-                &serde_json::to_value(answer).map_err(transient)?,
-                &raw,
-            ),
+            Some(raw) => {
+                let mut answer = serde_json::to_value(answer).map_err(transient)?;
+                answer["cache_policy"] = setup
+                    .cache_policy
+                    .clone()
+                    .ok_or_else(|| invalid_field("cache_policy"))?;
+                answer["head_slots"] = json!(head_slots.unwrap_or_default());
+                super::codec_claude_code::answer_bytes(&answer, &raw)
+            }
             None => bytes(&answer),
         }
     }
@@ -1344,6 +1381,9 @@ impl McHandler {
                     save_host_view(store, &work.key, &view, "produced")?;
                     setup.produced = Some(ViewSummary::from(&view.engine));
                     let mut answer = json!({"answer":"compaction_message","request_id":request.request_id,"compaction":view.wire});
+                    if let Some(slots) = view.head_slots {
+                        answer["head_slots"] = json!(slots);
+                    }
                     if let Some(coverage) = view.coverage {
                         answer["coverage"] = serde_json::to_value(coverage).map_err(transient)?;
                     }
@@ -1353,6 +1393,13 @@ impl McHandler {
                 }
             }
         };
+        let mut answer = answer;
+        if codec == Codec::ClaudeCodeAnthropic {
+            answer["cache_policy"] = setup
+                .cache_policy
+                .clone()
+                .ok_or_else(|| invalid_field("cache_policy"))?;
+        }
         conversation.cursor_frontier = frontier;
         conversation.wait_request = None;
         conversation.last_answer_json = Some(answer_receipt(&answer));
