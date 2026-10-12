@@ -362,6 +362,7 @@ function emitIn(root: string, host: Host, authority: Authority): Emitted {
         encoding: "utf8",
         env: { ...process.env, NODE_ENV: "test" },
         maxBuffer: 256 * 1024 * 1024,
+        windowsHide: true,
     });
     const marker = run.stdout.lastIndexOf("\nEMITTED ");
     if (run.status !== 0 || marker < 0) {

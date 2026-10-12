@@ -843,7 +843,7 @@ function runTree(root: string, work: string, scenario: Scenario, isBase: boolean
                 String(bounds[at]),
                 String(bounds[at + 1]),
             ],
-            { encoding: "utf8", env, maxBuffer: 512 * 1024 * 1024 },
+            { encoding: "utf8", env, maxBuffer: 512 * 1024 * 1024, windowsHide: true },
         );
         const marker = run.stdout.lastIndexOf("\nSEGMENT ");
         if (run.status !== 0 || marker < 0) {

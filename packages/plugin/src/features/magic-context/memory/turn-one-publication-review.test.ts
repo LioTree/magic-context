@@ -175,6 +175,7 @@ console.log("committed " + committed);
                 Bun.spawn([process.execPath, worker, path, harness, String(rounds)], {
                     stdout: "pipe",
                     stderr: "pipe",
+                    windowsHide: true,
                 }),
             );
             const results = await Promise.all(
