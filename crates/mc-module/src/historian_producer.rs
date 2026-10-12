@@ -870,6 +870,9 @@ impl HistorianProducer {
         max_output_tokens: u32,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
+        if self.session_id.as_deref() != Some(session_id) {
+            self.close().await;
+        }
         self.bind_session(session_id.to_string());
         let route = self.ensure_command_route().await?;
         let request = serde_json::to_value(session_send_request(
@@ -928,6 +931,9 @@ impl HistorianProducer {
         let session = submission["session_id"]
             .as_str()
             .ok_or(HistorianProducerError::MissingRunId)?;
+        if self.session_id.as_deref() != Some(session) {
+            self.close().await;
+        }
         self.bind_session(session.to_string());
         loop {
             let route = self.ensure_command_route().await?;
@@ -2234,6 +2240,19 @@ mod tests {
             "decision:revision=1:support:c1:hash=a:profile=p",
             "decision:revision=1:support:c2:hash=a:profile=p",
         ];
+        producer
+            .start_stage_with_generation(
+                "retained-historian",
+                "historian-key",
+                "historian-system",
+                "past-historian-context",
+                "prov/model",
+                None,
+                100,
+                None,
+            )
+            .await
+            .unwrap();
         for key in keys {
             producer
                 .start_check_with_generation(
@@ -2247,14 +2266,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            producer.close().await;
         }
         let log = server.log.lock().await;
         assert_eq!(
             log.route_sessions,
-            keys.map(crate::historian_stage::check_session_id)
+            std::iter::once("retained-historian".to_string())
+                .chain(keys.map(crate::historian_stage::check_session_id))
+                .collect::<Vec<_>>()
         );
-        for (send, key) in log.sends.iter().zip(keys) {
+        for (send, key) in log.sends.iter().skip(1).zip(keys) {
             assert_eq!(send["send_id"], key);
             assert_eq!(send["system"], "check-system");
             assert_eq!(send["prompt"], "only-operands-and-window");
