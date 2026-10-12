@@ -88,14 +88,15 @@ async function archiveExpiredThroughModule(args: {
             const response = await args.moduleRoute.moduleClient.call({
                 sessionId: args.moduleRoute.moduleSessionId,
                 projectRoot: args.moduleRoute.moduleProjectRoot,
-                method: "ctx_memory",
+                // The module's automated expiry, not the agent archive: it rechecks each
+                // row's declared expiry and archives with undo history and no
+                // mutation-log row, as the local path below does.
+                method: "memory.expire",
                 body: {
-                    name: "ctx_memory",
+                    name: "memory.expire",
                     arguments: {
-                        action: "archive",
                         memory_project: args.projectIdentity,
                         ids: moduleBatch,
-                        reason: EXPIRED_ARCHIVE_REASON,
                         command_id: `${args.moduleRoute.moduleCommandId}:expire:${offset / MODULE_ARCHIVE_BATCH_SIZE}`,
                     },
                 },

@@ -4034,14 +4034,8 @@ fn apply_additive_only(
             meta.m1_pending_since_ms = None;
             meta.soft_refresh_pending = false;
             commit_compartment_max_seq = Some(applied_m1_signal.max_compartment_seq);
-            if ctx.memory_enabled {
-                commit_memory_revision = Some(memory_revision_fence(
-                    store,
-                    ctx.project_path,
-                    meta.expiry_cutoff_ms,
-                    &applied_m1_signal,
-                )?);
-            }
+            // No memory fence: this SOFT rendered no memory rows, so a concurrent memory
+            // write cannot make its bytes stale.
         }
         PassPlan::Defer => {
             if m1_signal.revision != applied_m1_revision {
@@ -6679,16 +6673,9 @@ fn apply_once(
             }
             PassPlan::Soft => {
                 meta.memory_disabled = !ctx.memory_enabled;
-                commit_memory_revision = if ctx.memory_enabled {
-                    Some(memory_revision_fence(
-                        store,
-                        ctx.project_path,
-                        meta.expiry_cutoff_ms,
-                        &m1_signal,
-                    )?)
-                } else {
-                    None
-                };
+                // No memory fence: this SOFT renders no memory rows, so a concurrent memory
+                // write cannot make its bytes stale. A pressure refold below sets its own.
+                commit_memory_revision = None;
                 // EXPENSIVE bust-only: compose the m1 delta body from the store against the
                 // watermarks the last HARD froze (incl. the FROZEN expiry cutoff). A
                 // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
@@ -8502,25 +8489,6 @@ fn effective_hard_context_limit_tokens(
         })
 }
 
-fn memory_revision_fence(
-    store: &McStore,
-    project_path: &str,
-    expiry_cutoff_ms: i64,
-    signal: &crate::m1_compose::M1RevisionSignal,
-) -> Result<MemoryRevision, McStoreError> {
-    let project_paths = match store.resolve_workspace_membership(project_path)? {
-        Some(membership) => membership.union_identities,
-        None => vec![project_path.to_string()],
-    };
-    Ok(MemoryRevision {
-        project_paths,
-        reader_project_path: project_path.to_string(),
-        expiry_cutoff_ms,
-        max_memory_id: signal.max_memory_id,
-        mutation_cursor: signal.max_memory_mutation_id,
-    })
-}
-
 fn fold_mural_content_identity(render_config: &str, mural_hash: &str) -> String {
     if mural_hash.is_empty() {
         return render_config.to_string();
@@ -9585,8 +9553,8 @@ fn protected_tail_floor_ordinal(
 }
 
 fn post_end_revision_inputs_moved(before: &M1RevisionSignal, after: &M1RevisionSignal) -> bool {
-    // Sequence is the structural publication watermark. Also compare the revision so memory,
-    // note, or profile changes invalidate the aggregate observation when sequence is unchanged.
+    // Sequence is the structural publication watermark. Also compare the revision so a
+    // profile change invalidates the aggregate observation when sequence is unchanged.
     before.max_compartment_seq != after.max_compartment_seq || before.revision != after.revision
 }
 
@@ -33511,8 +33479,6 @@ pub(crate) mod tests {
             external_revision: 0xbeef,
             history_revision: 0,
             max_compartment_seq: 47,
-            max_memory_id: 9,
-            max_memory_mutation_id: 3,
             note_status_version: 2,
             user_profile_version: 1,
             legacy_note_revision: None,
@@ -34883,6 +34849,170 @@ pub(crate) mod tests {
                 1,
                 "pass {n}: the transform snapshot is the pass's only full decode"
             );
+        }
+    }
+
+    /// The whole-pass read gate for the memory pair: after a warm HARD, a busting SOFT
+    /// (`armed`) or a defer replay still completes with `table` renamed away, so nothing on
+    /// those passes reads memory rows, the mutation log or their `MAX(id)` heads.
+    fn soft_pass_runs_without_table(armed: bool, table: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.seed_memory(1, "git:proj", "ARCHITECTURE", "gate baseline", 50)
+            .unwrap();
+        s.replace_compartments("gate", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let request = req("gate", "cfg0", vec![item("m1msg", 1, "raw")]);
+        let hard = run(&s, &request, &spine());
+        assert_eq!(hard.action, "HARD");
+        if armed {
+            s.arm_soft_refresh("gate").unwrap();
+        }
+        s.with_context_conn_for_test(|tx| {
+            tx.execute_batch(&format!(
+                "ALTER TABLE {table} RENAME TO {table}_gate_hidden;"
+            ))
+        })
+        .unwrap();
+        let gated = transform(&s, &request, &pctx("git:proj", "/nonexistent-docs", 0))
+            .unwrap_or_else(|error| panic!("armed={armed} table={table}: {error:?}"));
+        assert_eq!(gated.action, if armed { "SOFT" } else { "SOFT+" });
+        assert_eq!(m0_bytes(&gated), m0_bytes(&hard));
+        assert_eq!(m1_bytes(&gated), m1_bytes(&hard));
+    }
+
+    #[test]
+    fn soft_reads_no_memory_rows_or_watermark() {
+        soft_pass_runs_without_table(true, "memories");
+    }
+
+    #[test]
+    fn soft_plus_reads_no_memory_rows_or_watermark() {
+        soft_pass_runs_without_table(false, "memories");
+    }
+
+    #[test]
+    fn soft_reads_no_mutation_log_rows_or_watermark() {
+        soft_pass_runs_without_table(true, "memory_mutation_log");
+    }
+
+    #[test]
+    fn soft_plus_reads_no_mutation_log_rows_or_watermark() {
+        soft_pass_runs_without_table(false, "memory_mutation_log");
+    }
+
+    /// A memory-only change is not m1 work: it never opens an execute-band SOFT.
+    #[test]
+    fn memory_only_change_opens_no_execute_band_soft() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let memory_id = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
+            .unwrap();
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        assert_eq!(run(&s, &execute_req, &spine()).action, "HARD");
+        s.update_memory_content("git:proj", memory_id, "changed", None, 1)
+            .unwrap();
+        s.insert_memory(memory_input("git:proj", "ARCHITECTURE", "added", 2))
+            .unwrap();
+        let pass = transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+        assert_eq!(pass.action, "SOFT+");
+        assert!(!pass.committed);
+    }
+
+    /// The automatic hint producer is one of the two named memory readers outside the pair
+    /// (with explicit `ctx_search`): a hint for a new user message searches current memory.
+    /// Its result goes to that message in the tail, never to m0/m1.
+    #[test]
+    fn automatic_hint_producer_is_a_named_memory_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.seed_memory(1, "git:proj", "CONSTRAINTS", "rust ownership beta", 50)
+            .unwrap();
+        let request = active_cc_req(
+            "hint",
+            "cfg0",
+            vec![wire_item("user", "m1", 1, &["rust ownership beta"])],
+        );
+        let projection = project_messages(&request.messages).unwrap();
+        let decide = || {
+            maybe_decide_live_user_hint(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 1),
+                &projection,
+                &[],
+                None,
+                None,
+                None,
+                &[],
+            )
+        };
+        assert!(decide().is_ok());
+        s.with_context_conn_for_test(|tx| {
+            tx.execute_batch("ALTER TABLE memories RENAME TO memories_hint_hidden;")
+        })
+        .unwrap();
+        assert!(
+            decide().is_err(),
+            "the hint producer searches current memory"
+        );
+    }
+
+    /// 150 rounds of foreign inserts, row updates and other sessions' HARD folds leave this
+    /// session's served pair byte-identical on every SOFT and SOFT+ pass.
+    #[test]
+    fn foreign_hards_and_row_churn_preserve_the_served_pair_over_150_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let id = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
+            .unwrap();
+        s.replace_compartments("random", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let request = req("random", "cfg0", vec![item("m1msg", 1, "raw")]);
+        let before = run(&s, &request, &spine());
+        assert_eq!(before.action, "HARD");
+        let mut seed = 0x5a17u32;
+        for i in 0..150 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            if seed % 3 == 0 {
+                s.insert_memory(memory_input(
+                    "git:proj",
+                    "ARCHITECTURE",
+                    &format!("foreign insertion {i}"),
+                    i,
+                ))
+                .unwrap();
+            } else {
+                s.update_memory_content("git:proj", id, &format!("update {i}"), None, i)
+                    .unwrap();
+            }
+            if seed % 4 == 0 {
+                let other = req(
+                    "other",
+                    &format!("cfg-{i}"),
+                    vec![item("other", 1, "foreign append")],
+                );
+                assert_eq!(run(&s, &other, &spine()).action, "HARD");
+            }
+            let mut appended = request.clone();
+            appended
+                .messages
+                .push(item(&format!("tail-{i}"), 2, "ordinary append"));
+            let soft_plus = run(&s, &appended, &spine());
+            assert_eq!(soft_plus.action, "SOFT+");
+            assert_eq!(m0_bytes(&soft_plus), m0_bytes(&before));
+            assert_eq!(m1_bytes(&soft_plus), m1_bytes(&before));
+            s.arm_soft_refresh("random").unwrap();
+            let soft = run(&s, &appended, &spine());
+            assert_eq!(soft.action, "SOFT");
+            assert_eq!(m0_bytes(&soft), m0_bytes(&before));
+            assert_eq!(m1_bytes(&soft), m1_bytes(&before));
         }
     }
 

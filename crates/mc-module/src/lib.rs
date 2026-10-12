@@ -12684,6 +12684,71 @@ impl McHandler {
         )
     }
 
+    /// The dreamer's expiry sweep for a module-owned project: an automated archive that the
+    /// store rechecks against each row's declared expiry and writes with undo history and no
+    /// mutation-log row (see `expire_memories_tx`). It is not the agent `ctx_memory` archive.
+    async fn handle_memory_expire(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request, &["ids"]) else {
+            return invalid_params_error("memory.expire requires arguments");
+        };
+        let Some(memory_project) = non_empty_string_arg(&args, "memory_project") else {
+            return invalid_params_error("memory.expire requires memory_project");
+        };
+        if let Err(outcome) = self.bind_facade_route_for_write(channel, &args, "memories") {
+            return outcome;
+        }
+        let binding = match self.facade_binding(channel) {
+            Ok(binding) => binding,
+            Err(_) => return session_unresolved_error(),
+        };
+        let route_root = binding.project_root.to_string_lossy().to_string();
+        let Some(store) = self.store.get() else {
+            return self.store_refusal();
+        };
+        let command_id = args
+            .get("command_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if let Some(command_id) = command_id {
+            if let Some(replayed) =
+                replayed_memory_apply_command(store, &binding.session, "expire", command_id)
+            {
+                return replayed;
+            }
+        }
+        let Some(ids) = args.get("ids").and_then(Value::as_array) else {
+            return invalid_params_error("memory.expire requires ids");
+        };
+        let Some(ids) = ids.iter().map(Value::as_i64).collect::<Option<Vec<_>>>() else {
+            return invalid_params_error("memory.expire ids must be integers");
+        };
+        let now = now_ms();
+        dream_apply_command_outcome(
+            store.with_facade_command(
+                &route_root,
+                memory_project,
+                "memories",
+                &binding.session,
+                "memory",
+                "expire",
+                command_id,
+                |tx| {
+                    let result = tx.expire_memories(memory_project, &ids, now)?;
+                    serde_json::to_vec(&json!({
+                        "ok": true,
+                        "accepted": result.accepted,
+                        "rejected": result.rejected.iter().map(|row| json!({
+                            "memory_id": row.memory_id,
+                            "reason": row.reason,
+                        })).collect::<Vec<_>>(),
+                    }))
+                    .map_err(|error| error.to_string())
+                },
+            ),
+            "expiry_apply_failed",
+        )
+    }
+
     async fn handle_memory_set_verification(
         &self,
         channel: u16,
@@ -12892,6 +12957,7 @@ impl McHandler {
                     .await
             }
             "memory.set_mural_cue" => self.handle_memory_set_mural_cue(channel, &request).await,
+            "memory.expire" => self.handle_memory_expire(channel, &request).await,
             "memory.set_verification" => {
                 self.handle_memory_set_verification(channel, &request).await
             }
@@ -32334,6 +32400,75 @@ mod tests {
         let after =
             crate::m1_compose::m1_revision_signal(&store, "git:classify", "session").unwrap();
         assert_eq!(before, after, "classification metadata must not change m1");
+    }
+
+    /// The dreamer's expiry sweep for a module-owned project is an automated archive: the
+    /// store rechecks each row's declared expiry, archives it with undo history and writes no
+    /// mutation-log row (the TypeScript local path writes the same records). A row whose
+    /// expiry has not passed is refused and left live.
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_routed_expiry_writes_history_and_no_mutation_log() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_root = project.to_str().unwrap();
+        let identity = "git:r4-expiry";
+        handler.bind_route(7, binding(route_root, "token"));
+        activate_module_authority(&store, "context", identity, route_root, "memories");
+        let expired = insert_memory(&store, identity, "CONSTRAINTS", "expired rule", 1);
+        let live = insert_memory(&store, identity, "CONSTRAINTS", "still valid rule", 1);
+        store
+            .with_context_conn_for_test(|tx| {
+                tx.execute(
+                    "UPDATE memories SET expires_at = 1 WHERE id = ?1",
+                    [expired],
+                )?;
+                tx.execute(
+                    "UPDATE memories SET expires_at = 9999999999999 WHERE id = ?1",
+                    [live],
+                )
+            })
+            .unwrap();
+        let outcome = call_facade(
+            &handler,
+            "memory.expire",
+            json!({
+                "memory_project": identity, "ids": [expired, live],
+                "context_store_uuid": "context", "authority_generation": 1, "command_id": "r4-expire"
+            }),
+        )
+        .await;
+        let body = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("expiry facade failed: {other:?}"),
+        };
+        assert_eq!(body["accepted"], json!([expired]));
+        assert_eq!(body["rejected"][0]["reason"], json!("not_expired"));
+        assert_eq!(
+            store.get_memory_full(expired).unwrap().unwrap().status,
+            "archived"
+        );
+        assert_eq!(
+            store.get_memory_full(live).unwrap().unwrap().status,
+            "active"
+        );
+        let counts: (i64, i64) = store
+            .with_context_conn_for_test(|tx| {
+                tx.query_row(
+                    "SELECT (SELECT COUNT(*) FROM memory_mutation_log WHERE target_memory_id = ?1),
+                            (SELECT COUNT(*) FROM memory_history WHERE memory_id = ?1)",
+                    [expired],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            counts,
+            (0, 1),
+            "expiry needs undo history, not a prompt mutation signal"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

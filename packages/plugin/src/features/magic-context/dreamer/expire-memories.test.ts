@@ -62,14 +62,13 @@ describe("archiveExpiredMemories", () => {
         expect(call).toHaveBeenCalledWith({
             sessionId: project,
             projectRoot: project,
-            method: "ctx_memory",
+            // The automated expiry facade, not the agent ctx_memory archive.
+            method: "memory.expire",
             body: {
-                name: "ctx_memory",
+                name: "memory.expire",
                 arguments: {
-                    action: "archive",
                     memory_project: project,
                     ids: [memory.id],
-                    reason: "expired",
                     command_id: "curate-expiry:expire:0",
                 },
             },

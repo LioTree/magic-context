@@ -158,8 +158,6 @@ pub struct M1RevisionSignal {
     pub history_revision: u64,
     /// Highest compartment sequence read while computing `revision`.
     pub max_compartment_seq: i64,
-    pub max_memory_id: i64,
-    pub max_memory_mutation_id: i64,
     /// Read for [`Self::legacy_note_revision`] only; it does not feed `revision`.
     pub note_status_version: i64,
     pub user_profile_version: u64,
@@ -260,8 +258,11 @@ pub fn m1_revision_signal_parts_for_pass_timed(
         timings.memories_ms += snapshot_ms;
     }
 
-    let max_memory_id = snapshot.max_memory_id;
-    let max_memory_mutation_id = snapshot.max_memory_mutation_id;
+    // The digest keeps its two memory slots as constant zeros: a busting SOFT renders no
+    // memory rows, so a memory or mutation-log change is not m1 work and must not open an
+    // execute-band SOFT. Sessions whose stored digest was taken with zero memory heads keep
+    // the same value.
+    let (max_memory_id, max_memory_mutation_id) = (0, 0);
     let max_compartment_seq = snapshot.max_compartment_seq;
     let note_status_version = snapshot.note_status_version;
     let revision = in_session_revision(
@@ -312,8 +313,6 @@ pub fn m1_revision_signal_parts_for_pass_timed(
             history.finish() | 1
         },
         max_compartment_seq,
-        max_memory_id,
-        max_memory_mutation_id,
         note_status_version,
         user_profile_version,
         legacy_note_revision,
@@ -940,11 +939,11 @@ mod tests {
         let after_memory =
             m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, false, 0).unwrap();
         assert_eq!(after_memory.revision, before.revision);
-        assert_eq!(after_memory.max_memory_id, 0);
-        assert_eq!(after_memory.max_memory_mutation_id, 0);
+        // With memory enabled the revision does not move either: a busting SOFT renders no
+        // memory rows, so memory and mutation-log changes are never pending m1 work.
         let enabled_after_memory =
             m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, true, 0).unwrap();
-        assert_ne!(enabled_after_memory.revision, before.revision);
+        assert_eq!(enabled_after_memory.revision, before.revision);
 
         store
             .replace_compartments("ses", &[comp(1, 1, 9, "m9")])
