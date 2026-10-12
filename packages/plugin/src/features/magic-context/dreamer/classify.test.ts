@@ -233,6 +233,60 @@ describe("runClassify disposition", () => {
         }
     });
 
+    test("skips every row that has a historian classification item, open or scored", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-historian-items";
+            addMemoriesForDisposition(db, projectIdentity, 8);
+            const pending = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Agent save awaiting its historian score.",
+                sourceSessionId: "ses",
+            });
+            const scored = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Agent save the historian scored.",
+                sourceSessionId: "ses",
+            });
+            db.prepare("UPDATE memories SET importance=30 WHERE id=?").run(scored.id);
+            const enqueue = db.prepare(
+                "INSERT INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal,state,importance) VALUES(?,?,1,'ses',?,1,?,?)",
+            );
+            enqueue.run(projectIdentity, pending.id, "part-pending", "pending", null);
+            enqueue.run(projectIdentity, scored.id, "part-scored", "scored", 30);
+            const args = classifyArgs(db, projectIdentity);
+            const prompted: number[] = [];
+            let manifest = "";
+            args.client = undefined;
+            args.hiddenCompletionExecutor = {
+                capabilities: { tools: false, harness: "opencode2" },
+                open: async () => ({ id: "v2-classify" }),
+                attempt: async (_handle, request) => {
+                    const prompt = request.body?.parts?.[0]?.text ?? "";
+                    const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) =>
+                        Number(match[1]),
+                    );
+                    prompted.push(...ids);
+                    manifest = `<classify>${ids.map((id) => `<memory id="${id}" importance="80" scope="project" shareable="true"/>`).join("")}</classify>`;
+                },
+                collect: async () => ({ text: manifest, reasoning: null, lengthCapped: false }),
+                close: async () => {},
+            } satisfies HiddenCompletionExecutor;
+
+            const result = await runClassify(args);
+
+            expect(result.classified).toBe(8);
+            expect(prompted).not.toContain(pending.id);
+            expect(prompted).not.toContain(scored.id);
+            expect(getMemoryById(db, pending.id)?.importance).toBe(50);
+            expect(getMemoryById(db, scored.id)?.importance).toBe(30);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("reports a swallowed chunk failure as incomplete", async () => {
         const db = freshDb();
         try {

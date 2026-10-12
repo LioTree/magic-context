@@ -215,7 +215,7 @@ function publications(db: Database) {
 function turnOneSends(db: Database) {
     return db
         .prepare(
-            "SELECT publication_id, run_attempt, stage, session_id, state FROM memory_stage_attempts ORDER BY run_attempt",
+            "SELECT publication_id, run_attempt, stage, session_id, state FROM memory_stage_attempts WHERE stage='turn_one' ORDER BY run_attempt",
         )
         .all() as Array<{
         publication_id: string;
@@ -371,6 +371,9 @@ describe("historian turn one on an enabled lane", () => {
 
         const newRow = getCompartments(db, sessionId)[1]!;
         expect(newRow.id).not.toBe(olderRowId);
+        // Turn two follows on the same child. This stub host answers only turn one,
+        // so turn two's outcome is unknown and both candidates stay reserved
+        // (`in_flight`) for recovery, with no attempt consumed.
         expect(pendingFacts(db)).toEqual([
             {
                 project_path: projectPath,
@@ -379,7 +382,7 @@ describe("historian turn one on an enabled lane", () => {
                 category: "CONSTRAINTS",
                 content: "Uploads are capped at 64 KiB.",
                 anchor_known: 1,
-                state: "retryable",
+                state: "in_flight",
                 fact_attempts: 0,
                 reason: null,
             },
@@ -390,7 +393,7 @@ describe("historian turn one on an enabled lane", () => {
                 category: "CONSTRAINTS",
                 content: "Uploads go through the gateway.",
                 anchor_known: 0,
-                state: "retryable",
+                state: "in_flight",
                 fact_attempts: 0,
                 reason: null,
             },
@@ -560,5 +563,148 @@ describe("historian turn one when the store is busy before dispatch", () => {
         expect(sentPrompts(prompt)).toHaveLength(1);
         expect(getCompartments(db, sessionId)).toHaveLength(2);
         expect(publications(db).map((row) => row.commit_order)).toEqual([1]);
+    });
+});
+
+describe("historian turn two on an enabled lane", () => {
+    /**
+     * A host whose hidden children answer turn one with `REPLY_WITH_FACTS` and a
+     * later prompt in the same child with `turnTwo(prompt)`. `events` records every
+     * prompt and delete in order, by child session id.
+     */
+    function twoTurnClient(directory: string, turnTwo: ((prompt: string) => string) | null) {
+        const events: string[] = [];
+        const replies = new Map<string, string>();
+        const prompts = new Map<string, number>();
+        let created = 0;
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory } })),
+                create: mock(async () => ({ data: { id: `ses-child-${++created}` } })),
+                prompt: mock(
+                    async (input: {
+                        path: { id: string };
+                        body: { parts: Array<{ text: string }> };
+                    }) => {
+                        const id = input.path.id;
+                        const turn = (prompts.get(id) ?? 0) + 1;
+                        prompts.set(id, turn);
+                        events.push(`prompt:${id}:${turn}`);
+                        const text = input.body.parts[0]?.text ?? "";
+                        if (turn === 1) replies.set(id, REPLY_WITH_FACTS);
+                        else if (turnTwo) replies.set(id, turnTwo(text));
+                        return {};
+                    },
+                ),
+                messages: mock(async (input: { path: { id: string } }) => ({
+                    data: [
+                        {
+                            info: {
+                                role: "assistant",
+                                time: { created: prompts.get(input.path.id) ?? 0 },
+                                providerID: "test",
+                                modelID: "fixture-historian",
+                            },
+                            parts: [{ type: "text", text: replies.get(input.path.id) ?? "" }],
+                        },
+                    ],
+                })),
+                delete: mock(async (input: { path: { id: string } }) => {
+                    events.push(`delete:${input.path.id}`);
+                    return {};
+                }),
+            },
+        } as unknown as PluginContext["client"];
+        return { client, events };
+    }
+
+    it("sends turn two on turn one's child and closes the child only after turn two resolved", async () => {
+        useTempDataHome("turn-two-same-child-");
+        const sessionId = "ses-turn-two";
+        const directory = "/tmp/turn-two-same-child";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        const projectPath = resolveProjectIdentity(directory);
+        seedPriorCompartment(db, sessionId);
+        let turnTwoPrompt = "";
+        const { client, events } = twoTurnClient(directory, (prompt) => {
+            turnTwoPrompt = prompt;
+            const ids = [...prompt.matchAll(/^## Fact (\d+)/gm)].map((match) => Number(match[1]));
+            return JSON.stringify({
+                decisions: ids.map((id) => ({ fact_id: id, action: "new" })),
+            });
+        });
+
+        await runHistorian(db, sessionId, client, directory, { memoryLifecycleLane: "enabled" });
+
+        // Turn one and turn two go to the same child, and it is deleted only after
+        // turn two; closing it in turn one's `finally` would put the delete first.
+        expect(events).toEqual([
+            "prompt:ses-child-1:1",
+            "prompt:ses-child-1:2",
+            "delete:ses-child-1",
+        ]);
+        expect(turnTwoPrompt).toContain("[3] U: Cap the upload at 64 KiB.");
+        expect(
+            db
+                .prepare(
+                    "SELECT stage, child_session_id, state FROM memory_stage_attempts WHERE stage='turn_two'",
+                )
+                .all(),
+        ).toEqual([{ stage: "turn_two", child_session_id: "ses-child-1", state: "resolved" }]);
+        expect((pendingFacts(db) as Array<{ state: string }>).map((row) => row.state)).toEqual([
+            "applied",
+            "applied",
+        ]);
+        expect(
+            getMemoriesByProject(db, projectPath)
+                .map((memory) => memory.content)
+                .sort(),
+        ).toEqual(["Uploads are capped at 64 KiB.", "Uploads go through the gateway."]);
+    });
+
+    it("keeps the child open while turn two is in flight", async () => {
+        useTempDataHome("turn-two-in-flight-");
+        const sessionId = "ses-turn-two-open";
+        const directory = "/tmp/turn-two-in-flight";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        // The host accepts turn two but has not answered it yet.
+        const { client, events } = twoTurnClient(directory, null);
+
+        await runHistorian(db, sessionId, client, directory, { memoryLifecycleLane: "enabled" });
+
+        expect(events).toEqual(["prompt:ses-child-1:1", "prompt:ses-child-1:2"]);
+        expect(
+            (pendingFacts(db) as Array<{ state: string; fact_attempts: number }>).map((row) => [
+                row.state,
+                row.fact_attempts,
+            ]),
+        ).toEqual([
+            ["in_flight", 0],
+            ["in_flight", 0],
+        ]);
+    });
+
+    it("sends no turn two on a dormant lane", async () => {
+        useTempDataHome("turn-two-dormant-");
+        const sessionId = "ses-turn-two-dormant";
+        const directory = "/tmp/turn-two-dormant";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        const { client, events } = twoTurnClient(directory, () => {
+            throw new Error("a dormant lane must not send turn two");
+        });
+
+        await runHistorian(db, sessionId, client, directory);
+
+        expect(events).toEqual(["prompt:ses-child-1:1", "delete:ses-child-1"]);
+        expect(
+            db
+                .prepare("SELECT COUNT(*) AS n FROM memory_stage_attempts WHERE stage='turn_two'")
+                .get(),
+        ).toEqual({ n: 0 });
     });
 });
