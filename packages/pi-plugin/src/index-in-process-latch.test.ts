@@ -9,12 +9,21 @@ import {
 } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	acquireCompartmentLease,
 	releaseCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
+import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import {
+	allocateTurnOneSend,
+	commitTurnOnePublication,
+} from "@magic-context/core/features/magic-context/memory/turn-one-publication";
+import {
+	runTurnTwo,
+	TurnTwoOutcomeUnknownError,
+} from "@magic-context/core/features/magic-context/memory/turn-two";
 import {
 	clearSession,
 	getOrCreateSessionMeta,
@@ -39,6 +48,7 @@ import {
 } from "./context-handler";
 import { __test as dreamerTest } from "./dreamer";
 import magicContextPiExtension, { __test } from "./index";
+import { PI_RPC_CARRIER } from "./pi-historian-turn-two";
 import { awaitInFlightRecomps, spawnPiRecompRun } from "./pi-recomp-runner";
 import {
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
@@ -208,6 +218,100 @@ describe("Pi in-process child guard (#247)", () => {
 			"ctx-status",
 		]);
 	}, 15_000);
+
+	it("session_start releases a lost RPC stage once without spawning a headless historian", async () => {
+		const configHome = isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const cwd = dirname(configHome);
+		const projectPath = resolveProjectIdentity(cwd);
+		if (!projectPath)
+			throw new Error("Recovery fixture requires a project identity");
+		const sessionId = "ses-start-rpc-recovery";
+		const db = openDatabase();
+		const send = allocateTurnOneSend(db, {
+			projectPath,
+			sessionId,
+			harness: "pi",
+			carrier: PI_RPC_CARRIER,
+			lane: "enabled",
+			chunkStart: 1,
+			chunkEnd: 2,
+		});
+		db.transaction(() =>
+			commitTurnOnePublication(db, {
+				send,
+				projectPath,
+				sessionId,
+				compartments: [],
+				blocks: [],
+				candidateFacts: [
+					{
+						category: "CONSTRAINTS",
+						content: "Recover the interrupted stage.",
+					},
+				],
+				honourAnchors: true,
+			}),
+		)();
+		await runTurnTwo(db, {
+			projectPath,
+			publicationId: send.publicationId,
+			sessionId,
+			lane: "enabled",
+			memoryEnabled: true,
+			autoPromote: true,
+			validatedProfiles: [],
+			carrier: {
+				carrier: PI_RPC_CARRIER,
+				harness: "pi",
+				enforcedJson: true,
+				childSessionId: `pi-rpc:${process.pid}:0:lost`,
+				send: async () => {
+					throw new TurnTwoOutcomeUnknownError();
+				},
+				check: async () => {
+					throw new Error("no check");
+				},
+			},
+		});
+		expect(
+			db
+				.prepare(
+					"SELECT state,fact_attempts FROM memory_pending_facts WHERE project_path=?",
+				)
+				.get(projectPath),
+		).toEqual({ state: "in_flight", fact_attempts: 0 });
+		const runtime = createCountingPi();
+		await magicContextPiExtension(runtime.pi);
+		const ctx = {
+			cwd,
+			hasUI: false,
+			sessionManager: { getSessionId: () => sessionId },
+			ui: { setStatus() {} },
+		};
+		await runtime.emitPiEvent("session_start", {}, ctx);
+		expect(
+			db
+				.prepare(
+					"SELECT state,fact_attempts,reason FROM memory_pending_facts WHERE project_path=?",
+				)
+				.get(projectPath),
+		).toEqual({ state: "retryable", fact_attempts: 1, reason: "carrier_lost" });
+		await runtime.emitPiEvent("session_start", {}, ctx);
+		expect(
+			db
+				.prepare(
+					"SELECT fact_attempts FROM memory_pending_facts WHERE project_path=?",
+				)
+				.get(projectPath),
+		).toEqual({ fact_attempts: 1 });
+		expect(
+			db
+				.prepare("SELECT COUNT(*) AS n FROM memories WHERE project_path=?")
+				.get(projectPath),
+		).toEqual({ n: 0 });
+		await runtime.emitPiEvent("session_shutdown", {}, ctx);
+	}, 20_000);
 
 	it("headless Pi does not register scheduled dreamer children", async () => {
 		const configHome = isolateXdgEnv();

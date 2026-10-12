@@ -204,6 +204,7 @@ import {
 	type PiHarnessKind,
 	resolvePiHarnessDetection,
 } from "./pi-harness-kind";
+import { recoverLostPiRpcStages } from "./pi-historian-turn-two";
 import { notePiLkgProviderUsage } from "./pi-lkg";
 import {
 	computePiPressure,
@@ -1875,6 +1876,7 @@ async function startPiMagicContextRuntime(
 			}
 		}
 		const model = ctx.model;
+		recoverLostPiRpcStages(db);
 		if (sessionId && model?.provider && model.id) {
 			seedSessionCacheTtlIfUnsynced({
 				db,

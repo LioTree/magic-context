@@ -4979,6 +4979,7 @@ function spawnPiHistorianRun(args: {
 				if (!runBoundary) return;
 				await runPiHistorian({
 					db,
+					hasUI: ctx.hasUI,
 					sessionId,
 					directory: ctx.cwd,
 					provider,
