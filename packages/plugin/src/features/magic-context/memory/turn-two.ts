@@ -29,6 +29,7 @@ import {
     type ApplierReceipt,
     applyHistorianRevision,
     applyMemoryAdmission,
+    assertMemoryFactReservation,
     MEMORY_PENDING_PROPOSAL,
     resolveFactDecision,
     tsOwnsMemory,
@@ -252,6 +253,7 @@ interface FactRow {
     content: string;
     anchor_known: number;
     fact_attempts: number;
+    stageKey?: string;
 }
 
 const PLACEHOLDER_PROFILE: ReportedProfile = {
@@ -370,10 +372,9 @@ function consumeStageAttempts(db: Database, stageKey: string, reason: string, st
                 state: "retryable",
                 reason,
             });
-        db.prepare("UPDATE memory_stage_attempts SET state=? WHERE stage_key=?").run(
-            state,
-            stageKey,
-        );
+        db.prepare(
+            "UPDATE memory_stage_attempts SET state=? WHERE stage_key=? AND state IN ('reserved','sending','replied')",
+        ).run(state, stageKey);
     }).immediate();
 }
 
@@ -525,7 +526,7 @@ function reserveTurnTwo(
 
 function recordStageReply(db: Database, stageKey: string, reply: TurnTwoStageReply): void {
     db.prepare(
-        "UPDATE memory_stage_attempts SET reply_json=?,reported_profile_json=?,usage_json=?,state='replied' WHERE stage_key=?",
+        "UPDATE memory_stage_attempts SET reply_json=?,reported_profile_json=?,usage_json=?,state='replied' WHERE stage_key=? AND state IN ('reserved','sending')",
     ).run(
         JSON.stringify({ text: reply.text, lengthCapped: reply.lengthCapped }),
         JSON.stringify(reply.profile),
@@ -565,7 +566,7 @@ async function resolveStage(
 ): Promise<boolean> {
     const row = db
         .prepare(
-            "SELECT reply_json,reported_profile_json FROM memory_stage_attempts WHERE stage_key=?",
+            "SELECT reply_json,reported_profile_json FROM memory_stage_attempts WHERE stage_key=? AND state='replied'",
         )
         .get(stageKey) as {
         reply_json: string | null;
@@ -585,25 +586,52 @@ async function resolveStage(
     }
     const facts = db
         .prepare(
-            "SELECT id,project_path,publication_id,category,content,anchor_known,fact_attempts FROM memory_pending_facts WHERE state='in_flight' AND reserved_stage_key=? ORDER BY id",
+            "SELECT id,project_path,publication_id,category,content,anchor_known,fact_attempts,reserved_stage_key AS stageKey FROM memory_pending_facts WHERE state='in_flight' AND reserved_stage_key=? ORDER BY id",
         )
         .all(stageKey) as FactRow[];
     for (const fact of facts) {
         const attempts = request.factAttempts[String(fact.id)] ?? fact.fact_attempts;
         const decision = envelope.decisions.get(fact.id);
         try {
+            assertMemoryFactReservation(db, {
+                stageKey,
+                factId: fact.id,
+                projectPath: fact.project_path,
+                factAttempts: attempts,
+            });
             await resolveFact(db, fact, attempts, decision, profile, context, stageKey);
         } catch (error) {
             if (error instanceof CheckOutcomeUnknownError) return false;
             throw error;
         }
     }
-    recordItemScores(db, request.items, envelope.scores);
-    if (stillReserved(db, stageKey) === 0)
-        db.prepare("UPDATE memory_stage_attempts SET state='resolved' WHERE stage_key=?").run(
-            stageKey,
-        );
+    db.transaction(() => {
+        if (
+            !db
+                .prepare(
+                    "SELECT 1 FROM memory_stage_attempts WHERE stage_key=? AND state='replied'",
+                )
+                .get(stageKey)
+        )
+            return;
+        recordItemScores(db, request.items, envelope.scores);
+        if (stillReserved(db, stageKey) === 0)
+            db.prepare(
+                "UPDATE memory_stage_attempts SET state='resolved' WHERE stage_key=? AND state='replied'",
+            ).run(stageKey);
+    }).immediate();
     return true;
+}
+
+function factReservation(fact: FactRow) {
+    return fact.stageKey
+        ? {
+              stageKey: fact.stageKey,
+              factId: fact.id,
+              projectPath: fact.project_path,
+              factAttempts: fact.fact_attempts,
+          }
+        : undefined;
 }
 
 function pending(
@@ -620,6 +648,7 @@ function pending(
         factId: fact.id,
         operation: "turn_two",
         state: "decided_pending",
+        reservation: factReservation(fact),
         reason,
         memoryId,
         mapping,
@@ -693,6 +722,7 @@ async function resolveFact(
                 memoryEnabled: context.memoryEnabled,
                 autoPromote: context.autoPromote,
                 factId: fact.id,
+                reservation: factReservation(fact),
             });
         case "conflict": {
             if (!context.autoPromote) {
@@ -712,6 +742,7 @@ async function resolveFact(
                 autoPromote: context.autoPromote,
                 conflictTargetId: decision.targetId,
                 factId: fact.id,
+                reservation: factReservation(fact),
             });
         }
         case "covered":
@@ -719,7 +750,7 @@ async function resolveFact(
         case "edit":
         case "replaces":
         case "merge":
-            return resolveRevision(db, fact, key, decision, profile, context);
+            return resolveRevision(db, fact, key, decision, profile, context, stageKey);
     }
 }
 
@@ -746,6 +777,7 @@ function resolveCovered(
             operation: "turn_two",
             state: "retryable",
             reason: "cas_loss",
+            reservation: factReservation(fact),
         });
     const clauses = splitMemoryClauses(target.memory.content);
     const ordinals = decision.clauses ?? [];
@@ -769,6 +801,7 @@ function resolveCovered(
         factId: fact.id,
         operation: "covered",
         state: "covered",
+        reservation: factReservation(fact),
         reason: "covered",
         memoryId: target.memory.id,
         mapping: { memoryId: target.memory.id, revision: target.revision, clauses: ordinals },
@@ -782,6 +815,7 @@ async function resolveRevision(
     decision: TurnTwoDecision,
     profile: ReportedProfile,
     context: ResolveContext,
+    stageKey: string,
 ): Promise<ApplierReceipt> {
     const expectedSources =
         decision.action === "merge"
@@ -864,6 +898,12 @@ async function resolveRevision(
             return context.checks.reattachCheck(request);
         },
         fact.id,
+        {
+            stageKey,
+            factId: fact.id,
+            projectPath: fact.project_path,
+            factAttempts: fact.fact_attempts,
+        },
     );
 }
 

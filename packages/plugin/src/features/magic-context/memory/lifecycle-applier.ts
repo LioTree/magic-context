@@ -60,6 +60,40 @@ export interface ApplierReceipt {
      */
     reportedProfile?: ReportedProfile;
 }
+
+export interface MemoryFactReservation {
+    stageKey: string;
+    factId: number;
+    projectPath: string;
+    factAttempts: number;
+}
+
+export class MemoryStageOwnershipLostError extends Error {
+    constructor() {
+        super("memory stage no longer owns the fact reservation");
+        this.name = "MemoryStageOwnershipLostError";
+    }
+}
+
+/** Recheck the send's reservation under the resolving write lock; memory revision CAS does not revoke a released send. */
+export function assertMemoryFactReservation(
+    db: Database,
+    reservation: MemoryFactReservation,
+): void {
+    const owned = db
+        .prepare(
+            `SELECT 1 FROM memory_pending_facts f JOIN memory_stage_attempts s ON s.stage_key=f.reserved_stage_key
+         WHERE f.id=? AND f.project_path=? AND f.state='in_flight' AND f.fact_attempts=?
+           AND s.stage_key=? AND s.project_path=f.project_path AND s.stage='turn_two' AND s.state='replied'`,
+        )
+        .get(
+            reservation.factId,
+            reservation.projectPath,
+            reservation.factAttempts,
+            reservation.stageKey,
+        );
+    if (!owned) throw new MemoryStageOwnershipLostError();
+}
 export interface AdmissionRequest {
     key: string;
     operation: "new" | "conflict" | "agent_save";
@@ -68,6 +102,7 @@ export interface AdmissionRequest {
     autoPromote?: boolean;
     conflictTargetId?: number;
     factId?: number;
+    reservation?: MemoryFactReservation;
     classificationAnchor?: { toolCallPartId: string; saveOrdinal: number };
     /** Harness of `input.sourceSessionId`, for an agent save's m[1] fragment. */
     sourceHarness?: string;
@@ -129,6 +164,7 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
         .transaction(() => {
             const existingReceipt = readReceipt(db, request.key);
             if (existingReceipt) return existingReceipt;
+            if (request.reservation) assertMemoryFactReservation(db, request.reservation);
             const record = (receipt: ApplierReceipt) =>
                 recordReceipt(
                     db,
@@ -286,6 +322,7 @@ export function resolveFactDecision(
         key: string;
         projectPath: string;
         factId: number;
+        reservation?: MemoryFactReservation;
         operation: string;
         /**
          * `retryable` consumes one of the fact's attempts: the fact becomes
@@ -307,6 +344,7 @@ export function resolveFactDecision(
         .transaction(() => {
             const existing = readReceipt(db, request.key);
             if (existing) return existing;
+            if (request.reservation) assertMemoryFactReservation(db, request.reservation);
             if (request.state === "retryable")
                 return resolveRevisionFailure(db, request, request.reason, true);
             const receipt = recordReceipt(db, request, {
@@ -745,6 +783,7 @@ export async function applyHistorianRevision(
     owner: { sessionId: string; harness: string },
     reattachOrSend: (request: CheckRequest, options: { reattach: boolean }) => Promise<CheckReply>,
     factId?: number,
+    reservation?: MemoryFactReservation,
 ): Promise<ApplierReceipt> {
     const existing = readReceipt(db, decision.key);
     if (existing) return existing;
@@ -767,15 +806,16 @@ export async function applyHistorianRevision(
     };
     if (!tsOwnsMemory(db, decision.projectPath))
         return db
-            .transaction(
-                () =>
-                    readReceipt(db, decision.key) ??
-                    recordReceipt(db, request, {
-                        state: "retryable",
-                        reason: "authority_elsewhere",
-                        adoptionClass: memoryAdoptionClass(decision.action),
-                    }),
-            )
+            .transaction(() => {
+                const recovered = readReceipt(db, decision.key);
+                if (recovered) return recovered;
+                if (reservation) assertMemoryFactReservation(db, reservation);
+                return recordReceipt(db, request, {
+                    state: "retryable",
+                    reason: "authority_elsewhere",
+                    adoptionClass: memoryAdoptionClass(decision.action),
+                });
+            })
             .immediate();
     // A target or source of this project that was archived or revised after the
     // decision read it: the decision is stale, not wrong, so it is retried.
@@ -791,30 +831,33 @@ export async function applyHistorianRevision(
         })
     )
         return db
-            .transaction(
-                () =>
-                    readReceipt(db, decision.key) ??
-                    resolveRevisionFailure(db, request, "cas_loss", true),
-            )
+            .transaction(() => {
+                const recovered = readReceipt(db, decision.key);
+                if (recovered) return recovered;
+                if (reservation) assertMemoryFactReservation(db, reservation);
+                return resolveRevisionFailure(db, request, "cas_loss", true);
+            })
             .immediate();
     const plan = planMemoryRevision(decision, context);
     if (!plan.ok)
         return db
-            .transaction(
-                () =>
-                    readReceipt(db, decision.key) ??
-                    recordReceipt(db, request, {
-                        state: "decided_pending",
-                        reason: plan.reason,
-                        adoptionClass: memoryAdoptionClass(decision.action),
-                    }),
-            )
+            .transaction(() => {
+                const recovered = readReceipt(db, decision.key);
+                if (recovered) return recovered;
+                if (reservation) assertMemoryFactReservation(db, reservation);
+                return recordReceipt(db, request, {
+                    state: "decided_pending",
+                    reason: plan.reason,
+                    adoptionClass: memoryAdoptionClass(decision.action),
+                });
+            })
             .immediate();
     const outcome = await checkMemoryRevision(db, owner, decision, context, reattachOrSend);
     const receipt = db
         .transaction(() => {
             const recovered = readReceipt(db, decision.key);
             if (recovered) return recovered;
+            if (reservation) assertMemoryFactReservation(db, reservation);
             if (!outcome.ok)
                 return resolveRevisionFailure(
                     db,
