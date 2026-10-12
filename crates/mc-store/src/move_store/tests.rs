@@ -1147,3 +1147,45 @@ fn transaction_probe_rejects_two_cursor_advances_in_one_transaction() {
         "transaction audit accepted two batch advances"
     );
 }
+
+#[test]
+fn review_module_move_preserves_populated_projection_and_fragment_references() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let src = seeded(source.path(), 2, 32);
+    let mut loaded = src.load("ses_move").unwrap();
+    loaded.meta.memory_projection = Some(crate::memory_projection::AppliedProjection {
+        generation: 7,
+        m0_sha256: "opaque-baseline-binding".into(),
+        fragment_watermark: 40,
+        committed: vec![crate::memory_projection::CommittedFragment {
+            id: 42,
+            form: "marker".into(),
+            overflow_ids: Vec::new(),
+            overflow_count: None,
+            lines: vec![
+                "  <stale-memory ids=\"9\" current=\"9\" read-with=\"ctx_search\"/>".into(),
+            ],
+            visible_texts: Vec::new(),
+        }],
+        ..Default::default()
+    });
+    src.commit("ses_move", loaded.row_version, &loaded.core, &loaded.meta)
+        .unwrap();
+    let staging = destination.path().join("staging");
+    let _export = capture(&src, "cut", &staging);
+    let dst = open(destination.path());
+    let mut mover = dst.move_store().unwrap();
+    mover
+        .reserve_install(&binding("cut"), "digest", &staging)
+        .unwrap();
+    install(&mut mover, "cut");
+    assert_eq!(
+        dump(&src, "mc_cache_state", "session_id,meta"),
+        dump(&dst, "mc_cache_state", "session_id,meta")
+    );
+    assert_eq!(
+        dst.load("ses_move").unwrap().meta.memory_projection,
+        loaded.meta.memory_projection
+    );
+}

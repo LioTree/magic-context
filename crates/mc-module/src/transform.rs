@@ -18583,6 +18583,10 @@ fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod memory_cache_review {
+        use super::*;
+        include!("transform_memory_cache_review_tests.rs");
+    }
     mod memory_projection {
         use super::*;
         include!("transform_memory_projection_tests.rs");

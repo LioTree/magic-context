@@ -7,14 +7,18 @@ import { renderAddedFragmentLine, renderUpdatedFragmentLine, renderRemovedFragme
 
 const db = new Database(":memory:");
 db.exec(`CREATE TABLE memory_agent_fragments(id INTEGER PRIMARY KEY,session_id TEXT,harness TEXT,project_path TEXT,operation_key TEXT,memory_ids_json TEXT,current_id INTEGER,lines TEXT,visible_texts_json TEXT)`);
-const file = new URL("./agent-fragments-golden.json",import.meta.url);
+const option = (name: string) => {
+    const index=process.argv.indexOf(name);
+    return index<0 ? undefined : process.argv[index+1];
+};
+const file = option("--output") ?? new URL("./agent-fragments-golden.json",import.meta.url);
 const cases: unknown[] = [];
-let seed = 0x54c0ffee;
+let seed = Number(option("--seed") ?? 0x54c0ffee)>>>0;
 const random = () => { seed = (Math.imul(seed,1664525)+1013904223)>>>0; return seed; };
 const fresh = (): AppliedProjection => ({generation:1,hardMemoryBlock:JSON.stringify({updateLines:[],newMemories:""}),fragmentWatermark:0,committed:[],legacy:false});
 let projection = fresh();
 let nextId = 0;
-for (let step=0;step<160;step++) {
+for (let step=0;step<Number(option("--steps") ?? 160);step++) {
     const pass = step<4 ? "soft" : ["soft","defer","hard"][random()%3];
     const pending = [];
     if (pass === "hard") { db.exec("DELETE FROM memory_agent_fragments"); projection=fresh(); }
@@ -58,6 +62,20 @@ for (const facadeAction of ["update", "merge", "archive", "write"] as const) {
     cases.push({pass:"soft",facadeAction,content,before,pending:[fragment],memoryBudgetTokens,historyBudgetTokens,independentTokens,m0Tokens,block:result.block,m1:`<session-history-since>\n${result.block}\n</session-history-since>`,committed:result.projection.committed});
 }
 const rendered="[\n"+cases.map(item=>JSON.stringify(item)).join(",\n")+"\n]\n";
+if (option("--input")) {
+    const input=await Bun.file(option("--input")!).json();
+    const output=[];
+    for (const entry of input) {
+        db.exec("DELETE FROM memory_agent_fragments");
+        for (const fragment of entry.pending) {
+            db.prepare("INSERT INTO memory_agent_fragments VALUES(?, 'ses','opencode','/repo',?,?,?,?,?)").run(fragment.id,fragment.operationKey,JSON.stringify(fragment.memoryIds),fragment.currentId,fragment.lines.join("\n"),JSON.stringify(fragment.visibleTexts));
+        }
+        const result=composeSoftMemoryUpdates({db:db as never,sessionId:"ses",projection:entry.before,memoryBudgetTokens:entry.memoryBudgetTokens,historyBudgetTokens:entry.historyBudgetTokens,independentTokens:entry.independentTokens,m0Tokens:()=>entry.m0Tokens});
+        output.push({block:result.block,committed:result.projection.committed});
+    }
+    await Bun.write(file,JSON.stringify(output));
+    console.log(`TS/Pi fragment parity: ${output.length} supplied pass cases generated`);
+} else
 if (process.argv.includes("--check")) {
     if (await Bun.file(file).text()!==rendered) throw new Error("Rust fragment golden differs from TS/Pi production output");
     console.log(`TS/Pi fragment parity: ${cases.length} fixed-seed pass cases checked`);
