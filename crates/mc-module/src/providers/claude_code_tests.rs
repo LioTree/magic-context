@@ -2,7 +2,7 @@
 //! IDs cannot later name different bytes. These tests do not use an LLM runner.
 use super::*;
 
-fn binding(root: &Path, principal: Option<subc_protocol::Principal>) -> SessionBinding {
+pub(super) fn binding(root: &Path, principal: Option<subc_protocol::Principal>) -> SessionBinding {
     SessionBinding {
         principal,
         project_root: root.into(),
@@ -17,12 +17,12 @@ fn binding(root: &Path, principal: Option<subc_protocol::Principal>) -> SessionB
         },
     }
 }
-fn thalamus() -> Option<subc_protocol::Principal> {
+pub(super) fn thalamus() -> Option<subc_protocol::Principal> {
     Some(subc_protocol::Principal::Reserved {
         module_id: "thalamus".into(),
     })
 }
-fn handler(root: &Path, principal: Option<subc_protocol::Principal>) -> McHandler {
+pub(super) fn handler(root: &Path, principal: Option<subc_protocol::Principal>) -> McHandler {
     let h = McHandler::new();
     let descriptor = StorageDescriptor {
         module_id: DEFAULT_MODULE_ID.into(),
@@ -42,7 +42,7 @@ fn handler(root: &Path, principal: Option<subc_protocol::Principal>) -> McHandle
 fn plan() -> Value {
     json!({"serializer_profile":"claude-code-anthropic","observation":"answer"})
 }
-async fn call(h: &McHandler, method: &str, params: Value) -> HandlerOutcome {
+pub(super) async fn call(h: &McHandler, method: &str, params: Value) -> HandlerOutcome {
     h.dispatch_value(7, json!({"method":method,"params":params}))
         .await
 }
@@ -58,7 +58,7 @@ fn code(outcome: HandlerOutcome) -> String {
         _ => panic!("{outcome:?}"),
     }
 }
-async fn setup(h: &McHandler) -> Value {
+pub(super) async fn setup(h: &McHandler) -> Value {
     response(
         call(
             h,
@@ -69,7 +69,7 @@ async fn setup(h: &McHandler) -> Value {
     );
     response(call(h,"compaction.setup",json!({"session":"cc","harness":"claude-code","request_id":"setup","params":plan(),"preset":"head","model":"fixture","context_window":100000,"composition":{},"lineage_id":"L","now":1})).await)
 }
-fn step(raw: &str) -> Value {
+pub(super) fn step(raw: &str) -> Value {
     json!({"session":"cc","harness":"claude-code","request_id":"step","lineage_id":"L","step_id":"1","step_kind":"user_turn",
         "model":"fixture","context_window":100000,"estimate":{"request_tokens":1},"newest":{"mid":"m","ordinal":0},"after_ordinal":0,"messages":[{"mid":"m","ordinal":0,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw}],"now":2})
 }

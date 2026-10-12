@@ -511,6 +511,52 @@ fn producer_context<'a>(
     }
 }
 
+fn claude_code_engine_failure(
+    error: transform::TransformError,
+    request_id: &str,
+) -> HandlerOutcome {
+    // An impossible protected tail is a terminal compaction answer, not a hook
+    // outage. Classify the typed error before the generic transient conversion.
+    if matches!(
+        error,
+        transform::TransformError::ProtectedToolResultsOverLimit
+    ) {
+        let answer = compact::answer::StepAnswer::Refuse {
+            request_id: request_id.into(),
+            code: compact::errors::RefuseCode::WindowTooSmall,
+            reason: transform::PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE.into(),
+            provider_code: Some(transform::PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE.into()),
+            detail: None,
+        };
+        return match bytes(&answer) {
+            Ok(bytes) => HandlerOutcome::Response(bytes),
+            Err(error) => error,
+        };
+    }
+    transient(error)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Inject only at the actual engine-return boundary so adapter tests cannot
+    // pass by checking a separate refusal serializer that dispatch never uses.
+    static CC_ENGINE_REFUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn host_engine_step(
+    store: &McStore,
+    request: &TransformRequest,
+    context: &transform::ProducerContext<'_>,
+    status: &transform::compaction::Status,
+    state: &mut transform::compaction::State,
+) -> Result<transform::compaction::Output, transform::TransformError> {
+    #[cfg(test)]
+    if CC_ENGINE_REFUSAL.with(|flag| flag.replace(false)) {
+        return Err(transform::TransformError::ProtectedToolResultsOverLimit);
+    }
+    transform::compaction::step(store, request, context, status, state)
+}
+
 fn execute_host(
     store: &McStore,
     work: &Work,
@@ -518,6 +564,7 @@ fn execute_host(
     setup: &mut HostSetup,
     status: &transform::compaction::Status,
     lineage: &ProviderLineage,
+    request_id: &str,
 ) -> Result<Option<HostView>, HandlerOutcome> {
     let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
     let messages = non_tag_messages(store, &work.key, lineage)?;
@@ -624,8 +671,14 @@ fn execute_host(
     store
         .append_pending_agent_drops(&conversation.engine_namespace, &targets, now_ms())
         .map_err(transient)?;
-    let output = transform::compaction::step(store, &template, &context, status, &mut state)
-        .map_err(transient)?;
+    let output =
+        host_engine_step(store, &template, &context, status, &mut state).map_err(|error| {
+            if codec == Codec::ClaudeCodeAnthropic {
+                claude_code_engine_failure(error, request_id)
+            } else {
+                transient(error)
+            }
+        })?;
     // Keep only scalars in Setup. Engine and native bytes are committed together
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
@@ -1354,6 +1407,7 @@ impl McHandler {
                     &mut setup,
                     &normalized,
                     &lineage,
+                    &request.request_id,
                 ) {
                     Err(HandlerOutcome::Error { code, message })
                         if codec == Codec::ClaudeCodeAnthropic
@@ -3458,6 +3512,95 @@ mod host_tests {
         assert_eq!(
             answer(h.provider_step(b, &foreign).await)["detail"]["history_gap_from"],
             3
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_refusal_tests {
+    use super::*;
+    use crate::providers::claude_code_tests as cc;
+
+    struct ClearInjection;
+    impl Drop for ClearInjection {
+        fn drop(&mut self) {
+            CC_ENGINE_REFUSAL.with(|flag| flag.set(false));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn protected_tail_refusal_precedes_outage_pass_and_never_publishes_a_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = cc::handler(dir.path(), cc::thalamus());
+        cc::setup(&h).await;
+        let declaration=declaration(&json!({"params":{"serializer_profile":"claude-code-anthropic","observation":"answer"}})).unwrap();
+        assert!(declaration
+            .subscriptions
+            .iter()
+            .all(|s| s.on_unavailable == Some(hooks::subscription::OnUnavailable::Pass)));
+        let mut status = cc::step(r#"{"role":"user","content":"tail"}"#);
+        status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+        let _clear = ClearInjection;
+        for request_id in ["lost-answer", "fresh-answer"] {
+            status["request_id"] = json!(request_id);
+            CC_ENGINE_REFUSAL.with(|flag| flag.set(true));
+            let HandlerOutcome::Response(bytes) =
+                cc::call(&h, "compaction.step", status.clone()).await
+            else {
+                panic!("typed engine refusal became an outage")
+            };
+            assert!(
+                !CC_ENGINE_REFUSAL.with(|flag| flag.get()),
+                "actual engine-return boundary was not reached"
+            );
+            let answer: compact::answer::StepAnswer = serde_json::from_slice(&bytes).unwrap();
+            let compact::answer::StepAnswer::Refuse {
+                request_id: echoed,
+                code,
+                reason,
+                provider_code,
+                ..
+            } = answer
+            else {
+                panic!("refusal was swallowed by pass/fallback")
+            };
+            assert_eq!(echoed, request_id);
+            assert_eq!(code, compact::errors::RefuseCode::WindowTooSmall);
+            assert!(!code.retryable());
+            assert_eq!(
+                provider_code.as_deref(),
+                Some("protected_tool_results_over_limit")
+            );
+            assert_eq!(reason,"The tool results kept by protected_tools are larger than this model's context window, so this turn was not sent. Lower the protected_tools counts.");
+        }
+        let key = Key::new(
+            &cc::binding(dir.path(), cc::thalamus()),
+            "cc",
+            "claude-code",
+        )
+        .unwrap();
+        let store = h.store.get().unwrap();
+        assert!(store
+            .load_provider_view(&key.store_key(), 2)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_provider_view(&key.store_key(), 3)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .load_provider_messages(&key.store_key(), "L")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unrelated_engine_errors_remain_transient_not_terminal_refusals() {
+        assert!(
+            matches!(claude_code_engine_failure(transform::TransformError::AssistantTerminalRetry,"r"),HandlerOutcome::Error { code,.. } if code=="transient")
         );
     }
 }
