@@ -10,6 +10,7 @@ import {
     embedPromotedFacts,
     promoteSessionFactsDurable,
 } from "../../features/magic-context/memory";
+import { tsOwnsMemory } from "../../features/magic-context/memory/lifecycle-applier";
 import {
     resolveProjectIdentity,
     shouldSkipHomeProjectMemory,
@@ -18,6 +19,14 @@ import {
     getMemoriesByProject,
     ModuleMemoryAuthorityError,
 } from "../../features/magic-context/memory/storage-memory";
+import {
+    allocateTurnOneSend,
+    blocksSentToHistorian,
+    commitTurnOnePublication,
+    resolveTurnOneLane,
+    type TurnOneFact,
+    type TurnOneSend,
+} from "../../features/magic-context/memory/turn-one-publication";
 import {
     clearEmergencyDrainLatch,
     clearEmergencyRecovery,
@@ -544,7 +553,13 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const producerLimits = { input: producerWindow.inputLimitTokens };
         const producerReserve = producerWindow.maxOutputTokens;
         const projectPath = resolveProjectIdentity(directory ?? process.cwd());
-        const memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+        // An enabled lane runs the memory-lifecycle turn one: no project-memory block,
+        // and every fact carries the source anchor its candidate row is stored with.
+        const turnOneLane = resolveTurnOneLane(deps.memoryLifecycleLane);
+        const anchoredFacts = turnOneLane === "enabled" && deps.memoryEnabled !== false;
+        const memories = anchoredFacts
+            ? []
+            : getMemoriesByProject(db, projectPath, ["active", "permanent"]);
         const promptFit = fitHistorianPrompt({
             window: producerWindow,
             systemPrompt: withContentLanguageDirective(
@@ -562,6 +577,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             ),
             memories,
             memoryEnabled: deps.memoryEnabled !== false,
+            anchoredFacts,
         });
         if (!promptFit.ok) {
             telemetry.failureReason = promptFit.reason;
@@ -750,9 +766,10 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const prompt = buildCompartmentAgentPrompt({
             seedExamples: promptFit.seedExamples,
             sessionReferences: promptFit.sessionReferences,
-            projectMemory: promptFit.projectMemory,
+            projectMemory: anchoredFacts ? "" : promptFit.projectMemory,
             inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
             memoryEnabled: deps.memoryEnabled !== false,
+            anchoredFacts,
         });
 
         // Intentional: session.get failure is non-fatal — we fall back to deps.directory
@@ -765,6 +782,23 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             { preferResponseOnMissingData: true },
         );
         const sessionDirectory = parentSession?.directory ?? directory;
+
+        // Turn one's send record, and the publication id the compartment transaction
+        // commits under, are persisted before the historian is dispatched. A run that
+        // fails before publishing leaves the id for the session's next run to reuse.
+        const publicationDirectory = sessionDirectory || deps.directory;
+        const publicationProjectPath = publicationDirectory
+            ? resolveProjectIdentity(publicationDirectory)
+            : projectPath;
+        const turnOneSend: TurnOneSend = allocateTurnOneSend(db, {
+            projectPath: publicationProjectPath,
+            sessionId,
+            harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
+            carrier: deps.hiddenCompletionExecutor ? "hidden-completion" : "opencode-session",
+            lane: turnOneLane,
+            chunkStart: chunk.startIndex,
+            chunkEnd: chunk.endIndex,
+        });
 
         // Defensive: use MAX(sequence) + 1 rather than .length. These only
         // differ when the current DB state has a gap or non-zero-indexed
@@ -1069,9 +1103,8 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             // They are the last `persistedCompartments.length` rows by sequence
             // (appendCompartments inserts at the tail). Used for events anchoring +
             // embedding. Pure DB read — cheap, no message mutation.
-            persistedIds = getCompartments(db, sessionId)
-                .slice(-persistedCompartments.length)
-                .map((c) => c.id);
+            const durableRows = getCompartments(db, sessionId).slice(-persistedCompartments.length);
+            persistedIds = durableRows.map((c) => c.id);
             // v2 faithful fact lifecycle: facts are NOT a REPLACE-the-whole-list
             // store anymore. The historian emits only THIS chunk's facts (deduped
             // against <project-memory> in the prompt); they flow to project memory
@@ -1079,7 +1112,54 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             // written/bumped. Promotion is in the SAME transaction as the boundary
             // floor below so a crash cannot advance past facts that never became
             // project memories.
-            if (promotionActive && !skipUnanchoredPromotion) {
+            //
+            // Turn one's publication commits here too, once: the activity ledger
+            // counts the new compartments, and candidate facts are recorded
+            // - on an enabled lane, every fact with its resolved anchor (none is
+            //   promoted; a later decision resolves it);
+            // - on a dormant lane whose project memory the Rust module owns, each fact
+            //   that today's promotion would have tried, with an unknown anchor, in
+            //   place of a promotion this process may not perform.
+            const memoryAuthorityHere = tsOwnsMemory(db, publicationProjectPath);
+            const facts: TurnOneFact[] = validatedPass.facts ?? [];
+            const candidateFacts =
+                turnOneLane === "enabled"
+                    ? deps.memoryEnabled !== false
+                        ? facts
+                        : []
+                    : promotionActive && !skipUnanchoredPromotion && !memoryAuthorityHere
+                      ? facts
+                      : [];
+            const turnOnePublication = commitTurnOnePublication(db, {
+                send: turnOneSend,
+                projectPath: publicationProjectPath,
+                sessionId,
+                compartments: durableRows.map((row, index) => ({
+                    id: row.id,
+                    startMessage: row.startMessage,
+                    endMessage: row.endMessage,
+                    replyStartMessage: persistedCompartments[index]?.startMessage ?? -1,
+                    replyEndMessage: persistedCompartments[index]?.endMessage ?? -1,
+                })),
+                blocks:
+                    turnOneLane === "enabled"
+                        ? blocksSentToHistorian(chunk.printedBlocks, chunk.text, chunkText)
+                        : [],
+                candidateFacts,
+                honourAnchors: turnOneLane === "enabled",
+            });
+            if (turnOnePublication.candidatesInserted > 0) {
+                sessionLog(
+                    sessionId,
+                    `historian turn one: recorded ${turnOnePublication.candidatesInserted} candidate fact(s) (${turnOnePublication.anchoredCandidates} anchored, ${turnOnePublication.blocksStored} block(s))${turnOnePublication.authorityElsewhere ? "; memory authority is the module" : ""}`,
+                );
+            }
+            if (
+                turnOneLane === "dormant" &&
+                memoryAuthorityHere &&
+                promotionActive &&
+                !skipUnanchoredPromotion
+            ) {
                 try {
                     const promotion = promoteSessionFactsDurable(
                         db,

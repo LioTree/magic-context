@@ -9,8 +9,8 @@
  *
  * Every case is a single complete `<output>` document: the Rust parser additionally
  * rejects outputs without one root, which the TypeScript parser does not check.
- * Side-channel anchor prefixes (`[at_compartment=N] fact`) are Rust-only and are kept
- * out of these cases.
+ * Fact anchor prefixes (`[at_compartment=N messages=A-B] fact`) are parsed by both
+ * sides; the observation anchor prefix is Rust-only and is kept out of these cases.
  *
  * Run: bun crates/mc-module/gen/gen-historian-parse-golden.ts
  */
@@ -27,7 +27,11 @@ const { parseCompartmentOutput } = parserMod as {
 
 interface ParsedTs {
     compartments: Array<Record<string, unknown>>;
-    facts: Array<{ category: string; content: string }>;
+    facts: Array<{
+        category: string;
+        content: string;
+        anchor?: { compartmentIndex: number; startOrdinal?: number; endOrdinal?: number };
+    }>;
     droppedFactBlocks: number;
     droppedFacts: number;
     events: Array<{ kind: string; atCompartment: number | null; fields: Record<string, string> }>;
@@ -61,7 +65,10 @@ function normalize(parsed: ParsedTs) {
         facts: parsed.facts.map((f) => ({
             category: f.category,
             content: f.content,
-            origin_compartment_index: null,
+            origin_compartment_index: f.anchor?.compartmentIndex ?? null,
+            ...(f.anchor?.startOrdinal !== undefined && f.anchor.endOrdinal !== undefined
+                ? { source_range: { start: f.anchor.startOrdinal, end: f.anchor.endOrdinal } }
+                : {}),
         })),
         dropped_fact_blocks: parsed.droppedFactBlocks,
         dropped_facts: parsed.droppedFacts,
@@ -241,6 +248,28 @@ ${tiers("second")}
 <causal_incident at_compartment="0"><summary>Zero stays.</summary></causal_incident>
 <causal_incident at_compartment="9"><summary>Out of range stays.</summary></causal_incident></events>
 <primer_candidates><primer at_compartment="2">How did the first part go?</primer></primer_candidates>
+<meta><unprocessed_from>7</unprocessed_from></meta>
+</output>`,
+    },
+    {
+        label: "fact source anchors follow their compartment when compartments are emitted out of order",
+        text: `<output><compartments>
+<compartment start="5" end="6" title="Third">
+${tiers("third")}
+</compartment>
+<compartment start="1" end="2" title="First">
+${tiers("first")}
+</compartment>
+</compartments>
+<facts>
+<PROJECT_RULES>
+* [at_compartment=1 messages=5-6] Fact from the third range.
+* (origin_compartment="2" messages="1") Fact from the first range.
+* [at_compartment=unknown] Fact with an unknown source.
+* [at_compartment=2] Fact with an index only.
+* Fact without an anchor.
+</PROJECT_RULES>
+</facts>
 <meta><unprocessed_from>7</unprocessed_from></meta>
 </output>`,
     },

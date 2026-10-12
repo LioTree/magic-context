@@ -102,7 +102,8 @@ function recordReceipt(
         );
     return receipt;
 }
-function tsOwnsMemory(db: Database, projectPath: string): boolean {
+/** True when this TypeScript process holds memory authority for the project. */
+export function tsOwnsMemory(db: Database, projectPath: string): boolean {
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='authority_managed'").get())
         return true;
     return !db

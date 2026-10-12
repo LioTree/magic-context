@@ -147,6 +147,70 @@ pub struct FactCandidate {
     /// cannot be proven.
     #[serde(default)]
     pub origin_compartment_index: Option<u64>,
+    /// The printed `[A]`/`[A-B]` range of `<new_messages>` lines the fact cites,
+    /// written as `messages=A-B` in its anchor prefix. Only a lane that runs the
+    /// memory-lifecycle turn one asks for it; see [`resolve_fact_anchor`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_range: Option<FactSourceRange>,
+}
+
+/// An inclusive raw-ordinal range a fact anchor cites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactSourceRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// A fact anchor resolved against the compartments of the same reply that are
+/// published and the `[N]`/`[N-M]` lines the historian was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFactAnchor {
+    /// 1-based position of the anchored compartment among the published ones.
+    pub compartment_index: u64,
+    /// Positions in the printed-line list of the lines that exactly tile the
+    /// cited range, in order.
+    pub block_indexes: Vec<usize>,
+}
+
+/// Resolve a fact's source anchor. Anything that does not resolve exactly is an
+/// unknown anchor; nothing is guessed:
+/// - the index must name a published compartment (a discarded tail does not count);
+/// - the cited range must lie inside that compartment;
+/// - the range must start at a printed line's start and end at a printed line's
+///   end, so the printed lines inside it tile it exactly.
+///
+/// `compartments` and `printed_blocks` are inclusive `(start, end)` ordinal ranges
+/// in order. The TypeScript publisher (`resolveTurnOneFactAnchor` in
+/// packages/plugin/src/features/magic-context/memory/turn-one-publication.ts)
+/// applies the same rules; both are pinned by
+/// tests/fixtures/turn-one-anchor-goldens.json.
+pub fn resolve_fact_anchor(
+    fact: &FactCandidate,
+    compartments: &[(u64, u64)],
+    printed_blocks: &[(u64, u64)],
+) -> Option<ResolvedFactAnchor> {
+    let index = fact.origin_compartment_index?;
+    let range = fact.source_range?;
+    let slot = usize::try_from(index).ok()?.checked_sub(1)?;
+    let &(compartment_start, compartment_end) = compartments.get(slot)?;
+    if range.start > range.end || range.start < compartment_start || range.end > compartment_end {
+        return None;
+    }
+    let block_indexes: Vec<usize> = printed_blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, &(start, end))| start >= range.start && end <= range.end)
+        .map(|(position, _)| position)
+        .collect();
+    let first = printed_blocks.get(*block_indexes.first()?)?;
+    let last = printed_blocks.get(*block_indexes.last()?)?;
+    if first.0 != range.start || last.1 != range.end {
+        return None;
+    }
+    Some(ResolvedFactAnchor {
+        compartment_index: index,
+        block_indexes,
+    })
 }
 
 /// A historian-extracted event. The event kind is the XML element name; fields
@@ -396,12 +460,14 @@ pub fn parse_compartment_output(
         for item_caps in fact_item_regex().captures_iter(block) {
             let raw = item_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
             let unescaped = unescape_xml(raw.trim());
-            let (origin_compartment_index, content) = split_anchor_prefix(&unescaped);
+            let (origin_compartment_index, source_range, content) =
+                split_fact_anchor_prefix(&unescaped);
             if !content.is_empty() {
                 facts.push(FactCandidate {
                     category: category.to_string(),
                     content,
                     origin_compartment_index,
+                    source_range,
                 });
             }
         }
@@ -1343,15 +1409,34 @@ fn text_outside_compartments(text: &str, elements: &[CompartmentElement<'_>]) ->
 }
 
 fn split_anchor_prefix(text: &str) -> (Option<u64>, String) {
+    let (anchor, _, content) = split_fact_anchor_prefix(text);
+    (anchor, content)
+}
+
+/// Split a side-channel bullet's optional anchor prefix from its text:
+/// `[at_compartment=N messages=A-B] text`, `[at_compartment=N] text`, or
+/// `[at_compartment=unknown] text`. An unknown or unparsable index yields no
+/// anchor and no range. Mirrors `splitFactAnchorPrefix` in
+/// packages/plugin/src/hooks/magic-context/compartment-parser.ts.
+pub fn split_fact_anchor_prefix(text: &str) -> (Option<u64>, Option<FactSourceRange>, String) {
     if let Some(caps) = side_channel_anchor_regex().captures(text) {
         let anchor = caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok());
         let content = caps
-            .get(2)
+            .get(4)
             .map(|m| m.as_str().trim().to_string())
             .unwrap_or_default();
-        return (anchor, content);
+        let start = caps.get(2).and_then(|m| m.as_str().parse::<u64>().ok());
+        let end = match caps.get(3) {
+            Some(m) => m.as_str().parse::<u64>().ok(),
+            None => start,
+        };
+        let range = match (anchor, start, end) {
+            (Some(_), Some(start), Some(end)) => Some(FactSourceRange { start, end }),
+            _ => None,
+        };
+        return (anchor, range, content);
     }
-    (None, text.trim().to_string())
+    (None, None, text.trim().to_string())
 }
 
 /// Decode the five predefined XML entities in a single left-to-right pass, so
@@ -1589,7 +1674,7 @@ fn side_channel_anchor_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"^\s*[\[(]\s*(?:at_compartment|origin_compartment)\s*=\s*"?(\d+)"?\s*[\])]\s*(.+)$"#,
+            r#"^\s*[\[(]\s*(?:at_compartment|origin_compartment)\s*=\s*"?([0-9]+|unknown)"?(?:\s+messages\s*=\s*"?([0-9]+)(?:\s*-\s*([0-9]+))?"?)?\s*[\])]\s*(.+)$"#,
         )
         .unwrap()
     })
@@ -2262,5 +2347,113 @@ full narrative
         assert_eq!(result.compartments.len(), 2);
         assert_eq!(result.events.len(), 1);
         assert_eq!(result.events[0].at_compartment, Some(1));
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AnchorGolden {
+        compartments: Vec<(u64, u64)>,
+        blocks: Vec<(u64, u64)>,
+        cases: Vec<AnchorGoldenCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AnchorGoldenCase {
+        name: String,
+        line: String,
+        #[serde(default)]
+        blocks: Option<Vec<(u64, u64)>>,
+        expect: AnchorGoldenExpect,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct AnchorGoldenExpect {
+        content: String,
+        compartment: Option<u64>,
+        range: Option<(u64, u64)>,
+        resolved: Option<AnchorGoldenResolved>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct AnchorGoldenResolved {
+        compartment: u64,
+        blocks: Vec<(u64, u64)>,
+    }
+
+    /// Turn-one fact anchors parse and resolve exactly as the TypeScript publisher
+    /// does; the TypeScript side asserts the same fixture in
+    /// packages/plugin/src/features/magic-context/memory/turn-one-publication.test.ts.
+    #[test]
+    fn turn_one_anchor_goldens_match_the_typescript_publisher() {
+        let golden: AnchorGolden = serde_json::from_str(include_str!(
+            "../tests/fixtures/turn-one-anchor-goldens.json"
+        ))
+        .expect("parse turn-one anchor goldens");
+        assert!(!golden.cases.is_empty());
+        let mut mismatches = Vec::new();
+        for case in &golden.cases {
+            let (origin_compartment_index, source_range, content) =
+                split_fact_anchor_prefix(&case.line);
+            let fact = FactCandidate {
+                category: "PROJECT_RULES".into(),
+                content: content.clone(),
+                origin_compartment_index,
+                source_range,
+            };
+            let blocks = case.blocks.as_ref().unwrap_or(&golden.blocks);
+            let resolved =
+                resolve_fact_anchor(&fact, &golden.compartments, blocks).map(|resolved| {
+                    AnchorGoldenResolved {
+                        compartment: resolved.compartment_index,
+                        blocks: resolved
+                            .block_indexes
+                            .iter()
+                            .map(|&index| blocks[index])
+                            .collect(),
+                    }
+                });
+            let got = AnchorGoldenExpect {
+                content,
+                compartment: origin_compartment_index,
+                range: source_range.map(|range| (range.start, range.end)),
+                resolved,
+            };
+            if got != case.expect {
+                mismatches.push(format!(
+                    "{}:\n  rust:     {got:?}\n  expected: {:?}",
+                    case.name, case.expect
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "turn-one anchor mismatch in {} case(s):\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
+    fn fact_anchor_ranges_ride_the_out_of_order_remap() {
+        let text = "<output><compartments>\
+<compartment start=\"5\" end=\"6\" title=\"later\"><p1>later</p1><p2>l</p2><p3>l</p3><p4/></compartment>\
+<compartment start=\"1\" end=\"2\" title=\"earlier\"><p1>earlier</p1><p2>e</p2><p3>e</p3><p4/></compartment>\
+</compartments><facts><PROJECT_RULES>\n* [at_compartment=1 messages=5-6] Fact from later.\n</PROJECT_RULES></facts></output>";
+        let parsed = parse_compartment_output(text).expect("parse anchored output");
+        assert_eq!(parsed.facts.len(), 1);
+        assert_eq!(parsed.facts[0].content, "Fact from later.");
+        assert_eq!(parsed.facts[0].origin_compartment_index, Some(2));
+        assert_eq!(
+            parsed.facts[0].source_range,
+            Some(FactSourceRange { start: 5, end: 6 })
+        );
+        let compartments: Vec<(u64, u64)> = parsed
+            .compartments
+            .iter()
+            .map(|compartment| (compartment.start_message, compartment.end_message))
+            .collect();
+        let resolved = resolve_fact_anchor(&parsed.facts[0], &compartments, &[(1, 2), (5, 6)])
+            .expect("anchor resolves to the later compartment");
+        assert_eq!(resolved.compartment_index, 2);
+        assert_eq!(resolved.block_indexes, vec![1]);
     }
 }

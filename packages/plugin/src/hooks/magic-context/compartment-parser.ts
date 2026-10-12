@@ -22,6 +22,19 @@ export interface ParsedCompartment {
 export interface ParsedFact {
     category: string;
     content: string;
+    /**
+     * Source anchor written as a `[at_compartment=N messages=A-B]` bullet prefix.
+     * Absent when the bullet carries no anchor or says `at_compartment=unknown`.
+     * `compartmentIndex` is 1-based into the returned (start-sorted) compartments.
+     */
+    anchor?: ParsedFactAnchor;
+}
+
+export interface ParsedFactAnchor {
+    compartmentIndex: number;
+    /** The printed `[A]`/`[A-B]` range the fact cites; absent when none was written. */
+    startOrdinal?: number;
+    endOrdinal?: number;
 }
 
 /**
@@ -99,6 +112,11 @@ const TIER_OPEN_ANY_REGEX = /<p\d/;
 const CATEGORY_BLOCK_REGEX = /<([A-Za-z_][A-Za-z0-9_-]*)>(.*?)<\/\1>/gs;
 const HISTORIAN_CATEGORIES: ReadonlySet<string> = new Set(V2_MEMORY_CATEGORIES);
 const FACT_ITEM_REGEX = /^\s*\*\s*(.+)$/gm;
+// A fact bullet's optional source-anchor prefix:
+// `[at_compartment=N messages=A-B] text`, `[at_compartment=unknown] text`.
+// Mirrors `side_channel_anchor_regex` in crates/mc-module/src/historian_validate.rs.
+const FACT_ANCHOR_PREFIX_REGEX =
+    /^\s*[[(]\s*(?:at_compartment|origin_compartment)\s*=\s*"?([0-9]+|unknown)"?(?:\s+messages\s*=\s*"?([0-9]+)(?:\s*-\s*([0-9]+))?"?)?\s*[\])]\s*(.+)$/;
 const UNPROCESSED_REGEX = /<unprocessed_from>(\d+)<\/unprocessed_from>/;
 const USER_OBSERVATIONS_REGEX = /<user_observations>(.*?)<\/user_observations>/s;
 const USER_OBS_ITEM_REGEX = /^\s*\*\s*(.+)$/gm;
@@ -124,6 +142,37 @@ const EVENT_FIELD_REGEX = /<([a-z_]+)\s*>(.*?)<\/\1>/gs;
 function searchFrom(s: string, regex: RegExp, from: number): number {
     const at = s.slice(from).search(regex);
     return at === -1 ? -1 : from + at;
+}
+
+function parseOrdinal(raw: string | undefined): number | undefined {
+    if (raw === undefined) return undefined;
+    const value = Number(raw);
+    return Number.isSafeInteger(value) ? value : undefined;
+}
+
+/**
+ * Split a fact bullet's optional source-anchor prefix from its text. A bullet
+ * without a prefix, or with `at_compartment=unknown`, has no anchor. The Rust
+ * parser (`historian_validate::split_fact_anchor_prefix`) gives the same result.
+ */
+export function splitFactAnchorPrefix(text: string): {
+    content: string;
+    anchor?: ParsedFactAnchor;
+} {
+    const match = text.match(FACT_ANCHOR_PREFIX_REGEX);
+    if (!match) return { content: text.trim() };
+    const content = match[4].trim();
+    const compartmentIndex = parseOrdinal(match[1]);
+    if (compartmentIndex === undefined) return { content };
+    const startOrdinal = parseOrdinal(match[2]);
+    const endOrdinal = match[3] === undefined ? startOrdinal : parseOrdinal(match[3]);
+    return {
+        content,
+        anchor:
+            startOrdinal === undefined || endOrdinal === undefined
+                ? { compartmentIndex }
+                : { compartmentIndex, startOrdinal, endOrdinal },
+    };
 }
 
 /** True when `inner` opens tier `digit` anywhere at or after `from`. */
@@ -402,7 +451,11 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
             log(`[historian] Dropped <facts> category ${category} (${items.length} facts)`);
             continue;
         }
-        for (const content of items) facts.push({ category, content });
+        for (const item of items) {
+            const { content, anchor } = splitFactAnchorPrefix(item);
+            if (!content) continue;
+            facts.push(anchor ? { category, content, anchor } : { category, content });
+        }
     }
 
     const unprocessedMatch = outside.match(UNPROCESSED_REGEX);
@@ -463,7 +516,17 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
 
     return {
         compartments: sortedByStart.map(({ compartment }) => compartment),
-        facts,
+        facts: facts.map((fact) =>
+            fact.anchor
+                ? {
+                      ...fact,
+                      anchor: {
+                          ...fact.anchor,
+                          compartmentIndex: remapAnchor(fact.anchor.compartmentIndex),
+                      },
+                  }
+                : fact,
+        ),
         droppedFactBlocks,
         droppedFacts,
         events: events.map((event) =>

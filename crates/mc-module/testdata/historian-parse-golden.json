@@ -447,5 +447,78 @@
         }
       ]
     }
+  },
+  {
+    "label": "fact source anchors follow their compartment when compartments are emitted out of order",
+    "text": "<output><compartments>\n<compartment start=\"5\" end=\"6\" title=\"Third\">\n<p1>third</p1>\n<p2>third short</p2>\n<p3>third shorter</p3>\n<p4/>\n</compartment>\n<compartment start=\"1\" end=\"2\" title=\"First\">\n<p1>first</p1>\n<p2>first short</p2>\n<p3>first shorter</p3>\n<p4/>\n</compartment>\n</compartments>\n<facts>\n<PROJECT_RULES>\n* [at_compartment=1 messages=5-6] Fact from the third range.\n* (origin_compartment=\"2\" messages=\"1\") Fact from the first range.\n* [at_compartment=unknown] Fact with an unknown source.\n* [at_compartment=2] Fact with an index only.\n* Fact without an anchor.\n</PROJECT_RULES>\n</facts>\n<meta><unprocessed_from>7</unprocessed_from></meta>\n</output>",
+    "parsed": {
+      "compartments": [
+        {
+          "start_message": 1,
+          "end_message": 2,
+          "title": "First",
+          "content": "first",
+          "p1": "first",
+          "p2": "first short",
+          "p3": "first shorter",
+          "p4": "",
+          "importance": null,
+          "episode_type": null
+        },
+        {
+          "start_message": 5,
+          "end_message": 6,
+          "title": "Third",
+          "content": "third",
+          "p1": "third",
+          "p2": "third short",
+          "p3": "third shorter",
+          "p4": "",
+          "importance": null,
+          "episode_type": null
+        }
+      ],
+      "facts": [
+        {
+          "category": "PROJECT_RULES",
+          "content": "Fact from the third range.",
+          "origin_compartment_index": 2,
+          "source_range": {
+            "start": 5,
+            "end": 6
+          }
+        },
+        {
+          "category": "PROJECT_RULES",
+          "content": "Fact from the first range.",
+          "origin_compartment_index": 1,
+          "source_range": {
+            "start": 1,
+            "end": 1
+          }
+        },
+        {
+          "category": "PROJECT_RULES",
+          "content": "Fact with an unknown source.",
+          "origin_compartment_index": null
+        },
+        {
+          "category": "PROJECT_RULES",
+          "content": "Fact with an index only.",
+          "origin_compartment_index": 1
+        },
+        {
+          "category": "PROJECT_RULES",
+          "content": "Fact without an anchor.",
+          "origin_compartment_index": null
+        }
+      ],
+      "dropped_fact_blocks": 0,
+      "dropped_facts": 0,
+      "events": [],
+      "unprocessed_from": 7,
+      "user_observations": [],
+      "primer_candidates": []
+    }
   }
 ]

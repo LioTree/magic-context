@@ -353,6 +353,19 @@ export interface SessionChunk {
         sourceOffset: number;
         bodyTokens: number;
     }>;
+    /**
+     * One record per `[N]`/`[N-M]` line of `text`, in order: the parts that line
+     * joins with ` / `, and the offset in `text` where the line ends. A historian
+     * fact's source anchor names these ranges, and the matching records become the
+     * fact's stored evidence.
+     */
+    printedBlocks?: Array<{
+        role: string;
+        startOrdinal: number;
+        endOrdinal: number;
+        parts: string[];
+        textEnd: number;
+    }>;
 }
 
 export function withRawSessionMessageCache<T>(fn: () => T): T {
@@ -1192,6 +1205,7 @@ export function readSessionChunk(
     let formattedBudgetCrossed = false;
     let sourceCharacters = 0;
     const toolResultBoundaries: NonNullable<SessionChunk["toolResultBoundaries"]> = [];
+    const printedBlocks: NonNullable<SessionChunk["printedBlocks"]> = [];
 
     function pinComponentWhenFormattedBudgetCrosses(ordinal: number, appendedText: string): void {
         if (admittedOversizeComponentEnd !== null || formattedBudgetCrossed || !currentBlock)
@@ -1264,6 +1278,13 @@ export function readSessionChunk(
         }
         lines.push(blockText);
         sourceCharacters = lineStart + blockText.length;
+        printedBlocks.push({
+            role: currentBlock.role,
+            startOrdinal: currentBlock.startOrdinal,
+            endOrdinal: currentBlock.endOrdinal,
+            parts: [...currentBlock.parts],
+            textEnd: sourceCharacters,
+        });
         lineMeta.push(...currentBlock.meta);
         totalTokens += blockTokens;
 
@@ -1476,6 +1497,7 @@ export function readSessionChunk(
         toolOnlyRanges,
         completedToolArcs,
         toolResultBoundaries,
+        printedBlocks,
     };
 }
 

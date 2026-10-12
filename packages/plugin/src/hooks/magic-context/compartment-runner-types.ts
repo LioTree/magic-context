@@ -1,10 +1,11 @@
+import type { TurnOneLane } from "../../features/magic-context/memory/turn-one-publication";
 import type { TokenTotals } from "../../features/magic-context/subagent-token-capture";
 import type { PluginContext } from "../../plugin/types";
 import type { HarnessId } from "../../shared/harness";
 import type { ModelInput } from "../../shared/model-resolution";
 import type { PromptArgs } from "../../shared/model-suggestion-retry";
 import type { Database } from "../../shared/sqlite";
-import type { ParsedEvent } from "./compartment-parser";
+import type { ParsedEvent, ParsedFact } from "./compartment-parser";
 import type {
     BoundarySnapshotValidationResult,
     ProtectedTailBoundarySnapshot,
@@ -195,6 +196,11 @@ export interface CompartmentRunnerDeps<
      */
     autoPromote?: boolean;
     /**
+     * Which historian turn one this lane runs (see `resolveTurnOneLane`). Unset means
+     * dormant, the only production value until a carrier enforces JSON.
+     */
+    memoryLifecycleLane?: TurnOneLane;
+    /**
      * Called after compartment state is published. The runner marks the active
      * run as published before invoking this callback.
      */
@@ -273,7 +279,7 @@ export type ValidatedHistorianPassResult =
     | {
           ok: true;
           compartments: CandidateCompartment[];
-          facts: Array<{ category: string; content: string }>;
+          facts: ParsedFact[];
           droppedFactBlocks?: number;
           droppedFacts?: number;
           userObservations?: string[];
