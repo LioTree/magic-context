@@ -296,6 +296,11 @@ export function resolveFactDecision(
         reason: string;
         memoryId?: number;
         mapping?: unknown;
+        /** An approval-gated operation, recorded in the review inbox in the same transaction. */
+        proposal?: Pick<
+            ProposalRequest,
+            "sourceSessionId" | "operation" | "targetIds" | "proposal"
+        >;
     },
 ): ApplierReceipt {
     return db
@@ -315,6 +320,13 @@ export function resolveFactDecision(
                     JSON.stringify(request.mapping),
                     request.factId,
                 );
+            if (request.proposal)
+                proposeMemoryMutation(db, {
+                    ...request.proposal,
+                    projectPath: request.projectPath,
+                    key: request.key,
+                    writer: "historian",
+                });
             return receipt;
         })
         .immediate();
@@ -325,8 +337,8 @@ export interface ProposalRequest {
     sourceSessionId?: string;
     key?: string;
     /** Automated writers whose retirements and ungrounded edits wait for review. */
-    writer: "curate" | "verify";
-    operation: "update" | "archive" | "merge";
+    writer: "curate" | "verify" | "historian";
+    operation: "update" | "archive" | "merge" | "promote_rule";
     targetIds: number[];
     proposal: unknown;
 }

@@ -21,9 +21,14 @@ import type {
     TurnTwoCarrier,
     TurnTwoReattach,
     TurnTwoRecoveryResolver,
+    TurnTwoStageRecord,
     TurnTwoStageReply,
 } from "../../features/magic-context/memory/turn-two";
 import { TurnTwoOutcomeUnknownError } from "../../features/magic-context/memory/turn-two";
+import {
+    closeTurnTwoChild,
+    retainedTurnTwoChild,
+} from "../../features/magic-context/memory/turn-two-children";
 import { modelBodyField, toModelEntry } from "../../shared/resolve-fallbacks";
 import type {
     HiddenCompletion,
@@ -116,12 +121,15 @@ export function createOpenCodeTurnTwoCarrier(args: {
 }): TurnTwoCarrier {
     const { child } = args;
     const historianSystemHash = lifecycleTextHash(child.system);
-    const prompt = (handle: HiddenRunHandle, text: string, system?: string) => ({
+    // `continueConversation` asks a carrier that rebuilds each request's context
+    // (OpenCode 2's hidden-child hook) to put turn one's prompt and reply before this
+    // prompt. OpenCode 1 keeps the session's history itself and ignores the field.
+    const prompt = (handle: HiddenRunHandle, text: string) => ({
         path: { id: handle.id },
         query: { directory: child.directory },
+        continueConversation: true,
         body: {
             agent: child.agent,
-            ...(system ? { system } : {}),
             ...modelBodyField(child.model),
             parts: [{ type: "text", text, synthetic: true }],
         },
@@ -132,6 +140,8 @@ export function createOpenCodeTurnTwoCarrier(args: {
         enforcedJson: args.enforcedJson,
         childSessionId: child.handle.childSessionId ?? child.handle.id,
         baseline: lifecycleTextHash(args.turnOneText),
+        historianSystemHash,
+        variant: toModelEntry(child.model)?.qualifier ?? null,
         async send(text: string): Promise<TurnTwoStageReply> {
             await withTimeout(
                 child.executor.attempt(child.handle, prompt(child.handle, text)),
@@ -167,6 +177,9 @@ async function sendCheck(
         parentSessionId,
         agent: child.agent,
         kind: "historian",
+        // Checks wait only for each other, never for the historian child that turn
+        // two keeps open (OpenCode 2 serializes hidden runs per role).
+        metadata: { memoryCheck: true },
         system: request.system,
         model: child.model,
         configuredModels: child.model ? [child.model] : [],
@@ -220,8 +233,14 @@ async function sendCheck(
 
 /**
  * Reach a turn-two stage an earlier run or process left in flight, for records of
- * this carrier kind and harness. A stage younger than the historian timeout may
- * still be served by another live process, so it is left alone.
+ * this carrier kind and harness.
+ * - A child this process retained for turn two is reached through the handle the
+ *   executor issued for it (OpenCode 2 knows its runs only by that object). While a
+ *   turn two here is still working on it, the stage is "busy".
+ * - Any other child is reached by its session id. A stage younger than the
+ *   historian timeout may still be served by another live process, so it is "busy".
+ * A recovered reply carries the profile the provider reported for it, with the
+ * historian system hash and variant the stage recorded when it was sent.
  */
 export function createOpenCodeTurnTwoRecovery(args: {
     executor: HiddenCompletionExecutor;
@@ -233,20 +252,25 @@ export function createOpenCodeTurnTwoRecovery(args: {
 }): TurnTwoRecoveryResolver {
     return (record) => {
         if (record.carrier !== args.carrier || record.harness !== args.harness) return null;
-        if (!record.childSessionId) return null;
-        const handle: HiddenRunHandle = {
-            id: record.childSessionId,
-            childSessionId: record.childSessionId,
-        };
+        const childId = record.childSessionId;
+        if (!childId) return null;
+        const retained = retainedTurnTwoChild(childId);
+        if (retained?.active) return "busy";
         const young = (args.now?.() ?? Date.now()) - record.startedAt < args.timeoutMs;
+        if (!retained && young) return "busy";
+        const handle = (retained?.handle as HiddenRunHandle | undefined) ?? {
+            id: childId,
+            childSessionId: childId,
+        };
         return {
             async reattach(): Promise<TurnTwoReattach> {
-                if (young) return { kind: "unknown" };
                 let completion: HiddenCompletion;
                 try {
                     completion = await args.executor.collect(handle, 50);
                 } catch {
-                    return { kind: "gone" };
+                    // A retained child's run exists but has not settled; an unknown
+                    // one is no longer there.
+                    return retained ? { kind: "unknown" } : { kind: "gone" };
                 }
                 if (!completion.text || lifecycleTextHash(completion.text) === record.baseline)
                     return { kind: "unknown" };
@@ -255,7 +279,7 @@ export function createOpenCodeTurnTwoRecovery(args: {
                     reply: {
                         text: completion.text,
                         lengthCapped: completion.lengthCapped,
-                        profile: null,
+                        profile: recoveredProfile(completion, record),
                         usage: completion.usage,
                     },
                 };
@@ -266,6 +290,10 @@ export function createOpenCodeTurnTwoRecovery(args: {
             reattachCheck: () => Promise.reject(new Error("check session is not recoverable")),
             check: () => Promise.reject(new Error("recovered stage cannot open checks")),
             async close() {
+                if (retained) {
+                    await closeTurnTwoChild(childId);
+                    return;
+                }
                 await args.executor.close(handle, {
                     promptSettled: true,
                     privacySensitive: false,
@@ -274,5 +302,20 @@ export function createOpenCodeTurnTwoRecovery(args: {
                 });
             },
         };
+    };
+}
+
+function recoveredProfile(
+    completion: HiddenCompletion,
+    record: TurnTwoStageRecord,
+): ReportedProfile | null {
+    const answered = answeredBy(completion);
+    if (!answered || !record.historianSystemHash) return null;
+    return {
+        provider: answered.provider,
+        modelId: answered.modelId,
+        variant: record.variant,
+        temperature: null,
+        systemHash: record.historianSystemHash,
     };
 }

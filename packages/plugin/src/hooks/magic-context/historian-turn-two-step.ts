@@ -6,6 +6,11 @@
 import type { ReportedProfile } from "../../features/magic-context/memory/lifecycle-gates";
 import { lifecycleTextHash } from "../../features/magic-context/memory/lifecycle-text";
 import { runTurnTwo, type TurnTwoRunResult } from "../../features/magic-context/memory/turn-two";
+import {
+    closeTurnTwoChild,
+    registerTurnTwoChild,
+    retainedTurnTwoChild,
+} from "../../features/magic-context/memory/turn-two-children";
 import type { TurnTwoQueryEmbedder } from "../../features/magic-context/memory/turn-two-retrieval";
 import type { TurnTwoExcerptReader } from "../../features/magic-context/memory/turn-two-scoring";
 import {
@@ -48,6 +53,65 @@ function projectEmbedder(projectPath: string): TurnTwoQueryEmbedder {
         const embedded = await embedTextForProject(projectPath, text);
         return embedded ? { vector: embedded.vector, modelId: embedded.modelId } : null;
     };
+}
+
+type HistorianTurnTwoArgs = Parameters<typeof runHistorianTurnTwo>[0];
+
+const scheduled = new Set<Promise<void>>();
+
+/**
+ * Run turn two after the compartment run that published turn one has settled, as its
+ * own background task: it holds neither the session's compartment lease nor the run
+ * a transform waits for at high context pressure, so a user request never waits on
+ * turn two or its checks. The task owns the retained child: it closes it when turn
+ * two resolves, and otherwise leaves it registered (see turn-two-children.ts) for
+ * recovery or session deletion to close.
+ */
+export function scheduleHistorianTurnTwo(args: HistorianTurnTwoArgs): void {
+    const childId = args.child.handle.childSessionId ?? args.child.handle.id;
+    registerTurnTwoChild({
+        childSessionId: childId,
+        parentSessionId: args.sessionId,
+        harness: args.harness,
+        handle: args.child.handle,
+        active: true,
+        close: () => args.child.close(),
+    });
+    const task = new Promise<void>((resolve) => setTimeout(resolve, 0))
+        .then(() => runHistorianTurnTwo(args))
+        .then(
+            async (result) => {
+                const retained = retainedTurnTwoChild(childId);
+                if (retained) retained.active = false;
+                if (!result.childInFlight) await closeTurnTwoChild(childId);
+            },
+            async (error) => {
+                sessionLog(args.sessionId, "historian turn two failed:", error);
+                const retained = retainedTurnTwoChild(childId);
+                if (retained) retained.active = false;
+                // Facts it reserved stay in flight until recovery gives the stage up,
+                // which closes the child; with nothing reserved, close it now.
+                if (!hasOpenTurnTwoStage(args.db, childId)) await closeTurnTwoChild(childId);
+            },
+        );
+    scheduled.add(task);
+    void task.finally(() => scheduled.delete(task));
+}
+
+/** True when a turn-two stage carried by this child has not finished. */
+function hasOpenTurnTwoStage(db: Database, childId: string): boolean {
+    return (
+        db
+            .prepare(
+                "SELECT 1 FROM memory_stage_attempts WHERE stage='turn_two' AND child_session_id=? AND state IN ('reserved','sending','replied') LIMIT 1",
+            )
+            .get(childId) != null
+    );
+}
+
+/** Wait until every scheduled turn two of this process has settled (tests, shutdown). */
+export async function settleHistorianTurnTwoRuns(): Promise<void> {
+    while (scheduled.size > 0) await Promise.allSettled([...scheduled]);
 }
 
 export async function runHistorianTurnTwo(args: {

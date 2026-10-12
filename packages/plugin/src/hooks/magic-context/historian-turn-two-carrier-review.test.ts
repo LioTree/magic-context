@@ -2,12 +2,10 @@
  * Independent review of memory slice S6 (historian turn two), commit dafaede1:
  * the OpenCode 2 carrier. Report: docs/reports/memory-s6-review.md.
  *
- * Skipped unless MC_S6_REVIEW=1. Run by name, for example:
- *   MC_S6_REVIEW=1 bun test packages/plugin/src/hooks/magic-context/historian-turn-two-carrier-review.test.ts
- *
- * Both tests drive the production OpenCode 2 hidden-completion executor and hidden-child
- * context hook over a fake host whose drafts carry the child's whole history, as the
- * real host's do. They FAIL at dafaede1.
+ * Part of the normal suite. Both tests drive the production OpenCode 2
+ * hidden-completion executor and hidden-child context hook over a fake host whose
+ * drafts carry the child's whole history, as the real host's do. They failed at
+ * dafaede1 (findings P1-1 and P1-2).
  */
 import { describe, expect, test } from "bun:test";
 import {
@@ -24,7 +22,6 @@ import type { StoreRow } from "../../v2/store-reader";
 import type { HiddenRunHandle, RetainedHistorianChild } from "./compartment-runner-types";
 import { createOpenCodeTurnTwoCarrier } from "./historian-turn-two-carrier";
 
-const SKIP = process.env.MC_S6_REVIEW !== "1";
 const TURN_ONE_PROMPT = "TURN-ONE-PROMPT: summarize messages 1-40";
 const TURN_ONE_REPLY = "<compartments>TURN-ONE-REPLY</compartments>";
 const SYSTEM = "historian system prompt";
@@ -153,63 +150,52 @@ async function oc2() {
     return { db, child, carrier, shaped };
 }
 
-describe("S6 review witnesses: OpenCode 2 carrier (fail at dafaede1)", () => {
-    test.skipIf(SKIP)(
-        "review witness: on OpenCode 2 a narrow check can start while turn one's child is retained",
-        async () => {
-            const { db, child, carrier } = await oc2();
-            const system = CHECK_SYSTEM_PROMPTS["kept-clause"];
-            const request: CheckRequest = {
-                key: "review-check",
-                system,
-                systemHash: lifecycleTextHash(system),
-                kind: "kept-clause",
-                operands: [{ id: "[1,1,1]", text: "Keep rule." }],
-                pairs: [],
-                input: "[42] user: New rule.",
-            };
-            const pending = carrier.check(request).then(
-                () => "settled",
-                () => "settled",
-            );
-            const outcome = await Promise.race([
-                pending,
-                new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 1500)),
-            ]);
-            // Release the retained child so the queued check can finish and the test exits.
-            await child.close();
-            await pending;
-            db.close();
-            // At dafaede1 the check child's open() waits for the executor's "historian"
-            // role, which turn one's retained child holds until turn two returns: the
-            // first check of an edit never starts.
-            expect(outcome).toBe("settled");
-        },
-        10_000,
-    );
+describe("S6 review witnesses: OpenCode 2 carrier (failed at dafaede1)", () => {
+    test("review witness: on OpenCode 2 a narrow check can start while turn one's child is retained", async () => {
+        const { db, child, carrier } = await oc2();
+        const system = CHECK_SYSTEM_PROMPTS["kept-clause"];
+        const request: CheckRequest = {
+            key: "review-check",
+            system,
+            systemHash: lifecycleTextHash(system),
+            kind: "kept-clause",
+            operands: [{ id: "[1,1,1]", text: "Keep rule." }],
+            pairs: [],
+            input: "[42] user: New rule.",
+        };
+        const pending = carrier.check(request).then(
+            () => "settled",
+            () => "settled",
+        );
+        const outcome = await Promise.race([
+            pending,
+            new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 1500)),
+        ]);
+        // Release the retained child so the queued check can finish and the test exits.
+        await child.close();
+        await pending;
+        db.close();
+        // At dafaede1 the check child's open() waits for the executor's "historian"
+        // role, which turn one's retained child holds until turn two returns: the
+        // first check of an edit never starts.
+        expect(outcome).toBe("settled");
+    }, 10_000);
 
-    test.skipIf(SKIP)(
-        "review witness: on OpenCode 2 the turn-two request carries turn one's prompt and reply",
-        async () => {
-            const { db, child, carrier, shaped } = await oc2();
-            try {
-                const reply = await carrier.send(
-                    "Turn two: reconcile each candidate fact.",
-                    "stage",
-                );
-                expect(reply.text).toBe(JSON.stringify({ decisions: [] }));
-                const sent = JSON.stringify(shaped.at(-1)?.messages ?? []);
-                expect(sent).toContain("Turn two: reconcile");
-                // The spec appends turn two to the same conversation, after turn one's
-                // prompt and reply. At dafaede1 the hidden-child hook replaces the
-                // child's history with the new prompt alone.
-                expect(sent).toContain(TURN_ONE_PROMPT);
-                expect(sent).toContain("TURN-ONE-REPLY");
-            } finally {
-                await child.close();
-                db.close();
-            }
-        },
-        10_000,
-    );
+    test("review witness: on OpenCode 2 the turn-two request carries turn one's prompt and reply", async () => {
+        const { db, child, carrier, shaped } = await oc2();
+        try {
+            const reply = await carrier.send("Turn two: reconcile each candidate fact.", "stage");
+            expect(reply.text).toBe(JSON.stringify({ decisions: [] }));
+            const sent = JSON.stringify(shaped.at(-1)?.messages ?? []);
+            expect(sent).toContain("Turn two: reconcile");
+            // The spec appends turn two to the same conversation, after turn one's
+            // prompt and reply. At dafaede1 the hidden-child hook replaces the
+            // child's history with the new prompt alone.
+            expect(sent).toContain(TURN_ONE_PROMPT);
+            expect(sent).toContain("TURN-ONE-REPLY");
+        } finally {
+            await child.close();
+            db.close();
+        }
+    }, 10_000);
 });

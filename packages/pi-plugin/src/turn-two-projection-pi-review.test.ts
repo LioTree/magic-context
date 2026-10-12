@@ -2,10 +2,8 @@
  * Independent review of memory slice S6 (historian turn two), commit dafaede1: Pi
  * projection. Report: docs/reports/memory-s6-review.md.
  *
- * Skipped unless MC_S6_REVIEW=1. Run by name:
- *   MC_S6_REVIEW=1 bun test packages/pi-plugin/src/turn-two-projection-pi-review.test.ts
- *
- * A `review probe` passes at dafaede1: it is evidence that an edit applied by turn two
+ * Part of the normal suite. The `review probe` passed when the review was written and
+ * stays as a permanent regression test: it is evidence that an edit applied by turn two
  * (lane enabled in this test) is held back on Pi's SOFT and defer passes and shown at
  * the next genuine HARD fold, with no mutation-log row.
  */
@@ -48,7 +46,7 @@ function textOf(message: unknown): string {
 		.join("");
 }
 
-test.skipIf(process.env.MC_S6_REVIEW !== "1")(
+test(
 	"review probe: an applied turn-two edit is invisible on Pi SOFT and defer passes and appears at the next genuine HARD",
 	async () => {
 		const f = createProjectionFixture("s6-review-pi", createTestDb);

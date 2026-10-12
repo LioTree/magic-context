@@ -5,10 +5,11 @@
  *   wording match is never crowded out by semantic neighbours;
  * - semantic (stored embeddings under the project's current embedding model): fills
  *   the rest of the shortlist up to `NEIGHBOUR_SHORTLIST_CAP`.
- * When the project has no stored embeddings under the current model (none at all, or
- * only ones from another model id), the semantic lane is unavailable and the
- * shortlist is lexical-only; the prompt says so, because an empty semantic lane does
- * not mean the fact has no neighbour.
+ * Slots the semantic lane leaves empty (only some memories have embeddings yet) are
+ * filled with the remaining lexical hits. When the semantic lane ranks nothing (no
+ * stored embeddings under the current model, only ones from another model id, or
+ * none of a usable length), the shortlist is lexical-only and the prompt says so,
+ * because an empty semantic lane does not mean the fact has no neighbour.
  */
 import type { Database } from "../../../shared/sqlite";
 import { cosineSimilarity } from "./cosine-similarity";
@@ -71,17 +72,14 @@ export async function retrieveTurnTwoNeighbours(
         if (ordered.length < NEIGHBOUR_SHORTLIST_CAP && !ordered.includes(id)) ordered.push(id);
     };
     for (const id of lexical.slice(0, LEXICAL_SLOT_COUNT)) add(id);
-    if (semantic) {
-        for (const id of semantic) {
-            if (ordered.length >= NEIGHBOUR_SHORTLIST_CAP) break;
-            if (neighbourOf(db, id)?.id === id) add(id);
-        }
-    } else {
-        for (const id of lexical.slice(LEXICAL_SLOT_COUNT)) add(id);
+    for (const id of semantic ?? []) {
+        if (ordered.length >= NEIGHBOUR_SHORTLIST_CAP) break;
+        if (neighbourOf(db, id)?.id === id) add(id);
     }
+    for (const id of lexical.slice(LEXICAL_SLOT_COUNT)) add(id);
     const neighbours = ordered.flatMap((id) => {
         const neighbour = neighbourOf(db, id);
         return neighbour && getMemoryById(db, id)?.projectPath === projectPath ? [neighbour] : [];
     });
-    return { neighbours, lexicalOnly: semantic === null };
+    return { neighbours, lexicalOnly: semantic === null || semantic.length === 0 };
 }

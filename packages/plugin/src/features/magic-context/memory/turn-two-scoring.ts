@@ -8,7 +8,7 @@
  * Timestamps never select items.
  */
 import type { Database } from "../../../shared/sqlite";
-import { EXCERPT_AFTER, EXCERPT_BEFORE } from "./lifecycle-constants";
+import { EXCERPT_AFTER, EXCERPT_BEFORE, MAX_STAGE2_ATTEMPTS } from "./lifecycle-constants";
 import type { TurnTwoPromptItem, TurnTwoScore } from "./turn-two-envelope";
 
 /** Reads ordinals `from..to` (inclusive) of a session's raw source. */
@@ -93,15 +93,49 @@ export function storeDueExcerpts(
     }
 }
 
-/** Pending items with a stored excerpt at or below the stage's watermark. */
+/**
+ * How many turn-two sends carried each item: an item has no attempt column, so its
+ * attempts are the stage records whose request lists it.
+ */
+const ITEM_SENDS = `(SELECT COUNT(*) FROM memory_stage_attempts s, json_each(s.request_json,'$.items') j
+    WHERE s.project_path=i.project_path AND s.stage='turn_two' AND j.value=i.enqueue_sequence)`;
+
+/**
+ * Pending items with a stored excerpt at or below the stage's watermark that have
+ * been sent fewer than `MAX_STAGE2_ATTEMPTS` times. An item the historian never
+ * scores validly stops being sent after that and stays pending on the review list.
+ */
 export function dueItemSequences(db: Database, projectPath: string, watermark: number): number[] {
     return (
         db
             .prepare(
-                "SELECT enqueue_sequence FROM memory_classification_items WHERE project_path=? AND state='pending' AND excerpt IS NOT NULL AND enqueue_sequence<=? ORDER BY enqueue_sequence",
+                `SELECT i.enqueue_sequence FROM memory_classification_items i
+                 WHERE i.project_path=? AND i.state='pending' AND i.excerpt IS NOT NULL AND i.enqueue_sequence<=?
+                   AND ${ITEM_SENDS} < ?
+                 ORDER BY i.enqueue_sequence`,
             )
-            .all(projectPath, watermark) as Array<{ enqueue_sequence: number }>
+            .all(projectPath, watermark, MAX_STAGE2_ATTEMPTS) as Array<{ enqueue_sequence: number }>
     ).map((row) => row.enqueue_sequence);
+}
+
+/**
+ * Memory ids whose classification item is still open: pending and not yet out of
+ * attempts. Dreamer classify leaves these to the historian; a scored item's memory
+ * is stamped classified when the score is recorded, and an item out of attempts
+ * gives its memory back to dreamer classify.
+ */
+export function memoriesWithOpenClassificationItems(db: Database): Set<number> {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_classification_items'").get())
+        return new Set();
+    return new Set(
+        (
+            db
+                .prepare(
+                    `SELECT DISTINCT i.memory_id FROM memory_classification_items i WHERE i.state='pending' AND ${ITEM_SENDS} < ?`,
+                )
+                .all(MAX_STAGE2_ATTEMPTS) as Array<{ memory_id: number }>
+        ).map((row) => row.memory_id),
+    );
 }
 
 /** The prompt view of the given items; items scored or gone meanwhile are omitted. */
@@ -140,9 +174,11 @@ export function recordItemScores(
                 )
                 .run(score.importance, score.proposedClass, Date.now(), score.item);
             if (won.changes !== 1) continue;
+            // Stamping `classified_at` keeps dreamer classify from re-scoring the row
+            // and overwriting the historian's importance.
             db.prepare(
-                "UPDATE memories SET importance=? WHERE id=(SELECT memory_id FROM memory_classification_items WHERE enqueue_sequence=?) AND status!='archived'",
-            ).run(score.importance, score.item);
+                "UPDATE memories SET importance=?,classified_at=? WHERE id=(SELECT memory_id FROM memory_classification_items WHERE enqueue_sequence=?) AND status!='archived'",
+            ).run(score.importance, Date.now(), score.item);
             recorded += 1;
         }
     }).immediate();

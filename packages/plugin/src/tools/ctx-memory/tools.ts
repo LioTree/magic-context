@@ -503,9 +503,23 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     return `Error: Unknown memory category '${rawCategory}'.`;
                 }
 
+                const callContext = toolContext as unknown as Record<string, unknown>;
+                const classificationAnchor =
+                    toolContext.agent === DREAMER_AGENT
+                        ? null
+                        : (deps.agentSaveClassificationAnchor?.({
+                              sessionId: toolContext.sessionID,
+                              ...(typeof callContext.messageID === "string"
+                                  ? { messageId: callContext.messageID }
+                                  : {}),
+                              ...(typeof callContext.callID === "string"
+                                  ? { callId: callContext.callID }
+                                  : {}),
+                          }) ?? null);
                 const receipt = applyMemoryAdmission(deps.db, {
                     key: randomUUID(),
                     operation: "agent_save",
+                    ...(classificationAnchor ? { classificationAnchor } : {}),
                     input: {
                         projectPath,
                         category,

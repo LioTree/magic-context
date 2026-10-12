@@ -22,6 +22,8 @@ import {
 } from "./turn-one-publication";
 import {
     runTurnTwo,
+    TURN_TWO_PROMPT_MAX,
+    TURN_TWO_UNKNOWN_MAX_VISITS,
     type TurnTwoCarrier,
     TurnTwoOutcomeUnknownError,
     type TurnTwoReattach,
@@ -29,7 +31,12 @@ import {
     type TurnTwoRunInput,
     type TurnTwoStageReply,
 } from "./turn-two";
-import { LEXICAL_ONLY_NOTICE } from "./turn-two-envelope";
+import {
+    __turnTwoChildrenTest,
+    registerTurnTwoChild,
+    retainedTurnTwoChild,
+} from "./turn-two-children";
+import { coverageNotice, LEXICAL_ONLY_NOTICE } from "./turn-two-envelope";
 
 const PROJECT = "git:turn-two";
 const HISTORIAN_HASH = lifecycleTextHash("historian system prompt");
@@ -577,28 +584,57 @@ describe("turn two decision matrix", () => {
         }
     });
 
-    test("retirement and standing-rule promotion stay decided_pending", async () => {
+    test("retirement and standing-rule promotion become inbox proposals and retire nothing", async () => {
         const db = store();
         try {
+            const target = insertMemory(db, {
+                projectPath: PROJECT,
+                category: "CONSTRAINTS",
+                content: "Stale rule.",
+            });
+            const before = db.prepare("SELECT * FROM memories").all();
             const { publicationId, factIds } = publish(db, [
                 { content: "Retire" },
                 { content: "Promote" },
+                { content: "Retire nothing" },
             ]);
             await run(
                 db,
                 publicationId,
                 stubCarrier(() =>
                     reply([
-                        { fact_id: factIds[0], action: "retire" },
-                        { fact_id: factIds[1], action: "promote_rule" },
+                        { fact_id: factIds[0], action: "retire", target_id: target.id },
+                        { fact_id: factIds[1], action: "promote_rule", target_id: target.id },
+                        { fact_id: factIds[2], action: "retire" },
                     ]),
                 ).carrier,
             );
-            for (const id of factIds)
+            for (const id of factIds.slice(0, 2))
                 expect(fact(db, id)).toMatchObject({
                     state: "decided_pending",
-                    reason: "approval_gated",
+                    reason: "MEMORY_PENDING_PROPOSAL",
+                    matched_memory_id: target.id,
                 });
+            expect(fact(db, factIds[2]!)).toMatchObject({
+                state: "decided_pending",
+                reason: "malformed_decision",
+            });
+            expect(
+                db
+                    .prepare(
+                        "SELECT writer,operation,target_ids_json FROM memory_tool_proposals ORDER BY id",
+                    )
+                    .all(),
+            ).toEqual([
+                { writer: "historian", operation: "archive", target_ids_json: `[${target.id}]` },
+                {
+                    writer: "historian",
+                    operation: "promote_rule",
+                    target_ids_json: `[${target.id}]`,
+                },
+            ]);
+            expect(db.prepare("SELECT * FROM memories").all()).toEqual(before);
+            expect(count(db, "SELECT COUNT(*) AS n FROM memory_history")).toBe(0);
         } finally {
             db.close();
         }
@@ -1426,6 +1462,110 @@ describe("turn two agent-memory scoring", () => {
                 }),
             ).toMatchObject({ status: "nothing_to_send" });
             expect(stub.prompts).toEqual([]);
+        } finally {
+            db.close();
+        }
+    });
+});
+
+describe("turn two bounds and isolation", () => {
+    test("deleting the parent session closes a child kept open for turn two", async () => {
+        const db = store();
+        runMigrations(db);
+        try {
+            let closed = 0;
+            registerTurnTwoChild({
+                childSessionId: "child-kept",
+                parentSessionId: "ses-parent-deleted",
+                harness: "opencode",
+                handle: {},
+                active: false,
+                close: async () => {
+                    closed++;
+                },
+            });
+            deleteSessionScopedRows(db, ["ses-parent-deleted"]);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            expect(closed).toBe(1);
+            expect(retainedTurnTwoChild("child-kept")).toBeUndefined();
+        } finally {
+            __turnTwoChildrenTest.clear();
+            db.close();
+        }
+    });
+
+    test("an oversized batch sends a smaller one with a coverage notice; the rest wait unreserved", async () => {
+        const db = store();
+        try {
+            // Each fact's own block makes its rendering about half the size bound.
+            const half = "x ".repeat(Math.ceil(TURN_TWO_PROMPT_MAX / 4));
+            const { publicationId, factIds } = publish(db, [
+                { content: "First large fact", block: { ordinal: 1, parts: [half] } },
+                { content: "Second large fact", block: { ordinal: 2, parts: [half] } },
+                { content: "Third large fact", block: { ordinal: 3, parts: [half] } },
+            ]);
+            const stub = stubCarrier((prompt) =>
+                reply(factIdsIn(prompt).map((id) => ({ fact_id: id, action: "abstain" }))),
+            );
+            await run(db, publicationId, stub.carrier);
+            const sent = factIdsIn(stub.prompts[0]!);
+            expect(sent.length).toBeGreaterThan(0);
+            expect(sent.length).toBeLessThan(3);
+            expect(stub.prompts[0]!.length).toBeLessThanOrEqual(TURN_TWO_PROMPT_MAX);
+            expect(stub.prompts[0]).toContain(coverageNotice(3 - sent.length, 0));
+            for (const id of factIds.filter((id) => !sent.includes(id)))
+                expect(fact(db, id)).toMatchObject({ state: "retryable", fact_attempts: 0 });
+        } finally {
+            db.close();
+        }
+    });
+
+    test("a stage whose recovery throws does not stop new sends and is given up after the visit bound", async () => {
+        const db = store();
+        try {
+            const stuck = publish(db, [{ content: "Resolution always throws" }]);
+            await run(db, stuck.publicationId, stubCarrier(() => "unknown").carrier);
+            // A deterministic failure while resolving this fact's decision.
+            db.exec(
+                `CREATE TRIGGER broken_fact BEFORE INSERT ON memory_decision_receipts WHEN NEW.fact_id = ${stuck.factIds[0]} AND NEW.receipt_json LIKE '%abstain%' BEGIN SELECT RAISE(ABORT, 'broken'); END`,
+            );
+            const resolver: TurnTwoRecoveryResolver = () => ({
+                reattach: async () => ({
+                    kind: "reply",
+                    reply: reply([{ fact_id: stuck.factIds[0], action: "abstain" }]),
+                }),
+                check: passingVerdicts as never,
+            });
+            const sentFacts: number[][] = [];
+            for (let visit = 0; visit < TURN_TWO_UNKNOWN_MAX_VISITS; visit++) {
+                const fresh = publish(db, [{ content: `Fresh fact ${visit}` }]);
+                const carrier = stubCarrier((prompt) => {
+                    sentFacts.push(factIdsIn(prompt));
+                    return reply(
+                        factIdsIn(prompt)
+                            .filter((id) => id !== stuck.factIds[0])
+                            .map((id) => ({ fact_id: id, action: "abstain" })),
+                    );
+                }).carrier;
+                await run(db, fresh.publicationId, carrier, { recover: resolver });
+                expect(fact(db, fresh.factIds[0]!)).toMatchObject({ state: "decided_pending" });
+            }
+            expect(sentFacts).toHaveLength(TURN_TWO_UNKNOWN_MAX_VISITS);
+            // Given up on the last visit (+1), then resent once as backlog and
+            // decided there (no decision for it in that reply).
+            expect(
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS n FROM memory_decision_receipts WHERE fact_id=? AND receipt_json LIKE '%recovery_error%'",
+                    )
+                    .get(stuck.factIds[0]!),
+            ).toEqual({ n: 1 });
+            expect(sentFacts.at(-1)).toContain(stuck.factIds[0]!);
+            expect(fact(db, stuck.factIds[0]!)).toMatchObject({
+                state: "decided_pending",
+                fact_attempts: 1,
+                reason: "missing_decision",
+            });
         } finally {
             db.close();
         }

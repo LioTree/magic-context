@@ -6,6 +6,7 @@ import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/comp
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { getMemoryById, insertMemory } from "../memory";
+import { recordItemScores } from "../memory/turn-two-scoring";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { getSubagentInvocations } from "../storage-subagent-invocations";
@@ -233,7 +234,7 @@ describe("runClassify disposition", () => {
         }
     });
 
-    test("skips every row that has a historian classification item, open or scored", async () => {
+    test("skips rows with an open historian classification item and never re-scores a historian score", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:classify-historian-items";
@@ -250,12 +251,19 @@ describe("runClassify disposition", () => {
                 content: "Agent save the historian scored.",
                 sourceSessionId: "ses",
             });
-            db.prepare("UPDATE memories SET importance=30 WHERE id=?").run(scored.id);
             const enqueue = db.prepare(
-                "INSERT INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal,state,importance) VALUES(?,?,1,'ses',?,1,?,?)",
+                "INSERT INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal,excerpt) VALUES(?,?,1,'ses',?,1,'excerpt')",
             );
-            enqueue.run(projectIdentity, pending.id, "part-pending", "pending", null);
-            enqueue.run(projectIdentity, scored.id, "part-scored", "scored", 30);
+            enqueue.run(projectIdentity, pending.id, "part-pending");
+            const scoredItem = Number(
+                enqueue.run(projectIdentity, scored.id, "part-scored").lastInsertRowid,
+            );
+            // The historian's score is recorded as turn two records it.
+            recordItemScores(
+                db,
+                [scoredItem],
+                [{ item: scoredItem, importance: 30, proposedClass: "durable" }],
+            );
             const args = classifyArgs(db, projectIdentity);
             const prompted: number[] = [];
             let manifest = "";
@@ -282,6 +290,44 @@ describe("runClassify disposition", () => {
             expect(prompted).not.toContain(scored.id);
             expect(getMemoryById(db, pending.id)?.importance).toBe(50);
             expect(getMemoryById(db, scored.id)?.importance).toBe(30);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("an item the historian ran out of attempts on gives its row back to dreamer classify", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-exhausted-item";
+            addMemoriesForDisposition(db, projectIdentity, 9);
+            const saved = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Agent save the historian never scored.",
+                sourceSessionId: "ses",
+            });
+            const item = Number(
+                db
+                    .prepare(
+                        "INSERT INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal,excerpt) VALUES(?,?,1,'ses','part',1,'excerpt')",
+                    )
+                    .run(projectIdentity, saved.id).lastInsertRowid,
+            );
+            // Three turn-two sends carried it and none scored it.
+            for (let attempt = 1; attempt <= 3; attempt++)
+                db.prepare(
+                    "INSERT INTO memory_stage_attempts(stage_key,project_path,publication_id,run_attempt,stage,session_id,carrier,state,request_json,started_at) VALUES(?,?,'pub',?,'turn_two','ses','stub','resolved',?,1)",
+                ).run(
+                    `stage-${attempt}`,
+                    projectIdentity,
+                    attempt,
+                    JSON.stringify({ items: [item] }),
+                );
+            const args = classifyArgs(db, projectIdentity);
+            args.client = successfulClassifyClient() as never;
+
+            expect((await runClassify(args)).classified).toBe(10);
+            expect(getMemoryById(db, saved.id)?.importance).toBe(80);
         } finally {
             closeQuietly(db);
         }

@@ -120,6 +120,11 @@ export interface HiddenCompletionExecutor {
     attempt(handle: HiddenRunHandle, request: PromptArgs): Promise<void>;
     /** Kept separate from prompt settlement so read failures never resend a historian prompt. */
     collect(handle: HiddenRunHandle, limit: number): Promise<HiddenCompletion>;
+    /**
+     * Stop holding the run's concurrency slot while keeping its child open, for a
+     * historian child kept open for turn two. Optional: carriers without slots omit it.
+     */
+    detach?(handle: HiddenRunHandle): void;
     close(
         handle: HiddenRunHandle | null,
         settlement: {

@@ -29,6 +29,7 @@ import {
     type ApplierReceipt,
     applyHistorianRevision,
     applyMemoryAdmission,
+    MEMORY_PENDING_PROPOSAL,
     resolveFactDecision,
     tsOwnsMemory,
 } from "./lifecycle-applier";
@@ -65,6 +66,28 @@ import type { MemoryCategory } from "./types";
 
 export const TURN_TWO_STAGE = "turn_two";
 
+/**
+ * Recovery visits after which a stage whose outcome is still unknown is given up:
+ * its facts are charged one attempt (and resent while attempts remain) and its
+ * child is closed. A visit counts only once the carrier says the send can no longer
+ * be live; a young stage another run may still be serving does not count.
+ */
+export const TURN_TWO_UNKNOWN_MAX_VISITS = 3;
+/**
+ * Age after which a stage no carrier in this process can reach is given up the same
+ * way, so a fact is never left in flight forever by a carrier that went away.
+ */
+export const TURN_TWO_UNREACHABLE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/**
+ * Size bound for the turn-two prompt in UTF-16 units. Memories are never truncated:
+ * when the batch would exceed this, later facts and items wait for a later request
+ * and the prompt says how many were left out.
+ */
+export const TURN_TWO_PROMPT_MAX = 160_000;
+
+/** Stage states after which nothing of the stage is in flight. */
+const OPEN_STAGE_STATES = ["reserved", "sending", "replied"] as const;
+
 /** What a carrier hands back for one turn-two send. */
 export interface TurnTwoStageReply {
     text: string;
@@ -92,8 +115,13 @@ export class TurnTwoOutcomeUnknownError extends Error {
 
 export type TurnTwoReattach =
     | { kind: "reply"; reply: TurnTwoStageReply }
-    /** The carrier is reachable but has no answer yet; the reservation stays. */
+    /**
+     * The carrier is reachable, the send can no longer be in progress, and still no
+     * answer is there. Counts toward `TURN_TWO_UNKNOWN_MAX_VISITS`.
+     */
     | { kind: "unknown" }
+    /** Another live run may still be serving the send; this visit does not count. */
+    | { kind: "busy" }
     /** The carrier reports that the send or the child no longer exists. */
     | { kind: "gone" };
 
@@ -125,6 +153,12 @@ export interface TurnTwoCarrier extends TurnTwoCheckCarrier {
      * to turn two has arrived.
      */
     readonly baseline?: string;
+    /**
+     * Hash of the historian system prompt and the configured variant, stored on the
+     * stage record so a reply recovered later carries the profile it ran on.
+     */
+    readonly historianSystemHash?: string;
+    readonly variant?: string | null;
     /** Continue the child with the turn-two prompt (a second turn, same session id). */
     send(prompt: string, stageKey: string): Promise<TurnTwoStageReply>;
 }
@@ -141,11 +175,15 @@ export interface TurnTwoStageRecord {
     childSessionId: string | null;
     startedAt: number;
     baseline: string | null;
+    historianSystemHash: string | null;
+    variant: string | null;
 }
 
 /**
- * Returns a handle on the carrier of an earlier stage, or null when this process
- * cannot reach that carrier (another carrier kind or harness, or no child id).
+ * Returns a handle on the carrier of an earlier stage; null when this process cannot
+ * reach that carrier (another carrier kind or harness, or no child id); or "busy"
+ * when a live run may still be working on the stage, so recovery leaves it alone
+ * this time without counting a visit.
  */
 export type TurnTwoRecoveryResolver = (record: TurnTwoStageRecord) =>
     | (TurnTwoCheckCarrier & {
@@ -153,6 +191,7 @@ export type TurnTwoRecoveryResolver = (record: TurnTwoStageRecord) =>
           /** Close the stage's hidden child session once none of its facts is in flight. */
           close?(): Promise<void>;
       })
+    | "busy"
     | null;
 
 export interface TurnTwoRunInput {
@@ -192,6 +231,10 @@ export interface TurnTwoRunResult {
 
 interface StageRequest {
     baseline?: string;
+    historianSystemHash?: string;
+    variant?: string | null;
+    /** Recovery visits that found the outcome still unknown (or failed to resolve it). */
+    recoveryVisits?: number;
     factAttempts: Record<string, number>;
     items: number[];
     lexicalOnly: boolean;
@@ -277,15 +320,18 @@ export function selectTurnTwoFacts(
 
 /**
  * The decision key: (project, fact, `fact_attempts` at send, the decision's position
- * in the reply, and the target ids with the revisions the decision read). The
- * resolving transaction records a receipt under it, so recovery never applies the
- * same decision twice, and a resend after a retry gets a new key.
+ * in the reply, the target ids with the revisions the decision read, and the stage
+ * key of the send). The resolving transaction records a receipt under it, so
+ * recovery of the same send never applies a decision twice. The stage key makes it
+ * unique per send: a receipt that left the fact `retryable` without charging an
+ * attempt (memory authority moved away meanwhile) can never answer a later resend.
  */
 export function turnTwoDecisionKey(
     projectPath: string,
     factId: number,
     factAttempts: number,
     decision: TurnTwoDecision | null,
+    stageKey: string,
 ): string {
     const targets: Array<[number, number | null]> = [];
     if (decision?.sources)
@@ -293,7 +339,14 @@ export function turnTwoDecisionKey(
     else if (decision?.targetId !== undefined)
         targets.push([decision.targetId, decision.revision ?? null]);
     targets.sort((a, b) => a[0] - b[0]);
-    return JSON.stringify([projectPath, factId, factAttempts, decision?.ordinal ?? -1, targets]);
+    return JSON.stringify([
+        projectPath,
+        factId,
+        factAttempts,
+        decision?.ordinal ?? -1,
+        targets,
+        stageKey,
+    ]);
 }
 
 /** Consume one attempt of every fact still reserved by `stageKey`. */
@@ -386,29 +439,70 @@ function reserveTurnTwo(
                 watermark,
                 Date.now(),
             );
-            const reserved: FactRow[] = [];
+            const available: FactRow[] = [];
             for (const fact of facts)
-                if (reserve.run(stageKey, fact.id).changes === 1) reserved.push(fact);
-            const itemViews = promptItems(db, items);
+                if (reserve.run(stageKey, fact.id).changes === 1) available.push(fact);
+            const availableItems = promptItems(db, items);
+            // Fit the batch to `TURN_TWO_PROMPT_MAX`: facts first (this publication's,
+            // then backlog), then items, each taken only while the prompt still fits.
+            // The first fact is always sent, since a memory is never truncated. What is
+            // left out is released unreserved, consumes no attempt, and is named in the
+            // prompt's coverage notice.
+            const reserved: FactRow[] = [];
+            const itemViews: typeof availableItems = [];
+            const render = (deferred?: { facts: number; items: number }) =>
+                buildTurnTwoPrompt({
+                    facts: reserved.map((fact) => promptFacts.get(fact.id)!),
+                    items: itemViews,
+                    lexicalOnly,
+                    deferred,
+                });
+            const worstCase = { facts: available.length, items: availableItems.length };
+            for (const fact of available) {
+                reserved.push(fact);
+                if (reserved.length > 1 && render(worstCase).length > TURN_TWO_PROMPT_MAX)
+                    reserved.pop();
+            }
+            for (const item of availableItems) {
+                itemViews.push(item);
+                if (
+                    (reserved.length > 0 || itemViews.length > 1) &&
+                    render(worstCase).length > TURN_TWO_PROMPT_MAX
+                )
+                    itemViews.pop();
+            }
+            const release = db.prepare(
+                "UPDATE memory_pending_facts SET state='retryable',reserved_stage_key=NULL WHERE id=? AND reserved_stage_key=?",
+            );
+            for (const fact of available)
+                if (!reserved.includes(fact)) release.run(fact.id, stageKey);
             if (reserved.length === 0 && itemViews.length === 0) {
                 db.prepare("DELETE FROM memory_stage_attempts WHERE stage_key=?").run(stageKey);
                 return null;
             }
+            const deferred = {
+                facts: available.length - reserved.length,
+                items: availableItems.length - itemViews.length,
+            };
             const request: StageRequest = {
                 ...(input.carrier.baseline !== undefined
                     ? { baseline: input.carrier.baseline }
                     : {}),
+                ...(input.carrier.historianSystemHash !== undefined
+                    ? { historianSystemHash: input.carrier.historianSystemHash }
+                    : {}),
+                variant: input.carrier.variant ?? null,
                 factAttempts: Object.fromEntries(
                     reserved.map((fact) => [String(fact.id), fact.fact_attempts]),
                 ),
                 items: itemViews.map((item) => item.item),
                 lexicalOnly,
-                prompt: buildTurnTwoPrompt({
-                    facts: reserved.map((fact) => promptFacts.get(fact.id)!),
-                    items: itemViews,
-                    lexicalOnly,
-                }),
+                prompt: render(deferred),
             };
+            if (deferred.facts > 0 || deferred.items > 0)
+                input.log?.(
+                    `turn two: prompt size bound left out ${deferred.facts} fact(s) and ${deferred.items} item(s) for a later request`,
+                );
             db.prepare("UPDATE memory_stage_attempts SET request_json=? WHERE stage_key=?").run(
                 JSON.stringify(request),
                 stageKey,
@@ -492,7 +586,7 @@ async function resolveStage(
         const attempts = request.factAttempts[String(fact.id)] ?? fact.fact_attempts;
         const decision = envelope.decisions.get(fact.id);
         try {
-            await resolveFact(db, fact, attempts, decision, profile, context);
+            await resolveFact(db, fact, attempts, decision, profile, context, stageKey);
         } catch (error) {
             if (error instanceof CheckOutcomeUnknownError) return false;
             throw error;
@@ -543,15 +637,16 @@ async function resolveFact(
     decision: TurnTwoDecision | "malformed" | undefined,
     profile: ReportedProfile,
     context: ResolveContext,
+    stageKey: string,
 ): Promise<ApplierReceipt> {
     if (decision === undefined || decision === "malformed")
         return pending(
             db,
             fact,
-            turnTwoDecisionKey(fact.project_path, fact.id, attempts, null),
+            turnTwoDecisionKey(fact.project_path, fact.id, attempts, null, stageKey),
             decision === undefined ? "missing_decision" : "malformed_decision",
         );
-    const key = turnTwoDecisionKey(fact.project_path, fact.id, attempts, decision);
+    const key = turnTwoDecisionKey(fact.project_path, fact.id, attempts, decision, stageKey);
     const sourceSessionId = publicationSession(db, fact.publication_id);
     const input = {
         projectPath: fact.project_path,
@@ -563,8 +658,27 @@ async function resolveFact(
         case "abstain":
             return pending(db, fact, key, "abstain");
         case "retire":
-        case "promote_rule":
-            return pending(db, fact, key, "approval_gated");
+        case "promote_rule": {
+            // Retirement and standing-rule promotion need a human approval: they go to
+            // the review inbox as proposals, and nothing is retired automatically.
+            const target = liveTarget(db, fact.project_path, decision.targetId);
+            if (!target) return pending(db, fact, key, "proposal_target");
+            return resolveFactDecision(db, {
+                key,
+                projectPath: fact.project_path,
+                factId: fact.id,
+                operation: "turn_two",
+                state: "decided_pending",
+                reason: MEMORY_PENDING_PROPOSAL,
+                memoryId: target.memory.id,
+                proposal: {
+                    sourceSessionId,
+                    operation: decision.action === "retire" ? "archive" : "promote_rule",
+                    targetIds: [target.memory.id],
+                    proposal: { factId: fact.id, action: decision.action },
+                },
+            });
+        }
         case "new":
             return applyMemoryAdmission(db, {
                 key,
@@ -755,24 +869,47 @@ function stageRecords(db: Database, projectPath: string): TurnTwoStageRecord[] {
                         s.session_id AS sessionId,s.harness AS harness,s.carrier AS carrier,s.child_session_id AS childSessionId,
                         s.started_at AS startedAt,s.request_json AS requestJson
                  FROM memory_stage_attempts s
-                 WHERE s.project_path=? AND s.stage=?
-                   AND EXISTS (SELECT 1 FROM memory_pending_facts f WHERE f.state='in_flight' AND f.reserved_stage_key=s.stage_key)
+                 WHERE s.project_path=? AND s.stage=? AND s.state IN (${OPEN_STAGE_STATES.map(() => "?").join(",")})
                  ORDER BY s.started_at, s.stage_key`,
             )
-            .all(projectPath, TURN_TWO_STAGE) as Array<
-            Omit<TurnTwoStageRecord, "baseline"> & { requestJson: string }
+            .all(projectPath, TURN_TWO_STAGE, ...OPEN_STAGE_STATES) as Array<
+            Omit<TurnTwoStageRecord, "baseline" | "historianSystemHash" | "variant"> & {
+                requestJson: string;
+            }
         >
     ).map(({ requestJson, ...record }) => {
         const request = JSON.parse(requestJson) as Partial<StageRequest>;
-        return { ...record, baseline: request.baseline ?? null };
+        return {
+            ...record,
+            baseline: request.baseline ?? null,
+            historianSystemHash: request.historianSystemHash ?? null,
+            variant: request.variant ?? null,
+        };
     });
 }
 
+/** Count one more recovery visit of a stage and return the new count. */
+function countRecoveryVisit(db: Database, stageKey: string): number {
+    const request = readStageRequest(db, stageKey);
+    if (!request) return TURN_TWO_UNKNOWN_MAX_VISITS;
+    const visits = (request.recoveryVisits ?? 0) + 1;
+    db.prepare("UPDATE memory_stage_attempts SET request_json=? WHERE stage_key=?").run(
+        JSON.stringify({ ...request, recoveryVisits: visits }),
+        stageKey,
+    );
+    return visits;
+}
+
 /**
- * Reattach every turn-two stage of the project that still holds reservations: a
- * recorded reply is resolved without a second send; otherwise the stage's carrier
- * is asked for the outcome under the original stage key. A stage this process
- * cannot reach stays reserved.
+ * Reattach every open turn-two stage of the project: a recorded reply is resolved
+ * without a second send; otherwise the stage's carrier is asked for the outcome
+ * under the original stage key. Every stage leaves flight in bounded time:
+ * - a carrier that reports the send or child gone charges one attempt at once;
+ * - an outcome still unknown after `TURN_TWO_UNKNOWN_MAX_VISITS` counted visits, a
+ *   stage no carrier here can reach for `TURN_TWO_UNREACHABLE_MAX_AGE_MS`, and a
+ *   stage whose resolution keeps throwing are given up the same way.
+ * A given-up or resolved stage's child is closed. A throw while recovering one stage
+ * never stops the others or the run's new send.
  */
 export async function recoverTurnTwoStages(
     db: Database,
@@ -783,47 +920,79 @@ export async function recoverTurnTwoStages(
         validatedProfiles: readonly ReportedProfile[];
         resolver: TurnTwoRecoveryResolver | undefined;
         log?: (message: string) => void;
+        now?: () => number;
     },
 ): Promise<void> {
     for (const record of stageRecords(db, input.projectPath)) {
-        const carrier = input.resolver?.(record) ?? null;
-        const replied = db
-            .prepare(
-                "SELECT reply_json IS NOT NULL AS replied FROM memory_stage_attempts WHERE stage_key=?",
-            )
-            .get(record.stageKey) as { replied: number };
-        if (!replied.replied) {
-            if (!carrier) continue;
-            let outcome: TurnTwoReattach;
+        let carrier: Exclude<ReturnType<TurnTwoRecoveryResolver>, "busy"> = null;
+        const giveUp = async (reason: string, state: string) => {
+            consumeStageAttempts(db, record.stageKey, reason, state);
+            input.log?.(`turn two: gave up stage ${record.stageKey} (${reason})`);
+            await carrier?.close?.().catch(() => undefined);
+        };
+        try {
+            const resolved = input.resolver?.(record) ?? null;
+            if (resolved === "busy") continue;
+            carrier = resolved;
+            const replied = db
+                .prepare(
+                    "SELECT reply_json IS NOT NULL AS replied FROM memory_stage_attempts WHERE stage_key=?",
+                )
+                .get(record.stageKey) as { replied: number };
+            if (!replied.replied) {
+                if (!carrier) {
+                    if (
+                        (input.now?.() ?? Date.now()) - record.startedAt >=
+                        TURN_TWO_UNREACHABLE_MAX_AGE_MS
+                    )
+                        await giveUp("carrier_unreachable", "expired");
+                    continue;
+                }
+                const outcome = await carrier
+                    .reattach()
+                    .catch((): TurnTwoReattach => ({ kind: "unknown" }));
+                if (outcome.kind === "busy") continue;
+                if (outcome.kind === "gone") {
+                    await giveUp("carrier_lost", "lost");
+                    continue;
+                }
+                if (outcome.kind === "unknown") {
+                    if (countRecoveryVisit(db, record.stageKey) >= TURN_TWO_UNKNOWN_MAX_VISITS)
+                        await giveUp("outcome_unknown", "expired");
+                    continue;
+                }
+                recordStageReply(db, record.stageKey, outcome.reply);
+            }
+            const done = await resolveStage(db, record.stageKey, {
+                memoryEnabled: input.memoryEnabled,
+                autoPromote: input.autoPromote,
+                // A reply is only recorded by a run on an enabled lane, which requires a
+                // provider-enforced response schema.
+                enforcedJson: true,
+                validatedProfiles: input.validatedProfiles,
+                checks: carrier ?? {
+                    check: () => Promise.reject(new CheckOutcomeUnknownError("no carrier")),
+                },
+                owner: { sessionId: record.sessionId, harness: record.harness },
+            });
+            input.log?.(
+                `turn two: recovered stage ${record.stageKey} (${done ? "resolved" : "still in flight"})`,
+            );
+            if (!done) {
+                if (countRecoveryVisit(db, record.stageKey) >= TURN_TWO_UNKNOWN_MAX_VISITS)
+                    await giveUp("check_outcome_unknown", "expired");
+                continue;
+            }
+            if (stillReserved(db, record.stageKey) === 0) await carrier?.close?.();
+        } catch (error) {
+            input.log?.(`turn two: recovering stage ${record.stageKey} failed: ${String(error)}`);
             try {
-                outcome = await carrier.reattach();
+                if (countRecoveryVisit(db, record.stageKey) >= TURN_TWO_UNKNOWN_MAX_VISITS)
+                    await giveUp("recovery_error", "expired");
             } catch {
-                continue;
+                // The next run counts the visit again.
             }
-            if (outcome.kind === "unknown") continue;
-            if (outcome.kind === "gone") {
-                consumeStageAttempts(db, record.stageKey, "carrier_lost", "lost");
-                await carrier.close?.();
-                continue;
-            }
-            recordStageReply(db, record.stageKey, outcome.reply);
         }
-        const done = await resolveStage(db, record.stageKey, {
-            memoryEnabled: input.memoryEnabled,
-            autoPromote: input.autoPromote,
-            // A reply is only recorded by a run on an enabled lane, which requires a
-            // provider-enforced response schema.
-            enforcedJson: true,
-            validatedProfiles: input.validatedProfiles,
-            checks: carrier ?? {
-                check: () => Promise.reject(new CheckOutcomeUnknownError("no carrier")),
-            },
-            owner: { sessionId: record.sessionId, harness: record.harness },
-        });
-        input.log?.(
-            `turn two: recovered stage ${record.stageKey} (${done ? "resolved" : "still in flight"})`,
-        );
-        if (done && stillReserved(db, record.stageKey) === 0) await carrier?.close?.();
     }
 }
 

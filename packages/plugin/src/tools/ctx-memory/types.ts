@@ -59,4 +59,14 @@ export interface CtxMemoryToolDeps {
     allowedActions?: CtxMemoryAction[];
     sourceType?: MemorySourceType;
     rustToolBackends?: RustToolBackends;
+    /**
+     * Where an agent's save happened, for the historian's agent-memory scoring; null
+     * (or absent) when this lane does not score agent saves, so no classification
+     * item is enqueued.
+     */
+    agentSaveClassificationAnchor?: (location: {
+        sessionId: string;
+        messageId?: string;
+        callId?: string;
+    }) => { toolCallPartId: string; saveOrdinal: number } | null;
 }

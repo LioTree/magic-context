@@ -17,17 +17,20 @@ import {
     getMemoriesByProject,
     insertMemory,
 } from "../../features/magic-context/memory/storage-memory";
+import { __turnTwoChildrenTest } from "../../features/magic-context/memory/turn-two-children";
 import {
     closeDatabase,
     getHistorianFailureState,
     openDatabase,
 } from "../../features/magic-context/storage";
+import { readSessionMeta } from "../../features/magic-context/storage-meta-session";
 import type { PluginContext } from "../../plugin/types";
 import { __resetNotificationStateForTests } from "../../shared/rpc-notifications";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { runCompartmentAgent as runCompartmentAgentImpl } from "./compartment-runner";
+import { settleHistorianTurnTwoRuns } from "./historian-turn-two-step";
 import {
     clearProducerModelObservations,
     observeProducerModelsForTest,
@@ -45,7 +48,10 @@ beforeEach(async () => {
     __ignoredNotificationTest.setHoldDetector(() => false);
 });
 
-afterEach(() => {
+afterEach(async () => {
+    // Turn two runs as its own task after a run; let it finish before the store closes.
+    await settleHistorianTurnTwoRuns();
+    __turnTwoChildrenTest.clear();
     clearProducerModelObservations();
     __ignoredNotificationTest.reset();
     __resetNotificationStateForTests();
@@ -371,9 +377,9 @@ describe("historian turn one on an enabled lane", () => {
 
         const newRow = getCompartments(db, sessionId)[1]!;
         expect(newRow.id).not.toBe(olderRowId);
-        // Turn two follows on the same child. This stub host answers only turn one,
-        // so turn two's outcome is unknown and both candidates stay reserved
-        // (`in_flight`) for recovery, with no attempt consumed.
+        // Turn two runs as its own task once this run has settled; it has not started
+        // yet, so the candidates are as turn one published them. (Turn two on this
+        // stub host is covered in "historian turn two on an enabled lane" below.)
         expect(pendingFacts(db)).toEqual([
             {
                 project_path: projectPath,
@@ -382,7 +388,7 @@ describe("historian turn one on an enabled lane", () => {
                 category: "CONSTRAINTS",
                 content: "Uploads are capped at 64 KiB.",
                 anchor_known: 1,
-                state: "in_flight",
+                state: "retryable",
                 fact_attempts: 0,
                 reason: null,
             },
@@ -393,7 +399,7 @@ describe("historian turn one on an enabled lane", () => {
                 category: "CONSTRAINTS",
                 content: "Uploads go through the gateway.",
                 anchor_known: 0,
-                state: "in_flight",
+                state: "retryable",
                 fact_attempts: 0,
                 reason: null,
             },
@@ -572,7 +578,11 @@ describe("historian turn two on an enabled lane", () => {
      * later prompt in the same child with `turnTwo(prompt)`. `events` records every
      * prompt and delete in order, by child session id.
      */
-    function twoTurnClient(directory: string, turnTwo: ((prompt: string) => string) | null) {
+    function twoTurnClient(
+        directory: string,
+        turnTwo: ((prompt: string) => string) | null,
+        beforeTurnTwo?: Promise<void>,
+    ) {
         const events: string[] = [];
         const replies = new Map<string, string>();
         const prompts = new Map<string, number>();
@@ -592,7 +602,10 @@ describe("historian turn two on an enabled lane", () => {
                         events.push(`prompt:${id}:${turn}`);
                         const text = input.body.parts[0]?.text ?? "";
                         if (turn === 1) replies.set(id, REPLY_WITH_FACTS);
-                        else if (turnTwo) replies.set(id, turnTwo(text));
+                        else {
+                            await beforeTurnTwo;
+                            if (turnTwo) replies.set(id, turnTwo(text));
+                        }
                         return {};
                     },
                 ),
@@ -636,6 +649,7 @@ describe("historian turn two on an enabled lane", () => {
         });
 
         await runHistorian(db, sessionId, client, directory, { memoryLifecycleLane: "enabled" });
+        await settleHistorianTurnTwoRuns();
 
         // Turn one and turn two go to the same child, and it is deleted only after
         // turn two; closing it in turn one's `finally` would put the delete first.
@@ -663,6 +677,50 @@ describe("historian turn two on an enabled lane", () => {
         ).toEqual(["Uploads are capped at 64 KiB.", "Uploads go through the gateway."]);
     });
 
+    it("runs turn two after the compartment run settles, outside its lease and in-progress flag", async () => {
+        useTempDataHome("turn-two-after-run-");
+        const sessionId = "ses-turn-two-after-run";
+        const directory = "/tmp/turn-two-after-run";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const { client, events } = twoTurnClient(
+            directory,
+            (prompt) =>
+                JSON.stringify({
+                    decisions: [...prompt.matchAll(/^## Fact (\d+)/gm)].map((match) => ({
+                        fact_id: Number(match[1]),
+                        action: "abstain",
+                    })),
+                }),
+            gate,
+        );
+
+        await runHistorian(db, sessionId, client, directory, { memoryLifecycleLane: "enabled" });
+        // The run has settled while turn two has not answered: a transform joining
+        // the run at high pressure no longer waits for turn two.
+        for (let tick = 0; tick < 20 && !events.includes("prompt:ses-child-1:2"); tick++)
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(events).toEqual(["prompt:ses-child-1:1", "prompt:ses-child-1:2"]);
+        expect(readSessionMeta(db, sessionId).compartmentInProgress).toBe(false);
+        // Another run can take the session's compartment lease meanwhile.
+        const holder = `next-run-${Math.random()}`;
+        expect(acquireCompartmentLease(db, sessionId, holder)).not.toBeNull();
+        releaseCompartmentLease(db, sessionId, holder);
+
+        release();
+        await settleHistorianTurnTwoRuns();
+        expect(events.at(-1)).toBe("delete:ses-child-1");
+        expect((pendingFacts(db) as Array<{ state: string }>).map((row) => row.state)).toEqual([
+            "decided_pending",
+            "decided_pending",
+        ]);
+    });
+
     it("keeps the child open while turn two is in flight", async () => {
         useTempDataHome("turn-two-in-flight-");
         const sessionId = "ses-turn-two-open";
@@ -674,6 +732,7 @@ describe("historian turn two on an enabled lane", () => {
         const { client, events } = twoTurnClient(directory, null);
 
         await runHistorian(db, sessionId, client, directory, { memoryLifecycleLane: "enabled" });
+        await settleHistorianTurnTwoRuns();
 
         expect(events).toEqual(["prompt:ses-child-1:1", "prompt:ses-child-1:2"]);
         expect(

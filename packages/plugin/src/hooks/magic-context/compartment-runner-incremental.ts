@@ -101,7 +101,7 @@ import {
     finishHistorianPublishStage,
     startHistorianPublishStage,
 } from "./historian-publish-stage-logger";
-import { runHistorianTurnTwo } from "./historian-turn-two-step";
+import { scheduleHistorianTurnTwo } from "./historian-turn-two-step";
 import { snapTerminalCompartmentToServedRow } from "./host-served-rows";
 import { clearInjectionCache } from "./inject-compartments";
 import { onNoteTrigger } from "./note-nudger";
@@ -273,8 +273,8 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
     let issueNotified = false;
     // On an enabled memory-lifecycle lane, the hidden historian child that produced
     // the published turn-one reply stays open so turn two runs in the same session.
-    // `finally` closes it, unless turn two is still awaiting an outcome (its facts
-    // stay `in_flight`); a later run's recovery or the child's deletion closes it.
+    // After publication it is handed to the scheduled turn two; on every other exit
+    // `finally` closes it.
     let retainedChild: RetainedHistorianChild | undefined;
     let drainReservation: ReturnType<typeof reserveProtectedTailDrainTokens>["reservation"] = null;
 
@@ -1522,13 +1522,17 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
 
         // Turn two: on an enabled lane, reconcile this publication's candidates (and
         // the project's retryable backlog) with existing memory on the same child.
+        // It runs as its own task after this run settles (see
+        // `scheduleHistorianTurnTwo`), which takes over the child.
         if (retainedChild) {
-            const turnTwo = await runHistorianTurnTwo({
+            const child = retainedChild;
+            retainedChild = undefined;
+            scheduleHistorianTurnTwo({
                 db,
                 sessionId,
                 projectPath: publicationProjectPath,
                 publicationId: turnOneSend.publicationId,
-                child: retainedChild,
+                child,
                 harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
                 carrier: deps.hiddenCompletionExecutor ? "hidden-completion" : "opencode-session",
                 memoryEnabled: deps.memoryEnabled !== false,
@@ -1537,7 +1541,6 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 validatedProfiles: deps.memoryLifecycleValidatedProfiles,
                 embedQuery: deps.memoryLifecycleEmbedQuery,
             });
-            if (turnTwo.childInFlight) retainedChild = undefined;
         }
     } catch (error: unknown) {
         const desc = describeError(error);
