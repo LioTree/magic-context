@@ -85,7 +85,7 @@ export const TURN_TWO_UNREACHABLE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
  */
 export const TURN_TWO_PROMPT_MAX = 160_000;
 
-/** Stage states after which nothing of the stage is in flight. */
+/** Stage states in which a turn-two send may still be awaiting or resolving its reply. */
 const OPEN_STAGE_STATES = ["reserved", "sending", "replied"] as const;
 
 /** What a carrier hands back for one turn-two send. */
@@ -154,8 +154,9 @@ export interface TurnTwoCarrier extends TurnTwoCheckCarrier {
      */
     readonly baseline?: string;
     /**
-     * Hash of the historian system prompt and the configured variant, stored on the
-     * stage record so a reply recovered later carries the profile it ran on.
+     * Hash of the historian system prompt and the model variant configured for the
+     * historian (for example a reasoning level), stored on the stage record so a reply
+     * recovered later carries the profile it ran on.
      */
     readonly historianSystemHash?: string;
     readonly variant?: string | null;
@@ -181,7 +182,9 @@ export interface TurnTwoStageRecord {
 
 /**
  * Returns a handle on the carrier of an earlier stage; null when this process cannot
- * reach that carrier (another carrier kind or harness, or no child id); or "busy"
+ * reach that carrier (the stage was sent through another carrier kind, for example
+ * a different host transport, or another harness, or it recorded no child session);
+ * or "busy"
  * when a live run may still be working on the stage, so recovery leaves it alone
  * this time without counting a visit.
  */
@@ -324,7 +327,8 @@ export function selectTurnTwoFacts(
  * key of the send). The resolving transaction records a receipt under it, so
  * recovery of the same send never applies a decision twice. The stage key makes it
  * unique per send: a receipt that left the fact `retryable` without charging an
- * attempt (memory authority moved away meanwhile) can never answer a later resend.
+ * attempt (the Rust module took over the project's memory while the reply was being
+ * produced, so nothing could be applied here) can never answer a later resend.
  */
 export function turnTwoDecisionKey(
     projectPath: string,
@@ -445,7 +449,9 @@ function reserveTurnTwo(
             const availableItems = promptItems(db, items);
             // Fit the batch to `TURN_TWO_PROMPT_MAX`: facts first (this publication's,
             // then backlog), then items, each taken only while the prompt still fits.
-            // The first fact is always sent, since a memory is never truncated. What is
+            // The first fact in that order is sent even when it alone exceeds the
+            // bound: nothing in a fact's rendering may be cut, so there is no smaller
+            // form to send. What is
             // left out is released unreserved, consumes no attempt, and is named in the
             // prompt's coverage notice.
             const reserved: FactRow[] = [];
@@ -903,7 +909,7 @@ function countRecoveryVisit(db: Database, stageKey: string): number {
 /**
  * Reattach every open turn-two stage of the project: a recorded reply is resolved
  * without a second send; otherwise the stage's carrier is asked for the outcome
- * under the original stage key. Every stage leaves flight in bounded time:
+ * under the original stage key. No stage keeps its facts `in_flight` indefinitely:
  * - a carrier that reports the send or child gone charges one attempt at once;
  * - an outcome still unknown after `TURN_TWO_UNKNOWN_MAX_VISITS` counted visits, a
  *   stage no carrier here can reach for `TURN_TWO_UNREACHABLE_MAX_AGE_MS`, and a

@@ -258,7 +258,8 @@ describe("runClassify disposition", () => {
             const scoredItem = Number(
                 enqueue.run(projectIdentity, scored.id, "part-scored").lastInsertRowid,
             );
-            // The historian's score is recorded as turn two records it.
+            // Record the historian's importance score for the saved memory the way turn two
+            // does (recordItemScores), which also stamps the row as classified.
             recordItemScores(
                 db,
                 [scoredItem],
@@ -313,7 +314,8 @@ describe("runClassify disposition", () => {
                     )
                     .run(projectIdentity, saved.id).lastInsertRowid,
             );
-            // Three turn-two sends carried it and none scored it.
+            // Three historian turn-two requests carried this item, and none recorded a
+            // score for it: it is out of attempts.
             for (let attempt = 1; attempt <= 3; attempt++)
                 db.prepare(
                     "INSERT INTO memory_stage_attempts(stage_key,project_path,publication_id,run_attempt,stage,session_id,carrier,state,request_json,started_at) VALUES(?,?,'pub',?,'turn_two','ses','stub','resolved',?,1)",

@@ -46,187 +46,184 @@ function textOf(message: unknown): string {
 		.join("");
 }
 
-test(
-	"review probe: an applied turn-two edit is invisible on Pi SOFT and defer passes and appears at the next genuine HARD",
-	async () => {
-		const f = createProjectionFixture("s6-review-pi", createTestDb);
-		try {
-			const [session] = f.sessions;
-			const state = (cacheExpired = false) => ({
-				sessionId: session,
-				projectIdentity: f.projectPath,
-				projectDirectory: f.directory,
-				injectDocs: false,
-				hardSignals: {
-					systemHash: "system",
-					modelKey: "anthropic/claude",
-					cacheExpired,
-					lastResponseTime: cacheExpired ? Date.now() + 60_000 : 1,
-				},
-			});
-			const pass = (busting: boolean, cacheExpired = false) => {
-				const messages: Parameters<typeof injectM0M1Pi>[2] = [];
-				const result = injectM0M1Pi(
-					state(cacheExpired),
-					f.db,
-					messages,
-					undefined,
-					busting,
-				);
-				return {
-					m0: textOf(messages[0]),
-					m1: textOf(messages[1]),
-					materialized: result.m0Materialized,
-				};
-			};
-			const memory = insertMemory(f.db, {
-				projectPath: f.projectPath,
-				category: "CONSTRAINTS",
-				content: "Old rule. Keep rule.",
-			});
-			materializeM0Pi(state(), f.db);
-			const before = pass(true);
-			expect(before.m0).toContain("Old rule. Keep rule.");
-			const send = allocateTurnOneSend(f.db, {
-				projectPath: f.projectPath,
-				sessionId: session,
-				harness: "pi",
-				carrier: "test",
-				lane: "enabled",
-				chunkStart: 1,
-				chunkEnd: 50,
-			});
-			f.db.transaction(() =>
-				commitTurnOnePublication(f.db, {
-					send,
-					projectPath: f.projectPath,
-					sessionId: session,
-					compartments: [
-						{
-							id: 1,
-							startMessage: 1,
-							endMessage: 50,
-							replyStartMessage: 1,
-							replyEndMessage: 50,
-						},
-					],
-					blocks: [
-						{
-							role: "user",
-							startOrdinal: 42,
-							endOrdinal: 42,
-							parts: ["New rule."],
-						},
-					],
-					candidateFacts: [
-						{
-							category: "CONSTRAINTS",
-							content: "New rule replaces the old one",
-							anchor: { compartmentIndex: 1, startOrdinal: 42, endOrdinal: 42 },
-						},
-					],
-					honourAnchors: true,
-				}),
-			)();
-			const logRows = () =>
-				(
-					f.db
-						.prepare("SELECT COUNT(*) AS n FROM memory_mutation_log")
-						.get() as { n: number }
-				).n;
-			const logBefore = logRows();
-			const result = await runTurnTwo(f.db, {
-				projectPath: f.projectPath,
-				publicationId: send.publicationId,
-				sessionId: session,
-				lane: "enabled",
-				carrier: {
-					carrier: "stub",
-					harness: "pi",
-					enforcedJson: true,
-					childSessionId: "pi-child",
-					async send(prompt) {
-						const ids = [...prompt.matchAll(/^## Fact (\d+)/gm)].map((match) =>
-							Number(match[1]),
-						);
-						return {
-							text: JSON.stringify({
-								decisions: ids.map((id) => ({
-									fact_id: id,
-									action: "edit",
-									target_id: memory.id,
-									revision: 1,
-									removed: [],
-									replaced: [
-										{
-											memory_id: memory.id,
-											clause: 1,
-											block: 42,
-											excerpt: "New rule.",
-										},
-									],
-									kept: [{ memory_id: memory.id, clause: 2 }],
-									added: [
-										{ text: "New rule. ", block: 42, excerpt: "New rule." },
-									],
-									final_text: "New rule. Keep rule.",
-								})),
-							}),
-							lengthCapped: false,
-							profile: PROFILE,
-						};
-					},
-					async check(request: CheckRequest) {
-						const passing =
-							request.kind === "disproof" || request.kind === "support"
-								? "yes"
-								: "no";
-						return {
-							verdicts: (request.kind === "compatibility"
-								? request.pairs
-								: request.operands
-							).map((operand) => ({
-								id: operand.id,
-								verdict: passing as "yes" | "no",
-							})),
-							profile: { ...PROFILE, systemHash: request.systemHash },
-							usage: null,
-						};
-					},
-				},
-				memoryEnabled: true,
-				autoPromote: true,
-				validatedProfiles: [
-					PROFILE,
-					...Object.values(CHECK_SYSTEM_PROMPTS).map((system) => ({
-						...PROFILE,
-						systemHash: lifecycleTextHash(system),
-					})),
-				],
-			});
-			expect(result.status).toBe("resolved");
-			expect(getMemoryById(f.db, memory.id)?.content).toBe(
-				"New rule. Keep rule.",
+test("review probe: an applied turn-two edit is invisible on Pi SOFT and defer passes and appears at the next genuine HARD", async () => {
+	const f = createProjectionFixture("s6-review-pi", createTestDb);
+	try {
+		const [session] = f.sessions;
+		const state = (cacheExpired = false) => ({
+			sessionId: session,
+			projectIdentity: f.projectPath,
+			projectDirectory: f.directory,
+			injectDocs: false,
+			hardSignals: {
+				systemHash: "system",
+				modelKey: "anthropic/claude",
+				cacheExpired,
+				lastResponseTime: cacheExpired ? Date.now() + 60_000 : 1,
+			},
+		});
+		const pass = (busting: boolean, cacheExpired = false) => {
+			const messages: Parameters<typeof injectM0M1Pi>[2] = [];
+			const result = injectM0M1Pi(
+				state(cacheExpired),
+				f.db,
+				messages,
+				undefined,
+				busting,
 			);
-			expect(logRows()).toBe(logBefore);
-			f.gate.blocking = true;
-			try {
-				for (const busting of [true, false, true, false]) {
-					const served = pass(busting);
-					expect(served.m0).toBe(before.m0);
-					expect(served.m1).toBe(before.m1);
-					expect(served.materialized).toBe(false);
+			return {
+				m0: textOf(messages[0]),
+				m1: textOf(messages[1]),
+				materialized: result.m0Materialized,
+			};
+		};
+		const memory = insertMemory(f.db, {
+			projectPath: f.projectPath,
+			category: "CONSTRAINTS",
+			content: "Old rule. Keep rule.",
+		});
+		materializeM0Pi(state(), f.db);
+		const before = pass(true);
+		expect(before.m0).toContain("Old rule. Keep rule.");
+		const send = allocateTurnOneSend(f.db, {
+			projectPath: f.projectPath,
+			sessionId: session,
+			harness: "pi",
+			carrier: "test",
+			lane: "enabled",
+			chunkStart: 1,
+			chunkEnd: 50,
+		});
+		f.db.transaction(() =>
+			commitTurnOnePublication(f.db, {
+				send,
+				projectPath: f.projectPath,
+				sessionId: session,
+				compartments: [
+					{
+						id: 1,
+						startMessage: 1,
+						endMessage: 50,
+						replyStartMessage: 1,
+						replyEndMessage: 50,
+					},
+				],
+				blocks: [
+					{
+						role: "user",
+						startOrdinal: 42,
+						endOrdinal: 42,
+						parts: ["New rule."],
+					},
+				],
+				candidateFacts: [
+					{
+						category: "CONSTRAINTS",
+						content: "New rule replaces the old one",
+						anchor: { compartmentIndex: 1, startOrdinal: 42, endOrdinal: 42 },
+					},
+				],
+				honourAnchors: true,
+			}),
+		)();
+		const logRows = () =>
+			(
+				f.db.prepare("SELECT COUNT(*) AS n FROM memory_mutation_log").get() as {
+					n: number;
 				}
-			} finally {
-				f.gate.blocking = false;
+			).n;
+		const logBefore = logRows();
+		const result = await runTurnTwo(f.db, {
+			projectPath: f.projectPath,
+			publicationId: send.publicationId,
+			sessionId: session,
+			lane: "enabled",
+			carrier: {
+				carrier: "stub",
+				harness: "pi",
+				enforcedJson: true,
+				childSessionId: "pi-child",
+				async send(prompt) {
+					const ids = [...prompt.matchAll(/^## Fact (\d+)/gm)].map((match) =>
+						Number(match[1]),
+					);
+					return {
+						text: JSON.stringify({
+							decisions: ids.map((id) => ({
+								fact_id: id,
+								action: "edit",
+								target_id: memory.id,
+								revision: 1,
+								removed: [],
+								replaced: [
+									{
+										memory_id: memory.id,
+										clause: 1,
+										block: 42,
+										excerpt: "New rule.",
+									},
+								],
+								kept: [{ memory_id: memory.id, clause: 2 }],
+								added: [
+									{ text: "New rule. ", block: 42, excerpt: "New rule." },
+								],
+								final_text: "New rule. Keep rule.",
+							})),
+						}),
+						lengthCapped: false,
+						profile: PROFILE,
+					};
+				},
+				async check(request: CheckRequest) {
+					const passing =
+						request.kind === "disproof" || request.kind === "support"
+							? "yes"
+							: "no";
+					return {
+						verdicts: (request.kind === "compatibility"
+							? request.pairs
+							: request.operands
+						).map((operand) => ({
+							id: operand.id,
+							verdict: passing as "yes" | "no",
+						})),
+						profile: { ...PROFILE, systemHash: request.systemHash },
+						usage: null,
+					};
+				},
+			},
+			memoryEnabled: true,
+			autoPromote: true,
+			validatedProfiles: [
+				PROFILE,
+				...Object.values(CHECK_SYSTEM_PROMPTS).map((system) => ({
+					...PROFILE,
+					systemHash: lifecycleTextHash(system),
+				})),
+			],
+		});
+		expect(result.status).toBe("resolved");
+		expect(getMemoryById(f.db, memory.id)?.content).toBe(
+			"New rule. Keep rule.",
+		);
+		expect(logRows()).toBe(logBefore);
+		f.gate.blocking = true;
+		try {
+			for (const busting of [true, false, true, false]) {
+				const served = pass(busting);
+				expect(served.m0).toBe(before.m0);
+				expect(served.m1).toBe(before.m1);
+				expect(served.materialized).toBe(false);
 			}
-			expect(f.gate.blocked).toEqual([]);
-			const hard = pass(true, true);
-			expect(hard.materialized).toBe(true);
-			expect(hard.m0).toContain("New rule. Keep rule.");
-			expect(hard.m0).not.toContain("Old rule.");
 		} finally {
-			f.close();
+			f.gate.blocking = false;
 		}
-	},
-);
+		expect(f.gate.blocked).toEqual([]);
+		const hard = pass(true, true);
+		expect(hard.materialized).toBe(true);
+		expect(hard.m0).toContain("New rule. Keep rule.");
+		expect(hard.m0).not.toContain("Old rule.");
+	} finally {
+		f.close();
+	}
+});

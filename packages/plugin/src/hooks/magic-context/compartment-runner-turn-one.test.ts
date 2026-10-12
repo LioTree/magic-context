@@ -377,9 +377,11 @@ describe("historian turn one on an enabled lane", () => {
 
         const newRow = getCompartments(db, sessionId)[1]!;
         expect(newRow.id).not.toBe(olderRowId);
-        // Turn two runs as its own task once this run has settled; it has not started
-        // yet, so the candidates are as turn one published them. (Turn two on this
-        // stub host is covered in "historian turn two on an enabled lane" below.)
+        // The candidate facts turn one published. Turn two (which reconciles them) runs
+        // as a separate task scheduled after the compartment run settles, so right
+        // after `runHistorian` returns it has not started and the facts are still as
+        // published. Turn two itself is covered in "historian turn two on an enabled
+        // lane" below.
         expect(pendingFacts(db)).toEqual([
             {
                 project_path: projectPath,

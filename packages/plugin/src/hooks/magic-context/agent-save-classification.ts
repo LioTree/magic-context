@@ -2,9 +2,10 @@
  * Where a `ctx_memory` save happened, so the historian can score the saved memory
  * (an agent-memory classification item, see memory/turn-two-scoring.ts).
  *
- * Only a lane whose historian runs turn two scores agent saves (`resolveTurnOneLane`);
- * on a dormant lane, which every production lane is today, no item is enqueued and
- * dreamer classify scores the row as before.
+ * Only an enabled lane, whose historian runs turn two, scores agent saves. A lane is
+ * dormant (`resolveTurnOneLane`) until its transport makes the provider enforce the
+ * turn-two response schema, and every production lane is dormant today: there no
+ * item is enqueued and dreamer classify scores the row as before.
  */
 import {
     resolveTurnOneLane,

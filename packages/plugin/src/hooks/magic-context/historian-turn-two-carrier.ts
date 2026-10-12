@@ -177,8 +177,10 @@ async function sendCheck(
         parentSessionId,
         agent: child.agent,
         kind: "historian",
-        // Checks wait only for each other, never for the historian child that turn
-        // two keeps open (OpenCode 2 serializes hidden runs per role).
+        // Narrow checks queue only behind other narrow checks. OpenCode 2 runs one
+        // hidden run per role at a time, and turn two keeps its historian child open
+        // while it waits on these checks, so queuing them as historian runs would
+        // never let them start.
         metadata: { memoryCheck: true },
         system: request.system,
         model: child.model,
@@ -232,8 +234,9 @@ async function sendCheck(
 }
 
 /**
- * Reach a turn-two stage an earlier run or process left in flight, for records of
- * this carrier kind and harness.
+ * Recovery access to a turn-two send that an earlier run or process left without a
+ * known outcome (its stage record still open), for records sent through this
+ * carrier kind and harness.
  * - A child this process retained for turn two is reached through the handle the
  *   executor issued for it (OpenCode 2 knows its runs only by that object). While a
  *   turn two here is still working on it, the stage is "busy".
@@ -268,8 +271,9 @@ export function createOpenCodeTurnTwoRecovery(args: {
                 try {
                     completion = await args.executor.collect(handle, 50);
                 } catch {
-                    // A retained child's run exists but has not settled; an unknown
-                    // one is no longer there.
+                    // For a child retained in this process the run still exists, so a
+                    // failed read means its reply has not settled yet. A child known
+                    // only by session id that cannot be read no longer exists.
                     return retained ? { kind: "unknown" } : { kind: "gone" };
                 }
                 if (!completion.text || lifecycleTextHash(completion.text) === record.baseline)

@@ -121,8 +121,10 @@ export interface HiddenCompletionExecutor {
     /** Kept separate from prompt settlement so read failures never resend a historian prompt. */
     collect(handle: HiddenRunHandle, limit: number): Promise<HiddenCompletion>;
     /**
-     * Stop holding the run's concurrency slot while keeping its child open, for a
-     * historian child kept open for turn two. Optional: carriers without slots omit it.
+     * Release the run's place in the executor's per-role queue (OpenCode 2 runs one
+     * hidden historian run at a time) while its child session stays open, for a
+     * historian child kept open for turn two. Executors without such a queue omit
+     * this method.
      */
     detach?(handle: HiddenRunHandle): void;
     close(
