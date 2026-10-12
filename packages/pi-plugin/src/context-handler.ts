@@ -1330,6 +1330,7 @@ export interface PiSchedulerOptions {
 }
 
 export interface PiContextHandlerOptions {
+	signedThinkingHold?: "off" | "on";
 	/** Report postprocessing's actual cache-bust permission; changed bytes alone do not authorize a bust. */
 	onPostprocess?: (result: { bustedThisPass: boolean }) => void;
 	cacheTtlConfig?: import("@magic-context/core/shared/model-cache-ttl").CacheTtlConfig;
@@ -3696,6 +3697,7 @@ export function registerPiContextHandler(
 					protectedTools: options.protectedTools,
 					protectedTags: options.protectedTags ?? 20,
 					protectedTokens: options.protectedTokens,
+					signedThinkingHold: options.signedThinkingHold,
 					protectedTokenTierOverrides: options.protectedTokenTierOverrides,
 					usableSoft:
 						windowGeometry?.usableSoft ?? usageContextLimit ?? 200_000,
@@ -5603,6 +5605,7 @@ function maybeFireHistorian(args: {
 	}
 }
 interface RunPipelineArgs {
+	signedThinkingHold?: "off" | "on";
 	resolvedProviderID?: string;
 	resolvedModelID?: string;
 	assertCurrentPass?: () => void;
@@ -5963,6 +5966,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	);
 	const protectedSignedPrefix =
 		activeThinkingTurn && args.reasoningClearing?.prefixBound === true;
+	const holdEnabled = args.signedThinkingHold === "on";
 	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
 		resolvePiStableId(
 			msg,
@@ -6282,13 +6286,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			)
 		: { value: false, reason: null };
 	const firstRenderBust =
-		!protectedSignedPrefix &&
+		!(holdEnabled && protectedSignedPrefix) &&
 		piM0State !== undefined &&
 		!(
 			injectionPassSnapshot?.cachedRow?.cached_m0_bytes &&
 			injectionPassSnapshot.cachedRow.cached_m1_bytes
 		);
 	const firstRenderHeld =
+		holdEnabled &&
 		protectedSignedPrefix &&
 		piM0State !== undefined &&
 		!(
@@ -6430,19 +6435,23 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		!args.sessionMeta.isSubagent &&
 		executePressureEligible &&
 		routinePressureAppliedBySession.get(args.sessionId) === true;
-	const parkedTriggers =
-		parkedBustTriggersBySession.get(args.sessionId) ?? new ParkedBustTriggers();
-	parkedBustTriggersBySession.set(args.sessionId, parkedTriggers);
+	if (!holdEnabled) parkedBustTriggersBySession.delete(args.sessionId);
+	const parkedTriggers = holdEnabled
+		? (parkedBustTriggersBySession.get(args.sessionId) ??
+			new ParkedBustTriggers())
+		: undefined;
+	if (parkedTriggers)
+		parkedBustTriggersBySession.set(args.sessionId, parkedTriggers);
 	const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
-	const triggerPermissions = parkedTriggers.permissions(
+	const triggerPermissions = parkedTriggers?.permissions(
 		protectedSignedPrefix,
 		hasPendingMaterializeSignal ||
 			deferredMaterializationSessions.has(args.sessionId),
 		emergencyDropEligible,
-	);
+	) ?? { materialization: true, force: true };
 	if (firstRenderHeld) {
 		signalPiPendingMaterialization(args.sessionId);
-		parkedTriggers.holdMaterialization();
+		parkedTriggers?.holdMaterialization();
 	}
 	// Subagents have no history fold to ride. Their execute pass admits every
 	// eligible cleanup lane together, without rewriting bytes when none acts.
@@ -6467,9 +6476,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				(canConsumeDeferredLate && deferredHistoryWasPendingAtPassStart)),
 	};
 	const isCacheBustingPass = hasReclaimRide(rideSignals);
-	const materializationHeld = protectedSignedPrefix && piM0State !== undefined;
+	const materializationHeld =
+		holdEnabled && protectedSignedPrefix && piM0State !== undefined;
 	if (materializationHeld && rideSignals.explicitFlush)
-		parkedTriggers.holdMaterialization();
+		parkedTriggers?.holdMaterialization();
 	if (args.temporalAwareness && isCacheBustingPass) {
 		temporalDecisions = freezeTemporalDecisions(
 			args.db,
@@ -6514,7 +6524,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			rideSignals.subagentExecute ||
 			(args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn));
 	if (protectedSignedPrefix && rideSignals.force && shouldRunHeuristics)
-		parkedTriggers.holdForce();
+		parkedTriggers?.holdForce();
 
 	// 1. Tagging: assigns tag numbers + injects §N§ prefixes when ctx_reduce
 	// is callable. DB-side tag IDs still get created when prefixes are skipped
@@ -6805,14 +6815,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		rideSignals.explicitFlush &&
 		pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
 	)
-		parkedTriggers.holdMaterialization();
+		parkedTriggers?.holdMaterialization();
 	if (
+		holdEnabled &&
 		args.schedulerDecision === "execute" &&
 		!emergencyDropEligible &&
 		pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
 	) {
 		signalPiPendingMaterialization(args.sessionId);
-		parkedTriggers.holdMaterialization();
+		parkedTriggers?.holdMaterialization();
 	}
 	const protectedToolTags = protectedToolTagNumbers(
 		getActiveTagsBySession(args.db, args.sessionId),
@@ -8157,13 +8168,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			)
 			.map((tag) => tag.tagNumber),
 	);
-	parkedTriggers.settle(
+	parkedTriggers?.settle(
 		hasPendingMaterialization(args.sessionId) ||
 			deferredMaterializationSessions.has(args.sessionId),
 		emergencyDropEligible &&
 			getEmergencyInputSample(args.db, args.sessionId) === 0,
 	);
-	if (!parkedTriggers.pending)
+	if (!parkedTriggers?.pending)
 		parkedBustTriggersBySession.delete(args.sessionId);
 	return {
 		messages: outputMessages,
@@ -8185,7 +8196,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			prefixEditBesidesReasoningTrim ||
 			firstRenderBust ||
 			args.isCacheBusting ||
-			(isCacheBustingPass && hasPendingMaterializeSignal) ||
+			((!holdEnabled || isCacheBustingPass) && hasPendingMaterializeSignal) ||
 			deferredMaterializationConsumedThisPass ||
 			foldBustsServedPrefixThisPass ||
 			publishedM1RefreshedThisPass ||

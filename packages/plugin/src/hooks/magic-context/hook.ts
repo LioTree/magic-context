@@ -192,6 +192,7 @@ export interface MagicContextDeps {
         };
         transform_mode?: ResolvedTransformMode;
         rust_pipeline?: "full_request" | "provider";
+        signed_thinking_hold?: "off" | "on";
         /** Path to the subc daemon's connection file. Threaded to the module
          *  transport so a host that publishes it outside the default data-dir
          *  location (e.g. a systemd RuntimeDirectory) is actually reachable. */
@@ -835,6 +836,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         maybeAutoEmbedSession,
         transformMode: deps.config.transform_mode,
         rustPipeline: deps.config.rust_pipeline,
+        signedThinkingHold: deps.config.signed_thinking_hold,
         promptSurface: deps.config.prompt_surface,
         promptSurfaceRuntime: deps.promptSurfaceRuntime,
         rustModeModuleClient,

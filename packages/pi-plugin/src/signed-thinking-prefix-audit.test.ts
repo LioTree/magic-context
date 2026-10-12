@@ -293,6 +293,7 @@ async function fixture(
 		},
 		db,
 		protectedTokens: 4000,
+		signedThinkingHold: "on",
 		todowriteEnabled: true,
 		injection: injectionEnabled
 			? {

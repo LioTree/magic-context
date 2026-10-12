@@ -310,6 +310,7 @@ async function fixture(
             },
             db,
             storeGeneration: generation,
+            signedThinkingHold: "on",
             tagger: createTagger(),
             scheduler: { shouldExecute: () => decision } as never,
             liveModelBySession: liveModel,

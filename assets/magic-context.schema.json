@@ -50,6 +50,15 @@
         "provider"
       ]
     },
+    "signed_thinking_hold": {
+      "default": "off",
+      "description": "Experimental, user-level only: park withheld signed-thinking triggers and release them on a later safe pass. Off by default; existing thinking-binding protections remain enabled.",
+      "type": "string",
+      "enum": [
+        "off",
+        "on"
+      ]
+    },
     "auto_update": {
       "description": "Enable automatic npm self-update checks for the OpenCode plugin. Security: USER-only in config loader, so hostile project configs cannot suppress updates.",
       "type": "boolean"

@@ -1,10 +1,10 @@
 import { describe, expect, it } from "bun:test";
-
 import {
     constrainProjectThresholdOverrides,
     dropInheritedEmbeddingKeyOnRedirect,
     stripUnsafeProjectConfigFields,
 } from "./project-security";
+import { MagicContextConfigSchema } from "./schema/magic-context";
 
 describe("stripUnsafeProjectConfigFields", () => {
     it("strips profile definitions from project config but leaves profile selection", () => {
@@ -461,4 +461,19 @@ it("rust_pipeline is user-only while a project may still select the transform im
     expect(warnings).toEqual([
         "Ignoring rust_pipeline from project config (security: only user-level config may select the Rust provider pipeline).",
     ]);
+});
+
+it("signed_thinking_hold is off by default and cannot be changed by a project", () => {
+    expect(MagicContextConfigSchema.parse({}).signed_thinking_hold).toBe("off");
+    expect(MagicContextConfigSchema.safeParse({ signed_thinking_hold: true }).success).toBe(false);
+    for (const projectValue of ["off", "on"]) {
+        const raw: Record<string, unknown> = { signed_thinking_hold: projectValue };
+        const warnings = stripUnsafeProjectConfigFields(raw);
+        expect(raw).toEqual({});
+        expect(warnings).toHaveLength(1);
+        expect(
+            MagicContextConfigSchema.parse({ signed_thinking_hold: "on", ...raw })
+                .signed_thinking_hold,
+        ).toBe("on");
+    }
 });

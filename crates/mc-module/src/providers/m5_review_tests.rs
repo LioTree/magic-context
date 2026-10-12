@@ -362,6 +362,7 @@ fn review_full_native(
         protected_tokens_floor: config.resolve_protected_tokens(100000).floor,
         protected_tokens_provenance: "derived",
         compaction_enabled: config.compaction_enabled,
+        signed_thinking_hold: config.signed_thinking_hold,
         smart_drops: config.smart_drops,
         protected_tools: config.protected_tools.clone(),
         cache_ttl: config

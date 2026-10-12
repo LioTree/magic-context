@@ -933,6 +933,8 @@ export interface MagicContextConfig {
     transform_mode: "ts" | "rust";
     /** Opt-in host provider pipeline; full_request preserves the existing Rust adapter. */
     rust_pipeline?: "full_request" | "provider";
+    /** User-only opt-in for unfinished signed-thinking trigger parking and release obligations. */
+    signed_thinking_hold?: "off" | "on";
     /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
      *  USER config only; project configs cannot disable it. Default: true. */
     auto_update?: boolean;
@@ -1145,6 +1147,12 @@ export const MagicContextConfigSchema = z
             .default("full_request")
             .describe(
                 'Experimental, user-level only, not for production use: off by default (full_request). The provider pipeline applies only with transform_mode: "rust" on OpenCode; full_request keeps the legacy request adapter.',
+            ),
+        signed_thinking_hold: z
+            .enum(["off", "on"])
+            .default("off")
+            .describe(
+                "Experimental, user-level only: park withheld signed-thinking triggers and release them on a later safe pass. Off by default; existing thinking-binding protections remain enabled.",
             ),
         auto_update: z
             .boolean()

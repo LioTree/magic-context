@@ -561,6 +561,8 @@ struct LegacyCkItemWire {
 /// transform. Production ALWAYS supplies it; it carries the render inputs (budget,
 /// expiry cutoff) so the frozen render decision preserves them and later passes replay identical bytes.
 pub struct ProducerContext<'a> {
+    /// Resolved from trusted user configuration, never from a project or transcript.
+    pub signed_thinking_hold: crate::config::SignedThinkingHold,
     /// The project identity the store reads key off (memories, mutation log, workspace).
     pub project_path: &'a str,
     /// The note owner key resolved for this route's notes authority. Keeping it separate
@@ -5438,20 +5440,39 @@ fn apply_once(
     // below can authorize new provider-visible mutations.
     // Subagents execute a reductions-only branch, not the prefix plan. Inherited
     // HARD/reconcile advisories cannot price automatic reductions without a fold.
-    let admission = edit_admission_for_request(&loaded.core, req);
-    let protected_signed_prefix = !admission.admit(crate::edit_admission::EditCoord::Prefix);
+    let hold_enabled = ctx.signed_thinking_hold == crate::config::SignedThinkingHold::On;
+    let admission = if hold_enabled {
+        edit_admission_for_request(&loaded.core, req)
+    } else {
+        crate::edit_admission::EditAdmission::new(&[], false)
+    };
+    // Always keep the cached history head unchanged during a signed-thinking turn.
+    // The opt-in admission instead locates thinking after replaying saved removals,
+    // so withheld flush/force triggers can be parked until a later safe request.
+    let protected_signed_prefix = if hold_enabled {
+        !admission.admit(crate::edit_admission::EditCoord::Prefix)
+    } else {
+        active_anthropic_thinking_turn(req)
+            && is_prefix_bound_thinking_model(req.model_key.as_deref())
+    };
     // For models whose signatures bind thinking to preceding bytes, Anthropic rejects
     // changes before a resent block. The Claude Code serializer keeps completed-turn
     // blocks, so releasing a parked /ctx-flush at the next user turn would be rejected.
     // Rollout step 8 in docs/designs/signed-thinking-hold.md removes completed-turn
     // thinking before parking withheld flushes. Until then, consume flushes without parking.
-    let trigger_holds_enabled = serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic);
-    let mut held_release = HeldRelease::from_meta(&loaded.meta);
-    held_release.cancel_inactive(
-        loaded.meta.soft_refresh_pending,
-        usage_percentage,
-        ctx.execute_threshold_percentage,
-    );
+    let trigger_holds_enabled =
+        hold_enabled && serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic);
+    let mut held_release = if trigger_holds_enabled {
+        let mut release = HeldRelease::from_meta(&loaded.meta);
+        release.cancel_inactive(
+            loaded.meta.soft_refresh_pending,
+            usage_percentage,
+            ctx.execute_threshold_percentage,
+        );
+        release
+    } else {
+        HeldRelease::default()
+    };
     let flush_armed = loaded.meta.soft_refresh_pending
         && !(trigger_holds_enabled && protected_signed_prefix && held_release.has("soft_refresh"));
     let prefix_materialization_enabled = !req.is_subagent && !protected_signed_prefix;
@@ -7737,7 +7758,7 @@ fn apply_once(
             (unit.key.starts_with("red:")
                 || unit.key.starts_with(CAV_KEY_PREFIX)
                 || (unit.key.starts_with("strip:")
-                    && !unit.key.starts_with("strip:trailing_blank_")
+                    && (!hold_enabled || !unit.key.starts_with("strip:trailing_blank_"))
                     && !unit.kind.ends_with("_keep")
                     && unit.reset_rule != SYSTEM_STRIP_PENDING))
                 && !loaded.core.frozen_units.iter().any(|old| {
@@ -17913,6 +17934,13 @@ fn has_anthropic_reasoning_metadata(block: &CkWireBlock) -> bool {
             .is_some_and(serde_json::Value::is_object)
 }
 
+fn active_anthropic_thinking_turn(req: &TransformRequest) -> bool {
+    let protected = protected_thinking_turn_mids(req);
+    req.messages
+        .iter()
+        .any(|m| protected.contains(m.mid.as_str()) && m.ck.content.iter().any(is_reasoning_block))
+}
+
 // Only authorized work actually withheld adds entries. An entry parks its trigger while
 // thinking is kept without spending it; the saved reason belongs to the later release.
 #[derive(Default, Deserialize, Serialize)]
@@ -21882,6 +21910,7 @@ pub(crate) mod tests {
             protected_tokens_floor: 16_000,
             protected_tokens_provenance: "derived",
             compaction_enabled: true,
+            signed_thinking_hold: crate::config::SignedThinkingHold::Off,
             smart_drops: false,
             protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),

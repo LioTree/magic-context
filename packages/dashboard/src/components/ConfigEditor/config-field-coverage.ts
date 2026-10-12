@@ -143,6 +143,8 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
     "experimental project-wide Rust runtime cutover; requires user-level subc configuration and is not exposed in the dashboard yet",
   rust_pipeline:
     "experimental user-only Rust provider pipeline; applies only to OpenCode with Rust transform mode and remains editable in Raw JSONC",
+  signed_thinking_hold:
+    "experimental user-only signed-thinking trigger parking; off by default and editable in Raw JSONC",
   fail_closed_blocking:
     "user-only inoperability policy; raw JSONC because project configs cannot change it",
   "smart_notes.retina_handoff":

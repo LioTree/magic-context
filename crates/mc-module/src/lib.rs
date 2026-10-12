@@ -4883,6 +4883,7 @@ impl McHandler {
                 protected_tokens_project: None,
                 keep_reasoning_tokens: None,
                 compaction_enabled: true,
+                signed_thinking_hold: config::SignedThinkingHold::Off,
                 memory_enabled: true,
                 auto_search: crate::config::AutoSearchConfig::default(),
                 caveman: crate::config::CavemanConfig::default(),
@@ -10532,6 +10533,7 @@ impl McHandler {
                     .map_err(transform::TransformError::Store)?
                 };
             let producer_ctx = transform::ProducerContext {
+                signed_thinking_hold: binding.config.signed_thinking_hold,
                 project_path: &project_path,
                 note_project_path: &note_project_path,
                 project_directory: &route_project_root,
@@ -22425,6 +22427,7 @@ mod tests {
             protected_tokens_project: None,
             keep_reasoning_tokens: None,
             compaction_enabled: true,
+            signed_thinking_hold: config::SignedThinkingHold::Off,
             memory_enabled: true,
             auto_search: crate::config::AutoSearchConfig::default(),
             caveman: crate::config::CavemanConfig::default(),
@@ -38370,6 +38373,7 @@ mod tests {
                 protected_tokens_floor: 16_000,
                 protected_tokens_provenance: "derived",
                 compaction_enabled: true,
+                signed_thinking_hold: config::SignedThinkingHold::Off,
                 smart_drops: false,
                 protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
@@ -39385,6 +39389,7 @@ mod tests {
                 protected_tokens_floor: 16_000,
                 protected_tokens_provenance: "derived",
                 compaction_enabled: true,
+                signed_thinking_hold: config::SignedThinkingHold::Off,
                 smart_drops: false,
                 protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),

@@ -3440,6 +3440,7 @@ mod tests {
             protected_tokens_floor: 16_000,
             protected_tokens_provenance: "derived",
             compaction_enabled: true,
+            signed_thinking_hold: crate::config::SignedThinkingHold::Off,
             smart_drops: false,
             protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
