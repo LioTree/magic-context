@@ -55,6 +55,17 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			// before Magic Context's first write for a session (62c040ad76, "gate every
 			// pre-turn Magic Context write on the checkout claim"); OpenCode 2 wires the
 			// same check through its own adapter, so this is a v1 change, not v2 leakage.
+			// Re-minted when that checkout-claim check was removed again: the claim is
+			// now checked only at session registration, reconnect and move, outside
+			// Magic Context's per-turn path. Also a v1 change, not v2 leakage.
+			// Re-minted when the v1 entry began passing the startup-only
+			// `smart_notes.enabled` switch to the dreamer runtime (7965fc9bf0, "add
+			// startup-only smart notes capability switch"); also a v1 change.
+			// Re-minted when the v1 entry began sending a historian or dreamer
+			// child's temperature only when the model's metadata accepts it
+			// (cdd3dedf7f, "gate subagent temperature on affirmative model
+			// metadata"); OpenCode 2 applies the same rule in its own hidden
+			// completion path, so this is a v1 change, not v2 leakage.
 			bytes = bytes
 				.replace('import { setup } from "./v2/server";\n', "")
 				.replace("PluginModule & { setup: typeof setup }", "PluginModule")

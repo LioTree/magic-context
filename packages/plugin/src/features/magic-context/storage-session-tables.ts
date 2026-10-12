@@ -1,3 +1,4 @@
+import { getHarness } from "../../shared/harness";
 import type { Database } from "../../shared/sqlite";
 import { deleteChunkEmbedBackoffForSession } from "./compartment-chunk-embedding";
 import { releaseMemoryReservations } from "./memory/lifecycle-applier";
@@ -5,6 +6,12 @@ import { deleteUncommittedPublications } from "./memory/turn-one-publication";
 import { closeTurnTwoChildrenOfSessions } from "./memory/turn-two-children";
 import { deleteUnmappedMessageFtsRows } from "./message-fts-rowid-map";
 import { deleteSessionActivity } from "./session-activity";
+import {
+    tagIdentityRevisionKey,
+    tagRevisionKey,
+    tagTombstoneOwnerKey,
+    tagTombstoneOwnerRange,
+} from "./storage-tag-identity-revision";
 
 export interface SessionScopedTableDefinition {
     readonly table: string;
@@ -94,6 +101,8 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
 export interface DeleteSessionScopedRowsOptions {
     /** Set only after the Rust module has acknowledged its idempotent session deletion. */
     readonly rustModuleCleanupAcknowledged?: boolean;
+    /** Keep tag-change counters when a session may resume; remove them only after host deletion is confirmed. */
+    readonly preserveTagRevisionTombstones?: boolean;
 }
 
 /**
@@ -137,6 +146,38 @@ export function deleteSessionScopedRows(
     // facts were just released, so nothing remains to reattach to it.
     closeTurnTwoChildrenOfSessions(deletableSessionIds);
     deleteUncommittedPublications(db, deletableSessionIds, harness);
+    const harnessTables = SESSION_SCOPED_TABLES.filter((definition) => definition.harnessScoped);
+    if (options.preserveTagRevisionTombstones) {
+        // With the context rows gone, retain each producing harness next to the
+        // tag-change counters. OpenCode's orphan sweep cannot infer Pi/OMP
+        // session liveness from OpenCode's own database.
+        const owners = db
+            .prepare(
+                harnessTables
+                    .map(
+                        (definition) =>
+                            `SELECT session_id, harness FROM ${definition.table} WHERE session_id IN (${placeholders})${definition.extraPredicate ? ` AND ${definition.extraPredicate}` : ""}`,
+                    )
+                    .join(" UNION "),
+            )
+            .all(...harnessTables.flatMap(() => deletableSessionIds)) as {
+            session_id: string;
+            harness: string;
+        }[];
+        const record = db.prepare(
+            "INSERT OR IGNORE INTO schema_migrations_meta (key, value) VALUES (?, ?)",
+        );
+        for (const owner of owners)
+            record.run(tagTombstoneOwnerKey(owner.session_id, owner.harness), owner.harness);
+        const fallback = db.prepare(`INSERT INTO schema_migrations_meta (key, value)
+            SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM schema_migrations_meta WHERE key >= ? AND key < ?)`);
+        for (const id of deletableSessionIds)
+            fallback.run(
+                tagTombstoneOwnerKey(id, getHarness()),
+                getHarness(),
+                ...tagTombstoneOwnerRange(id),
+            );
+    }
 
     for (const sessionId of deletableSessionIds) deleteChunkEmbedBackoffForSession(db, sessionId);
     for (const definition of SESSION_SCOPED_TABLES) {
@@ -166,5 +207,31 @@ export function deleteSessionScopedRows(
     // Activity is session-owned but stored as keys in the existing KV table,
     // so it cannot appear in the schema-derived SESSION_SCOPED_TABLES list.
     deleteSessionActivity(db, deletableSessionIds);
+    if (!options.preserveTagRevisionTombstones) {
+        const retireOwner = db.prepare(
+            harness === undefined
+                ? "DELETE FROM schema_migrations_meta WHERE key >= ? AND key < ?"
+                : "DELETE FROM schema_migrations_meta WHERE key = ?",
+        );
+        const survivingRows = harnessTables
+            .map(
+                (definition) =>
+                    `EXISTS (SELECT 1 FROM ${definition.table} WHERE session_id = ?${definition.extraPredicate ? ` AND ${definition.extraPredicate}` : ""})`,
+            )
+            .join(" OR ");
+        const retire = db.prepare(`DELETE FROM schema_migrations_meta WHERE key IN (?, ?)
+            AND NOT (${survivingRows})
+            AND NOT EXISTS (SELECT 1 FROM schema_migrations_meta AS owners WHERE owners.key >= ? AND owners.key < ?)`);
+        for (const id of deletableSessionIds) {
+            if (harness === undefined) retireOwner.run(...tagTombstoneOwnerRange(id));
+            else retireOwner.run(tagTombstoneOwnerKey(id, harness));
+            retire.run(
+                tagIdentityRevisionKey(id),
+                tagRevisionKey(id),
+                ...harnessTables.map(() => id),
+                ...tagTombstoneOwnerRange(id),
+            );
+        }
+    }
     return deletableSessionIds.length;
 }

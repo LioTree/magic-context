@@ -26,6 +26,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { runCompartmentAgent } from "./compartment-runner";
+import { settleHistorianTurnTwoRuns } from "./historian-turn-two-step";
 import {
     clearProducerModelObservations,
     observeProducerModelsForTest,
@@ -41,7 +42,21 @@ beforeEach(async () => {
     __ignoredNotificationTest.setHoldDetector(() => false);
 });
 
-afterEach(() => {
+afterEach(async () => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+        await Promise.race([
+            settleHistorianTurnTwoRuns(),
+            new Promise<never>((_, reject) => {
+                timeout = setTimeout(
+                    () => reject(new Error("historian turn-two teardown timed out")),
+                    3000,
+                );
+            }),
+        ]);
+    } finally {
+        clearTimeout(timeout);
+    }
     clearProducerModelObservations();
     __ignoredNotificationTest.reset();
     __resetNotificationStateForTests();

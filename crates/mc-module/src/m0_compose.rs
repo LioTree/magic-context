@@ -419,10 +419,19 @@ fn render_m0_retry(
     };
     let mut decay_pressure_multiplier = 1.0;
     let mut m0_bytes = render(decay_pressure_multiplier);
+    // The incremental renderer measures the slice through the history render cache, as
+    // it does its tier texts: a repeat fold then finds the slice's paragraphs there
+    // even after other estimates in the process have cycled the shared cache.
+    let slice_tokens = |m0_bytes: &str| {
+        if incremental {
+            history_slice_tokens(m0_bytes, mc_tokenizer::estimate_history_render_tokens)
+        } else {
+            history_slice_tokens(m0_bytes, estimate_tokens)
+        }
+    };
     let mut attempts = 0;
     while inputs.history_budget_tokens > 0.0
-        && history_slice_tokens(&m0_bytes, estimate_tokens) as f64
-            > inputs.history_budget_tokens * 1.05
+        && slice_tokens(&m0_bytes) as f64 > inputs.history_budget_tokens * 1.05
         && attempts < 3
     {
         decay_pressure_multiplier *= 1.15;
@@ -522,12 +531,33 @@ pub(crate) fn compose_m0_from_store_timed<S: M0Source + ?Sized>(
     // --- compartments: the session history, coverage anchor, and folded watermark ---
     let score_snapshot =
         store.load_compartment_score_snapshot(inputs.session_id, inputs.score_selector)?;
-    let compartments = score_snapshot.compartments;
+    compose_m0_with_score_snapshot(
+        store,
+        inputs,
+        &score_snapshot,
+        estimate_tokens,
+        incremental,
+        timings,
+    )
+}
+
+/// Compose from the row/score snapshot already used for the live coverage guard.
+/// Sharing this read avoids copying a long session's history twice and keeps the
+/// rendered scores and their watermark tied to the same compartment rows.
+pub(crate) fn compose_m0_with_score_snapshot<S: M0Source + ?Sized>(
+    store: &S,
+    inputs: &M0ComposeInputs<'_>,
+    score_snapshot: &mc_store::CompartmentScoreSnapshot,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+    incremental: bool,
+    timings: &mut ComposeTimings,
+) -> Result<M0Composition, M0ComposeError> {
+    let compartments = &score_snapshot.compartments;
     // Store-pure coverage checks enforce strict ordering without assuming integer
     // contiguity: consumer producers may retire ordinal numbers permanently. The
     // transform layer has the live array and fails loud if a present message below
     // the coverage end is not covered by any compartment.
-    let coverage = resolve_coverage(&compartments).map_err(M0ComposeError::CoverageGap)?;
+    let coverage = resolve_coverage(compartments).map_err(M0ComposeError::CoverageGap)?;
     let (boundary_id, coverage_ordinal, first_covered_ordinal, folded_compartment_seq) =
         match &coverage {
             Some(c) => (

@@ -10,7 +10,7 @@ import { createScheduler } from "../../features/magic-context/scheduler";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { createTagger } from "../../features/magic-context/tagger";
-import { resetLkgSlotsForTest } from "../../hooks/magic-context/lkg-slot";
+import { lkgContentDigest, resetLkgSlotsForTest } from "../../hooks/magic-context/lkg-slot";
 import { setRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
 import { createTransform, type TransformDeps } from "../../hooks/magic-context/transform";
 import type { MessageLike } from "../../hooks/magic-context/transform-operations";
@@ -35,7 +35,8 @@ const packageRoot = join(root, "packages/plugin");
 // and caches cannot leak between host, setting, or request scenarios. The frozen
 // JSON fixture contains capture()'s requests and store writes from the commit
 // recorded in its source_revision, before the Rust provider-pipeline adapter
-// was added. Request and write strings are compared without normalization.
+// was added. Request and write strings remain exact except for the explicitly
+// versioned LKG content-digest field, recomputed from the fixture's echoed input.
 function childCapture(
     directory: string,
     output: string,
@@ -78,6 +79,60 @@ function loadHistoricalFixture(): { source_revision: string; captures: Record<st
     if (!existsSync(baselinePath))
         throw new Error(`Missing pre-H4 setting-off fixture: ${baselinePath}`);
     return JSON.parse(readFileSync(baselinePath, "utf8"));
+}
+
+function expectedVersionedLkgWrites(captures: Capture[]): string[][] {
+    const chunks = new Map<number, string>();
+    return captures.map((capture) =>
+        capture.writes.map((write) => {
+            const record = JSON.parse(write) as { sql?: string; args?: unknown[] };
+            if (!record.sql) return write;
+            const sql = record.sql.trimStart();
+            const args = record.args;
+            if (sql.startsWith("INSERT INTO lkg_slot_chunks") && args)
+                chunks.set(Number(args[1]), String(args[3]));
+            if (sql.startsWith("DELETE FROM lkg_slot_chunks") && args)
+                for (const index of chunks.keys())
+                    if (index >= Number(args[1])) chunks.delete(index);
+            if (!sql.startsWith("INSERT INTO lkg_slots (") || !args) return write;
+
+            // This fixture's fake module echoes the pristine inputs. Use the frozen
+            // historical bytes, not the revised request or its recorded digest values.
+            const messages = JSON.parse(
+                [...chunks]
+                    .sort(([a], [b]) => a - b)
+                    .map(([, body]) => body)
+                    .join(""),
+            ) as MessageLike[];
+            const ids = JSON.parse(String(args[4])) as string[];
+            expect(Array.isArray(ids)).toBe(true);
+            const digests = ids.map((id) => {
+                const matching = messages.filter((message) => message.info.id === id);
+                expect(matching).toHaveLength(1);
+                const digest = lkgContentDigest(matching[0]);
+                expect(digest).toMatch(/^2\.[A-Za-z0-9_-]{43}$/);
+                return digest;
+            });
+            return JSON.stringify({
+                ...record,
+                args: args.map((value, index) => (index === 5 ? JSON.stringify(digests) : value)),
+            });
+        }),
+    );
+}
+
+function assertVersionedLkgDigests(captures: Capture[]): void {
+    for (const capture of captures)
+        for (const write of capture.writes) {
+            const record = JSON.parse(write) as { sql?: string; args?: unknown[] };
+            if (!record.sql?.trimStart().startsWith("INSERT INTO lkg_slots (") || !record.args)
+                continue;
+            const ids = JSON.parse(String(record.args[4])) as unknown[];
+            const digests = JSON.parse(String(record.args[5])) as unknown[];
+            expect(Array.isArray(digests)).toBe(true);
+            expect(digests).toHaveLength(ids.length);
+            for (const digest of digests) expect(digest).toMatch(/^2\.[A-Za-z0-9_-]{43}$/);
+        }
 }
 
 class Asset {
@@ -518,7 +573,7 @@ if (process.env.H4_REVIEW2_CAPTURE) {
         );
         writeFileSync(process.env.H4_REVIEW2_CAPTURE!, JSON.stringify(result));
         expect(result).toHaveLength(3);
-    });
+    }, 30000);
 } else {
     const cases = (["v1", "v2"] as const).flatMap((host) =>
         (["absent", "full_request"] as const).flatMap((setting) =>
@@ -536,14 +591,15 @@ if (process.env.H4_REVIEW2_CAPTURE) {
         for (const snapshots of Object.values(fixture.captures)) expect(snapshots).toHaveLength(3);
     });
     for (const { host, setting, lane, key } of cases) {
-        test(`setting-off differential ${key}: outgoing request and all store writes equal pre-H4`, () => {
+        test(`setting-off differential ${key}: exact pre-H4 request and writes with versioned LKG digests`, () => {
             const before = loadHistoricalFixture().captures[key];
             const after = revisedCapture(host, setting, lane);
             expect(before).toHaveLength(3);
             expect(after).toHaveLength(3);
             expect(before.every((p) => p.methods.includes("transform"))).toBe(true);
             expect(after.every((p) => p.methods.includes("transform"))).toBe(true);
-            expect(after.map((p) => p.writes)).toEqual(before.map((p) => p.writes));
+            assertVersionedLkgDigests(after);
+            expect(after.map((p) => p.writes)).toEqual(expectedVersionedLkgWrites(before));
             expect(after.map((p) => p.request)).toEqual(before.map((p) => p.request));
         }, 60000);
     }

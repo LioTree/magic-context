@@ -102,7 +102,7 @@ import { createModuleToolBackends } from "./module-tool-backends";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import { runManagedRecomp } from "./recomp-orchestrator";
-import type { RustModeModuleClient } from "./rust-mode-transform";
+import { type RustModeModuleClient, rustWrapupHistorianFields } from "./rust-mode-transform";
 import { createRustRefusalRecovery } from "./rust-refusal-recovery";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
@@ -179,7 +179,7 @@ export interface MagicContextDeps {
             provider?: "local" | "openai-compatible" | "off" | "synapse";
         };
         dreamer?: DreamerConfig;
-        smart_notes?: { retina_handoff?: boolean };
+        smart_notes?: { enabled?: boolean; retina_handoff?: boolean };
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
         /** Issue #53: per-agent system-prompt injection opt-out. Optional in
          *  the inline type so legacy tests/callers don't have to construct it;
@@ -934,6 +934,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             dreaming,
             "opencode",
             deps.config.language,
+            deps.config.smart_notes?.enabled,
         );
         const executor = createDreamTaskExecutor({
             client: deps.client,
@@ -949,6 +950,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreaming),
             language: deps.config.language,
             retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
+            smartNotesEnabled: deps.config.smart_notes?.enabled,
             transformMode: deps.config.transform_mode,
             // Scheduled/message-triggered runs must share the same direct
             // authority.status transport as the transform path. The
@@ -976,6 +978,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
 
     const commandHandler = createMagicContextCommandHandler({
+        smartNotesEnabled: deps.config.smart_notes?.enabled,
         db,
         compactionOff,
         toastDurationMs: deps.config.toast_duration_ms,
@@ -985,6 +988,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historyBudgetPercentage: deps.config.history_budget_percentage,
         transformMode: deps.config.transform_mode,
         rustModeModuleClient,
+        resolveRustWrapupHistorianFields: () => {
+            const run = sampleHistorian();
+            return rustWrapupHistorianFields({
+                historianModel: run.model,
+                fallbackModels: run.fallbackModels,
+                timeoutMs: run.timeoutMs,
+                maxOutputTokens: run.maxOutputTokens,
+            });
+        },
         projectRoot: deps.directory,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
         sampleCommitClusterTrigger: () =>
@@ -1076,6 +1088,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               currentDreamer,
                               "opencode",
                               deps.config.language,
+                              deps.config.smart_notes?.enabled,
                           ),
                           executor: createDreamTaskExecutor({
                               client: deps.client,
@@ -1093,6 +1106,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               memoryInjectionBudgetTokens:
                                   deps.config.memory?.injection_budget_tokens,
                               retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
+                              smartNotesEnabled: deps.config.smart_notes?.enabled,
                               transformMode: deps.config.transform_mode,
                               // Manual /ctx-dream uses the same live authority
                               // lookup and module transport as scheduled runs.
@@ -1119,6 +1133,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const systemPromptHash = createSystemPromptHashHandler({
         db,
         dreamerEnabled: dreamerRunnable,
+        smartNotesEnabled: deps.config.smart_notes?.enabled,
         // Gates ctx_memory guidance out of the prompt when memory is off (the
         // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
         memoryEnabled: deps.config.memory?.enabled !== false,

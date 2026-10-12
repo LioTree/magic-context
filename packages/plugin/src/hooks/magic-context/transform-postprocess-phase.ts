@@ -17,6 +17,7 @@ import {
     captureChannel1PostReduceGraceBaseline,
     clearPendingCompactionMarkerStateIf,
     clearPersistedTodoSyntheticAnchor,
+    flushAutoSearchHintDecisionRetirement,
     getActiveTagsBySession,
     getAutoSearchHintDecisions,
     getChannel1NudgeState,
@@ -28,7 +29,6 @@ import {
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
     type PendingCompactionMarker,
-    pruneAutoSearchHintDecisions,
     pruneNoteNudgeAnchors,
     replacePendingCompactionMarkerStateIf,
     setPendingCompactionMarkerState,
@@ -61,9 +61,9 @@ import {
     markDropLeavesReasoning,
 } from "../../features/magic-context/storage-reasoning-removal";
 import {
-    getReasoningTokenEstimatesByMessage,
     getTagNumberByMessageId,
     markTagsCompactedByMessageIds,
+    tryGetReasoningTokenEstimatesByMessage,
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import type { Tagger } from "../../features/magic-context/tagger";
@@ -73,6 +73,7 @@ import {
 } from "../../features/magic-context/temporal-decisions";
 import type { SessionMeta, TagEntry } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
+import { getUnpublishedAutoSearchNoHint } from "../../shared/auto-search-lifecycle";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
@@ -80,6 +81,7 @@ import { isRecord } from "../../shared/record-type-guard";
 import { stableStringify } from "../../shared/stable-json";
 import { hasAnthropicReasoning } from "./active-anthropic-turn";
 import {
+    applyFlushedStatuses,
     type ConvertedToolDropMode,
     foldBustsServedPrefix,
     prepareLegacyToolSkeletonConversions,
@@ -149,6 +151,7 @@ import {
     postprocessReplaySnapshot,
     postprocessTailTags,
 } from "./postprocess-read-cache";
+import { providerVisiblePart } from "./provider-visible-parts";
 import { estimateTokens } from "./read-session-formatting";
 import { DEFAULT_KEEP_REASONING_TOKENS, opencodeReasoningBudgetCutoff } from "./reasoning-budget";
 import { captureOpencodeReasoningBudgetStatus } from "./reasoning-budget-status";
@@ -170,6 +173,7 @@ import {
     findMergedReasoningStripDecisions,
     findReasoningBearingAssistantIds,
     findTrailingBlankDecisionCandidates,
+    replayClearedReasoning,
     replayStrippedInlineThinking,
     snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
@@ -187,6 +191,7 @@ import {
     recentSupersessionOwnerMessageIds,
 } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
+import { waitForTagOwners } from "./tag-owner-warmup";
 import {
     assertTailHygieneContentUnchangedIfEnabled,
     countRealUserMessages,
@@ -660,8 +665,12 @@ function isPartDroppedBeforeWire(part: unknown, providerID: string | undefined):
 function servedMessageKey(message: unknown, providerID: string | undefined): string {
     const record = isRecord(message) ? message : {};
     const info = isRecord(record.info) ? record.info : {};
+    // Fields of a part the provider never receives (tool metadata such as LSP
+    // diagnostics) are left out as well; see provider-visible-parts.ts.
     const parts = Array.isArray(record.parts)
-        ? record.parts.filter((part) => !isPartDroppedBeforeWire(part, providerID))
+        ? record.parts
+              .filter((part) => !isPartDroppedBeforeWire(part, providerID))
+              .map(providerVisiblePart)
         : (record.parts ?? null);
     // The JSON round trip drops undefined fields and shared references, so a live
     // object and its JSON snapshot compare equal when they would serialize equal.
@@ -1196,7 +1205,10 @@ export function runRustModePostprocess(args: {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
     for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-        if (decision.decision === "hint") {
+        if (
+            decision.decision === "hint" &&
+            getUnpublishedAutoSearchNoHint(args.sessionId, decision.messageId) === undefined
+        ) {
             appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
         }
     }
@@ -1898,6 +1910,23 @@ export async function runPostTransformPhase(
 ): Promise<PostTransformPhaseResult> {
     const tPostprocessSetup = performance.now();
     const compactionOff = args.compactionOff === true;
+    // Wait before this phase reads any decision/protection snapshot. The tagged
+    // message graph and prepared history are one coherent caller-owned input;
+    // do not replace only pieces of that render with a peer's newer epoch.
+    if (
+        !compactionOff &&
+        !tryGetReasoningTokenEstimatesByMessage(
+            args.db,
+            args.sessionId,
+            sessionDecisionCalibration(args.db, args.sessionId).proseRatio,
+        )
+    ) {
+        await waitForTagOwners(
+            args.db,
+            args.sessionId,
+            sessionDecisionCalibration(args.db, args.sessionId).proseRatio,
+        );
+    }
     // A caught error or failed persistence can leave an already-mutated array
     // only partly replayed. Never publish it, even if it fits the window. The
     // wrapper owns last-good replay or refusal; native compaction owns off mode.
@@ -2385,6 +2414,75 @@ export async function runPostTransformPhase(
     const removedReasoningIds = new Set<string>();
     let dropLeavesReasoning = false;
     let reasoningRemovalReadable = false;
+    const refreshReasoningRemovalUnion = (): void => {
+        if (compactionOff) return;
+        try {
+            if (reasoningRemovalEnabled) {
+                const committed = getReasoningRemovalState(args.db, args.sessionId);
+                for (const id of committed.messageIds) removedReasoningIds.add(id);
+                dropLeavesReasoning = committed.dropLeavesReasoning;
+            }
+            const committedWatermark = args.db
+                .prepare(
+                    "SELECT cleared_reasoning_through_tag AS watermark, last_observed_model_key AS modelKey FROM session_meta WHERE session_id=?",
+                )
+                .get(args.sessionId) as { watermark: number; modelKey: string | null } | null;
+            // A model transition intentionally resets the watermark. Never mix
+            // its older epoch into this pass's tagged/prepared input.
+            if (
+                committedWatermark &&
+                committedWatermark.modelKey === args.sessionMeta.lastObservedModelKey
+            ) {
+                args.sessionMeta.clearedReasoningThroughTag = Math.max(
+                    args.sessionMeta.clearedReasoningThroughTag,
+                    committedWatermark.watermark,
+                );
+                if (!prefixBoundModel) {
+                    if (canUseEmptySentinels)
+                        replayClearedReasoning(
+                            args.messages,
+                            args.reasoningByMessage,
+                            args.messageTagNumbers,
+                            args.sessionMeta.clearedReasoningThroughTag,
+                        );
+                    replayStrippedInlineThinking(
+                        args.messages,
+                        args.messageTagNumbers,
+                        args.sessionMeta.clearedReasoningThroughTag,
+                    );
+                }
+            }
+        } catch (error) {
+            failPass("reasoning-removal-read-failure", error);
+            throw new EmergencyFailClosedError("Saved reasoning removals could not be refreshed", {
+                cause: error,
+            });
+        }
+    };
+    const replayCommittedVisibleDrops = (): boolean => {
+        if (compactionOff) return false;
+        const visible = new Set(args.messages);
+        const targets = new Map(
+            [...args.targets].filter(([, target]) => {
+                if (target.mutationParts)
+                    return target.mutationParts.some(
+                        ({ message, part }) =>
+                            visible.has(message) &&
+                            message.info.syntheticHead !== true &&
+                            message.parts.includes(part) &&
+                            (!isRecord(part) || part.synthetic !== true),
+                    );
+                return (
+                    target.message !== undefined &&
+                    visible.has(target.message) &&
+                    target.message.info.syntheticHead !== true
+                );
+            }),
+        );
+        // History preparation may reuse a host text object for a synthetic
+        // prefix. A persisted drop of the former raw part must not erase it.
+        return applyFlushedStatuses(args.sessionId, args.db, targets);
+    };
     if (reasoningRemovalEnabled) {
         try {
             const state = getReasoningRemovalState(args.db, args.sessionId);
@@ -2730,31 +2828,36 @@ export async function runPostTransformPhase(
                     }
                 }
             }
-            const budgetCutoff = routineCleanupApplied
-                ? Math.min(
-                      safeReasoningCutoff,
-                      opencodeReasoningBudgetCutoff({
-                          messages: args.messages,
-                          messageTagNumbers: args.messageTagNumbers,
-                          budget: args.keepReasoningTokens ?? DEFAULT_KEEP_REASONING_TOKENS,
-                          alreadyRemoved: removedReasoningIds,
-                          alsoGone: bindingStrippedIds,
-                          countNeutralized: reasoningRemovalSelectable,
-                          proseRatio: sessionDecisionCalibration(args.db, args.sessionId)
-                              .proseRatio,
-                          frozenMergedIds: getMergedReasoningStrippedIds(args.db, args.sessionId),
-                          anthropic:
-                              canUseEmptySentinels ||
-                              prefixBoundModel ||
-                              hasAnthropicReasoning(args.messages),
-                          textEstimateByMessageId: getReasoningTokenEstimatesByMessage(
-                              args.db,
-                              args.sessionId,
-                              sessionDecisionCalibration(args.db, args.sessionId).proseRatio,
-                          ),
-                      }),
-                  )
-                : 0;
+            const reasoningEstimates = tryGetReasoningTokenEstimatesByMessage(
+                args.db,
+                args.sessionId,
+                sessionDecisionCalibration(args.db, args.sessionId).proseRatio,
+            );
+            const budgetCutoff =
+                routineCleanupApplied && reasoningEstimates
+                    ? Math.min(
+                          safeReasoningCutoff,
+                          opencodeReasoningBudgetCutoff({
+                              messages: args.messages,
+                              messageTagNumbers: args.messageTagNumbers,
+                              budget: args.keepReasoningTokens ?? DEFAULT_KEEP_REASONING_TOKENS,
+                              alreadyRemoved: removedReasoningIds,
+                              alsoGone: bindingStrippedIds,
+                              countNeutralized: reasoningRemovalSelectable,
+                              proseRatio: sessionDecisionCalibration(args.db, args.sessionId)
+                                  .proseRatio,
+                              frozenMergedIds: getMergedReasoningStrippedIds(
+                                  args.db,
+                                  args.sessionId,
+                              ),
+                              anthropic:
+                                  canUseEmptySentinels ||
+                                  prefixBoundModel ||
+                                  hasAnthropicReasoning(args.messages),
+                              textEstimateByMessageId: reasoningEstimates,
+                          }),
+                      )
+                    : 0;
             const clearedReasoning =
                 routineCleanupApplied && canUseEmptySentinels && ageLaneAllowed
                     ? clearOldReasoning(
@@ -3758,11 +3861,16 @@ export async function runPostTransformPhase(
             }
         }
         const prunedAnchors = pruneNoteNudgeAnchors(args.db, args.sessionId, visibleIds);
-        const prunedDecisions = pruneAutoSearchHintDecisions(args.db, args.sessionId, visibleIds);
-        if (prunedAnchors > 0 || prunedDecisions > 0) {
+        flushAutoSearchHintDecisionRetirement(args.db, args.sessionId, visibleIds);
+        // A branch switch can hide user messages that will later be served again.
+        // Keep their saved search hints, including no-hint omissions. Only the actual
+        // prefix trim records IDs covered by a summary; this prefix-rebuild opportunity
+        // may flush them to storage, while cached-prefix replay must not write them.
+        // Today's visible IDs are not proof of deletion.
+        if (prunedAnchors > 0) {
             sessionLog(
                 args.sessionId,
-                `sticky-injection GC: pruned ${prunedAnchors} note-nudge anchor(s), ${prunedDecisions} auto-search decision(s)`,
+                `sticky-injection GC: pruned ${prunedAnchors} note-nudge anchor(s)`,
             );
         }
     }
@@ -4095,6 +4203,10 @@ export async function runPostTransformPhase(
     // blocks exactly as a primary's does.
     // The first rebuilding pass after upgrade switches how reasoning a drop
     // touched is served; that changes bytes only where such a part is present.
+    // Todo and search work also suspend the pass. Read the committed union
+    // after the last suspension, even when this pass selected no new IDs.
+    refreshReasoningRemovalUnion();
+    replayCommittedVisibleDrops();
     const dropModeSwitchesThisPass =
         !canUseEmptySentinels &&
         !dropLeavesReasoning &&
@@ -4254,6 +4366,15 @@ export async function runPostTransformPhase(
     );
 
     args.restoreLatestTurnOriginals?.();
+    // Authorized restoration must not undo a peer's durable omissions.
+    if (args.restoreLatestTurnOriginals) {
+        refreshReasoningRemovalUnion();
+        if (replayCommittedVisibleDrops()) {
+            finalizeMessageRepresentation(args.messages, args.resolvedProviderID, finalizeOptions);
+        }
+        if (reasoningRemovalEnabled)
+            removeReasoningParts(args.messages, removedReasoningIds, args.resolvedProviderID);
+    }
     sessionLog(
         args.sessionId,
         `final representation: clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts} removedReasoningParts=${removedReasoningParts} settledDroppedReasoning=${settledDroppedReasoning}`,

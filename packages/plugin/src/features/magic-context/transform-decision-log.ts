@@ -40,7 +40,8 @@ export type CanonicalMaterializeReason =
     | "epoch_change"
     | "coverage_fold"
     | "profile_transition"
-    | "host_compaction";
+    | "host_compaction"
+    | "tag_identity_repair";
 
 export interface PendingTransformDecision {
     tsMs: number;
@@ -89,6 +90,8 @@ export interface PendingTransformDecision {
     droppedCount: number;
     inputTokens: number;
     bustedThisPass: boolean;
+    /** Why the host stopped serving its frozen last-known-good replay, persisted in materialize_reason without a schema change. */
+    lkgFrozenReleaseReason?: string;
 }
 
 interface TransformDecisionRow extends PendingTransformDecision {
@@ -123,6 +126,7 @@ const canonicalReasons = new Set<string>([
     "coverage_fold",
     "profile_transition",
     "host_compaction",
+    "tag_identity_repair",
 ]);
 
 const piReasonAliases: Record<string, CanonicalMaterializeReason> = {
@@ -185,6 +189,7 @@ export function writeRustTransformDecision(args: {
     materializeReason: string | null;
     inputTokens: number;
     tsMs?: number;
+    lkgFrozenReleaseReason?: string;
 }): void {
     const rawDecision = args.decision.trim();
     const decisionUpper = rawDecision.toUpperCase();
@@ -219,6 +224,7 @@ export function writeRustTransformDecision(args: {
         droppedCount: 0,
         inputTokens: args.inputTokens,
         bustedThisPass: mapped.bustedThisPass,
+        lkgFrozenReleaseReason: args.lkgFrozenReleaseReason,
     });
 }
 
@@ -478,6 +484,10 @@ function writeTransformDecisionRowOnDatabase(
     const m0ModelKeyNew = row.materialized ? row.m0ModelKeyNew : null;
     const m0ToolSetHashPrev = row.m0ToolSetHashPrev ?? null;
     const m0ToolSetHashNew = row.m0ToolSetHashNew ?? null;
+    const persistedMaterializeReason = row.lkgFrozenReleaseReason
+        ? `lkg_frozen_release:${row.lkgFrozenReleaseReason}` +
+          (row.materializeReason ? `;materialize_reason=${row.materializeReason}` : "")
+        : row.materializeReason;
     db.prepare(
         `INSERT OR REPLACE INTO transform_decisions (
                 session_id, harness, message_id, ts_ms, decision, materialized,
@@ -493,7 +503,7 @@ function writeTransformDecisionRowOnDatabase(
         row.tsMs,
         row.decision,
         row.materialized ? 1 : 0,
-        row.materializeReason,
+        persistedMaterializeReason,
         systemHashPrev,
         systemHashNew,
         m0ToolSetHashPrev,

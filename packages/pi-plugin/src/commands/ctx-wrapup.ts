@@ -41,6 +41,11 @@ import {
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
 import { resolvePiUsableContextLimit } from "../pi-context-limit";
 import { runPiHistorian } from "../pi-historian-runner";
+import {
+	isPiOrdinalAlignmentUnanchored,
+	piRawOrdinalOffsetSource,
+	resolvePiOrdinalAlignmentForContext,
+} from "../pi-ordinal-alignment";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 import {
 	readPiSessionMessagePage,
@@ -212,13 +217,29 @@ export async function runPiWrapup(
 		return "## Magic Wrapup — Skipped\n\nA recomp or upgrade is already running for this session. Wait for it to finish, then try `/ctx-wrapup` again.";
 	}
 
+	const ordinalAlignment = resolvePiOrdinalAlignmentForContext(
+		deps.db,
+		sessionId,
+		ctx,
+	);
+	if (isPiOrdinalAlignmentUnanchored(ordinalAlignment)) {
+		return `## Magic Wrapup — Skipped\n\nThe stored history boundaries no longer match this session branch (${ordinalAlignment.detail}), so a wrapup cannot place new summaries safely.`;
+	}
+	const offsetSource = piRawOrdinalOffsetSource(deps.db, sessionId);
 	const provider = {
-		readMessages: () => readPiSessionMessages(ctx),
+		readMessages: () => readPiSessionMessages(ctx, offsetSource),
 		readMessagePage: (
 			afterOrdinal: number,
 			limit: number,
 			finalWatermark: number,
-		) => readPiSessionMessagePage(ctx, afterOrdinal, limit, finalWatermark),
+		) =>
+			readPiSessionMessagePage(
+				ctx,
+				afterOrdinal,
+				limit,
+				finalWatermark,
+				offsetSource,
+			),
 	};
 	const unregister = setRawMessageProvider(sessionId, provider);
 	let holderId = "";
@@ -468,7 +489,7 @@ export async function runPiWrapup(
 						userMemoriesEnabled: deps.userMemoriesEnabled,
 						language: deps.language,
 						compartmentLeaseHolderId: leaseHolder,
-						readBranchEntries: () => readBranchEntries(ctx),
+						readBranchEntries: () => readPiWrapupBranchEntries(ctx),
 						notifyIssue: (text) =>
 							sendStatus({
 								title: "/ctx-wrapup",
@@ -605,13 +626,23 @@ function formatExistingWrapup(
 	return `## Magic Wrapup — Skipped\n\nAnother /ctx-wrapup is already compacting this session (chunk ${state.chunkIndex}/${Math.max(state.chunkIndex, state.expectedChunks)}, wrapped through message ${state.lastCompartmentEnd}). Wait for it to finish, then try again.`;
 }
 
-function readBranchEntries(ctx: ExtensionCommandContext): unknown[] {
-	const getBranch = (ctx.sessionManager as { getBranch?: () => unknown })
-		.getBranch;
-	if (typeof getBranch !== "function") return [];
-	const branch = getBranch.call(ctx.sessionManager) as
-		| { entries?: unknown }
-		| null
+/**
+ * The live branch for the native compaction marker step, read fresh on each
+ * call. Pi and Oh My Pi both return `getBranch()` as an array of entries.
+ * An unreadable branch is empty, which keeps the marker waiting (the ordinal
+ * alignment cannot find its anchor in it) instead of guessing a cut.
+ */
+export function readPiWrapupBranchEntries(
+	ctx: Pick<ExtensionCommandContext, "sessionManager">,
+): unknown[] {
+	const sessionManager = ctx.sessionManager as
+		| { getBranch?: () => unknown }
 		| undefined;
-	return Array.isArray(branch?.entries) ? branch.entries : [];
+	if (typeof sessionManager?.getBranch !== "function") return [];
+	try {
+		const branch = sessionManager.getBranch.call(sessionManager);
+		return Array.isArray(branch) ? branch : [];
+	} catch {
+		return [];
+	}
 }

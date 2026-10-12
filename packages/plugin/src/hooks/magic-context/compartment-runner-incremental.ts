@@ -124,6 +124,7 @@ import {
     getRawSessionTagKeysThrough,
     hasRawMessageProvider,
     hasRawSessionMessageById,
+    prepareRawSessionOrdinals,
     readRawSessionMessageOrdinalById,
     readRawSessionMessageRange,
     readSessionChunk,
@@ -264,6 +265,10 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         providerHistorianChunkTokens,
         producerKey,
     );
+    // A historian run follows a transform pass of the same session, which has
+    // already waited for the canonical ordinal warm-up; this wait is normally
+    // instant and covers a run started any other way.
+    const ordinalsReady = await prepareRawSessionOrdinals(sessionId);
     let completedSuccessfully = false;
     // Set at COMMIT of the publish transaction. From then on the new compartments are
     // durable and already signaled, so a later throw is a failed side step, not a
@@ -359,6 +364,8 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
     updateSessionMeta(db, sessionId, { compartmentInProgress: true });
 
     try {
+        if (!ordinalsReady)
+            throw new Error("Session ordinals are warming; retry the historian shortly.");
         const openCodeDbResolution = resolveOpenCodeDbPath();
         if (!openCodeDbPathExists(openCodeDbResolution) && !hasRawMessageProvider(sessionId)) {
             telemetry.status = "noop";
