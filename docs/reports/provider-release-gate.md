@@ -4,7 +4,7 @@
 
 Base: `0f8f341c8c4b27df6bf9678e022250ef3a9b8ac4` (master's schema-95 storage code). This is a provider-only extraction, not the migration-train executable. The delivered task branch also has the local `train/provider-release` ref. No release artifact was built or placed; no OpenCode/Pi distribution was rebuilt. The conformance executable and comparison executable are debug builds.
 
-The candidate serves runner-bound `compaction.setup`, `compaction.step`, `transform.declare`, and `transform.hook`, with durable answer/version/tag/catalog records at private store **65**. Context remains **95**. The existing configurable provider-runner target remains independent of the host producer target. Commons provider/runner roles are pinned to `90d5c5567ad7ec8dcc8d26252b1a759fdd49bb75` after the amendment update, with the approved stable-tool exception below. Runtime subc protocol remains `0.29.1`, client `0.26.1`, and the in-process daemon is master's `0.31.2`. This verifies the published v1 role wire contract with a scripted Broca runner, not Broca's own implementation or a production canary.
+The candidate serves runner-bound `compaction.setup`, `compaction.step`, `transform.declare`, and `transform.hook`, with durable answer/version/tag/catalog records at private store **65**. Context remains **95**. The existing configurable provider-runner target remains independent of the host producer target. The provider/runner contracts that previously needed Git pins are now published on crates.io: compaction/step-transform0.1.2 and llm-runner/conformance0.2.0. Their recorded source commit is `9d20fb916417e359a4bb1b1c32cd83b4bfd06514`, with the final registry evidence below. Runtime subc protocol remains `0.29.1`, client `0.26.1`, and the in-process daemon is master's `0.31.2`. This verifies the published v1 role wire contract with a scripted Broca runner, not Broca's own implementation or a production canary.
 
 ## Pin and prune: file/hunk dependency list
 
@@ -80,7 +80,7 @@ Comment review examined the new provider paths, compatibility harness, private f
 
 The late SUBC amendment update was applied to the new roles and checked again. The task owner explicitly chose: keep master's tool-provider and tool-provider-conformance **0.5.0**; pin only the new provider/runner roles to commons **90d5c556**. Tool-provider **0.7.0**, its bind-mode contract and protocol0.31 belong to the next coordinated daemon cut, not this binary-only release. An exploratory all-role pin exposed the expected protocol0.29/0.31 ErrorBody mismatch in the existing tool conformance harness; it was reverted, not bridged with a shim or a runtime SDK upgrade.
 
-Exact final resolved crates:
+Exact resolved crates when the llm-runner/v1 typed-run-error amendment required Git sources (the later registry publication replaces these Git pins):
 
 | Crate | Version | Source |
 | --- | --- | --- |
@@ -92,7 +92,7 @@ Exact final resolved crates:
 | `cortexkit-role-tool-provider` | **0.5.0** | Registry, approved master exception |
 | `cortexkit-role-tool-provider-conformance` | **0.5.0** | Registry, approved master exception |
 
-`cargo tree --locked -p mc-module --edges normal` was inspected: the **only runtime subc-protocol is0.29.1**, used consistently by tool-provider, module SDK, control and transport. Compaction/step/llm-runner role runtime dependencies contain serde/JSON types, not subc protocol types. Protocol **0.30.2** appears only through the dev-only llm conformance package. Protocol **0.31** is absent from the final lockfile. No new protocol types enter ck-mc's sent/received SDK frames, and no bind-mode support was activated.
+`cargo tree --locked -p mc-module --edges normal` was inspected: the **only runtime subc-protocol is0.29.1**, used consistently by tool-provider, module SDK, control and transport. Compaction/step/llm-runner role runtime dependencies contain serde/JSON types, not subc protocol types. Protocol **0.30.2** appears only through the dev-only llm conformance package. Protocol **0.31** was absent from that Git-pinned stage's lockfile. No new protocol types entered ck-mc's sent/received SDK frames, and tools retained their classic protocol0.29 behavior rather than activating the newer daemon-stamped tool modes.
 
 The amended `RunError` requires `class`, `message` and `provider_code`, with optional diagnostic `provider_detail_code` and measured retry/reset/account/provider details. The new provider lane neither constructs nor deserializes that runner-owned typed `RunResult` error: its callbacks are `session.head`, `session.read` and `compaction.ready`, with generic JSON/transport-error handling. Existing Setup refusal fields are unchanged.
 
@@ -166,3 +166,50 @@ Local follow-up reruns on the same Cargo/rustc1.99 toolchain used `nice -n10`, f
 - `cargo test --locked -j4 -p mc-module --test real_daemon_store_ahead -- --nocapture`: **1 passed**,2.27 s, using task-built lock-pinned debug daemon/CLI paths; candidate max65 still refuses fixture66 on health and transform.
 
 The follow-up did not change manifests, lockfile, role/SDK pins, context schema, private-store migrations, host codecs, memory writers, ARCHITECTURE.md or STRUCTURE.md. No live-store access, placement, dist rebuild or release-artifact build occurred. The requested local `train/provider-release` ref is advanced to the follow-up HEAD together with the assigned task branch. Final source/comment review and whitespace/staged-scope checks completed before commit; temporary mutation/source-export scratch was removed.
+
+## CI provenance diagnosis and master rebase
+
+CI run **38184366422** was inspected directly, including both failing provenance steps. The full log contains one locked revision for each core, not two: cache-core `067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7` and subc-core `1a14993c120725fa1dce7267b6e7d0823835930c`. The additional package entries in that logged Git-revision dictionary are the five new Git role packages, all at `90d5c5567ad7ec8dcc8d26252b1a759fdd49bb75`. At the CI failure, the script's provenance policy allowed only the two named Git core packages, each with one locked commit. It rejected the *additional Git role-package names*, not multiple revisions of either core. The full log therefore does not show two cache or daemon implementations linked into one binary.
+
+To distinguish the CI provenance-policy failure from a runtime dependency split, the Git-pinned candidate's package consumers were checked against Cargo.lock and Cargo's normal reverse dependency graph:
+
+| Locked package | Introduced by | Runtime status |
+| --- | --- | --- |
+| `cortexkit-cache-core`0.1.0, Git067701f1 | mc-core and mc-store, then mc-module | One source/revision, normal runtime dependency |
+| `subc-core`0.20.55, Git1a14993 | mc-module dev-dependency | One source/revision, absent from the normal binary graph |
+| compaction-provider0.1.2 / step-transform-provider0.1.2 / llm-runner0.2.0, Git90d5c556 | New provider surface; compaction also uses step-transform and llm-runner | Serde/JSON contract types; no additional core dependency |
+| llm-runner-conformance0.2.0 / Git role-harness0.1.0, Git90d5c556 | Development-only dependency for llm-runner contract-conformance tests | Test-only; protocol0.30.2 remains dev-only |
+
+The task owner responsible for the release boundary initially authorized porting the migration branch's provenance extension. A narrowed draft preserved both required cores and restricted extra Git names to the five role packages and the commons URL; negative controls confirmed that unlisted packages and fork URLs were refused. Before that draft was committed, SUBC published the requested role versions. The task owner then superseded the policy change: take those registry versions and restore the original script. **The draft exception was completely reverted; the delivered provenance script is byte-identical to origin/master.** There is no vendoring, core-pin change or new policy exception.
+
+The branch was rebased cleanly onto `origin/master` **`55e9f18ca9d6a868eb899ac09933ec37c241c7b8`**, which includes the master fix that makes the 3 MB base64 token-count timing test check linear scaling instead of a fixed six-second limit and intervening master fixes. Earlier reports and commit IDs above are historical evidence for their original candidates; the restored gates below verify the rebased branch. Subsequent comparisons use a separate debug baseline built from this new master, not the old0f8f341c baseline. No release artifact is built or placed.
+
+The temporary draft that would allow five extra Git role-package names is not delivered, and its extra self-tests are not active release gates. The restored original script's two self-tests and actual lockfile output are verified below.
+
+### Published role transition and wire-boundary check
+
+The final Cargo.lock takes all four newly published contracts from crates.io; all four downloaded `.cargo_vcs_info.json` files independently identify commons commit **`9d20fb916417e359a4bb1b1c32cd83b4bfd06514`**: compaction-provider **0.1.2**, step-transform-provider **0.1.2**, llm-runner **0.2.0** (normal transitive dependency) and llm-runner-conformance **0.2.0** (dev-only). Direct manifest entries use exact `=` versions. Their former Git pins are removed, and role-harness0.1.0 now has one registry source shared by both conformance crates. Stable tool-provider/tool conformance remain0.5.0, using protocol0.29.1 with module SDK0.26.1 instead of the newer protocol0.31 daemon/tool-mode contract.
+
+The requested unsuffixed `cargo tree -e normal -i subc-protocol` is ambiguous because the lock contains0.29.1 and0.31.0. Both versions were queried explicitly:
+
+- `cargo tree --locked -p mc-module -e normal --invert subc-protocol@0.29.1` shows mc-module, SDK0.26.1, control0.28.0, transport0.10.0 and stable tool-provider0.5.0.
+- `cargo tree --locked -p mc-module -e normal --invert subc-protocol@0.31.0` prints **nothing**; repeated with `--target all` also has no normal path.
+- The all-edge reverse tree for0.31.0 has exactly `llm-runner-conformance0.2.0 -> [dev-dependencies] mc-module`. The resolved published compaction/step/llm-runner contracts use serde/JSON types and do not have a normal protocol0.31 edge in this package graph. The publication notice's protocol requirement therefore applies here to conformance, not to ck-mc's normal dependency graph.
+
+Thus no protocol0.31 route frame, error body or bind type enters ck-mc's actual SDK wire. No SDK upgrade or conversion shim is needed. The original provenance script now succeeds unchanged: its allowed Git-name set is exactly cache-core and subc-core, and Cargo.lock contains one source/commit entry for each (067701f1 and1a14993 respectively). The final registry lock and wire/gate results follow.
+
+### Final registry/rebase verification
+
+- The original `scripts/cargo-lock-pins.py` is identical to `origin/master`; its **2 self-tests** and actual Cargo.lock provenance output pass on Linux/Python3.14.4. No role Git exception is retained.
+- Final normal protocol tree checks, including `--target all`, show **no protocol0.31 path**. The only all-edge0.31 path is the dev-only llm-runner conformance package. Runtime protocol0.29.1, SDK0.26.1 and both sole core Git revisions are unchanged.
+- `cargo check --locked -p mc-store -p mc-module --all-targets`: passed on Linux8c.
+- Store/core tests: **248 +22 passed**,3 private store cases ignored.
+- Module library with drive-fault: **1727 passed,22 ignored**. The new upstream `anthropic_whole_message_strip_leaves_system_rows_without_content` regression accounts for the additional test; it checks that neutralized OpenCode2 system rows are removed rather than sent as empty Anthropic text blocks.
+- Nine other module integration targets: **15 passed**.
+- Complete executable Broca conformance, shared fixtures, admission/crash cuts, schema95/private65 compatibility and baseline comparisons: **24 passed,0 failed,0 ignored**,15.37 s. The baseline was built separately from current master55e9f18c.
+- `cargo fmt --check` and strict workspace/all-targets clippy, **both default and drive-fault**, passed on rustfmt1.10.0/Clippy1.99.
+- Registry Cargo dependencies were installed with `cargo fetch`; Cargo.lock now records registry checksums for all four published roles and removes the Git role/harness sources. No JS manifest or lockfile changed.
+- Niced Mac real-daemon tests with the final registry candidate: **5 passed,2 private-fixture cases ignored**,5.70 s; no-Broca host-runner **1 passed**,2.83 s; native store-ahead **1 passed**,2.51 s. All use task-owned pinned daemon sources/binaries and isolated roots, with lsof10–11 healthy-module DB handles.
+- Rebased plugin `bun run --cwd packages/plugin typecheck`: **3 project checks passed**, TypeScript5.9.3. Targeted `bun run --cwd packages/plugin test src/hooks/magic-context/token-count-exact.test.ts`: **4 tests passed**,307 assertions, Bun1.4.2; the 3 MB linear-scaling case passed in3.89 s. Its frozen install checked1013 installs/1254 packages with no changes. An initial version-probe command used a nonexistent root tsc path and did not run checks; the actual workspace binary path and script were used for the successful gate. No OpenCode/Pi distribution was rebuilt.
+
+The published transition changes dependency sources and the dev-only protocol version, not the module's transport, bind/error types, context writers or schema boundary. The admission, crash-cut and schema-fence mutation proofs and independent review are retained above as evidence for those tested behaviors. The superseded draft that broadened the Git-name policy is not delivered. The branch is rebased, committed and clean, with the local `train/provider-release` ref updated; no push or placement is performed here. CI job38184366422 was inspected, but a new remote CI run is not claimed without a push.
