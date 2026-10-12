@@ -1322,11 +1322,10 @@ export function mustMaterializePi(
 	// the render path), folded into m[0] only on a HARD bust.
 	// project_user_profile_version is also NOT a trigger: additive user-profile
 	// rides the m[1] <new-user-profile> delta.
-	// maxMemoryId is deliberately NOT a materialization trigger (parity with
-	// OpenCode): new memories are additive and surface in m[1] via the
-	// maxMemoryId watermark, so they must not bust the m[0] cache. Memory
-	// mutations use cachedM0MaxMemoryMutationId as an m[1] reconcile cursor,
-	// not as a materialization trigger; keep it out of this trigger set.
+	// No memory row or mutation-log head is a materialization trigger (parity
+	// with OpenCode), and the decision does not read them. A busting SOFT renders
+	// no memory rows: other writers' inserts and edits reach the prompt at the next
+	// HARD fold, and this session's own agent edits ride m[1] as fragments.
 	// projectDocsHash is also NOT a trigger: docs-only edits ride along until a
 	// natural HARD fold, which reads fresh docs and persists the hash matching the
 	// bytes it rendered.
@@ -1880,10 +1879,10 @@ export function materializeM0Pi(
 		// pairing the first render with a later on-disk hash.
 		const current = readCurrentMarkers(db, state, docs.canonicalHash);
 		// maxMemoryId deliberately EXCLUDED (parity with OpenCode materializeM0):
-		// additive memory writes don't bump projectMemoryEpoch and must NOT bust
-		// m[0] — they surface in m[1] via the persisted maxMemoryId watermark. The
-		// memory-mutation cursor IS included because a materialization pass must
-		// reconcile every non-additive memory change up to its persisted cursor.
+		// a memory inserted after this fold's read is not lost, because this fold's
+		// own m[1], rendered under the writer below, admits rows above the fold's
+		// maxMemoryId. The memory-mutation cursor IS included: a log row written
+		// after the read would make this fold's m[0] stale, so the fold retries.
 		const memoryEpochStale =
 			current.workspaceFingerprint !== null ||
 			snapshotMarkers.workspaceFingerprint !== null

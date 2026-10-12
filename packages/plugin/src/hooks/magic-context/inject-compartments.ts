@@ -2017,10 +2017,12 @@ export function mustMaterialize(args: {
     // the prompt-cache prefix on a routine background publish — the exact bug the
     // m[0]/m[1] split exists to prevent. They fold into m[0] only on a HARD bust.
     //
-    // NOTE: maxMemoryId is NOT a trigger. Additive memory writes surface in m[1]
-    // via the maxMemoryId watermark; memory mutations use the m[1] reconcile
-    // cursor. max_mutation_id (structural compartment delete/merge/recomp) IS a
-    // trigger because it changes the rendered m[0] baseline content.
+    // NOTE: no memory row or mutation-log head is a trigger, and this decision
+    // does not read them (memoryWatermarks: false above). A busting SOFT renders no
+    // memory rows: other writers' inserts and edits reach the prompt at the next
+    // HARD fold, and this session's own agent edits ride m[1] as fragments.
+    // max_mutation_id (structural compartment delete/merge/recomp) IS a trigger
+    // because it changes the rendered m[0] baseline content.
     //
     // NOTE: projectDocsHash is deliberately NOT a trigger. Project docs are part
     // of m[0], but docs-only edits must not evict the cached prefix; materializeM0
@@ -2823,10 +2825,10 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             renderedBudgets: snapshotMarkers.renderedBudgets,
         };
         // NOTE: maxMemoryId is deliberately EXCLUDED from this stale-check.
-        // Additive memory writes (write/promote) do not invalidate the rendered
-        // m[0]; they surface in m[1] via the maxMemoryId watermark. The memory
-        // mutation cursor IS included here because a materialization pass must
-        // reconcile every non-additive memory change up to its persisted cursor.
+        // A memory inserted after this fold's read is not lost: this fold's own
+        // m[1], rendered under the writer below, admits rows above the fold's
+        // maxMemoryId. The memory mutation cursor IS included: a log row written
+        // after the read would make this fold's m[0] stale, so the fold retries.
         const memoryEpochStale =
             current.workspaceFingerprint !== null || snapshotMarkers.workspaceFingerprint !== null
                 ? current.workspaceFingerprint !== snapshotMarkers.workspaceFingerprint
