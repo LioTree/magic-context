@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { applyMemoryAdmission } from "../../features/magic-context/memory/lifecycle-applier";
 import {
     archiveMemory,
     insertMemory,
@@ -142,11 +143,21 @@ describe("OpenCode visible-memory manifest", () => {
             f.db
                 .prepare("UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?")
                 .run(legacyIdentity, f.options.sessionId);
-            const delta = insertMemory(f.db, {
-                projectPath: f.options.projectPath,
-                category: "ARCHITECTURE",
-                content: "metadata adoption delta",
-            });
+            // A busting SOFT shows memory only through this session's agent
+            // fragments, so the refreshed delta comes from an agent save.
+            const delta = {
+                id: applyMemoryAdmission(f.db, {
+                    key: "metadata-adoption-save",
+                    operation: "agent_save",
+                    input: {
+                        projectPath: f.options.projectPath,
+                        category: "ARCHITECTURE",
+                        content: "metadata adoption delta",
+                        sourceSessionId: f.options.sessionId,
+                        sourceType: "agent",
+                    },
+                }).memoryId!,
+            };
             const refreshed = f.serve(true);
             expect(refreshed.m0RematerializedThisPass).toBe(false);
             expect(f.manifest()).toEqual({ ids: [baseline.id, delta.id], count: 2 });
@@ -167,7 +178,9 @@ describe("OpenCode visible-memory manifest", () => {
         }
     });
 
-    it("includes forced m[1] replacements below the baseline watermark without changing repeated refresh bytes", () => {
+    // Busting SOFT passes no longer force successor rows into m[1]: another
+    // writer's supersession or archive reaches this session at its next HARD fold.
+    it("leaves another writer's supersession below the baseline watermark out of repeated refresh bytes", () => {
         const f = fixture();
         try {
             const original = insertMemory(f.db, {
@@ -214,11 +227,12 @@ describe("OpenCode visible-memory manifest", () => {
                 });
             const first = refresh();
             expect(first.m0Bytes).toEqual(fold.m0Bytes);
-            expect(first.m1Text).toContain(`#${replacement.id}: replacement B`);
-            expect(f.manifest()).toEqual({ ids: [original.id, replacement.id], count: 2 });
+            expect(first.m1Text).not.toContain(`#${replacement.id}:`);
+            expect(first.m1Text).not.toContain(`id="${original.id}"`);
+            expect(f.manifest()).toEqual({ ids: [original.id], count: 1 });
             const second = refresh();
             expect(second.m1Text).toBe(first.m1Text);
-            expect(f.manifest()).toEqual({ ids: [original.id, replacement.id], count: 2 });
+            expect(f.manifest()).toEqual({ ids: [original.id], count: 1 });
             archiveMemory(f.db, replacement.id);
             queueMemoryMutation(f.db, {
                 projectPath: options.projectPath,
@@ -226,7 +240,7 @@ describe("OpenCode visible-memory manifest", () => {
                 targetMemoryId: replacement.id,
             });
             const third = refresh();
-            expect(third.m1Text).not.toContain(`#${replacement.id}:`);
+            expect(third.m1Text).toBe(first.m1Text);
             expect(f.manifest()).toEqual({ ids: [original.id], count: 1 });
         } finally {
             f.close();
@@ -289,11 +303,14 @@ describe("OpenCode visible-memory manifest", () => {
                 content: "not served during defer",
             });
             const defer = capture();
-            // Captured from the unmodified renderer before the manifest fix.
+            // The fold hash was captured from the unmodified renderer before the
+            // manifest fix, so HARD bytes are unchanged. A busting SOFT no longer
+            // admits other writers' new memories, so the refresh and the defer after it
+            // serve the fold's bytes.
             expect({ fold, refresh, defer }).toEqual({
                 fold: "259a053d3215cdb0d32792144c2bab8c581075a047176d55402405bff76bcac1",
-                refresh: "c08b78fc2e739b52411db91b12311ea3f78a384aebbf2c6aa2cd2ef28527c978",
-                defer: "c08b78fc2e739b52411db91b12311ea3f78a384aebbf2c6aa2cd2ef28527c978",
+                refresh: "259a053d3215cdb0d32792144c2bab8c581075a047176d55402405bff76bcac1",
+                defer: "259a053d3215cdb0d32792144c2bab8c581075a047176d55402405bff76bcac1",
             });
             expect(defer).toBe(refresh);
             expect(f.row()).toEqual(before);

@@ -3,7 +3,7 @@
 //! semantics, the version fence against older binaries, and the writer guards
 //! on the two new session tables.
 use super::*;
-use crate::{Migration, LATEST_MIGRATION_VERSION, MIGRATIONS};
+use crate::{Migration, MIGRATIONS};
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
 fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
@@ -183,8 +183,12 @@ fn migration_68_steps_a_populated_v67_provider_store_and_fences_v67() {
     };
     assert!(before.contains("m3#1"), "the v67 store holds policy rows");
 
-    let current = McStore::open_for_test(&descriptor).unwrap();
-    assert_eq!(LATEST_MIGRATION_VERSION, 68);
+    let chain_68 = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 68)
+        .cloned()
+        .collect::<Vec<_>>();
+    let current = McStore::open_with_migrations(&descriptor, false, &chain_68).unwrap();
     assert_eq!(current.module_store_schema_version().unwrap(), 68);
     assert_eq!(
         provider_rows(&current),

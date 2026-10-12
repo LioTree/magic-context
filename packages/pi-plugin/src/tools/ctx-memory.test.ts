@@ -201,6 +201,104 @@ describe("createCtxMemoryTool", () => {
 		}
 	});
 
+	// Curate is proposals only and a dreamer save is an automated insert, exactly as
+	// in OpenCode: no dreamer update, merge or archive changes a row, and no dreamer
+	// action writes a mutation-log row or records an agent fragment, so no dreamer
+	// action can reach a busting SOFT.
+	it("routes dreamer update, merge and archive to proposals and writes no log row or fragment", async () => {
+		const db = createTestDb();
+		try {
+			const ctx = fakeContext("ses-dreamer-routed") as never;
+			const projectIdentity = resolveProjectIdentity(
+				(ctx as { cwd: string }).cwd,
+			);
+			const first = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "ARCHITECTURE",
+				content: "Dreamer target one.",
+			});
+			const second = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "ARCHITECTURE",
+				content: "Dreamer target two.",
+			});
+			const dreamer = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: true,
+			});
+			const run = async (params: Record<string, unknown>) => {
+				const result = await dreamer.execute(
+					"call",
+					params as never,
+					new AbortController().signal,
+					undefined,
+					ctx,
+				);
+				expect(result.isError).toBeUndefined();
+				return result.content[0]?.text ?? "";
+			};
+			const before = db
+				.prepare(
+					"SELECT id, content, status, revision FROM memories ORDER BY id",
+				)
+				.all();
+			expect(
+				await run({ action: "update", ids: [first.id], content: "Rewritten." }),
+			).toContain("pending proposal");
+			expect(
+				await run({
+					action: "merge",
+					ids: [first.id, second.id],
+					content: "Merged.",
+				}),
+			).toContain("pending proposal");
+			expect(
+				await run({
+					action: "archive",
+					ids: [second.id],
+					superseded_by: first.id,
+				}),
+			).toContain("pending proposal");
+			expect(
+				db
+					.prepare(
+						"SELECT id, content, status, revision FROM memories ORDER BY id",
+					)
+					.all(),
+			).toEqual(before);
+			expect(
+				db
+					.prepare(
+						"SELECT writer, operation FROM memory_tool_proposals ORDER BY id",
+					)
+					.all(),
+			).toEqual([
+				{ writer: "curate", operation: "update" },
+				{ writer: "curate", operation: "merge" },
+				{ writer: "curate", operation: "archive" },
+			]);
+			expect(
+				await run({
+					action: "write",
+					category: "ARCHITECTURE",
+					content: "A dreamer-written fact.",
+				}),
+			).toContain("Saved memory");
+			const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
+			expect(count("SELECT COUNT(*) AS n FROM memory_mutation_log")).toBe(0);
+			expect(count("SELECT COUNT(*) AS n FROM memory_agent_fragments")).toBe(0);
+			expect(
+				count(
+					"SELECT COUNT(*) AS n FROM memories WHERE source_type = 'dreamer'",
+				),
+			).toBe(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("refuses a dreamer mutation outside the persisted curate category scope", async () => {
 		const db = createTestDb();
 		try {
@@ -290,6 +388,75 @@ describe("createCtxMemoryTool", () => {
 			);
 			expect(archived.isError).toBeUndefined();
 			expect(archived.content[0]?.text).toContain("Archived memory");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	// Primary-agent edits share OpenCode's applier: each one writes undo history
+	// and exactly one fragment for the session that made it, which that session's
+	// next busting m[1] shows.
+	it("routes primary write, update, merge and archive through the shared applier", async () => {
+		const db = createTestDb();
+		try {
+			const primary = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const ctx = fakeContext("ses-routed") as never;
+			const run = async (params: Record<string, unknown>) => {
+				const result = await primary.execute(
+					"call",
+					params as never,
+					new AbortController().signal,
+					undefined,
+					ctx,
+				);
+				expect(result.isError).toBeUndefined();
+				return Number(result.content[0]?.text?.match(/ID:\s*(\d+)/)?.[1]);
+			};
+			const first = await run({
+				action: "write",
+				category: "ARCHITECTURE",
+				content: "First routed fact.",
+			});
+			const second = await run({
+				action: "write",
+				category: "ARCHITECTURE",
+				content: "Second routed fact.",
+			});
+			await run({
+				action: "update",
+				ids: [first],
+				content: "First fact, edited.",
+			});
+			const merged = await run({
+				action: "merge",
+				ids: [first, second],
+				content: "Both facts, merged.",
+			});
+			await run({ action: "archive", ids: [merged] });
+			const fragments = db
+				.prepare(
+					"SELECT session_id, lines FROM memory_agent_fragments ORDER BY id",
+				)
+				.all() as Array<{ session_id: string; lines: string }>;
+			expect(fragments.map((fragment) => fragment.session_id)).toEqual(
+				Array(5).fill("ses-routed"),
+			);
+			expect(fragments[2]?.lines).toBe(
+				`  <updated id="${first}" category="ARCHITECTURE">First fact, edited.</updated>`,
+			);
+			expect(fragments[4]?.lines).toBe(`  <removed id="${merged}"/>`);
+			expect(
+				(
+					db.prepare("SELECT COUNT(*) AS n FROM memory_history").get() as {
+						n: number;
+					}
+				).n,
+			).toBeGreaterThanOrEqual(4);
 		} finally {
 			closeQuietly(db);
 		}
@@ -869,10 +1036,12 @@ describe("createCtxMemoryTool", () => {
 				ctx,
 			);
 
-			// Fresh canonical inserted; both sources superseded → archived.
+			// The workspace scope still admits the merge, which, as curate, is now a
+			// pending proposal: both sources stay live until it is reviewed.
 			expect(result.isError).toBeUndefined();
-			expect(getMemoryById(db, own.id)?.status).toBe("archived");
-			expect(getMemoryById(db, foreignShared.id)?.status).toBe("archived");
+			expect(result.content[0]?.text).toContain("pending proposal");
+			expect(getMemoryById(db, own.id)?.status).toBe("active");
+			expect(getMemoryById(db, foreignShared.id)?.status).toBe("active");
 		} finally {
 			closeQuietly(db);
 		}
@@ -1024,7 +1193,7 @@ describe("createCtxMemoryTool", () => {
 		}
 	});
 
-	it("keeps dreamer able to curate archived memories during merge", async () => {
+	it("keeps dreamer able to propose a merge that includes an archived memory", async () => {
 		const db = createTestDb();
 		try {
 			const dreamer = createCtxMemoryTool({
@@ -1061,12 +1230,12 @@ describe("createCtxMemoryTool", () => {
 				ctx,
 			);
 
+			// Curate is proposals only: the merge is accepted for review and no row
+			// changes.
 			expect(result.isError).toBeUndefined();
-			expect(result.content[0]?.text).toContain(
-				`canonical memory [ID: ${archived.id}]`,
-			);
-			expect(getMemoryById(db, archived.id)?.status).toBe("active");
-			expect(getMemoryById(db, active.id)?.status).toBe("archived");
+			expect(result.content[0]?.text).toContain("pending proposal");
+			expect(getMemoryById(db, archived.id)?.status).toBe("archived");
+			expect(getMemoryById(db, active.id)?.status).toBe("active");
 		} finally {
 			closeQuietly(db);
 		}

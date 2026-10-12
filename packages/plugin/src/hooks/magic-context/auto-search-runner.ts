@@ -72,6 +72,12 @@ export interface AutoSearchRunnerOptions {
     /** Memory ids already rendered in the injected <session-history> block —
      *  skip fragments that just duplicate visible memories. */
     visibleMemoryIds?: Set<number>;
+    /**
+     * Resolves `visibleMemoryIds` only when a new hint is computed for a new user
+     * message. Automatic search is a named memory reader: it reads current memory, but
+     * only then, never on a pass that replays an already-decided message.
+     */
+    resolveVisibleMemoryIds?: () => Set<number> | undefined;
     /** Caveman word rules for hint fragments, from the user-level `language` setting. */
     wordRules?: CavemanWordRules;
 }
@@ -346,7 +352,8 @@ export async function runAutoSearchHint(args: {
                         // Hard-filter memories already rendered in <session-history>.
                         // unifiedSearch applies this during memory merging so ranking
                         // can't be distorted by already-visible hits.
-                        visibleMemoryIds: options.visibleMemoryIds ?? null,
+                        visibleMemoryIds:
+                            options.visibleMemoryIds ?? options.resolveVisibleMemoryIds?.() ?? null,
                         // Leave primers out of automatic hints so primer updates cannot rewrite
                         // cached request prefixes. Explicit ctx_search and the dashboard expose them.
                         sources: ["memory", "message", "git_commit"],

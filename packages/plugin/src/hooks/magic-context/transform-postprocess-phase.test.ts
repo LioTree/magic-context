@@ -118,6 +118,22 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 let db: Database;
 
+/**
+ * Grow the global user profile enough that its m[1] delta alone exceeds the m[1]
+ * pressure cap of a 500-token history budget. A busting SOFT renders profile
+ * changes but reads no memory rows, so this is how the tests produce SOFT pressure.
+ */
+async function growUserProfile(label: string): Promise<void> {
+    const { insertUserMemory } = await import(
+        "../../features/magic-context/user-memory/storage-user-memory"
+    );
+    const { bumpProjectUserProfileVersion } = await import(
+        "../../features/magic-context/storage-project-state"
+    );
+    for (let i = 0; i < 45; i++) insertUserMemory(db, `${label}_${i}: user rule ${i}.`, []);
+    bumpProjectUserProfileVersion(db);
+}
+
 function createOpenCodeDbWithoutMessages(prefix: string): void {
     const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
@@ -5063,9 +5079,11 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         expect(advSha(deferAgain.messages)).toBe(advSha(defer.messages));
     });
 
-    it("ADV: a pressure refold (memoryUpdateCount > 40 on an execute pass) converts legacy markers", async () => {
+    it("ADV: a pressure refold (an oversized m[1] on an execute pass) converts legacy markers", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
+        // The user-profile tables come from migrations.
+        runMigrations(db);
         const sessionId = "ses-adv-pressure";
         injectM0M1({
             db,
@@ -5079,15 +5097,9 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         });
         const tags = advSeedLegacy(sessionId);
         const d1 = await advPass(sessionId, { budget: 500 });
-        const { insertMemory } = await import("../../features/magic-context/memory/storage-memory");
-        for (let i = 0; i < 45; i++) {
-            insertMemory(db, {
-                projectPath: FOLD_PROJECT,
-                category: "PROJECT_RULES",
-                content: `ADV_PRESSURE_MEMORY_${i}: rule ${i}.`,
-                importance: 50,
-            });
-        }
+        // A busting SOFT reads no memory rows, so new memories can no longer grow
+        // m[1]. A large user-profile change still does, which is the pressure source.
+        await growUserProfile("ADV_PRESSURE_PROFILE");
         const d2 = await advPass(sessionId, { budget: 500 });
         const exec = await advPass(sessionId, { scheduler: "execute", budget: 500 });
         const modes = advModes(sessionId, tags);
@@ -5744,6 +5756,8 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         it("pressure refold: absorbing a large m[1] into m[0] changes the served pair", async () => {
             db = new Database(":memory:");
             initializeDatabase(db);
+            // The user-profile tables come from migrations.
+            runMigrations(db);
             const sessionId = "ses-identical-pressure";
             injectM0M1({
                 db,
@@ -5755,17 +5769,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 isCacheBustingPass: true,
                 hardSignals: BASE_HARD,
             });
-            const { insertMemory } = await import(
-                "../../features/magic-context/memory/storage-memory"
-            );
-            for (let i = 0; i < 45; i++) {
-                insertMemory(db, {
-                    projectPath: FOLD_PROJECT,
-                    category: "PROJECT_RULES",
-                    content: `PRESSURE_MEMORY_${i}: rule ${i}.`,
-                    importance: 50,
-                });
-            }
+            await growUserProfile("PRESSURE_PROFILE");
             const defer = await pass(sessionId, { budget: 500 });
             const exec = await pass(sessionId, { scheduler: "execute", budget: 500 });
             expect(exec.result.materialized).toBe(true);
@@ -6171,16 +6175,22 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         it("starvation: a held drop lands on the next execute pass that publishes m[1]; the defer after replays it", async () => {
             const sessionId = "ses-adv-starve-execute";
             const { defer, target } = await heldAfterIdenticalHard(sessionId);
-            // An additive memory surfaces through m[1] on the next execute pass,
-            // which is the published-history bust queued drops wait for.
-            const { insertMemory } = await import(
-                "../../features/magic-context/memory/storage-memory"
+            // This session's own agent save surfaces through m[1] on the next execute
+            // pass, which is the published-history bust queued drops wait for.
+            const { applyMemoryAdmission } = await import(
+                "../../features/magic-context/memory/lifecycle-applier"
             );
-            insertMemory(db, {
-                projectPath: FOLD_PROJECT,
-                category: "PROJECT_RULES",
-                content: "ADV_EXECUTE_PUBLISH: new rule.",
-                importance: 50,
+            applyMemoryAdmission(db, {
+                key: "adv-execute-publish",
+                operation: "agent_save",
+                input: {
+                    projectPath: FOLD_PROJECT,
+                    category: "PROJECT_RULES",
+                    content: "ADV_EXECUTE_PUBLISH: new rule.",
+                    importance: 50,
+                    sourceSessionId: sessionId,
+                    sourceType: "agent",
+                },
             });
             const exec = await pass(sessionId, { scheduler: "execute", turn: "t-exec" });
             console.log(

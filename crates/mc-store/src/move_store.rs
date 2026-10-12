@@ -968,36 +968,49 @@ fn preflight(conn: &Connection, session: &str, path: &Path) -> Result<(), MoveEr
             if keys.execute("INSERT INTO keys VALUES(?1)", [key]).is_err() {
                 return Err(MoveError::table("key_collision", table.table));
             }
-            if table.key_policy == Some(KeyPolicy::PreserveOrRefuseCollision) {
-                let columns = table.shipped_columns();
-                let key_values = table
-                    .primary_key
-                    .iter()
-                    .map(|name| &row[columns.iter().position(|c| c == name).unwrap()]);
-                let predicate = table
-                    .primary_key
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| format!("{} = ?{}", codec::quoted(c), i + 1))
-                    .collect::<Vec<_>>()
-                    .join(" AND ");
-                let collision = conn.query_row(
-                    &format!(
-                        "SELECT EXISTS(SELECT 1 FROM {} WHERE {predicate})",
-                        codec::quoted(table.table)
-                    ),
-                    rusqlite::params_from_iter(key_values),
-                    |r| r.get::<_, bool>(0),
-                )?;
-                if collision {
-                    return Err(MoveError::table("key_collision", table.table));
-                }
-            }
+            refuse_inventory_key_collision(conn, table, &row)?;
         }
     }
     let mut tail = [0];
     if input.read(&mut tail)? != 0 {
         return Err(MoveError::refusal("manifest_mismatch"));
+    }
+    Ok(())
+}
+
+/// Check the inventory-declared primary key against a destination table without
+/// reserving or installing rows. Production preflight uses this only for store.db
+/// (Module) tables. A context.db (Context) query test does not implement that importer.
+fn refuse_inventory_key_collision(
+    conn: &Connection,
+    table: &move_inventory::TableInventory,
+    row: &[Value],
+) -> Result<(), MoveError> {
+    if table.key_policy != Some(KeyPolicy::PreserveOrRefuseCollision) {
+        return Ok(());
+    }
+    let columns = table.shipped_columns();
+    let key_values = table
+        .primary_key
+        .iter()
+        .map(|name| &row[columns.iter().position(|column| column == name).unwrap()]);
+    let predicate = table
+        .primary_key
+        .iter()
+        .enumerate()
+        .map(|(index, column)| format!("{} = ?{}", codec::quoted(column), index + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let collision = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE {predicate})",
+            codec::quoted(table.table)
+        ),
+        rusqlite::params_from_iter(key_values),
+        |row| row.get::<_, bool>(0),
+    )?;
+    if collision {
+        return Err(MoveError::table("key_collision", table.table));
     }
     Ok(())
 }

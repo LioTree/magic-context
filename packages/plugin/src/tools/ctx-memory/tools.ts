@@ -503,14 +503,32 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     return `Error: Unknown memory category '${rawCategory}'.`;
                 }
 
+                const callContext = toolContext as unknown as Record<string, unknown>;
+                const classificationAnchor =
+                    toolContext.agent === DREAMER_AGENT
+                        ? null
+                        : (deps.agentSaveClassificationAnchor?.({
+                              sessionId: toolContext.sessionID,
+                              ...(typeof callContext.messageID === "string"
+                                  ? { messageId: callContext.messageID }
+                                  : {}),
+                              ...(typeof callContext.callID === "string"
+                                  ? { callId: callContext.callID }
+                                  : {}),
+                          }) ?? null);
                 const receipt = applyMemoryAdmission(deps.db, {
                     key: randomUUID(),
                     operation: "agent_save",
+                    ...(classificationAnchor ? { classificationAnchor } : {}),
                     input: {
                         projectPath,
                         category,
                         content,
                         sourceSessionId: toolContext.sessionID,
+                        // A dreamer save is an automated insert: it writes no fragment.
+                        ...(toolContext.agent === DREAMER_AGENT
+                            ? { sourceType: "dreamer" as const }
+                            : {}),
                     },
                 });
                 if (receipt.state !== "applied") return `${receipt.reason}: memory was not saved.`;

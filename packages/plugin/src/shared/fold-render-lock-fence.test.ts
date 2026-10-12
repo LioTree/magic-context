@@ -53,8 +53,12 @@ for (const [host, path, functions] of [
                         call.arguments[0]?.getText(source) === '"COMMIT"',
                 );
                 expect(commit).toBeDefined();
+                // A HARD fold renders m[1] from memory rows; a busting SOFT renders it
+                // from the session's applied projection. Either must run under the writer.
                 const renders = calls.filter((call) =>
-                    /^renderM1(?:Pi)?WithMetadata$/.test(call.expression.getText(source)),
+                    /^(?:renderM1(?:Pi)?WithMetadata|renderSoftM1(?:Pi)?)$/.test(
+                        call.expression.getText(source),
+                    ),
                 );
                 expect(renders).toHaveLength(1);
                 for (const render of renders) {

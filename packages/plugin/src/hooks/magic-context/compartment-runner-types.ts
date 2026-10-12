@@ -1,10 +1,11 @@
+import type { TurnOneLane } from "../../features/magic-context/memory/turn-one-publication";
 import type { TokenTotals } from "../../features/magic-context/subagent-token-capture";
 import type { PluginContext } from "../../plugin/types";
 import type { HarnessId } from "../../shared/harness";
 import type { ModelInput } from "../../shared/model-resolution";
 import type { PromptArgs } from "../../shared/model-suggestion-retry";
 import type { Database } from "../../shared/sqlite";
-import type { ParsedEvent } from "./compartment-parser";
+import type { ParsedEvent, ParsedFact } from "./compartment-parser";
 import type {
     BoundarySnapshotValidationResult,
     ProtectedTailBoundarySnapshot,
@@ -119,6 +120,13 @@ export interface HiddenCompletionExecutor {
     attempt(handle: HiddenRunHandle, request: PromptArgs): Promise<void>;
     /** Kept separate from prompt settlement so read failures never resend a historian prompt. */
     collect(handle: HiddenRunHandle, limit: number): Promise<HiddenCompletion>;
+    /**
+     * Release the run's place in the executor's per-role queue (OpenCode 2 runs one
+     * hidden historian run at a time) while its child session stays open, for a
+     * historian child kept open for turn two. Executors without such a queue omit
+     * this method.
+     */
+    detach?(handle: HiddenRunHandle): void;
     close(
         handle: HiddenRunHandle | null,
         settlement: {
@@ -195,6 +203,21 @@ export interface CompartmentRunnerDeps<
      */
     autoPromote?: boolean;
     /**
+     * Which historian turn one this lane runs (see `TurnOneLane`). Unset means
+     * `dormant`, the only production value: `enabled` needs a transport that makes
+     * the provider enforce a JSON response schema, and none does yet.
+     */
+    memoryLifecycleLane?: TurnOneLane;
+    /**
+     * Historian and check model profiles (`ReportedProfile`) that a recorded replay
+     * validated for turn two. None is validated yet, so on an enabled lane every
+     * edit, merge and replacement is deferred (retried, then left pending) rather
+     * than applied; tests pass profiles here to exercise those paths.
+     */
+    memoryLifecycleValidatedProfiles?: readonly import("../../features/magic-context/memory/lifecycle-gates").ReportedProfile[];
+    /** Overrides the turn-two neighbour embedder (tests). */
+    memoryLifecycleEmbedQuery?: import("../../features/magic-context/memory/turn-two-retrieval").TurnTwoQueryEmbedder;
+    /**
      * Called after compartment state is published. The runner marks the active
      * run as published before invoking this callback.
      */
@@ -260,7 +283,29 @@ export interface CandidateCompartment {
     episodeType?: string | null;
 }
 
+/**
+ * A historian child kept open after a validated turn one, so turn two continues the
+ * same session. Its owner must call `close` once no turn-two stage is in flight.
+ */
+export interface RetainedHistorianChild {
+    executor: HiddenCompletionExecutor;
+    handle: HiddenRunHandle;
+    agent: string;
+    /** The system prompt turn one ran with; its hash is the historian's profile hash. */
+    system: string;
+    model?: ModelInput;
+    directory: string;
+    /** Turn one's reply text. */
+    turnOneText: string;
+    /** The model the provider reported for turn one, when the carrier exposes it. */
+    providerId?: string;
+    modelId?: string;
+    close(): Promise<void>;
+}
+
 export interface HistorianRunResult {
+    /** Set only when the caller asked to retain the child and the run succeeded. */
+    retained?: RetainedHistorianChild;
     refusal?: HiddenCompletionRefusal;
     ok: boolean;
     result?: string;
@@ -273,7 +318,7 @@ export type ValidatedHistorianPassResult =
     | {
           ok: true;
           compartments: CandidateCompartment[];
-          facts: Array<{ category: string; content: string }>;
+          facts: ParsedFact[];
           droppedFactBlocks?: number;
           droppedFacts?: number;
           userObservations?: string[];
@@ -293,6 +338,8 @@ export type ValidatedHistorianPassResult =
            * under subagent='recomp') to a stale subagent='historian' row.
            */
           invocationId?: number | null;
+          /** The child that produced the published reply, kept open for turn two. */
+          retainedChild?: RetainedHistorianChild;
       }
     | { ok: false; error: string; invocationId?: number | null };
 

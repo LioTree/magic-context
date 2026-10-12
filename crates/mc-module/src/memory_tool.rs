@@ -548,6 +548,11 @@ pub fn resolve_memory_ids_for_search_with_diagnostics(
         let Some(memory) = visible.get(id) else {
             continue;
         };
+        if !matches!(memory.status.as_str(), "active" | "permanent")
+            || memory.superseded_by_memory_id.is_some()
+        {
+            continue;
+        }
         if from_ms.is_some_and(|from| memory.created_at < from)
             || to_ms.is_some_and(|to| memory.created_at > to)
         {

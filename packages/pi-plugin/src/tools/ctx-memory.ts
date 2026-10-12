@@ -32,6 +32,7 @@
  * versa).
  */
 
+import { randomUUID } from "node:crypto";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
 	curateCategoryForMemoryCategory,
@@ -43,38 +44,35 @@ import {
 	recordCurateSafetyRefusal,
 } from "@magic-context/core/features/magic-context/dreamer/curate-memory-safety";
 import {
-	archiveMemory,
 	getMemoriesByIds,
 	getMemoriesByProject,
 	getMemoryByHash,
 	getMemoryById,
-	hasMemoryClassifiedAtColumn,
-	hasMemoryShareableColumn,
-	insertMemory,
 	type Memory,
 	type MemoryCategory,
-	mergeMemoryStats,
 	saveEmbedding,
-	supersededMemory,
-	updateMemoryContent,
-	updateMemorySeenCount,
 	V2_MEMORY_CATEGORIES,
 } from "@magic-context/core/features/magic-context/memory";
 import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
-import { invalidateMemory } from "@magic-context/core/features/magic-context/memory/embedding-cache";
+import {
+	type AgentMemoryMutation,
+	type ApplierReceipt,
+	applyAgentMemoryMutation,
+	applyMemoryAdmission,
+	getMemoryRevision,
+	MemoryContentDuplicateError,
+	proposeMemoryMutation,
+} from "@magic-context/core/features/magic-context/memory/lifecycle-applier";
 import { computeNormalizedHash } from "@magic-context/core/features/magic-context/memory/normalize-hash";
 import {
 	normalizeStoredProjectPath,
 	resolveProjectIdentityForSession,
 	storedPathBelongsToIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
-import {
-	type ContextDatabase,
-	queueMemoryMutation,
-} from "@magic-context/core/features/magic-context/storage";
+import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
 	expandWorkspaceIdentitySetWithAliases,
 	resolveStoredPathWorkspaceIdentity,
@@ -87,7 +85,6 @@ import {
 	CTX_MEMORY_DESCRIPTION,
 	CTX_MEMORY_LIST_DESCRIPTION,
 } from "@magic-context/core/tools/ctx-memory/constants";
-import { runImmediateTransaction } from "@magic-context/core/tools/ctx-memory/verification-recording";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
@@ -313,33 +310,6 @@ function formatGetOutput(args: {
 	return parts.join("\n\n");
 }
 
-function updateMemoryContentInCurrentTransaction(
-	db: ContextDatabase,
-	memory: Memory,
-	content: string,
-	normalizedHash: string,
-	category: MemoryCategory,
-): void {
-	db.prepare(
-		"UPDATE memories SET content = ?, normalized_hash = ?, category = ?, updated_at = ? WHERE id = ?",
-	).run(content, normalizedHash, category, Date.now(), memory.id);
-	// The classify `shareable` verdict was scored against the OLD content; new
-	// content invalidates it. Fail closed → private; the dreamer re-scores later.
-	if (hasMemoryShareableColumn(db)) {
-		db.prepare("UPDATE memories SET shareable = 0 WHERE id = ?").run(memory.id);
-	}
-	// Clear the classify marker so the changed fact is re-scored next classify run.
-	if (hasMemoryClassifiedAtColumn(db)) {
-		db.prepare("UPDATE memories SET classified_at = NULL WHERE id = ?").run(
-			memory.id,
-		);
-	}
-	db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(
-		memory.id,
-	);
-	invalidateMemory(memory.projectPath, memory.id);
-}
-
 function queueEmbedding(args: {
 	deps: CtxMemoryToolDeps;
 	projectIdentity: string;
@@ -390,6 +360,27 @@ export function createCtxMemoryTool(
 	deps: CtxMemoryToolDeps,
 ): ToolDefinition<typeof PrimaryParamsSchema | typeof DreamerParamsSchema> {
 	const dreamerAllowed = deps.allowDreamerActions === true;
+	/**
+	 * A primary agent's update, merge or archive applies immediately through the
+	 * shared applier: revision-checked, with undo history and the fragment that
+	 * shows the change in this session's next busting m[1]. Returns the error
+	 * text to report when the change was refused.
+	 */
+	const applyPrimaryAgentMutation = (
+		mutation: AgentMemoryMutation,
+	): ApplierReceipt | string => {
+		let receipt: ApplierReceipt;
+		try {
+			receipt = applyAgentMemoryMutation(deps.db, mutation);
+		} catch (error) {
+			if (error instanceof MemoryContentDuplicateError)
+				return `Error: ${error.message}`;
+			throw error;
+		}
+		return receipt.state === "applied"
+			? receipt
+			: `Error: ${receipt.reason}; memory is unchanged.`;
+	};
 	const resolveProject =
 		deps.resolveProjectIdentity ?? resolveProjectIdentityForSession;
 	return {
@@ -593,37 +584,34 @@ export function createCtxMemoryTool(
 					return err("Error: 'category' is required when action is 'write'.");
 				}
 
-				const existing = getMemoryByHash(
-					deps.db,
-					projectIdentity,
-					rawCategory,
-					computeNormalizedHash(content),
-				);
-				if (existing) {
-					updateMemorySeenCount(deps.db, existing.id);
-					return ok(
-						`Memory already exists [ID: ${existing.id}] in ${rawCategory} (seen count incremented).`,
-					);
-				}
-
-				const memory = insertMemory(deps.db, {
-					projectPath: projectIdentity,
-					category: rawCategory,
-					content,
-					sourceSessionId: sessionId,
-					sourceType: dreamerAllowed ? "dreamer" : "agent",
+				// Every save goes through the shared applier. A primary agent's save also
+				// records the fragment that shows it in this session's next busting m[1]; a
+				// dreamer save is an automated insert that writes no fragment and waits for
+				// the next HARD fold.
+				const receipt = applyMemoryAdmission(deps.db, {
+					key: randomUUID(),
+					operation: "agent_save",
+					input: {
+						projectPath: projectIdentity,
+						category: rawCategory,
+						content,
+						sourceSessionId: sessionId,
+						sourceType: dreamerAllowed ? "dreamer" : "agent",
+					},
 				});
-
-				queueEmbedding({ deps, projectIdentity, memoryId: memory.id, content });
-				// Do NOT invalidate the m[0]/m[1] cache here. An additive write is a
-				// supersede-delta operation: it surfaces in m[1] via the maxMemoryId
-				// watermark (renderM1 reads memories with id > cachedM0MaxMemoryId) on
-				// the next cache-busting pass, WITHOUT busting m[0]. Clearing the cache
-				// re-materialized m[0] for every session (the call was global over
-				// session_meta), defeating the whole additive/non-additive split and
-				// busting unrelated projects. Matches OpenCode's write path, which
-				// likewise does no cache invalidation.
-				return ok(`Saved memory [ID: ${memory.id}] in ${rawCategory}.`);
+				if (receipt.state !== "applied")
+					return err(`${receipt.reason}: memory was not saved.`);
+				if (!receipt.inserted)
+					return ok(
+						`Memory already exists [ID: ${receipt.memoryId}] in ${rawCategory} (seen count incremented).`,
+					);
+				queueEmbedding({
+					deps,
+					projectIdentity,
+					memoryId: receipt.memoryId!,
+					content,
+				});
+				return ok(`Saved memory [ID: ${receipt.memoryId}] in ${rawCategory}.`);
 			}
 
 			if (params.action === "list") {
@@ -712,29 +700,43 @@ export function createCtxMemoryTool(
 					);
 				}
 
-				runImmediateTransaction(deps.db, () => {
-					updateMemoryContentInCurrentTransaction(
-						deps.db,
-						memory,
-						content,
-						normalizedHash,
-						targetCategory,
-					);
-					queueMemoryMutation(deps.db, {
+				if (!dreamerAllowed) {
+					const receipt = applyPrimaryAgentMutation({
+						key: randomUUID(),
 						projectPath: targetIdentity,
-						mutationType: "update",
-						targetMemoryId: memory.id,
+						operation: "update",
+						sourceSessionId: sessionId,
+						targets: [
+							{
+								id: memory.id,
+								revision: getMemoryRevision(deps.db, memory.id)!,
+							},
+						],
+						content,
 						category: targetCategory,
-						newContent: content,
 					});
+					if (typeof receipt === "string") return err(receipt);
+					queueEmbedding({
+						deps,
+						projectIdentity: targetIdentity,
+						memoryId: memory.id,
+						content,
+					});
+					return ok(`Updated memory [ID: ${memory.id}] in ${targetCategory}.`);
+				}
+				// Curate is proposals only: a dreamer rewrite waits for review and the row
+				// stays unchanged, exactly as in OpenCode.
+				const receipt = proposeMemoryMutation(deps.db, {
+					projectPath: targetIdentity,
+					sourceSessionId: sessionId,
+					writer: "curate",
+					operation: "update",
+					targetIds: [memory.id],
+					proposal: { content, category: params.category },
 				});
-				queueEmbedding({
-					deps,
-					projectIdentity: targetIdentity,
-					memoryId: memory.id,
-					content,
-				});
-				return ok(`Updated memory [ID: ${memory.id}] in ${targetCategory}.`);
+				return ok(
+					`${receipt.reason}: update retained as a pending proposal; memory [ID: ${memory.id}] is unchanged.`,
+				);
 			}
 
 			if (params.action === "merge") {
@@ -839,127 +841,42 @@ export function createCtxMemoryTool(
 					);
 				}
 
-				// Aggregate stats from all source memories.
-				const mergedSeenCount = sourceMemories.reduce(
-					(sum, memory) => sum + memory.seenCount,
-					0,
-				);
-				const mergedRetrievalCount = sourceMemories.reduce(
-					(sum, memory) => sum + memory.retrievalCount,
-					0,
-				);
-				// `mergedFrom` is JSON-stringified in the DB. Flatten any prior
-				// merge chains so the lineage stays accurate when merging
-				// already-merged memories. Mirrors OpenCode's parity construction
-				// at packages/plugin/src/tools/ctx-memory/tools.ts:381-405.
-				const mergedFromIds = Array.from(
-					new Set(
-						sourceMemories.flatMap((memory) => {
-							let parsed: unknown[] = [];
-							try {
-								parsed = memory.mergedFrom ? JSON.parse(memory.mergedFrom) : [];
-							} catch {
-								parsed = [];
-							}
-							const priorIds = Array.isArray(parsed)
-								? parsed.filter(
-										(value): value is number => typeof value === "number",
-									)
-								: [];
-							return [memory.id, ...priorIds];
-						}),
-					),
-				).sort((left, right) => left - right);
-				const mergedFrom = JSON.stringify(mergedFromIds);
-				const mergedStatus: "active" | "permanent" = sourceMemories.some(
-					(memory) => memory.status === "permanent",
-				)
-					? "permanent"
-					: "active";
-
-				let canonicalMemory!: Memory;
-				deps.db
-					.transaction(() => {
-						let canonicalContentChanged = false;
-						if (canonicalExisting) {
-							// One of the source memories already has the merged content.
-							// Update it in place to absorb stats from the others.
-							canonicalMemory = canonicalExisting;
-							canonicalContentChanged =
-								canonicalMemory.content !== content ||
-								canonicalMemory.normalizedHash !== normalizedHash;
-							if (canonicalContentChanged) {
-								updateMemoryContent(
-									deps.db,
-									canonicalMemory.id,
-									content,
-									normalizedHash,
-								);
-							}
-						} else {
-							// Insert a fresh canonical memory with the merged content.
-							canonicalMemory = insertMemory(deps.db, {
-								projectPath: projectIdentity,
-								category,
-								content,
-								sourceSessionId: sessionId,
-								sourceType: dreamerAllowed ? "dreamer" : "agent",
-							});
-						}
-
-						mergeMemoryStats(
-							deps.db,
-							canonicalMemory.id,
-							mergedSeenCount,
-							mergedRetrievalCount,
-							mergedFrom,
-							mergedStatus,
-						);
-
-						for (const memory of sourceMemories) {
-							if (memory.id === canonicalMemory.id) {
-								continue;
-							}
-							supersededMemory(deps.db, memory.id, canonicalMemory.id);
-							queueMemoryMutation(deps.db, {
-								// Normalize the stored path to the resolved identity
-								// before queueing — the render-side mutation-log reader
-								// matches exact project_path, and OpenCode + dashboard
-								// both normalize first. A legacy raw filesystem path here
-								// would write a row that normalized git:/dir: sessions
-								// never read (the supersede delta would silently vanish).
-								projectPath: normalizeStoredProjectPath(memory.projectPath),
-								mutationType: "superseded",
-								targetMemoryId: memory.id,
-								supersededById: canonicalMemory.id,
-							});
-						}
-
-						if (canonicalExisting && canonicalContentChanged) {
-							queueMemoryMutation(deps.db, {
-								projectPath: normalizeStoredProjectPath(
-									canonicalMemory.projectPath,
-								),
-								mutationType: "update",
-								targetMemoryId: canonicalMemory.id,
-								category,
-								newContent: content,
-							});
-						}
-					})
-					.immediate();
-
-				queueEmbedding({
-					deps,
-					projectIdentity,
-					memoryId: canonicalMemory.id,
-					content,
+				if (!dreamerAllowed) {
+					const receipt = applyPrimaryAgentMutation({
+						key: randomUUID(),
+						projectPath: projectIdentity,
+						operation: "merge",
+						sourceSessionId: sessionId,
+						targets: sourceMemories.map((memory) => ({
+							id: memory.id,
+							revision: getMemoryRevision(deps.db, memory.id)!,
+						})),
+						content,
+						category,
+					});
+					if (typeof receipt === "string") return err(receipt);
+					queueEmbedding({
+						deps,
+						projectIdentity,
+						memoryId: receipt.memoryId!,
+						content,
+					});
+					return ok(
+						`Merged memories [${ids.join(", ")}] into canonical memory [ID: ${receipt.memoryId}] in ${category}; superseded [${(receipt.supersededIds ?? []).join(", ")}].`,
+					);
+				}
+				// Curate is proposals only: a dreamer merge waits for review and the rows
+				// stay live, exactly as in OpenCode.
+				const receipt = proposeMemoryMutation(deps.db, {
+					projectPath: projectIdentity,
+					sourceSessionId: sessionId,
+					writer: "curate",
+					operation: "merge",
+					targetIds: ids,
+					proposal: { content, category },
 				});
-				const supersededIds = sourceMemories
-					.map((memory) => memory.id)
-					.filter((id) => id !== canonicalMemory.id);
 				return ok(
-					`Merged memories [${ids.join(", ")}] into canonical memory [ID: ${canonicalMemory.id}] in ${category}; superseded [${supersededIds.join(", ")}].`,
+					`${receipt.reason}: merge retained as a pending proposal; memories [${ids.join(", ")}] are unchanged.`,
 				);
 			}
 
@@ -995,39 +912,40 @@ export function createCtxMemoryTool(
 						return err(inactiveMemoryError(memoryId, "archiving"));
 					}
 				}
-				const targets = archiveIds.map((memoryId) => {
-					const memory = getMemoryById(deps.db, memoryId);
-					if (!memory)
-						throw new Error(`validated memory ${memoryId} disappeared`);
-					return {
-						memoryId,
-						projectIdentity: targetIdentityForStoredPath(memory.projectPath),
-					};
-				});
-				runImmediateTransaction(deps.db, () => {
-					for (const target of targets) {
-						archiveMemory(deps.db, target.memoryId, params.reason);
-						if (dreamerAllowed && curateSuccessor) {
-							supersededMemory(deps.db, target.memoryId, curateSuccessor.id);
-							queueMemoryMutation(deps.db, {
-								projectPath: target.projectIdentity,
-								mutationType: "superseded",
-								targetMemoryId: target.memoryId,
-								supersededById: curateSuccessor.id,
-							});
-						} else {
-							queueMemoryMutation(deps.db, {
-								projectPath: target.projectIdentity,
-								mutationType: "archive",
-								targetMemoryId: target.memoryId,
-							});
-						}
-					}
-				});
 				const reasonSuffix = params.reason ? ` (${params.reason})` : "";
 				const idList = archiveIds.join(", ");
 				const plural = archiveIds.length > 1 ? "memories" : "memory";
-				return ok(`Archived ${plural} [ID: ${idList}]${reasonSuffix}.`);
+				if (!dreamerAllowed) {
+					const receipt = applyPrimaryAgentMutation({
+						key: randomUUID(),
+						projectPath: projectIdentity,
+						operation: "archive",
+						sourceSessionId: sessionId,
+						targets: archiveIds.map((id) => ({
+							id,
+							revision: getMemoryRevision(deps.db, id)!,
+						})),
+						reason: params.reason,
+					});
+					if (typeof receipt === "string") return err(receipt);
+					return ok(`Archived ${plural} [ID: ${idList}]${reasonSuffix}.`);
+				}
+				// Curate is proposals only: a dreamer retirement waits for review and the
+				// rows stay live, exactly as in OpenCode.
+				const receipt = proposeMemoryMutation(deps.db, {
+					projectPath: projectIdentity,
+					sourceSessionId: sessionId,
+					writer: "curate",
+					operation: "archive",
+					targetIds: archiveIds,
+					proposal: {
+						reason: params.reason,
+						supersededBy: curateSuccessor?.id,
+					},
+				});
+				return ok(
+					`${receipt.reason}: archive retained as a pending proposal; memories [${archiveIds.join(", ")}] are unchanged.`,
+				);
 			}
 
 			return err("Error: Unknown action.");

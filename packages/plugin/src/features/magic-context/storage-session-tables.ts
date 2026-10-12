@@ -1,6 +1,8 @@
 import type { Database } from "../../shared/sqlite";
 import { deleteChunkEmbedBackoffForSession } from "./compartment-chunk-embedding";
 import { releaseMemoryReservations } from "./memory/lifecycle-applier";
+import { deleteUncommittedPublications } from "./memory/turn-one-publication";
+import { closeTurnTwoChildrenOfSessions } from "./memory/turn-two-children";
 import { deleteUnmappedMessageFtsRows } from "./message-fts-rowid-map";
 import { deleteSessionActivity } from "./session-activity";
 
@@ -84,6 +86,7 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
     { table: "host_runner_state", harnessScoped: true },
     { table: "memory_check_attempts", harnessScoped: true },
     { table: "memory_stage_attempts", harnessScoped: true },
+    { table: "memory_agent_fragments", harnessScoped: true },
     { table: "memory_applied_rows", harnessScoped: true },
     { table: "memory_applied_snapshots", harnessScoped: true },
 ];
@@ -130,6 +133,10 @@ export function deleteSessionScopedRows(
     const placeholders = deletableSessionIds.map(() => "?").join(", ");
 
     releaseMemoryReservations(db, deletableSessionIds, harness);
+    // A hidden child kept open for turn two goes with its session: its reserved
+    // facts were just released, so nothing remains to reattach to it.
+    closeTurnTwoChildrenOfSessions(deletableSessionIds);
+    deleteUncommittedPublications(db, deletableSessionIds, harness);
 
     for (const sessionId of deletableSessionIds) deleteChunkEmbedBackoffForSession(db, sessionId);
     for (const definition of SESSION_SCOPED_TABLES) {

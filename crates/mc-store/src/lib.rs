@@ -22,6 +22,7 @@ pub use context_boundaries::ResolvedContextBoundary;
 pub mod context_writes;
 mod historian_claim;
 pub mod memory_lifecycle;
+pub mod memory_projection;
 pub mod move_inventory;
 pub mod move_snapshot;
 pub mod move_store;
@@ -3263,6 +3264,10 @@ const MIGRATIONS: &[Migration] = &[
         // policy part of the conversation lineage on each hook.
         statements: include_str!("migrations/store_068_provider_policy_summaries.sql"),
     },
+    Migration {
+        version: 69,
+        statements: include_str!("migrations/store_069_memory_projection.sql"),
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -4777,6 +4782,10 @@ pub struct SessionCacheTtlPolicy {
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
+    /// The memory view stored with the baseline/delta text blocks and mural image.
+    /// A SOFT delta refresh adds only immutable operations from the owning session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_projection: Option<memory_projection::AppliedProjection>,
     /// Highest `compartment_score_selections.sequence` (context.db) whose scores
     /// are rendered into the frozen m0, committed in the same write as those
     /// bytes. Zero or absent means m0 uses the original historian scores.
@@ -5483,6 +5492,8 @@ pub struct MemoryRevision {
 pub struct MemoryRenderSnapshot {
     pub memories: Vec<StoredMemory>,
     pub revision: MemoryRevision,
+    pub revisions: std::collections::BTreeMap<i64, i64>,
+    pub fragment_watermark: i64,
 }
 
 /// A rendered mural artifact shared by every session under one project identity.
@@ -5498,8 +5509,6 @@ pub struct ProjectMuralArtifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M1RevisionSnapshot {
     pub membership: Option<WorkspaceMembership>,
-    pub max_memory_id: i64,
-    pub max_memory_mutation_id: i64,
     pub max_compartment_seq: i64,
     pub note_status_version: i64,
     /// `project_state.project_memory_epoch` for the project, 0 when it has no row.
@@ -5514,7 +5523,7 @@ pub struct M1RevisionSnapshot {
 }
 
 /// A project memory row projected for rendering into the prompt.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMemory {
     /// The `context.db` row id: the id every harness renders and every tool accepts.
     pub id: i64,
@@ -6770,6 +6779,7 @@ impl<'a> FacadeMutationTxn<'a> {
         if let Some(duplicate_id) = duplicate.filter(|duplicate_id| *duplicate_id != id) {
             return Err(FacadeMemoryMutationError::DuplicateContent { id: duplicate_id });
         }
+        self.record_agent_history(&memory, content, "agent_update", now_ms)?;
         self.tx
             .execute(
                 "UPDATE memories
@@ -6833,6 +6843,7 @@ impl<'a> FacadeMutationTxn<'a> {
             if memory.status == "archived" {
                 continue;
             }
+            self.record_agent_history(&memory, &memory.content, "agent_archive", now_ms)?;
             if let Some(reason) = trimmed_reason {
                 let metadata_json = merge_archive_reason(memory.metadata_json.as_deref(), reason);
                 self.tx
@@ -7052,6 +7063,7 @@ impl<'a> FacadeMutationTxn<'a> {
             "active"
         };
         for source in &source_rows {
+            self.record_agent_history(source, &source.content, "agent_merge_source", now_ms)?;
             self.tx
                 .execute(
                     "UPDATE memories
@@ -7075,6 +7087,9 @@ impl<'a> FacadeMutationTxn<'a> {
                 },
             )
             .map_err(FacadeMemoryMutationError::storage)?;
+        }
+        if target.content != merged_content {
+            self.record_agent_history(&target, merged_content, "agent_merge_target", now_ms)?;
         }
         self.tx
             .execute(
@@ -7127,6 +7142,16 @@ impl<'a> FacadeMutationTxn<'a> {
     ) -> Result<VerificationApplyResult, String> {
         set_memory_verification_tx(self.tx, project, rows, now_ms)
             .map_err(|error| error.to_string())
+    }
+
+    /// Archive memories whose declared expiry has passed, as an automated edit.
+    pub fn expire_memories(
+        &self,
+        project: &str,
+        memory_ids: &[i64],
+        now_ms: i64,
+    ) -> Result<VerificationApplyResult, String> {
+        expire_memories_tx(self.tx, project, memory_ids, now_ms).map_err(|error| error.to_string())
     }
 
     pub fn set_memory_mural_cue(
@@ -12648,10 +12673,10 @@ impl McStore {
         Ok(version.unwrap_or(0).max(0) as u64)
     }
 
-    /// Read the membership and all m1 revision watermarks from one `context.db` read
-    /// transaction. The memory-id watermark uses the same visible render-pool predicate as
-    /// m0 and m1 additions at `now_ms`; note and compartment watermarks retain their
-    /// existing scopes.
+    /// Read the membership and the m1 revision watermarks from one `context.db` read
+    /// transaction. Memory and mutation-log heads are not among them: a busting SOFT
+    /// renders no memory rows, so memory changes are not m1 work. `_memory_enabled` and
+    /// `_now_ms` are kept for call-site stability.
     ///
     /// Two further heads come from the same snapshot for the caller to fold into the
     /// external revision: the project's `project_memory_epoch` (bumped by identity and
@@ -12663,50 +12688,13 @@ impl McStore {
         project_path: &str,
         note_project_path: &str,
         session_id: &str,
-        memory_enabled: bool,
-        now_ms: i64,
+        _memory_enabled: bool,
+        _now_ms: i64,
     ) -> Result<M1RevisionSnapshot, McStoreError> {
         self.context_read(|transaction| {
             let membership = workspace_membership_from_connection(transaction, project_path)?;
-            let project_paths = if memory_enabled {
-                membership
-                    .as_ref()
-                    .map(|value| value.union_identities.clone())
-                    .unwrap_or_else(|| vec![project_path.to_string()])
-            } else {
-                Vec::new()
-            };
-
-            let (max_memory_id, max_memory_mutation_id) = if project_paths.is_empty() {
-                (0, 0)
-            } else {
-                let (pool_filter, pool_binds) = memory_render_pool_filter_for_column(
-                    membership.as_ref(),
-                    project_path,
-                    "project_path",
-                    now_ms,
-                );
-                let max_memory_id = transaction.query_row(
-                    &format!("SELECT COALESCE(MAX(id), 0) FROM memories WHERE {pool_filter}"),
-                    rusqlite::params_from_iter(pool_binds.iter()),
-                    |row| row.get(0),
-                )?;
-                let mut projects = project_paths.clone();
-                projects.sort_unstable();
-                projects.dedup();
-                let placeholders = std::iter::repeat_n("?", projects.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let max_memory_mutation_id = transaction.query_row(
-                    &format!(
-                        "SELECT COALESCE(MAX(id), 0) FROM memory_mutation_log
-                          WHERE project_path IN ({placeholders})"
-                    ),
-                    rusqlite::params_from_iter(projects.iter()),
-                    |row| row.get(0),
-                )?;
-                (max_memory_id, max_memory_mutation_id)
-            };
+            // No memory or mutation-log head is read here: a busting SOFT renders no memory
+            // rows, so a memory change is not pending m1 work and must not open a SOFT.
             let max_compartment_seq = transaction.query_row(
                 "SELECT COALESCE(MAX(sequence), 0) FROM compartments WHERE session_id = ?1",
                 params![session_id],
@@ -12745,8 +12733,6 @@ impl McStore {
                 .unwrap_or(0);
             Ok(M1RevisionSnapshot {
                 membership,
-                max_memory_id,
-                max_memory_mutation_id,
                 max_compartment_seq,
                 note_status_version,
                 project_memory_epoch,
@@ -17424,48 +17410,43 @@ fn set_memory_verification_tx(
                     "DELETE FROM memory_verifications WHERE memory_id = ?1",
                     params![update.memory_id],
                 )?;
-                append_memory_mutation_tx(
+                // A gated verify correction is an automated edit: undo history and a new
+                // revision, but no mutation-log row, so prompts see it only at their next
+                // natural HARD fold (the TypeScript verify writes the same records).
+                record_automated_memory_edit_tx(
                     tx,
-                    MemoryMutationAppend {
-                        project_path: project,
-                        mutation_type: "update",
-                        target_memory_id: update.memory_id,
-                        superseded_by_id: None,
-                        category: Some(&memory.category),
-                        new_content: Some(content),
-                        queued_at: now_ms,
-                    },
+                    update.memory_id,
+                    &memory.content,
+                    content,
+                    "verify_update",
+                    now_ms,
                 )?;
             }
             "archive" => {
-                let metadata = merge_archive_reason(
-                    memory.metadata_json.as_deref(),
-                    update
-                        .archive_reason
-                        .as_deref()
-                        .unwrap_or("verified archive"),
-                );
-                tx.execute(
-                    "UPDATE memories
-                        SET status = 'archived', metadata_json = ?1, updated_at = ?2
-                      WHERE id = ?3",
-                    params![metadata, now_ms, update.memory_id],
-                )?;
-                tx.execute(
-                    "DELETE FROM memory_verifications WHERE memory_id = ?1",
+                // "The files refute this memory" is a model-judged retirement: it waits as
+                // a pending proposal and the row stays live, as the TypeScript verify does.
+                let revision: i64 = tx.query_row(
+                    "SELECT revision FROM memories WHERE id = ?1",
                     params![update.memory_id],
+                    |row| row.get(0),
                 )?;
-                append_memory_mutation_tx(
-                    tx,
-                    MemoryMutationAppend {
-                        project_path: project,
-                        mutation_type: "archive",
-                        target_memory_id: update.memory_id,
-                        superseded_by_id: None,
-                        category: None,
-                        new_content: None,
-                        queued_at: now_ms,
-                    },
+                tx.execute(
+                    "INSERT OR IGNORE INTO memory_tool_proposals
+                        (project_path, source_session_id, proposal_key, writer, operation,
+                         target_ids_json, expected_revisions_json, proposal_json, reason, created_at)
+                     VALUES (?1, NULL, ?2, 'verify', 'archive', ?3, ?4, ?5, 'MEMORY_PENDING_PROPOSAL', ?6)",
+                    params![
+                        project,
+                        format!("verify-archive:{}:{}", update.memory_id, memory.normalized_hash),
+                        serde_json::json!([update.memory_id]).to_string(),
+                        serde_json::json!([{ "id": update.memory_id, "revision": revision }])
+                            .to_string(),
+                        serde_json::json!({
+                            "reason": update.archive_reason.as_deref().unwrap_or("verified archive")
+                        })
+                        .to_string(),
+                        now_ms,
+                    ],
                 )?;
             }
             _ => {
@@ -17479,6 +17460,104 @@ fn set_memory_verification_tx(
         accepted.push(update.memory_id);
     }
     Ok(VerificationApplyResult { accepted, rejected })
+}
+
+/// The dreamer's expiry sweep routed through the module. Each id is rechecked inside this
+/// transaction: it must belong to `project`, still be `active` (never `permanent`) and carry a
+/// declared `expires_at` at or before `now_ms`. A row that passes is archived as an automated
+/// edit, matching the TypeScript local path: undo history and a new revision, but no
+/// mutation-log row, so prompts drop it only at their next natural HARD fold. Rows that fail
+/// the recheck are rejected and left unchanged.
+fn expire_memories_tx(
+    tx: &rusqlite::Connection,
+    project: &str,
+    memory_ids: &[i64],
+    now_ms: i64,
+) -> rusqlite::Result<VerificationApplyResult> {
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for &memory_id in memory_ids {
+        let Some(memory) = load_memory_full_tx(tx, memory_id)? else {
+            rejected.push(VerificationRejected {
+                memory_id,
+                reason: "not_found".to_string(),
+            });
+            continue;
+        };
+        let reason = if memory.project_path != project {
+            Some("not_owned")
+        } else if memory.status != "active" {
+            Some("not_active")
+        } else if !memory
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= now_ms)
+        {
+            Some("not_expired")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            rejected.push(VerificationRejected {
+                memory_id,
+                reason: reason.to_string(),
+            });
+            continue;
+        }
+        let metadata = merge_archive_reason(memory.metadata_json.as_deref(), "expired");
+        tx.execute(
+            "UPDATE memories SET status = 'archived', metadata_json = ?1, updated_at = ?2
+              WHERE id = ?3",
+            params![metadata, now_ms, memory_id],
+        )?;
+        record_automated_memory_edit_tx(
+            tx,
+            memory_id,
+            &memory.content,
+            &memory.content,
+            "expired",
+            now_ms,
+        )?;
+        accepted.push(memory_id);
+    }
+    Ok(VerificationApplyResult { accepted, rejected })
+}
+
+/// Record an automated writer's direct content edit as undo history and advance the
+/// memory's revision. The caller has already changed the row in this transaction.
+fn record_automated_memory_edit_tx(
+    tx: &rusqlite::Connection,
+    memory_id: i64,
+    previous_text: &str,
+    after_text: &str,
+    reason: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let revision: i64 = tx.query_row(
+        "SELECT revision FROM memories WHERE id = ?1",
+        params![memory_id],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO memory_history
+            (memory_id, revision, previous_text, after_text, applied_at, reason,
+             evidence_json, source_ids_json, decision_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', ?7, ?8)",
+        params![
+            memory_id,
+            revision,
+            previous_text,
+            after_text,
+            now_ms,
+            reason,
+            serde_json::json!([memory_id]).to_string(),
+            format!("{reason}:{memory_id}:{revision}"),
+        ],
+    )?;
+    tx.execute(
+        "UPDATE memories SET revision = revision + 1 WHERE id = ?1",
+        params![memory_id],
+    )?;
+    Ok(())
 }
 
 fn set_memory_mapping_tx(
@@ -20408,6 +20487,55 @@ mod tests {
     }
 
     #[test]
+    fn migration_69_preserves_populated_cache_and_fences_applied_tuple() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let old_chain = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 68)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut core = CoreState::default();
+        core.frozen_units.push(FrozenUnit {
+            key: "m0".into(),
+            kind: "synth-region".into(),
+            durability_class: DurabilityClass::Lineage,
+            frozen_payload: "frozen populated prefix".into(),
+            reset_rule: String::new(),
+        });
+        {
+            let old = McStore::open_with_migrations(&descriptor, false, &old_chain).unwrap();
+            old.commit("legacy", None, &core, &ModuleMeta::default())
+                .unwrap();
+        }
+        let current = McStore::open_for_test(&descriptor).unwrap();
+        let mut loaded = current.load("legacy").unwrap();
+        assert_eq!(loaded.core, core);
+        assert!(loaded.meta.memory_projection.is_none());
+        let projection = memory_projection::AppliedProjection {
+            legacy: true,
+            hard_memory_block: "shown delta".into(),
+            generation: 1,
+            ..Default::default()
+        };
+        loaded.meta.memory_projection = Some(projection.clone());
+        current
+            .commit("legacy", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        drop(current);
+        assert!(matches!(
+            McStore::open_with_migrations(&descriptor, false, &old_chain),
+            Err(McStoreError::StoreAheadOfBinary { binary_max: 68, .. })
+        ));
+        let current = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            current.load("legacy").unwrap().meta.memory_projection,
+            Some(projection)
+        );
+        assert_eq!(current.load("legacy").unwrap().core, core);
+    }
+
+    #[test]
     fn protected_tool_selection_snapshot_round_trips_without_a_schema_migration() {
         let dir = tempfile::tempdir().unwrap();
         let descriptor = descriptor(dir.path());
@@ -22726,16 +22854,6 @@ mod tests {
         assert_eq!(membership.union_identities, vec![foreign, own]);
         assert_eq!(membership.share_categories, vec!["CONSTRAINTS"]);
         assert_eq!(
-            snapshot.max_memory_id,
-            store.max_memory_id(&membership.union_identities).unwrap()
-        );
-        assert_eq!(
-            snapshot.max_memory_mutation_id,
-            store
-                .max_memory_mutation_id(&membership.union_identities)
-                .unwrap()
-        );
-        assert_eq!(
             snapshot.max_compartment_seq,
             store.max_compartment_seq("m1-session").unwrap()
         );
@@ -22752,8 +22870,6 @@ mod tests {
             .load_m1_revision_snapshot(own, own, "m1-session", false, 0)
             .unwrap();
         assert_eq!(disabled.membership, snapshot.membership);
-        assert_eq!(disabled.max_memory_id, 0);
-        assert_eq!(disabled.max_memory_mutation_id, 0);
         assert_eq!(disabled.max_compartment_seq, snapshot.max_compartment_seq);
         assert_eq!(disabled.note_status_version, snapshot.note_status_version);
     }
@@ -22817,10 +22933,6 @@ mod tests {
             vec![5, 7]
         );
         assert_eq!(baseline.revision.max_memory_id, 7);
-        let cheap = store
-            .load_m1_revision_snapshot(own, own, "watermark-session", true, 100)
-            .unwrap();
-        assert_eq!(cheap.max_memory_id, 7);
     }
 
     #[test]
@@ -23085,10 +23197,6 @@ mod tests {
         let mutation_cursor = store
             .max_memory_mutation_id(&[foreign.to_string()])
             .unwrap();
-        let before = store
-            .load_m1_revision_snapshot(own, own, "session", true, 100)
-            .unwrap();
-
         store
             .set_memory_classification(
                 foreign,
@@ -23103,11 +23211,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.get_memory_full(1).unwrap().unwrap().updated_at, 100);
-        let after = store
-            .load_m1_revision_snapshot(own, own, "session", true, 100)
-            .unwrap();
-        assert_eq!(before.max_memory_id, after.max_memory_id);
-        assert_eq!(before.max_memory_mutation_id, after.max_memory_mutation_id);
         assert_eq!(
             store
                 .max_memory_mutation_id(&[foreign.to_string()])

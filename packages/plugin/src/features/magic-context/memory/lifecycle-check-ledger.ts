@@ -1,6 +1,7 @@
 import type { Database } from "../../../shared/sqlite";
 import {
     type CheckOutcome,
+    CheckOutcomeUnknownError,
     type CheckReply,
     type CheckRequest,
     type GateContext,
@@ -11,13 +12,19 @@ import {
 } from "./lifecycle-gates";
 import { lifecycleTextHash } from "./lifecycle-text";
 
-/** A recovering carrier must reattach an in-flight request by key, rather than send it again. */
+/**
+ * Run a revision's narrow checks through the attempt ledger. Every check is one
+ * `memory_check_attempts` row keyed by its request key, written before the request
+ * leaves. A check whose row already has a reply is answered from that reply; a
+ * check whose row exists without a reply was dispatched by an earlier, interrupted
+ * run, so `reattachOrSend` is told to reattach it by key rather than send it again.
+ */
 export async function checkMemoryRevision(
     db: Database,
     owner: { sessionId: string; harness: string },
     decision: RevisionDecision,
     context: GateContext,
-    reattachOrSend: (request: CheckRequest) => Promise<CheckReply>,
+    reattachOrSend: (request: CheckRequest, options: { reattach: boolean }) => Promise<CheckReply>,
 ): Promise<CheckOutcome> {
     const plan = planMemoryRevision(decision, context);
     if (!plan.ok) return { ok: false, reason: plan.reason, retryable: false };
@@ -26,6 +33,7 @@ export async function checkMemoryRevision(
             .prepare("SELECT reply_json FROM memory_check_attempts WHERE check_key=?")
             .get(request.key) as { reply_json: string | null } | null;
         if (row?.reply_json) return JSON.parse(row.reply_json) as CheckReply;
+        const reattach = row !== null;
         const planned = plan.checks.find(
             (check) =>
                 makeCheckRequest(decision.key, check, context.historianProfile).key === request.key,
@@ -51,7 +59,7 @@ export async function checkMemoryRevision(
             Date.now(),
         );
         try {
-            const reply = await reattachOrSend(request);
+            const reply = await reattachOrSend(request, { reattach });
             db.prepare(
                 "UPDATE memory_check_attempts SET reply_json=?,reported_profile_json=?,usage_json=?,state='resolved' WHERE check_key=?",
             ).run(
@@ -62,6 +70,8 @@ export async function checkMemoryRevision(
             );
             return reply;
         } catch (error) {
+            // An unknown outcome leaves the check dispatched so a later run reattaches it.
+            if (error instanceof CheckOutcomeUnknownError) throw error;
             db.prepare(
                 "UPDATE memory_check_attempts SET state='transport_failed' WHERE check_key=?",
             ).run(request.key);

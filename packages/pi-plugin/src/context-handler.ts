@@ -3991,7 +3991,8 @@ export function registerPiContextHandler(
 								scoreThreshold: options.autoSearch.scoreThreshold,
 								minPromptChars: options.autoSearch.minPromptChars,
 								projectPath: projectIdentity,
-								visibleMemoryIds:
+								// Read only when a new hint is computed for a new user message.
+								resolveVisibleMemoryIds: () =>
 									getVisibleMemoryIds(options.db, sessionId) ?? null,
 								// `language` is user-level only; a project config cannot set it.
 								wordRules: cavemanWordRulesForLanguage(options.language),

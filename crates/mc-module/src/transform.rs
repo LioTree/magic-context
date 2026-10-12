@@ -27,7 +27,7 @@ use crate::injection::{
 };
 use crate::m0_compose::{trim_memories_to_budget, trim_user_profile_to_budget};
 use crate::m1_compose::{
-    compose_m1_from_store, m1_revision_signal_parts_for_pass_timed, M1RevisionReadTimings,
+    compose_projected_soft_m1, m1_revision_signal_parts_for_pass_timed, M1RevisionReadTimings,
     M1RevisionSignal,
 };
 use crate::memory_render::{render_m0, workspace_source_names, M0Inputs, M1_PLACEHOLDER};
@@ -3536,14 +3536,15 @@ fn todo_synthesis_verdict(req: &TransformRequest) -> Option<bool> {
 }
 
 struct AdditiveM0Composition {
+    memory_projection: mc_store::memory_projection::AppliedProjection,
     m0_bytes: String,
     mural: Option<crate::m0_compose::M0MuralBlock>,
     rendered_memory_ids: Vec<i64>,
     memory_revision: MemoryRevision,
 }
 
-fn compose_additive_m0(
-    store: &McStore,
+fn compose_additive_m0<S: crate::m0_compose::M0Source>(
+    store: &S,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     expiry_cutoff_ms: i64,
@@ -3561,6 +3562,8 @@ fn compose_additive_m0(
         mc_store::MemoryRenderSnapshot {
             memories: Vec::new(),
             revision: MemoryRevision::default(),
+            revisions: Default::default(),
+            fragment_watermark: 0,
         }
     };
     let source_name_by_module_id = membership
@@ -3568,7 +3571,7 @@ fn compose_additive_m0(
         .map(|value| workspace_source_names(&snapshot.memories, value))
         .unwrap_or_default();
     let selected_memories = trim_memories_to_budget(
-        snapshot.memories,
+        snapshot.memories.clone(),
         membership.as_ref(),
         &source_name_by_module_id,
         ctx.memory_budget_tokens,
@@ -3620,6 +3623,15 @@ fn compose_additive_m0(
         m0_bytes.push_str(crate::m0_compose::MEMORY_MURAL_BLOCK);
     }
     Ok(AdditiveM0Composition {
+        memory_projection: {
+            let mut projection = mc_store::memory_projection::AppliedProjection::hard(
+                &snapshot,
+                &rendered_memories,
+                &user_profile,
+            );
+            projection.bind_m0(&m0_bytes);
+            projection
+        },
         m0_bytes,
         mural,
         rendered_memory_ids,
@@ -3906,103 +3918,189 @@ fn apply_additive_only(
     let compose_started_at = Instant::now();
     let mut commit_memory_revision = None;
     let mut commit_compartment_max_seq = None;
+    let mut marker_pair_replayed = false;
     match plan {
         PassPlan::Hard | PassPlan::MigrateHard => {
-            let composition = compose_additive_m0(
-                store,
-                req,
-                ctx,
-                ctx.now_ms,
-                serializer_profile,
-                estimate_tokens,
-            )?;
-            // Ready smart notes are not rendered into m1: the host's deferred-notes
-            // reminder announces them and `ctx_note read` shows them, exactly as in
-            // TypeScript mode. A HARD therefore always starts m1 empty.
-            let m1_unit = render_m1_placeholder();
-            let mural_unit = composition.mural.as_ref().map(render_mural_block);
-            let committed_mural_hash = composition
-                .mural
-                .as_ref()
-                .map(|mural| mural.content_hash.clone())
-                .unwrap_or_default();
-            meta.rendered_m0_coverage = Some(RenderedCompartmentCoverage::default());
-            meta.rendered_m1_coverage = Some(RenderedCompartmentCoverage::default());
-            let mut rendered_units = vec![synth_region("m0", composition.m0_bytes)];
-            if let Some(mural_unit) = mural_unit {
-                rendered_units.push(mural_unit);
+            let marker_pair = if hard_fold_requested
+                && !idle_fold_due
+                && !render_config_changed
+                && loaded.meta.initialized
+            {
+                let source = MarkerMemorySource {
+                    store,
+                    projection: loaded.meta.memory_projection.as_ref(),
+                    allow_external_repair: external_revision_changed
+                        || project_memory_epoch_hard_due,
+                };
+                let mut frozen_request = req.clone();
+                frozen_request.mural = loaded
+                    .core
+                    .frozen_units
+                    .iter()
+                    .find(|unit| unit.key == M0_MURAL_KEY)
+                    .map(|unit| crate::m0_compose::M0MuralInput {
+                        enabled: true,
+                        supports_vision: true,
+                        data_url: Some(unit.frozen_payload.clone()),
+                        content_hash: Some(unit.reset_rule.clone()),
+                    });
+                compose_additive_m0(
+                    &source,
+                    &frozen_request,
+                    ctx,
+                    loaded.meta.expiry_cutoff_ms,
+                    serializer_profile,
+                    estimate_tokens,
+                )
+                .ok()
+                .map(|mut candidate| {
+                    if loaded.meta.memory_projection.is_none() {
+                        if let Some(m0) = loaded
+                            .core
+                            .frozen_units
+                            .iter()
+                            .find(|unit| unit.key == "m0")
+                        {
+                            candidate.m0_bytes = restore_legacy_memory_blocks(
+                                &candidate.m0_bytes,
+                                &m0.frozen_payload,
+                            );
+                        }
+                    }
+                    candidate
+                })
+                .is_some_and(|candidate| {
+                    !hard_fold_busts_served_prefix(
+                        &loaded.core,
+                        &candidate.m0_bytes,
+                        &served_m1_payload(&loaded.core),
+                        candidate.mural.as_ref(),
+                        false,
+                        false,
+                    )
+                })
+            } else {
+                false
+            };
+            if marker_pair {
+                marker_pair_replayed = true;
+                meta.m1_external_revision = m1_signal.external_revision;
+                meta.m1_history_revision = m1_signal.history_revision;
+                meta.project_memory_epoch_pending = false;
+            } else {
+                let composition = compose_additive_m0(
+                    store,
+                    req,
+                    ctx,
+                    ctx.now_ms,
+                    serializer_profile,
+                    estimate_tokens,
+                )?;
+                // Ready smart notes are not rendered into m1: the host's deferred-notes
+                // reminder announces them and `ctx_note read` shows them, exactly as in
+                // TypeScript mode. A HARD therefore always starts m1 empty.
+                let m1_unit = render_m1_placeholder();
+                let mural_unit = composition.mural.as_ref().map(render_mural_block);
+                let committed_mural_hash = composition
+                    .mural
+                    .as_ref()
+                    .map(|mural| mural.content_hash.clone())
+                    .unwrap_or_default();
+                meta.rendered_m0_coverage = Some(RenderedCompartmentCoverage::default());
+                meta.rendered_m1_coverage = Some(RenderedCompartmentCoverage::default());
+                let mut rendered_units = vec![synth_region("m0", composition.m0_bytes)];
+                if let Some(mural_unit) = mural_unit {
+                    rendered_units.push(mural_unit);
+                }
+                rendered_units.push(m1_unit);
+                core.frozen_units.clear();
+                core.pending_changes.clear();
+                core.step(PassInput {
+                    proposed: Some(mc_core::Action::Hard),
+                    boundary_present: "-".to_string(),
+                    rendered_units,
+                    new_boundary_id: Some(String::new()),
+                    queued: Vec::new(),
+                    run_started: false,
+                });
+
+                let applied_m1_signal = m1_revision_signal_parts_for_pass_timed(
+                    store,
+                    ctx.project_path,
+                    ctx.note_project_path,
+                    &req.session_id,
+                    meta.user_profile_version,
+                    ctx.memory_enabled,
+                    ctx.now_ms,
+                    Some(&mut m1_revision_read_timings),
+                )?;
+                meta.initialized = true;
+                meta.bootstrap_seed_fold_pending = false;
+                meta.last_render_config = fold_mural_content_identity(
+                    &effective_render_config_base,
+                    &committed_mural_hash,
+                );
+                meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
+                meta.last_model_key = req.model_key.clone().unwrap_or_default();
+                meta.last_system_prompt_hash = req.system_prompt_hash.clone();
+                meta.last_upgrade_state = req.upgrade_state.clone();
+                meta.coverage_ordinal = None;
+                meta.coverage_start_ordinal = None;
+                meta.coverage_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
+                // Compaction-off ignores stored compartments. Record the current maximum sequence
+                // so rows created before this mode was enabled do not reappear in m1 as new history.
+                meta.folded_compartment_seq = applied_m1_signal.max_compartment_seq;
+                let mut projection = composition.memory_projection;
+                projection.generation = meta
+                    .memory_projection
+                    .as_ref()
+                    .map_or(1, |previous| previous.generation.saturating_add(1));
+                meta.memory_projection = Some(projection);
+                meta.rendered_memory_ids = composition.rendered_memory_ids;
+                meta.memory_mutation_cursor = composition.memory_revision.mutation_cursor;
+                meta.max_memory_id = composition.memory_revision.max_memory_id;
+                meta.expiry_cutoff_ms = ctx.now_ms;
+                meta.memory_disabled = !ctx.memory_enabled;
+                meta.m1_revision = applied_m1_signal.revision;
+                meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
+                meta.m1_user_profile_version = meta.user_profile_version;
+                meta.m1_external_revision = applied_m1_signal.external_revision;
+                meta.m1_history_revision = applied_m1_signal.history_revision;
+
+                meta.project_memory_epoch_pending = false;
+                meta.synthetic_todo = None;
+                meta.m1_pending_since_ms = None;
+                meta.soft_refresh_pending = false;
+                commit_compartment_max_seq = Some(applied_m1_signal.max_compartment_seq);
+                commit_memory_revision = Some(composition.memory_revision);
             }
-            rendered_units.push(m1_unit);
-            core.frozen_units.clear();
-            core.pending_changes.clear();
-            core.step(PassInput {
-                proposed: Some(mc_core::Action::Hard),
-                boundary_present: "-".to_string(),
-                rendered_units,
-                new_boundary_id: Some(String::new()),
-                queued: Vec::new(),
-                run_started: false,
-            });
-
-            let applied_m1_signal = m1_revision_signal_parts_for_pass_timed(
-                store,
-                ctx.project_path,
-                ctx.note_project_path,
-                &req.session_id,
-                meta.user_profile_version,
-                ctx.memory_enabled,
-                ctx.now_ms,
-                Some(&mut m1_revision_read_timings),
-            )?;
-            meta.initialized = true;
-            meta.bootstrap_seed_fold_pending = false;
-            meta.last_render_config =
-                fold_mural_content_identity(&effective_render_config_base, &committed_mural_hash);
-            meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
-            meta.last_model_key = req.model_key.clone().unwrap_or_default();
-            meta.last_system_prompt_hash = req.system_prompt_hash.clone();
-            meta.last_upgrade_state = req.upgrade_state.clone();
-            meta.coverage_ordinal = None;
-            meta.coverage_start_ordinal = None;
-            meta.coverage_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
-            // Compaction-off ignores stored compartments. Record the current maximum sequence
-            // so rows created before this mode was enabled do not reappear in m1 as new history.
-            meta.folded_compartment_seq = applied_m1_signal.max_compartment_seq;
-            meta.rendered_memory_ids = composition.rendered_memory_ids;
-            meta.memory_mutation_cursor = composition.memory_revision.mutation_cursor;
-            meta.max_memory_id = composition.memory_revision.max_memory_id;
-            meta.expiry_cutoff_ms = ctx.now_ms;
-            meta.memory_disabled = !ctx.memory_enabled;
-            meta.m1_revision = applied_m1_signal.revision;
-            meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
-            meta.m1_user_profile_version = meta.user_profile_version;
-            meta.m1_external_revision = applied_m1_signal.external_revision;
-            meta.m1_history_revision = applied_m1_signal.history_revision;
-
-            meta.project_memory_epoch_pending = false;
-            meta.synthetic_todo = None;
-            meta.m1_pending_since_ms = None;
-            meta.soft_refresh_pending = false;
-            commit_compartment_max_seq = Some(applied_m1_signal.max_compartment_seq);
-            commit_memory_revision = Some(composition.memory_revision);
         }
         PassPlan::Soft => {
             let mut additive_meta = meta.clone();
             additive_meta.folded_compartment_seq = m1_signal.max_compartment_seq;
             additive_meta.coverage_ordinal = None;
-            let m1 = compose_m1_from_store(
+            // This already-authorized SOFT replays served memory and appends only this
+            // session's immutable agent fragments. It reads no canonical memory rows or
+            // mutation log; automated and foreign changes still wait for HARD.
+            let m1 = compose_projected_soft_m1(
                 store,
                 ctx.project_path,
-                ctx.note_project_path,
                 &req.session_id,
                 &additive_meta,
-                meta.expiry_cutoff_ms,
                 ctx.memory_enabled,
                 ctx.memory_budget_tokens,
+                ctx.history_budget_tokens,
                 ctx.user_profile_budget_tokens,
                 ctx.temporal_awareness,
+                core.frozen_units
+                    .iter()
+                    .find(|unit| unit.key == "m0")
+                    .map(|unit| unit.frozen_payload.as_str())
+                    .unwrap_or_default(),
+                &served_m1_payload(&core),
                 mc_tokenizer::estimate_tokens,
             )?;
+            meta.memory_projection = m1.memory_projection.clone();
             let profile_rendered = m1.profile_rendered;
             meta.rendered_m1_coverage = Some(m1.rendered_coverage);
             core.step(PassInput {
@@ -4034,14 +4132,8 @@ fn apply_additive_only(
             meta.m1_pending_since_ms = None;
             meta.soft_refresh_pending = false;
             commit_compartment_max_seq = Some(applied_m1_signal.max_compartment_seq);
-            if ctx.memory_enabled {
-                commit_memory_revision = Some(memory_revision_fence(
-                    store,
-                    ctx.project_path,
-                    meta.expiry_cutoff_ms,
-                    &applied_m1_signal,
-                )?);
-            }
+            // No memory fence: this SOFT rendered no memory rows, so a concurrent memory
+            // write cannot make its bytes stale.
         }
         PassPlan::Defer => {
             if m1_signal.revision != applied_m1_revision {
@@ -4229,7 +4321,7 @@ fn apply_additive_only(
             prefix_bust_permitted: matches!(
                 plan,
                 PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
-            ),
+            ) && !marker_pair_replayed,
             scheduler_decision: Some(scheduler_outcome.pass.canonical_decision().to_string()),
             scheduler_defer_reason: scheduler_outcome
                 .defer_reason
@@ -5164,11 +5256,6 @@ fn apply_once(
     let compartment_seq_changed_since_meta = loaded.meta.initialized
         && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
     *boundary_divergence_detected = boundary_divergence_recut.is_some();
-    // Pre-gate memory-off sessions stored an ungated digest and have no durable gate marker.
-    // The next natural bust adopts the gated digest; the mismatch does not authorize a bust now.
-    let memory_gate_digest_transition = !ctx.memory_enabled
-        && !loaded.meta.memory_disabled
-        && current_m1_digest != applied_m1_revision;
     let external_revision_changed = loaded.meta.initialized
         && loaded.meta.m1_external_revision != 0
         && m1_signal.external_revision != loaded.meta.m1_external_revision;
@@ -5422,13 +5509,14 @@ fn apply_once(
             estimate_tokens,
             incremental_history,
             &mut timings.compose,
-            loaded.meta.score_selection_watermark,
+            &loaded,
+            external_revision_changed || project_memory_epoch_hard_due,
         )
         .filter(|comp| {
             !hard_fold_busts_served_prefix(
                 &loaded.core,
                 &comp.m0_bytes,
-                M1_PLACEHOLDER,
+                &served_m1_payload(&loaded.core),
                 comp.mural.as_ref(),
                 loaded.meta.coverage_ordinal != comp.coverage_ordinal,
                 hard_fold_loses_provider_cache,
@@ -6346,6 +6434,15 @@ fn apply_once(
     } else {
         match plan {
             PassPlan::Reject(m) => return Err(TransformError::UnknownShape(m)),
+            PassPlan::Hard | PassPlan::MigrateHard if marker_hard_keeps_provider_cache => {
+                // The probe reproduces the baseline, delta and image already served.
+                // Commit only external/history markers. Rebuilding the baseline here
+                // would erase shown fragments or acknowledge pending memory revisions.
+                meta.m1_external_revision = m1_signal.external_revision;
+                meta.m1_history_revision = m1_signal.history_revision;
+                meta.project_memory_epoch_pending = false;
+                meta.last_render_config = effective_render_config.clone();
+            }
             PassPlan::Hard | PassPlan::MigrateHard => {
                 // EXPENSIVE bust-only: compose the m0 baseline from the store. now_ms freezes
                 // the expiry cutoff into meta so every later in-epoch SOFT/defer reads the
@@ -6657,6 +6754,12 @@ fn apply_once(
                 meta.folded_compartment_seq = comp.folded_compartment_seq;
                 meta.score_selection_watermark = comp.score_selection_watermark;
                 commit_memory_revision = Some(comp.memory_revision.clone());
+                let mut projection = comp.memory_projection;
+                projection.generation = meta
+                    .memory_projection
+                    .as_ref()
+                    .map_or(1, |previous| previous.generation.saturating_add(1));
+                meta.memory_projection = Some(projection);
                 meta.rendered_memory_ids = comp.rendered_memory_ids;
                 meta.memory_mutation_cursor = comp.memory_mutation_cursor;
                 meta.max_memory_id = comp.max_memory_id;
@@ -6685,32 +6788,32 @@ fn apply_once(
             }
             PassPlan::Soft => {
                 meta.memory_disabled = !ctx.memory_enabled;
-                commit_memory_revision = if ctx.memory_enabled {
-                    Some(memory_revision_fence(
-                        store,
-                        ctx.project_path,
-                        meta.expiry_cutoff_ms,
-                        &m1_signal,
-                    )?)
-                } else {
-                    None
-                };
-                // EXPENSIVE bust-only: compose the m1 delta body from the store against the
-                // watermarks the last HARD froze (incl. the FROZEN expiry cutoff). A
-                // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
-                // the m1 unit stays stable; a new compartment extends coverage → advance the
-                // boundary anchor in this same commit.
-                let m1 = compose_m1_from_store(
+                // No memory fence: this SOFT renders no memory rows, so a concurrent memory
+                // write cannot make its bytes stale. A pressure refold below sets its own.
+                commit_memory_revision = None;
+                // Compose the independent compartment/profile delta and any pending
+                // own-session fragments. A reduction-only SOFT with no other pending
+                // content keeps m1 byte-identical. New compartment coverage advances
+                // the boundary anchor in this same cache commit.
+                // Replay the served memory blocks and append this session's immutable
+                // agent fragments. No canonical memory or mutation-log read is involved
+                // (see `compose_projected_soft_m1`).
+                let m1 = compose_projected_soft_m1(
                     store,
                     ctx.project_path,
-                    ctx.note_project_path,
                     &req.session_id,
                     &meta,
-                    meta.expiry_cutoff_ms,
                     ctx.memory_enabled,
                     ctx.memory_budget_tokens,
+                    ctx.history_budget_tokens,
                     ctx.user_profile_budget_tokens,
                     ctx.temporal_awareness,
+                    core.frozen_units
+                        .iter()
+                        .find(|unit| unit.key == "m0")
+                        .map(|unit| unit.frozen_payload.as_str())
+                        .unwrap_or_default(),
+                    &served_m1_payload(&core),
                     mc_tokenizer::estimate_tokens,
                 )?;
                 let m0_tokens = core
@@ -6719,16 +6822,21 @@ fn apply_once(
                     .find(|unit| unit.key == "m0")
                     .map(|unit| mc_tokenizer::estimate_tokens(&unit.frozen_payload))
                     .unwrap_or(0);
-                let m1_has_content = m1.body != M1_PLACEHOLDER;
+                let pressure_body = m1.body.replace(
+                    &crate::agent_fragments::block(&m1.body, "memory-updates"),
+                    "",
+                );
+                let m1_has_content = pressure_body.contains("<new-compartments>")
+                    || pressure_body.contains("<new-memories>")
+                    || pressure_body.contains("<new-user-profile>");
                 let m1_tokens = if m1_has_content {
-                    mc_tokenizer::estimate_tokens(&m1.body)
+                    mc_tokenizer::estimate_tokens(&pressure_body)
                 } else {
                     0
                 };
-                let pressure_refold = m1.memory_update_count > 40
-                    || (m1_has_content
-                        && m1_tokens as f64 > (ctx.history_budget_tokens * 0.20)
-                        && ctx.history_budget_tokens > 0.0)
+                let pressure_refold = (m1_has_content
+                    && m1_tokens as f64 > (ctx.history_budget_tokens * 0.20)
+                    && ctx.history_budget_tokens > 0.0)
                     || (m1_has_content
                         && m0_tokens >= 500
                         && m1_tokens as f64 > m0_tokens as f64 * 0.15);
@@ -6882,6 +6990,12 @@ fn apply_once(
                     meta.coverage_compartment_seq = Some(comp.folded_compartment_seq);
                     meta.folded_compartment_seq = comp.folded_compartment_seq;
                     meta.score_selection_watermark = comp.score_selection_watermark;
+                    let mut projection = comp.memory_projection;
+                    projection.generation = meta
+                        .memory_projection
+                        .as_ref()
+                        .map_or(1, |previous| previous.generation.saturating_add(1));
+                    meta.memory_projection = Some(projection);
                     meta.rendered_memory_ids = comp.rendered_memory_ids;
                     meta.memory_mutation_cursor = comp.memory_mutation_cursor;
                     meta.max_memory_id = comp.max_memory_id;
@@ -6906,6 +7020,7 @@ fn apply_once(
                     meta.m1_pending_since_ms = None;
                     commit_memory_revision = Some(comp.memory_revision);
                 } else {
+                    meta.memory_projection = m1.memory_projection.clone();
                     meta.rendered_m1_coverage = Some(m1.rendered_coverage);
                     let mut rendered = vec![render_m1_body(&m1.body)];
                     rendered.extend(new_reduction_units(
@@ -6994,9 +7109,10 @@ fn apply_once(
                         meta.expiry_cutoff_ms,
                         Some(&mut m1_revision_read_timings),
                     )?;
-                    if m1_has_content || memory_gate_digest_transition {
-                        meta.m1_revision = applied_m1_signal.revision;
-                    }
+                    // A busting SOFT renders no memory rows, so a memory-only revision change
+                    // has nothing left to wait for: record it even when m1 stayed empty, or
+                    // every later execute-band pass would reopen a SOFT for the same change.
+                    meta.m1_revision = applied_m1_signal.revision;
                     meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
                     if m1.profile_rendered {
                         meta.m1_user_profile_version = loaded.meta.user_profile_version;
@@ -8507,25 +8623,6 @@ fn effective_hard_context_limit_tokens(
         })
 }
 
-fn memory_revision_fence(
-    store: &McStore,
-    project_path: &str,
-    expiry_cutoff_ms: i64,
-    signal: &crate::m1_compose::M1RevisionSignal,
-) -> Result<MemoryRevision, McStoreError> {
-    let project_paths = match store.resolve_workspace_membership(project_path)? {
-        Some(membership) => membership.union_identities,
-        None => vec![project_path.to_string()],
-    };
-    Ok(MemoryRevision {
-        project_paths,
-        reader_project_path: project_path.to_string(),
-        expiry_cutoff_ms,
-        max_memory_id: signal.max_memory_id,
-        mutation_cursor: signal.max_memory_mutation_id,
-    })
-}
-
 fn fold_mural_content_identity(render_config: &str, mural_hash: &str) -> String {
     if mural_hash.is_empty() {
         return render_config.to_string();
@@ -9590,8 +9687,8 @@ fn protected_tail_floor_ordinal(
 }
 
 fn post_end_revision_inputs_moved(before: &M1RevisionSignal, after: &M1RevisionSignal) -> bool {
-    // Sequence is the structural publication watermark. Also compare the revision so memory,
-    // note, or profile changes invalidate the aggregate observation when sequence is unchanged.
+    // Sequence is the structural publication watermark. Also compare the revision so a
+    // profile change invalidates the aggregate observation when sequence is unchanged.
     before.max_compartment_seq != after.max_compartment_seq || before.revision != after.revision
 }
 
@@ -10226,7 +10323,8 @@ fn compose_hard_fold_m0(
     estimate_tokens: impl Fn(&str) -> usize + Copy,
     incremental_history: bool,
     timings: &mut crate::m0_compose::ComposeTimings,
-    score_selection_watermark: i64,
+    loaded: &mc_store::LoadedState,
+    allow_external_repair: bool,
 ) -> Option<crate::m0_compose::M0Composition> {
     let compartments = store.load_compartments(&req.session_id).ok()?;
     let coverage_bounds = coverage_bounds_from_compartments(&compartments).ok()?;
@@ -10236,14 +10334,32 @@ fn compose_hard_fold_m0(
         coverage_bounds.map(|(start, _)| start),
         serializer_profile,
     );
-    crate::m0_compose::compose_m0_from_store_timed(
+    let source = MarkerMemorySource {
         store,
+        projection: loaded.meta.memory_projection.as_ref(),
+        allow_external_repair,
+    };
+    let frozen_mural = loaded
+        .core
+        .frozen_units
+        .iter()
+        .find(|unit| unit.key == M0_MURAL_KEY)
+        .map(|unit| crate::m0_compose::M0MuralInput {
+            enabled: true,
+            supports_vision: true,
+            data_url: Some(unit.frozen_payload.clone()),
+            content_hash: Some(unit.reset_rule.clone()),
+        });
+    let mut composed = crate::m0_compose::compose_m0_from_store_timed(
+        &source,
         &crate::m0_compose::M0ComposeInputs {
-            score_selector: mc_store::ScoreSelector::AtWatermark(score_selection_watermark),
+            score_selector: mc_store::ScoreSelector::AtWatermark(
+                loaded.meta.score_selection_watermark,
+            ),
             session_id: &req.session_id,
             project_path: ctx.project_path,
             project_directory: ctx.project_directory,
-            now_ms: ctx.now_ms,
+            now_ms: loaded.meta.expiry_cutoff_ms,
             history_budget_tokens: crate::decay_render::history_local_budget(
                 ctx.history_budget_tokens,
                 req.model_key.as_deref(),
@@ -10254,18 +10370,186 @@ fn compose_hard_fold_m0(
             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
             inject_docs: ctx.inject_docs,
             temporal_awareness: ctx.temporal_awareness,
-            mural: m0_mural_input(req, serializer_profile),
+            mural: frozen_mural.as_ref(),
         },
         estimate_tokens,
         incremental_history,
         timings,
     )
-    .ok()
+    .ok()?;
+    if let Some(projection) = &loaded.meta.memory_projection {
+        composed.memory_projection = projection.clone();
+        composed.rendered_memory_ids = loaded.meta.rendered_memory_ids.clone();
+        composed.memory_mutation_cursor = loaded.meta.memory_mutation_cursor;
+        composed.max_memory_id = loaded.meta.max_memory_id;
+    } else if let Some(m0) = loaded
+        .core
+        .frozen_units
+        .iter()
+        .find(|unit| unit.key == "m0")
+    {
+        composed.m0_bytes = restore_legacy_memory_blocks(&composed.m0_bytes, &m0.frozen_payload);
+    }
+    Some(composed)
+}
+
+/// A marker requests a content check, not permission to adopt pending memories.
+/// Compose current compartment history beside the previously served memory view.
+/// Only separately requested SQL repair may expose a changed same-revision row.
+struct MarkerMemorySource<'a> {
+    store: &'a McStore,
+    projection: Option<&'a mc_store::memory_projection::AppliedProjection>,
+    allow_external_repair: bool,
+}
+
+impl crate::m0_compose::M0Source for MarkerMemorySource<'_> {
+    fn load_compartments(
+        &self,
+        session: &str,
+    ) -> Result<Vec<mc_store::StoredCompartment>, McStoreError> {
+        self.store.load_compartments(session)
+    }
+    fn load_compartment_score_snapshot(
+        &self,
+        session: &str,
+        selector: mc_store::ScoreSelector,
+    ) -> Result<mc_store::CompartmentScoreSnapshot, McStoreError> {
+        self.store
+            .load_compartment_score_snapshot(session, selector)
+    }
+    fn resolve_workspace_membership(
+        &self,
+        project: &str,
+    ) -> Result<Option<mc_store::WorkspaceMembership>, McStoreError> {
+        self.store.resolve_workspace_membership(project)
+    }
+    fn load_memory_render_snapshot(
+        &self,
+        project: &str,
+        membership: Option<&mc_store::WorkspaceMembership>,
+        cutoff: i64,
+    ) -> Result<mc_store::MemoryRenderSnapshot, McStoreError> {
+        let Some(projection) = self.projection else {
+            return Ok(mc_store::MemoryRenderSnapshot {
+                memories: Vec::new(),
+                revision: MemoryRevision::default(),
+                revisions: Default::default(),
+                fragment_watermark: 0,
+            });
+        };
+        let current = self
+            .store
+            .load_memory_render_snapshot(project, membership, cutoff)?;
+        let memories = projection
+            .rows
+            .iter()
+            .filter(|row| row.representation == "text")
+            .filter(|row| {
+                row.memory.project_path == project
+                    || membership.is_some_and(|membership| {
+                        membership
+                            .union_identities
+                            .contains(&row.memory.project_path)
+                            && membership.share_categories.contains(&row.memory.category)
+                    })
+            })
+            .filter(|row| {
+                !self.allow_external_repair
+                    || current
+                        .revisions
+                        .get(&row.memory.id)
+                        .is_some_and(|revision| {
+                            *revision != row.revision
+                                || current
+                                    .memories
+                                    .iter()
+                                    .any(|memory| memory.id == row.memory.id)
+                        })
+            })
+            .map(|shown| {
+                current
+                    .memories
+                    .iter()
+                    .find(|memory| {
+                        memory.id == shown.memory.id
+                            && self.allow_external_repair
+                            && current.revisions.get(&memory.id) == Some(&shown.revision)
+                            && memory.content != shown.memory.content
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| shown.memory.clone())
+            })
+            .collect();
+        Ok(mc_store::MemoryRenderSnapshot {
+            memories,
+            revisions: projection
+                .rows
+                .iter()
+                .map(|row| (row.memory.id, row.revision))
+                .collect(),
+            fragment_watermark: projection.fragment_watermark,
+            revision: current.revision,
+        })
+    }
+    fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError> {
+        self.projection
+            .map(|projection| Ok(projection.user_profile.clone()))
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+}
+
+/// Pre-projection caches have bytes but no revision manifest. Their marker probes
+/// borrow the original memory/profile blocks instead of guessing from current rows.
+fn restore_legacy_memory_blocks(candidate: &str, cached: &str) -> String {
+    let extract = |text: &str, tag: &str| {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        text.find(&open)
+            .and_then(|start| {
+                text[start..]
+                    .find(&close)
+                    .map(|end| text[start..start + end + close.len()].to_string())
+            })
+            .unwrap_or_default()
+    };
+    let mut sections = Vec::new();
+    for tag in [
+        "project-docs",
+        "user-profile",
+        "covered-system-messages",
+        "session-history",
+        "project-memory",
+    ] {
+        let section = extract(
+            if matches!(tag, "user-profile" | "project-memory") {
+                cached
+            } else {
+                candidate
+            },
+            tag,
+        );
+        if !section.is_empty() {
+            sections.push(section);
+        }
+    }
+    if candidate.contains(crate::m0_compose::MEMORY_MURAL_BLOCK) {
+        sections.push(crate::m0_compose::MEMORY_MURAL_BLOCK.to_string());
+    }
+    sections.join("\n\n")
 }
 
 /// The m1 placeholder unit (a HARD resets m1 to it; m1 is never fully empty).
 fn render_m1_placeholder() -> FrozenUnit {
     synth_region("m1", M1_PLACEHOLDER.to_string())
+}
+
+/// The m1 body the session is serving now (empty when no m1 unit is frozen yet).
+fn served_m1_payload(core: &CoreState) -> String {
+    core.frozen_units
+        .iter()
+        .find(|unit| unit.key == "m1")
+        .map(|unit| unit.frozen_payload.clone())
+        .unwrap_or_default()
 }
 
 /// The m1 delta unit from a composed body (an empty delta composes to the placeholder
@@ -12637,7 +12921,7 @@ pub(crate) fn maybe_decide_live_user_hint(
     overlay_frontier: Option<u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
-    rendered_memory_ids: &[i64],
+    _rendered_memory_ids: &[i64],
 ) -> Result<Option<UserHintDecisionInput>, TransformError> {
     let Some(message) = eligible_authored_user_tail(req)
         .filter(|message| {
@@ -12681,7 +12965,9 @@ pub(crate) fn maybe_decide_live_user_hint(
             &raw_prompt,
             ctx.memory_enabled,
             req.auto_search_score_threshold,
-            rendered_memory_ids,
+            &store
+                .fully_visible_memory_ids_for_hint(&req.session_id)
+                .unwrap_or_default(),
         )?;
         render_user_hint(&results, ctx.caveman_english_word_rules).unwrap_or_default()
     };
@@ -18338,6 +18624,14 @@ fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod memory_cache_review {
+        use super::*;
+        include!("transform_memory_cache_review_tests.rs");
+    }
+    mod memory_projection {
+        use super::*;
+        include!("transform_memory_projection_tests.rs");
+    }
     mod score_projection {
         use super::*;
         include!("transform_score_projection_tests.rs");
@@ -27038,7 +27332,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pending_in_session_delta_is_consumed_on_execute_but_deferred_passes_replay() {
+    fn in_session_memory_change_opens_no_execute_band_soft_and_defers_replay() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -27054,8 +27348,10 @@ pub(crate) mod tests {
 
         let consumed =
             transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
-        assert_eq!(consumed.action, "SOFT");
-        assert!(m1_bytes(&consumed).contains("pending rule"));
+        // A memory change is not m1 work, so even at execute band the pass replays; the
+        // update waits for the next HARD fold.
+        assert_eq!(consumed.action, "SOFT+");
+        assert!(!m1_bytes(&consumed).contains("pending rule"));
         let consumed_bytes = serde_json::to_vec(&consumed.ck_messages).unwrap();
 
         let defer_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 10, 100);
@@ -27067,16 +27363,17 @@ pub(crate) mod tests {
                 serde_json::to_vec(&deferred.ck_messages).unwrap(),
                 consumed_bytes
             );
-            assert!(m1_bytes(&deferred).contains("pending rule"));
+            assert!(!m1_bytes(&deferred).contains("pending rule"));
         }
     }
 
     #[test]
-    fn in_session_memory_mutations_ride_the_next_bust_and_defers_replay_them() {
+    fn in_session_memory_mutations_open_no_bust_and_defers_replay() {
         // An update, an archive and a merge each append to context.db's
-        // memory_mutation_log and change no memory id. The mutation-log head is the only
-        // revision input that moves, so it alone must open the next execute-band pass as a
-        // SOFT carrying <memory-updates>; the defers after it replay those bytes exactly.
+        // memory_mutation_log. None of them is m1 work any more (a busting SOFT renders no
+        // memory rows), so the next execute-band pass replays (SOFT+) with no
+        // <memory-updates>, the change waits for the next HARD fold, and the defers after
+        // it replay the same bytes.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -27137,10 +27434,10 @@ pub(crate) mod tests {
         for (marker, mutate) in mutations {
             mutate(&s);
             let soft = transform(&s, &execute_req, &ctx).unwrap();
-            assert_eq!(soft.action, "SOFT", "{marker}");
+            assert_eq!(soft.action, "SOFT+", "{marker}");
             let m1 = m1_bytes(&soft);
-            assert!(m1.contains("<memory-updates>"), "{marker}: {m1}");
-            assert!(m1.contains(marker), "{marker}: {m1}");
+            assert!(!m1.contains("<memory-updates>"), "{marker}: {m1}");
+            assert!(!m1.contains(marker), "{marker}: {m1}");
             let served = serde_json::to_vec(&soft.ck_messages).unwrap();
             for _ in 0..3 {
                 let deferred = transform(&s, &defer_req, &ctx).unwrap();
@@ -27363,7 +27660,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn compaction_off_additive_changes_defer_then_ride_m1_and_fold_on_hard() {
+    fn compaction_off_additive_changes_defer_then_fold_on_hard() {
         let dir = tempfile::tempdir().unwrap();
         let project_dir = dir.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -27423,10 +27720,12 @@ pub(crate) mod tests {
 
         let execute_request = with_usage(request.clone(), 70, 100);
         let soft = transform(&s, &execute_request, &ctx).unwrap();
-        assert_eq!(soft.action, "SOFT");
+        // A memory change is not m1 work, so it opens no SOFT even at execute band; the
+        // new memory folds in at the HARD below.
+        assert_eq!(soft.action, "SOFT+");
         assert_eq!(m0_bytes(&soft), first_m0);
-        assert!(m1_bytes(&soft).contains("<new-memories>"));
-        assert!(m1_bytes(&soft).contains("Deferred memory B"));
+        assert!(!m1_bytes(&soft).contains("<new-memories>"));
+        assert!(!m1_bytes(&soft).contains("Deferred memory B"));
         assert!(!m0_bytes(&soft).contains("Deferred docs B"));
         assert_eq!(&*soft.messages()[2], &request.messages[0].ck);
         let soft_bytes = serde_json::to_vec(soft.messages()).unwrap();
@@ -33543,8 +33842,6 @@ pub(crate) mod tests {
             external_revision: 0xbeef,
             history_revision: 0,
             max_compartment_seq: 47,
-            max_memory_id: 9,
-            max_memory_mutation_id: 3,
             note_status_version: 2,
             user_profile_version: 1,
             legacy_note_revision: None,
@@ -33627,7 +33924,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn legacy_revision_exclusion_escalates_despite_project_memory_churn() {
+    fn legacy_revision_exclusion_recuts_at_once_despite_project_memory_churn() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let request = seed_astro_divergence(&store, "astro-memory-churn", 2_402);
@@ -33651,18 +33948,8 @@ pub(crate) mod tests {
             ))
             .unwrap();
 
-        for expected_count in 1..BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT {
-            let deferred = run(&store, &request, &spine());
-            assert_eq!(deferred.action, "SOFT+");
-            assert_eq!(
-                store
-                    .load("astro-memory-churn")
-                    .unwrap()
-                    .meta
-                    .boundary_divergence_pending_count,
-                expected_count
-            );
-        }
+        // Project memory churn is not m1 work (a busting SOFT renders no memory rows), so
+        // it leaves no pending m1 revision to wait behind: the divergence recuts at once.
         let escalated = run(&store, &request, &spine());
         assert_eq!(escalated.action, "HARD");
         assert_eq!(
@@ -34918,8 +35205,174 @@ pub(crate) mod tests {
         }
     }
 
+    /// The whole-pass read gate for the memory pair: after a warm HARD, a busting SOFT
+    /// (`armed`) or a defer replay still completes with `table` renamed away, so nothing on
+    /// those passes reads memory rows, the mutation log or their `MAX(id)` heads.
+    fn soft_pass_runs_without_table(armed: bool, table: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.seed_memory(1, "git:proj", "ARCHITECTURE", "gate baseline", 50)
+            .unwrap();
+        s.replace_compartments("gate", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let request = req("gate", "cfg0", vec![item("m1msg", 1, "raw")]);
+        let hard = run(&s, &request, &spine());
+        assert_eq!(hard.action, "HARD");
+        if armed {
+            s.arm_soft_refresh("gate").unwrap();
+        }
+        s.with_context_conn_for_test(|tx| {
+            tx.execute_batch(&format!(
+                "ALTER TABLE {table} RENAME TO {table}_gate_hidden;"
+            ))
+        })
+        .unwrap();
+        let gated = transform(&s, &request, &pctx("git:proj", "/nonexistent-docs", 0))
+            .unwrap_or_else(|error| panic!("armed={armed} table={table}: {error:?}"));
+        assert_eq!(gated.action, if armed { "SOFT" } else { "SOFT+" });
+        assert_eq!(m0_bytes(&gated), m0_bytes(&hard));
+        assert_eq!(m1_bytes(&gated), m1_bytes(&hard));
+    }
+
     #[test]
-    fn public_memory_update_rides_soft_not_hard() {
+    fn soft_reads_no_memory_rows_or_watermark() {
+        soft_pass_runs_without_table(true, "memories");
+    }
+
+    #[test]
+    fn soft_plus_reads_no_memory_rows_or_watermark() {
+        soft_pass_runs_without_table(false, "memories");
+    }
+
+    #[test]
+    fn soft_reads_no_mutation_log_rows_or_watermark() {
+        soft_pass_runs_without_table(true, "memory_mutation_log");
+    }
+
+    #[test]
+    fn soft_plus_reads_no_mutation_log_rows_or_watermark() {
+        soft_pass_runs_without_table(false, "memory_mutation_log");
+    }
+
+    /// A memory-only change is not m1 work: it never opens an execute-band SOFT.
+    #[test]
+    fn memory_only_change_opens_no_execute_band_soft() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let memory_id = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
+            .unwrap();
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        assert_eq!(run(&s, &execute_req, &spine()).action, "HARD");
+        s.update_memory_content("git:proj", memory_id, "changed", None, 1)
+            .unwrap();
+        s.insert_memory(memory_input("git:proj", "ARCHITECTURE", "added", 2))
+            .unwrap();
+        let pass = transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+        assert_eq!(pass.action, "SOFT+");
+        assert!(!pass.committed);
+    }
+
+    /// The automatic hint producer is one of the two named memory readers outside the pair
+    /// (with explicit `ctx_search`): a hint for a new user message searches current memory.
+    /// Its result goes to that message in the tail, never to m0/m1.
+    #[test]
+    fn automatic_hint_producer_is_a_named_memory_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.seed_memory(1, "git:proj", "CONSTRAINTS", "rust ownership beta", 50)
+            .unwrap();
+        let request = active_cc_req(
+            "hint",
+            "cfg0",
+            vec![wire_item("user", "m1", 1, &["rust ownership beta"])],
+        );
+        let projection = project_messages(&request.messages).unwrap();
+        let decide = || {
+            maybe_decide_live_user_hint(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 1),
+                &projection,
+                &[],
+                None,
+                None,
+                None,
+                &[],
+            )
+        };
+        assert!(decide().is_ok());
+        s.with_context_conn_for_test(|tx| {
+            tx.execute_batch("ALTER TABLE memories RENAME TO memories_hint_hidden;")
+        })
+        .unwrap();
+        assert!(
+            decide().is_err(),
+            "the hint producer searches current memory"
+        );
+    }
+
+    /// 150 rounds of foreign inserts, row updates and other sessions' HARD folds leave this
+    /// session's served pair byte-identical on every SOFT and SOFT+ pass.
+    #[test]
+    fn foreign_hards_and_row_churn_preserve_the_served_pair_over_150_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let id = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
+            .unwrap();
+        s.replace_compartments("random", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let request = req("random", "cfg0", vec![item("m1msg", 1, "raw")]);
+        let before = run(&s, &request, &spine());
+        assert_eq!(before.action, "HARD");
+        let mut seed = 0x5a17u32;
+        for i in 0..150 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            if seed.is_multiple_of(3) {
+                s.insert_memory(memory_input(
+                    "git:proj",
+                    "ARCHITECTURE",
+                    &format!("foreign insertion {i}"),
+                    i,
+                ))
+                .unwrap();
+            } else {
+                s.update_memory_content("git:proj", id, &format!("update {i}"), None, i)
+                    .unwrap();
+            }
+            if seed.is_multiple_of(4) {
+                let other = req(
+                    "other",
+                    &format!("cfg-{i}"),
+                    vec![item("other", 1, "foreign append")],
+                );
+                assert_eq!(run(&s, &other, &spine()).action, "HARD");
+            }
+            let mut appended = request.clone();
+            appended
+                .messages
+                .push(item(&format!("tail-{i}"), 2, "ordinary append"));
+            let soft_plus = run(&s, &appended, &spine());
+            assert_eq!(soft_plus.action, "SOFT+");
+            assert_eq!(m0_bytes(&soft_plus), m0_bytes(&before));
+            assert_eq!(m1_bytes(&soft_plus), m1_bytes(&before));
+            s.arm_soft_refresh("random").unwrap();
+            let soft = run(&s, &appended, &spine());
+            assert_eq!(soft.action, "SOFT");
+            assert_eq!(m0_bytes(&soft), m0_bytes(&before));
+            assert_eq!(m1_bytes(&soft), m1_bytes(&before));
+        }
+    }
+
+    /// A busting SOFT reads no memory rows or mutation log, so a memory update waits for the
+    /// next HARD fold; a genuine HARD trigger (here a render-config change) shows it in m0.
+    #[test]
+    fn public_memory_update_waits_for_hard_and_a_genuine_hard_shows_it() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let memory_id = s
@@ -34944,16 +35397,20 @@ pub(crate) mod tests {
         );
         assert_eq!(soft.action, "SOFT", "public update port should not HARD");
         assert_eq!(m0_bytes(&soft), m0_bytes(&before));
-        assert!(
-            m1_bytes(&soft).contains("<memory-updates>"),
-            "{}",
-            m1_bytes(&soft)
+        assert_eq!(m1_bytes(&soft), m1_bytes(&before));
+        let hard = run(
+            &s,
+            &req("ses", "cfg1", vec![item("m1msg", 1, "raw")]),
+            &spine(),
         );
-        assert!(m1_bytes(&soft).contains("corrected"), "{}", m1_bytes(&soft));
+        assert_eq!(hard.action, "HARD");
+        assert!(m0_bytes(&hard).contains("corrected"), "{}", m0_bytes(&hard));
     }
 
+    /// A busting SOFT reads no memory rows, so a new memory waits for the next HARD fold;
+    /// a genuine HARD trigger (here a render-config change) shows it in m0.
     #[test]
-    fn public_memory_insert_rides_soft_not_hard() {
+    fn public_memory_insert_waits_for_hard_and_a_genuine_hard_shows_it() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
@@ -34980,15 +35437,17 @@ pub(crate) mod tests {
         );
         assert_eq!(soft.action, "SOFT", "public insert port should not HARD");
         assert_eq!(m0_bytes(&soft), m0_bytes(&before));
-        assert!(
-            m1_bytes(&soft).contains("<new-memories>"),
-            "{}",
-            m1_bytes(&soft)
+        assert_eq!(m1_bytes(&soft), m1_bytes(&before));
+        let hard = run(
+            &s,
+            &req("ses", "cfg1", vec![item("m1msg", 1, "raw")]),
+            &spine(),
         );
+        assert_eq!(hard.action, "HARD");
         assert!(
-            m1_bytes(&soft).contains("a durable rule"),
+            m0_bytes(&hard).contains("a durable rule"),
             "{}",
-            m1_bytes(&soft)
+            m0_bytes(&hard)
         );
     }
 
@@ -35021,7 +35480,9 @@ pub(crate) mod tests {
         let ungated_signal =
             m1_revision_signal_parts_for_pass(&s, "git:proj", "git:proj", "ses", 0, true, 0)
                 .unwrap();
-        assert_ne!(gated_signal.revision, ungated_signal.revision);
+        // The memory slots of the digest are constant zeros now, so the memory-off gate no
+        // longer changes the digest.
+        assert_eq!(gated_signal.revision, ungated_signal.revision);
         let loaded = s.load("ses").unwrap();
         let mut legacy_meta = loaded.meta.clone();
         legacy_meta.m1_revision = ungated_signal.revision;
@@ -35038,14 +35499,14 @@ pub(crate) mod tests {
         assert!(!deferred.committed);
         assert_eq!(m1_bytes(&deferred), M1_PLACEHOLDER);
 
-        // An independently scheduled execute absorbs the gated digest without rendering memory.
+        // The digest's memory slots are constant zeros, so the legacy ungated digest already
+        // equals the gated one: an execute-band pass has nothing to absorb and replays.
         let execute_request = with_usage(off_request.clone(), 70, 100);
         let migrated = transform(&s, &execute_request, &off_ctx).unwrap();
-        assert_eq!(migrated.action, "SOFT");
+        assert_eq!(migrated.action, "SOFT+");
         assert_eq!(m1_bytes(&migrated), M1_PLACEHOLDER);
         let migrated_meta = s.load("ses").unwrap().meta;
         assert_eq!(migrated_meta.m1_revision, gated_signal.revision);
-        assert!(migrated_meta.memory_disabled);
 
         // Later workspace-memory churn is revision-neutral and cannot populate or bust m1.
         s.seed_memory(7, "git:foreign", "CONSTRAINTS", "new shared rule", 70)
@@ -35067,7 +35528,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn new_memory_rides_m1_soft_and_m0_stays_frozen() {
+    fn new_memory_waits_for_hard_while_soft_replays_served_memory() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
@@ -35088,18 +35549,17 @@ pub(crate) mod tests {
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &spine(),
         );
-        assert_eq!(soft.action, "SOFT", "a new store memory rides a SOFT");
+        assert_eq!(
+            soft.action, "SOFT",
+            "a new store memory still prices a SOFT"
+        );
         assert_eq!(
             m0_bytes(&soft),
             m0_bytes(&before),
             "m0 frozen across the SOFT"
         );
-        assert!(
-            m1_bytes(&soft).contains("<new-memories>"),
-            "{}",
-            m1_bytes(&soft)
-        );
-        assert!(m1_bytes(&soft).contains("a durable rule"));
+        // A busting SOFT reads no memory rows: the new memory waits for the next HARD fold.
+        assert_eq!(m1_bytes(&soft), m1_bytes(&before), "{}", m1_bytes(&soft));
         assert!(soft.committed);
 
         // defer after: the store is unchanged → digest stable → pure SOFT+ replay, no write
@@ -35119,7 +35579,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn in_m0_memory_update_rides_m1_as_a_supersede_delta() {
+    fn in_m0_memory_update_waits_for_hard_while_soft_replays_served_memory() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         // a memory is in the m0 baseline (seeded before bootstrap → in the manifest)
@@ -35146,17 +35606,13 @@ pub(crate) mod tests {
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &spine(),
         );
-        assert_eq!(r.action, "SOFT", "an in-m0 memory mutation rides a SOFT");
         assert_eq!(
-            m0_bytes(&r),
-            m0_bytes(&before),
-            "m0 frozen (the supersede rides m1)"
+            r.action, "SOFT",
+            "an in-m0 memory mutation still prices a SOFT"
         );
-        assert!(
-            m1_bytes(&r).contains("corrected"),
-            "memory-updates delta: {}",
-            m1_bytes(&r)
-        );
+        assert_eq!(m0_bytes(&r), m0_bytes(&before), "m0 frozen");
+        // A busting SOFT reads no mutation log: the correction waits for the next HARD fold.
+        assert_eq!(m1_bytes(&r), m1_bytes(&before), "{}", m1_bytes(&r));
     }
 
     #[test]
@@ -35377,7 +35833,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn frozen_expiry_cutoff_survives_a_wall_clock_advance_on_recompose() {
+    fn soft_recompose_renders_no_new_memory_whatever_the_wall_clock() {
         // Resume-determinism guard for the frozen expiry cutoff: a memory live under the
         // FROZEN cutoff must keep rendering even when a later SOFT recomposes at a
         // wall-clock past its expiry (e.g. after a restart). A live-clock bug (using now_ms
@@ -35400,8 +35856,8 @@ pub(crate) mod tests {
             .unwrap();
         s.arm_soft_refresh("ses").unwrap();
 
-        // a SOFT recompose at wall-clock 2000 — the cutoff stays FROZEN at 500, so the
-        // memory is live and renders. A bug using now_ms=2000 would expire + drop it.
+        // a SOFT recompose at wall-clock 2000 reads no memory rows at all, whatever the
+        // cutoff: the new memory waits for the next HARD fold, which judges its expiry.
         let soft = transform(
             &s,
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
@@ -35410,8 +35866,8 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(soft.action, "SOFT");
         assert!(
-            m1_bytes(&soft).contains("still valid"),
-            "frozen cutoff (500) keeps the memory live at wall-clock 2000: {}",
+            !m1_bytes(&soft).contains("still valid"),
+            "a SOFT renders no new memory rows: {}",
             m1_bytes(&soft)
         );
     }
@@ -38302,8 +38758,28 @@ pub(crate) mod tests {
         let loaded = store.load(session).unwrap();
         let mut meta = loaded.meta.clone();
         meta.rendered_memory_ids = vec![1];
+        let snapshot = store
+            .load_memory_render_snapshot("git:proj", None, 0)
+            .unwrap();
+        let selected = snapshot
+            .memories
+            .iter()
+            .filter(|memory| memory.id == 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        let m0 = crate::memory_render::render_memory_block(
+            &selected,
+            "project-memory",
+            &Default::default(),
+        );
+        let mut shown =
+            mc_store::memory_projection::AppliedProjection::hard(&snapshot, &selected, &[]);
+        shown.bind_m0(&m0);
+        meta.memory_projection = Some(shown);
+        let mut core = loaded.core.clone();
+        core.frozen_units = vec![synth_region("m0", m0), render_m1_placeholder()];
         store
-            .commit(session, loaded.row_version, &loaded.core, &meta)
+            .commit(session, loaded.row_version, &core, &meta)
             .unwrap();
         let mut request = cc_req(
             session,
@@ -41693,7 +42169,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn coalesced_memory_delta_and_reduction_one_soft() {
+    fn memory_change_and_reduction_open_one_soft_that_renders_only_the_reduction() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
@@ -41705,9 +42181,10 @@ pub(crate) mod tests {
         let items = vec![item("a", 1, "raw"), item("t2", 2, "OUT")];
         let r = run(&s, &req("ses", "cfg0", items.clone()), &d);
         assert_eq!(r.action, "SOFT");
+        // A busting SOFT reads no memory rows: the new memory waits for the next HARD fold.
         assert!(
-            m1_bytes(&r).contains("a rule"),
-            "m1 delta rendered: {}",
+            !m1_bytes(&r).contains("a rule"),
+            "no memory delta rendered: {}",
             m1_bytes(&r)
         );
         assert_eq!(
@@ -41808,11 +42285,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pressure_refold_keeps_ready_notes_out_of_m1_and_ready() {
+    fn memory_corrections_make_no_pressure_and_a_hard_keeps_ready_notes_out_of_m1() {
         // Ready smart notes reach the agent through the host's deferred-notes reminder
-        // and `ctx_note read`, never through m1. A pressure refold with a ready note in
-        // the store must therefore leave m1 empty and must not claim the note: it stays
-        // `ready`, so the host mirror keeps announcing it.
+        // and `ctx_note read`, never through m1. Memory corrections no longer count as m1
+        // pressure (a busting SOFT reads no mutation log), so 41 of them leave an
+        // execute-band pass SOFT. A HARD fold with a ready note in the store must leave m1
+        // empty and must not claim the note: it stays `ready`, so the host mirror keeps
+        // announcing it.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -41855,20 +42334,25 @@ pub(crate) mod tests {
         ));
         add_pressure_memory_updates(&s, &memory_ids);
 
-        let pressure = transform(
+        let soft = transform(
             &s,
             &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
             &pctx("git:proj", "/nonexistent-docs", 0),
         )
         .unwrap();
+        assert_ne!(soft.action, "HARD", "memory corrections made pressure");
+        assert!(!m1_bytes(&soft).contains("updated rule"));
+
+        let pressure = transform(
+            &s,
+            &with_usage(req("ses", "cfg1", messages.clone()), 70, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
         assert_eq!(pressure.action, "HARD");
-        assert_eq!(
-            pressure.materialize_reason.as_deref(),
-            Some("pressure_refold")
-        );
         assert!(
             m0_bytes(&pressure).contains("updated rule 1"),
-            "folded m0 must carry the memory deltas that caused the pressure"
+            "the HARD fold reads the corrected rows"
         );
         assert!(!m1_bytes(&pressure).contains("ready note announced"));
         assert!(!m1_bytes(&pressure).contains("<new-notes>"));
@@ -41876,7 +42360,7 @@ pub(crate) mod tests {
 
         let stable = transform(
             &s,
-            &with_usage(req("ses", "cfg0", messages), 10, 100),
+            &with_usage(req("ses", "cfg1", messages), 10, 100),
             &pctx("git:proj", "/nonexistent-docs", 0),
         )
         .unwrap();
@@ -42120,20 +42604,18 @@ pub(crate) mod tests {
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
-        let memory_ids = seed_pressure_memory(&s);
+        seed_pressure_memory(&s);
         let messages = vec![item("a", 1, "raw")];
         run(&s, &req("ses", "cfg0", messages.clone()), &spine());
-        add_pressure_memory_updates(&s, &memory_ids);
-        let pressure = transform(
+        // Memory corrections no longer produce SOFT pressure (a busting SOFT reads no
+        // mutation log), so a render-config HARD freezes the m1 unit this test rewrites.
+        let folded = transform(
             &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
+            &with_usage(req("ses", "cfg1", messages.clone()), 70, 100),
             &pctx("git:proj", "/nonexistent-docs", 0),
         )
         .unwrap();
-        assert_eq!(
-            pressure.materialize_reason.as_deref(),
-            Some("pressure_refold")
-        );
+        assert_eq!(folded.action, "HARD");
 
         // Rewrite the frozen m1 into the pre-fix full-body shape the old binary froze.
         let loaded = s.load("ses").unwrap();
@@ -42144,14 +42626,14 @@ pub(crate) mod tests {
             .frozen_units
             .iter_mut()
             .find(|unit| unit.key == "m1")
-            .expect("refold froze an m1 unit");
+            .expect("the HARD froze an m1 unit");
         m1.frozen_payload = legacy_body.to_string();
         s.commit("ses", loaded.row_version, &core, &loaded.meta)
             .unwrap();
 
         let replay = transform(
             &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 10, 100),
+            &with_usage(req("ses", "cfg1", messages.clone()), 10, 100),
             &pctx("git:proj", "/nonexistent-docs", 0),
         )
         .unwrap();

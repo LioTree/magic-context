@@ -908,6 +908,18 @@ fn locked_subc_revision(lock: &str) -> String {
 
 fn locked_daemon_source(workspace: &Path) -> PathBuf {
     let revision = locked_subc_revision(&fs::read_to_string(workspace.join("Cargo.lock")).unwrap());
+    // An exported source tree keeps isolated tests from inspecting a sibling checkout.
+    // Its export marker must agree with the revision selected by this workspace's lockfile.
+    if let Some(source) = std::env::var_os("MC_TEST_LOCKED_SUBC_SOURCE") {
+        let source = PathBuf::from(source);
+        let recorded = fs::read_to_string(source.join(".source-revision")).unwrap();
+        assert_eq!(
+            recorded.trim(),
+            revision,
+            "daemon export must match Cargo.lock"
+        );
+        return source;
+    }
     let subconscious = subconscious_root(workspace);
     let compatible = Command::new("git")
         .current_dir(&subconscious)

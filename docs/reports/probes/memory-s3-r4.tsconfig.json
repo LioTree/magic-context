@@ -1,0 +1,10 @@
+{
+	"extends": "../../../packages/pi-plugin/tsconfig.json",
+	"compilerOptions": {
+		"types": ["node", "bun"],
+		"typeRoots": ["../../../packages/plugin/node_modules/@types"]
+	},
+	"include": ["memory-s3-r4.probe.ts"],
+	"exclude": [],
+	"references": []
+}

@@ -50,8 +50,19 @@ import {
 	embedPromotedFacts,
 	promoteSessionFactsDurable,
 } from "@magic-context/core/features/magic-context/memory";
+import { tsOwnsMemory } from "@magic-context/core/features/magic-context/memory/lifecycle-applier";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import {
+	allocateTurnOneSend,
+	blocksSentToHistorian,
+	commitTurnOnePublication,
+	publishedFacts,
+	resolveTurnOneLane,
+	type TurnOneFact,
+	type TurnOneLane,
+	type TurnOneSend,
+} from "@magic-context/core/features/magic-context/memory/turn-one-publication";
 import {
 	clearEmergencyDrainLatch,
 	clearEmergencyRecovery,
@@ -142,7 +153,10 @@ import type {
 	ModelInput,
 	ResolvedModelEntry,
 } from "@magic-context/core/shared/model-resolution";
-import type { Database } from "@magic-context/core/shared/sqlite";
+import {
+	type Database,
+	isTransientSqliteError,
+} from "@magic-context/core/shared/sqlite";
 import type {
 	SubagentProgressEvent,
 	SubagentRunner,
@@ -478,6 +492,12 @@ export interface PiHistorianDeps {
 	forceDrainQuota?: boolean;
 	/** Persist the final weak-lookahead compartment for coverage while skipping promotion. */
 	forceKeepLastCompartment?: boolean;
+	/**
+	 * Which historian turn one this lane runs (see `TurnOneLane`). Unset means
+	 * `dormant`, the only production value: `enabled` needs the Pi subagent to make
+	 * the provider enforce a JSON response schema, which it does not yet.
+	 */
+	memoryLifecycleLane?: TurnOneLane;
 }
 
 export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
@@ -727,9 +747,17 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				directory,
 				allowHomeProject,
 			);
-			const memories = projectPath
-				? getMemoriesByProject(db, projectPath, ["active", "permanent"])
-				: [];
+			// On an `enabled` turn-one lane (see `TurnOneLane`) with memory on, the
+			// historian gets no project-memory block and anchors every fact to its
+			// source lines; the anchor is stored with the fact's candidate row, and a
+			// later reconcile step compares the fact with existing memory instead.
+			const turnOneLane = resolveTurnOneLane(deps.memoryLifecycleLane);
+			const anchoredFacts =
+				turnOneLane === "enabled" && memoryEnabled !== false;
+			const memories =
+				projectPath && !anchoredFacts
+					? getMemoriesByProject(db, projectPath, ["active", "permanent"])
+					: [];
 			const fitModelKey = piModelRefToCanonical(historianModel ?? "");
 			const fitContext = fitModelKey
 				? resolveProducerContextLimit(fitModelKey)
@@ -756,6 +784,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				),
 				memories,
 				memoryEnabled: memoryEnabled !== false,
+				anchoredFacts,
 			});
 			if (!promptFit.ok) {
 				telemetry.failureReason = promptFit.reason;
@@ -939,9 +968,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			const prompt = buildCompartmentAgentPrompt({
 				seedExamples: promptFit.seedExamples,
 				sessionReferences: promptFit.sessionReferences,
-				projectMemory: promptFit.projectMemory,
+				projectMemory: anchoredFacts ? "" : promptFit.projectMemory,
 				inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
 				memoryEnabled: memoryEnabled !== false,
+				anchoredFacts,
 			});
 
 			// Defensive: use MAX(sequence) + 1 over .length to survive any old
@@ -1023,6 +1053,38 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					}
 				};
 			};
+
+			// Persist turn one's send record, with the publication id the compartment
+			// transaction will commit under, before spawning the subagent. A run that
+			// fails before publishing leaves the id for the session's next run, so one
+			// chunk's candidates and activity are published under one id however many
+			// sends it takes.
+			let turnOneSend: TurnOneSend;
+			try {
+				turnOneSend = allocateTurnOneSend(db, {
+					projectPath,
+					sessionId,
+					harness: resolvePiHarnessKind(),
+					carrier: "pi-subagent",
+					lane: turnOneLane,
+					chunkStart: chunk.startIndex,
+					chunkEnd: chunk.endIndex,
+				});
+			} catch (error) {
+				if (!isTransientSqliteError(error)) throw error;
+				// The store stayed busy past its timeout before anything was sent. This
+				// is contention, not a historian failure: skip the run without touching
+				// the failure count or its backoff, release the drain budget, and let
+				// the next trigger try again.
+				telemetry.status = "noop";
+				telemetry.failureReason = "turn_one_send_store_busy";
+				sessionLog(
+					sessionId,
+					`historian skipped: store busy while recording turn one's send (${describeError(error).brief}); retrying on the next trigger`,
+				);
+				rollbackDrainReservation();
+				return;
+			}
 
 			retainDrainReservationForRetryThrottle = true;
 			const historianEditorSystemPrompt = withContentLanguageDirective(
@@ -1438,22 +1500,79 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				// Resolve durable ids for the just-appended compartments (last N rows by
 				// sequence — appendCompartments inserts at the tail). Used for events
 				// anchoring + post-commit embeddings.
-				persistedIds = getCompartments(db, sessionId)
-					.slice(-newCompartments.length)
-					.map((c) => c.id);
-				// v2 faithful fact lifecycle (E6 parity): facts are no longer a
-				// REPLACE-the-whole-list store. The historian emits only THIS
-				// chunk's facts (deduped against <project-memory> in the prompt);
-				// they flow to project memory via in-transaction durable promotion.
-				// No replaceSessionFacts — promoted facts reach the agent through the
-				// renderer's m[1] new-memories watermark. Promotion is in the SAME
-				// transaction as the boundary floor below, so both commit or both roll back.
-				if (promotionActive && !skipUnanchoredPromotion) {
+				const durableRows = getCompartments(db, sessionId).slice(
+					-newCompartments.length,
+				);
+				persistedIds = durableRows.map((c) => c.id);
+				// The historian emits only this chunk's facts. As in the OpenCode runner,
+				// this transaction also commits turn one's publication, once: the
+				// activity ledger counts the new compartments, and the reply's published
+				// facts (see `keepPublishedFact`: one tied to a discarded or weak final
+				// compartment is dropped and comes back when the next run re-derives
+				// those lines) go to one of three places.
+				// - `enabled` lane: every published fact becomes a candidate with its
+				//   resolved anchor; nothing is promoted, a later reconcile step decides.
+				// - `dormant` lane, project memory owned by the Rust module: each fact
+				//   becomes a candidate with an unknown anchor, since this process may
+				//   not write those memories.
+				// - `dormant` lane, project memory owned here: facts are promoted below,
+				//   in the same transaction as the protected-tail publication floor, so
+				//   both commit or both roll back. A promoted memory reaches the agent at
+				//   the session's next HARD rebuild of its memory block.
+				const memoryAuthorityHere = tsOwnsMemory(db, projectPath);
+				const keptFacts: TurnOneFact[] = publishedFacts(
+					validatedPass.facts ?? [],
+					newCompartments.length,
+					discardedLast,
+					weakLookaheadFinalCompartment ? emittedCompartments.length : null,
+				);
+				const candidateFacts =
+					turnOneLane === "enabled"
+						? memoryEnabled !== false
+							? keptFacts
+							: []
+						: promotionActive && !memoryAuthorityHere
+							? keptFacts
+							: [];
+				const turnOnePublication = commitTurnOnePublication(db, {
+					send: turnOneSend,
+					projectPath,
+					sessionId,
+					compartments: durableRows.map((row, index) => ({
+						id: row.id,
+						startMessage: row.startMessage,
+						endMessage: row.endMessage,
+						replyStartMessage: newCompartments[index]?.startMessage ?? -1,
+						replyEndMessage: newCompartments[index]?.endMessage ?? -1,
+					})),
+					blocks:
+						turnOneLane === "enabled"
+							? blocksSentToHistorian(
+									chunk.printedBlocks,
+									chunk.text,
+									chunkText,
+								)
+							: [],
+					candidateFacts,
+					honourAnchors: turnOneLane === "enabled",
+				});
+				if (turnOnePublication.candidatesInserted > 0) {
+					sessionLog(
+						sessionId,
+						`historian turn one: recorded ${turnOnePublication.candidatesInserted} candidate fact(s) (${turnOnePublication.anchoredCandidates} anchored, ${turnOnePublication.blocksStored} block(s))${turnOnePublication.authorityElsewhere ? "; memory authority is the module" : ""}`,
+					);
+				}
+				if (
+					turnOneLane === "dormant" &&
+					memoryAuthorityHere &&
+					promotionActive &&
+					keptFacts.length > 0
+				) {
 					const promotion = promoteSessionFactsDurable(
 						db,
 						sessionId,
 						projectPath,
-						validatedPass.facts ?? [],
+						keptFacts,
 					);
 					promotedFactRefs = promotion.newMemoryRefs;
 					promotedFactCount = promotion.factsPromoted;

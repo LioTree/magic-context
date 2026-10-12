@@ -407,6 +407,36 @@ pub fn read_memory_render_snapshot(
         )?
     };
     Ok(MemoryRenderSnapshot {
+        revisions: if tables.memories == "memories" {
+            let has_revision = conn
+                .prepare("PRAGMA table_info(memories)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .iter()
+                .any(|name| name == "revision");
+            let sql = format!(
+                "SELECT id, {} FROM memories WHERE project_path IN ({placeholders})",
+                if has_revision { "revision" } else { "1" }
+            );
+            let revisions = conn
+                .prepare(&sql)?
+                .query_map(rusqlite::params_from_iter(project_paths.iter()), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            revisions
+        } else {
+            Default::default()
+        },
+        fragment_watermark: if table_exists(conn, "main", "memory_agent_fragments")? {
+            conn.query_row(
+                "SELECT COALESCE(MAX(id),0) FROM memory_agent_fragments",
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        },
         memories,
         revision: MemoryRevision {
             project_paths,

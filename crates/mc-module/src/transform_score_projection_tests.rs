@@ -116,7 +116,8 @@ fn probe_uses_committed_view_and_writes_no_cache_state() {
         mc_tokenizer::estimate_tokens,
         false,
         &mut crate::m0_compose::ComposeTimings::default(),
-        before.meta.score_selection_watermark,
+        &before,
+        false,
     )
     .unwrap();
     assert_eq!(probe.score_selection_watermark, 0);
@@ -143,7 +144,8 @@ fn ttl_and_model_cache_loss_adopt_latest_even_when_w_render_matches() {
             mc_tokenizer::estimate_tokens,
             false,
             &mut crate::m0_compose::ComposeTimings::default(),
-            0,
+            &s.load("ses").unwrap(),
+            false,
         )
         .unwrap();
         assert_eq!(probe.m0_bytes, m0_bytes(&baseline));
@@ -570,11 +572,23 @@ fn review_downgrade_meta_rewrite_must_not_adopt_unserved_scores_on_marker_hard()
 fn review_pressure_refold_commits_latest_snapshot_not_late_publication() {
     let (_dir, s, mut request) = scored_fixture();
     let s = std::sync::Arc::new(s);
-    let memory_ids = seed_pressure_memory(&s);
     let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
     transform(&s, &request, &ctx).unwrap();
     s.publish_score_for_test("ses", 1, 1).unwrap();
-    add_pressure_memory_updates(&s, &memory_ids);
+    // Memory corrections no longer make m1 pressure (a busting SOFT reads no mutation
+    // log), so an oversized new compartment over the raw tail message is the pressure.
+    s.append_compartments(
+        "ses",
+        &[comp(
+            17,
+            17,
+            17,
+            "m17",
+            &format!("detail-P1-17; {}", "pressure ".repeat(30_000)),
+        )],
+    )
+    .unwrap();
+    request.messages.push(item("m18", 18, "raw"));
     let publisher = std::sync::Arc::clone(&s);
     s.after_score_snapshot_for_test(move || {
         publisher.publish_score_for_test("ses", 2, 1).unwrap();

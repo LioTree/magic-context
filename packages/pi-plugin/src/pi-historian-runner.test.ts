@@ -258,6 +258,9 @@ async function runHistorianWith(args: {
 	ensureProjectRegistered?: Parameters<
 		typeof runPiHistorian
 	>[0]["ensureProjectRegistered"];
+	memoryLifecycleLane?: Parameters<
+		typeof runPiHistorian
+	>[0]["memoryLifecycleLane"];
 }) {
 	const db = createTestDb();
 	const runner = args.runner ?? runnerReturning([...(args.outputs ?? [])]);
@@ -311,6 +314,7 @@ async function runHistorianWith(args: {
 		compartmentLeaseHolderId: holderId,
 		ensureProjectRegistered: args.ensureProjectRegistered,
 		forceKeepLastCompartment: args.forceKeepLastCompartment,
+		memoryLifecycleLane: args.memoryLifecycleLane,
 	});
 	return { db, runner };
 }
@@ -1455,6 +1459,220 @@ describe("Pi historian prompt sized to the producer window", () => {
 			expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(
 				0,
 			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+});
+
+describe("runPiHistorian turn one", () => {
+	const projectPath = resolveProjectIdentity(process.cwd());
+	const anchoredXml = `<compartment start="1" end="2" title="Initial Pi slice"><p1>Summarized the first Pi turn.</p1></compartment>
+<PROJECT_RULES>
+* [at_compartment=1 messages=1] Pi turn-one facts carry anchors.
+* [at_compartment=unknown] Pi unknown anchors are not guessed.
+</PROJECT_RULES>`;
+	const sentUserMessages = (runner: SubagentRunner): string[] =>
+		(
+			runner.run as unknown as {
+				mock: { calls: Array<[Parameters<SubagentRunner["run"]>[0]]> };
+			}
+		).mock.calls.map(([options]) => options.userMessage);
+	const pendingFacts = (db: ReturnType<typeof createTestDb>) =>
+		db
+			.prepare(
+				"SELECT fact_index, compartment_id, content, anchor_known, state, fact_attempts, reason FROM memory_pending_facts ORDER BY id",
+			)
+			.all();
+	const publications = (db: ReturnType<typeof createTestDb>) =>
+		db
+			.prepare(
+				"SELECT publication_id, source_session_id, commit_order FROM memory_publications",
+			)
+			.all() as Array<{
+			publication_id: string;
+			source_session_id: string;
+			commit_order: number | null;
+		}>;
+
+	it("keeps today's promotion on the dormant lane and commits the publication once", async () => {
+		const { db } = await runHistorianWith({
+			outputs: [successXml("Pi dormant lane still promotes.")],
+		});
+		try {
+			expect(
+				getMemoriesByProject(db, projectPath).map((m) => m.content),
+			).toContain("Pi dormant lane still promotes.");
+			expect(pendingFacts(db)).toEqual([]);
+			const [publication] = publications(db);
+			expect(publications(db)).toHaveLength(1);
+			expect(publication).toMatchObject({
+				source_session_id: "ses-historian",
+				commit_order: 1,
+			});
+			expect(
+				db
+					.prepare(
+						"SELECT publication_id, run_attempt, stage, harness, state FROM memory_stage_attempts",
+					)
+					.all(),
+			).toEqual([
+				{
+					publication_id: publication!.publication_id,
+					run_attempt: 1,
+					stage: "turn_one",
+					harness: "pi",
+					state: "published",
+				},
+			]);
+			expect(
+				db.prepare("SELECT compartment_id FROM memory_activity_ledger").all(),
+			).toEqual([
+				{ compartment_id: getCompartments(db, "ses-historian")[0]!.id },
+			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("records each fact as an authority_elsewhere candidate on a dormant lane the module owns", async () => {
+		let memoriesBefore: unknown[] = [];
+		const { db } = await runHistorianWith({
+			outputs: [successXml("Pi facts survive module authority.")],
+			beforeRun: (db) => {
+				db.prepare(
+					"INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, 'module-store', 1)",
+				).run(projectPath);
+				memoriesBefore = db.prepare("SELECT * FROM memories").all();
+			},
+		});
+		try {
+			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
+			expect(db.prepare("SELECT * FROM memories").all()).toEqual(
+				memoriesBefore,
+			);
+			expect(pendingFacts(db)).toEqual([
+				{
+					fact_index: 0,
+					compartment_id: null,
+					content: "Pi facts survive module authority.",
+					anchor_known: 0,
+					state: "retryable",
+					fact_attempts: 0,
+					reason: "authority_elsewhere",
+				},
+			]);
+			expect(publications(db).map((row) => row.commit_order)).toEqual([1]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("omits the memory block and stores anchored candidates on an enabled lane", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [anchoredXml],
+			memoryLifecycleLane: "enabled",
+			beforeRun: (db) => {
+				insertMemory(db, {
+					projectPath,
+					category: "NAMING",
+					content: "Pi memory hidden from turn one.",
+					sourceType: "historian",
+				});
+			},
+		});
+		try {
+			const [sent] = sentUserMessages(runner);
+			expect(sent).not.toContain("Pi memory hidden from turn one.");
+			expect(sent).toContain("<fact_anchors>required</fact_anchors>");
+			const compartmentId = getCompartments(db, "ses-historian")[0]!.id;
+			expect(pendingFacts(db)).toEqual([
+				{
+					fact_index: 0,
+					compartment_id: compartmentId,
+					content: "Pi turn-one facts carry anchors.",
+					anchor_known: 1,
+					state: "retryable",
+					fact_attempts: 0,
+					reason: null,
+				},
+				{
+					fact_index: 1,
+					compartment_id: null,
+					content: "Pi unknown anchors are not guessed.",
+					anchor_known: 0,
+					state: "retryable",
+					fact_attempts: 0,
+					reason: null,
+				},
+			]);
+			expect(
+				db
+					.prepare(
+						"SELECT start_ordinal, end_ordinal, role, joined_text FROM memory_fact_blocks",
+					)
+					.all(),
+			).toEqual([
+				{
+					start_ordinal: 1,
+					end_ordinal: 1,
+					role: "U",
+					joined_text: "User request 1",
+				},
+			]);
+			expect(
+				getMemoriesByProject(db, projectPath).map((m) => m.content),
+			).toEqual(["Pi memory hidden from turn one."]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+});
+
+describe("runPiHistorian when the store is busy before dispatch", () => {
+	it("skips the run without counting a failure when turn one's send cannot be recorded", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [successXml("Pi busy-store fact.")],
+			beforeRun: (db) => {
+				// Recording the send reports a store that stayed busy past its timeout.
+				const prepare = db.prepare.bind(db);
+				Object.defineProperty(db, "prepare", {
+					configurable: true,
+					writable: true,
+					value: (sql: string) => {
+						if (/INSERT INTO memory_stage_attempts/.test(sql)) {
+							throw Object.assign(new Error("database is locked"), {
+								code: "SQLITE_BUSY",
+							});
+						}
+						return prepare(sql);
+					},
+				});
+			},
+		});
+		try {
+			expect(runner.run).not.toHaveBeenCalled();
+			expect(getCompartments(db, "ses-historian")).toEqual([]);
+			expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(
+				0,
+			);
+			expect(
+				db
+					.prepare(
+						"SELECT historian_drain_failure_at AS at FROM session_meta WHERE session_id = ?",
+					)
+					.get("ses-historian"),
+			).toEqual({ at: 0 });
+			expect(
+				db
+					.prepare(
+						"SELECT status, failure_reason FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+					)
+					.get("ses-historian"),
+			).toEqual({ status: "noop", failure_reason: "turn_one_send_store_busy" });
+			expect(
+				db.prepare("SELECT COUNT(*) AS n FROM memory_publications").get(),
+			).toEqual({ n: 0 });
 		} finally {
 			closeQuietly(db);
 		}

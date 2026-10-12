@@ -3753,12 +3753,11 @@ export async function runPostTransformPhase(
     let autoSearchHintAppendedThisPass = false;
     let autoSearchCompletedThisPass = false;
     if (args.fullFeatureMode && args.autoSearch?.enabled && args.projectPath) {
-        // Resolve memory ids currently rendered in the <session-history>
-        // block. The auto-search runner drops hint fragments for memories the
-        // agent already sees in message[0] so the hint stays "vague recall"
-        // for content not already in context.
+        // The runner drops hint fragments for memories whose current text the agent
+        // already sees in the memory pair, so the hint stays "vague recall". That
+        // visibility check reads current memory, so it is resolved only when a new hint
+        // is computed for a new user message, never on a replaying pass.
         const tAutoSearch = performance.now();
-        const visibleMemoryIds = getVisibleMemoryIds(args.db, args.sessionId) ?? undefined;
         autoSearchHintsBefore = countAutoSearchHints(args.db, args.sessionId);
 
         try {
@@ -3773,7 +3772,8 @@ export async function runPostTransformPhase(
                     directory: args.autoSearch.directory ?? args.sessionDirectory,
                     projectPath: args.projectPath,
                     ensureProjectRegistered: args.autoSearch.ensureProjectRegistered,
-                    visibleMemoryIds,
+                    resolveVisibleMemoryIds: () =>
+                        getVisibleMemoryIds(args.db, args.sessionId) ?? undefined,
                     wordRules: args.autoSearch.wordRules,
                 },
             });

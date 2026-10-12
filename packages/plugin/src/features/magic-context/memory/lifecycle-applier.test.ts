@@ -196,7 +196,7 @@ describe("memory lifecycle applier", () => {
             Array(4).fill(null),
         );
     });
-    test("production revisions remain pending until projection exists with no canonical writes", async () => {
+    test("historian revisions run every check through the ledger before one canonical write, with no mutation-log row", async () => {
         const db = store();
         try {
             const memory = insertMemory(db, { ...input, content: "Old rule. Keep rule." });
@@ -245,21 +245,6 @@ describe("memory lifecycle applier", () => {
                 ],
             };
             let calls = 0;
-            const receipt = await applyHistorianRevision(
-                db,
-                decision,
-                context,
-                { sessionId: "s", harness: "opencode" },
-                async () => {
-                    calls++;
-                    throw Error("must not send");
-                },
-            );
-            expect(receipt).toMatchObject({
-                state: "decided_pending",
-                reason: "projection_pending",
-            });
-            expect(calls).toBe(0);
             const send = async (
                 request: Parameters<Parameters<typeof checkMemoryRevision>[4]>[0],
             ) => {
@@ -288,21 +273,40 @@ describe("memory lifecycle applier", () => {
                 ),
             ).toEqual({ ok: true });
             expect(calls).toBe(4);
+            // The four check calls are recorded only in memory_check_attempts; no memory row or
+            // history row is written until applyHistorianRevision commits the edit.
+            expect(db.prepare("SELECT * FROM memories").all()).toEqual(before);
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({ n: 0 });
+            const receipt = await applyHistorianRevision(
+                db,
+                decision,
+                context,
+                { sessionId: "s", harness: "opencode" },
+                send,
+            );
+            expect(receipt).toMatchObject({
+                state: "applied",
+                reason: "edit",
+                adoptionClass: "live",
+            });
+            expect(calls).toBe(4);
             expect(
-                await checkMemoryRevision(
+                await applyHistorianRevision(
                     db,
-                    { sessionId: "s", harness: "opencode" },
                     decision,
                     context,
+                    { sessionId: "s", harness: "opencode" },
                     send,
                 ),
-            ).toEqual({ ok: true });
-            expect(calls).toBe(4);
+            ).toEqual(receipt);
             expect(db.prepare("SELECT state,usage_json FROM memory_check_attempts").all()).toEqual(
                 Array(4).fill({ state: "resolved", usage_json: '{"tokens":10}' }),
             );
-            expect(db.prepare("SELECT * FROM memories").all()).toEqual(before);
-            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({ n: 0 });
+            expect(getMemoryById(db, memory.id)?.content).toBe("New rule. Keep rule.");
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({ n: 1 });
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_mutation_log").get()).toEqual({
+                n: 0,
+            });
         } finally {
             db.close();
         }

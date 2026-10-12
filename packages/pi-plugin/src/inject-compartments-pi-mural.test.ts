@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,10 @@ import {
 	MEMORY_MURAL_BLOCK,
 	MEMORY_MURAL_GUIDANCE,
 } from "@magic-context/core/agents/magic-context-prompt";
+import { insertMemory } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import * as renderTrigger from "@magic-context/core/features/magic-context/mural/render-trigger";
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
+import type { MuralPool } from "@magic-context/core/features/magic-context/mural/resolve-mural";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import {
 	clearModelsDevCache,
@@ -489,6 +492,54 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			} catch {
 				/* ignore */
 			}
+			closeQuietly(db);
+		}
+	});
+});
+
+describe("Pi mural pool capture", () => {
+	// The HARD fold hands the mural the rows it read with the m[0] memories. A
+	// memory written after that read must not reach the image (and so its cue
+	// manifest) through a live re-read, or text and image would describe two states.
+	it("resolves the mural from the fold's captured pool, not live rows", () => {
+		const db = createTestDb();
+		const spy = spyOn(renderTrigger, "resolveMuralWire");
+		try {
+			getOrCreateSessionMeta(db, SESSION_ID);
+			const frozen = insertMemory(db, {
+				projectPath: "git:pi-mural",
+				category: "ARCHITECTURE",
+				content: "Read with the m[0] memories.",
+			});
+			let late = 0;
+			let captured: MuralPool | undefined;
+			spy.mockImplementation((...args: unknown[]) => {
+				captured = args[6] as MuralPool | undefined;
+				return { enabled: true, supportsVision: false };
+			});
+			injectM0M1Pi(
+				baseState({
+					muralEnabled: true,
+					afterM0InputsReadForTest: () => {
+						late = insertMemory(db, {
+							projectPath: "git:pi-mural",
+							category: "ARCHITECTURE",
+							content: "Written after the frozen read.",
+						}).id;
+					},
+				}),
+				db,
+				[userMessage("hello")] as never,
+				undefined,
+				true,
+			);
+			expect(late).toBeGreaterThan(0);
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(captured?.memories.map((memory) => memory.id)).toEqual([
+				frozen.id,
+			]);
+		} finally {
+			spy.mockRestore();
 			closeQuietly(db);
 		}
 	});

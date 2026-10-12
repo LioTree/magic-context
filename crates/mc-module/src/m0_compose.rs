@@ -50,6 +50,7 @@ impl From<McStoreError> for M0ComposeError {
 /// [`mc_store::ModuleMeta`] atomically with those bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M0Composition {
+    pub memory_projection: mc_store::memory_projection::AppliedProjection,
     /// Highest score-selection sequence whose rescored importance is rendered into
     /// `m0_bytes` (zero for original scores). With `ScoreSelector::Latest` it is
     /// read in the same context.db snapshot as the compartment rows.
@@ -552,6 +553,8 @@ pub(crate) fn compose_m0_from_store_timed<S: M0Source + ?Sized>(
         mc_store::MemoryRenderSnapshot {
             memories: Vec::new(),
             revision: MemoryRevision::default(),
+            revisions: Default::default(),
+            fragment_watermark: 0,
         }
     };
     let source_name_by_module_id = membership
@@ -559,7 +562,7 @@ pub(crate) fn compose_m0_from_store_timed<S: M0Source + ?Sized>(
         .map(|value| workspace_source_names(&snapshot.memories, value))
         .unwrap_or_else(HashMap::new);
     let selected_memories = trim_memories_to_budget(
-        snapshot.memories,
+        snapshot.memories.clone(),
         membership.as_ref(),
         &source_name_by_module_id,
         inputs.memory_budget_tokens,
@@ -645,6 +648,15 @@ pub(crate) fn compose_m0_from_store_timed<S: M0Source + ?Sized>(
     }
 
     Ok(M0Composition {
+        memory_projection: {
+            let mut projection = mc_store::memory_projection::AppliedProjection::hard(
+                &snapshot,
+                &rendered_memories,
+                &user_profile,
+            );
+            projection.bind_m0(&m0_bytes);
+            projection
+        },
         score_selection_watermark: score_snapshot.watermark,
         m0_bytes,
         mural,

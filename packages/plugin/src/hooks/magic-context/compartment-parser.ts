@@ -22,6 +22,19 @@ export interface ParsedCompartment {
 export interface ParsedFact {
     category: string;
     content: string;
+    /**
+     * Source anchor written as a `[at_compartment=N messages=A-B]` bullet prefix.
+     * Absent when the bullet carries no anchor or says `at_compartment=unknown`.
+     * `compartmentIndex` is 1-based into the returned (start-sorted) compartments.
+     */
+    anchor?: ParsedFactAnchor;
+}
+
+export interface ParsedFactAnchor {
+    compartmentIndex: number;
+    /** The printed `[A]`/`[A-B]` range the fact cites; absent when none was written. */
+    startOrdinal?: number;
+    endOrdinal?: number;
 }
 
 /**
@@ -98,7 +111,20 @@ const TIER_CLOSE_ANY_REGEX = /<\/p\d/;
 const TIER_OPEN_ANY_REGEX = /<p\d/;
 const CATEGORY_BLOCK_REGEX = /<([A-Za-z_][A-Za-z0-9_-]*)>(.*?)<\/\1>/gs;
 const HISTORIAN_CATEGORIES: ReadonlySet<string> = new Set(V2_MEMORY_CATEGORIES);
-const FACT_ITEM_REGEX = /^\s*\*\s*(.+)$/gm;
+// A fact bullet's optional source-anchor prefix:
+// `[at_compartment=N messages=A-B] text`, `[at_compartment=unknown] text`. Only
+// ASCII space and tab separate its parts, and the text after it may hold any
+// character, so JavaScript and Rust classify the same input the same way.
+// Mirrors `side_channel_anchor_regex` in crates/mc-module/src/historian_validate.rs.
+const FACT_ANCHOR_PREFIX_REGEX =
+    /^[ \t]*[[(][ \t]*(?:at_compartment|origin_compartment)[ \t]*=[ \t]*"?([0-9]+|unknown)"?(?:[ \t]+messages[ \t]*=[ \t]*"?([0-9]+)(?:[ \t]*-[ \t]*([0-9]+))?"?)?[ \t]*[\])][ \t]*([\s\S]+)$/;
+// Whitespace trimmed from fact text: Unicode White_Space without U+0085 (that is,
+// JavaScript's `trim` set without U+FEFF). U+0085 and U+FEFF stay ordinary text, as
+// in `is_fact_trim_char` in the Rust parser.
+const FACT_TRIM_CHARS =
+    "\\t\\n\\v\\f\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+const FACT_TRIM_START_REGEX = new RegExp(`^[${FACT_TRIM_CHARS}]+`);
+const FACT_TRIM_END_REGEX = new RegExp(`[${FACT_TRIM_CHARS}]+$`);
 const UNPROCESSED_REGEX = /<unprocessed_from>(\d+)<\/unprocessed_from>/;
 const USER_OBSERVATIONS_REGEX = /<user_observations>(.*?)<\/user_observations>/s;
 const USER_OBS_ITEM_REGEX = /^\s*\*\s*(.+)$/gm;
@@ -124,6 +150,58 @@ const EVENT_FIELD_REGEX = /<([a-z_]+)\s*>(.*?)<\/\1>/gs;
 function searchFrom(s: string, regex: RegExp, from: number): number {
     const at = s.slice(from).search(regex);
     return at === -1 ? -1 : from + at;
+}
+
+function parseOrdinal(raw: string | undefined): number | undefined {
+    if (raw === undefined) return undefined;
+    const value = Number(raw);
+    return Number.isSafeInteger(value) ? value : undefined;
+}
+
+/** Trim fact text the same way the Rust parser does; see `FACT_TRIM_CHARS`. */
+export function trimFactText(text: string): string {
+    return text.replace(FACT_TRIM_START_REGEX, "").replace(FACT_TRIM_END_REGEX, "");
+}
+
+/**
+ * The bullet items of a fact category block, XML-unescaped. A bullet is one
+ * `\n`-terminated line (the `\r` of a CRLF ending is dropped) that starts with `*`
+ * after optional whitespace. U+2028, U+2029, U+0085 and a lone `\r` are ordinary
+ * text inside a bullet, never a line end. `fact_items` in the Rust parser splits
+ * the same way.
+ */
+function factItems(block: string): string[] {
+    const items: string[] = [];
+    for (const rawLine of block.split("\n")) {
+        const line = rawLine.replace(FACT_TRIM_START_REGEX, "");
+        if (!line.startsWith("*")) continue;
+        const body = line.slice(1);
+        const item = trimFactText(body);
+        if (item) items.push(unescapeXml(item));
+    }
+    return items;
+}
+
+/**
+ * Split a fact bullet's optional source-anchor prefix from its text. A bullet
+ * without a prefix, or with `at_compartment=unknown`, has no anchor. The Rust
+ * parser (`historian_validate::split_fact_anchor_prefix`) gives the same result.
+ */
+export function splitFactAnchorPrefix(text: string): {
+    content: string;
+    anchor?: ParsedFactAnchor;
+} {
+    const match = text.match(FACT_ANCHOR_PREFIX_REGEX);
+    if (!match) return { content: trimFactText(text) };
+    const content = trimFactText(match[4]);
+    // An index or range past 2^53 rejects the whole anchor, as in Rust.
+    const compartmentIndex = parseOrdinal(match[1]);
+    if (compartmentIndex === undefined) return { content };
+    if (match[2] === undefined) return { content, anchor: { compartmentIndex } };
+    const startOrdinal = parseOrdinal(match[2]);
+    const endOrdinal = match[3] === undefined ? startOrdinal : parseOrdinal(match[3]);
+    if (startOrdinal === undefined || endOrdinal === undefined) return { content };
+    return { content, anchor: { compartmentIndex, startOrdinal, endOrdinal } };
 }
 
 /** True when `inner` opens tier `digit` anywhere at or after `from`. */
@@ -392,9 +470,7 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
     for (const categoryMatch of factsScope.matchAll(CATEGORY_BLOCK_REGEX)) {
         const category = categoryMatch[1];
         const blockContent = categoryMatch[2];
-        const items = [...blockContent.matchAll(FACT_ITEM_REGEX)]
-            .map((match) => unescapeXml(match[1].trim()))
-            .filter(Boolean);
+        const items = factItems(blockContent);
         if (!HISTORIAN_CATEGORIES.has(category)) {
             if (items.length === 0) continue;
             droppedFactBlocks++;
@@ -402,7 +478,11 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
             log(`[historian] Dropped <facts> category ${category} (${items.length} facts)`);
             continue;
         }
-        for (const content of items) facts.push({ category, content });
+        for (const item of items) {
+            const { content, anchor } = splitFactAnchorPrefix(item);
+            if (!content) continue;
+            facts.push(anchor ? { category, content, anchor } : { category, content });
+        }
     }
 
     const unprocessedMatch = outside.match(UNPROCESSED_REGEX);
@@ -463,7 +543,17 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
 
     return {
         compartments: sortedByStart.map(({ compartment }) => compartment),
-        facts,
+        facts: facts.map((fact) =>
+            fact.anchor
+                ? {
+                      ...fact,
+                      anchor: {
+                          ...fact.anchor,
+                          compartmentIndex: remapAnchor(fact.anchor.compartmentIndex),
+                      },
+                  }
+                : fact,
+        ),
         droppedFactBlocks,
         droppedFacts,
         events: events.map((event) =>
