@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod codec;
+mod codec_claude_code;
 mod codec_opencode;
 mod compaction;
 mod historian;
