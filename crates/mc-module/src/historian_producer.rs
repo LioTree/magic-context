@@ -546,6 +546,10 @@ impl HistorianProducerError {
         )
     }
     /// Provider reset metadata is a retry hint, never an error-class override.
+    pub(crate) fn unknown_run_outcome(&self) -> bool {
+        !matches!(self, Self::RunFailed { .. })
+    }
+
     pub(crate) fn provider_retry_at_ms(&self, now_ms: i64) -> Option<i64> {
         let (metadata, text) = match self {
             Self::Subc(body) => (body.retry_metadata.as_ref(), body.message.as_str()),
@@ -855,9 +859,10 @@ pub struct HistorianProducer {
 }
 
 impl HistorianProducer {
-    /// Historian turns share one provider session. Their send keys distinguish
-    /// project, publication, run attempt and turn. Clause-verification requests
-    /// use separate sessions so they cannot inherit earlier historian messages.
+    /// Dormant calls keep session_id as send_id, as the original producer did.
+    /// Enabled historian turns share one provider session, with send keys that
+    /// distinguish project, publication, run attempt and turn. Clause checks use
+    /// separate sessions so they cannot inherit earlier historian messages.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_stage_with_generation(
         &mut self,
@@ -870,6 +875,19 @@ impl HistorianProducer {
         max_output_tokens: u32,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
+        if !crate::historian_stage::lifecycle_enabled() {
+            return self
+                .start_with_generation(
+                    session_id,
+                    system,
+                    prompt,
+                    model,
+                    variant,
+                    max_output_tokens,
+                    temperature,
+                )
+                .await;
+        }
         if self.session_id.as_deref() != Some(session_id) {
             self.close().await;
         }
@@ -910,6 +928,12 @@ impl HistorianProducer {
         max_output_tokens: u32,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
+        if !crate::historian_stage::lifecycle_enabled() {
+            return Err(HistorianProducerError::Subc(ProducerErrorBody::untagged(
+                "historian_lane_dormant",
+                "clause checks require an enabled historian lane",
+            )));
+        }
         let session = crate::historian_stage::check_session_id(check_key);
         self.start_stage_with_generation(
             &session,
@@ -2177,7 +2201,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dormant_stage_api_preserves_legacy_send_and_refuses_checks() {
+        assert!(!crate::historian_stage::lifecycle_enabled());
+        let server = fake_server(json!({"run_id":"run-1"}), vec![]).await;
+        let mut producer = client(&server).await;
+        producer
+            .start_stage_with_generation(
+                "legacy-child",
+                "different-stage-key",
+                "system",
+                "prompt",
+                "prov/model",
+                None,
+                100,
+                None,
+            )
+            .await
+            .unwrap();
+        let check = producer
+            .start_check_with_generation(
+                "check-key",
+                "check-system",
+                "input",
+                "prov/model",
+                None,
+                100,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(check, Err(HistorianProducerError::Subc(ref error)) if error.code == "historian_lane_dormant")
+        );
+        producer.close().await;
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 1);
+        assert_eq!(log.sends[0]["send_id"], "legacy-child");
+        assert_eq!(log.route_sessions, vec!["legacy-child"]);
+    }
+
+    #[tokio::test]
     async fn queued_stage_reattaches_after_restart_without_retract_or_new_identity() {
+        let _lane = crate::historian_stage::enabled_test_lane();
         let events = vec![
             json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
             json!({"kind":"control","unit":{"type":"assistant_message","message":{"content":[{"type":"text","text":"stage reply"}]}}}),
@@ -2234,6 +2298,7 @@ mod tests {
 
     #[tokio::test]
     async fn checks_bind_distinct_fresh_sessions_and_never_historian_lineage() {
+        let _lane = crate::historian_stage::enabled_test_lane();
         let server = fake_server(json!({"run_id":"run-1"}), vec![]).await;
         let mut producer = client(&server).await;
         let keys = [
@@ -2283,6 +2348,7 @@ mod tests {
 
     #[tokio::test]
     async fn staged_lost_ack_keeps_original_request_for_recovery() {
+        let _lane = crate::historian_stage::enabled_test_lane();
         let server =
             fake_server_with_lost_send_reply(json!({"run_id":"run-1"}), vec![], true).await;
         let key = crate::historian_stage::stage_key("/p", "pub", 3, "turn_one");

@@ -320,11 +320,7 @@ fn publish_dormant_candidates_tx(
             )?;
         }
     }
-    tx.execute(
-        "UPDATE memory_stage_attempts SET state='committed'
-        WHERE publication_id=?1 AND stage='turn_one' AND state='in_flight'",
-        [publication_id],
-    )?;
+
     for compartment in &fold.compartments {
         tx.execute(
             "INSERT OR IGNORE INTO memory_activity_ledger(project_path,publication_id,compartment_id,committed_at)
@@ -560,7 +556,6 @@ impl McStore {
                 "memory_publications",
                 "memory_pending_facts",
                 "memory_activity_ledger",
-                "memory_stage_attempts",
             ]);
         }
         let promoted = self.context_write(&tables, |tx| apply_pending_tx(tx, session_id, write))?;

@@ -538,7 +538,9 @@ pub fn fire(
             to_ordinal,
         });
     }
-    if current.state != HistorianPhase::Idle {
+    if current.state != HistorianPhase::Idle
+        || crate::historian_recovery::redispatch_blocked(current, fired_at_ms)
+    {
         return Ok(FireOutcome::Busy(current.clone()));
     }
 
@@ -782,6 +784,18 @@ fn persist_historian_state_inner(
     let preserve_report_audit = metadata_retries > 0;
     let mut loaded = store.load_meta(session_id)?;
     loop {
+        if preserve_report_audit
+            && (loaded.meta.historian.state == HistorianPhase::Idle
+                || loaded.meta.historian.firing_seq != next_state.firing_seq
+                || (next_state.state != HistorianPhase::Idle
+                    && (loaded.meta.historian.producer_run_id != next_state.producer_run_id
+                        || loaded.meta.historian.producer_attempt != next_state.producer_attempt)))
+        {
+            return Err(HistorianStateError::InvalidTransition {
+                from: loaded.meta.historian.state.clone(),
+                event: "late_report",
+            });
+        }
         if preserve_report_audit {
             next_state.recent_decisions = loaded.meta.historian.recent_decisions.clone();
             if next_state.state != HistorianPhase::Idle {
@@ -851,6 +865,8 @@ pub struct ValidatedPublishRequest<'a> {
     pub predicate: &'a HistorianPublishPredicate,
     pub observed_chunk_fingerprint: &'a str,
     pub validated: &'a ValidatedChunk,
+    /// Allow extracted facts to be retained independently of memory-row admission.
+    pub collect_facts: bool,
     /// Promote facts only when memory support and automatic promotion are enabled.
     /// When TypeScript is the authorized memory writer instead of this module,
     /// publication keeps every fact pending rather than attempting promotion.
@@ -902,12 +918,16 @@ pub fn publish_validated_chunk(
         .iter()
         .map(|c| to_stored_compartment(c, request.created_at_ms, request.boundary_dates))
         .collect();
-    let facts: Vec<FactCandidate> = request
-        .validated
-        .facts
-        .iter()
-        .map(|fact| to_store_fact(fact, request.session_id))
-        .collect();
+    let facts: Vec<FactCandidate> = if request.collect_facts {
+        request
+            .validated
+            .facts
+            .iter()
+            .map(|fact| to_store_fact(fact, request.session_id))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let events: Vec<HistorianEventCandidate> = request
         .validated
         .events
@@ -986,6 +1006,12 @@ pub fn publish_validated_chunk(
         i64::try_from(publish_started_at.elapsed().as_micros()).unwrap_or(i64::MAX);
     match publish_result {
         Ok(result) => {
+            crate::historian_stage::finish_idle_stage(
+                store,
+                request.session_id,
+                request.predicate.firing_seq,
+            )
+            .map_err(|e| mc_store::single_store_domain::context_error(e.code(), e))?;
             // How long the largest write in the system holds its transaction. Recorded
             // only for a publish that committed, because an aborted one is not the write
             // a concurrent reader would have been waiting behind. Failing to record it
@@ -2248,33 +2274,51 @@ where
             fired.failure_backoff_at_ms = None;
         }
         persist_historian_state(request.store, request.session_id, fired.clone())?;
+        crate::historian_recovery::log_release(
+            &loaded.meta.historian,
+            request.session_id,
+            request.now_ms,
+        );
 
         let producer_session_id = historian_producer_session_id(
             request.project_slug,
             request.session_id,
             fired.firing_seq,
         );
-        let stage = crate::historian_stage::HistorianStage::turn_one(
-            request.project_path,
-            request.session_id,
-            &fired,
-        );
-        stage.persist(request.store, request.session_id, request.harness, "broca", Some(&producer_session_id),
-            &serde_json::json!({"system": request.system.as_ref(), "prompt": prompt, "model": model,
-                "variant": request.model_variants.get(model), "temperature": request.temperature}), request.now_ms)
-            .map_err(|e| mc_store::single_store_domain::context_error(e.code(), e))?;
-        let handle = match producer
-            .start_stage_with_temperature(
-                &producer_session_id,
-                &stage.stage_key,
-                request.system.as_ref(),
-                &prompt,
-                model,
-                request.model_variants.get(model).map(String::as_str),
-                request.temperature,
-            )
-            .await
-        {
+        let started = if crate::historian_stage::lifecycle_enabled() {
+            let stage = crate::historian_stage::HistorianStage::turn_one(
+                request.project_path,
+                request.session_id,
+                &fired,
+            );
+            stage.persist(request.store, request.session_id, request.harness, "broca", Some(&producer_session_id),
+                &serde_json::json!({"system": request.system.as_ref(), "prompt": prompt, "model": model,
+                    "variant": request.model_variants.get(model), "temperature": request.temperature}), request.now_ms)
+                .map_err(|e| mc_store::single_store_domain::context_error(e.code(), e))?;
+            producer
+                .start_stage_with_temperature(
+                    &producer_session_id,
+                    &stage.stage_key,
+                    request.system.as_ref(),
+                    &prompt,
+                    model,
+                    request.model_variants.get(model).map(String::as_str),
+                    request.temperature,
+                )
+                .await
+        } else {
+            producer
+                .start_with_temperature(
+                    &producer_session_id,
+                    request.system.as_ref(),
+                    &prompt,
+                    model,
+                    request.model_variants.get(model).map(String::as_str),
+                    request.temperature,
+                )
+                .await
+        };
+        let mut handle = match started {
             Ok(handle) => {
                 if let Some(cache) = runner_refusal_cache {
                     cache.record_success(model);
@@ -2395,16 +2439,51 @@ where
         let awaiting =
             producer_started(&fired, producer_session_id.clone(), handle.run_id.clone())?;
         persist_historian_state(request.store, request.session_id, awaiting.clone())?;
+        let awaiting = if crate::historian_recovery::is_unknown_handle(&awaiting) {
+            let reserved = crate::historian_recovery::reserve_probe(
+                request.store,
+                request.session_id,
+                &awaiting,
+                request.now_ms,
+                request.await_timeout,
+                request.failure_backoff_at_ms,
+            )?;
+            handle.run_id = reserved.producer_run_id.clone().unwrap();
+            reserved
+        } else {
+            awaiting
+        };
 
         let output = match producer
-            .await_output_with_timeout(&handle.run_id, request.await_timeout)
+            .await_output_with_timeout(
+                &handle.run_id,
+                crate::historian_recovery::probe_wait_budget(
+                    &awaiting,
+                    request.now_ms,
+                    request.await_timeout,
+                ),
+            )
             .await
         {
             Ok(output) => output,
             Err(HistorianProducerError::TimedOut)
                 if crate::historian_producer::is_stage_submission(&handle.run_id) =>
             {
+                let now = (request.completion_now_ms)().max(request.now_ms);
+                let backoff = completion_failure_backoff_at_ms(
+                    request.now_ms,
+                    request.failure_backoff_at_ms,
+                    now,
+                );
+                let resolution = crate::historian_recovery::probe_failed(
+                    request.store,
+                    request.session_id,
+                    &awaiting,
+                    now,
+                    backoff,
+                );
                 producer.close().await;
+                resolution?;
                 return Err(HistorianDriveError::Producer(
                     HistorianProducerError::TimedOut,
                 ));
@@ -2487,9 +2566,23 @@ where
             }
             Err(err)
                 if crate::historian_producer::is_stage_submission(&handle.run_id)
-                    && err.unknown_send_outcome() =>
+                    && err.unknown_run_outcome() =>
             {
+                let now = (request.completion_now_ms)().max(request.now_ms);
+                let backoff = completion_failure_backoff_at_ms(
+                    request.now_ms,
+                    request.failure_backoff_at_ms,
+                    now,
+                );
+                let resolution = crate::historian_recovery::probe_failed(
+                    request.store,
+                    request.session_id,
+                    &awaiting,
+                    now,
+                    backoff,
+                );
                 producer.close().await;
+                resolution?;
                 return Err(HistorianDriveError::Producer(err));
             }
             Err(err) => {
@@ -2720,29 +2813,27 @@ pub async fn run_historian_firing_on_host(
         FireOutcome::Fired(state) => state,
     };
     persist_historian_state(request.store, request.session_id, fired.clone())?;
+    crate::historian_recovery::log_release(
+        &loaded.meta.historian,
+        request.session_id,
+        request.now_ms,
+    );
 
     // The run id is the module's, minted at fire, and never the claimant's. Reusing
     // the producer-session naming keeps one vocabulary for "this firing's run"
     // across both runners.
     let run_id =
         historian_producer_session_id(request.project_slug, request.session_id, fired.firing_seq);
-    let stage = crate::historian_stage::HistorianStage::turn_one(
-        request.project_path,
-        request.session_id,
-        &fired,
-    );
-    stage
-        .persist(
-            request.store,
+    if crate::historian_stage::lifecycle_enabled() {
+        let stage = crate::historian_stage::HistorianStage::turn_one(
+            request.project_path,
             request.session_id,
-            request.harness,
-            "rust_host",
-            None,
-            &serde_json::json!({"system": request.system.as_ref(), "prompt": request.prompt,
-            "model_chain": request.model_chain}),
-            request.now_ms,
-        )
-        .map_err(|e| mc_store::single_store_domain::context_error(e.code(), e))?;
+            &fired,
+        );
+        stage.persist(request.store, request.session_id, request.harness, "rust_host", None,
+            &serde_json::json!({"system": request.system.as_ref(), "prompt": request.prompt, "model_chain": request.model_chain}), request.now_ms)
+            .map_err(|e| mc_store::single_store_domain::context_error(e.code(), e))?;
+    }
     let registration = ledger.register(&run_id);
     let queued = request
         .store
@@ -3064,6 +3155,8 @@ pub async fn reattach_historian_producer<P>(
 where
     P: HistorianProducerDriver + ?Sized,
 {
+    let initial = request.store.load_meta(request.session_id)?.meta.historian;
+    crate::historian_recovery::reject_retired_reattach(&initial)?;
     let action = handle_restart_load(
         request.store,
         request.session_id,
@@ -3072,7 +3165,7 @@ where
     )?;
     let RestartAction::ReattachProducer {
         producer_session_id,
-        producer_run_id,
+        mut producer_run_id,
         firing_seq,
         ..
     } = action
@@ -3086,9 +3179,43 @@ where
         });
     };
 
+    if crate::historian_producer::is_stage_submission(&producer_run_id) {
+        let current = request.store.load_meta(request.session_id)?.meta.historian;
+        let now = request.now_ms;
+        let backoff =
+            completion_failure_backoff_at_ms(request.now_ms, request.failure_backoff_at_ms, now);
+        let reserved = crate::historian_recovery::reserve_probe(
+            request.store,
+            request.session_id,
+            &current,
+            now,
+            request.await_timeout,
+            backoff,
+        )?;
+        producer_run_id = reserved.producer_run_id.unwrap();
+    }
     producer.bind_session(&producer_session_id).await?;
     let state = match producer.status(&producer_run_id).await {
         Ok(state) => state,
+        Err(error) if crate::historian_producer::is_stage_submission(&producer_run_id) => {
+            let now = (request.completion_now_ms)().max(request.now_ms);
+            let backoff = completion_failure_backoff_at_ms(
+                request.now_ms,
+                request.failure_backoff_at_ms,
+                now,
+            );
+            let current = request.store.load_meta(request.session_id)?.meta.historian;
+            let resolution = crate::historian_recovery::probe_failed(
+                request.store,
+                request.session_id,
+                &current,
+                now,
+                backoff,
+            );
+            producer.close().await;
+            resolution?;
+            return Err(error.into());
+        }
         Err(_) => {
             let failure_backoff_at_ms = completion_failure_backoff_at_ms(
                 request.now_ms,
@@ -3118,15 +3245,36 @@ where
     let loaded = request.store.load_meta(request.session_id)?;
     let awaiting = loaded.meta.historian.clone();
     let output = match producer
-        .await_output_with_timeout(&producer_run_id, request.await_timeout)
+        .await_output_with_timeout(
+            &producer_run_id,
+            crate::historian_recovery::probe_wait_budget(
+                &awaiting,
+                request.now_ms,
+                request.await_timeout,
+            ),
+        )
         .await
     {
         Ok(output) => output,
         Err(err)
             if crate::historian_producer::is_stage_submission(&producer_run_id)
-                && err.unknown_send_outcome() =>
+                && err.unknown_run_outcome() =>
         {
+            let now = (request.completion_now_ms)().max(request.now_ms);
+            let backoff = completion_failure_backoff_at_ms(
+                request.now_ms,
+                request.failure_backoff_at_ms,
+                now,
+            );
+            let resolution = crate::historian_recovery::probe_failed(
+                request.store,
+                request.session_id,
+                &awaiting,
+                now,
+                backoff,
+            );
             producer.close().await;
+            resolution?;
             return Err(HistorianDriveError::Producer(err));
         }
         Err(err) => {
@@ -3327,6 +3475,8 @@ fn publish_output_from_awaiting(
             predicate: &predicate,
             observed_chunk_fingerprint,
             validated: &validated,
+            collect_facts: validate_options.memory_enabled
+                && (crate::historian_stage::lifecycle_enabled() || validate_options.auto_promote),
             promote_facts: validate_options.memory_enabled && validate_options.auto_promote,
             collect_user_memory_candidates: validate_options.user_memory_collection_enabled,
             publication_floor_ordinal: validated.unprocessed_from,
@@ -4199,6 +4349,163 @@ mod tests {
         assert_eq!(
             producer_input_token_limit_with_input(Some(0), None, 32_000),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_budget_is_durable_and_expiring_fence_discards_late_reply() {
+        #[derive(Clone)]
+        struct RecoveryLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for RecoveryLogs {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = RecoveryLogs(logs.clone());
+        let _trace = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let main_store = store(dir.path());
+        seed_prior_compartment(&main_store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".into()];
+        let original = crate::historian_producer::stage_submission_handle(
+            "old-child",
+            &serde_json::json!({"method":"session.send","params":{"send_id":"original-stage","prompt":"private prompt","system":"private system"}}),
+        );
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(original))
+            .with_output(Err(HistorianProducerError::TimedOut));
+        let mut request = fire_request(&main_store, "p", &models, &chunk, &prior);
+        request.await_timeout = Duration::from_secs(3_600);
+        assert!(run_historian_firing(&mut producer, request).await.is_err());
+        let original_state = main_store.load_meta("ses").unwrap().meta.historian;
+        assert_eq!(
+            crate::historian_recovery::probe_wait_budget(
+                &original_state,
+                3_600_122,
+                Duration::from_secs(7_200)
+            ),
+            Duration::from_millis(1)
+        );
+        assert_eq!(producer.observed_starts.len(), 1);
+        for now in [124, 125] {
+            let error = if now == 124 {
+                HistorianProducerError::Subc(ProducerErrorBody::untagged(
+                    "transport_busy",
+                    "observation failed; original may still run",
+                ))
+            } else {
+                HistorianProducerError::TimedOut
+            };
+            let mut probe = ScriptedProducer::default()
+                .with_status(Ok(RunState::Active))
+                .with_output(Err(error));
+            let mut request = reattach_request(&main_store, &chunk, &prior);
+            request.now_ms = now;
+            request.await_timeout = Duration::from_millis(1);
+            assert!(reattach_historian_producer(&mut probe, request)
+                .await
+                .is_err());
+            assert!(probe.observed_starts.is_empty());
+        }
+        let retired = main_store.load_meta("ses").unwrap().meta.historian;
+        assert_eq!(retired.state, HistorianPhase::Idle);
+        assert_eq!(retired.firing_seq, 1);
+        assert!(retired
+            .last_failure
+            .as_deref()
+            .unwrap()
+            .contains("historian_outcome_unknown"));
+        let record: serde_json::Value = serde_json::from_str(
+            retired
+                .producer_run_id
+                .as_deref()
+                .unwrap()
+                .strip_prefix("mc-broca-stage:")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["recovery"]["attempts"], 3);
+        assert_eq!(record["recovery"]["expires_at_ms"], 3_600_123);
+        assert_eq!(record["recovery"]["fence_expires_at_ms"], 7_200_123);
+        assert!(record.get("request").is_none());
+        let mut blocked = ScriptedProducer::default();
+        let mut request = fire_request(&main_store, "p", &models, &chunk, &prior);
+        request.now_ms = 7_200_122;
+        assert!(matches!(
+            run_historian_firing(&mut blocked, request).await.unwrap(),
+            HistorianDriveOutcome::Busy(_)
+        ));
+        assert!(blocked.observed_starts.is_empty());
+        let mut fresh = ScriptedProducer::default()
+            .with_start(Ok(run_handle("new-run")))
+            .with_output(Ok(producer_output(historian_xml("fresh accepted output"))));
+        let mut request = fire_request(&main_store, "p", &models, &chunk, &prior);
+        request.now_ms = 7_200_123;
+        assert!(matches!(
+            run_historian_firing(&mut fresh, request).await.unwrap(),
+            HistorianDriveOutcome::Completed(_)
+        ));
+        assert_eq!(fresh.observed_starts.len(), 1);
+        assert_eq!(
+            fresh.observed_starts[0].0,
+            historian_producer_session_id("proj", "ses", 2)
+        );
+        let before = main_store.load_meta("ses").unwrap();
+        let rows = main_store.load_compartments("ses").unwrap();
+        let late = publish_output_from_awaiting(PublishOutputRequest {
+            store: &main_store,
+            session_id: "ses",
+            project_path: FIRE_PROJECT,
+            harness: "opencode",
+            awaiting: original_state.clone(),
+            output: producer_output(historian_xml("late original output")),
+            max_output_tokens: None,
+            observed_chunk_fingerprint: "fp",
+            validation_chunk: &chunk,
+            chunk_transcript: "U: transcript",
+            raw_chunk_messages: "[]",
+            boundary_dates: empty_boundary_dates(),
+            prior_compartments: &prior,
+            validate_options: validate_options(),
+            created_at_ms: 7_200_124,
+            failure_started_at_ms: 123,
+            failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
+            publication_fence: None,
+        });
+        assert!(late.is_err());
+        assert!(crate::historian_recovery::probe_failed(
+            &main_store,
+            "ses",
+            &original_state,
+            7_200_124,
+            7_200_999
+        )
+        .is_err());
+        assert_eq!(main_store.load_meta("ses").unwrap().meta, before.meta);
+        assert_eq!(main_store.load_compartments("ses").unwrap(), rows);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logs.matches("historian unknown-send tombstone recorded")
+                .count(),
+            1
+        );
+        assert_eq!(
+            logs.matches("historian unknown-send tombstone released")
+                .count(),
+            1
         );
     }
 
@@ -6607,6 +6914,7 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &validated,
+                collect_facts: true,
                 promote_facts: true,
                 collect_user_memory_candidates: true,
                 publication_floor_ordinal: 4,
@@ -6698,6 +7006,7 @@ mod tests {
                     predicate: &predicate,
                     observed_chunk_fingerprint: "fp",
                     validated: &validated,
+                    collect_facts: memory_enabled && auto_promote,
                     promote_facts: memory_enabled && auto_promote,
                     collect_user_memory_candidates: false,
                     publication_floor_ordinal: 1,
@@ -6854,6 +7163,7 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "different-fingerprint",
                 validated: &ValidatedChunk::default(),
+                collect_facts: true,
                 promote_facts: true,
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
@@ -6944,6 +7254,7 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &ValidatedChunk::default(),
+                collect_facts: true,
                 promote_facts: true,
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
@@ -7027,6 +7338,7 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &validated,
+                collect_facts: false,
                 promote_facts: false,
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,

@@ -10,6 +10,30 @@ use std::path::Path;
 
 pub const RUST_LIFECYCLE_ENABLED: bool = false;
 
+pub(crate) fn lifecycle_enabled() -> bool {
+    #[cfg(test)]
+    if TEST_ENABLED.with(std::cell::Cell::get) {
+        return true;
+    }
+    RUST_LIFECYCLE_ENABLED
+}
+
+#[cfg(test)]
+thread_local! { static TEST_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+pub(crate) struct EnabledTestLane(bool);
+#[cfg(test)]
+impl Drop for EnabledTestLane {
+    fn drop(&mut self) {
+        TEST_ENABLED.with(|enabled| enabled.set(self.0));
+    }
+}
+#[cfg(test)]
+pub(crate) fn enabled_test_lane() -> EnabledTestLane {
+    EnabledTestLane(TEST_ENABLED.with(|enabled| enabled.replace(true)))
+}
+
 pub fn publication_id(
     project: &str,
     session: &str,
@@ -60,7 +84,7 @@ impl HistorianStage {
     pub fn wire(&self, child: Option<&str>) -> Value {
         json!({"publication_id": self.publication_id, "run_attempt": self.run_attempt,
             "stage": self.stage, "stage_key": self.stage_key, "child_session_id": child,
-            "lane": "dormant", "retain_child": true})
+            "lane": if lifecycle_enabled() { "enabled" } else { "dormant" }, "retain_child": true})
     }
 
     /// The module's database adapter exposes the context.db path in its status.
@@ -86,6 +110,9 @@ impl HistorianStage {
         request: &Value,
         now: i64,
     ) -> Result<(), HostStoreError> {
+        if !lifecycle_enabled() {
+            return Ok(());
+        }
         let Some(mut host) = Self::host_store(store)? else {
             return Ok(());
         };
@@ -125,6 +152,9 @@ impl HistorianStage {
         child: &str,
         reply: &Value,
     ) -> Result<(), HostStoreError> {
+        if !lifecycle_enabled() {
+            return Ok(());
+        }
         let Some(mut host) = Self::host_store(store)? else {
             return Ok(());
         };
@@ -149,6 +179,9 @@ pub(crate) fn recover_broca_stage(
     session: &str,
     state: &HistorianDurableState,
 ) -> Result<Option<(String, String)>, HostStoreError> {
+    if !lifecycle_enabled() {
+        return Ok(None);
+    }
     let Some(mut host) = HistorianStage::host_store(store)? else {
         return Ok(None);
     };
@@ -197,6 +230,9 @@ pub(crate) fn finish_idle_stage(
     session: &str,
     attempt: u64,
 ) -> Result<(), HostStoreError> {
+    if !lifecycle_enabled() {
+        return Ok(());
+    }
     let Some(mut host) = HistorianStage::host_store(store)? else {
         return Ok(());
     };
@@ -216,6 +252,7 @@ mod tests {
 
     #[test]
     fn host_stage_retains_child_and_broca_dispatch_recovers_before_ack() {
+        let _lane = enabled_test_lane();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("context.db");
         let descriptor = cortexkit_store_types::StorageDescriptor {

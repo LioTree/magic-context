@@ -55,21 +55,13 @@
         "run_id": "mc-historian:project:a1a1a1a1a1a1a1a1:1",
         "claimant_instance_id": "install-uuid-one"
       },
-      "volatile": ["token", "claim_deadline_ms", "lifecycle.publication_id", "lifecycle.stage_key"],
+      "volatile": ["token", "claim_deadline_ms"],
       "response": {
         "ok": true,
         "run_id": "mc-historian:project:a1a1a1a1a1a1a1a1:1",
         "session_id": "ses",
         "attempt": 1,
-        "lifecycle": {
-          "publication_id": "<volatile>",
-          "run_attempt": 1,
-          "stage": "turn_one",
-          "stage_key": "<volatile>",
-          "child_session_id": null,
-          "lane": "dormant",
-          "retain_child": true
-        },
+
         "token": "<volatile>",
         "prompt": {
           "system": "historian-system-prompt",

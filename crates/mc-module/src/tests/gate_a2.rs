@@ -847,6 +847,7 @@ async fn gate_the_a8_emergency_accounting_on_a_fixture_that_has_tool_arcs() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn gate_host_stage_wire_refuses_wrong_key_and_retains_reported_child() {
+    let _lane = historian_stage::enabled_test_lane();
     let producer = Arc::new(ProducerState::default());
     let (handler, store, dir, _) = handler_with_store(producer, host_runner_config());
     let descriptor = dev_descriptor_at(dir.path().join("data").to_str().unwrap());
@@ -874,7 +875,7 @@ async fn gate_host_stage_wire_refuses_wrong_key_and_retains_reported_child() {
     .await;
     assert_eq!(claim["ok"], true, "{claim}");
     assert_eq!(claim["lifecycle"]["stage"], "turn_one");
-    assert_eq!(claim["lifecycle"]["lane"], "dormant");
+    assert_eq!(claim["lifecycle"]["lane"], "enabled");
     assert_eq!(claim["lifecycle"]["retain_child"], true);
     let key = claim["lifecycle"]["stage_key"].as_str().unwrap();
     let (start, end) = prompt_ordinal_range(claim["prompt"]["user"].as_str().unwrap()).unwrap();
