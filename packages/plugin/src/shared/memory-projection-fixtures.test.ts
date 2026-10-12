@@ -9,11 +9,16 @@ import {
     recordAutomatedMemoryEdit,
 } from "../features/magic-context/memory/lifecycle-applier";
 import { computeNormalizedHash } from "../features/magic-context/memory/normalize-hash";
+import { promoteSessionFactsDurable } from "../features/magic-context/memory/promotion";
 import {
     getMemoryById,
     insertMemory,
     updateMemoryContent,
 } from "../features/magic-context/memory/storage-memory";
+import {
+    allocateTurnOneSend,
+    commitTurnOnePublication,
+} from "../features/magic-context/memory/turn-one-publication";
 import { runMigrations } from "../features/magic-context/migrations";
 import { getOrCreateSessionMeta, queueMemoryMutation } from "../features/magic-context/storage";
 import { initializeDatabase } from "../features/magic-context/storage-db";
@@ -209,6 +214,92 @@ function gated<T>(f: ProjectionFixture, body: () => T): T {
     } finally {
         f.gate.blocking = false;
     }
+}
+
+/** Tables only the historian's turn-one publication writes. */
+const TURN_ONE_TABLES =
+    /\b(?:memory_publications|memory_stage_attempts|memory_pending_facts|memory_fact_blocks|memory_fact_block_links|memory_activity_ledger)\b/i;
+
+/** Record every statement prepared on `db` that names a turn-one table. */
+function watchTurnOneTables(db: Database): string[] {
+    const seen: string[] = [];
+    const prepare = db.prepare.bind(db);
+    Object.defineProperty(db, "prepare", {
+        configurable: true,
+        writable: true,
+        value: (sql: string) => {
+            if (TURN_ONE_TABLES.test(sql)) seen.push(sql);
+            return prepare(sql);
+        },
+    });
+    return seen;
+}
+
+/**
+ * A historian publication on the dormant lane (the production default: the existing
+ * turn-one prompt and promotion): one fact promoted through
+ * `promoteSessionFactsDurable`, and, when `withTurnOne` is set, every row turn one
+ * records around it. These are a
+ * committed publication with its send record, an anchored candidate with its stored
+ * block, an unknown-anchor candidate, an activity count, and an abandoned send for
+ * the other session. Production writes candidates only when the Rust module owns the
+ * project's memory; this fixture writes them anyway so their presence alone is what
+ * is compared.
+ */
+function dormantPublish(f: ProjectionFixture, withTurnOne: boolean): void {
+    const [a, b] = f.sessions;
+    const promotion = f.db
+        .transaction(() =>
+            promoteSessionFactsDurable(f.db, a, f.projectPath, [
+                { category: "CONSTRAINTS", content: "Promoted at the publish." },
+            ]),
+        )
+        .immediate();
+    expect(promotion.factsPromoted).toBe(1);
+    if (!withTurnOne) return;
+    const allocate = (sessionId: string) =>
+        allocateTurnOneSend(f.db, {
+            projectPath: f.projectPath,
+            sessionId,
+            harness: "opencode",
+            carrier: "opencode-session",
+            lane: "dormant",
+            chunkStart: 1,
+            chunkEnd: 4,
+        });
+    allocate(b);
+    const send = allocate(a);
+    f.db
+        .transaction(() =>
+            commitTurnOnePublication(f.db, {
+                send,
+                projectPath: f.projectPath,
+                sessionId: a,
+                compartments: [
+                    {
+                        id: 9001,
+                        startMessage: 1,
+                        endMessage: 4,
+                        replyStartMessage: 1,
+                        replyEndMessage: 4,
+                    },
+                ],
+                blocks: [{ role: "U", startOrdinal: 1, endOrdinal: 2, parts: ["Cap is 64 KiB."] }],
+                candidateFacts: [
+                    {
+                        category: "CONSTRAINTS",
+                        content: "Candidate fact that must not render.",
+                        anchor: { compartmentIndex: 1, startOrdinal: 1, endOrdinal: 2 },
+                    },
+                    {
+                        category: "NAMING",
+                        content: "Unknown-anchor candidate that must not render.",
+                    },
+                ],
+                honourAnchors: true,
+            }),
+        )
+        .immediate();
 }
 
 /** The lines of the `<memory-updates>` block in an m[1] text. */
@@ -566,6 +657,85 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
             expect(next.m1).not.toContain("<stale-memory");
         } finally {
             f.close();
+        }
+    });
+
+    // Turn one records publications, send records, candidates, stored blocks and
+    // activity counts. None of these rows may change the served pair (the m[0] bytes
+    // and m[1] text a pass sends): run the same pass sequence on two stores, one of
+    // which also has every turn-one row, and require identical bytes on every pass.
+    // The fact promoted by the publish step is withheld on every SOFT and defer pass
+    // and first appears at the HARD fold forced by provider cache expiry (a real fold
+    // trigger, as opposed to the test's initial `driver.hard`).
+    test(`${driver.host} turn-one publication rows never change a served pair; a dormant promotion waits for HARD`, () => {
+        const plain = create("turn-one-plain");
+        const recorded = create("turn-one-recorded");
+        try {
+            const reads = watchTurnOneTables(recorded.db);
+            for (const f of [plain, recorded]) {
+                memory(f, "Baseline memory served by the HARD fold.");
+                driver.hard(f, f.sessions[0]);
+            }
+            const steps: Array<"soft" | "defer" | "publish" | "genuine-hard"> = [
+                "soft",
+                "defer",
+                "soft",
+                "defer",
+                "publish",
+                ...Array<"defer">(6).fill("defer"),
+                "soft",
+                "defer",
+                "defer",
+                "defer",
+                "soft",
+                "defer",
+                "genuine-hard",
+                "defer",
+                "soft",
+                "defer",
+            ];
+            let published = false;
+            let hardAfterPublish = false;
+            let passes = 0;
+            for (const step of steps) {
+                if (step === "publish") {
+                    dormantPublish(plain, false);
+                    dormantPublish(recorded, true);
+                    published = true;
+                    continue;
+                }
+                const watched = reads.length;
+                const served = [plain, recorded].map((f) =>
+                    driver.pass(
+                        f,
+                        f.sessions[0],
+                        step !== "defer",
+                        step === "genuine-hard" ? { cacheExpired: true } : {},
+                    ),
+                );
+                passes += 1;
+                expect(reads.slice(watched)).toEqual([]);
+                expect(served[1]).toEqual(served[0]);
+                const text = `${served[0].m0}${served[0].m1}`;
+                expect(text).not.toContain("must not render");
+                if (step === "genuine-hard") {
+                    expect(served[0].materialized).toBe(true);
+                    hardAfterPublish = true;
+                } else {
+                    expect(served[0].materialized).toBe(false);
+                }
+                if (published && !hardAfterPublish) {
+                    expect(text).not.toContain("Promoted at the publish.");
+                }
+                if (hardAfterPublish) expect(served[0].m0).toContain("Promoted at the publish.");
+            }
+            expect(passes).toBeGreaterThanOrEqual(20);
+            expect(
+                recorded.db.prepare("SELECT COUNT(*) AS n FROM memory_pending_facts").get(),
+            ).toEqual({ n: 2 });
+        } finally {
+            plain.close();
+            recorded.close();
         }
     });
 }
