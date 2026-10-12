@@ -96,10 +96,12 @@ pub const DOMAIN_TABLES: &[&str] = &[
     "compartment_events",
     "compartments",
     "memories",
+    "memory_agent_fragments",
     "memory_classification_items",
     "memory_conflict_links",
     "memory_decision_receipts",
     "memory_embedding_watermarks",
+    "memory_history",
     "memory_journal",
     "memory_mutation_log",
     "memory_pending_facts",
@@ -341,6 +343,14 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     (
         "memories",
         "58c79f0e321c82007bebfe3fb250e318786c920ac36320e6883d44013d051fd5",
+    ),
+    (
+        "memory_agent_fragments",
+        "f0c95f8d4c5610e0a37b196be1e0b646e50fecda2f3cddafe59b1e4930a58d56",
+    ),
+    (
+        "memory_history",
+        "0fe79728828749f14b1351f91eab71d8c603d987446cb14ee665a14ffb1ab346",
     ),
     (
         "memory_classification_items",
@@ -1099,7 +1109,12 @@ impl HostStore {
 fn companion_tables(table: &str) -> &'static [&'static str] {
     match table {
         "compartments" => &["compartment_history_versions"],
-        "memories" => &["memory_mutation_log", "memory_verifications"],
+        "memories" => &[
+            "memory_mutation_log",
+            "memory_verifications",
+            "memory_agent_fragments",
+            "memory_history",
+        ],
         _ => &[],
     }
 }

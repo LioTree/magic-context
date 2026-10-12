@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// Section-inventory protocol version serialized in move manifests.
 pub const INVENTORY_VERSION: u32 = 5;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 100;
-pub const STORE_SCHEMA_VERSION: u32 = 68;
+pub const STORE_SCHEMA_VERSION: u32 = 69;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

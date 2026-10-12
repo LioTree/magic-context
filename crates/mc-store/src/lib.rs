@@ -22,6 +22,7 @@ pub use context_boundaries::ResolvedContextBoundary;
 pub mod context_writes;
 mod historian_claim;
 pub mod memory_lifecycle;
+pub mod memory_projection;
 pub mod move_inventory;
 pub mod move_snapshot;
 pub mod move_store;
@@ -3263,6 +3264,10 @@ const MIGRATIONS: &[Migration] = &[
         // policy part of the conversation lineage on each hook.
         statements: include_str!("migrations/store_068_provider_policy_summaries.sql"),
     },
+    Migration {
+        version: 69,
+        statements: include_str!("migrations/store_069_memory_projection.sql"),
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -4777,6 +4782,10 @@ pub struct SessionCacheTtlPolicy {
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
+    /// The memory view stored with the baseline/delta text blocks and mural image.
+    /// A SOFT delta refresh adds only immutable operations from the owning session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_projection: Option<memory_projection::AppliedProjection>,
     /// Highest `compartment_score_selections.sequence` (context.db) whose scores
     /// are rendered into the frozen m0, committed in the same write as those
     /// bytes. Zero or absent means m0 uses the original historian scores.
@@ -5483,6 +5492,8 @@ pub struct MemoryRevision {
 pub struct MemoryRenderSnapshot {
     pub memories: Vec<StoredMemory>,
     pub revision: MemoryRevision,
+    pub revisions: std::collections::BTreeMap<i64, i64>,
+    pub fragment_watermark: i64,
 }
 
 /// A rendered mural artifact shared by every session under one project identity.
@@ -5512,7 +5523,7 @@ pub struct M1RevisionSnapshot {
 }
 
 /// A project memory row projected for rendering into the prompt.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMemory {
     /// The `context.db` row id: the id every harness renders and every tool accepts.
     pub id: i64,
@@ -6768,6 +6779,7 @@ impl<'a> FacadeMutationTxn<'a> {
         if let Some(duplicate_id) = duplicate.filter(|duplicate_id| *duplicate_id != id) {
             return Err(FacadeMemoryMutationError::DuplicateContent { id: duplicate_id });
         }
+        self.record_agent_history(&memory, content, "agent_update", now_ms)?;
         self.tx
             .execute(
                 "UPDATE memories
@@ -6831,6 +6843,7 @@ impl<'a> FacadeMutationTxn<'a> {
             if memory.status == "archived" {
                 continue;
             }
+            self.record_agent_history(&memory, &memory.content, "agent_archive", now_ms)?;
             if let Some(reason) = trimmed_reason {
                 let metadata_json = merge_archive_reason(memory.metadata_json.as_deref(), reason);
                 self.tx
@@ -7050,6 +7063,7 @@ impl<'a> FacadeMutationTxn<'a> {
             "active"
         };
         for source in &source_rows {
+            self.record_agent_history(source, &source.content, "agent_merge_source", now_ms)?;
             self.tx
                 .execute(
                     "UPDATE memories
@@ -7073,6 +7087,9 @@ impl<'a> FacadeMutationTxn<'a> {
                 },
             )
             .map_err(FacadeMemoryMutationError::storage)?;
+        }
+        if target.content != merged_content {
+            self.record_agent_history(&target, merged_content, "agent_merge_target", now_ms)?;
         }
         self.tx
             .execute(
@@ -20467,6 +20484,55 @@ mod tests {
             current.load("legacy").unwrap().meta.held_release,
             Some(request)
         );
+    }
+
+    #[test]
+    fn migration_69_preserves_populated_cache_and_fences_applied_tuple() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let old_chain = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 68)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut core = CoreState::default();
+        core.frozen_units.push(FrozenUnit {
+            key: "m0".into(),
+            kind: "synth-region".into(),
+            durability_class: DurabilityClass::Lineage,
+            frozen_payload: "frozen populated prefix".into(),
+            reset_rule: String::new(),
+        });
+        {
+            let old = McStore::open_with_migrations(&descriptor, false, &old_chain).unwrap();
+            old.commit("legacy", None, &core, &ModuleMeta::default())
+                .unwrap();
+        }
+        let current = McStore::open_for_test(&descriptor).unwrap();
+        let mut loaded = current.load("legacy").unwrap();
+        assert_eq!(loaded.core, core);
+        assert!(loaded.meta.memory_projection.is_none());
+        let projection = memory_projection::AppliedProjection {
+            legacy: true,
+            hard_memory_block: "shown delta".into(),
+            generation: 1,
+            ..Default::default()
+        };
+        loaded.meta.memory_projection = Some(projection.clone());
+        current
+            .commit("legacy", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        drop(current);
+        assert!(matches!(
+            McStore::open_with_migrations(&descriptor, false, &old_chain),
+            Err(McStoreError::StoreAheadOfBinary { binary_max: 68, .. })
+        ));
+        let current = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            current.load("legacy").unwrap().meta.memory_projection,
+            Some(projection)
+        );
+        assert_eq!(current.load("legacy").unwrap().core, core);
     }
 
     #[test]

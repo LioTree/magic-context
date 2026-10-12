@@ -83,7 +83,12 @@ async fn gate_probe_default_runner_request_and_meta_digests() {
         .collect::<Vec<_>>()
         .join(",");
 
-    let meta_blob = serde_json::to_string(&store.load("ses").unwrap().meta).unwrap();
+    let mut meta = store.load("ses").unwrap().meta;
+    // The new applied tuple has its own migration/CAS tests. Remove only that
+    // explicitly named addition from this older exact-size metadata baseline.
+    assert!(meta.memory_projection.is_some());
+    meta.memory_projection = None;
+    let meta_blob = serde_json::to_string(&meta).unwrap();
     let meta_digest = digest(&[&meta_blob]);
 
     println!("GATE-PROBE request_digest={request_digest}");

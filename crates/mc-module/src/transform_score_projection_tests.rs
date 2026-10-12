@@ -116,7 +116,8 @@ fn probe_uses_committed_view_and_writes_no_cache_state() {
         mc_tokenizer::estimate_tokens,
         false,
         &mut crate::m0_compose::ComposeTimings::default(),
-        before.meta.score_selection_watermark,
+        &before,
+        false,
     )
     .unwrap();
     assert_eq!(probe.score_selection_watermark, 0);
@@ -143,7 +144,8 @@ fn ttl_and_model_cache_loss_adopt_latest_even_when_w_render_matches() {
             mc_tokenizer::estimate_tokens,
             false,
             &mut crate::m0_compose::ComposeTimings::default(),
-            0,
+            &s.load("ses").unwrap(),
+            false,
         )
         .unwrap();
         assert_eq!(probe.m0_bytes, m0_bytes(&baseline));

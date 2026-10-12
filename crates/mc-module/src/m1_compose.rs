@@ -327,6 +327,7 @@ pub fn m1_revision_signal_parts_for_pass_timed(
 /// empty. (Keeping the revision out avoids two sources of "did m1 change".)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M1Composition {
+    pub memory_projection: Option<mc_store::memory_projection::AppliedProjection>,
     pub body: String,
     /// Number of memory corrections represented in the m1 body, for the pressure backstop.
     pub memory_update_count: usize,
@@ -396,6 +397,99 @@ pub fn compose_soft_m1(
         estimate_tokens,
         M1MemorySource::Served(served_m1),
     )
+}
+
+/// Extend an authorized SOFT with only this session's immutable fragments. Measure
+/// the other delta content first: memory fragments must not authorize a HARD rebuild.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_projected_soft_m1(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    meta: &ModuleMeta,
+    memory_enabled: bool,
+    memory_budget: f64,
+    history_budget: f64,
+    user_profile_budget: f64,
+    temporal_awareness: bool,
+    served_m0: &str,
+    served_m1: &str,
+    estimate: impl Fn(&str) -> usize + Copy,
+) -> Result<M1Composition, M1ComposeError> {
+    let mut composition = compose_soft_m1(
+        store,
+        project_path,
+        session_id,
+        meta,
+        memory_enabled,
+        user_profile_budget,
+        temporal_awareness,
+        served_m1,
+        estimate,
+    )?;
+    let mut projection = meta
+        .memory_projection
+        .clone()
+        .filter(|projection| projection.matches_m0(served_m0))
+        .unwrap_or_else(|| {
+            let mut projection = mc_store::memory_projection::AppliedProjection {
+                hard_memory_block: served_memory_blocks(served_m1).0
+                    + "\n"
+                    + &served_memory_blocks(served_m1).1,
+                legacy: true,
+                ..Default::default()
+            };
+            projection.bind_m0(served_m0);
+            projection
+        });
+    let after = projection
+        .committed
+        .iter()
+        .map(|entry| entry.id)
+        .fold(projection.fragment_watermark, i64::max);
+    let pending = if memory_enabled {
+        store.load_agent_fragments(session_id, after)?
+    } else {
+        Vec::new()
+    };
+    let old_updates = crate::agent_fragments::block(&composition.body, "memory-updates");
+    let independent = composition.body.replace(&old_updates, "");
+    let independent_tokens = if composition.body == M1_PLACEHOLDER {
+        0
+    } else {
+        estimate(&independent)
+    };
+    let (updates, next) = crate::agent_fragments::compose(
+        projection.clone(),
+        &pending,
+        memory_budget,
+        history_budget,
+        independent_tokens,
+        estimate(served_m0),
+        estimate,
+    );
+    projection = next;
+    let mut sections = Vec::new();
+    if !updates.is_empty() {
+        sections.push(updates);
+    }
+    for tag in ["new-compartments", "new-memories", "new-user-profile"] {
+        let section = crate::agent_fragments::block(&composition.body, tag);
+        if !section.is_empty() {
+            sections.push(section);
+        }
+    }
+    composition.body = if sections.is_empty() {
+        M1_PLACEHOLDER.into()
+    } else {
+        format!(
+            "<session-history-since>\n{}\n</session-history-since>",
+            sections.join("\n")
+        )
+    };
+    projection.generation = projection.generation.saturating_add(1);
+    composition.memory_projection = Some(projection);
+    Ok(composition)
 }
 
 /// EXPENSIVE bust-only: compose the m1 delta body from the store against the watermarks
@@ -640,6 +734,7 @@ fn compose_m1(
     );
 
     Ok(M1Composition {
+        memory_projection: None,
         rendered_coverage,
         body,
         memory_update_count: mutations.len(),
@@ -1932,11 +2027,9 @@ mod tests {
         .is_err());
     }
 
-    /// Interim gap until the Rust renderer gains agent fragments: OpenCode and Pi append a
-    /// session's own agent memory edits to its next busting m1, but a Rust SOFT replays only
-    /// the served memory blocks, so the same edit waits for the next HARD fold here.
+    /// Immutable fragments are the only memory input an authorized SOFT may append.
     #[test]
-    fn rust_soft_renders_no_agent_fragments_yet() {
+    fn rust_soft_renders_own_agent_fragments() {
         let fixture = FixtureBuilder::store();
         let store = &fixture.store;
         let project = "git:proj";
@@ -1946,26 +2039,29 @@ mod tests {
         store
             .with_context_conn_for_test(|tx| {
                 tx.execute(
-                    "INSERT INTO memory_agent_fragments(session_id,harness,project_path,operation_key,memory_ids_json,current_id,lines,visible_texts_json,created_at) VALUES('ses','opencode',?1,'op','[1]',1,'  <updated id=\"1\">agent fragment line</updated>','[]',0)",
+                     "INSERT INTO memory_agent_fragments(session_id,harness,project_path,operation_key,memory_ids_json,current_id,lines,visible_texts_json,created_at) VALUES('ses','ck-mc',?1,'op','[1]',1,'  <updated id=\"1\">agent fragment line</updated>','[]',0)",
                     [project],
                 )
             })
             .unwrap();
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
-        let soft = compose_soft_m1(
+        let soft = compose_projected_soft_m1(
             store,
             project,
             "ses",
             &meta,
             true,
+            8_000.0,
+            60_000.0,
             4_000.0,
             true,
+            "m0",
             M1_PLACEHOLDER,
             no_estimate,
         )
         .unwrap();
-        assert!(!soft.body.contains("agent fragment line"), "{}", soft.body);
-        assert_eq!(soft.body, M1_PLACEHOLDER);
+        assert!(soft.body.contains("agent fragment line"), "{}", soft.body);
+        assert_eq!(soft.memory_projection.unwrap().committed.len(), 1);
     }
 
     #[test]
