@@ -4,6 +4,10 @@ import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import {
+	applyAgentMemoryMutation,
+	applyMemoryAdmission,
+} from "@magic-context/core/features/magic-context/memory/lifecycle-applier";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	archiveMemory,
@@ -167,11 +171,19 @@ describe("Pi render-to-commit concurrency", () => {
 					{
 						...state,
 						beforeCacheCommitForTest: () => {
+							// A busting SOFT shows memory only through this session's
+							// agent fragments, so the concurrent memory is an agent save.
 							if (change === "memory")
-								insertMemory(sibling, {
-									projectPath: state.projectIdentity,
-									category: "ARCHITECTURE",
-									content: "Concurrent Pi refresh memory",
+								applyMemoryAdmission(sibling, {
+									key: "concurrent-pi-refresh-save",
+									operation: "agent_save",
+									input: {
+										projectPath: state.projectIdentity,
+										category: "ARCHITECTURE",
+										content: "Concurrent Pi refresh memory",
+										sourceSessionId: state.sessionId,
+										sourceType: "agent",
+									},
 								});
 							else
 								appendCompartments(sibling, state.sessionId, [
@@ -1723,7 +1735,7 @@ describe("injectM0M1Pi", () => {
 		}
 	});
 
-	it("replays byte-identical m[1] on defer and surfaces additive memory on next cache-busting pass", () => {
+	it("replays byte-identical m[1] on defer and shows only this session's agent save on the next cache-busting pass", () => {
 		const db = createTestDb();
 		const cwd = createTestTempDirFromPath(
 			join(tmpdir(), "pi-m1-additive-stable-"),
@@ -1751,12 +1763,25 @@ describe("injectM0M1Pi", () => {
 			injectM0M1Pi(state, db, first as never, undefined, true);
 			const initialM1 = textOf(first[1] as never);
 
+			// Another writer's insert waits for the next HARD fold; this session's
+			// own agent save reaches its next busting m[1] as a fragment.
 			insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
-				content: "New additive memory appears only after a bust.",
-				sourceType: "agent",
+				content: "Another writer's memory waits for the next HARD fold.",
+				sourceType: "historian",
 			});
+			const saved = applyMemoryAdmission(db, {
+				key: "pi-agent-save-1",
+				operation: "agent_save",
+				input: {
+					projectPath: state.projectIdentity,
+					category: "ARCHITECTURE",
+					content: "New additive memory appears only after a bust.",
+					sourceSessionId: state.sessionId,
+					sourceType: "agent",
+				},
+			}).memoryId!;
 
 			const deferOne = [userMessage("defer one", 11)];
 			injectM0M1Pi(state, db, deferOne as never, undefined, false);
@@ -1769,16 +1794,17 @@ describe("injectM0M1Pi", () => {
 
 			const bust = [userMessage("bust", 13)];
 			injectM0M1Pi(state, db, bust as never, undefined, true);
-			expect(textOf(bust[1] as never)).toContain("<new-memories>");
+			expect(textOf(bust[1] as never)).not.toContain("<new-memories>");
 			expect(textOf(bust[1] as never)).toContain(
-				"New additive memory appears only after a bust.",
+				`<added id="${saved}" category="ARCHITECTURE">New additive memory appears only after a bust.</added>`,
 			);
+			expect(textOf(bust[1] as never)).not.toContain("Another writer's memory");
 		} finally {
 			closeQuietly(db);
 		}
 	});
 
-	it("renders archive removals for m0-resident memory only on cache-busting pass and replays them on defer", () => {
+	it("renders this session's agent archive of an m0-resident memory only on a cache-busting pass and replays it on defer", () => {
 		const db = createTestDb();
 		const cwd = createTestTempDirFromPath(
 			join(tmpdir(), "pi-m1-archive-delta-"),
@@ -1810,15 +1836,16 @@ describe("injectM0M1Pi", () => {
 				true,
 			);
 
-			db.transaction(() => {
-				archiveMemory(db, memory.id);
-				queueMemoryMutation(db, {
-					projectPath: state.projectIdentity,
-					mutationType: "archive",
-					targetMemoryId: memory.id,
-					queuedAt: 10,
-				});
-			})();
+			// Busting SOFT passes read no mutation log; the agent archive reaches
+			// this session's m[1] as its pre-rendered fragment.
+			applyAgentMemoryMutation(db, {
+				key: "pi-agent-archive-1",
+				projectPath: state.projectIdentity,
+				sourceSessionId: state.sessionId,
+				operation: "archive",
+				targets: [{ id: memory.id, revision: 1 }],
+				reason: "obsolete",
+			});
 
 			const defer = [userMessage("defer", 11)];
 			injectM0M1Pi(state, db, defer as never, undefined, false);
@@ -2092,11 +2119,17 @@ describe("injectM0M1Pi", () => {
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never, undefined, true);
 			const baselineM0 = textOf(first[0] as never);
-			insertMemory(db, {
-				projectPath: state.projectIdentity,
-				category: "ARCHITECTURE",
-				content: "Pi docs-hash-only CAS delta memory",
-				sourceType: "agent",
+			// This session's agent save renders only if the SOFT refresh is admitted.
+			applyMemoryAdmission(db, {
+				key: "pi-docs-hash-only-save",
+				operation: "agent_save",
+				input: {
+					projectPath: state.projectIdentity,
+					category: "ARCHITECTURE",
+					content: "Pi docs-hash-only CAS delta memory",
+					sourceSessionId: state.sessionId,
+					sourceType: "agent",
+				},
 			});
 			let changedDocsMarker = false;
 			db.exec = ((sql: string) => {

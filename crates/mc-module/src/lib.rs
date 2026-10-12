@@ -35,6 +35,7 @@ mod per_pass_profile;
 #[cfg(test)]
 mod private_permissions_source_test;
 
+mod agent_fragments;
 pub mod boundary;
 pub mod caveman;
 pub mod ck_wire;
@@ -12684,6 +12685,71 @@ impl McHandler {
         )
     }
 
+    /// The dreamer's expiry sweep for a module-owned project: an automated archive that the
+    /// store rechecks against each row's declared expiry and writes with undo history and no
+    /// mutation-log row (see `expire_memories_tx`). It is not the agent `ctx_memory` archive.
+    async fn handle_memory_expire(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request, &["ids"]) else {
+            return invalid_params_error("memory.expire requires arguments");
+        };
+        let Some(memory_project) = non_empty_string_arg(&args, "memory_project") else {
+            return invalid_params_error("memory.expire requires memory_project");
+        };
+        if let Err(outcome) = self.bind_facade_route_for_write(channel, &args, "memories") {
+            return outcome;
+        }
+        let binding = match self.facade_binding(channel) {
+            Ok(binding) => binding,
+            Err(_) => return session_unresolved_error(),
+        };
+        let route_root = binding.project_root.to_string_lossy().to_string();
+        let Some(store) = self.store.get() else {
+            return self.store_refusal();
+        };
+        let command_id = args
+            .get("command_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if let Some(command_id) = command_id {
+            if let Some(replayed) =
+                replayed_memory_apply_command(store, &binding.session, "expire", command_id)
+            {
+                return replayed;
+            }
+        }
+        let Some(ids) = args.get("ids").and_then(Value::as_array) else {
+            return invalid_params_error("memory.expire requires ids");
+        };
+        let Some(ids) = ids.iter().map(Value::as_i64).collect::<Option<Vec<_>>>() else {
+            return invalid_params_error("memory.expire ids must be integers");
+        };
+        let now = now_ms();
+        dream_apply_command_outcome(
+            store.with_facade_command(
+                &route_root,
+                memory_project,
+                "memories",
+                &binding.session,
+                "memory",
+                "expire",
+                command_id,
+                |tx| {
+                    let result = tx.expire_memories(memory_project, &ids, now)?;
+                    serde_json::to_vec(&json!({
+                        "ok": true,
+                        "accepted": result.accepted,
+                        "rejected": result.rejected.iter().map(|row| json!({
+                            "memory_id": row.memory_id,
+                            "reason": row.reason,
+                        })).collect::<Vec<_>>(),
+                    }))
+                    .map_err(|error| error.to_string())
+                },
+            ),
+            "expiry_apply_failed",
+        )
+    }
+
     async fn handle_memory_set_verification(
         &self,
         channel: u16,
@@ -12892,6 +12958,7 @@ impl McHandler {
                     .await
             }
             "memory.set_mural_cue" => self.handle_memory_set_mural_cue(channel, &request).await,
+            "memory.expire" => self.handle_memory_expire(channel, &request).await,
             "memory.set_verification" => {
                 self.handle_memory_set_verification(channel, &request).await
             }
@@ -13430,6 +13497,20 @@ impl McHandler {
         if is_mutation && command_id.is_none() {
             self.log_missing_facade_command_id(conversation_key, "ctx_memory", action);
         }
+        let shown_projection = store.load(conversation_key).ok().and_then(|loaded| {
+            let projection = loaded.meta.memory_projection?;
+            let m0 = loaded
+                .core
+                .frozen_units
+                .iter()
+                .find(|unit| unit.key == "m0")?;
+            projection
+                .matches_m0(&m0.frozen_payload)
+                .then_some(projection)
+        });
+        let fragment_key = command_id.clone().unwrap_or_else(|| {
+            mc_store::memory_lifecycle::applier::fresh_decision_key("ctx-memory-fragment", now_ms())
+        });
 
         match action {
             "write" => {
@@ -13499,6 +13580,30 @@ impl McHandler {
                                 }),
                             );
                         };
+                        let saved = tx.memory_for_fragment(id)?;
+                        if !shown_projection
+                            .as_ref()
+                            .is_some_and(|shown| shown.shows_text(id, &saved.content))
+                        {
+                            tx.record_agent_fragment(
+                                conversation_key,
+                                memory_project,
+                                &fragment_key,
+                                &[id],
+                                Some(id),
+                                &[mc_store::memory_projection::text_line(
+                                    "added",
+                                    id,
+                                    &saved.category,
+                                    &saved.content,
+                                )],
+                                &[mc_store::memory_projection::VisibleText {
+                                    id,
+                                    text: saved.content,
+                                }],
+                                saved_at,
+                            )?;
+                        }
                         let text = format!("Saved memory [ID: {id}] in {category}.");
                         mcp_memory_result(
                             text,
@@ -13538,6 +13643,24 @@ impl McHandler {
                             .update_memory_content(memory_project, id, content, category, now_ms())
                             .map_err(|error| request_context.render_mutation_error(error))?;
                         let rendered_id = memory.id;
+                        tx.record_agent_fragment(
+                            conversation_key,
+                            memory_project,
+                            &fragment_key,
+                            &[memory.id],
+                            Some(memory.id),
+                            &[mc_store::memory_projection::text_line(
+                                "updated",
+                                memory.id,
+                                &memory.category,
+                                &memory.content,
+                            )],
+                            &[mc_store::memory_projection::VisibleText {
+                                id: memory.id,
+                                text: memory.content.clone(),
+                            }],
+                            now_ms(),
+                        )?;
                         facade_text_response(
                             format!("Updated memory [ID: {rendered_id}] in {}.", memory.category),
                             false,
@@ -13571,6 +13694,19 @@ impl McHandler {
                                 false,
                             )
                         } else {
+                            tx.record_agent_fragment(
+                                conversation_key,
+                                memory_project,
+                                &fragment_key,
+                                &archived,
+                                None,
+                                &archived
+                                    .iter()
+                                    .map(|id| format!("  <removed id=\"{id}\"/>"))
+                                    .collect::<Vec<_>>(),
+                                &[],
+                                now_ms(),
+                            )?;
                             let rendered_ids = archived;
                             facade_text_response(
                                 format!("Archived memory IDs [{}].", join_i64s(&rendered_ids)),
@@ -13628,6 +13764,14 @@ impl McHandler {
                                     .map_err(|error| request_context.render_mutation_error(error))?;
                             }
                             let rendered_inputs = ids.clone();
+                            let mut lines = superseded_ids.iter().map(|id| format!("  <superseded id=\"{id}\" by=\"{}\"/>",memory.id)).collect::<Vec<_>>();
+                            let shown = shown_projection.as_ref().is_some_and(|shown| shown.shows_text(memory.id,&memory.content));
+                            let visible = if shown { Vec::new() } else {
+                                lines.push(mc_store::memory_projection::text_line(if ids.contains(&memory.id) { "updated" } else { "added" },memory.id,&memory.category,&memory.content));
+                                vec![mc_store::memory_projection::VisibleText { id:memory.id,text:memory.content.clone() }]
+                            };
+                            let mut fragment_ids = superseded_ids.clone(); fragment_ids.push(memory.id);
+                            tx.record_agent_fragment(conversation_key,memory_project,&fragment_key,&fragment_ids,Some(memory.id),&lines,&visible,now_ms())?;
                             let rendered_superseded = superseded_ids.clone();
                             let text = {
                                 format!(
@@ -13787,18 +13931,14 @@ impl McHandler {
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
-        let state = match store.load(conversation_key) {
-            Ok(state) => state,
-            Err(error) => return tool_error_result(format!("Error: {error}")),
-        };
         let include_memories = facade_scope.memory_enabled && sources.memory;
         let workspace_membership = match store.resolve_workspace_membership(memory_project) {
             Ok(membership) => membership,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
-        let visible_memory_ids = state
-            .meta
-            .rendered_memory_ids
+        let visible_memory_ids = store
+            .fully_visible_memory_ids(conversation_key)
+            .unwrap_or_default()
             .into_iter()
             .collect::<BTreeSet<_>>();
 
@@ -32191,7 +32331,8 @@ mod tests {
         .await;
         let memory_revision_after_update =
             crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
-        assert_ne!(memory_revision_after_update, memory_revision_after_write);
+        // A busting SOFT renders no memory rows, so memory edits never move the m1 revision.
+        assert_eq!(memory_revision_after_update, memory_revision_after_write);
         call_and_replay(
             &handler,
             &store,
@@ -32207,7 +32348,22 @@ mod tests {
         .await;
         let memory_revision_after_archive =
             crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
-        assert_ne!(memory_revision_after_archive, memory_revision_after_update);
+        assert_eq!(memory_revision_after_archive, memory_revision_after_update);
+        let fragments = store.load_agent_fragments("session", 0).unwrap();
+        assert_eq!(
+            fragments.len(),
+            3,
+            "each canonical operation and its retry commit one fragment"
+        );
+        assert_eq!(
+            fragments[0].lines,
+            vec!["  <added id=\"1\" category=\"CONSTRAINTS\">first</added>"]
+        );
+        assert_eq!(
+            fragments[1].lines,
+            vec!["  <updated id=\"1\" category=\"CONSTRAINTS\">updated</updated>"]
+        );
+        assert_eq!(fragments[2].lines, vec!["  <removed id=\"1\"/>"]);
 
         call_and_replay(
             &handler,
@@ -32336,6 +32492,75 @@ mod tests {
         assert_eq!(before, after, "classification metadata must not change m1");
     }
 
+    /// The dreamer's expiry sweep for a module-owned project is an automated archive: the
+    /// store rechecks each row's declared expiry, archives it with undo history and writes no
+    /// mutation-log row (the TypeScript local path writes the same records). A row whose
+    /// expiry has not passed is refused and left live.
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_routed_expiry_writes_history_and_no_mutation_log() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_root = project.to_str().unwrap();
+        let identity = "git:r4-expiry";
+        handler.bind_route(7, binding(route_root, "token"));
+        activate_module_authority(&store, "context", identity, route_root, "memories");
+        let expired = insert_memory(&store, identity, "CONSTRAINTS", "expired rule", 1);
+        let live = insert_memory(&store, identity, "CONSTRAINTS", "still valid rule", 1);
+        store
+            .with_context_conn_for_test(|tx| {
+                tx.execute(
+                    "UPDATE memories SET expires_at = 1 WHERE id = ?1",
+                    [expired],
+                )?;
+                tx.execute(
+                    "UPDATE memories SET expires_at = 9999999999999 WHERE id = ?1",
+                    [live],
+                )
+            })
+            .unwrap();
+        let outcome = call_facade(
+            &handler,
+            "memory.expire",
+            json!({
+                "memory_project": identity, "ids": [expired, live],
+                "context_store_uuid": "context", "authority_generation": 1, "command_id": "r4-expire"
+            }),
+        )
+        .await;
+        let body = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("expiry facade failed: {other:?}"),
+        };
+        assert_eq!(body["accepted"], json!([expired]));
+        assert_eq!(body["rejected"][0]["reason"], json!("not_expired"));
+        assert_eq!(
+            store.get_memory_full(expired).unwrap().unwrap().status,
+            "archived"
+        );
+        assert_eq!(
+            store.get_memory_full(live).unwrap().unwrap().status,
+            "active"
+        );
+        let counts: (i64, i64) = store
+            .with_context_conn_for_test(|tx| {
+                tx.query_row(
+                    "SELECT (SELECT COUNT(*) FROM memory_mutation_log WHERE target_memory_id = ?1),
+                            (SELECT COUNT(*) FROM memory_history WHERE memory_id = ?1)",
+                    [expired],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            counts,
+            (0, 1),
+            "expiry needs undo history, not a prompt mutation signal"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn verification_and_mapping_facades_are_fenced_hash_guarded_and_idempotent() {
         let producer = Arc::new(ProducerState::default());
@@ -32402,9 +32627,29 @@ mod tests {
         let after_update =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
         assert_eq!(update_body["accepted"], json!([updated_id]));
-        assert_ne!(
+        // A gated verify correction is an automated edit: it changes the row and records
+        // undo history but writes no mutation-log row, so it opens no SOFT and reaches
+        // prompts only at their next natural HARD fold.
+        assert_eq!(
             after_update, before_update,
-            "content updates advance the m1 mutation signal"
+            "an automated content update must not move the m1 mutation signal"
+        );
+        let (history, log_rows, revision): (i64, i64, i64) = store
+            .with_context_conn_for_test(|tx| {
+                tx.query_row(
+                    "SELECT
+                        (SELECT COUNT(*) FROM memory_history WHERE memory_id = ?1 AND after_text = 'updated by verifier'),
+                        (SELECT COUNT(*) FROM memory_mutation_log WHERE target_memory_id = ?1),
+                        (SELECT revision FROM memories WHERE id = ?1)",
+                    [updated_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!((history, log_rows, revision), (1, 0, 2));
+        assert_eq!(
+            store.get_memory_full(updated_id).unwrap().unwrap().content,
+            "updated by verifier"
         );
 
         let before_archive =
@@ -32416,9 +32661,34 @@ mod tests {
         assert!(matches!(archive, HandlerOutcome::Response(_)));
         let after_archive =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        assert!(
-            after_archive > before_archive,
-            "archives advance the m1 mutation signal"
+        // A verify archive is a model-judged retirement: a pending proposal, the row
+        // stays live, and nothing moves the prompt.
+        assert_eq!(
+            after_archive, before_archive,
+            "a verify archive must not move the m1 mutation signal"
+        );
+        assert_eq!(
+            store.get_memory_full(archived_id).unwrap().unwrap().status,
+            "active"
+        );
+        let proposals: Vec<(String, String, String)> = store
+            .with_context_conn_for_test(|tx| {
+                let mut statement = tx.prepare(
+                    "SELECT writer, operation, target_ids_json FROM memory_tool_proposals",
+                )?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>();
+                rows
+            })
+            .unwrap();
+        assert_eq!(
+            proposals,
+            vec![(
+                "verify".to_string(),
+                "archive".to_string(),
+                format!("[{archived_id}]")
+            )]
         );
 
         let mapping = call_facade(&handler, "memory.set_mapping", json!({
@@ -32988,7 +33258,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_merge_renders_a_budget_trimmed_target_then_defer_replays_bytes() {
+    // This merge does not originate a render opportunity. The unchanged passes
+    // below replay their prefix; an independent SOFT can later append its fragment.
+    async fn facade_merge_of_a_budget_trimmed_target_waits_for_hard_and_defer_replays_bytes() {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
         let (handler, store, _dir, project) = handler_with_store_and_resolver(
             Arc::new(ProducerState::default()),
@@ -33036,7 +33308,8 @@ mod tests {
         // mirror acknowledges the merge's new row before the next pass, as it does for the
         // rows `insert_memory` created.
         let revision_after = crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap();
-        assert_ne!(revision_before, revision_after);
+        // A busting SOFT renders no memory rows, so the merge does not move the m1 revision.
+        assert_eq!(revision_before, revision_after);
         assert_eq!(
             revision_after,
             crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap(),
@@ -33044,7 +33317,7 @@ mod tests {
         );
 
         let transition = call_transform_request(&handler, request.clone()).await;
-        assert_eq!(transition["action"], "SOFT");
+        assert_eq!(transition["action"], "SOFT+");
         let transition_m1 = transition["ck_messages"]
             .as_array()
             .unwrap()
@@ -33054,16 +33327,77 @@ mod tests {
             .and_then(|message| message["content"][0]["kind"]["text"].as_str())
             .unwrap();
         assert!(
-            transition_m1.contains("merged correction"),
+            !transition_m1.contains("merged correction"),
             "{transition_m1}"
         );
-        assert!(
-            transition_m1.contains(&format!("<superseded id=\"{source}\" by=\"{canonical}\"/>")),
-            "{transition_m1}"
-        );
+        assert!(!transition_m1.contains("<superseded"), "{transition_m1}");
         let stable = call_transform_request(&handler, request).await;
         assert_eq!(stable["action"], "SOFT+");
         assert_eq!(transition["ck_messages"], stable["ck_messages"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_facade_fragments_follow_served_survivor_and_duplicate_rules() {
+        for survivor_shown in [true, false] {
+            let resolver =
+                FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+            let (handler, store, _dir, project) = handler_with_store_and_resolver(
+                Arc::new(ProducerState::default()),
+                default_test_config(),
+                resolver,
+            );
+            let project = project.to_str().unwrap();
+            store
+                .replace_compartments("ses", &[stored_comp(1, 0, 0, "m0", "summary")])
+                .unwrap();
+            let request = request(vec![ck("m0", 0, "live input")]);
+            if !survivor_shown {
+                call_transform_request(&handler, request.clone()).await;
+            }
+            let survivor = insert_memory(&store, project, "CONSTRAINTS", "unchanged survivor", 1);
+            let source = insert_memory(&store, project, "CONSTRAINTS", "merge source", 1);
+            if survivor_shown {
+                call_transform_request(&handler, request.clone()).await;
+            }
+            let merged=call_facade(&handler,"ctx_memory",json!({"action":"merge","ids":[survivor,source],"content":"unchanged survivor","command_id":"merge-fragment"})).await;
+            assert!(!tool_is_error(merged));
+            let fragments = store.load_agent_fragments("ses", 0).unwrap();
+            assert_eq!(fragments.len(), 1);
+            assert_eq!(
+                fragments[0].lines[0],
+                format!("  <superseded id=\"{source}\" by=\"{survivor}\"/>")
+            );
+            assert_eq!(
+                fragments[0].visible_texts.len(),
+                usize::from(!survivor_shown)
+            );
+            if !survivor_shown {
+                assert_eq!(fragments[0].lines[1],format!("  <updated id=\"{survivor}\" category=\"CONSTRAINTS\">unchanged survivor</updated>"));
+            }
+            let saved=call_facade(&handler,"ctx_memory",json!({"action":"write","category":"CONSTRAINTS","content":"UNCHANGED SURVIVOR","command_id":"duplicate-fragment"})).await;
+            assert!(!tool_is_error(saved));
+            assert_eq!(
+                store.load_agent_fragments("ses", 0).unwrap().len(),
+                if survivor_shown { 1 } else { 2 }
+            );
+            if !survivor_shown {
+                assert_eq!(
+                    store.load_agent_fragments("ses", 0).unwrap()[1].visible_texts[0].text,
+                    "unchanged survivor"
+                );
+            }
+            store.arm_soft_refresh("ses").unwrap();
+            let soft = call_transform_request(&handler, request.clone()).await;
+            let wire = serde_json::to_string(&soft["ck_messages"]).unwrap();
+            assert!(wire.contains("superseded"), "{wire}");
+            if !survivor_shown {
+                assert!(wire.contains("unchanged survivor"));
+            }
+            assert_eq!(
+                soft["ck_messages"],
+                call_transform_request(&handler, request).await["ck_messages"]
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -33216,17 +33550,7 @@ mod tests {
                 now_ms: now_ms(),
             })
             .unwrap();
-        store
-            .commit(
-                "ses",
-                None,
-                &CoreState::default(),
-                &ModuleMeta {
-                    rendered_memory_ids: vec![visible_id],
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        seed_shown_memory_pair(&store, "ses", project, visible_id);
 
         let all = tool_text(
             call_facade(
@@ -33319,17 +33643,7 @@ mod tests {
 
         let visible = insert_memory(&store, project, "CONSTRAINTS", "needle visible", 10);
         let hidden = insert_memory(&store, project, "CONSTRAINTS", "needle hidden", 20);
-        store
-            .commit(
-                "ses",
-                None,
-                &CoreState::default(),
-                &ModuleMeta {
-                    rendered_memory_ids: vec![visible],
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        seed_shown_memory_pair(&store, "ses", project, visible);
 
         let results = tool_text(
             call_facade(
@@ -33347,6 +33661,46 @@ mod tests {
             results.contains(&format!("[memory] score=1.00 id={hidden} ")),
             "{results}"
         );
+    }
+
+    fn seed_shown_memory_pair(store: &McStore, session: &str, project: &str, id: i64) {
+        let snapshot = store.load_memory_render_snapshot(project, None, 0).unwrap();
+        let selected = snapshot
+            .memories
+            .iter()
+            .filter(|memory| memory.id == id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let text = crate::memory_render::render_memory_block(
+            &selected,
+            "project-memory",
+            &Default::default(),
+        );
+        let mut projection =
+            mc_store::memory_projection::AppliedProjection::hard(&snapshot, &selected, &[]);
+        projection.bind_m0(&text);
+        let core = CoreState {
+            frozen_units: vec![mc_core::FrozenUnit {
+                key: "m0".into(),
+                kind: "synth-region".into(),
+                frozen_payload: text,
+                durability_class: mc_core::DurabilityClass::Lineage,
+                reset_rule: String::new(),
+            }],
+            ..Default::default()
+        };
+        store
+            .commit(
+                session,
+                None,
+                &core,
+                &ModuleMeta {
+                    rendered_memory_ids: vec![id],
+                    memory_projection: Some(projection),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -33473,7 +33827,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_cache_mutations_drive_soft_memory_deltas_through_public_path() {
+    // The Rust facade commits each agent edit's pre-rendered lines for the editing
+    // session. token and token-additive resolve to the cache keys served by routes 8
+    // and 9. SOFT+ is a defer, not an m1 refresh: an independently authorized SOFT
+    // appends those own-session lines while keeping the m0 baseline unchanged.
+    async fn facade_same_session_memory_edits_wait_for_an_independent_soft() {
         let producer = Arc::new(ProducerState::default());
         let project_root = "/repo/cache-project";
         let scope = "pm_a5ee3bf8/parent-session/epoch-1";
@@ -33526,11 +33884,16 @@ mod tests {
         );
 
         let update_delta = call_transform_request_on_channel(&handler, 8, boot_req.clone()).await;
-        assert_eq!(update_delta["action"], "SOFT");
-        assert!(synthetic_text(&update_delta, 1).contains("<memory-updates>"));
-        assert!(synthetic_text(&update_delta, 1).contains(&format!(
-            "<updated id=\"{memory_id}\" category=\"CONSTRAINTS\">updated rule</updated>"
-        )));
+        // Saving the row and its pending lines cannot itself rewrite cached m0/m1 bytes.
+        assert_eq!(update_delta["action"], "SOFT+");
+        assert!(!synthetic_text(&update_delta, 1).contains("<memory-updates>"));
+        assert!(!synthetic_text(&update_delta, 1).contains("updated rule"));
+        assert_eq!(store.load_agent_fragments(scope, 0).unwrap().len(), 1);
+        store.arm_soft_refresh(scope).unwrap();
+        let update_soft = call_transform_request_on_channel(&handler, 8, boot_req).await;
+        assert_eq!(update_soft["action"], "SOFT");
+        assert!(synthetic_text(&update_soft, 1).contains("updated rule"));
+        assert!(synthetic_text(&update_soft, 1).contains("<memory-updates>"));
 
         handler.bind_route(9, binding(additive_project_root, additive_scope));
         store
@@ -33576,10 +33939,157 @@ mod tests {
                 .as_deref(),
             Some(additive_scope)
         );
-        let add_delta = call_transform_request_on_channel(&handler, 9, add_req).await;
-        assert_eq!(add_delta["action"], "SOFT");
-        assert!(synthetic_text(&add_delta, 1).contains("<new-memories>"));
-        assert!(synthetic_text(&add_delta, 1).contains("new additive memory"));
+        let add_delta = call_transform_request_on_channel(&handler, 9, add_req.clone()).await;
+        assert_eq!(add_delta["action"], "SOFT+");
+        assert!(!synthetic_text(&add_delta, 1).contains("<new-memories>"));
+        assert!(!synthetic_text(&add_delta, 1).contains("new additive memory"));
+        assert_eq!(
+            store.load_agent_fragments(additive_scope, 0).unwrap().len(),
+            1
+        );
+        store.arm_soft_refresh(additive_scope).unwrap();
+        let add_soft = call_transform_request_on_channel(&handler, 9, add_req).await;
+        assert_eq!(add_soft["action"], "SOFT");
+        assert!(synthetic_text(&add_soft, 1).contains("new additive memory"));
+        assert!(synthetic_text(&add_soft, 1).contains("<added"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_memory_operations_match_ts_goldens_on_soft_and_isolate_sessions() {
+        let goldens: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/agent-fragments-golden.json"
+        ))
+        .unwrap();
+        let operations = goldens
+            .iter()
+            .filter(|case| case.get("facadeAction").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(operations.len(), 4);
+        for golden in operations {
+            let action = golden["facadeAction"].as_str().unwrap();
+            let content = golden["content"].as_str().unwrap();
+            let mine = "pm_facade/mine/epoch-1";
+            let other = "pm_facade/other/epoch-1";
+            let resolver =
+                FakeSessionResolver::with(&[("writer-token", FakeResolve::Hit(mine.into()))]);
+            let (handler, store, _dir, project) = handler_with_store_and_resolver(
+                Arc::new(ProducerState::default()),
+                default_test_config(),
+                resolver,
+            );
+            let project = project.to_str().unwrap();
+            handler.bind_route(7, binding(project, "writer-token"));
+            handler.bind_route(8, binding(project, mine));
+            handler.bind_route(9, binding(project, other));
+            for session in [mine, other] {
+                store
+                    .replace_compartments(session, &[stored_comp(1, 1, 10, "m10", "SUMMARY")])
+                    .unwrap();
+            }
+            assert_eq!(
+                insert_memory(&store, project, "CONSTRAINTS", "original alpha", 1),
+                1
+            );
+            assert_eq!(
+                insert_memory(&store, project, "CONSTRAINTS", "original beta", 1),
+                2
+            );
+            let mut mine_req = request(vec![ck("m10", 10, "raw covered")]);
+            mine_req["session_id"] = json!(mine);
+            let mut other_req = mine_req.clone();
+            other_req["session_id"] = json!(other);
+            let mine_boot = call_transform_request_on_channel(&handler, 8, mine_req.clone()).await;
+            let other_boot =
+                call_transform_request_on_channel(&handler, 9, other_req.clone()).await;
+            assert_eq!(mine_boot["action"], "HARD");
+            assert_eq!(other_boot["action"], "HARD");
+            assert!(synthetic_text(&mine_boot, 0).contains("original alpha"));
+            assert!(synthetic_text(&mine_boot, 0).contains("original beta"));
+            let arguments = match action {
+                "update" => {
+                    json!({"action":action,"id":1,"category":"CONSTRAINTS","content":content})
+                }
+                "merge" => json!({"action":action,"ids":[1,2],"content":content}),
+                "archive" => json!({"action":action,"ids":[1]}),
+                "write" => json!({"action":action,"category":"CONSTRAINTS","content":content}),
+                _ => panic!("unknown facade golden {action}"),
+            };
+            let result = call_facade(&handler, "ctx_memory", arguments).await;
+            assert!(
+                !tool_is_error(result),
+                "{action} must apply through the facade"
+            );
+            let fragments = store.load_agent_fragments(mine, 0).unwrap();
+            assert_eq!(
+                fragments.len(),
+                1,
+                "{action} must record exactly one own-session fragment"
+            );
+            assert_eq!(
+                serde_json::to_value(&fragments[0].lines).unwrap(),
+                golden["pending"][0]["lines"]
+            );
+            assert_eq!(
+                serde_json::to_value(&fragments[0].visible_texts).unwrap(),
+                golden["pending"][0]["visibleTexts"]
+            );
+            assert!(store.load_agent_fragments(other, 0).unwrap().is_empty());
+
+            // A memory tool call does not authorize rewriting either cached prompt block.
+            // These requests must replay until session.flush separately requests a SOFT.
+            let mine_defer = call_transform_request_on_channel(&handler, 8, mine_req.clone()).await;
+            let other_defer =
+                call_transform_request_on_channel(&handler, 9, other_req.clone()).await;
+            assert_eq!(mine_defer["action"], "SOFT+");
+            assert_eq!(other_defer["action"], "SOFT+");
+            assert_eq!(
+                serde_json::to_vec(&mine_defer["ck_messages"]).unwrap(),
+                serde_json::to_vec(&mine_boot["ck_messages"]).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(&other_defer["ck_messages"]).unwrap(),
+                serde_json::to_vec(&other_boot["ck_messages"]).unwrap()
+            );
+            for (channel, session) in [(8, mine), (9, other)] {
+                let flushed = tool_body(
+                    handler
+                        .dispatch_value(
+                            channel,
+                            json!({"method":"session.flush","v":1,"session_id":session}),
+                        )
+                        .await,
+                );
+                assert_eq!(flushed, json!({"ok":true,"armed":true}));
+            }
+            let mine_soft = call_transform_request_on_channel(&handler, 8, mine_req.clone()).await;
+            let other_soft =
+                call_transform_request_on_channel(&handler, 9, other_req.clone()).await;
+            assert_eq!(mine_soft["action"], "SOFT");
+            assert_eq!(other_soft["action"], "SOFT");
+            assert_eq!(
+                synthetic_text(&mine_soft, 1),
+                golden["m1"].as_str().unwrap(),
+                "{action} must match the TS/Pi composer byte for byte"
+            );
+            assert_eq!(synthetic_text(&mine_soft, 0), synthetic_text(&mine_boot, 0));
+            assert_eq!(
+                serde_json::to_vec(&other_soft["ck_messages"]).unwrap(),
+                serde_json::to_vec(&other_boot["ck_messages"]).unwrap(),
+                "{action} from another session must not enter this SOFT"
+            );
+            let mine_replay = call_transform_request_on_channel(&handler, 8, mine_req).await;
+            let other_replay = call_transform_request_on_channel(&handler, 9, other_req).await;
+            assert_eq!(mine_replay["action"], "SOFT+");
+            assert_eq!(other_replay["action"], "SOFT+");
+            assert_eq!(
+                serde_json::to_vec(&mine_replay["ck_messages"]).unwrap(),
+                serde_json::to_vec(&mine_soft["ck_messages"]).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(&other_replay["ck_messages"]).unwrap(),
+                serde_json::to_vec(&other_soft["ck_messages"]).unwrap()
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

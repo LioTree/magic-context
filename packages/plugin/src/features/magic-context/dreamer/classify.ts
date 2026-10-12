@@ -30,6 +30,7 @@ import {
     type Memory,
     setMemoryClassification,
 } from "../memory";
+import { memoriesWithOpenClassificationItems } from "../memory/turn-two-scoring";
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import {
     failedInvocationStatus,
@@ -240,7 +241,15 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
             active.map((candidate) => candidate.contextMemory.id),
         ),
     );
-    toClassify = active.filter((candidate) => unclassifiedIds.has(candidate.contextMemory.id));
+    const historianScored = memoriesWithOpenClassificationItems(args.db);
+    toClassify = active.filter(
+        (candidate) =>
+            unclassifiedIds.has(candidate.contextMemory.id) &&
+            // A row whose classification item is still open is the historian's to
+            // score. A scored row was stamped classified when its score was recorded,
+            // so it is not re-scored here either.
+            !historianScored.has(candidate.contextMemory.id),
+    );
     if (active.length <= FULL_POOL_CEILING) {
         // An unchanged classification is already durable; only new or changed rows need a prompt.
         stage = 2;

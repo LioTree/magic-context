@@ -6,6 +6,7 @@ import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/comp
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { getMemoryById, insertMemory } from "../memory";
+import { recordItemScores } from "../memory/turn-two-scoring";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { getSubagentInvocations } from "../storage-subagent-invocations";
@@ -228,6 +229,107 @@ describe("runClassify disposition", () => {
             expect(second.classified).toBe(0);
             expect(second.remaining).toBe(0);
             expect(prompts).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("skips rows with an open historian classification item and never re-scores a historian score", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-historian-items";
+            addMemoriesForDisposition(db, projectIdentity, 8);
+            const pending = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Agent save awaiting its historian score.",
+                sourceSessionId: "ses",
+            });
+            const scored = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Agent save the historian scored.",
+                sourceSessionId: "ses",
+            });
+            const enqueue = db.prepare(
+                "INSERT INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal,excerpt) VALUES(?,?,1,'ses',?,1,'excerpt')",
+            );
+            enqueue.run(projectIdentity, pending.id, "part-pending");
+            const scoredItem = Number(
+                enqueue.run(projectIdentity, scored.id, "part-scored").lastInsertRowid,
+            );
+            // Record the historian's importance score for the saved memory the way turn two
+            // does (recordItemScores), which also stamps the row as classified.
+            recordItemScores(
+                db,
+                [scoredItem],
+                [{ item: scoredItem, importance: 30, proposedClass: "durable" }],
+            );
+            const args = classifyArgs(db, projectIdentity);
+            const prompted: number[] = [];
+            let manifest = "";
+            args.client = undefined;
+            args.hiddenCompletionExecutor = {
+                capabilities: { tools: false, harness: "opencode2" },
+                open: async () => ({ id: "v2-classify" }),
+                attempt: async (_handle, request) => {
+                    const prompt = request.body?.parts?.[0]?.text ?? "";
+                    const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) =>
+                        Number(match[1]),
+                    );
+                    prompted.push(...ids);
+                    manifest = `<classify>${ids.map((id) => `<memory id="${id}" importance="80" scope="project" shareable="true"/>`).join("")}</classify>`;
+                },
+                collect: async () => ({ text: manifest, reasoning: null, lengthCapped: false }),
+                close: async () => {},
+            } satisfies HiddenCompletionExecutor;
+
+            const result = await runClassify(args);
+
+            expect(result.classified).toBe(8);
+            expect(prompted).not.toContain(pending.id);
+            expect(prompted).not.toContain(scored.id);
+            expect(getMemoryById(db, pending.id)?.importance).toBe(50);
+            expect(getMemoryById(db, scored.id)?.importance).toBe(30);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("an item the historian ran out of attempts on gives its row back to dreamer classify", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-exhausted-item";
+            addMemoriesForDisposition(db, projectIdentity, 9);
+            const saved = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Agent save the historian never scored.",
+                sourceSessionId: "ses",
+            });
+            const item = Number(
+                db
+                    .prepare(
+                        "INSERT INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal,excerpt) VALUES(?,?,1,'ses','part',1,'excerpt')",
+                    )
+                    .run(projectIdentity, saved.id).lastInsertRowid,
+            );
+            // Three historian turn-two requests carried this item, and none recorded a
+            // score for it: it is out of attempts.
+            for (let attempt = 1; attempt <= 3; attempt++)
+                db.prepare(
+                    "INSERT INTO memory_stage_attempts(stage_key,project_path,publication_id,run_attempt,stage,session_id,carrier,state,request_json,started_at) VALUES(?,?,'pub',?,'turn_two','ses','stub','resolved',?,1)",
+                ).run(
+                    `stage-${attempt}`,
+                    projectIdentity,
+                    attempt,
+                    JSON.stringify({ items: [item] }),
+                );
+            const args = classifyArgs(db, projectIdentity);
+            args.client = successfulClassifyClient() as never;
+
+            expect((await runClassify(args)).classified).toBe(10);
+            expect(getMemoryById(db, saved.id)?.importance).toBe(80);
         } finally {
             closeQuietly(db);
         }

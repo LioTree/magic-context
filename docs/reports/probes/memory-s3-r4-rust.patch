@@ -1,0 +1,211 @@
+diff --git a/crates/mc-module/src/lib.rs b/crates/mc-module/src/lib.rs
+index b30fbfd660..4fdc53d793 100644
+--- a/crates/mc-module/src/lib.rs
++++ b/crates/mc-module/src/lib.rs
+@@ -32337,6 +32337,48 @@ mod tests {
+     }
+
+     #[tokio::test(flavor = "current_thread")]
++    async fn r4_module_routed_expiry_writes_history_and_no_mutation_log() {
++        let producer = Arc::new(ProducerState::default());
++        let resolver =
++            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
++        let (handler, store, _dir, project) =
++            handler_with_store_and_resolver(producer, default_test_config(), resolver);
++        let route_root = project.to_str().unwrap();
++        let identity = "git:r4-expiry";
++        handler.bind_route(7, binding(route_root, "token"));
++        activate_module_authority(&store, "context", identity, route_root, "memories");
++        let id = insert_memory(&store, identity, "CONSTRAINTS", "expired rule", 1);
++        store
++            .with_context_conn_for_test(|tx| {
++                tx.execute("UPDATE memories SET expires_at=1 WHERE id=?1", [id])
++            })
++            .unwrap();
++        let outcome = call_facade(
++            &handler,
++            "ctx_memory",
++            json!({
++                "action":"archive", "memory_project":identity, "ids":[id], "reason":"expired",
++                "context_store_uuid":"context", "authority_generation":1, "command_id":"r4-expire"
++            }),
++        )
++        .await;
++        assert!(
++            matches!(outcome, HandlerOutcome::Response(_)),
++            "{outcome:?}"
++        );
++        assert_eq!(
++            store.get_memory_full(id).unwrap().unwrap().status,
++            "archived"
++        );
++        let counts:(i64,i64)=store.with_context_conn_for_test(|tx| tx.query_row("SELECT (SELECT COUNT(*) FROM memory_mutation_log WHERE target_memory_id=?1), (SELECT COUNT(*) FROM memory_history WHERE memory_id=?1)",[id],|row|Ok((row.get(0)?,row.get(1)?)))).unwrap();
++        assert_eq!(
++            counts,
++            (0, 1),
++            "expiry needs undo history, not a prompt mutation signal"
++        );
++    }
++
++    #[tokio::test]
+     async fn verification_and_mapping_facades_are_fenced_hash_guarded_and_idempotent() {
+         let producer = Arc::new(ProducerState::default());
+         let resolver =
+diff --git a/crates/mc-module/src/transform.rs b/crates/mc-module/src/transform.rs
+index 8bf90b0a20..2ff0fef455 100644
+--- a/crates/mc-module/src/transform.rs
++++ b/crates/mc-module/src/transform.rs
+@@ -34888,6 +34888,153 @@ pub(crate) mod tests {
+
+     /// A busting SOFT reads no memory rows or mutation log, so a memory update waits for the
+     /// next HARD fold; a genuine HARD trigger (here a render-config change) shows it in m0.
++    fn r4_full_gate(armed: bool, table: &str) {
++        let dir = tempfile::tempdir().unwrap();
++        let s = store(dir.path());
++        s.seed_memory(1, "git:proj", "ARCHITECTURE", "gate baseline", 50)
++            .unwrap();
++        s.replace_compartments("r4", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
++            .unwrap();
++        let request = req("r4", "cfg0", vec![item("m1msg", 1, "raw")]);
++        assert_eq!(run(&s, &request, &spine()).action, "HARD");
++        if armed {
++            s.arm_soft_refresh("r4").unwrap();
++        }
++        let control = transform(&s, &request, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
++        assert_eq!(control.action, if armed { "SOFT" } else { "SOFT+" });
++        if armed {
++            s.arm_soft_refresh("r4").unwrap();
++        }
++        s.with_context_conn_for_test(|tx| {
++            tx.execute_batch(&format!("ALTER TABLE {table} RENAME TO {table}_r4_hidden;"))
++        })
++        .unwrap();
++        let gated = transform(&s, &request, &pctx("git:proj", "/nonexistent-docs", 0));
++        assert!(
++            gated.is_ok(),
++            "armed={armed} table={table}: {:?}",
++            gated.err()
++        );
++    }
++
++    #[test]
++    fn r4_soft_reads_no_memory_watermark() {
++        r4_full_gate(true, "memories");
++    }
++    #[test]
++    fn r4_soft_plus_reads_no_memory_watermark() {
++        r4_full_gate(false, "memories");
++    }
++    #[test]
++    fn r4_soft_reads_no_mutation_log_watermark() {
++        r4_full_gate(true, "memory_mutation_log");
++    }
++    #[test]
++    fn r4_soft_plus_reads_no_mutation_log_watermark() {
++        r4_full_gate(false, "memory_mutation_log");
++    }
++
++    #[test]
++    fn r4_automatic_hint_producer_reads_no_memory_rows() {
++        let dir = tempfile::tempdir().unwrap();
++        let s = store(dir.path());
++        s.seed_memory(1, "git:proj", "CONSTRAINTS", "rust ownership beta", 50)
++            .unwrap();
++        let request = active_cc_req(
++            "r4-auto",
++            "cfg0",
++            vec![wire_item("user", "m1", 1, &["rust ownership beta"])],
++        );
++        let projection = project_messages(&request.messages).unwrap();
++        assert!(maybe_decide_live_user_hint(
++            &s,
++            &request,
++            &pctx("git:proj", "/nonexistent-docs", 1),
++            &projection,
++            &[],
++            None,
++            None,
++            None,
++            &[]
++        )
++        .is_ok());
++        s.with_context_conn_for_test(|tx| {
++            tx.execute_batch("ALTER TABLE memories RENAME TO memories_r4_hidden;")
++        })
++        .unwrap();
++        let gated = maybe_decide_live_user_hint(
++            &s,
++            &request,
++            &pctx("git:proj", "/nonexistent-docs", 1),
++            &projection,
++            &[],
++            None,
++            None,
++            None,
++            &[],
++        );
++        assert!(gated.is_ok(), "{:?}", gated.err());
++    }
++
++    #[test]
++    fn r4_rust_150_rounds_foreign_hards_and_row_churn_preserve_served_pair() {
++        let dir = tempfile::tempdir().unwrap();
++        let s = store(dir.path());
++        let id = s
++            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original r4", 0))
++            .unwrap();
++        s.replace_compartments("r4-random", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
++            .unwrap();
++        let request = req("r4-random", "cfg0", vec![item("m1msg", 1, "raw")]);
++        let before = run(&s, &request, &spine());
++        assert_eq!(before.action, "HARD");
++        let mut seed = 0x5a17u32;
++        for i in 0..150 {
++            seed ^= seed << 13;
++            seed ^= seed >> 17;
++            seed ^= seed << 5;
++            if seed % 3 == 0 {
++                s.insert_memory(memory_input(
++                    "git:proj",
++                    "ARCHITECTURE",
++                    &format!("foreign insertion {i}"),
++                    i,
++                ))
++                .unwrap();
++            } else {
++                s.update_memory_content(
++                    "git:proj",
++                    id,
++                    &format!("foreign or own update {i}"),
++                    None,
++                    i,
++                )
++                .unwrap();
++            }
++            if seed % 4 == 0 {
++                let other = req(
++                    "r4-other",
++                    &format!("cfg-{i}"),
++                    vec![item("other", 1, "foreign append")],
++                );
++                assert_eq!(run(&s, &other, &spine()).action, "HARD");
++            }
++            let mut appended = request.clone();
++            appended
++                .messages
++                .push(item(&format!("tail-{i}"), 2, "ordinary append"));
++            let soft_plus = run(&s, &appended, &spine());
++            assert_eq!(soft_plus.action, "SOFT+");
++            assert_eq!(m0_bytes(&soft_plus), m0_bytes(&before));
++            assert_eq!(m1_bytes(&soft_plus), m1_bytes(&before));
++            s.arm_soft_refresh("r4-random").unwrap();
++            let soft = run(&s, &appended, &spine());
++            assert_eq!(soft.action, "SOFT");
++            assert_eq!(m0_bytes(&soft), m0_bytes(&before));
++            assert_eq!(m1_bytes(&soft), m1_bytes(&before));
++        }
++    }
++
+     #[test]
+     fn public_memory_update_waits_for_hard_and_a_genuine_hard_shows_it() {
+         let dir = tempfile::tempdir().unwrap();

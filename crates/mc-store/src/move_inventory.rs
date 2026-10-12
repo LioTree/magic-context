@@ -6,9 +6,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Section-inventory protocol version serialized in move manifests.
-pub const INVENTORY_VERSION: u32 = 4;
+pub const INVENTORY_VERSION: u32 = 5;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 100;
-pub const STORE_SCHEMA_VERSION: u32 = 68;
+pub const STORE_SCHEMA_VERSION: u32 = 69;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1030,7 +1030,7 @@ pub const TABLES: &[TableInventory] = &[
             "category",
             "new_content",
             "queued_at",
-            "adoption_class"
+            "operation_id"
         ],
         &[],
         None,
@@ -2705,26 +2705,42 @@ pub const TABLES: &[TableInventory] = &[
             "session_id",
             "harness",
             "project_path",
-            "applied_epoch",
-            "applied_mutation_cursor",
-            "max_memory_id",
             "generation",
-            "source_generation",
-            "m0_bytes",
-            "m1_bytes",
-            "mural_payload",
-            "mural_hash",
-            "applied_revisions_json",
-            "selection_metadata_json",
-            "activity_expiry_clocks_json",
-            "policy_budget_identity_json",
-            "text_cue_search_manifest_json",
-            "admission_ledger_json",
-            "correction_receipts_json",
-            "correction_cursors_json"
+            "m0_sha256",
+            "hard_memory_block",
+            "fragment_watermark",
+            "committed_fragments_json",
+            "legacy"
         ],
         &[],
         Some(KeyPolicy::Preserve),
+        None
+    ),
+    // A session's agent memory fragments. Their ids are referenced by the
+    // session's applied snapshot (its fragment watermark and committed list).
+    // Collision refusal for this Context entry must be enforced by the future
+    // agent-move context-half importer: the current module-half installer never
+    // runs this entry. Export preserves ids; it does not enforce destination refusal.
+    table!(
+        Context,
+        "memory_agent_fragments",
+        Ship,
+        RowSelector::Predicate("session_id = ?1"),
+        &["id"],
+        &[
+            "id",
+            "session_id",
+            "harness",
+            "project_path",
+            "operation_key",
+            "memory_ids_json",
+            "current_id",
+            "lines",
+            "visible_texts_json",
+            "created_at"
+        ],
+        &[],
+        Some(KeyPolicy::PreserveOrRefuseCollision),
         None
     ),
     table!(
@@ -3706,7 +3722,8 @@ mod tests {
     // of the inventory or a schema reconstructed from its column list.
     fn fresh_stores() -> (tempfile::TempDir, Connection, Connection) {
         let root = root();
-        let dir = tempfile::tempdir_in(root.join("target")).unwrap();
+        // Honour TMPDIR so isolated runs do not put their databases in the build tree.
+        let dir = tempfile::tempdir().unwrap();
         let script = r#"
             import { Database } from './packages/plugin/src/shared/sqlite';
             import { initializeDatabase, LATEST_SUPPORTED_VERSION } from './packages/plugin/src/features/magic-context/storage-db';
@@ -3858,6 +3875,7 @@ mod tests {
             "memory_check_attempts",
             "memory_applied_snapshots",
             "memory_applied_rows",
+            "memory_agent_fragments",
         ] {
             let definition = entry(Store::Context, table).unwrap();
             assert_eq!(definition.class, Class::Ship, "{table}");
@@ -3915,7 +3933,11 @@ mod tests {
                     "host_runner_views",
                     "host_runner_state"
                 ],
-                vec!["memory_applied_snapshots", "memory_applied_rows"]
+                vec![
+                    "memory_applied_snapshots",
+                    "memory_applied_rows",
+                    "memory_agent_fragments"
+                ]
             ]
         );
         for table in &groups[0] {
@@ -4118,6 +4140,31 @@ mod tests {
     }
 
     #[test]
+    fn rust_applied_tuple_and_fragments_have_session_owned_move_classification() {
+        const {
+            assert!(STORE_SCHEMA_VERSION >= 69);
+        }
+        let cache = TABLES
+            .iter()
+            .find(|entry| entry.store == Store::Module && entry.table == "mc_cache_state")
+            .unwrap();
+        assert_eq!(cache.class, Class::Ship);
+        assert_eq!(cache.session_column(), Some("session_id"));
+        assert!(cache.shipped_columns().contains(&"meta"));
+        assert_eq!(cache.key_policy, Some(KeyPolicy::Preserve));
+        let fragments = TABLES
+            .iter()
+            .find(|entry| entry.store == Store::Context && entry.table == "memory_agent_fragments")
+            .unwrap();
+        assert_eq!(fragments.class, Class::Ship);
+        assert_eq!(fragments.session_column(), Some("session_id"));
+        assert_eq!(
+            fragments.key_policy,
+            Some(KeyPolicy::PreserveOrRefuseCollision)
+        );
+    }
+
+    #[test]
     fn excluded_tables_and_generated_columns_still_have_a_drift_fence() {
         let (_dir, context, module) = fresh_stores();
         context
@@ -4169,7 +4216,7 @@ mod tests {
             .unwrap();
         assert_bun_succeeded(&output);
         let session_tables: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(session_tables.len(), 45);
+        assert_eq!(session_tables.len(), 46);
         for table in session_tables {
             assert!(matches!(
                 entry(Store::Context, &table).unwrap().class,
@@ -4328,5 +4375,33 @@ mod tests {
         assert!(selected("workspaces", &scope).is_empty());
         assert_eq!(selected("project_state", &scope), [3]);
         assert_eq!(selected("user_memories", &scope), [1]);
+    }
+
+    #[test]
+    fn review_context_export_preserves_fragment_ids_and_session_filter() {
+        let (_dir, mut context, _module) = fresh_stores();
+        context.execute_batch("INSERT INTO memory_agent_fragments(id,session_id,harness,project_path,operation_key,memory_ids_json,current_id,lines,visible_texts_json,created_at) VALUES(37,'ses_move','ck-mc','git:proj','first','[9]',9,'first line','[]',0),(91,'ses_move','ck-mc','git:proj','second','[9]',9,'second line','[]',1),(92,'foreign','ck-mc','git:proj','foreign','[9]',9,'foreign line','[]',2);").unwrap();
+        let mut bytes = Vec::new();
+        crate::move_snapshot::capture_half(&mut context, Store::Context, "ses_move", &mut bytes)
+            .unwrap();
+        let mut input = std::io::Cursor::new(bytes);
+        let mut ids = Vec::new();
+        for table in crate::move_snapshot::ship_tables(Store::Context) {
+            let count = crate::move_snapshot::read_section(&mut input, table).unwrap();
+            for _ in 0..count {
+                let row = crate::move_snapshot::read_row(&mut input, table).unwrap();
+                if table.table == "memory_agent_fragments" {
+                    ids.push(row[0].clone());
+                    assert_eq!(row[1], rusqlite::types::Value::Text("ses_move".into()));
+                }
+            }
+        }
+        assert_eq!(
+            ids,
+            vec![
+                rusqlite::types::Value::Integer(37),
+                rusqlite::types::Value::Integer(91)
+            ]
+        );
     }
 }

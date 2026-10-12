@@ -41,6 +41,19 @@ interface MemoryMutationLogDbRow {
     queued_at: number;
 }
 
+// Databases that predate the v99 lifecycle schema have no operation_id column.
+const operationColumnByDb = new WeakMap<Database, boolean>();
+function hasOperationColumn(db: Database): boolean {
+    const cached = operationColumnByDb.get(db);
+    if (cached !== undefined) return cached;
+    const columns = db.prepare("PRAGMA table_info(memory_mutation_log)").all() as Array<{
+        name: string;
+    }>;
+    const present = columns.some((column) => column.name === "operation_id");
+    if (columns.length > 0) operationColumnByDb.set(db, present);
+    return present;
+}
+
 function assertMemoryMutationType(
     mutationType: string,
 ): asserts mutationType is MemoryMutationType {
@@ -73,12 +86,26 @@ export function queueMemoryMutation(
         category?: string | null;
         newContent?: string | null;
         queuedAt?: number;
+        /**
+         * Shared by every row of one agent multi-row operation (merge, batch archive),
+         * so the rows are recognisable as one all-or-nothing change.
+         */
+        operationId?: string | null;
     },
 ): MemoryMutationLogRow {
     assertMemoryMutationType(input.mutationType);
+    const withOperation = hasOperationColumn(db);
+    if (!withOperation && input.operationId) {
+        // Without the column the rows of one operation could not be recognised as a group.
+        throw new Error("memory_mutation_log has no operation_id column");
+    }
     const result = db
         .prepare(
-            `INSERT INTO memory_mutation_log
+            withOperation
+                ? `INSERT INTO memory_mutation_log
+                (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at, operation_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+                : `INSERT INTO memory_mutation_log
                 (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
@@ -90,6 +117,7 @@ export function queueMemoryMutation(
             input.category ?? null,
             input.newContent ?? null,
             input.queuedAt ?? Date.now(),
+            ...(withOperation ? [input.operationId ?? null] : []),
         ) as {
         lastInsertRowid?: number | bigint;
     };

@@ -51,6 +51,7 @@ import type {
     HiddenRunHandle,
     HistorianProgressCallbacks,
     HistorianRunResult,
+    RetainedHistorianChild,
     StoredCompartmentRange,
     ValidatedHistorianPassResult,
 } from "./compartment-runner-types";
@@ -408,7 +409,17 @@ export async function runValidatedHistorianPass(args: {
     subagentKind?: SubagentKind;
     agentId?: string;
     language?: string;
+    /**
+     * Keep the child whose reply is returned open (`retainedChild` on the result) for
+     * historian turn two. Children of replies that fail validation are closed here.
+     */
+    retainChild?: boolean;
 }): Promise<ValidatedHistorianPassResult> {
+    const withChild = (
+        result: ValidatedHistorianPassResult,
+        run: HistorianRunResult,
+    ): ValidatedHistorianPassResult =>
+        result.ok ? { ...result, retainedChild: run.retained } : result;
     const firstRun = await runHistorianPrompt({
         ...args,
         dumpLabel: `${args.dumpLabelBase}-initial`,
@@ -441,11 +452,16 @@ export async function runValidatedHistorianPass(args: {
                   draftValidation: firstValidation,
                   draftDumpPath: firstRun.dumpPath,
                   draftInvocationId: firstRun.invocationId ?? null,
+                  draftRetained: firstRun.retained,
               })
-            : { ...firstValidation, invocationId: firstRun.invocationId ?? null };
+            : withChild(
+                  { ...firstValidation, invocationId: firstRun.invocationId ?? null },
+                  firstRun,
+              );
         cleanupHistorianDump(args.parentSessionId, firstRun.dumpPath);
         return finalResult;
     }
+    await firstRun.retained?.close();
 
     await args.callbacks?.onRepairRetry?.(firstValidation.error ?? "invalid compartment output");
     const repairPrompt = buildHistorianRepairPrompt(
@@ -487,13 +503,18 @@ export async function runValidatedHistorianPass(args: {
                   draftValidation: repairValidation,
                   draftDumpPath: repairRun.dumpPath,
                   draftInvocationId: repairRun.invocationId ?? null,
+                  draftRetained: repairRun.retained,
               })
-            : { ...repairValidation, invocationId: repairRun.invocationId ?? null };
+            : withChild(
+                  { ...repairValidation, invocationId: repairRun.invocationId ?? null },
+                  repairRun,
+              );
         // Keep firstRun.dumpPath (initial failure) for debugging.
         // Only cleanup the successful repair run's dump.
         cleanupHistorianDump(args.parentSessionId, repairRun.dumpPath);
         return finalResult;
     }
+    await repairRun.retained?.close();
 
     return runFallbackHistorianPass({
         ...args,
@@ -541,8 +562,23 @@ async function runEditorPassOrFallback(args: {
     draftDumpPath?: string;
     draftInvocationId?: number | null;
     model?: ModelInput;
+    /**
+     * The draft's child, when the caller retains children for turn two. The child of
+     * whichever reply is returned (the editor's when accepted, else the draft's) is
+     * kept on the result; the other is closed.
+     */
+    draftRetained?: RetainedHistorianChild;
+    retainChild?: boolean;
 }): Promise<ValidatedHistorianPassResult> {
     shared.sessionLog(args.parentSessionId, "historian two-pass: running editor on draft");
+    const keepDraft = (): ValidatedHistorianPassResult =>
+        args.draftValidation.ok
+            ? {
+                  ...args.draftValidation,
+                  invocationId: args.draftInvocationId ?? null,
+                  retainedChild: args.draftRetained,
+              }
+            : args.draftValidation;
     const editorRun = await runHistorianPrompt({
         client: args.client,
         hiddenCompletionExecutor: args.hiddenCompletionExecutor,
@@ -557,6 +593,7 @@ async function runEditorPassOrFallback(args: {
         agentId: HISTORIAN_EDITOR_AGENT,
         parentInvocationId: args.draftInvocationId ?? null,
         modelOverride: args.model,
+        retainChild: args.retainChild,
     });
 
     if (!editorRun.ok || !editorRun.result) {
@@ -564,7 +601,7 @@ async function runEditorPassOrFallback(args: {
             error: editorRun.error,
         });
         // Editor failed → keep the validated draft; FK links to the draft run.
-        return { ...args.draftValidation, invocationId: args.draftInvocationId ?? null };
+        return keepDraft();
     }
 
     const editorValidation = validateHistorianOutput(
@@ -581,12 +618,19 @@ async function runEditorPassOrFallback(args: {
             { error: editorValidation.error },
         );
         // Editor output was bad — keep editor dump for debugging.
-        return { ...args.draftValidation, invocationId: args.draftInvocationId ?? null };
+        await editorRun.retained?.close();
+        return keepDraft();
     }
 
     cleanupHistorianDump(args.parentSessionId, editorRun.dumpPath);
     shared.sessionLog(args.parentSessionId, "historian two-pass: editor accepted");
-    return { ...editorValidation, invocationId: editorRun.invocationId ?? null };
+    // The editor's reply is the one published, so its child is the one turn two continues.
+    await args.draftRetained?.close();
+    return {
+        ...editorValidation,
+        invocationId: editorRun.invocationId ?? null,
+        retainedChild: editorRun.retained,
+    };
 }
 
 async function runHistorianPrompt(args: {
@@ -608,6 +652,11 @@ async function runHistorianPrompt(args: {
     fallbackModels?: readonly ModelInput[];
     subagentKind?: SubagentKind;
     parentInvocationId?: number | null;
+    /**
+     * Keep the child open after a successful run and hand it back as `retained`, so
+     * turn two can continue the same session. The caller then owns closing it.
+     */
+    retainChild?: boolean;
 }): Promise<HistorianRunResult> {
     const {
         client,
@@ -635,6 +684,7 @@ async function runHistorianPrompt(args: {
     );
     let promptSettled = false;
     let hadUnsettledPrompt = false;
+    let childRetained = false;
     const startedAt = Date.now();
     let invocationRecorded = false;
 
@@ -856,6 +906,42 @@ async function runHistorianPrompt(args: {
             dumpLabel ?? "historian-response",
             result,
         );
+        if (args.retainChild && textResult) {
+            childRetained = true;
+            const retainedHandle = handle;
+            // The child stays open for turn two, but it must not keep other hidden
+            // runs (later historian runs, turn two's own checks) waiting for its slot.
+            executor.detach?.(retainedHandle);
+            const settled = promptSettled;
+            let closed = false;
+            return {
+                ok: true,
+                result,
+                dumpPath,
+                invocationId: invocationId ?? undefined,
+                retained: {
+                    executor,
+                    handle: retainedHandle,
+                    agent: agentId,
+                    system,
+                    model: modelOverride,
+                    directory: sessionDirectory,
+                    turnOneText: textResult,
+                    providerId: completion.providerId,
+                    modelId: completion.modelId,
+                    close: async () => {
+                        if (closed) return;
+                        closed = true;
+                        await executor.close(retainedHandle, {
+                            promptSettled: settled,
+                            privacySensitive: false,
+                            context: "historian",
+                            log: (message) => shared.sessionLog(parentSessionId, message),
+                        });
+                    },
+                },
+            };
+        }
         return { ok: true, result, dumpPath, invocationId: invocationId ?? undefined };
     } catch (modelError: unknown) {
         const desc = describeError(modelError);
@@ -873,12 +959,14 @@ async function runHistorianPrompt(args: {
             ...(modelError instanceof HiddenCompletionRefusal ? { refusal: modelError } : {}),
         };
     } finally {
-        await executor.close(handle, {
-            promptSettled,
-            privacySensitive: false,
-            context: "historian",
-            log: (message) => shared.sessionLog(parentSessionId, message),
-        });
+        // A retained child stays open for turn two; its owner closes it.
+        if (!childRetained)
+            await executor.close(handle, {
+                promptSettled,
+                privacySensitive: false,
+                context: "historian",
+                log: (message) => shared.sessionLog(parentSessionId, message),
+            });
     }
 }
 
@@ -921,6 +1009,7 @@ async function runFallbackHistorianPass(args: {
     error: string;
     language?: string;
     dumpPaths: Array<string | undefined>;
+    retainChild?: boolean;
 }): Promise<ValidatedHistorianPassResult> {
     // Ordered escalation that matches the intended fallback policy:
     //   configured fallback_models (in order)  →  live session model (last resort)
@@ -981,6 +1070,7 @@ async function runFallbackHistorianPass(args: {
             dumpLabel: `${args.dumpLabelBase}-fallback-${i + 1}`,
             modelOverride,
             agentId: args.agentId,
+            retainChild: args.retainChild,
         });
         if (!fallbackRun.ok || !fallbackRun.result) {
             lastError = fallbackRun.error ?? lastError;
@@ -998,8 +1088,13 @@ async function runFallbackHistorianPass(args: {
             // Only cleanup the successful run's dump. Prior failed dumps
             // (args.dumpPaths + earlier chain attempts) are kept for debugging.
             cleanupHistorianDump(args.parentSessionId, fallbackRun.dumpPath);
-            return { ...fallbackValidation, invocationId: fallbackRun.invocationId ?? null };
+            return {
+                ...fallbackValidation,
+                invocationId: fallbackRun.invocationId ?? null,
+                retainedChild: fallbackRun.retained,
+            };
         }
+        await fallbackRun.retained?.close();
         lastError = fallbackValidation.error ?? lastError;
         // Keep the dump for debugging; escalate to the next candidate.
     }

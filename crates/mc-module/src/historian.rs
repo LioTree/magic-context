@@ -6547,6 +6547,7 @@ mod tests {
                     category: "ARCHITECTURE".into(),
                     content: "gated fact".into(),
                     origin_compartment_index: None,
+                    source_range: None,
                 }],
                 events: vec![crate::historian_validate::ParsedEvent {
                     kind: "causal_incident".into(),

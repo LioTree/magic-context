@@ -116,6 +116,8 @@ export interface HistorianPromptFitArgs {
     memories: Memory[];
     memoryEnabled: boolean;
     extractionFree?: boolean;
+    /** The run asks for source-anchored facts; see `buildCompartmentAgentPrompt`. */
+    anchoredFacts?: boolean;
 }
 
 export interface HistorianPromptFitKept {
@@ -247,6 +249,7 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
             inputSource: header,
             memoryEnabled: args.memoryEnabled,
             extractionFree: args.extractionFree,
+            anchoredFacts: args.anchoredFacts,
         });
         let tokens = counted.get(text);
         if (tokens === undefined) {

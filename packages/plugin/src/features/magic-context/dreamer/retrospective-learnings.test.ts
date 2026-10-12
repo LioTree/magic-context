@@ -143,6 +143,26 @@ describe("applyRetrospectiveLearnings", () => {
         expect(getMemoriesByProject(db, PROJECT).length).toBe(1);
     });
 
+    // A retrospective memory is an automated insert: one dreamer-sourced row, no
+    // mutation-log row and no agent fragment. Busting SOFT passes read neither memory
+    // rows nor the log, so it reaches a prompt only at that session's next HARD fold.
+    test("writes an automated dreamer row with no mutation-log row and no agent fragment", () => {
+        db = freshDb();
+        applyRetrospectiveLearnings({
+            db,
+            projectIdentity: PROJECT,
+            sourceSessionId: "ses-1",
+            learnings: parseRetrospectiveLearnings(
+                `<learnings><learning route="memory" category="CONSTRAINTS">Batch provider calls stay under the published rate limit.</learning></learnings>`,
+            ),
+            userMemoryCollectionEnabled: false,
+        });
+        const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
+        expect(count("SELECT COUNT(*) AS n FROM memories WHERE source_type = 'dreamer'")).toBe(1);
+        expect(count("SELECT COUNT(*) AS n FROM memory_mutation_log")).toBe(0);
+        expect(count("SELECT COUNT(*) AS n FROM memory_agent_fragments")).toBe(0);
+    });
+
     test("gate ON inserts observation candidates", () => {
         db = freshDb();
         const learnings = parseRetrospectiveLearnings(`<learnings>

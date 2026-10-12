@@ -1,7 +1,7 @@
 import type { Database } from "../../../shared/sqlite";
 
-import { archiveMemory } from "../memory";
-import { queueMemoryMutation } from "../storage-memory-mutation-log";
+import { archiveMemory, getMemoryById } from "../memory";
+import { recordAutomatedMemoryEdit } from "../memory/lifecycle-applier";
 import { type LeaseAcquisition, leaseOwnershipMatches, runLeaseGuardedWrite } from "./lease";
 import {
     DreamerModuleFailureError,
@@ -88,14 +88,15 @@ async function archiveExpiredThroughModule(args: {
             const response = await args.moduleRoute.moduleClient.call({
                 sessionId: args.moduleRoute.moduleSessionId,
                 projectRoot: args.moduleRoute.moduleProjectRoot,
-                method: "ctx_memory",
+                // The module's automated expiry, not the agent archive: it rechecks each
+                // row's declared expiry and archives with undo history and no
+                // mutation-log row, as the local path below does.
+                method: "memory.expire",
                 body: {
-                    name: "ctx_memory",
+                    name: "memory.expire",
                     arguments: {
-                        action: "archive",
                         memory_project: args.projectIdentity,
                         ids: moduleBatch,
-                        reason: EXPIRED_ARCHIVE_REASON,
                         command_id: `${args.moduleRoute.moduleCommandId}:expire:${offset / MODULE_ARCHIVE_BATCH_SIZE}`,
                     },
                 },
@@ -159,13 +160,17 @@ export async function archiveExpiredMemories(args: {
             args.now,
         ).filter((id) => selectedIds.has(id));
         for (const id of stillExpired) {
+            // Expiry was declared when the memory was written, so archiving it is a
+            // grounded automated edit: undo history, no mutation-log row. Prompts
+            // drop the row at their next natural HARD fold.
+            const before = getMemoryById(args.db, id);
             archiveMemory(args.db, id, EXPIRED_ARCHIVE_REASON);
-            queueMemoryMutation(args.db, {
-                projectPath: args.projectIdentity,
-                mutationType: "archive",
-                targetMemoryId: id,
-                queuedAt: args.now,
-            });
+            if (before)
+                recordAutomatedMemoryEdit(args.db, {
+                    writer: "expire",
+                    before,
+                    reason: EXPIRED_ARCHIVE_REASON,
+                });
         }
         return stillExpired.length;
     });

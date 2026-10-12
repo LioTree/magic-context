@@ -64,7 +64,7 @@ describe("migration 99", () => {
             ])
                 db.exec(`ALTER TABLE memories DROP COLUMN ${column}`);
             db.exec(
-                "ALTER TABLE memory_mutation_log DROP COLUMN adoption_class; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,description TEXT,applied_at INTEGER)",
+                "DROP INDEX idx_memory_mutation_log_operation; ALTER TABLE memory_mutation_log DROP COLUMN operation_id; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,description TEXT,applied_at INTEGER)",
             );
             for (const migration of MIGRATIONS.filter((m) => m.version <= 97)) {
                 migration.up(db);

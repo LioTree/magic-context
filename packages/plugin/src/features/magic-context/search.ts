@@ -1978,16 +1978,18 @@ export function resolveMemoriesByIdsForSearch(args: {
         return null;
     }
     const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
+    // Search returns current memory only. An archived or superseded row is history:
+    // asking for its id finds nothing, exactly as the semantic and full-text lanes do.
     const fetched = workspace.isWorkspaced
         ? getMemoriesByProjects(
               args.db,
               workspace.expandedIdentities,
-              ["active", "permanent", "archived"],
+              ["active", "permanent"],
               Date.now(),
               workspace.ownIdentities,
               workspace.shareCategories,
           )
-        : getMemoriesByProject(args.db, args.projectPath, ["active", "permanent", "archived"]);
+        : getMemoriesByProject(args.db, args.projectPath, ["active", "permanent"]);
     if (fetched.length === 0) {
         return null;
     }

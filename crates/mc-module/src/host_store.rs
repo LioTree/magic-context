@@ -96,10 +96,12 @@ pub const DOMAIN_TABLES: &[&str] = &[
     "compartment_events",
     "compartments",
     "memories",
+    "memory_agent_fragments",
     "memory_classification_items",
     "memory_conflict_links",
     "memory_decision_receipts",
     "memory_embedding_watermarks",
+    "memory_history",
     "memory_journal",
     "memory_mutation_log",
     "memory_pending_facts",
@@ -343,6 +345,14 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
         "58c79f0e321c82007bebfe3fb250e318786c920ac36320e6883d44013d051fd5",
     ),
     (
+        "memory_agent_fragments",
+        "f0c95f8d4c5610e0a37b196be1e0b646e50fecda2f3cddafe59b1e4930a58d56",
+    ),
+    (
+        "memory_history",
+        "0fe79728828749f14b1351f91eab71d8c603d987446cb14ee665a14ffb1ab346",
+    ),
+    (
         "memory_classification_items",
         "f414a42b0dd8a73e859c8687089c5616abe3ae12fb4fe33e2fbbbb30646c57cc",
     ),
@@ -364,7 +374,7 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     ),
     (
         "memory_mutation_log",
-        "17c675a535e7b8ea1589c769c0cd82c7f1524a32b7b8a471154dfb8f97b6a83f",
+        "3df65a4de3a311e953e06adbe65c53f168c51e9847322130b5adff823ff6bb91",
     ),
     (
         "memory_pending_facts",
@@ -1099,7 +1109,12 @@ impl HostStore {
 fn companion_tables(table: &str) -> &'static [&'static str] {
     match table {
         "compartments" => &["compartment_history_versions"],
-        "memories" => &["memory_mutation_log", "memory_verifications"],
+        "memories" => &[
+            "memory_mutation_log",
+            "memory_verifications",
+            "memory_agent_fragments",
+            "memory_history",
+        ],
         _ => &[],
     }
 }

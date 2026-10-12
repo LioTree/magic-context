@@ -4,6 +4,7 @@ import { isCompactionEnabled, isDreamerRunnable } from "../../config/agent-disab
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
 import { getObservedEpochFloor } from "../../features/magic-context/storage-meta-persisted";
+import { agentSaveClassificationAnchor } from "../../hooks/magic-context/agent-save-classification";
 import { setCtxReduceRegisteredGlobally } from "../../hooks/magic-context/ctx-reduce-availability";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
@@ -66,6 +67,8 @@ export async function registerTools(
                   ...createCtxMemoryTools({
                       ...project,
                       ...(rustToolBackends ? { rustToolBackends } : {}),
+                      agentSaveClassificationAnchor: (location) =>
+                          agentSaveClassificationAnchor(location),
                   }),
                   ...createCtxMemoryListTools({
                       ...project,

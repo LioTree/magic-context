@@ -316,6 +316,18 @@ export interface CheckRequest {
     pairs: CheckPair[];
     input: string;
 }
+/**
+ * Thrown by a check carrier when it cannot tell whether a dispatched check was
+ * answered (a crash, a lost reply, a local timeout with no provider result). The
+ * check stays dispatched and its fact stays reserved, so a later run reattaches the
+ * same request by key instead of sending it again or charging an attempt.
+ */
+export class CheckOutcomeUnknownError extends Error {
+    constructor(message = "check outcome unknown") {
+        super(message);
+        this.name = "CheckOutcomeUnknownError";
+    }
+}
 export type CheckOutcome =
     | { ok: true }
     | { ok: false; reason: string; retryable: boolean; reportedProfile?: ReportedProfile };
@@ -382,7 +394,8 @@ export async function runMemoryChecks(
         let reply: CheckReply;
         try {
             reply = await send(request);
-        } catch {
+        } catch (error) {
+            if (error instanceof CheckOutcomeUnknownError) throw error;
             return { ok: false, reason: "check_transport", retryable: true };
         }
         if (

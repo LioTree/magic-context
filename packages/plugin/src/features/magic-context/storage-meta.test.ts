@@ -96,8 +96,10 @@ describe("storage-meta", () => {
             // legacy FTS rows.
             expect(db.transaction).toHaveBeenCalledTimes(1);
             // The runner and score-history tables are session-owned too; their
-            // deletion must stay in the same transaction as other session state.
-            expect(db.prepare).toHaveBeenCalledTimes(51);
+            // deletion must stay in the same transaction as other session state,
+            // and so do this session's agent memory fragments and the check for its
+            // uncommitted memory publications.
+            expect(db.prepare).toHaveBeenCalledTimes(53);
             const sqls = db.prepare.mock.calls.map(([sql]) => sql);
             for (const table of [
                 "host_runner_entries",

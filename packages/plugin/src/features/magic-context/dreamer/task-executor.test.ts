@@ -573,7 +573,12 @@ describe("createDreamTaskExecutor — curate", () => {
                     "SELECT mutation_type, target_memory_id FROM memory_mutation_log WHERE project_path = ?",
                 )
                 .all(project),
-        ).toEqual([{ mutation_type: "archive", target_memory_id: expired.id }]);
+        ).toEqual([]);
+        // Expiry archives directly with undo history and no mutation-log row, so
+        // prompts drop the row only at their next natural HARD fold.
+        expect(db.prepare("SELECT memory_id, reason FROM memory_history").all()).toEqual([
+            { memory_id: expired.id, reason: "expired" },
+        ]);
         expect(
             JSON.parse(getDreamRuns(db, project)[0]?.memory_changes_json ?? "null"),
         ).toMatchObject({

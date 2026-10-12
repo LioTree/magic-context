@@ -9,6 +9,7 @@ import {
     openCurrentDatabase as openDatabase,
 } from "../features/magic-context/storage";
 import { getObservedEpochFloor } from "../features/magic-context/storage-meta-persisted";
+import { agentSaveClassificationAnchor } from "../hooks/magic-context/agent-save-classification";
 import { setCtxReduceRegisteredGlobally } from "../hooks/magic-context/ctx-reduce-availability";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
@@ -177,6 +178,8 @@ export function createToolRegistry(args: {
                   // toolContext.agent in tools.ts).
                   allowedActions: [...CTX_MEMORY_ACTIONS],
                   rustToolBackends,
+                  agentSaveClassificationAnchor: (location) =>
+                      agentSaveClassificationAnchor(location),
               })
             : {}),
         ...(memoryEnabled && args.includeDreamerOnlyTools

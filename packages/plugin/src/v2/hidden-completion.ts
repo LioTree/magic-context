@@ -68,6 +68,11 @@ interface RunState {
     child: PersistedHiddenChild;
     releaseRole: () => void;
     completion?: HiddenCompletion;
+    /**
+     * The settled exchanges of this run, oldest first. A request that asks to
+     * continue the conversation (historian turn two) is sent after them.
+     */
+    turns: Array<{ prompt: string; reply: string }>;
     failed: boolean;
     /** A failure other than a settled provider error row (dispatch error, refusal, timeout, abort). */
     unsettledFailure: boolean;
@@ -92,6 +97,15 @@ function configuredHead(identity: HiddenRunIdentity): Model | undefined {
         if (parsed) return { ...parsed, ...(entry?.qualifier ? { variant: entry.qualifier } : {}) };
     }
     return undefined;
+}
+
+/**
+ * Which concurrency slot a run waits for. Runs of one role are serialized, except
+ * memory narrow checks: they are short single-turn calls a historian turn two makes
+ * while its own historian child is still open, so they wait only for each other.
+ */
+function slotFor(identity: HiddenRunIdentity, role: HiddenChildRole): string {
+    return identity.metadata?.memoryCheck === true ? "memory-check" : role;
 }
 
 function roleFor(identity: HiddenRunIdentity): HiddenChildRole {
@@ -373,6 +387,7 @@ export function createLateHiddenExecutor(
         recover: (id) => wired().recover?.(id) ?? Promise.resolve(null),
         recoveryState: (id) => wired().recoveryState?.(id) ?? Promise.resolve("unknown"),
         interrupt: (id) => wired().interrupt?.(id) ?? Promise.resolve(),
+        detach: (handle) => current()?.detach?.(handle),
         close: (handle, settlement) => wired().close(handle, settlement),
     };
 }
@@ -383,7 +398,7 @@ export async function createV2HiddenCompletionExecutor(
 ): Promise<HiddenCompletionExecutor> {
     const runs = new WeakMap<HiddenRunHandle, RunState>();
     const generation = options.generation ?? "opencode2";
-    const roleTails = new Map<HiddenChildRole, Promise<void>>();
+    const roleTails = new Map<string, Promise<void>>();
     const note = options.log ?? log;
 
     const removeSession = host.removeSession;
@@ -401,18 +416,23 @@ export async function createV2HiddenCompletionExecutor(
         },
     );
 
-    const acquireRole = async (role: HiddenChildRole): Promise<() => void> => {
-        const previous = roleTails.get(role) ?? Promise.resolve();
+    const acquireRole = async (slot: string): Promise<() => void> => {
+        const previous = roleTails.get(slot) ?? Promise.resolve();
         let release!: () => void;
         const gate = new Promise<void>((resolve) => {
             release = resolve;
         });
         const tail = previous.then(() => gate);
-        roleTails.set(role, tail);
+        roleTails.set(slot, tail);
         await previous;
+        let released = false;
+        // Idempotent: a run kept open for turn two releases its slot early (`detach`)
+        // and again when it closes.
         return () => {
+            if (released) return;
+            released = true;
             release();
-            if (roleTails.get(role) === tail) roleTails.delete(role);
+            if (roleTails.get(slot) === tail) roleTails.delete(slot);
         };
     };
 
@@ -514,7 +534,7 @@ export async function createV2HiddenCompletionExecutor(
         capabilities: V2_HIDDEN_EXECUTOR_CAPABILITIES,
         async open(identity) {
             const role = roleFor(identity);
-            const releaseRole = await acquireRole(role);
+            const releaseRole = await acquireRole(slotFor(identity, role));
             let openedChild: PersistedHiddenChild | undefined;
             try {
                 await options.ensureAgent?.();
@@ -531,6 +551,7 @@ export async function createV2HiddenCompletionExecutor(
                     role,
                     child: active,
                     releaseRole,
+                    turns: [],
                     failed: false,
                     unsettledFailure: false,
                     retired: false,
@@ -579,6 +600,9 @@ export async function createV2HiddenCompletionExecutor(
                 request,
                 shaped: false,
                 budget: run.budget,
+                ...(request.continueConversation === true && run.turns.length > 0
+                    ? { priorTurns: [...run.turns] }
+                    : {}),
             };
             options.hook.registerAttempt(marker, attempt);
             const deadline = Date.now() + run.identity.timeoutMs;
@@ -745,6 +769,7 @@ export async function createV2HiddenCompletionExecutor(
                     providerId: row.data.model?.providerID ?? requested.providerID,
                     modelId: row.data.model?.id ?? requested.modelID,
                 };
+                if (text) run.turns.push({ prompt: promptText(request), reply: text });
                 // Recorded for `keep_subagents` retention: this child now holds a settled run.
                 if (!run.child.ever_settled) run.child = lifecycle.markEverSettled(run.child);
             } catch (caught) {
@@ -785,6 +810,9 @@ export async function createV2HiddenCompletionExecutor(
                 request.signal?.removeEventListener("abort", onAbort);
                 options.hook.releaseAttempt(marker);
             }
+        },
+        detach(handle) {
+            runs.get(handle)?.releaseRole();
         },
         async collect(handle) {
             const completion = runs.get(handle)?.completion;

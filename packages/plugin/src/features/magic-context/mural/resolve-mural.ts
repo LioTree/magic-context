@@ -13,6 +13,8 @@ export interface MuralWireOptions {
     supportsVision: boolean;
     dataUrl?: string;
     contentHash?: string;
+    /** Memory ids drawn as cues in this image. A cue never counts as visible full text. */
+    cueMemoryIds?: number[];
 }
 
 /** A single deterministic mural entry: a compressed cue plus the ordering

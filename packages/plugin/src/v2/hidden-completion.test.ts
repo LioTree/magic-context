@@ -13,6 +13,7 @@ import {
 } from "../shared/model-suggestion-retry";
 import { Database } from "../shared/sqlite";
 import {
+    createLateHiddenExecutor,
     createV2HiddenCompletionExecutor,
     type HiddenChildHost,
     toolLoopMessages,
@@ -1342,4 +1343,53 @@ test("OpenCode 2 recovery preserves actual model and length/error termination me
         failed: true,
     });
     f.db.close();
+});
+
+test("rescore and memory-check slots coexist with retained historian turns through the late executor", async () => {
+    const f = await setup("merged-host", { keepSubagents: true });
+    const executor = createLateHiddenExecutor(() => f.executor);
+    const historian = await executor.open({ ...run, kind: "historian", agent: "historian" });
+    const scorePromise = executor.open({ ...run, kind: "rescore", agent: "rescore" });
+    const checkPromise = executor.open({
+        ...run,
+        kind: "historian",
+        metadata: { memoryCheck: true },
+    });
+    let nextHistorian: Promise<Awaited<ReturnType<typeof executor.open>>> | undefined;
+    try {
+        await eventually(() => f.creates.length === 3);
+        const [score, check] = await Promise.all([scorePromise, checkPromise]);
+        expect(f.creates[1].agent).toBe("rescore");
+        expect(f.creates[1].metadata.role).toBe("rescore");
+        expect(f.creates[1].permissions).toEqual([{ action: "*", resource: "*", effect: "deny" }]);
+        await executor.attempt(historian, request());
+        executor.detach?.(historian);
+        nextHistorian = executor.open({ ...run, kind: "historian", agent: "historian" });
+        await eventually(() => f.creates.length === 4);
+        await nextHistorian;
+        await executor.attempt(
+            historian,
+            request("cheap", { parts: [{ type: "text", text: "turn two" }] }),
+        );
+        expect(f.requests[1].messages).toEqual([
+            { role: "user", content: [{ type: "text", text: "calibrated chunk" }] },
+            { role: "assistant", content: [{ type: "text", text: "editor completion" }] },
+            { role: "user", content: [{ type: "text", text: "turn two" }] },
+        ]);
+        await executor.attempt(score, request());
+        f.rows.appendIdle(score.id, "succeeded");
+        expect(await executor.recoveryState?.(score.id)).toBe("terminal");
+        expect((await executor.recover?.(score.id))?.modelId).toBe("cheap");
+        await executor.interrupt?.(score.id);
+        expect(f.interrupts).toContain(score.id);
+        expect(f.requests[2].tools).toEqual({});
+        expect(check.id).not.toBe(historian.id);
+        expect(f.removed).not.toContain(historian.id);
+    } finally {
+        await close(f.executor, historian, true);
+        await close(f.executor, await scorePromise, true);
+        await close(f.executor, await checkPromise, false);
+        if (nextHistorian) await close(f.executor, await nextHistorian, false);
+        f.db.close();
+    }
 });

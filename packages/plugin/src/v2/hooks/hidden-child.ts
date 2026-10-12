@@ -173,6 +173,19 @@ export interface HiddenChildAttempt {
     budget?: ReturnType<typeof createDreamTokenBudget>;
     observedMessages?: SessionContext["messages"];
     marker?: string;
+    /**
+     * Earlier settled exchanges of the same run, sent before this attempt's prompt
+     * when the caller continues the conversation (historian turn two after turn one).
+     */
+    priorTurns?: Array<{ prompt: string; reply: string }>;
+}
+
+/** Prior exchanges as the user/assistant messages that precede the current prompt. */
+function priorTurnMessages(attempt: HiddenChildAttempt): SessionContext["messages"] {
+    return (attempt.priorTurns ?? []).flatMap((turn) => [
+        { role: "user", content: [{ type: "text", text: turn.prompt }] },
+        { role: "assistant", content: [{ type: "text", text: turn.reply }] },
+    ]) as SessionContext["messages"];
 }
 
 /** Last user text on a context draft. 2.0.5 may use a string body, extra parts, or input_text. */
@@ -547,6 +560,7 @@ export class HiddenChildHook {
         draft.system = [{ type: "text", text: system }];
         if (!selected.shaped) {
             draft.messages = [
+                ...priorTurnMessages(selected),
                 { role: "user", content: this.calibratedParts(selected, draft, raw) },
             ];
         } else {
@@ -575,6 +589,7 @@ export class HiddenChildHook {
             // text sent on step one. Replace only that placeholder, preserving all
             // assistant tool calls and tool results after it.
             draft.messages = [
+                ...priorTurnMessages(selected),
                 { ...first, content: this.calibratedParts(selected, draft, raw) },
                 ...draft.messages.slice(start + 1),
             ];

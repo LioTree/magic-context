@@ -1,12 +1,20 @@
 import { sessionLog } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
+import {
+    recordAgentFragment,
+    renderAddedFragmentLine,
+    renderRemovedFragmentLine,
+    renderSupersededFragmentLine,
+    renderUpdatedFragmentLine,
+} from "./agent-fragments";
+import { sessionShowsMemoryText } from "./applied-projection";
 import { CATEGORY_DEFAULT_TTL } from "./constants";
 import { embedTextForProject } from "./embedding";
 import { invalidateMemory } from "./embedding-cache";
 import { checkMemoryRevision } from "./lifecycle-check-ledger";
 import { MAX_STAGE2_ATTEMPTS } from "./lifecycle-constants";
-import type { CheckReply, CheckRequest } from "./lifecycle-gates";
+import type { CheckReply, CheckRequest, ReportedProfile } from "./lifecycle-gates";
 import {
     type GateContext,
     type GatePlan,
@@ -46,6 +54,11 @@ export interface ApplierReceipt {
     inserted?: boolean;
     adoptionClass: AdoptionClass;
     supersededIds?: number[];
+    /**
+     * The model profile the provider reported, recorded when the decision was deferred
+     * because that profile (or one of its checks) is not a replay-validated one.
+     */
+    reportedProfile?: ReportedProfile;
 }
 export interface AdmissionRequest {
     key: string;
@@ -56,6 +69,8 @@ export interface AdmissionRequest {
     conflictTargetId?: number;
     factId?: number;
     classificationAnchor?: { toolCallPartId: string; saveOrdinal: number };
+    /** Harness of `input.sourceSessionId`, for an agent save's m[1] fragment. */
+    sourceHarness?: string;
 }
 export function resolveExpiresAt(category: MemoryInput["category"]): number | null {
     const ttl = CATEGORY_DEFAULT_TTL[category];
@@ -92,7 +107,8 @@ function recordReceipt(
         );
     return receipt;
 }
-function tsOwnsMemory(db: Database, projectPath: string): boolean {
+/** True when this TypeScript process holds memory authority for the project. */
+export function tsOwnsMemory(db: Database, projectPath: string): boolean {
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='authority_managed'").get())
         return true;
     return !db
@@ -194,7 +210,13 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
             } else {
                 memory = insertMemory(db, {
                     ...request.input,
-                    sourceType: request.operation === "agent_save" ? "agent" : "historian",
+                    // A dreamer save keeps its provenance; every other save is the agent's.
+                    sourceType:
+                        request.operation !== "agent_save"
+                            ? "historian"
+                            : request.input.sourceType === "dreamer"
+                              ? "dreamer"
+                              : "agent",
                     importance: request.operation === "agent_save" ? 50 : request.input.importance,
                     expiresAt:
                         request.operation === "agent_save"
@@ -203,6 +225,33 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
                 });
             }
             if (target) linkConflict(db, request.key, memory.id, target.id);
+            // An agent's own save surfaces in its session's m[1] as a fragment, including a
+            // save that matched an existing memory this session does not show: the agent
+            // asked for it, so it must reach the agent's own session. Historian admissions
+            // and dreamer saves are automated: no fragment, so they wait for the next HARD
+            // fold.
+            if (
+                request.operation === "agent_save" &&
+                request.input.sourceSessionId &&
+                request.input.sourceType !== "dreamer" &&
+                (!match ||
+                    !sessionShowsMemoryText(
+                        db,
+                        request.input.sourceSessionId,
+                        memory.id,
+                        memory.content,
+                    ))
+            )
+                recordAgentFragment(db, {
+                    sessionId: request.input.sourceSessionId,
+                    harness: request.sourceHarness,
+                    projectPath: request.input.projectPath,
+                    operationKey: request.key,
+                    memoryIds: [memory.id],
+                    currentId: memory.id,
+                    lines: [renderAddedFragmentLine(memory.id, memory.category, memory.content)],
+                    visibleTexts: [{ id: memory.id, text: memory.content }],
+                });
             if (request.operation === "agent_save" && request.classificationAnchor) {
                 db.prepare(
                     "INSERT OR IGNORE INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal) SELECT project_path,id,revision,?,?,? FROM memories WHERE id=?",
@@ -224,12 +273,72 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
         .immediate();
 }
 
+/**
+ * Resolve a candidate fact without touching any memory row: `covered` (the mapping
+ * is recorded on the fact only), and every `decided_pending` outcome that needs no
+ * applier write (abstain, a malformed decision, an approval-gated operation, a
+ * recitation). One transaction writes the receipt keyed by the decision key and the
+ * fact's new state; a receipt already recorded under the key wins.
+ */
+export function resolveFactDecision(
+    db: Database,
+    request: {
+        key: string;
+        projectPath: string;
+        factId: number;
+        operation: string;
+        /**
+         * `retryable` consumes one of the fact's attempts: the fact becomes
+         * `retryable`, or `decided_pending` once the attempt reaches
+         * `MAX_STAGE2_ATTEMPTS`.
+         */
+        state: "covered" | "decided_pending" | "retryable";
+        reason: string;
+        memoryId?: number;
+        mapping?: unknown;
+        /** An approval-gated operation, recorded in the review inbox in the same transaction. */
+        proposal?: Pick<
+            ProposalRequest,
+            "sourceSessionId" | "operation" | "targetIds" | "proposal"
+        >;
+    },
+): ApplierReceipt {
+    return db
+        .transaction(() => {
+            const existing = readReceipt(db, request.key);
+            if (existing) return existing;
+            if (request.state === "retryable")
+                return resolveRevisionFailure(db, request, request.reason, true);
+            const receipt = recordReceipt(db, request, {
+                state: request.state,
+                reason: request.reason,
+                memoryId: request.memoryId,
+                adoptionClass: null,
+            });
+            if (request.mapping !== undefined)
+                db.prepare("UPDATE memory_pending_facts SET mapping_json=? WHERE id=?").run(
+                    JSON.stringify(request.mapping),
+                    request.factId,
+                );
+            if (request.proposal)
+                proposeMemoryMutation(db, {
+                    ...request.proposal,
+                    projectPath: request.projectPath,
+                    key: request.key,
+                    writer: "historian",
+                });
+            return receipt;
+        })
+        .immediate();
+}
+
 export interface ProposalRequest {
     projectPath: string;
     sourceSessionId?: string;
     key?: string;
-    writer: "curate";
-    operation: "update" | "archive" | "merge";
+    /** Automated writers whose retirements and ungrounded edits wait for review. */
+    writer: "curate" | "verify" | "historian";
+    operation: "update" | "archive" | "merge" | "promote_rule";
     targetIds: number[];
     proposal: unknown;
 }
@@ -263,6 +372,42 @@ export function proposeMemoryMutation(db: Database, request: ProposalRequest): A
         .immediate();
 }
 
+/**
+ * Record an automated writer's direct edit of one memory (a verify content
+ * correction, an expiry archive) as undo history. The caller has already changed
+ * the row inside the same transaction. Automated edits write no mutation-log row
+ * and no agent fragment: they reach a prompt only at the next natural HARD fold.
+ */
+export function recordAutomatedMemoryEdit(
+    db: Database,
+    input: {
+        writer: "verify" | "expire";
+        before: Memory;
+        reason: string;
+    },
+): void {
+    const revision = getMemoryRevision(db, input.before.id);
+    if (revision === null) return;
+    const after = getMemoryById(db, input.before.id);
+    const key = `${input.writer}:${input.before.id}:${revision}`;
+    db.prepare(
+        "INSERT OR IGNORE INTO memory_history(memory_id,revision,previous_text,after_text,before_json,after_json,applied_at,reason,evidence_json,source_ids_json,decision_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+    ).run(
+        input.before.id,
+        revision,
+        input.before.content,
+        after?.content ?? input.before.content,
+        JSON.stringify(input.before),
+        JSON.stringify(after),
+        Date.now(),
+        input.reason,
+        "[]",
+        JSON.stringify([input.before.id]),
+        key,
+    );
+    db.prepare("UPDATE memories SET revision=revision+1 WHERE id=?").run(input.before.id);
+}
+
 export interface AgentMemoryMutation {
     key: string;
     projectPath: string;
@@ -272,6 +417,8 @@ export interface AgentMemoryMutation {
     category?: MemoryInput["category"];
     reason?: string;
     sourceSessionId: string;
+    /** The harness of that session; defaults to this process's harness. */
+    sourceHarness?: string;
 }
 export class MemoryContentDuplicateError extends Error {
     constructor(readonly memoryId: number) {
@@ -304,6 +451,66 @@ function clearAgentMutationDerivedData(db: Database, memory: Memory): void {
     if (db.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_verifications'").get())
         db.prepare("DELETE FROM memory_verifications WHERE memory_id=?").run(memory.id);
     invalidateMemory(memory.projectPath, memory.id);
+}
+
+/**
+ * The m[1] lines an agent operation shows its own session (see agent-fragments.ts).
+ * A merge shows every superseded source and, unless this session already shows the
+ * survivor's current text, the survivor's text; an archive shows each removal.
+ */
+function agentMutationFragment(
+    operation: AgentMemoryMutation["operation"],
+    sources: readonly Memory[],
+    canonical: Memory | null,
+    survivorExisted: boolean,
+    category: string,
+    finalText: string | undefined,
+    survivorShown: boolean,
+): {
+    memoryIds: number[];
+    currentId: number | null;
+    lines: string[];
+    visibleTexts: Array<{ id: number; text: string }>;
+} {
+    if (operation === "archive")
+        return {
+            memoryIds: sources.map((source) => source.id),
+            currentId: null,
+            lines: sources.map((source) => renderRemovedFragmentLine(source.id)),
+            visibleTexts: [],
+        };
+    if (!canonical || finalText === undefined)
+        return { memoryIds: [], currentId: null, lines: [], visibleTexts: [] };
+    if (operation === "update")
+        return {
+            memoryIds: [canonical.id],
+            currentId: canonical.id,
+            lines: [renderUpdatedFragmentLine(canonical.id, category, finalText)],
+            visibleTexts: [{ id: canonical.id, text: finalText }],
+        };
+    const lines = sources
+        .filter((source) => source.id !== canonical.id)
+        .map((source) => renderSupersededFragmentLine(source.id, canonical.id));
+    const original = sources.find((source) => source.id === canonical.id);
+    // The survivor's text is shown unless this session's served pair already shows
+    // exactly that text for it. Whether the row is new or changed does not decide it:
+    // an unchanged survivor another writer added is still unknown to this session.
+    const survivorChanged = !survivorShown;
+    if (survivorChanged)
+        lines.push(
+            survivorExisted && original
+                ? renderUpdatedFragmentLine(canonical.id, category, finalText)
+                : renderAddedFragmentLine(canonical.id, category, finalText),
+        );
+    return {
+        memoryIds: [
+            ...sources.map((source) => source.id).filter((id) => id !== canonical.id),
+            canonical.id,
+        ],
+        currentId: canonical.id,
+        lines,
+        visibleTexts: survivorChanged ? [{ id: canonical.id, text: finalText }] : [],
+    };
 }
 
 /** Agent tool calls authorize immediate changes; automated curation remains a proposal. */
@@ -405,6 +612,7 @@ export function applyAgentMemoryMutation(
                         projectPath: normalizeStoredProjectPath(source.projectPath),
                         mutationType: "archive",
                         targetMemoryId: source.id,
+                        operationId: request.key,
                     });
                 }
             } else {
@@ -427,6 +635,7 @@ export function applyAgentMemoryMutation(
                         targetMemoryId: canonical.id,
                         category,
                         newContent: content!,
+                        operationId: request.key,
                     });
                 }
                 const mergedFrom = new Set(sources.map((source) => source.id));
@@ -449,6 +658,7 @@ export function applyAgentMemoryMutation(
                             mutationType: "superseded",
                             targetMemoryId: source.id,
                             supersededById: canonical.id,
+                            operationId: request.key,
                         });
                         supersededIds.push(source.id);
                     }
@@ -486,6 +696,23 @@ export function applyAgentMemoryMutation(
                     request.key,
                 );
             }
+            recordAgentFragment(db, {
+                sessionId: request.sourceSessionId,
+                harness: request.sourceHarness,
+                projectPath: normalizeStoredProjectPath(request.projectPath),
+                operationKey: request.key,
+                ...agentMutationFragment(
+                    request.operation,
+                    sources,
+                    canonical,
+                    duplicate !== null,
+                    category,
+                    content,
+                    canonical !== null &&
+                        content !== undefined &&
+                        sessionShowsMemoryText(db, request.sourceSessionId, canonical.id, content),
+                ),
+            });
             const receipt = record({
                 state: "applied",
                 reason: request.operation,
@@ -501,15 +728,22 @@ export function applyAgentMemoryMutation(
         .immediate();
 }
 
-// Before edits can apply, each renderer must replay the memory bytes it already served.
-// Reading new canonical text on a deferred pass would silently change the cached prompt.
-const MEMORY_PROJECTION_READY = false;
+/**
+ * Apply one gated historian edit, merge or replacement (turn two). It is an
+ * automated edit: it changes canonical rows and writes history, but no mutation-log
+ * row and no agent fragment, so it reaches a prompt only at that session's next
+ * natural HARD fold (docs/designs/memory-s3-projection.md, "Automated writers").
+ *
+ * Order: a recorded receipt answers at once; a project whose memory the module owns
+ * is `authority_elsewhere`; a source that moved since the decision read it is a CAS
+ * loss; then every deterministic gate runs before any check call.
+ */
 export async function applyHistorianRevision(
     db: Database,
     decision: RevisionDecision,
     context: GateContext,
     owner: { sessionId: string; harness: string },
-    reattachOrSend: (request: CheckRequest) => Promise<CheckReply>,
+    reattachOrSend: (request: CheckRequest, options: { reattach: boolean }) => Promise<CheckReply>,
     factId?: number,
 ): Promise<ApplierReceipt> {
     const existing = readReceipt(db, decision.key);
@@ -525,7 +759,6 @@ export async function applyHistorianRevision(
             return row ? [row as GateContext["sources"][number]] : [];
         }),
     };
-    const plan = planMemoryRevision(decision, context);
     const request = {
         key: decision.key,
         projectPath: decision.projectPath,
@@ -544,14 +777,35 @@ export async function applyHistorianRevision(
                     }),
             )
             .immediate();
-    if (!plan.ok || !MEMORY_PROJECTION_READY)
+    // A target or source of this project that was archived or revised after the
+    // decision read it: the decision is stale, not wrong, so it is retried.
+    if (
+        Array.isArray(decision.expectedSources) &&
+        decision.expectedSources.some((expected) => {
+            const source = context.sources.find((row) => row.id === expected?.id);
+            return (
+                source !== undefined &&
+                source.projectPath === decision.projectPath &&
+                (source.status === "archived" || source.revision !== expected.revision)
+            );
+        })
+    )
+        return db
+            .transaction(
+                () =>
+                    readReceipt(db, decision.key) ??
+                    resolveRevisionFailure(db, request, "cas_loss", true),
+            )
+            .immediate();
+    const plan = planMemoryRevision(decision, context);
+    if (!plan.ok)
         return db
             .transaction(
                 () =>
                     readReceipt(db, decision.key) ??
                     recordReceipt(db, request, {
                         state: "decided_pending",
-                        reason: plan.ok ? "projection_pending" : plan.reason,
+                        reason: plan.reason,
                         adoptionClass: memoryAdoptionClass(decision.action),
                     }),
             )
@@ -562,7 +816,13 @@ export async function applyHistorianRevision(
             const recovered = readReceipt(db, decision.key);
             if (recovered) return recovered;
             if (!outcome.ok)
-                return resolveRevisionFailure(db, request, outcome.reason, outcome.retryable);
+                return resolveRevisionFailure(
+                    db,
+                    request,
+                    outcome.reason,
+                    outcome.retryable,
+                    outcome.reportedProfile,
+                );
             const rows = decision.expectedSources.map(
                 (expected) =>
                     db
@@ -608,6 +868,7 @@ function resolveRevisionFailure(
     request: { key: string; projectPath: string; operation: string; factId?: number },
     reason: string,
     retryable: boolean,
+    reportedProfile?: ReportedProfile,
 ): ApplierReceipt {
     if (retryable && request.factId !== undefined)
         db.prepare(
@@ -625,8 +886,13 @@ function resolveRevisionFailure(
         state: retryable && attempts < MAX_STAGE2_ATTEMPTS ? "retryable" : "decided_pending",
         reason,
         adoptionClass: memoryAdoptionClass(request.operation),
+        ...(reportedProfile ? { reportedProfile } : {}),
     });
 }
+/**
+ * Commit a gated historian revision. Automated edits write no mutation-log row:
+ * nothing between HARD folds renders them (see agent-fragments.ts).
+ */
 function commitMemoryRevision(
     db: Database,
     decision: RevisionDecision,
@@ -681,16 +947,6 @@ function commitMemoryRevision(
                 computeNormalizedHash(decision.finalText),
             );
             db.prepare("UPDATE memories SET revision=revision+1 WHERE id=?").run(source.id);
-            const mutation = queueMemoryMutation(db, {
-                projectPath: decision.projectPath,
-                mutationType: "update",
-                targetMemoryId: source.id,
-                category: survivor.category,
-                newContent: decision.finalText,
-            });
-            db.prepare("UPDATE memory_mutation_log SET adoption_class='live' WHERE id=?").run(
-                mutation.id,
-            );
         } else {
             archiveMemory(db, source.id, decision.action);
             db.prepare("DELETE FROM memory_embeddings WHERE memory_id=?").run(source.id);
@@ -700,15 +956,6 @@ function commitMemoryRevision(
             db.prepare(
                 "INSERT INTO memory_successor_links(source_id,successor_id,decision_key) VALUES(?,?,?)",
             ).run(source.id, survivorId, decision.key);
-            const mutation = queueMemoryMutation(db, {
-                projectPath: decision.projectPath,
-                mutationType: "superseded",
-                targetMemoryId: source.id,
-                supersededById: survivorId,
-            });
-            db.prepare("UPDATE memory_mutation_log SET adoption_class='live' WHERE id=?").run(
-                mutation.id,
-            );
         }
     }
     for (const clause of splitMemoryClauses(decision.finalText)) {
@@ -744,7 +991,14 @@ export function releaseMemoryReservations(
     if (!exists || sessionIds.length === 0) return;
     const placeholders = sessionIds.map(() => "?").join(",");
     const predicate = harness === undefined ? "" : " AND harness=?";
+    // A stage is released when either its owning session or the hidden child that
+    // carries it is deleted: without the child there is nothing left to reattach.
     db.prepare(
-        `UPDATE memory_pending_facts SET fact_attempts=fact_attempts+1, state=CASE WHEN fact_attempts+1>=? THEN 'decided_pending' ELSE 'retryable' END,reason='session_deleted',reserved_stage_key=NULL WHERE state='in_flight' AND reserved_stage_key IN (SELECT stage_key FROM memory_stage_attempts WHERE session_id IN (${placeholders})${predicate})`,
-    ).run(MAX_STAGE2_ATTEMPTS, ...sessionIds, ...(harness === undefined ? [] : [harness]));
+        `UPDATE memory_pending_facts SET fact_attempts=fact_attempts+1, state=CASE WHEN fact_attempts+1>=? THEN 'decided_pending' ELSE 'retryable' END,reason='session_deleted',reserved_stage_key=NULL WHERE state='in_flight' AND reserved_stage_key IN (SELECT stage_key FROM memory_stage_attempts WHERE (session_id IN (${placeholders}) OR child_session_id IN (${placeholders}))${predicate})`,
+    ).run(
+        MAX_STAGE2_ATTEMPTS,
+        ...sessionIds,
+        ...sessionIds,
+        ...(harness === undefined ? [] : [harness]),
+    );
 }

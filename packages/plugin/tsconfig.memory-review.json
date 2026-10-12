@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "../..",
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false
+  },
+  "include": [
+    "../../crates/mc-module/tests/fixtures/agent-fragments-golden.ts",
+    "src/**/*.d.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

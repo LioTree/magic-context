@@ -1,4 +1,5 @@
 import { withContentLanguageDirective } from "../../agents/language-directive";
+import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 import { embedAndStoreCompartmentChunks } from "../../features/magic-context/compartment-embedding";
 import { insertCompartmentEvents } from "../../features/magic-context/compartment-events";
 import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
@@ -10,6 +11,7 @@ import {
     embedPromotedFacts,
     promoteSessionFactsDurable,
 } from "../../features/magic-context/memory";
+import { tsOwnsMemory } from "../../features/magic-context/memory/lifecycle-applier";
 import {
     resolveProjectIdentity,
     shouldSkipHomeProjectMemory,
@@ -18,6 +20,15 @@ import {
     getMemoriesByProject,
     ModuleMemoryAuthorityError,
 } from "../../features/magic-context/memory/storage-memory";
+import {
+    allocateTurnOneSend,
+    blocksSentToHistorian,
+    commitTurnOnePublication,
+    publishedFacts,
+    resolveTurnOneLane,
+    type TurnOneFact,
+    type TurnOneSend,
+} from "../../features/magic-context/memory/turn-one-publication";
 import {
     clearEmergencyDrainLatch,
     clearEmergencyRecovery,
@@ -58,7 +69,7 @@ import {
     resolveOpenCodeDbPath,
 } from "../../shared/opencode-db-path";
 import { toModelEntry } from "../../shared/resolve-fallbacks";
-import { beginSqliteWriterAsync } from "../../shared/sqlite";
+import { beginSqliteWriterAsync, isTransientSqliteError } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt, COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
@@ -67,7 +78,10 @@ import {
     queuePreparedCompartmentDrops,
 } from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
-import type { HiddenCompartmentRunnerDeps } from "./compartment-runner-types";
+import type {
+    HiddenCompartmentRunnerDeps,
+    RetainedHistorianChild,
+} from "./compartment-runner-types";
 import {
     buildHistorianFailureNotice,
     buildHistorianWindowTooSmallNotice,
@@ -87,6 +101,7 @@ import {
     finishHistorianPublishStage,
     startHistorianPublishStage,
 } from "./historian-publish-stage-logger";
+import { scheduleHistorianTurnTwo } from "./historian-turn-two-step";
 import { snapTerminalCompartmentToServedRow } from "./host-served-rows";
 import { clearInjectionCache } from "./inject-compartments";
 import { onNoteTrigger } from "./note-nudger";
@@ -256,6 +271,11 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
     let publishCommitted = false;
     let retainDrainReservationForRetryThrottle = false;
     let issueNotified = false;
+    // On an enabled memory-lifecycle lane, the hidden historian child that produced
+    // the published turn-one reply stays open so turn two runs in the same session.
+    // After publication it is handed to the scheduled turn two; on every other exit
+    // `finally` closes it.
+    let retainedChild: RetainedHistorianChild | undefined;
     let drainReservation: ReturnType<typeof reserveProtectedTailDrainTokens>["reservation"] = null;
 
     // historian_runs telemetry (migration v24). Captured across the run and
@@ -544,7 +564,15 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const producerLimits = { input: producerWindow.inputLimitTokens };
         const producerReserve = producerWindow.maxOutputTokens;
         const projectPath = resolveProjectIdentity(directory ?? process.cwd());
-        const memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+        // On an `enabled` turn-one lane (see `TurnOneLane`) with memory on, the
+        // historian gets no project-memory block and anchors every fact to its source
+        // lines; the anchor is stored with the fact's candidate row, and a later
+        // reconcile step compares the fact with existing memory instead.
+        const turnOneLane = resolveTurnOneLane(deps.memoryLifecycleLane);
+        const anchoredFacts = turnOneLane === "enabled" && deps.memoryEnabled !== false;
+        const memories = anchoredFacts
+            ? []
+            : getMemoriesByProject(db, projectPath, ["active", "permanent"]);
         const promptFit = fitHistorianPrompt({
             window: producerWindow,
             systemPrompt: withContentLanguageDirective(
@@ -562,6 +590,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             ),
             memories,
             memoryEnabled: deps.memoryEnabled !== false,
+            anchoredFacts,
         });
         if (!promptFit.ok) {
             telemetry.failureReason = promptFit.reason;
@@ -750,9 +779,10 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const prompt = buildCompartmentAgentPrompt({
             seedExamples: promptFit.seedExamples,
             sessionReferences: promptFit.sessionReferences,
-            projectMemory: promptFit.projectMemory,
+            projectMemory: anchoredFacts ? "" : promptFit.projectMemory,
             inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
             memoryEnabled: deps.memoryEnabled !== false,
+            anchoredFacts,
         });
 
         // Intentional: session.get failure is non-fatal — we fall back to deps.directory
@@ -765,6 +795,42 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             { preferResponseOnMissingData: true },
         );
         const sessionDirectory = parentSession?.directory ?? directory;
+
+        // Persist turn one's send record, with the publication id the compartment
+        // transaction will commit under, before dispatching the historian. A run that
+        // fails before publishing leaves the id for the session's next run, so one
+        // chunk's candidates and activity are published under one id however many
+        // sends it takes.
+        const publicationDirectory = sessionDirectory || deps.directory;
+        const publicationProjectPath = publicationDirectory
+            ? resolveProjectIdentity(publicationDirectory)
+            : projectPath;
+        let turnOneSend: TurnOneSend;
+        try {
+            turnOneSend = allocateTurnOneSend(db, {
+                projectPath: publicationProjectPath,
+                sessionId,
+                harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
+                carrier: deps.hiddenCompletionExecutor ? "hidden-completion" : "opencode-session",
+                lane: turnOneLane,
+                chunkStart: chunk.startIndex,
+                chunkEnd: chunk.endIndex,
+            });
+        } catch (error) {
+            if (!isTransientSqliteError(error)) throw error;
+            // The store stayed busy past its timeout before anything was sent. This
+            // is contention, not a historian failure: skip the run without touching
+            // the failure count or its backoff, release the drain budget, and let the
+            // next trigger try again.
+            telemetry.status = "noop";
+            telemetry.failureReason = "turn_one_send_store_busy";
+            sessionLog(
+                sessionId,
+                `historian skipped: store busy while recording turn one's send (${describeError(error).brief}); retrying on the next trigger`,
+            );
+            rollbackDrainReservation();
+            return;
+        }
 
         // Defensive: use MAX(sequence) + 1 rather than .length. These only
         // differ when the current DB state has a gap or non-zero-indexed
@@ -797,7 +863,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             fallbackModels: deps.fallbackModels,
             twoPass: deps.historianTwoPass,
             language: deps.language,
+            retainChild: anchoredFacts,
         });
+        retainedChild = validatedPass.ok ? validatedPass.retainedChild : undefined;
         // A window refusal here comes from a fallback model (the primary was fitted
         // above). Treat it like any other failed pass: count it, notify, and keep
         // the reserved drain budget spent so the next trigger does not retry at once.
@@ -1069,23 +1137,73 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             // They are the last `persistedCompartments.length` rows by sequence
             // (appendCompartments inserts at the tail). Used for events anchoring +
             // embedding. Pure DB read — cheap, no message mutation.
-            persistedIds = getCompartments(db, sessionId)
-                .slice(-persistedCompartments.length)
-                .map((c) => c.id);
-            // v2 faithful fact lifecycle: facts are NOT a REPLACE-the-whole-list
-            // store anymore. The historian emits only THIS chunk's facts (deduped
-            // against <project-memory> in the prompt); they flow to project memory
-            // via in-transaction durable promotion. session_facts is no longer
-            // written/bumped. Promotion is in the SAME transaction as the boundary
-            // floor below so a crash cannot advance past facts that never became
-            // project memories.
-            if (promotionActive && !skipUnanchoredPromotion) {
+            const durableRows = getCompartments(db, sessionId).slice(-persistedCompartments.length);
+            persistedIds = durableRows.map((c) => c.id);
+            // The historian emits only this chunk's facts. This transaction also commits
+            // turn one's publication, once: the activity ledger counts the new
+            // compartments, and the reply's published facts (see `keepPublishedFact`:
+            // one tied to a discarded or weak final compartment is dropped and comes
+            // back when the next run re-derives those lines) go to one of three places.
+            // - `enabled` lane: every published fact becomes a candidate with its
+            //   resolved anchor; nothing is promoted, a later reconcile step decides.
+            // - `dormant` lane, project memory owned by the Rust module: each fact
+            //   becomes a candidate with an unknown anchor, since this process may not
+            //   write those memories.
+            // - `dormant` lane, project memory owned here: facts are promoted to
+            //   project memory below, in the same transaction as the protected-tail
+            //   publication floor (`recordProtectedTailPublicationFloor`), so a crash
+            //   cannot advance past facts that never became memories.
+            const memoryAuthorityHere = tsOwnsMemory(db, publicationProjectPath);
+            const keptFacts: TurnOneFact[] = publishedFacts(
+                validatedPass.facts ?? [],
+                persistedCompartments.length,
+                discardedLast,
+                weakLookaheadFinalCompartment ? emittedCompartments.length : null,
+            );
+            const candidateFacts =
+                turnOneLane === "enabled"
+                    ? deps.memoryEnabled !== false
+                        ? keptFacts
+                        : []
+                    : promotionActive && !memoryAuthorityHere
+                      ? keptFacts
+                      : [];
+            const turnOnePublication = commitTurnOnePublication(db, {
+                send: turnOneSend,
+                projectPath: publicationProjectPath,
+                sessionId,
+                compartments: durableRows.map((row, index) => ({
+                    id: row.id,
+                    startMessage: row.startMessage,
+                    endMessage: row.endMessage,
+                    replyStartMessage: persistedCompartments[index]?.startMessage ?? -1,
+                    replyEndMessage: persistedCompartments[index]?.endMessage ?? -1,
+                })),
+                blocks:
+                    turnOneLane === "enabled"
+                        ? blocksSentToHistorian(chunk.printedBlocks, chunk.text, chunkText)
+                        : [],
+                candidateFacts,
+                honourAnchors: turnOneLane === "enabled",
+            });
+            if (turnOnePublication.candidatesInserted > 0) {
+                sessionLog(
+                    sessionId,
+                    `historian turn one: recorded ${turnOnePublication.candidatesInserted} candidate fact(s) (${turnOnePublication.anchoredCandidates} anchored, ${turnOnePublication.blocksStored} block(s))${turnOnePublication.authorityElsewhere ? "; memory authority is the module" : ""}`,
+                );
+            }
+            if (
+                turnOneLane === "dormant" &&
+                memoryAuthorityHere &&
+                promotionActive &&
+                keptFacts.length > 0
+            ) {
                 try {
                     const promotion = promoteSessionFactsDurable(
                         db,
                         sessionId,
                         promotionProjectIdentity,
-                        validatedPass.facts ?? [],
+                        keptFacts,
                     );
                     promotedFactRefs = promotion.newMemoryRefs;
                     promotedFactCount = promotion.factsPromoted;
@@ -1401,6 +1519,29 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             sessionId,
             `historian publish completed: compartments=${persistedCompartments.length} range=${offset}-${lastCompartmentEnd}`,
         );
+
+        // Turn two: on an enabled lane, reconcile this publication's candidates (and
+        // the project's retryable backlog) with existing memory on the same child.
+        // It runs as its own task after this run settles (see
+        // `scheduleHistorianTurnTwo`), which takes over the child.
+        if (retainedChild) {
+            const child = retainedChild;
+            retainedChild = undefined;
+            scheduleHistorianTurnTwo({
+                db,
+                sessionId,
+                projectPath: publicationProjectPath,
+                publicationId: turnOneSend.publicationId,
+                child,
+                harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
+                carrier: deps.hiddenCompletionExecutor ? "hidden-completion" : "opencode-session",
+                memoryEnabled: deps.memoryEnabled !== false,
+                autoPromote: deps.autoPromote !== false,
+                timeoutMs: historianTimeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+                validatedProfiles: deps.memoryLifecycleValidatedProfiles,
+                embedQuery: deps.memoryLifecycleEmbedQuery,
+            });
+        }
     } catch (error: unknown) {
         const desc = describeError(error);
         if (publishCommitted) {
@@ -1426,6 +1567,13 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             await notifyHistorianIssue(buildHistorianFailureNotice(failCount, desc.brief));
         }
     } finally {
+        if (retainedChild) {
+            try {
+                await retainedChild.close();
+            } catch (error) {
+                sessionLog(sessionId, "historian child close failed:", error);
+            }
+        }
         if (!completedSuccessfully) {
             if (!retainDrainReservationForRetryThrottle) {
                 rollbackDrainReservation();

@@ -730,6 +730,99 @@ fn preflight_refusals_do_not_reserve_or_write_live_rows() {
     );
 }
 #[test]
+fn context_fragment_collision_query_detects_foreign_id_without_reserving_or_writing() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let context_store = |dir: &Path| {
+        McStore::open_for_test(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .unwrap()
+    };
+    let src = context_store(source.path());
+    let dst = context_store(destination.path());
+    src.with_context_conn_for_test(|conn| {
+        conn.execute_batch("INSERT INTO memory_agent_fragments(id,session_id,harness,project_path,operation_key,memory_ids_json,current_id,lines,visible_texts_json,created_at) VALUES(37,'ses_move','ck-mc','git:proj','source','[9]',9,'source line','[]',0)")
+    }).unwrap();
+    dst.with_context_conn_for_test(|conn| {
+        conn.execute_batch("INSERT INTO memory_agent_fragments(id,session_id,harness,project_path,operation_key,memory_ids_json,current_id,lines,visible_texts_json,created_at) VALUES(37,'other','ck-mc','git:proj','foreign','[11]',11,'foreign line','[]',0)")
+    }).unwrap();
+    let table = move_inventory::TABLES
+        .iter()
+        .find(|table| table.store == Store::Context && table.table == "memory_agent_fragments")
+        .unwrap();
+    let columns = table.shipped_columns();
+    let incoming = src
+        .with_context_conn_for_test(|conn| {
+            conn.query_row(
+                &format!(
+                    "SELECT {} FROM memory_agent_fragments WHERE session_id='ses_move'",
+                    columns
+                        .iter()
+                        .map(|column| codec::quoted(column))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                [],
+                |row| {
+                    (0..columns.len())
+                        .map(|index| row.get::<_, Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(incoming[0], Value::Integer(37));
+    let error = dst
+        .with_context_conn_for_test(|conn| {
+            let writes_before = conn.total_changes();
+            let collision = refuse_inventory_key_collision(conn, table, &incoming);
+            let mut unused_id = incoming.clone();
+            unused_id[0] = Value::Integer(91);
+            assert!(refuse_inventory_key_collision(conn, table, &unused_id).is_ok());
+            assert_eq!(
+                conn.total_changes(),
+                writes_before,
+                "collision queries must write no rows"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM memory_agent_fragments WHERE session_id='ses_move'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?,
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT lines FROM memory_agent_fragments WHERE id=37 AND session_id='other'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )?,
+                "foreign line"
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM memory_agent_fragments", [], |row| row
+                    .get::<_, i64>(0))?,
+                1
+            );
+            Ok(collision)
+        })
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(error, MoveError::Refused { code:"key_collision", table:Some(ref name) } if name == "memory_agent_fragments")
+    );
+    assert!(dst.session_move_phase("ses_move").unwrap().is_none());
+    assert!(!dst.has_cache_state("ses_move").unwrap());
+}
+
+#[test]
 fn capture_inventory_drift_refuses_before_writing_and_files_are_private() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
@@ -1145,5 +1238,47 @@ fn transaction_probe_rejects_two_cursor_advances_in_one_transaction() {
     assert!(
         refused.is_err(),
         "transaction audit accepted two batch advances"
+    );
+}
+
+#[test]
+fn review_module_move_preserves_populated_projection_and_fragment_references() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let src = seeded(source.path(), 2, 32);
+    let mut loaded = src.load("ses_move").unwrap();
+    loaded.meta.memory_projection = Some(crate::memory_projection::AppliedProjection {
+        generation: 7,
+        m0_sha256: "opaque-baseline-binding".into(),
+        fragment_watermark: 40,
+        committed: vec![crate::memory_projection::CommittedFragment {
+            id: 42,
+            form: "marker".into(),
+            overflow_ids: Vec::new(),
+            overflow_count: None,
+            lines: vec![
+                "  <stale-memory ids=\"9\" current=\"9\" read-with=\"ctx_search\"/>".into(),
+            ],
+            visible_texts: Vec::new(),
+        }],
+        ..Default::default()
+    });
+    src.commit("ses_move", loaded.row_version, &loaded.core, &loaded.meta)
+        .unwrap();
+    let staging = destination.path().join("staging");
+    let _export = capture(&src, "cut", &staging);
+    let dst = open(destination.path());
+    let mut mover = dst.move_store().unwrap();
+    mover
+        .reserve_install(&binding("cut"), "digest", &staging)
+        .unwrap();
+    install(&mut mover, "cut");
+    assert_eq!(
+        dump(&src, "mc_cache_state", "session_id,meta"),
+        dump(&dst, "mc_cache_state", "session_id,meta")
+    );
+    assert_eq!(
+        dst.load("ses_move").unwrap().meta.memory_projection,
+        loaded.meta.memory_projection
     );
 }

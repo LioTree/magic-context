@@ -6,7 +6,7 @@ import { modelSupportsVision } from "../../../shared/models-dev-cache";
 import type { Database } from "../../../shared/sqlite";
 import { DEFAULT_MURAL_MEMORY_BUDGET } from "./mural-selection";
 import { planMuralRender, renderPlannedMural } from "./render-mural";
-import type { MuralWireOptions } from "./resolve-mural";
+import type { MuralPool, MuralWireOptions } from "./resolve-mural";
 import { getMuralCoverage, readMuralPool, resolveMural } from "./resolve-mural";
 import { getMural, upsertMural } from "./storage-mural";
 
@@ -92,6 +92,8 @@ export interface EnsureMuralResult {
     skipReason?: string;
     width?: number;
     height?: number;
+    /** Memory ids the rendered layout actually draws. */
+    cueMemoryIds?: number[];
 }
 
 /** A mural is useful with enough cues or broad enough pool coverage. */
@@ -118,8 +120,11 @@ export function ensureMuralRendered(
     projectIdentity: string,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
     mode: "persist" | "read-only" = "persist",
+    capturedPool?: MuralPool,
 ): EnsureMuralResult {
-    const pool = readMuralPool(db, projectIdentity);
+    // A HARD fold passes the rows and cues it read in the same snapshot as its m[0]
+    // text, so a write in between cannot give text and image different revisions.
+    const pool = capturedPool ?? readMuralPool(db, projectIdentity);
     const coverage = getMuralCoverage(db, projectIdentity, pool);
     if (
         coverage.activeMemoryCount === 0 ||
@@ -171,6 +176,7 @@ export function ensureMuralRendered(
             rerendered: false,
             width: existing.width,
             height: existing.height,
+            cueMemoryIds: [...plan.layout.renderedIds],
         });
     }
 
@@ -197,6 +203,7 @@ export function ensureMuralRendered(
         rerendered: true,
         width: rendered.width,
         height: rendered.height,
+        cueMemoryIds: [...rendered.renderedIds],
     });
 }
 
@@ -231,16 +238,18 @@ export function resolveMuralWire(
     enabled: boolean,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
     mode: "persist" | "read-only" = "persist",
+    capturedPool?: MuralPool,
 ): MuralWireOptions {
     if (!enabled || !projectIdentity || !modelKeyAcceptsImages(modelKey)) {
         return { enabled, supportsVision: false };
     }
-    const result = ensureMuralRendered(db, projectIdentity, budgetTokens, mode);
+    const result = ensureMuralRendered(db, projectIdentity, budgetTokens, mode, capturedPool);
     if (!result.hasMural) return { enabled: true, supportsVision: true };
     return {
         enabled: true,
         supportsVision: true,
         dataUrl: result.dataUrl,
         contentHash: result.contentHash,
+        cueMemoryIds: result.cueMemoryIds ?? [],
     };
 }

@@ -1,17 +1,24 @@
-//! The store → m1 delta producer for bust arms, in TWO tiers (the
-//! compose-on-opportunity discipline):
+//! Compose the delta prompt block (m1) beside the frozen baseline (m0).
+//! HARD means an independently required full rebuild; SOFT is an authorized delta
+//! refresh, while a defer replays the stored blocks without composing new bytes.
+//! Permission is decided before the expensive composition work:
 //!
 //!  - [`m1_revision_signal`] is the CHEAP per-pass read: split in-session and external
 //!    fingerprints run EVERY pass to tell the classifier whether work is pending and whether
 //!    a render-config HARD is due, WITHOUT composing the body. In-session changes are allowed
 //!    to remain pending so ordinary turns replay frozen bytes; external workspace changes stay
 //!    eager-HARD.
-//!  - [`compose_m1_from_store`] is the EXPENSIVE bust-only read: it composes the actual m1
-//!    delta body (memory-updates + new-compartments + new-memories) from the store and
-//!    reports whether a newly-published compartment EXTENDS coverage (so the bust must
-//!    advance the boundary anchor). Runs ONLY on a bust opportunity — never on a defer (a
-//!    defer replays the frozen m1 verbatim; re-composing from the now-possibly-mutated store
-//!    on a defer would change bytes on a defer, violating the deferred-work invariant).
+//!  - [`compose_soft_m1`] recomposes compartments and a pending user-profile delta,
+//!    but replays the served memory blocks without reading canonical memory rows,
+//!    the mutation log or their heads.
+//!  - [`compose_projected_soft_m1`] extends that body on an independently authorized
+//!    SOFT with this session's immutable agent fragments. Those pending lines do not
+//!    authorize a SOFT or HARD, and another session's fragments are not selected.
+//!    Automated and foreign canonical memory changes remain pending until HARD.
+//!  - [`compose_m1_from_store`] is the row-reading comparison renderer retained for
+//!    byte-parity fixtures. It has no production caller; a production HARD captures
+//!    canonical memory into m0 and resets the m1 fragment ledger. A defer never runs
+//!    either composer: it replays the frozen m1 bytes verbatim.
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -151,8 +158,6 @@ pub struct M1RevisionSignal {
     pub history_revision: u64,
     /// Highest compartment sequence read while computing `revision`.
     pub max_compartment_seq: i64,
-    pub max_memory_id: i64,
-    pub max_memory_mutation_id: i64,
     /// Read for [`Self::legacy_note_revision`] only; it does not feed `revision`.
     pub note_status_version: i64,
     pub user_profile_version: u64,
@@ -253,8 +258,11 @@ pub fn m1_revision_signal_parts_for_pass_timed(
         timings.memories_ms += snapshot_ms;
     }
 
-    let max_memory_id = snapshot.max_memory_id;
-    let max_memory_mutation_id = snapshot.max_memory_mutation_id;
+    // The digest keeps its two memory slots as constant zeros: a busting SOFT renders no
+    // memory rows, so a memory or mutation-log change is not m1 work and must not open an
+    // execute-band SOFT. Sessions whose stored digest was taken with zero memory heads keep
+    // the same value.
+    let (max_memory_id, max_memory_mutation_id) = (0, 0);
     let max_compartment_seq = snapshot.max_compartment_seq;
     let note_status_version = snapshot.note_status_version;
     let revision = in_session_revision(
@@ -305,8 +313,6 @@ pub fn m1_revision_signal_parts_for_pass_timed(
             history.finish() | 1
         },
         max_compartment_seq,
-        max_memory_id,
-        max_memory_mutation_id,
         note_status_version,
         user_profile_version,
         legacy_note_revision,
@@ -321,6 +327,7 @@ pub fn m1_revision_signal_parts_for_pass_timed(
 /// empty. (Keeping the revision out avoids two sources of "did m1 change".)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M1Composition {
+    pub memory_projection: Option<mc_store::memory_projection::AppliedProjection>,
     pub body: String,
     /// Number of memory corrections represented in the m1 body, for the pressure backstop.
     pub memory_update_count: usize,
@@ -331,6 +338,160 @@ pub struct M1Composition {
     pub profile_rendered: bool,
 }
 
+/// Where an m1 body's `<memory-updates>` and `<new-memories>` blocks come from.
+#[derive(Debug, Clone, Copy)]
+enum M1MemorySource<'a> {
+    /// Render memory corrections and additions from memory rows and the mutation log.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Rows,
+    /// Replay the memory blocks of the m1 body the session currently serves.
+    Served(&'a str),
+}
+
+/// The `<memory-updates>` and `<new-memories>` blocks of a served m1 body, verbatim.
+/// Missing blocks are empty, so a placeholder body replays as no memory blocks.
+fn served_memory_blocks(served: &str) -> (String, String) {
+    let block = |open: &str, close: &str| {
+        served
+            .find(open)
+            .and_then(|start| {
+                served[start..]
+                    .find(close)
+                    .map(|end| served[start..start + end + close.len()].to_string())
+            })
+            .unwrap_or_default()
+    };
+    (
+        block("<memory-updates>\n", "\n</memory-updates>"),
+        block("<new-memories>\n", "\n</new-memories>"),
+    )
+}
+
+/// The m1 of a busting SOFT. New compartments and a pending user-profile delta render as
+/// in [`compose_m1_from_store`], but the memory blocks are those of `served_m1`, the body
+/// this session is serving now: nothing here loads memory rows or the mutation log.
+/// [`compose_projected_soft_m1`] then appends this session's pending immutable agent
+/// fragments to the independently authorized SOFT, subject to its rendering budget.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_soft_m1(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    meta: &ModuleMeta,
+    memory_enabled: bool,
+    user_profile_budget_tokens: f64,
+    temporal_awareness: bool,
+    served_m1: &str,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<M1Composition, M1ComposeError> {
+    compose_m1(
+        store,
+        project_path,
+        session_id,
+        meta,
+        0,
+        memory_enabled,
+        0.0,
+        user_profile_budget_tokens,
+        temporal_awareness,
+        estimate_tokens,
+        M1MemorySource::Served(served_m1),
+    )
+}
+
+/// Extend an authorized SOFT with only this session's immutable fragments. Measure
+/// the other delta content first: memory fragments must not authorize a HARD rebuild.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_projected_soft_m1(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    meta: &ModuleMeta,
+    memory_enabled: bool,
+    memory_budget: f64,
+    history_budget: f64,
+    user_profile_budget: f64,
+    temporal_awareness: bool,
+    served_m0: &str,
+    served_m1: &str,
+    estimate: impl Fn(&str) -> usize + Copy,
+) -> Result<M1Composition, M1ComposeError> {
+    let mut composition = compose_soft_m1(
+        store,
+        project_path,
+        session_id,
+        meta,
+        memory_enabled,
+        user_profile_budget,
+        temporal_awareness,
+        served_m1,
+        estimate,
+    )?;
+    let mut projection = meta
+        .memory_projection
+        .clone()
+        .filter(|projection| projection.matches_m0(served_m0))
+        .unwrap_or_else(|| {
+            let mut projection = mc_store::memory_projection::AppliedProjection {
+                hard_memory_block: served_memory_blocks(served_m1).0
+                    + "\n"
+                    + &served_memory_blocks(served_m1).1,
+                legacy: true,
+                ..Default::default()
+            };
+            projection.bind_m0(served_m0);
+            projection
+        });
+    let after = projection
+        .committed
+        .iter()
+        .map(|entry| entry.id)
+        .fold(projection.fragment_watermark, i64::max);
+    let pending = if memory_enabled {
+        store.load_agent_fragments(session_id, after)?
+    } else {
+        Vec::new()
+    };
+    let old_updates = crate::agent_fragments::block(&composition.body, "memory-updates");
+    let independent = composition.body.replace(&old_updates, "");
+    let independent_tokens = if composition.body == M1_PLACEHOLDER {
+        0
+    } else {
+        estimate(&independent)
+    };
+    let (updates, next) = crate::agent_fragments::compose(
+        projection.clone(),
+        &pending,
+        memory_budget,
+        history_budget,
+        independent_tokens,
+        estimate(served_m0),
+        estimate,
+    );
+    projection = next;
+    let mut sections = Vec::new();
+    if !updates.is_empty() {
+        sections.push(updates);
+    }
+    for tag in ["new-compartments", "new-memories", "new-user-profile"] {
+        let section = crate::agent_fragments::block(&composition.body, tag);
+        if !section.is_empty() {
+            sections.push(section);
+        }
+    }
+    composition.body = if sections.is_empty() {
+        M1_PLACEHOLDER.into()
+    } else {
+        format!(
+            "<session-history-since>\n{}\n</session-history-since>",
+            sections.join("\n")
+        )
+    };
+    projection.generation = projection.generation.saturating_add(1);
+    composition.memory_projection = Some(projection);
+    Ok(composition)
+}
+
 /// EXPENSIVE bust-only: compose the m1 delta body from the store against the watermarks
 /// the last HARD froze in `meta`. `now_ms` is the frozen expiry cutoff (same as the m0
 /// compose). Reads compartments + memories; never call on a defer. `_note_project_path`
@@ -339,6 +500,7 @@ pub struct M1Composition {
 /// Every id m1 renders, and every id in `meta.rendered_memory_ids`, is a `context.db`
 /// memory id, whatever the harness.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn compose_m1_from_store(
     store: &McStore,
     project_path: &str,
@@ -351,6 +513,35 @@ pub fn compose_m1_from_store(
     user_profile_budget_tokens: f64,
     temporal_awareness: bool,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<M1Composition, M1ComposeError> {
+    compose_m1(
+        store,
+        project_path,
+        session_id,
+        meta,
+        now_ms,
+        memory_enabled,
+        memory_budget_tokens,
+        user_profile_budget_tokens,
+        temporal_awareness,
+        estimate_tokens,
+        M1MemorySource::Rows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compose_m1(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    meta: &ModuleMeta,
+    now_ms: i64,
+    memory_enabled: bool,
+    memory_budget_tokens: f64,
+    user_profile_budget_tokens: f64,
+    temporal_awareness: bool,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+    memory_source: M1MemorySource<'_>,
 ) -> Result<M1Composition, M1ComposeError> {
     // --- new compartments (seq past the folded watermark) at P1 + coverage extension ---
     // Store-only ordering deliberately allows sparse ordinal gaps; transform has
@@ -391,118 +582,125 @@ pub fn compose_m1_from_store(
         _ => None,
     };
 
-    let (mutations, memory_updates_block, new_memories_block) = if memory_enabled {
-        // Resolve membership from the calling project. The sorted union's first member is not
-        // necessarily the caller, so using it as `own_identity` would hide own private categories.
-        let membership = store.resolve_workspace_membership(project_path)?;
-        let paths = membership
-            .as_ref()
-            .map(|workspace| workspace.union_identities.clone())
-            .unwrap_or_else(|| vec![project_path.to_string()]);
+    let (mutations, memory_updates_block, new_memories_block) =
+        if let M1MemorySource::Served(served) = memory_source {
+            // Replayed corrections are bytes the session already serves, so they add nothing
+            // to the correction count the refold backstop reads: it stays 0.
+            let (updates, additions) = served_memory_blocks(served);
+            (Vec::new(), updates, additions)
+        } else if memory_enabled {
+            // Resolve membership from the calling project. The sorted union's first member is not
+            // necessarily the caller, so using it as `own_identity` would hide own private categories.
+            let membership = store.resolve_workspace_membership(project_path)?;
+            let paths = membership
+                .as_ref()
+                .map(|workspace| workspace.union_identities.clone())
+                .unwrap_or_else(|| vec![project_path.to_string()]);
 
-        // Rendered ids are context.db ids, the same ids the mutation log targets.
-        let baseline_module_ids = meta.rendered_memory_ids.clone();
+            // Rendered ids are context.db ids, the same ids the mutation log targets.
+            let baseline_module_ids = meta.rendered_memory_ids.clone();
 
-        // --- memory-updates (corrections to in-m0 memories, past the cursor) ---
-        // The store also returns visibility-transition markers for rows omitted from m0 and
-        // resolves supersede chains to their terminal target.
-        let pending_mutations = store.memory_mutations_for_render(
-            &paths,
-            meta.memory_mutation_cursor,
-            &baseline_module_ids,
-        )?;
-        let baseline_ids: HashSet<i64> = baseline_module_ids.iter().copied().collect();
+            // --- memory-updates (corrections to in-m0 memories, past the cursor) ---
+            // The store also returns visibility-transition markers for rows omitted from m0 and
+            // resolves supersede chains to their terminal target.
+            let pending_mutations = store.memory_mutations_for_render(
+                &paths,
+                meta.memory_mutation_cursor,
+                &baseline_module_ids,
+            )?;
+            let baseline_ids: HashSet<i64> = baseline_module_ids.iter().copied().collect();
 
-        // Read through the exact m0 visibility, lifecycle, and frozen-expiry predicate. Existing
-        // merge targets and newly-visible rows may be below the folded numeric watermark.
-        let eligible_memories =
-            load_render_eligible_memories(store, membership.as_ref(), project_path, now_ms)?;
-        let eligible_ids: HashSet<i64> = eligible_memories.iter().map(|memory| memory.id).collect();
-        let mut forced_ids = pending_mutations
-            .iter()
-            .filter_map(|mutation| {
-                if mutation.mutation_type == "superseded" {
-                    mutation.superseded_by_id
-                } else if mutation.visibility_changed
-                    && !baseline_ids.contains(&mutation.target_memory_id)
-                {
-                    Some(mutation.target_memory_id)
-                } else {
-                    None
-                }
-            })
-            .filter(|id| !baseline_ids.contains(id) && eligible_ids.contains(id))
-            .collect::<Vec<_>>();
-        forced_ids.sort_unstable();
-        forced_ids.dedup();
-        if forced_ids.len() > MAX_MERGE_REPLACEMENTS_PER_DELTA {
-            tracing::warn!(
-                "mc-module: m1 forced-memory cap exceeded session={} memories={} cap={}",
-                session_id,
-                forced_ids.len(),
-                MAX_MERGE_REPLACEMENTS_PER_DELTA
-            );
-            forced_ids.truncate(MAX_MERGE_REPLACEMENTS_PER_DELTA);
-        }
-        let forced_ids: HashSet<i64> = forced_ids.into_iter().collect();
-
-        // Numeric additions are limited to 25% of the m1 memory budget. Terminal merge
-        // replacements and visibility grants correct the rendered baseline, so they are emitted
-        // outside that additive limit and only once.
-        let additive_candidates = eligible_memories
-            .iter()
-            .filter(|memory| memory.id > meta.max_memory_id)
-            .filter(|memory| !forced_ids.contains(&memory.id))
-            .cloned()
-            .collect();
-        let source_name_by_id = membership
-            .as_ref()
-            .map(|workspace| workspace_source_names(&eligible_memories, workspace))
-            .unwrap_or_default();
-        let mut delta_memories = trim_memories_to_budget(
-            additive_candidates,
-            None,
-            &source_name_by_id,
-            (memory_budget_tokens.max(1.0) * 0.25).floor().max(1.0),
-            estimate_tokens,
-        );
-        delta_memories.extend(
-            eligible_memories
+            // Read through the exact m0 visibility, lifecycle, and frozen-expiry predicate. Existing
+            // merge targets and newly-visible rows may be below the folded numeric watermark.
+            let eligible_memories =
+                load_render_eligible_memories(store, membership.as_ref(), project_path, now_ms)?;
+            let eligible_ids: HashSet<i64> =
+                eligible_memories.iter().map(|memory| memory.id).collect();
+            let mut forced_ids = pending_mutations
                 .iter()
-                .filter(|memory| forced_ids.contains(&memory.id))
-                .cloned(),
-        );
+                .filter_map(|mutation| {
+                    if mutation.mutation_type == "superseded" {
+                        mutation.superseded_by_id
+                    } else if mutation.visibility_changed
+                        && !baseline_ids.contains(&mutation.target_memory_id)
+                    {
+                        Some(mutation.target_memory_id)
+                    } else {
+                        None
+                    }
+                })
+                .filter(|id| !baseline_ids.contains(id) && eligible_ids.contains(id))
+                .collect::<Vec<_>>();
+            forced_ids.sort_unstable();
+            forced_ids.dedup();
+            if forced_ids.len() > MAX_MERGE_REPLACEMENTS_PER_DELTA {
+                tracing::warn!(
+                    "mc-module: m1 forced-memory cap exceeded session={} memories={} cap={}",
+                    session_id,
+                    forced_ids.len(),
+                    MAX_MERGE_REPLACEMENTS_PER_DELTA
+                );
+                forced_ids.truncate(MAX_MERGE_REPLACEMENTS_PER_DELTA);
+            }
+            let forced_ids: HashSet<i64> = forced_ids.into_iter().collect();
 
-        let mut resolvable_ids: HashSet<i64> =
-            baseline_ids.intersection(&eligible_ids).copied().collect();
-        resolvable_ids.extend(delta_memories.iter().map(|memory| memory.id));
-        let mutations = pending_mutations
-            .into_iter()
-            .filter_map(|mut mutation| {
-                if !baseline_ids.contains(&mutation.target_memory_id) {
-                    return None;
-                }
-                if mutation.mutation_type == "superseded" {
-                    return Some(mutation);
-                }
-                if !eligible_ids.contains(&mutation.target_memory_id) {
-                    mutation.mutation_type = "delete".to_string();
-                    mutation.new_content = None;
-                    return Some(mutation);
-                }
-                if mutation.visibility_changed && mutation.new_content.is_none() {
-                    return None;
-                }
-                Some(mutation)
-            })
-            .collect::<Vec<_>>();
-        let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
-        let new_memories_block =
-            render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
-        (mutations, memory_updates_block, new_memories_block)
-    } else {
-        (Vec::new(), String::new(), String::new())
-    };
+            // Numeric additions are limited to 25% of the m1 memory budget. Terminal merge
+            // replacements and visibility grants correct the rendered baseline, so they are emitted
+            // outside that additive limit and only once.
+            let additive_candidates = eligible_memories
+                .iter()
+                .filter(|memory| memory.id > meta.max_memory_id)
+                .filter(|memory| !forced_ids.contains(&memory.id))
+                .cloned()
+                .collect();
+            let source_name_by_id = membership
+                .as_ref()
+                .map(|workspace| workspace_source_names(&eligible_memories, workspace))
+                .unwrap_or_default();
+            let mut delta_memories = trim_memories_to_budget(
+                additive_candidates,
+                None,
+                &source_name_by_id,
+                (memory_budget_tokens.max(1.0) * 0.25).floor().max(1.0),
+                estimate_tokens,
+            );
+            delta_memories.extend(
+                eligible_memories
+                    .iter()
+                    .filter(|memory| forced_ids.contains(&memory.id))
+                    .cloned(),
+            );
+
+            let mut resolvable_ids: HashSet<i64> =
+                baseline_ids.intersection(&eligible_ids).copied().collect();
+            resolvable_ids.extend(delta_memories.iter().map(|memory| memory.id));
+            let mutations = pending_mutations
+                .into_iter()
+                .filter_map(|mut mutation| {
+                    if !baseline_ids.contains(&mutation.target_memory_id) {
+                        return None;
+                    }
+                    if mutation.mutation_type == "superseded" {
+                        return Some(mutation);
+                    }
+                    if !eligible_ids.contains(&mutation.target_memory_id) {
+                        mutation.mutation_type = "delete".to_string();
+                        mutation.new_content = None;
+                        return Some(mutation);
+                    }
+                    if mutation.visibility_changed && mutation.new_content.is_none() {
+                        return None;
+                    }
+                    Some(mutation)
+                })
+                .collect::<Vec<_>>();
+            let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
+            let new_memories_block =
+                render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
+            (mutations, memory_updates_block, new_memories_block)
+        } else {
+            (Vec::new(), String::new(), String::new())
+        };
 
     // Profile rows and their version arrive together through state sync. Render the block only
     // after a version change, and leave the applied version behind when trimming leaves no body
@@ -536,6 +734,7 @@ pub fn compose_m1_from_store(
     );
 
     Ok(M1Composition {
+        memory_projection: None,
         rendered_coverage,
         body,
         memory_update_count: mutations.len(),
@@ -835,11 +1034,11 @@ mod tests {
         let after_memory =
             m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, false, 0).unwrap();
         assert_eq!(after_memory.revision, before.revision);
-        assert_eq!(after_memory.max_memory_id, 0);
-        assert_eq!(after_memory.max_memory_mutation_id, 0);
+        // With memory enabled the revision does not move either: a busting SOFT renders no
+        // memory rows, so memory and mutation-log changes are never pending m1 work.
         let enabled_after_memory =
             m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, true, 0).unwrap();
-        assert_ne!(enabled_after_memory.revision, before.revision);
+        assert_eq!(enabled_after_memory.revision, before.revision);
 
         store
             .replace_compartments("ses", &[comp(1, 1, 9, "m9")])
@@ -1235,9 +1434,11 @@ mod tests {
             }
 
             let after_signal = m1_revision_signal(&store, project, "ses").unwrap();
-            assert_ne!(
+            // A busting SOFT renders no memory rows, so memory ports never move the m1
+            // signal; the fold-time renderer below still renders the change.
+            assert_eq!(
                 before_signal, after_signal,
-                "{case} must move the m1 signal"
+                "{case} must not move the m1 signal"
             );
             let meta = meta_after_hard(1, Some(10), max_mem, cursor, manifest);
             let m1 = compose_m1_from_store(
@@ -1287,7 +1488,10 @@ mod tests {
             .unwrap();
 
         let after = m1_revision_signal(store, project, "ses").unwrap();
-        assert_ne!(before, after, "the atomic merge must move the m1 revision");
+        assert_eq!(
+            before, after,
+            "a merge is not m1 work: a busting SOFT renders no memory rows"
+        );
         assert_eq!(
             after,
             m1_revision_signal(store, project, "ses").unwrap(),
@@ -1753,6 +1957,113 @@ mod tests {
         );
     }
 
+    /// The acceptance gate for the Rust renderer: a busting SOFT composes m1 without loading
+    /// memory rows or the mutation log. With both tables renamed away the SOFT still composes,
+    /// replays the served memory blocks byte for byte and renders the new compartment; the
+    /// row renderer, as the positive control, fails on the same store.
+    #[test]
+    fn soft_m1_reads_no_memory_rows_or_mutation_log() {
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
+        let project = "git:proj";
+        store
+            .replace_compartments("ses", &[comp(1, 1, 10, "m10"), comp(2, 11, 20, "m20")])
+            .unwrap();
+        store
+            .insert_memory(insert_input(
+                project,
+                "CONSTRAINTS",
+                "row only a fold reads",
+                1,
+            ))
+            .unwrap();
+        let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
+        let updates = "<memory-updates>\nserved correction line\n</memory-updates>";
+        let additions = "<new-memories>\nserved addition line\n</new-memories>";
+        let served =
+            format!("<session-history-since>\n{updates}\n{additions}\n</session-history-since>");
+        store
+            .with_context_conn_for_test(|tx| {
+                tx.execute_batch(
+                    "ALTER TABLE memories RENAME TO memories_hidden_for_gate;
+                     ALTER TABLE memory_mutation_log RENAME TO memory_mutation_log_hidden_for_gate;",
+                )
+            })
+            .unwrap();
+        let soft = compose_soft_m1(
+            store,
+            project,
+            "ses",
+            &meta,
+            true,
+            4_000.0,
+            true,
+            &served,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(soft.body.contains(updates), "{}", soft.body);
+        assert!(soft.body.contains(additions), "{}", soft.body);
+        assert!(soft.body.contains("<new-compartments>"), "{}", soft.body);
+        assert!(
+            !soft.body.contains("row only a fold reads"),
+            "{}",
+            soft.body
+        );
+        assert_eq!(soft.memory_update_count, 0);
+        assert!(compose_m1_from_store(
+            store,
+            project,
+            project,
+            "ses",
+            &meta,
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .is_err());
+    }
+
+    /// Immutable fragments are the only memory input an authorized SOFT may append.
+    #[test]
+    fn rust_soft_renders_own_agent_fragments() {
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
+        let project = "git:proj";
+        store
+            .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
+            .unwrap();
+        store
+            .with_context_conn_for_test(|tx| {
+                tx.execute(
+                     "INSERT INTO memory_agent_fragments(session_id,harness,project_path,operation_key,memory_ids_json,current_id,lines,visible_texts_json,created_at) VALUES('ses','ck-mc',?1,'op','[1]',1,'  <updated id=\"1\">agent fragment line</updated>','[]',0)",
+                    [project],
+                )
+            })
+            .unwrap();
+        let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
+        let soft = compose_projected_soft_m1(
+            store,
+            project,
+            "ses",
+            &meta,
+            true,
+            8_000.0,
+            60_000.0,
+            4_000.0,
+            true,
+            "m0",
+            M1_PLACEHOLDER,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(soft.body.contains("agent fragment line"), "{}", soft.body);
+        assert_eq!(soft.memory_projection.unwrap().committed.len(), 1);
+    }
+
     #[test]
     fn public_insert_renders_new_memories_without_mutation_log() {
         let fixture = FixtureBuilder::store();
@@ -1770,7 +2081,10 @@ mod tests {
             .insert_memory(insert_input(project, "CONSTRAINTS", "brand new", 1))
             .unwrap();
         let after_signal = m1_revision_signal(store, project, "ses").unwrap();
-        assert_ne!(before_signal, after_signal, "insert moves max_memory_id");
+        assert_eq!(
+            before_signal, after_signal,
+            "an insert is not m1 work: a busting SOFT renders no memory rows"
+        );
         assert_eq!(
             store
                 .max_memory_mutation_id(&[project.to_string()])
