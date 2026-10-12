@@ -148,8 +148,10 @@ pub struct FactCandidate {
     #[serde(default)]
     pub origin_compartment_index: Option<u64>,
     /// The printed `[A]`/`[A-B]` range of `<new_messages>` lines the fact cites,
-    /// written as `messages=A-B` in its anchor prefix. Only a lane that runs the
-    /// memory-lifecycle turn one asks for it; see [`resolve_fact_anchor`].
+    /// written as `messages=A-B` in its anchor prefix. Present only when the
+    /// historian wrote that range; the TypeScript runners ask for it only on a turn
+    /// one that requests anchored facts, and every production run is still
+    /// unanchored. See [`resolve_fact_anchor`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_range: Option<FactSourceRange>,
 }

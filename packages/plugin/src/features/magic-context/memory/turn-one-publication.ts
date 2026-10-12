@@ -4,21 +4,26 @@ import { PROMOTABLE_CATEGORIES } from "./constants";
 import { tsOwnsMemory } from "./lifecycle-applier";
 
 /**
- * Which historian turn one a lane runs.
- * - `enabled`: the memory-lifecycle turn one. The prompt has no project-memory
- *   block, facts carry source anchors, and every fact is published as a candidate
- *   for a later decision instead of being promoted.
- * - `dormant`: today's turn one. The prompt keeps the memory block and facts are
- *   promoted through the applier when this process holds memory authority.
+ * How a historian lane (one transport path to the historian model: the OpenCode host
+ * prompt, the OpenCode 2 hidden completion, the Pi subagent, ...) runs its first
+ * historian request, "turn one".
+ * - `enabled`: the prompt has no project-memory block, facts carry source anchors,
+ *   and every fact is published as a pending candidate (`memory_pending_facts`) for
+ *   a later reconcile step to decide, instead of being promoted.
+ * - `dormant`: the existing turn one. The prompt keeps the memory block, and facts
+ *   are promoted through the lifecycle applier when this process holds memory
+ *   authority (`tsOwnsMemory`).
  */
 export type TurnOneLane = "enabled" | "dormant";
 
 /**
- * A lane may run the new turn one only when its carrier sends a response schema the
- * provider honours and the reported model profile has been replay-validated. No
- * carrier (OpenCode host prompt, OpenCode 2 hidden completion, Pi subagent, Rust
- * host or Broca) sends such a field yet, so every production lane is dormant. The
- * override exists for tests that exercise the enabled contract.
+ * A lane may run the `enabled` turn one only when its transport sends a response
+ * schema the provider enforces (so a reply is either schema-valid JSON or an error,
+ * never free text that could be misparsed into an automatic memory edit) and the
+ * model profile the provider reports has passed a recorded replay of the trial
+ * corpus. No transport (OpenCode host prompt, OpenCode 2 hidden completion, Pi
+ * subagent, Rust host or Broca) sends such a field yet, so every production lane is
+ * `dormant`. The override exists for tests that exercise the enabled contract.
  */
 export function resolveTurnOneLane(override?: TurnOneLane): TurnOneLane {
     return override ?? "dormant";
@@ -201,8 +206,11 @@ export interface TurnOnePublicationInput {
     projectPath: string;
     sessionId: string;
     /**
-     * The durable rows just appended for this reply, in reply order, paired with the
-     * ranges the reply gave them. A pair whose ranges differ is not bound.
+     * The durable rows just appended for this reply, in reply order. Each carries its
+     * stored range (`startMessage`/`endMessage`) and the range the reply gave that
+     * compartment (`replyStartMessage`/`replyEndMessage`). If any row's two ranges
+     * differ, the rows cannot be trusted to be this reply's compartments, so no fact
+     * anchor is resolved to them and every candidate is stored with an unknown anchor.
      */
     compartments: ReadonlyArray<{
         id: number;
@@ -215,7 +223,11 @@ export interface TurnOnePublicationInput {
     blocks: readonly TurnOnePrintedBlock[];
     /** Facts to record as candidates, in reply order. Empty when none are recorded. */
     candidateFacts: readonly TurnOneFact[];
-    /** Resolve anchors (enabled lane). When false every candidate's anchor is unknown. */
+    /**
+     * Resolve each candidate's source anchor against `compartments` and `blocks`. Only
+     * an `enabled` lane asks the historian for anchors; when false every candidate's
+     * anchor is stored as unknown.
+     */
     honourAnchors: boolean;
 }
 

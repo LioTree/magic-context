@@ -400,12 +400,13 @@ describe("turn-one publication", () => {
                         send,
                         projectPath: PROJECT,
                         sessionId: SESSION,
-                        // An older row (1-9) where the reply's first compartment belongs.
+                        // A row whose range differs from the reply's first compartment
+                        // (10-12), although it covers the cited line.
                         compartments: [
                             {
                                 id: 7,
-                                startMessage: 1,
-                                endMessage: 9,
+                                startMessage: 10,
+                                endMessage: 14,
                                 replyStartMessage: 10,
                                 replyEndMessage: 12,
                             },

@@ -553,8 +553,10 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const producerLimits = { input: producerWindow.inputLimitTokens };
         const producerReserve = producerWindow.maxOutputTokens;
         const projectPath = resolveProjectIdentity(directory ?? process.cwd());
-        // An enabled lane runs the memory-lifecycle turn one: no project-memory block,
-        // and every fact carries the source anchor its candidate row is stored with.
+        // On an `enabled` turn-one lane (see `TurnOneLane`) with memory on, the
+        // historian gets no project-memory block and anchors every fact to its source
+        // lines; the anchor is stored with the fact's candidate row, and a later
+        // reconcile step compares the fact with existing memory instead.
         const turnOneLane = resolveTurnOneLane(deps.memoryLifecycleLane);
         const anchoredFacts = turnOneLane === "enabled" && deps.memoryEnabled !== false;
         const memories = anchoredFacts
@@ -783,9 +785,11 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         );
         const sessionDirectory = parentSession?.directory ?? directory;
 
-        // Turn one's send record, and the publication id the compartment transaction
-        // commits under, are persisted before the historian is dispatched. A run that
-        // fails before publishing leaves the id for the session's next run to reuse.
+        // Persist turn one's send record, with the publication id the compartment
+        // transaction will commit under, before dispatching the historian. A run that
+        // fails before publishing leaves the id for the session's next run, so one
+        // chunk's candidates and activity are published under one id however many
+        // sends it takes.
         const publicationDirectory = sessionDirectory || deps.directory;
         const publicationProjectPath = publicationDirectory
             ? resolveProjectIdentity(publicationDirectory)
@@ -1113,13 +1117,13 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             // floor below so a crash cannot advance past facts that never became
             // project memories.
             //
-            // Turn one's publication commits here too, once: the activity ledger
-            // counts the new compartments, and candidate facts are recorded
-            // - on an enabled lane, every fact with its resolved anchor (none is
-            //   promoted; a later decision resolves it);
-            // - on a dormant lane whose project memory the Rust module owns, each fact
-            //   that today's promotion would have tried, with an unknown anchor, in
-            //   place of a promotion this process may not perform.
+            // The publication also commits here, once: the activity ledger counts the
+            // new compartments, and candidate facts are recorded
+            // - on an `enabled` lane, every fact with its resolved anchor; none is
+            //   promoted here, a later reconcile step decides each one;
+            // - on a `dormant` lane whose project memory the Rust module owns, each fact
+            //   the promotion below would otherwise have attempted, with an unknown
+            //   anchor, since this process may not write that project's memories.
             const memoryAuthorityHere = tsOwnsMemory(db, publicationProjectPath);
             const facts: TurnOneFact[] = validatedPass.facts ?? [];
             const candidateFacts =

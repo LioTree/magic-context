@@ -196,8 +196,9 @@ export interface CompartmentRunnerDeps<
      */
     autoPromote?: boolean;
     /**
-     * Which historian turn one this lane runs (see `resolveTurnOneLane`). Unset means
-     * dormant, the only production value until a carrier enforces JSON.
+     * Which historian turn one this lane runs (see `TurnOneLane`). Unset means
+     * `dormant`, the only production value: `enabled` needs a transport that makes
+     * the provider enforce a JSON response schema, and none does yet.
      */
     memoryLifecycleLane?: TurnOneLane;
     /**

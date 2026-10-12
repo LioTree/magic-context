@@ -36,7 +36,8 @@ const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 beforeEach(async () => {
     await observeProducerModelsForTest(["test/fixture-historian"]);
-    // These fixtures end on real user rows, so the notice hold would queue.
+    // These fixtures end on real user messages, which would make the notification
+    // hold detector queue notices; turn it off so notices go out immediately.
     __ignoredNotificationTest.setHoldDetector(() => false);
 });
 
@@ -254,7 +255,7 @@ describe("historian turn one on a dormant lane (production default)", () => {
         const [sent] = sentPrompts(prompt);
         expect(sent).toContain("Existing memory shown to the historian.");
         expect(sent).not.toContain("<fact_anchors>");
-        // Today's promotion through the applier: both facts become memories, the
+        // Promotion through the lifecycle applier: both facts become memories, the
         // anchor prefix is not part of the stored text, and no candidate is written.
         expect(
             getMemoriesByProject(db, projectPath)

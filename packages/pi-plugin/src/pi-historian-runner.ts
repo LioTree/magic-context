@@ -488,8 +488,9 @@ export interface PiHistorianDeps {
 	/** Persist the final weak-lookahead compartment for coverage while skipping promotion. */
 	forceKeepLastCompartment?: boolean;
 	/**
-	 * Which historian turn one this lane runs (see `resolveTurnOneLane`). Unset means
-	 * dormant, the only production value until the Pi carrier enforces JSON.
+	 * Which historian turn one this lane runs (see `TurnOneLane`). Unset means
+	 * `dormant`, the only production value: `enabled` needs the Pi subagent to make
+	 * the provider enforce a JSON response schema, which it does not yet.
 	 */
 	memoryLifecycleLane?: TurnOneLane;
 }
@@ -741,9 +742,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				directory,
 				allowHomeProject,
 			);
-			// An enabled lane runs the memory-lifecycle turn one: no project-memory
-			// block, and every fact carries the source anchor its candidate row is
-			// stored with.
+			// On an `enabled` turn-one lane (see `TurnOneLane`) with memory on, the
+			// historian gets no project-memory block and anchors every fact to its
+			// source lines; the anchor is stored with the fact's candidate row, and a
+			// later reconcile step compares the fact with existing memory instead.
 			const turnOneLane = resolveTurnOneLane(deps.memoryLifecycleLane);
 			const anchoredFacts =
 				turnOneLane === "enabled" && memoryEnabled !== false;
@@ -1054,10 +1056,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				{ preserveUserQuotes: true },
 			);
 
-			// Turn one's send record, and the publication id the compartment
-			// transaction commits under, are persisted before the subagent is
-			// spawned. A run that fails before publishing leaves the id for the
-			// session's next run to reuse.
+			// Persist turn one's send record, with the publication id the compartment
+			// transaction will commit under, before spawning the subagent. A run that
+			// fails before publishing leaves the id for the session's next run, so one
+			// chunk's candidates and activity are published under one id however many
+			// sends it takes.
 			const turnOneSend = allocateTurnOneSend(db, {
 				projectPath,
 				sessionId,
@@ -1487,12 +1490,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				// renderer's m[1] new-memories watermark. Promotion is in the SAME
 				// transaction as the boundary floor below, so both commit or both roll back.
 				//
-				// Turn one's publication commits here too, once (OpenCode parity):
-				// the activity ledger counts the new compartments, and candidate
-				// facts are recorded on an enabled lane (every fact, with its
-				// resolved anchor) or, on a dormant lane whose project memory the
-				// Rust module owns, in place of the promotion this process may not
-				// perform (unknown anchor).
+				// The publication also commits here, once, as in the OpenCode runner:
+				// the activity ledger counts the new compartments, and candidate facts
+				// are recorded on an `enabled` lane (every fact, with its resolved
+				// anchor) or, on a `dormant` lane whose project memory the Rust module
+				// owns, in place of the promotion this process may not perform (each
+				// with an unknown anchor).
 				const memoryAuthorityHere = tsOwnsMemory(db, projectPath);
 				const facts: TurnOneFact[] = validatedPass.facts ?? [];
 				const candidateFacts =
