@@ -355,11 +355,11 @@ describe("turn two fact selection", () => {
                 { content: "Covered fact" },
             ]);
             const states = ["decided_pending", "applied", "covered"];
-            first.factIds.forEach((id, index) =>
-                db
-                    .prepare("UPDATE memory_pending_facts SET state=? WHERE id=?")
-                    .run(states[index]!, id),
-            );
+            for (const [index, id] of first.factIds.entries())
+                db.prepare("UPDATE memory_pending_facts SET state=? WHERE id=?").run(
+                    states[index]!,
+                    id,
+                );
             const stub = stubCarrier(() => reply([]));
             for (let runIndex = 0; runIndex < 2; runIndex++) {
                 const next = publish(db, []);
