@@ -60,6 +60,13 @@ pub(super) fn envelope(message: &Value, raw: Option<&Value>) -> Result<Value, Ha
     Ok(json!({"message":message,"raw_message":raw}))
 }
 
+/// Read the raw JSON string beside the parsed message on Claude Code requests.
+/// Keep this lookup separate so a typed commons field can later replace it;
+/// validation and stored provenance must remain the same.
+pub(super) fn from_wire(fields: &Value) -> Result<Value, HandlerOutcome> {
+    envelope(&fields["message"], fields.get("raw_message"))
+}
+
 pub(super) fn decode_message(
     entry: &compact::status::StatusMessage,
 ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {

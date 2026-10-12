@@ -26,13 +26,17 @@ fn host_plan(
     harness: &str,
     params: &Value,
 ) -> Result<bool, HandlerOutcome> {
-    let profile =
-        params.get("serializer_profile").and_then(Value::as_str) == Some("opencode-aisdk");
+    let expected = if attested_claude_code(binding) {
+        "claude-code-anthropic"
+    } else {
+        "opencode-aisdk"
+    };
+    let profile = params.get("serializer_profile").and_then(Value::as_str) == Some(expected);
     let answer = params.get("observation").and_then(Value::as_str) == Some("answer");
-    if !profile && !answer && !matches!(binding.harness.as_str(), "opencode" | "opencode2") {
+    if !profile && !answer && !host_binding(binding) {
         return Ok(false);
     }
-    if !matches!(binding.harness.as_str(), "opencode" | "opencode2") {
+    if !host_binding(binding) {
         return Err(invalid_field(if answer {
             "params.observation"
         } else {
@@ -84,6 +88,8 @@ struct HostView {
     wire: compact::answer::CompactionMessage,
     #[serde(default)]
     coverage: Option<HostCoverage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_replacement: Option<Vec<String>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct HostCoverage {
@@ -246,6 +252,15 @@ fn non_tag_messages(
         let message = &mut messages[position];
         let mut ops: Vec<hooks::answer::Operation> =
             serde_json::from_str(&answer.ops_json).map_err(transient)?;
+        if message.message.get("raw_message").is_some() {
+            // Claude Code hooks currently record unchanged messages. They do not
+            // authorize tool reductions or delivery notices, and OpenCode's part
+            // operations cannot be applied to Anthropic content blocks.
+            if !ops.is_empty() {
+                return Err(invalid_field("message"));
+            }
+            continue;
+        }
         // The host record keeps its earlier hook answer unchanged when a step
         // does not replace history. Remove Channel 1 Appends from live post_tool
         // answers before engine ingestion: tagged CHANNEL1_NOTE operations and
@@ -500,12 +515,13 @@ fn execute_host(
     status: &transform::compaction::Status,
     lineage: &ProviderLineage,
 ) -> Result<Option<HostView>, HandlerOutcome> {
+    let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
     let messages = non_tag_messages(store, &work.key, lineage)?;
     let mut template: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
-        "serializer_profile":"opencode-aisdk","session_id":conversation.engine_namespace,
+        "serializer_profile":codec.serializer_profile().wire_id(),"session_id":conversation.engine_namespace,
         "render_config":serde_json::to_string(&setup.setup.request.params).map_err(transient)?,
         "model_key":setup.setup.request.model,"messages":[],"tool_present":true,"auto_search_enabled":false}))?;
-    Codec::OpencodeAiSdk.prepare_request(&mut template, &messages)?;
+    codec.prepare_request(&mut template, &messages)?;
     let meta = store
         .load_meta(&conversation.engine_namespace)
         .map_err(transient)?
@@ -613,7 +629,7 @@ fn execute_host(
     let transform::compaction::Answer::Replacement(engine) = output.answer else {
         return Ok(None);
     };
-    let (wire, coverage) = if let Some(previous) = previous.filter(|p| {
+    let (wire, coverage, raw_replacement) = if let Some(previous) = previous.filter(|p| {
         status
             .last_not_applied
             .is_some_and(|n| !n.structural && n.version == p.engine.version)
@@ -622,13 +638,25 @@ fn execute_host(
     }) {
         let mut wire = previous.wire;
         wire.version = engine.version;
-        (wire, previous.coverage)
+        (wire, previous.coverage, previous.raw_replacement)
     } else {
-        let wire = Codec::OpencodeAiSdk.encode_view(
-            &engine,
-            &template,
-            &super::codec_opencode::NativeRenderContext::from(&output.engine),
-        )?;
+        let (wire, raw_replacement) = if codec == Codec::ClaudeCodeAnthropic {
+            let (wire, raw) = super::codec_claude_code::encode_view(
+                &engine,
+                &template,
+                output.engine.response.coverage_ordinal,
+            )?;
+            (wire, Some(raw))
+        } else {
+            (
+                codec.encode_view(
+                    &engine,
+                    &template,
+                    &super::codec_opencode::NativeRenderContext::from(&output.engine),
+                )?,
+                None,
+            )
+        };
         let coverage = output.engine.response.coverage_ordinal.and_then(|ordinal| {
             messages
                 .iter()
@@ -638,12 +666,13 @@ fn execute_host(
                     ordinal,
                 })
         });
-        (wire, coverage)
+        (wire, coverage, raw_replacement)
     };
     Ok(Some(HostView {
         engine,
         wire,
         coverage,
+        raw_replacement,
     }))
 }
 
@@ -831,6 +860,7 @@ impl McHandler {
         request: compact::setup::SetupRequest,
         chosen: transform::compaction::Preset,
     ) -> Result<Vec<u8>, HandlerOutcome> {
+        let codec = Codec::from_params(&Value::Object(request.params.clone()))?;
         if !binding.config.compaction_enabled {
             return bytes(&compact::setup::SetupAnswer::Refuse {
                 request_id: request.request_id,
@@ -844,7 +874,11 @@ impl McHandler {
             .map_err(transient)?
             .unwrap_or_default();
         if conversation.engine_namespace.is_empty() {
-            conversation.engine_namespace = binding.session.clone();
+            conversation.engine_namespace = if codec == Codec::ClaudeCodeAnthropic {
+                key.engine_key()
+            } else {
+                binding.session.clone()
+            };
         }
         let mut setup: HostSetup = if let Some(raw) = &conversation.setup_json {
             serde_json::from_str(raw).map_err(transient)?
@@ -863,7 +897,9 @@ impl McHandler {
                 setup: Setup {
                     request: request.clone(),
                     state: transform::compaction::State::new(id, chosen),
-                    stability: if chosen == transform::compaction::Preset::Head {
+                    stability: if chosen == transform::compaction::Preset::Head
+                        && codec != Codec::ClaudeCodeAnthropic
+                    {
                         vec![
                             compact::setup::StabilityRank { index: 0, rank: 2 },
                             compact::setup::StabilityRank { index: 1, rank: 1 },
@@ -911,7 +947,9 @@ impl McHandler {
                     from: 0,
                     to: 0,
                 },
-                replacement: if chosen == transform::compaction::Preset::Head {
+                replacement: if chosen == transform::compaction::Preset::Head
+                    && codec != Codec::ClaudeCodeAnthropic
+                {
                     vec![
                         ck_wire::CkWireMessage::synthetic_user_text(
                             transform::compaction::M0_EMPTY_PLACEHOLDER,
@@ -927,9 +965,9 @@ impl McHandler {
             let mut template: TransformRequest = decode(
                 &json!({"v":2,"kind":"compaction.step","session_id":conversation.engine_namespace,"messages":[],"render_config":"","tool_present":false,"auto_search_enabled":false}),
             )?;
-            Codec::OpencodeAiSdk.prepare_request(&mut template, &[])?;
+            codec.prepare_request(&mut template, &[])?;
             let tags = BTreeMap::new();
-            let wire = Codec::OpencodeAiSdk.encode_view(
+            let wire = codec.encode_view(
                 &engine,
                 &template,
                 &super::codec_opencode::NativeRenderContext {
@@ -945,12 +983,14 @@ impl McHandler {
                 engine,
                 wire,
                 coverage: None,
+                raw_replacement: (codec == Codec::ClaudeCodeAnthropic).then(Vec::new),
             }
         };
         save_host_view(store, key, &view, "applied")?;
         setup.setup.state.version_high_water = high;
         setup.applied = Some(ViewSummary::from(&view.engine));
         setup.produced = setup.applied.clone();
+        let raw_replacement = view.raw_replacement.clone();
         let answer = compact::setup::SetupAnswer::Ready {
             request_id: request.request_id,
             initial: view.wire,
@@ -960,7 +1000,13 @@ impl McHandler {
         conversation.last_answer_json = Some(serde_json::to_string(&answer).map_err(transient)?);
         save_host_setup(store, key, &mut conversation, &setup)?;
         fault("AnswerRecorded");
-        bytes(&answer)
+        match raw_replacement {
+            Some(raw) => super::codec_claude_code::answer_bytes(
+                &serde_json::to_value(answer).map_err(transient)?,
+                &raw,
+            ),
+            None => bytes(&answer),
+        }
     }
 
     fn host_step(
@@ -983,6 +1029,7 @@ impl McHandler {
                 error("setup_missing", "compaction.step requires a Setup record")
             })?)
             .map_err(transient)?;
+        let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
         let lineage = host_lineage(store, &work.key, params, &request)?;
         // An acknowledgement names a frozen object, not just a sequence number.
         // Validate both components before admission can promote or burn anything.
@@ -1017,8 +1064,13 @@ impl McHandler {
         let messages = request
             .messages
             .iter()
-            .map(|m| {
-                Codec::OpencodeAiSdk.decode_message(m)?;
+            .enumerate()
+            .map(|(index, m)| {
+                let mut m = m.clone();
+                if codec == Codec::ClaudeCodeAnthropic {
+                    m.message = super::codec_claude_code::from_wire(&params["messages"][index])?;
+                }
+                codec.decode_message(&m)?;
                 Ok(ProviderMessage {
                     ordinal: m.ordinal,
                     mid: m.mid.clone(),
@@ -1223,6 +1275,7 @@ impl McHandler {
                 }
             }
         }
+        let mut raw_replacement = None;
         let answer = if incomplete {
             // Host paging never owns asynchronous wait work or a ready callback.
             // The lock's guard belongs to the request and drops at this return.
@@ -1257,14 +1310,27 @@ impl McHandler {
                     .checked_add(1)
                     .ok_or_else(|| transient("version exhausted"))?;
                 save_host_setup(store, &work.key, &mut conversation, &setup)?;
-                let view = execute_host(
+                let view = match execute_host(
                     store,
                     work,
                     &conversation,
                     &mut setup,
                     &normalized,
                     &lineage,
-                )?;
+                ) {
+                    Err(HandlerOutcome::Error { code, message })
+                        if codec == Codec::ClaudeCodeAnthropic
+                            && matches!(
+                                code.as_str(),
+                                "signed_prefix_edit" | "invalid_signed_tool_boundary"
+                            ) =>
+                    {
+                        return bytes(
+                            &json!({"answer":"refuse","request_id":request.request_id,"code":"misconfigured","reason":message,"provider_code":code}),
+                        );
+                    }
+                    result => result?,
+                };
                 let current = store
                     .load_provider_conversation(&work.key.store_key())
                     .map_err(transient)?
@@ -1274,6 +1340,7 @@ impl McHandler {
                 counters["channel1_hook_append_pending"] = json!(false);
                 conversation.hook_counters_json = counters.to_string();
                 if let Some(view) = view {
+                    raw_replacement = view.raw_replacement.clone();
                     save_host_view(store, &work.key, &view, "produced")?;
                     setup.produced = Some(ViewSummary::from(&view.engine));
                     let mut answer = json!({"answer":"compaction_message","request_id":request.request_id,"compaction":view.wire});
@@ -1291,7 +1358,10 @@ impl McHandler {
         conversation.last_answer_json = Some(answer_receipt(&answer));
         save_host_setup(store, &work.key, &mut conversation, &setup)?;
         fault("AnswerRecorded");
-        bytes(&answer)
+        match raw_replacement {
+            Some(raw) => super::codec_claude_code::answer_bytes(&answer, &raw),
+            None => bytes(&answer),
+        }
     }
 
     fn provider_work(
@@ -1638,6 +1708,7 @@ mod host_tests {
         handler.store.set(store.clone()).ok().unwrap();
         handler.provider_runner = runner;
         let binding = SessionBinding {
+            principal: None,
             project_root: dir.into(),
             harness: "opencode".into(),
             session: "s".into(),

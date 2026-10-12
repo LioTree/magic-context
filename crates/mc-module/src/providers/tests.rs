@@ -65,6 +65,7 @@ fn handler(dir: &Path, runner: Arc<Runner>) -> McHandler {
         handler.bind_route(
             channel,
             SessionBinding {
+                principal: None,
                 project_root: dir.to_path_buf(),
                 harness: session_resolver::RUNNER_BIND_HARNESS.into(),
                 session: session.into(),

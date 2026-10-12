@@ -189,6 +189,8 @@ use transform::{
 /// the daemon controls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
+    /// Identity stamped by the daemon at bind, never supplied by an RPC body.
+    pub principal: Option<subc_protocol::Principal>,
     pub project_root: PathBuf,
     pub harness: String,
     pub session: String,
@@ -14648,6 +14650,7 @@ impl ModuleHandler for McHandler {
         self.bind_route(
             req.handle.channel,
             SessionBinding {
+                principal: req.principal.clone(),
                 project_root: req.identity.project_root.clone(),
                 harness: req.identity.harness.clone(),
                 session: req.identity.session.clone(),
@@ -21192,6 +21195,7 @@ mod tests {
 
     fn binding_with_harness(root: &str, harness: &str, session: &str) -> SessionBinding {
         SessionBinding {
+            principal: None,
             project_root: PathBuf::from(root),
             harness: harness.to_string(),
             session: session.to_string(),
