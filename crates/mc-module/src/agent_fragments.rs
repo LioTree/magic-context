@@ -209,7 +209,7 @@ mod tests {
             "../tests/fixtures/agent-fragments-golden.json"
         ))
         .unwrap();
-        assert_eq!(cases.len(), 160);
+        assert_eq!(cases.len(), 164);
         for (index, case) in cases.iter().enumerate() {
             let before = &case["before"];
             let projection = AppliedProjection {

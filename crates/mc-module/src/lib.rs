@@ -33827,10 +33827,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    // A busting SOFT reads no memory rows or mutation log, and the Rust renderer has no
-    // agent fragments yet (see `m1_compose::tests::rust_soft_renders_no_agent_fragments_yet`),
-    // so facade memory edits are stored at once but reach the prompt at the next HARD fold.
-    async fn facade_memory_edits_store_at_once_and_wait_for_hard_in_rust() {
+    // token and token-additive resolve to scope and additive_scope, the cache keys
+    // served by transform routes 8 and 9. SOFT+ means defer: cached prompt bytes stay
+    // unchanged while the editing session's pre-rendered lines wait for a real SOFT.
+    async fn facade_same_session_memory_edits_wait_for_an_independent_soft() {
         let producer = Arc::new(ProducerState::default());
         let project_root = "/repo/cache-project";
         let scope = "pm_a5ee3bf8/parent-session/epoch-1";
@@ -33883,10 +33883,16 @@ mod tests {
         );
 
         let update_delta = call_transform_request_on_channel(&handler, 8, boot_req.clone()).await;
-        // Memory edits are not m1 work: the pass replays (SOFT+) and renders nothing new.
+        // Saving the row and its pending lines cannot itself rewrite cached m0/m1 bytes.
         assert_eq!(update_delta["action"], "SOFT+");
         assert!(!synthetic_text(&update_delta, 1).contains("<memory-updates>"));
         assert!(!synthetic_text(&update_delta, 1).contains("updated rule"));
+        assert_eq!(store.load_agent_fragments(scope, 0).unwrap().len(), 1);
+        store.arm_soft_refresh(scope).unwrap();
+        let update_soft = call_transform_request_on_channel(&handler, 8, boot_req).await;
+        assert_eq!(update_soft["action"], "SOFT");
+        assert!(synthetic_text(&update_soft, 1).contains("updated rule"));
+        assert!(synthetic_text(&update_soft, 1).contains("<memory-updates>"));
 
         handler.bind_route(9, binding(additive_project_root, additive_scope));
         store
@@ -33932,10 +33938,157 @@ mod tests {
                 .as_deref(),
             Some(additive_scope)
         );
-        let add_delta = call_transform_request_on_channel(&handler, 9, add_req).await;
+        let add_delta = call_transform_request_on_channel(&handler, 9, add_req.clone()).await;
         assert_eq!(add_delta["action"], "SOFT+");
         assert!(!synthetic_text(&add_delta, 1).contains("<new-memories>"));
         assert!(!synthetic_text(&add_delta, 1).contains("new additive memory"));
+        assert_eq!(
+            store.load_agent_fragments(additive_scope, 0).unwrap().len(),
+            1
+        );
+        store.arm_soft_refresh(additive_scope).unwrap();
+        let add_soft = call_transform_request_on_channel(&handler, 9, add_req).await;
+        assert_eq!(add_soft["action"], "SOFT");
+        assert!(synthetic_text(&add_soft, 1).contains("new additive memory"));
+        assert!(synthetic_text(&add_soft, 1).contains("<added"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_memory_operations_match_ts_goldens_on_soft_and_isolate_sessions() {
+        let goldens: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/agent-fragments-golden.json"
+        ))
+        .unwrap();
+        let operations = goldens
+            .iter()
+            .filter(|case| case.get("facadeAction").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(operations.len(), 4);
+        for golden in operations {
+            let action = golden["facadeAction"].as_str().unwrap();
+            let content = golden["content"].as_str().unwrap();
+            let mine = "pm_facade/mine/epoch-1";
+            let other = "pm_facade/other/epoch-1";
+            let resolver =
+                FakeSessionResolver::with(&[("writer-token", FakeResolve::Hit(mine.into()))]);
+            let (handler, store, _dir, project) = handler_with_store_and_resolver(
+                Arc::new(ProducerState::default()),
+                default_test_config(),
+                resolver,
+            );
+            let project = project.to_str().unwrap();
+            handler.bind_route(7, binding(project, "writer-token"));
+            handler.bind_route(8, binding(project, mine));
+            handler.bind_route(9, binding(project, other));
+            for session in [mine, other] {
+                store
+                    .replace_compartments(session, &[stored_comp(1, 1, 10, "m10", "SUMMARY")])
+                    .unwrap();
+            }
+            assert_eq!(
+                insert_memory(&store, project, "CONSTRAINTS", "original alpha", 1),
+                1
+            );
+            assert_eq!(
+                insert_memory(&store, project, "CONSTRAINTS", "original beta", 1),
+                2
+            );
+            let mut mine_req = request(vec![ck("m10", 10, "raw covered")]);
+            mine_req["session_id"] = json!(mine);
+            let mut other_req = mine_req.clone();
+            other_req["session_id"] = json!(other);
+            let mine_boot = call_transform_request_on_channel(&handler, 8, mine_req.clone()).await;
+            let other_boot =
+                call_transform_request_on_channel(&handler, 9, other_req.clone()).await;
+            assert_eq!(mine_boot["action"], "HARD");
+            assert_eq!(other_boot["action"], "HARD");
+            assert!(synthetic_text(&mine_boot, 0).contains("original alpha"));
+            assert!(synthetic_text(&mine_boot, 0).contains("original beta"));
+            let arguments = match action {
+                "update" => {
+                    json!({"action":action,"id":1,"category":"CONSTRAINTS","content":content})
+                }
+                "merge" => json!({"action":action,"ids":[1,2],"content":content}),
+                "archive" => json!({"action":action,"ids":[1]}),
+                "write" => json!({"action":action,"category":"CONSTRAINTS","content":content}),
+                _ => panic!("unknown facade golden {action}"),
+            };
+            let result = call_facade(&handler, "ctx_memory", arguments).await;
+            assert!(
+                !tool_is_error(result),
+                "{action} must apply through the facade"
+            );
+            let fragments = store.load_agent_fragments(mine, 0).unwrap();
+            assert_eq!(
+                fragments.len(),
+                1,
+                "{action} must record exactly one own-session fragment"
+            );
+            assert_eq!(
+                serde_json::to_value(&fragments[0].lines).unwrap(),
+                golden["pending"][0]["lines"]
+            );
+            assert_eq!(
+                serde_json::to_value(&fragments[0].visible_texts).unwrap(),
+                golden["pending"][0]["visibleTexts"]
+            );
+            assert!(store.load_agent_fragments(other, 0).unwrap().is_empty());
+
+            // A memory tool call does not authorize rewriting either cached prompt block.
+            // These requests must replay until session.flush separately requests a SOFT.
+            let mine_defer = call_transform_request_on_channel(&handler, 8, mine_req.clone()).await;
+            let other_defer =
+                call_transform_request_on_channel(&handler, 9, other_req.clone()).await;
+            assert_eq!(mine_defer["action"], "SOFT+");
+            assert_eq!(other_defer["action"], "SOFT+");
+            assert_eq!(
+                serde_json::to_vec(&mine_defer["ck_messages"]).unwrap(),
+                serde_json::to_vec(&mine_boot["ck_messages"]).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(&other_defer["ck_messages"]).unwrap(),
+                serde_json::to_vec(&other_boot["ck_messages"]).unwrap()
+            );
+            for (channel, session) in [(8, mine), (9, other)] {
+                let flushed = tool_body(
+                    handler
+                        .dispatch_value(
+                            channel,
+                            json!({"method":"session.flush","v":1,"session_id":session}),
+                        )
+                        .await,
+                );
+                assert_eq!(flushed, json!({"ok":true,"armed":true}));
+            }
+            let mine_soft = call_transform_request_on_channel(&handler, 8, mine_req.clone()).await;
+            let other_soft =
+                call_transform_request_on_channel(&handler, 9, other_req.clone()).await;
+            assert_eq!(mine_soft["action"], "SOFT");
+            assert_eq!(other_soft["action"], "SOFT");
+            assert_eq!(
+                synthetic_text(&mine_soft, 1),
+                golden["m1"].as_str().unwrap(),
+                "{action} must match the TS/Pi composer byte for byte"
+            );
+            assert_eq!(synthetic_text(&mine_soft, 0), synthetic_text(&mine_boot, 0));
+            assert_eq!(
+                serde_json::to_vec(&other_soft["ck_messages"]).unwrap(),
+                serde_json::to_vec(&other_boot["ck_messages"]).unwrap(),
+                "{action} from another session must not enter this SOFT"
+            );
+            let mine_replay = call_transform_request_on_channel(&handler, 8, mine_req).await;
+            let other_replay = call_transform_request_on_channel(&handler, 9, other_req).await;
+            assert_eq!(mine_replay["action"], "SOFT+");
+            assert_eq!(other_replay["action"], "SOFT+");
+            assert_eq!(
+                serde_json::to_vec(&mine_replay["ck_messages"]).unwrap(),
+                serde_json::to_vec(&mine_soft["ck_messages"]).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(&other_replay["ck_messages"]).unwrap(),
+                serde_json::to_vec(&other_soft["ck_messages"]).unwrap()
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

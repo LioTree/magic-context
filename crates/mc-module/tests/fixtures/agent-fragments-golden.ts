@@ -41,6 +41,22 @@ for (let step=0;step<160;step++) {
     if (pass==="soft") { const result=composeSoftMemoryUpdates({db:db as never,sessionId:"ses",projection,memoryBudgetTokens,historyBudgetTokens,independentTokens,m0Tokens:()=>m0Tokens}); projection=result.projection;block=result.block; }
     cases.push({pass,before,pending,memoryBudgetTokens,historyBudgetTokens,independentTokens,m0Tokens,block,committed:projection.committed});
 }
+// Fixed operation goldens are also exercised through the real Rust module facade.
+// Each scenario begins with memory IDs 1 and 2 folded into both sessions' heads.
+for (const facadeAction of ["update", "merge", "archive", "write"] as const) {
+    db.exec("DELETE FROM memory_agent_fragments");
+    const before=fresh();
+    const content=facadeAction==="update" ? "updated rule" : facadeAction==="merge" ? "merged rule" : "new additive memory";
+    const memoryIds=facadeAction==="merge" ? [1,2,3] : facadeAction==="write" ? [3] : [1];
+    const currentId=facadeAction==="archive" ? null : facadeAction==="update" ? 1 : 3;
+    const lines=facadeAction==="archive" ? [renderRemovedFragmentLine(1)] : facadeAction==="merge" ? [renderSupersededFragmentLine(1,3),renderSupersededFragmentLine(2,3),renderAddedFragmentLine(3,"CONSTRAINTS",content)] : [facadeAction==="update" ? renderUpdatedFragmentLine(1,"CONSTRAINTS",content) : renderAddedFragmentLine(3,"CONSTRAINTS",content)];
+    const visibleTexts=currentId===null ? [] : [{id:currentId,text:content}];
+    const fragment={id:1,operationKey:`facade-${facadeAction}`,memoryIds,currentId,lines,visibleTexts};
+    db.prepare("INSERT INTO memory_agent_fragments VALUES(?, 'ses','opencode','/repo',?,?,?,?,?)").run(fragment.id,fragment.operationKey,JSON.stringify(memoryIds),currentId,lines.join("\n"),JSON.stringify(visibleTexts));
+    const memoryBudgetTokens=8000, historyBudgetTokens=60000, independentTokens=0, m0Tokens=0;
+    const result=composeSoftMemoryUpdates({db:db as never,sessionId:"ses",projection:before,memoryBudgetTokens,historyBudgetTokens,independentTokens,m0Tokens:()=>m0Tokens});
+    cases.push({pass:"soft",facadeAction,content,before,pending:[fragment],memoryBudgetTokens,historyBudgetTokens,independentTokens,m0Tokens,block:result.block,m1:`<session-history-since>\n${result.block}\n</session-history-since>`,committed:result.projection.committed});
+}
 const rendered="[\n"+cases.map(item=>JSON.stringify(item)).join(",\n")+"\n]\n";
 if (process.argv.includes("--check")) {
     if (await Bun.file(file).text()!==rendered) throw new Error("Rust fragment golden differs from TS/Pi production output");

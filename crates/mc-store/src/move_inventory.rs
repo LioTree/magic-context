@@ -4137,6 +4137,31 @@ mod tests {
     }
 
     #[test]
+    fn rust_applied_tuple_and_fragments_have_session_owned_move_classification() {
+        const {
+            assert!(STORE_SCHEMA_VERSION >= 69);
+        }
+        let cache = TABLES
+            .iter()
+            .find(|entry| entry.store == Store::Module && entry.table == "mc_cache_state")
+            .unwrap();
+        assert_eq!(cache.class, Class::Ship);
+        assert_eq!(cache.session_column(), Some("session_id"));
+        assert!(cache.shipped_columns().contains(&"meta"));
+        assert_eq!(cache.key_policy, Some(KeyPolicy::Preserve));
+        let fragments = TABLES
+            .iter()
+            .find(|entry| entry.store == Store::Context && entry.table == "memory_agent_fragments")
+            .unwrap();
+        assert_eq!(fragments.class, Class::Ship);
+        assert_eq!(fragments.session_column(), Some("session_id"));
+        assert_eq!(
+            fragments.key_policy,
+            Some(KeyPolicy::PreserveOrRefuseCollision)
+        );
+    }
+
+    #[test]
     fn excluded_tables_and_generated_columns_still_have_a_drift_fence() {
         let (_dir, context, module) = fresh_stores();
         context
