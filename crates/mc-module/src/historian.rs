@@ -800,7 +800,17 @@ fn persist_historian_state_inner(
             }
         });
         match store.commit_meta(session_id, loaded.row_version, &meta) {
-            Ok(row_version) => return Ok(row_version),
+            Ok(row_version) => {
+                if next_state.state == HistorianPhase::Idle {
+                    crate::historian_stage::finish_idle_stage(
+                        store,
+                        session_id,
+                        next_state.firing_seq,
+                    )
+                    .map_err(|e| mc_store::single_store_domain::context_error(e.code(), e))?;
+                }
+                return Ok(row_version);
+            }
             Err(error @ McStoreError::CasConflict { .. }) if metadata_retries > 0 => {
                 let fresh = store.load_meta(session_id)?;
                 let mut expected = loaded.meta.historian.clone();
@@ -841,7 +851,9 @@ pub struct ValidatedPublishRequest<'a> {
     pub predicate: &'a HistorianPublishPredicate,
     pub observed_chunk_fingerprint: &'a str,
     pub validated: &'a ValidatedChunk,
-    /// Facts are dropped when either memory.enabled or memory.auto_promote is off.
+    /// Promote facts only when memory support and automatic promotion are enabled.
+    /// When TypeScript is the authorized memory writer instead of this module,
+    /// publication keeps every fact pending rather than attempting promotion.
     pub promote_facts: bool,
     /// User observations are stored only when the privacy collection gate is enabled.
     pub collect_user_memory_candidates: bool,
@@ -890,16 +902,12 @@ pub fn publish_validated_chunk(
         .iter()
         .map(|c| to_stored_compartment(c, request.created_at_ms, request.boundary_dates))
         .collect();
-    let facts: Vec<FactCandidate> = if request.promote_facts {
-        request
-            .validated
-            .facts
-            .iter()
-            .map(|fact| to_store_fact(fact, request.session_id))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let facts: Vec<FactCandidate> = request
+        .validated
+        .facts
+        .iter()
+        .map(|fact| to_store_fact(fact, request.session_id))
+        .collect();
     let events: Vec<HistorianEventCandidate> = request
         .validated
         .events
@@ -945,7 +953,14 @@ pub fn publish_validated_chunk(
             Vec::new()
         };
 
+    let publication_id = crate::historian_stage::publication_id(
+        request.project_path,
+        request.session_id,
+        &request.predicate.chunk_fingerprint,
+        request.expected_revert_epoch,
+    );
     let publish_request = HistorianPublishRequest {
+        lifecycle_publication_id: Some(&publication_id),
         harness: Some(request.harness),
         session_id: request.session_id,
         expected_row_version: request.expected_row_version,
@@ -1074,9 +1089,27 @@ pub fn handle_restart_load(
     failure_backoff_at_ms: i64,
 ) -> Result<RestartAction, HistorianStateError> {
     let loaded = store.load_meta(session_id)?;
-    let state = loaded.meta.historian.clone();
+    let mut state = loaded.meta.historian.clone();
+    if matches!(
+        state.state,
+        HistorianPhase::Firing | HistorianPhase::Validating | HistorianPhase::Publishing
+    ) {
+        if let Some((child, handle)) =
+            crate::historian_stage::recover_broca_stage(store, session_id, &state)
+                .map_err(|e| mc_store::single_store_domain::context_error(e.code(), e))?
+        {
+            state.state = HistorianPhase::AwaitingProducer;
+            state.producer_session_id = Some(child);
+            state.producer_run_id = Some(handle);
+            persist_historian_state(store, session_id, state.clone())?;
+        }
+    }
     match state.state {
-        HistorianPhase::Idle => Ok(RestartAction::Done),
+        HistorianPhase::Idle => {
+            crate::historian_stage::finish_idle_stage(store, session_id, state.firing_seq)
+                .map_err(|e| mc_store::single_store_domain::context_error(e.code(), e))?;
+            Ok(RestartAction::Done)
+        }
         HistorianPhase::AwaitingProducer => {
             let (Some(producer_session_id), Some(producer_run_id)) = (
                 state.producer_session_id.clone(),
@@ -1249,6 +1282,22 @@ pub trait HistorianProducerDriver: Send {
     ) -> Result<RunHandle, HistorianProducerError> {
         self.start(session_id, system, prompt, model).await
     }
+    /// Reuse one provider session for historian turns, but give each turn its own
+    /// send key so the Broca model runner cannot deduplicate turn two as turn one.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_stage_with_temperature(
+        &mut self,
+        session_id: &str,
+        _stage_key: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        variant: Option<&str>,
+        temperature: Option<f64>,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        self.start_with_temperature(session_id, system, prompt, model, variant, temperature)
+            .await
+    }
     async fn await_output(
         &mut self,
         run_id: &str,
@@ -1318,6 +1367,30 @@ impl HistorianProducerDriver for HistorianProducer {
             prompt,
             model,
             variant,
+            temperature,
+        )
+        .await
+    }
+
+    async fn start_stage_with_temperature(
+        &mut self,
+        session_id: &str,
+        stage_key: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        variant: Option<&str>,
+        temperature: Option<f64>,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        HistorianProducer::start_stage_with_generation(
+            self,
+            session_id,
+            stage_key,
+            system,
+            prompt,
+            model,
+            variant,
+            crate::historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS,
             temperature,
         )
         .await
@@ -2181,9 +2254,19 @@ where
             request.session_id,
             fired.firing_seq,
         );
+        let stage = crate::historian_stage::HistorianStage::turn_one(
+            request.project_path,
+            request.session_id,
+            &fired,
+        );
+        stage.persist(request.store, request.session_id, request.harness, "broca", Some(&producer_session_id),
+            &serde_json::json!({"system": request.system.as_ref(), "prompt": prompt, "model": model,
+                "variant": request.model_variants.get(model), "temperature": request.temperature}), request.now_ms)
+            .map_err(|e| mc_store::single_store_domain::context_error(e.code(), e))?;
         let handle = match producer
-            .start_with_temperature(
+            .start_stage_with_temperature(
                 &producer_session_id,
+                &stage.stage_key,
                 request.system.as_ref(),
                 &prompt,
                 model,
@@ -2318,6 +2401,14 @@ where
             .await
         {
             Ok(output) => output,
+            Err(HistorianProducerError::TimedOut)
+                if crate::historian_producer::is_stage_submission(&handle.run_id) =>
+            {
+                producer.close().await;
+                return Err(HistorianDriveError::Producer(
+                    HistorianProducerError::TimedOut,
+                ));
+            }
             Err(HistorianProducerError::TimedOut) => {
                 // A timed-out attempt moves on to the next model in the chain, the same
                 // rule as the TypeScript historian's outer model loop (a timed-out prompt
@@ -2393,6 +2484,13 @@ where
                         return Err(HistorianDriveError::Producer(recovery_err));
                     }
                 }
+            }
+            Err(err)
+                if crate::historian_producer::is_stage_submission(&handle.run_id)
+                    && err.unknown_send_outcome() =>
+            {
+                producer.close().await;
+                return Err(HistorianDriveError::Producer(err));
             }
             Err(err) => {
                 let _ = producer.cancel(&handle.run_id).await;
@@ -2628,6 +2726,23 @@ pub async fn run_historian_firing_on_host(
     // across both runners.
     let run_id =
         historian_producer_session_id(request.project_slug, request.session_id, fired.firing_seq);
+    let stage = crate::historian_stage::HistorianStage::turn_one(
+        request.project_path,
+        request.session_id,
+        &fired,
+    );
+    stage
+        .persist(
+            request.store,
+            request.session_id,
+            request.harness,
+            "rust_host",
+            None,
+            &serde_json::json!({"system": request.system.as_ref(), "prompt": request.prompt,
+            "model_chain": request.model_chain}),
+            request.now_ms,
+        )
+        .map_err(|e| mc_store::single_store_domain::context_error(e.code(), e))?;
     let registration = ledger.register(&run_id);
     let queued = request
         .store
@@ -3007,6 +3122,13 @@ where
         .await
     {
         Ok(output) => output,
+        Err(err)
+            if crate::historian_producer::is_stage_submission(&producer_run_id)
+                && err.unknown_send_outcome() =>
+        {
+            producer.close().await;
+            return Err(HistorianDriveError::Producer(err));
+        }
         Err(err) => {
             let _ = producer.cancel(&producer_run_id).await;
             let detail_prefix = match err
@@ -7050,6 +7172,7 @@ mod tests {
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: loaded.row_version,
@@ -7174,6 +7297,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: Some(row_version),

@@ -55,6 +55,7 @@ pub mod historian_host;
 pub mod historian_producer;
 pub mod historian_prompt;
 pub mod historian_runner;
+pub mod historian_stage;
 pub mod historian_tool_template;
 pub mod historian_validate;
 pub mod host_store;
@@ -8369,7 +8370,35 @@ impl McHandler {
         };
         match store.claim_historian_run(&project_path, &run_id, &claimant, now_ms()) {
             Ok(mc_store::HistorianClaimOutcome::Claimed(claim)) => {
+                let state = match store.load_meta(&claim.session_id) {
+                    Ok(loaded) => loaded.meta.historian,
+                    Err(error) => {
+                        return HandlerOutcome::Error {
+                            code: "store_load_failed".into(),
+                            message: error.to_string(),
+                        }
+                    }
+                };
+                let stage = historian_stage::HistorianStage::turn_one(
+                    &project_path,
+                    &claim.session_id,
+                    &state,
+                );
+                if let Err(error) = stage.persist(store, &claim.session_id, &binding.harness, "rust_host", None,
+                    &json!({"system": claim.system_prompt, "prompt": claim.user_prompt, "model_chain": claim.model_chain}), now_ms()) {
+                    return HandlerOutcome::Error { code: error.code().into(), message: error.to_string() };
+                }
+                let child = match stage.child(store) {
+                    Ok(child) => child,
+                    Err(error) => {
+                        return HandlerOutcome::Error {
+                            code: error.code().into(),
+                            message: error.to_string(),
+                        }
+                    }
+                };
                 let mut body = json!({
+                "lifecycle": stage.wire(child.as_deref()),
                 "ok": true,
                 "run_id": claim.run_id,
                 "session_id": claim.session_id,
@@ -8484,8 +8513,8 @@ impl McHandler {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        match store.authorize_historian_report(&project_path, &run_id, &token) {
-            Ok(mc_store::HistorianReportOutcome::Authorized(_)) => {}
+        let authorization = match store.authorize_historian_report(&project_path, &run_id, &token) {
+            Ok(mc_store::HistorianReportOutcome::Authorized(authorization)) => authorization,
             Ok(mc_store::HistorianReportOutcome::Refused(refusal)) => {
                 return respond(json!({ "ok": false, "refusal": refusal.as_wire_str() }));
             }
@@ -8495,12 +8524,46 @@ impl McHandler {
                     message: error.to_string(),
                 };
             }
-        }
+        };
 
         let report = match parse_historian_report(request) {
             Ok(report) => report,
             Err(outcome) => return outcome,
         };
+        // Legacy hosts may omit the lifecycle object while turn two is disabled.
+        // Hosts using that object must echo the claimed stage key and the provider
+        // session they created. Refuse a wrong key before recording their output.
+        if let Some(lifecycle) = request.get("lifecycle") {
+            let state = match store.load_meta(&authorization.session_id) {
+                Ok(loaded) => loaded.meta.historian,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".into(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+            let stage = historian_stage::HistorianStage::turn_one(
+                &project_path,
+                &authorization.session_id,
+                &state,
+            );
+            let child = lifecycle
+                .get("child_session_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty());
+            if lifecycle.get("stage_key").and_then(Value::as_str) != Some(stage.stage_key.as_str())
+                || child.is_none()
+            {
+                return respond(json!({"ok": false, "refusal": "stage_identity_mismatch"}));
+            }
+            if let Err(error) = stage.record_host_child(store, child.unwrap(), lifecycle) {
+                return HandlerOutcome::Error {
+                    code: error.code().into(),
+                    message: error.to_string(),
+                };
+            }
+        }
         let durable = durable_report(&report);
         match self.host_runs.deliver(&run_id, report) {
             Ok(()) => respond(json!({ "ok": true, "accepted": true, "publish": "immediate" })),
@@ -27557,6 +27620,7 @@ mod tests {
                     let loaded = store.load("ses").unwrap();
                     store
                         .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                            lifecycle_publication_id: None,
                             harness: None,
                             session_id: "ses",
                             expected_row_version: loaded.row_version,
@@ -29724,6 +29788,7 @@ mod tests {
             .unwrap();
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: Some(1),
@@ -38948,6 +39013,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: loaded.row_version,
@@ -41198,6 +41264,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id,
                 expected_row_version: store.load(session_id).unwrap().row_version,
@@ -42148,6 +42215,16 @@ mod tests {
             None,
         )
         .await;
+        let key: Value =
+            serde_json::from_str(claimed["lifecycle"]["stage_key"].as_str().unwrap()).unwrap();
+        assert_eq!(key[0], project.to_string_lossy().as_ref());
+        assert_eq!(key[1], claimed["lifecycle"]["publication_id"]);
+        assert_eq!(key[2], 1);
+        assert_eq!(key[3], "turn_one");
+        assert!(claimed["lifecycle"]["publication_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("rust-publication:"));
         let token = claimed["token"]
             .as_str()
             .expect("a claim mints a token")

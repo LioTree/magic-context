@@ -844,3 +844,79 @@ async fn gate_the_a8_emergency_accounting_on_a_fixture_that_has_tool_arcs() {
          second_rewrite_dropped_tags={host_second_dropped} second_rewrite_messages={host_second_messages} second_rewrite_bytes={host_second_bytes}"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn gate_host_stage_wire_refuses_wrong_key_and_retains_reported_child() {
+    let producer = Arc::new(ProducerState::default());
+    let (handler, store, dir, _) = handler_with_store(producer, host_runner_config());
+    let descriptor = dev_descriptor_at(dir.path().join("data").to_str().unwrap());
+    let cortexkit_store_types::StorageBackend::Sqlite { path } = descriptor.backend else {
+        unreachable!()
+    };
+    let context = std::path::Path::new(&path)
+        .parent()
+        .unwrap()
+        .join("context.db");
+    store.install_context_domain(Arc::new(
+        single_store_reads::ModuleContextDomain::open(&context).unwrap(),
+    ));
+    assert_eq!(
+        call_transform(&handler, big_messages()).await["historian"]["fired"],
+        true
+    );
+    let queued = a2_await_queued_run(&handler).await;
+    let run = queued["run_id"].as_str().unwrap();
+    let claim = call_dispatch_request(
+        &handler,
+        json!({"method":"historian.claim","v":1,
+        "run_id":run,"claimant_instance_id":"stage-host"}),
+    )
+    .await;
+    assert_eq!(claim["ok"], true, "{claim}");
+    assert_eq!(claim["lifecycle"]["stage"], "turn_one");
+    assert_eq!(claim["lifecycle"]["lane"], "dormant");
+    assert_eq!(claim["lifecycle"]["retain_child"], true);
+    let key = claim["lifecycle"]["stage_key"].as_str().unwrap();
+    let (start, end) = prompt_ordinal_range(claim["prompt"]["user"].as_str().unwrap()).unwrap();
+    let output = historian_output(start, end, "stage-aware output");
+    let wrong = call_dispatch_request(
+        &handler,
+        json!({"method":"historian.complete","v":1,
+        "run_id":run,"token":claim["token"],"output":{"text":output,"length_capped":false},
+        "lifecycle":{"stage_key":"not-this-stage","child_session_id":"child-kept"}}),
+    )
+    .await;
+    assert_eq!(
+        wrong,
+        json!({"ok":false,"refusal":"stage_identity_mismatch"})
+    );
+    assert!(store.load_compartments("ses").unwrap().is_empty());
+    let accepted = call_dispatch_request(
+        &handler,
+        json!({"method":"historian.complete","v":1,
+        "run_id":run,"token":claim["token"],"output":{"text":output,"length_capped":false},
+        "lifecycle":{"stage_key":key,"child_session_id":"child-kept"}}),
+    )
+    .await;
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    wait_for_idle(&store).await;
+    let conn = rusqlite::Connection::open(&context).unwrap();
+    let stage: (String, String) = conn
+        .query_row(
+            "SELECT child_session_id,state FROM memory_stage_attempts WHERE stage_key=?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stage, ("child-kept".into(), "committed".into()));
+    assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    let candidates: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_pending_facts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        candidates, 0,
+        "authority-owned dormant lane writes no candidates"
+    );
+}

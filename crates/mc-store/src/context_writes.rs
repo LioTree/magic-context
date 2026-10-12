@@ -69,6 +69,8 @@ pub(crate) enum PendingContextWrite {
 /// The `context.db` rows one historian fold writes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FoldWrite {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_publication_id: Option<String>,
     pub project_path: String,
     /// The harness label for the fold's rows; `None` falls back to the session's own.
     #[serde(default)]
@@ -285,6 +287,54 @@ fn delete_candidates_past_tail_tx(
     Ok(())
 }
 
+/// When TypeScript owns the project's memory rows, preserve every extracted fact
+/// as a pending candidate instead of attempting module admission. This runs in
+/// the compartment transaction, including when the saved FoldWrite is replayed
+/// from store.db after a crash; neither half of the publication can commit alone.
+fn publish_dormant_candidates_tx(
+    tx: &rusqlite::Connection,
+    session_id: &str,
+    fold: &FoldWrite,
+) -> rusqlite::Result<()> {
+    let Some(publication_id) = &fold.lifecycle_publication_id else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT OR IGNORE INTO memory_publications(publication_id,project_path,source_session_id)
+         VALUES (?1,?2,?3)",
+        params![publication_id, fold.project_path, session_id],
+    )?;
+    tx.execute(
+        "UPDATE memory_publications
+         SET commit_order=(SELECT COALESCE(MAX(commit_order),0)+1 FROM memory_publications), committed_at=?2
+         WHERE publication_id=?1 AND commit_order IS NULL",
+        params![publication_id, fold.published_at_ms],
+    )?;
+    if !crate::memory_lifecycle::authority::module_owns_memory(tx, &fold.project_path)? {
+        for (index, fact) in fold.facts.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_pending_facts
+                 (project_path,publication_id,fact_index,category,content,anchor_known,state,fact_attempts,reason)
+                 VALUES (?1,?2,?3,?4,?5,0,'retryable',0,'authority_elsewhere')",
+                params![fold.project_path, publication_id, index as i64, fact.category, fact.content],
+            )?;
+        }
+    }
+    tx.execute(
+        "UPDATE memory_stage_attempts SET state='committed'
+        WHERE publication_id=?1 AND stage='turn_one' AND state='in_flight'",
+        [publication_id],
+    )?;
+    for compartment in &fold.compartments {
+        tx.execute(
+            "INSERT OR IGNORE INTO memory_activity_ledger(project_path,publication_id,compartment_id,committed_at)
+             SELECT ?1,?2,id,?3 FROM compartments WHERE session_id=?4 AND sequence=?5",
+            params![fold.project_path, publication_id, fold.published_at_ms, session_id, compartment.sequence],
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_fold_tx(
     tx: &rusqlite::Connection,
     session_id: &str,
@@ -300,6 +350,7 @@ fn apply_fold_tx(
         // belong to a stale tail it replaced.
         append_m0_mutation_tx(tx, session_id, "compartment_delete", fold.published_at_ms)?;
     }
+    publish_dormant_candidates_tx(tx, session_id, fold)?;
     let promoted = if fold.promote_facts {
         promote_facts_tx(tx, &fold.project_path, &fold.facts, fold.published_at_ms)?
     } else {
@@ -502,8 +553,17 @@ impl McStore {
         write: &PendingContextWrite,
         recorded: &str,
     ) -> Result<Vec<PromotedRef>, McStoreError> {
-        let promoted =
-            self.context_write(HISTORY_TABLES, |tx| apply_pending_tx(tx, session_id, write))?;
+        let mut tables = HISTORY_TABLES.to_vec();
+        if matches!(write, PendingContextWrite::Fold(fold) if fold.lifecycle_publication_id.is_some())
+        {
+            tables.extend([
+                "memory_publications",
+                "memory_pending_facts",
+                "memory_activity_ledger",
+                "memory_stage_attempts",
+            ]);
+        }
+        let promoted = self.context_write(&tables, |tx| apply_pending_tx(tx, session_id, write))?;
         self.inner.with_conn_fenced(|tx| {
             tx.execute(
                 "DELETE FROM mc_single_store_pending_publish
@@ -627,6 +687,7 @@ mod tests {
 
     fn fold() -> PendingContextWrite {
         PendingContextWrite::Fold(FoldWrite {
+            lifecycle_publication_id: None,
             project_path: "git:proj".to_string(),
             harness: None,
             compartments: vec![StoredCompartment {
@@ -702,6 +763,281 @@ mod tests {
         store
             .inner
             .with_conn_fenced(|tx| record_pending_context_write_tx(tx, "ses", write))
+            .unwrap();
+    }
+
+    fn lifecycle_counts(conn: &Connection) -> [i64; 4] {
+        [
+            "memory_publications",
+            "memory_pending_facts",
+            "memory_activity_ledger",
+            "memories",
+        ]
+        .map(|table| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        })
+    }
+
+    fn mark_ts_owned(conn: &Connection) {
+        conn.execute(
+            "INSERT OR IGNORE INTO authority_managed(project_path,context_store_uuid,marked_at)
+            VALUES ('git:another-project','fixture',1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dormant_mirror_keeps_all_facts_retryable_without_attempts_or_memory_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&crash_descriptor(dir.path())).unwrap();
+        let PendingContextWrite::Fold(mut write) = fold() else {
+            unreachable!()
+        };
+        write.lifecycle_publication_id = Some("publication-1".into());
+        write.facts.push(FactCandidate {
+            category: "CONSTRAINTS".into(),
+            content: "another fact".into(),
+            ..Default::default()
+        });
+        store.with_context_conn_for_test(|conn| {
+            mark_ts_owned(conn);
+            apply_fold_tx(conn, "ses", &write)?;
+            apply_fold_tx(conn, "ses", &write)?;
+            assert_eq!(lifecycle_counts(conn), [1,2,1,0]);
+            let facts = conn.prepare("SELECT content,anchor_known,state,fact_attempts,reason,reserved_stage_key,compartment_id
+                FROM memory_pending_facts ORDER BY fact_index")?.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<i64>>(6)?)))?.collect::<Result<Vec<_>,_>>()?;
+            assert_eq!(facts, vec![("a promoted fact".into(),0,"retryable".into(),0,"authority_elsewhere".into(),None,None),
+                ("another fact".into(),0,"retryable".into(),0,"authority_elsewhere".into(),None,None)]);
+            Ok(())
+        }).unwrap();
+    }
+
+    fn domain_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
+        let names = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
+            .query_map([], |row| row.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        names
+            .into_iter()
+            .map(|name| {
+                let mut statement = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+                let cols = statement.column_count();
+                let mut rows = statement
+                    .query_map([], |row| {
+                        Ok((0..cols)
+                            .map(|col| format!("{:?}", row.get_ref(col).unwrap()))
+                            .collect::<Vec<_>>()
+                            .join("|"))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                rows.sort();
+                (name, rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn publication_without_candidates_is_byte_identical_to_legacy_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&crash_descriptor(dir.path())).unwrap();
+        let legacy_dir = tempfile::tempdir().unwrap();
+        let legacy = McStore::open_for_test(&crash_descriptor(legacy_dir.path())).unwrap();
+        let PendingContextWrite::Fold(write) = fold() else {
+            unreachable!()
+        };
+        assert!(!serde_json::to_string(&write)
+            .unwrap()
+            .contains("lifecycle_publication_id"));
+        for fixture in [&store, &legacy] {
+            fixture.with_context_conn_for_test(|conn| {
+                conn.execute("INSERT INTO compartment_history_versions(session_id,generation,version,rewrite_version,seeded)
+                    VALUES ('ses','fixed-generation',0,0,0)", [])?;
+                Ok(())
+            }).unwrap();
+        }
+        let before_a = store
+            .with_context_conn_for_test(|conn| Ok(domain_rows(conn)))
+            .unwrap();
+        let before_b = legacy
+            .with_context_conn_for_test(|conn| Ok(domain_rows(conn)))
+            .unwrap();
+        store
+            .with_context_conn_for_test(|conn| {
+                apply_fold_tx(conn, "ses", &write)?;
+                Ok(())
+            })
+            .unwrap();
+        legacy
+            .with_context_conn_for_test(|conn| {
+                let harness = session_harness_tx(conn, "ses")?;
+                upsert_compartments_tx(conn, "ses", &write.compartments, &harness)?;
+                promote_facts_tx(
+                    conn,
+                    &write.project_path,
+                    &write.facts,
+                    write.published_at_ms,
+                )?;
+                insert_historian_events_tx(conn, "ses", &write.events, &harness)?;
+                for candidate in &write.primer_candidates {
+                    insert_historian_primer_tx(conn, candidate, &harness)?;
+                }
+                for candidate in &write.user_memory_candidates {
+                    crate::insert_historian_user_observation_tx(conn, candidate)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let a = store
+            .with_context_conn_for_test(|conn| Ok(domain_rows(conn)))
+            .unwrap();
+        let b = legacy
+            .with_context_conn_for_test(|conn| Ok(domain_rows(conn)))
+            .unwrap();
+        let a = a
+            .into_iter()
+            .zip(before_a)
+            .filter_map(|(after, before)| (after != before).then_some(after))
+            .collect::<Vec<_>>();
+        let b = b
+            .into_iter()
+            .zip(before_b)
+            .filter_map(|(after, before)| (after != before).then_some(after))
+            .collect::<Vec<_>>();
+        assert_eq!(a.len(), b.len());
+        for (a, b) in a.iter().zip(&b) {
+            assert_eq!(a, b, "legacy row bytes differ in {}", a.0);
+        }
+    }
+
+    struct KillBeforeFoldCommit {
+        inner: SqliteContextDomain,
+        marker: std::path::PathBuf,
+    }
+
+    impl ContextDomain for KillBeforeFoldCommit {
+        fn read(
+            &self,
+            read: &mut dyn FnMut(&Connection) -> rusqlite::Result<()>,
+        ) -> Result<(), McStoreError> {
+            self.inner.read(read)
+        }
+        fn write(
+            &self,
+            tables: &[&str],
+            write: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
+        ) -> Result<(), McStoreError> {
+            self.inner.write(tables, &mut |tx| {
+                write(tx)?;
+                assert_eq!(
+                    lifecycle_counts(tx),
+                    [1, 1, 1, 0],
+                    "candidate must be in the uncommitted compartment transaction"
+                );
+                std::fs::write(&self.marker, "fold applied, transaction uncommitted").unwrap();
+                loop {
+                    std::thread::park_timeout(std::time::Duration::from_secs(60));
+                }
+            })
+        }
+    }
+
+    fn crash_descriptor(dir: &std::path::Path) -> cortexkit_store_types::StorageDescriptor {
+        cortexkit_store_types::StorageDescriptor {
+            module_id: "magic-context-test".into(),
+            storage_namespace: crate::single_store_schema::STORE_NAMESPACE.into(),
+            isolation: cortexkit_store_types::Isolation::Module,
+            backend: cortexkit_store_types::StorageBackend::Sqlite {
+                path: dir.join("store.db").to_string_lossy().into_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn dormant_candidate_killed_before_commit_replays_exactly_once() {
+        const CHILD_DIR: &str = "MC_TEST_CANDIDATE_CRASH_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let dir = std::path::PathBuf::from(dir);
+            let store = McStore::open_for_test(&crash_descriptor(&dir)).unwrap();
+            let context = dir.join("context.db");
+            mark_ts_owned(&Connection::open(&context).unwrap());
+            store.install_context_domain(Arc::new(KillBeforeFoldCommit {
+                inner: SqliteContextDomain::open(&context).unwrap(),
+                marker: dir.join("before-commit"),
+            }));
+            let PendingContextWrite::Fold(mut write) = fold() else {
+                unreachable!()
+            };
+            write.lifecycle_publication_id = Some("crash-publication".into());
+            let write = PendingContextWrite::Fold(write);
+            record(&store, &write);
+            store.complete_pending_context_write("ses", &write).unwrap();
+            unreachable!("parent must kill the child before commit");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("before-commit");
+        let log = std::fs::File::create(dir.path().join("child.log")).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "context_writes::tests::dormant_candidate_killed_before_commit_replays_exactly_once", "--nocapture"])
+            .env(CHILD_DIR, dir.path()).stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!(
+                    "crash child exited before atomicity cut ({status}): {}",
+                    std::fs::read_to_string(dir.path().join("child.log")).unwrap()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !marker.exists() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("child never reached precommit cut");
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        let store = McStore::open_for_test(&crash_descriptor(dir.path())).unwrap();
+        store
+            .with_context_conn_for_test(|conn| {
+                assert_eq!(
+                    lifecycle_counts(conn),
+                    [0, 0, 0, 0],
+                    "killed fold leaked uncommitted evidence"
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.has_pending_context_write("ses").unwrap());
+        assert!(store.resume_pending_context_write("ses").unwrap());
+        assert!(!store.resume_pending_context_write("ses").unwrap());
+        store
+            .with_context_conn_for_test(|conn| {
+                assert_eq!(lifecycle_counts(conn), [1, 1, 1, 0]);
+                let attempts: i64 = conn.query_row(
+                    "SELECT fact_attempts FROM memory_pending_facts",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(attempts, 0);
+                Ok(())
+            })
+            .unwrap();
+        // Also recover a commit whose outbox acknowledgement was lost.
+        let PendingContextWrite::Fold(mut write) = fold() else {
+            unreachable!()
+        };
+        write.lifecycle_publication_id = Some("crash-publication".into());
+        record(&store, &PendingContextWrite::Fold(write));
+        assert!(store.resume_pending_context_write("ses").unwrap());
+        store
+            .with_context_conn_for_test(|conn| {
+                assert_eq!(lifecycle_counts(conn), [1, 1, 1, 0]);
+                Ok(())
+            })
             .unwrap();
     }
 
