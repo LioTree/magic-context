@@ -24195,9 +24195,11 @@ pub(crate) mod tests {
 
     #[test]
     fn signed_thinking_hold_off_ignores_saved_release_obligations() {
+        let root = std::env::temp_dir().join("magic-context/signed-thinking-hold-off-obligations");
+        std::fs::create_dir_all(&root).unwrap();
         let mut captures = Vec::new();
         for seeded in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir_in(&root).unwrap();
             let store = store(dir.path());
             let mut request = opus_55_request("saved-release-off", "cfg0");
             request.auto_search_enabled = false;

@@ -46,6 +46,8 @@ fn message(mid: &str, ordinal: u64, role: &str, kinds: Vec<Value>) -> Value {
 
 #[test]
 fn signed_thinking_hold_off_randomized_pass_corpus() {
+    let root = std::env::temp_dir().join("magic-context/signed-thinking-hold-off-corpus");
+    std::fs::create_dir_all(&root).unwrap();
     let mut random_state = 630665_u32;
     let mut random = |n| {
         random_state ^= random_state << 13;
@@ -56,7 +58,7 @@ fn signed_thinking_hold_off_randomized_pass_corpus() {
     let mut captures = Vec::new();
     for profile in ["opencode-aisdk", "claude-code-anthropic", "owned-broca"] {
         for seed in 0..12 {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir_in(&root).unwrap();
             let store = McStore::open_for_test(&StorageDescriptor {
                 module_id: "hold-off-corpus".into(),
                 storage_namespace: "mc_cache".into(),

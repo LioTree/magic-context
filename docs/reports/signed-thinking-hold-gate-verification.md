@@ -110,8 +110,11 @@ denotes recomputation of stored compartment summaries.
 
 ## Package and crate gates before reconciliation
 
-All executable verification ran on Linux. Stores and session/config roots were
-in-memory or under `$TMPDIR/magic-context/`; no live store was used. Package
+All executable verification ran on Linux. No live store was used: corpus and
+narrow guards only create throwaway databases, while package/full Rust jobs
+redirect HOME, TMPDIR and session/config roots under `$TMPDIR/magic-context/`.
+The new Rust fixtures also constrain their own directories to that subtree.
+Package
 suites need distributions built in the **same** remote job and scoped Git
 identity/safe-directory settings under the throwaway HOME. Without those
 prerequisites, worker-loading and project-identity tests fail environmentally.
@@ -152,3 +155,21 @@ The Linux runner initially refused 16-core jobs twice while permits were busy.
 A 4-core package-scoped retry compiled and ran the differential;
 later module/store suites and clippy ran with 16 requested cores. No Rust test or
 build was run on macOS.
+
+## Pending reconciliation follow-up
+
+This delivery covers the standalone default-off gate at train base
+`3549c4340ef37066f6690fb466824ac752ba0cbb`. The reconciled train was not yet
+available when this checkpoint was requested for delivery. These three steps
+remain pending for the resumed item:
+
+1. Merge the reconciled train plus the placeholder/system-injection admission
+   slice (s5) when its SHA is supplied.
+2. Gate s5 placeholder/system-injection admission and history-trigger consumers
+   under the same setting, while keeping the Pi stable-ID cutover preservation
+   and refused-reminder decision withdrawal fixes always enabled.
+3. Compare the resulting code against current master's fixes for held thinking
+   turns (issue 665) and prove those protections remain outside the experimental switch.
+
+The pending placeholder/system-injection gating and updated-master merge are
+not claimed as implemented or verified by the before-reconciliation results above.
