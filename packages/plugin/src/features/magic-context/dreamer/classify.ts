@@ -176,6 +176,21 @@ function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
     }));
 }
 
+/** Memory ids that have a historian classification item (see turn-two-scoring.ts). */
+function memoriesWithClassificationItems(db: ClassifyArgs["db"]): Set<number> {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_classification_items'").get())
+        return new Set();
+    return new Set(
+        (
+            db
+                .prepare("SELECT DISTINCT memory_id FROM memory_classification_items")
+                .all() as Array<{
+                memory_id: number;
+            }>
+        ).map((row) => row.memory_id),
+    );
+}
+
 function toPromptMemory(candidate: ClassifyCandidate): ClassifyPromptMemory {
     const m = candidate.contextMemory;
     return {
@@ -240,7 +255,15 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
             active.map((candidate) => candidate.contextMemory.id),
         ),
     );
-    toClassify = active.filter((candidate) => unclassifiedIds.has(candidate.contextMemory.id));
+    const historianScored = memoriesWithClassificationItems(args.db);
+    toClassify = active.filter(
+        (candidate) =>
+            unclassifiedIds.has(candidate.contextMemory.id) &&
+            // A row the historian scores (it has a classification item, open or
+            // scored) is never classified here, so a historian score is never
+            // overwritten.
+            !historianScored.has(candidate.contextMemory.id),
+    );
     if (active.length <= FULL_POOL_CEILING) {
         // An unchanged classification is already durable; only new or changed rows need a prompt.
         stage = 2;

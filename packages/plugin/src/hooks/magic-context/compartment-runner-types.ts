@@ -202,6 +202,13 @@ export interface CompartmentRunnerDeps<
      */
     memoryLifecycleLane?: TurnOneLane;
     /**
+     * Replay-validated historian and check profiles for turn two. None exist yet, so
+     * on an enabled lane every edit, merge and replacement defers; tests supply them.
+     */
+    memoryLifecycleValidatedProfiles?: readonly import("../../features/magic-context/memory/lifecycle-gates").ReportedProfile[];
+    /** Overrides the turn-two neighbour embedder (tests). */
+    memoryLifecycleEmbedQuery?: import("../../features/magic-context/memory/turn-two-retrieval").TurnTwoQueryEmbedder;
+    /**
      * Called after compartment state is published. The runner marks the active
      * run as published before invoking this callback.
      */
@@ -267,7 +274,29 @@ export interface CandidateCompartment {
     episodeType?: string | null;
 }
 
+/**
+ * A historian child kept open after a validated turn one, so turn two continues the
+ * same session. Its owner must call `close` once no turn-two stage is in flight.
+ */
+export interface RetainedHistorianChild {
+    executor: HiddenCompletionExecutor;
+    handle: HiddenRunHandle;
+    agent: string;
+    /** The system prompt turn one ran with; its hash is the historian's profile hash. */
+    system: string;
+    model?: ModelInput;
+    directory: string;
+    /** Turn one's reply text. */
+    turnOneText: string;
+    /** The model the provider reported for turn one, when the carrier exposes it. */
+    providerId?: string;
+    modelId?: string;
+    close(): Promise<void>;
+}
+
 export interface HistorianRunResult {
+    /** Set only when the caller asked to retain the child and the run succeeded. */
+    retained?: RetainedHistorianChild;
     refusal?: HiddenCompletionRefusal;
     ok: boolean;
     result?: string;
@@ -300,6 +329,8 @@ export type ValidatedHistorianPassResult =
            * under subagent='recomp') to a stale subagent='historian' row.
            */
           invocationId?: number | null;
+          /** The child that produced the published reply, kept open for turn two. */
+          retainedChild?: RetainedHistorianChild;
       }
     | { ok: false; error: string; invocationId?: number | null };
 

@@ -1,4 +1,5 @@
 import { withContentLanguageDirective } from "../../agents/language-directive";
+import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 import { embedAndStoreCompartmentChunks } from "../../features/magic-context/compartment-embedding";
 import { insertCompartmentEvents } from "../../features/magic-context/compartment-events";
 import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
@@ -77,7 +78,10 @@ import {
     queuePreparedCompartmentDrops,
 } from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
-import type { HiddenCompartmentRunnerDeps } from "./compartment-runner-types";
+import type {
+    HiddenCompartmentRunnerDeps,
+    RetainedHistorianChild,
+} from "./compartment-runner-types";
 import {
     buildHistorianFailureNotice,
     buildHistorianWindowTooSmallNotice,
@@ -97,6 +101,7 @@ import {
     finishHistorianPublishStage,
     startHistorianPublishStage,
 } from "./historian-publish-stage-logger";
+import { runHistorianTurnTwo } from "./historian-turn-two-step";
 import { snapTerminalCompartmentToServedRow } from "./host-served-rows";
 import { clearInjectionCache } from "./inject-compartments";
 import { onNoteTrigger } from "./note-nudger";
@@ -266,6 +271,10 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
     let publishCommitted = false;
     let retainDrainReservationForRetryThrottle = false;
     let issueNotified = false;
+    // On an enabled lane the child that produced the published turn-one reply stays
+    // open for turn two. It is closed in `finally` unless turn two left a stage in
+    // flight, in which case recovery or the child's deletion closes it later.
+    let retainedChild: RetainedHistorianChild | undefined;
     let drainReservation: ReturnType<typeof reserveProtectedTailDrainTokens>["reservation"] = null;
 
     // historian_runs telemetry (migration v24). Captured across the run and
@@ -853,7 +862,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             fallbackModels: deps.fallbackModels,
             twoPass: deps.historianTwoPass,
             language: deps.language,
+            retainChild: anchoredFacts,
         });
+        retainedChild = validatedPass.ok ? validatedPass.retainedChild : undefined;
         // A window refusal here comes from a fallback model (the primary was fitted
         // above). Treat it like any other failed pass: count it, notify, and keep
         // the reserved drain budget spent so the next trigger does not retry at once.
@@ -1507,6 +1518,26 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             sessionId,
             `historian publish completed: compartments=${persistedCompartments.length} range=${offset}-${lastCompartmentEnd}`,
         );
+
+        // Turn two: on an enabled lane, reconcile this publication's candidates (and
+        // the project's retryable backlog) with existing memory on the same child.
+        if (retainedChild) {
+            const turnTwo = await runHistorianTurnTwo({
+                db,
+                sessionId,
+                projectPath: publicationProjectPath,
+                publicationId: turnOneSend.publicationId,
+                child: retainedChild,
+                harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
+                carrier: deps.hiddenCompletionExecutor ? "hidden-completion" : "opencode-session",
+                memoryEnabled: deps.memoryEnabled !== false,
+                autoPromote: deps.autoPromote !== false,
+                timeoutMs: historianTimeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+                validatedProfiles: deps.memoryLifecycleValidatedProfiles,
+                embedQuery: deps.memoryLifecycleEmbedQuery,
+            });
+            if (turnTwo.childInFlight) retainedChild = undefined;
+        }
     } catch (error: unknown) {
         const desc = describeError(error);
         if (publishCommitted) {
@@ -1532,6 +1563,13 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             await notifyHistorianIssue(buildHistorianFailureNotice(failCount, desc.brief));
         }
     } finally {
+        if (retainedChild) {
+            try {
+                await retainedChild.close();
+            } catch (error) {
+                sessionLog(sessionId, "historian child close failed:", error);
+            }
+        }
         if (!completedSuccessfully) {
             if (!retainDrainReservationForRetryThrottle) {
                 rollbackDrainReservation();

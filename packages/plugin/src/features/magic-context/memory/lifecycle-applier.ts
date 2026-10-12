@@ -14,7 +14,7 @@ import { embedTextForProject } from "./embedding";
 import { invalidateMemory } from "./embedding-cache";
 import { checkMemoryRevision } from "./lifecycle-check-ledger";
 import { MAX_STAGE2_ATTEMPTS } from "./lifecycle-constants";
-import type { CheckReply, CheckRequest } from "./lifecycle-gates";
+import type { CheckReply, CheckRequest, ReportedProfile } from "./lifecycle-gates";
 import {
     type GateContext,
     type GatePlan,
@@ -54,6 +54,8 @@ export interface ApplierReceipt {
     inserted?: boolean;
     adoptionClass: AdoptionClass;
     supersededIds?: number[];
+    /** The profile the provider reported, when a profile gate deferred the decision. */
+    reportedProfile?: ReportedProfile;
 }
 export interface AdmissionRequest {
     key: string;
@@ -264,6 +266,53 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
                 inserted: !match,
                 adoptionClass: null,
             });
+        })
+        .immediate();
+}
+
+/**
+ * Resolve a candidate fact without touching any memory row: `covered` (the mapping
+ * is recorded on the fact only), and every `decided_pending` outcome that needs no
+ * applier write (abstain, a malformed decision, an approval-gated operation, a
+ * recitation). One transaction writes the receipt keyed by the decision key and the
+ * fact's new state; a receipt already recorded under the key wins.
+ */
+export function resolveFactDecision(
+    db: Database,
+    request: {
+        key: string;
+        projectPath: string;
+        factId: number;
+        operation: string;
+        /**
+         * `retryable` consumes one of the fact's attempts: the fact becomes
+         * `retryable`, or `decided_pending` once the attempt reaches
+         * `MAX_STAGE2_ATTEMPTS`.
+         */
+        state: "covered" | "decided_pending" | "retryable";
+        reason: string;
+        memoryId?: number;
+        mapping?: unknown;
+    },
+): ApplierReceipt {
+    return db
+        .transaction(() => {
+            const existing = readReceipt(db, request.key);
+            if (existing) return existing;
+            if (request.state === "retryable")
+                return resolveRevisionFailure(db, request, request.reason, true);
+            const receipt = recordReceipt(db, request, {
+                state: request.state,
+                reason: request.reason,
+                memoryId: request.memoryId,
+                adoptionClass: null,
+            });
+            if (request.mapping !== undefined)
+                db.prepare("UPDATE memory_pending_facts SET mapping_json=? WHERE id=?").run(
+                    JSON.stringify(request.mapping),
+                    request.factId,
+                );
+            return receipt;
         })
         .immediate();
 }
@@ -664,17 +713,22 @@ export function applyAgentMemoryMutation(
         .immediate();
 }
 
-// Historian revisions stay off until the historian's second turn is wired to call this.
-// When on, a revision is an automated edit: it changes canonical rows and writes history,
-// but no mutation-log row and no agent fragment, so it reaches a prompt only at that
-// session's next natural HARD fold.
-const MEMORY_PROJECTION_READY = false;
+/**
+ * Apply one gated historian edit, merge or replacement (turn two). It is an
+ * automated edit: it changes canonical rows and writes history, but no mutation-log
+ * row and no agent fragment, so it reaches a prompt only at that session's next
+ * natural HARD fold (docs/designs/memory-s3-projection.md, "Automated writers").
+ *
+ * Order: a recorded receipt answers at once; a project whose memory the module owns
+ * is `authority_elsewhere`; a source that moved since the decision read it is a CAS
+ * loss; then every deterministic gate runs before any check call.
+ */
 export async function applyHistorianRevision(
     db: Database,
     decision: RevisionDecision,
     context: GateContext,
     owner: { sessionId: string; harness: string },
-    reattachOrSend: (request: CheckRequest) => Promise<CheckReply>,
+    reattachOrSend: (request: CheckRequest, options: { reattach: boolean }) => Promise<CheckReply>,
     factId?: number,
 ): Promise<ApplierReceipt> {
     const existing = readReceipt(db, decision.key);
@@ -690,7 +744,6 @@ export async function applyHistorianRevision(
             return row ? [row as GateContext["sources"][number]] : [];
         }),
     };
-    const plan = planMemoryRevision(decision, context);
     const request = {
         key: decision.key,
         projectPath: decision.projectPath,
@@ -709,14 +762,35 @@ export async function applyHistorianRevision(
                     }),
             )
             .immediate();
-    if (!plan.ok || !MEMORY_PROJECTION_READY)
+    // A target or source of this project that was archived or revised after the
+    // decision read it: the decision is stale, not wrong, so it is retried.
+    if (
+        Array.isArray(decision.expectedSources) &&
+        decision.expectedSources.some((expected) => {
+            const source = context.sources.find((row) => row.id === expected?.id);
+            return (
+                source !== undefined &&
+                source.projectPath === decision.projectPath &&
+                (source.status === "archived" || source.revision !== expected.revision)
+            );
+        })
+    )
+        return db
+            .transaction(
+                () =>
+                    readReceipt(db, decision.key) ??
+                    resolveRevisionFailure(db, request, "cas_loss", true),
+            )
+            .immediate();
+    const plan = planMemoryRevision(decision, context);
+    if (!plan.ok)
         return db
             .transaction(
                 () =>
                     readReceipt(db, decision.key) ??
                     recordReceipt(db, request, {
                         state: "decided_pending",
-                        reason: plan.ok ? "projection_pending" : plan.reason,
+                        reason: plan.reason,
                         adoptionClass: memoryAdoptionClass(decision.action),
                     }),
             )
@@ -727,7 +801,13 @@ export async function applyHistorianRevision(
             const recovered = readReceipt(db, decision.key);
             if (recovered) return recovered;
             if (!outcome.ok)
-                return resolveRevisionFailure(db, request, outcome.reason, outcome.retryable);
+                return resolveRevisionFailure(
+                    db,
+                    request,
+                    outcome.reason,
+                    outcome.retryable,
+                    outcome.reportedProfile,
+                );
             const rows = decision.expectedSources.map(
                 (expected) =>
                     db
@@ -773,6 +853,7 @@ function resolveRevisionFailure(
     request: { key: string; projectPath: string; operation: string; factId?: number },
     reason: string,
     retryable: boolean,
+    reportedProfile?: ReportedProfile,
 ): ApplierReceipt {
     if (retryable && request.factId !== undefined)
         db.prepare(
@@ -790,6 +871,7 @@ function resolveRevisionFailure(
         state: retryable && attempts < MAX_STAGE2_ATTEMPTS ? "retryable" : "decided_pending",
         reason,
         adoptionClass: memoryAdoptionClass(request.operation),
+        ...(reportedProfile ? { reportedProfile } : {}),
     });
 }
 /**
@@ -894,7 +976,14 @@ export function releaseMemoryReservations(
     if (!exists || sessionIds.length === 0) return;
     const placeholders = sessionIds.map(() => "?").join(",");
     const predicate = harness === undefined ? "" : " AND harness=?";
+    // A stage is released when either its owning session or the hidden child that
+    // carries it is deleted: without the child there is nothing left to reattach.
     db.prepare(
-        `UPDATE memory_pending_facts SET fact_attempts=fact_attempts+1, state=CASE WHEN fact_attempts+1>=? THEN 'decided_pending' ELSE 'retryable' END,reason='session_deleted',reserved_stage_key=NULL WHERE state='in_flight' AND reserved_stage_key IN (SELECT stage_key FROM memory_stage_attempts WHERE session_id IN (${placeholders})${predicate})`,
-    ).run(MAX_STAGE2_ATTEMPTS, ...sessionIds, ...(harness === undefined ? [] : [harness]));
+        `UPDATE memory_pending_facts SET fact_attempts=fact_attempts+1, state=CASE WHEN fact_attempts+1>=? THEN 'decided_pending' ELSE 'retryable' END,reason='session_deleted',reserved_stage_key=NULL WHERE state='in_flight' AND reserved_stage_key IN (SELECT stage_key FROM memory_stage_attempts WHERE (session_id IN (${placeholders}) OR child_session_id IN (${placeholders}))${predicate})`,
+    ).run(
+        MAX_STAGE2_ATTEMPTS,
+        ...sessionIds,
+        ...sessionIds,
+        ...(harness === undefined ? [] : [harness]),
+    );
 }
