@@ -1367,10 +1367,11 @@ test("rescore and memory-check slots coexist with retained historian turns throu
         nextHistorian = executor.open({ ...run, kind: "historian", agent: "historian" });
         await eventually(() => f.creates.length === 4);
         await nextHistorian;
-        await executor.attempt(
-            historian,
-            request("cheap", { parts: [{ type: "text", text: "turn two" }] }),
-        );
+        await executor.attempt(historian, {
+            ...request("cheap", { parts: [{ type: "text", text: "turn two" }] }),
+            // Detach frees the queue; a retained child's next request must opt into conversation replay.
+            continueConversation: true,
+        });
         expect(f.requests[1].messages).toEqual([
             { role: "user", content: [{ type: "text", text: "calibrated chunk" }] },
             { role: "assistant", content: [{ type: "text", text: "editor completion" }] },
