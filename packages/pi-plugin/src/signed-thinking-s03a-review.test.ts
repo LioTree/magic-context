@@ -227,6 +227,54 @@ describe("signed-thinking s03a review: Pi", () => {
 		}
 	});
 
+	test("a reminder strip refused for another reason withdraws the decision it added", () => {
+		const db = createTestDb();
+		const sessionId = "s03a-refused-reminder";
+		try {
+			getOrCreateSessionMeta(db, sessionId);
+			const messages = [
+				userMessage("words <system-reminder>noise</system-reminder>", 1),
+				assistantMessage("answer", 2),
+			];
+			const tagger = createTagger();
+			tagger.initFromDb(sessionId, db);
+			const transcript = createPiTranscript(messages, sessionId, ["u", "a"]);
+			const view = transcript.messages.map((message) => ({
+				...message,
+				parts: message.parts,
+			}));
+			const { targets } = tagTranscript(
+				sessionId,
+				{ ...transcript, messages: view },
+				tagger,
+				db,
+				{ skipPrefixInjection: true },
+			);
+			const tag = getActiveTagsBySession(db, sessionId).find(
+				(tag) => tag.messageId === "u:p0",
+			)!;
+			// Not thinking-protected, but the setter still refuses the edit.
+			const refusing = new Map(targets);
+			const target = targets.get(tag.tagNumber)!;
+			refusing.set(tag.tagNumber, { ...target, setContent: () => false });
+			const result = applyPiHeuristicCleanup(
+				sessionId,
+				db,
+				refusing,
+				messages,
+				{ protectedTags: 0, staleReduceStripEnabled: false },
+			);
+			expect(result.droppedInjections).toBe(0);
+			expect(
+				getPiContentDecisions(db, sessionId).has(
+					encodePiContentDecision("reminder-strip", tag.messageId),
+				),
+			).toBe(false);
+		} finally {
+			db.close();
+		}
+	});
+
 	test("ordinary placeholder discovery holds then lands on one safe refresh", () => {
 		const db = createTestDb();
 		const sessionId = "s03a-placeholder-release";
