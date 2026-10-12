@@ -1628,3 +1628,53 @@ describe("runPiHistorian turn one", () => {
 		}
 	});
 });
+
+describe("runPiHistorian when the store is busy before dispatch", () => {
+	it("skips the run without counting a failure when turn one's send cannot be recorded", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [successXml("Pi busy-store fact.")],
+			beforeRun: (db) => {
+				// Recording the send reports a store that stayed busy past its timeout.
+				const prepare = db.prepare.bind(db);
+				Object.defineProperty(db, "prepare", {
+					configurable: true,
+					writable: true,
+					value: (sql: string) => {
+						if (/INSERT INTO memory_stage_attempts/.test(sql)) {
+							throw Object.assign(new Error("database is locked"), {
+								code: "SQLITE_BUSY",
+							});
+						}
+						return prepare(sql);
+					},
+				});
+			},
+		});
+		try {
+			expect(runner.run).not.toHaveBeenCalled();
+			expect(getCompartments(db, "ses-historian")).toEqual([]);
+			expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(
+				0,
+			);
+			expect(
+				db
+					.prepare(
+						"SELECT historian_drain_failure_at AS at FROM session_meta WHERE session_id = ?",
+					)
+					.get("ses-historian"),
+			).toEqual({ at: 0 });
+			expect(
+				db
+					.prepare(
+						"SELECT status, failure_reason FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+					)
+					.get("ses-historian"),
+			).toEqual({ status: "noop", failure_reason: "turn_one_send_store_busy" });
+			expect(
+				db.prepare("SELECT COUNT(*) AS n FROM memory_publications").get(),
+			).toEqual({ n: 0 });
+		} finally {
+			closeQuietly(db);
+		}
+	});
+});

@@ -57,9 +57,11 @@ import {
 	allocateTurnOneSend,
 	blocksSentToHistorian,
 	commitTurnOnePublication,
+	publishedFacts,
 	resolveTurnOneLane,
 	type TurnOneFact,
 	type TurnOneLane,
+	type TurnOneSend,
 } from "@magic-context/core/features/magic-context/memory/turn-one-publication";
 import {
 	clearEmergencyDrainLatch,
@@ -151,7 +153,10 @@ import type {
 	ModelInput,
 	ResolvedModelEntry,
 } from "@magic-context/core/shared/model-resolution";
-import type { Database } from "@magic-context/core/shared/sqlite";
+import {
+	type Database,
+	isTransientSqliteError,
+} from "@magic-context/core/shared/sqlite";
 import type {
 	SubagentProgressEvent,
 	SubagentRunner,
@@ -1049,27 +1054,44 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				};
 			};
 
+			// Persist turn one's send record, with the publication id the compartment
+			// transaction will commit under, before spawning the subagent. A run that
+			// fails before publishing leaves the id for the session's next run, so one
+			// chunk's candidates and activity are published under one id however many
+			// sends it takes.
+			let turnOneSend: TurnOneSend;
+			try {
+				turnOneSend = allocateTurnOneSend(db, {
+					projectPath,
+					sessionId,
+					harness: resolvePiHarnessKind(),
+					carrier: "pi-subagent",
+					lane: turnOneLane,
+					chunkStart: chunk.startIndex,
+					chunkEnd: chunk.endIndex,
+				});
+			} catch (error) {
+				if (!isTransientSqliteError(error)) throw error;
+				// The store stayed busy past its timeout before anything was sent. This
+				// is contention, not a historian failure: skip the run without touching
+				// the failure count or its backoff, release the drain budget, and let
+				// the next trigger try again.
+				telemetry.status = "noop";
+				telemetry.failureReason = "turn_one_send_store_busy";
+				sessionLog(
+					sessionId,
+					`historian skipped: store busy while recording turn one's send (${describeError(error).brief}); retrying on the next trigger`,
+				);
+				rollbackDrainReservation();
+				return;
+			}
+
 			retainDrainReservationForRetryThrottle = true;
 			const historianEditorSystemPrompt = withContentLanguageDirective(
 				HISTORIAN_EDITOR_SYSTEM_PROMPT,
 				deps.language,
 				{ preserveUserQuotes: true },
 			);
-
-			// Persist turn one's send record, with the publication id the compartment
-			// transaction will commit under, before spawning the subagent. A run that
-			// fails before publishing leaves the id for the session's next run, so one
-			// chunk's candidates and activity are published under one id however many
-			// sends it takes.
-			const turnOneSend = allocateTurnOneSend(db, {
-				projectPath,
-				sessionId,
-				harness: resolvePiHarnessKind(),
-				carrier: "pi-subagent",
-				lane: turnOneLane,
-				chunkStart: chunk.startIndex,
-				chunkEnd: chunk.endIndex,
-			});
 
 			// First pass.
 			const firstResult = await runHistorianSubagentWithTransientRetries({
@@ -1482,31 +1504,35 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					-newCompartments.length,
 				);
 				persistedIds = durableRows.map((c) => c.id);
-				// v2 faithful fact lifecycle (E6 parity): facts are no longer a
-				// REPLACE-the-whole-list store. The historian emits only THIS
-				// chunk's facts (deduped against <project-memory> in the prompt);
-				// they flow to project memory via in-transaction durable promotion.
-				// No replaceSessionFacts — promoted facts reach the agent through the
-				// renderer's m[1] new-memories watermark. Promotion is in the SAME
-				// transaction as the boundary floor below, so both commit or both roll back.
-				//
-				// The publication also commits here, once, as in the OpenCode runner:
-				// the activity ledger counts the new compartments, and candidate facts
-				// are recorded on an `enabled` lane (every fact, with its resolved
-				// anchor) or, on a `dormant` lane whose project memory the Rust module
-				// owns, in place of the promotion this process may not perform (each
-				// with an unknown anchor).
+				// The historian emits only this chunk's facts. As in the OpenCode runner,
+				// this transaction also commits turn one's publication, once: the
+				// activity ledger counts the new compartments, and the reply's published
+				// facts (see `keepPublishedFact`: one tied to a discarded or weak final
+				// compartment is dropped and comes back when the next run re-derives
+				// those lines) go to one of three places.
+				// - `enabled` lane: every published fact becomes a candidate with its
+				//   resolved anchor; nothing is promoted, a later reconcile step decides.
+				// - `dormant` lane, project memory owned by the Rust module: each fact
+				//   becomes a candidate with an unknown anchor, since this process may
+				//   not write those memories.
+				// - `dormant` lane, project memory owned here: facts are promoted below,
+				//   in the same transaction as the protected-tail publication floor, so
+				//   both commit or both roll back. A promoted memory reaches the agent at
+				//   the session's next HARD rebuild of its memory block.
 				const memoryAuthorityHere = tsOwnsMemory(db, projectPath);
-				const facts: TurnOneFact[] = validatedPass.facts ?? [];
+				const keptFacts: TurnOneFact[] = publishedFacts(
+					validatedPass.facts ?? [],
+					newCompartments.length,
+					discardedLast,
+					weakLookaheadFinalCompartment ? emittedCompartments.length : null,
+				);
 				const candidateFacts =
 					turnOneLane === "enabled"
 						? memoryEnabled !== false
-							? facts
+							? keptFacts
 							: []
-						: promotionActive &&
-								!skipUnanchoredPromotion &&
-								!memoryAuthorityHere
-							? facts
+						: promotionActive && !memoryAuthorityHere
+							? keptFacts
 							: [];
 				const turnOnePublication = commitTurnOnePublication(db, {
 					send: turnOneSend,
@@ -1540,13 +1566,13 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					turnOneLane === "dormant" &&
 					memoryAuthorityHere &&
 					promotionActive &&
-					!skipUnanchoredPromotion
+					keptFacts.length > 0
 				) {
 					const promotion = promoteSessionFactsDurable(
 						db,
 						sessionId,
 						projectPath,
-						validatedPass.facts ?? [],
+						keptFacts,
 					);
 					promotedFactRefs = promotion.newMemoryRefs;
 					promotedFactCount = promotion.factsPromoted;

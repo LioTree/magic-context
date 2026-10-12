@@ -1,6 +1,7 @@
 import type { Database } from "../../shared/sqlite";
 import { deleteChunkEmbedBackoffForSession } from "./compartment-chunk-embedding";
 import { releaseMemoryReservations } from "./memory/lifecycle-applier";
+import { deleteUncommittedPublications } from "./memory/turn-one-publication";
 import { deleteUnmappedMessageFtsRows } from "./message-fts-rowid-map";
 import { deleteSessionActivity } from "./session-activity";
 
@@ -131,6 +132,7 @@ export function deleteSessionScopedRows(
     const placeholders = deletableSessionIds.map(() => "?").join(", ");
 
     releaseMemoryReservations(db, deletableSessionIds, harness);
+    deleteUncommittedPublications(db, deletableSessionIds, harness);
 
     for (const sessionId of deletableSessionIds) deleteChunkEmbedBackoffForSession(db, sessionId);
     for (const definition of SESSION_SCOPED_TABLES) {

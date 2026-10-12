@@ -1,10 +1,11 @@
 /// <reference types="bun-types" />
 
 /**
- * Independent review tests for historian turn one, run through the production
- * OpenCode runner. Tests named "review witness" document a defect found in review;
- * they fail today and run only with MC_REVIEW_WITNESSES=1 so the package suite stays
- * green (docs/reports/memory-s5-review.md lists them).
+ * Tests for historian turn-one anchors, run through the production OpenCode runner:
+ * out-of-order compartments, ranges outside or across compartments, and facts of a
+ * reply whose last compartment is discarded. The "review witness" test reproduces a
+ * fixed defect (a discarded-tail fact recorded twice once the tail was re-derived;
+ * docs/reports/memory-s5-review.md) so it cannot return.
  */
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
@@ -32,7 +33,6 @@ import {
 } from "./producer-window-test-support";
 import { __ignoredNotificationTest } from "./send-session-notification";
 
-const witness = process.env.MC_REVIEW_WITNESSES === "1" ? it : it.skip;
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
@@ -211,11 +211,8 @@ ${compartmentXml(3, 4, "Earlier")}
                 compartment_id: null,
                 anchor_known: 0,
             },
-            {
-                content: "Fact naming a compartment that was never emitted.",
-                compartment_id: null,
-                anchor_known: 0,
-            },
+            // "Fact naming a compartment that was never emitted" is not recorded: an
+            // index past the published compartments is dropped (keepPublishedFact).
         ]);
         // Each anchored candidate links exactly the printed lines it cited.
         expect(
@@ -233,15 +230,15 @@ ${compartmentXml(3, 4, "Earlier")}
         ]);
     });
 
-    witness(
-        "review witness: a fact anchored to the discarded tail compartment is recorded once, not again when the tail is re-derived",
-        async () => {
-            const sessionId = "ses-review-discard-last";
-            const directory = "/tmp/turn-one-review-discard-last";
-            const db = createSession(sessionId);
-            // The reply consumes the whole chunk, so discard-last drops 7-12 and the next
-            // run re-derives it; the model cites the same source lines both times.
-            const first = `<output><compartments>
+    it("review witness: a fact anchored to the discarded tail compartment is recorded once, not again when the tail is re-derived", async () => {
+        const sessionId = "ses-review-discard-last";
+        const directory = "/tmp/turn-one-review-discard-last";
+        const db = createSession(sessionId);
+        // The reply's last compartment (7-12) ends at the end of the messages the
+        // historian was sent, so it had no lookahead: the runner discards it, and the
+        // next run summarises messages 7-12 again. The model cites the same source
+        // lines both times.
+        const first = `<output><compartments>
 ${compartmentXml(3, 6, "Head")}
 ${compartmentXml(7, 12, "Tail")}
 </compartments>
@@ -252,15 +249,15 @@ ${compartmentXml(7, 12, "Tail")}
 </CONSTRAINTS>
 </facts>
 </output>`;
-            await runEnabledHistorian(db, sessionId, directory, first);
-            expect(
-                getCompartments(db, sessionId).map((row) => [row.startMessage, row.endMessage]),
-            ).toEqual([
-                [1, 2],
-                [3, 6],
-            ]);
+        await runEnabledHistorian(db, sessionId, directory, first);
+        expect(
+            getCompartments(db, sessionId).map((row) => [row.startMessage, row.endMessage]),
+        ).toEqual([
+            [1, 2],
+            [3, 6],
+        ]);
 
-            const second = `<output><compartments>
+        const second = `<output><compartments>
 ${compartmentXml(7, 8, "Tail again")}
 </compartments>
 <facts>
@@ -270,10 +267,9 @@ ${compartmentXml(7, 8, "Tail again")}
 </facts>
 <meta><unprocessed_from>9</unprocessed_from></meta>
 </output>`;
-            await runEnabledHistorian(db, sessionId, directory, second);
+        await runEnabledHistorian(db, sessionId, directory, second);
 
-            const tail = candidates(db).filter((row) => row.content === "Fact from the tail.");
-            expect(tail).toHaveLength(1);
-        },
-    );
+        const tail = candidates(db).filter((row) => row.content === "Fact from the tail.");
+        expect(tail).toHaveLength(1);
+    });
 });

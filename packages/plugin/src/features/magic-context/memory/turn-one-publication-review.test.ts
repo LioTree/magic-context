@@ -1,8 +1,11 @@
 /**
- * Independent review tests for the turn-one publication record. Tests named "review
- * witness" document a defect found in review; they fail today and run only with
- * MC_REVIEW_WITNESSES=1 so the package suite stays green
- * (docs/reports/memory-s5-review.md lists them).
+ * Tests for the turn-one publication record: rollback with the compartment
+ * transaction, publication reuse, commit order across processes, which printed lines
+ * count as sent, and the TypeScript side of the shared anchor fuzz corpus. Each test
+ * named "review witness" reproduces one fixed defect, named in the test, so it cannot
+ * return: a send left `dispatched` after a later attempt published, and an
+ * uncommitted publication left behind by session deletion
+ * (docs/reports/memory-s5-review.md).
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -20,7 +23,6 @@ import {
     type TurnOneSend,
 } from "./turn-one-publication";
 
-const witness = process.env.MC_REVIEW_WITNESSES === "1" ? test : test.skip;
 const PROJECT = "git:turn-one-review";
 
 function store(): Database {
@@ -255,7 +257,7 @@ console.log("committed " + committed);
         expect(blocksSentToHistorian(blocks, text, `X${text}`)).toEqual([]);
     });
 
-    witness("review witness: a session's deletion leaves no uncommitted publication behind", () => {
+    test("review witness: a session's deletion leaves no uncommitted publication behind", () => {
         const db = store();
         try {
             allocate(db, "ses-deleted");
@@ -280,26 +282,23 @@ console.log("committed " + committed);
         }
     });
 
-    witness(
-        "review witness: a send superseded by a later published attempt does not stay dispatched",
-        () => {
-            const db = store();
-            try {
-                for (let attempt = 0; attempt < 5; attempt += 1) allocate(db, "ses-retry");
-                const send = allocate(db, "ses-retry");
-                db.transaction(() => commit(db, send, "ses-retry")).immediate();
-                expect(
-                    db
-                        .prepare(
-                            "SELECT run_attempt, state FROM memory_stage_attempts WHERE publication_id=? AND state='dispatched' ORDER BY run_attempt",
-                        )
-                        .all(send.publicationId),
-                ).toEqual([]);
-            } finally {
-                db.close();
-            }
-        },
-    );
+    test("review witness: a send superseded by a later published attempt does not stay dispatched", () => {
+        const db = store();
+        try {
+            for (let attempt = 0; attempt < 5; attempt += 1) allocate(db, "ses-retry");
+            const send = allocate(db, "ses-retry");
+            db.transaction(() => commit(db, send, "ses-retry")).immediate();
+            expect(
+                db
+                    .prepare(
+                        "SELECT run_attempt, state FROM memory_stage_attempts WHERE publication_id=? AND state='dispatched' ORDER BY run_attempt",
+                    )
+                    .all(send.publicationId),
+            ).toEqual([]);
+        } finally {
+            db.close();
+        }
+    });
 });
 
 describe("turn-one anchor fuzz corpus shared with the Rust validator", () => {

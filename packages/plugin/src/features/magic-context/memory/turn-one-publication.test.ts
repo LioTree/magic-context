@@ -8,6 +8,8 @@ import {
     allocateTurnOneSend,
     blocksSentToHistorian,
     commitTurnOnePublication,
+    keepPublishedFact,
+    publishedFacts,
     resolveTurnOneFactAnchor,
     resolveTurnOneLane,
     type TurnOnePrintedBlock,
@@ -27,6 +29,14 @@ interface AnchorGolden {
             range: [number, number] | null;
             resolved: { compartment: number; blocks: Array<[number, number]> } | null;
         };
+    }>;
+    keep: Array<{
+        name: string;
+        index: number | null;
+        persisted: number;
+        droppedTail: boolean;
+        weakFinal: number | null;
+        keep: boolean;
     }>;
 }
 
@@ -143,6 +153,35 @@ describe("turn-one anchor goldens shared with the Rust validator", () => {
     }
 });
 
+describe("published-fact policy shared with the Rust validator", () => {
+    for (const golden of goldens.keep) {
+        test(golden.name, () => {
+            expect(
+                keepPublishedFact(
+                    golden.index ?? undefined,
+                    golden.persisted,
+                    golden.droppedTail,
+                    golden.weakFinal,
+                ),
+            ).toBe(golden.keep);
+        });
+    }
+
+    test("published facts keep their position in the reply", () => {
+        const kept = publishedFacts(
+            [
+                { category: "NAMING", content: "Unanchored." },
+                { category: "NAMING", content: "Tail.", anchor: { compartmentIndex: 2 } },
+                { category: "NAMING", content: "Head.", anchor: { compartmentIndex: 1 } },
+            ],
+            1,
+            true,
+            null,
+        );
+        expect(kept.map((fact) => [fact.content, fact.factIndex])).toEqual([["Head.", 2]]);
+    });
+});
+
 describe("turn-one publication", () => {
     test("every production lane is dormant", () => {
         expect(resolveTurnOneLane()).toBe("dormant");
@@ -167,7 +206,7 @@ describe("turn-one publication", () => {
                     run_attempt: 1,
                     stage: "turn_one",
                     session_id: SESSION,
-                    state: "dispatched",
+                    state: "superseded",
                 },
                 {
                     publication_id: first.publicationId,

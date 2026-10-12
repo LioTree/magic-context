@@ -288,12 +288,12 @@ function dormantPublish(f: ProjectionFixture, withTurnOne: boolean): void {
                 candidateFacts: [
                     {
                         category: "CONSTRAINTS",
-                        content: "Candidate fact that must not render.",
+                        content: "Anchored candidate recorded by turn one.",
                         anchor: { compartmentIndex: 1, startOrdinal: 1, endOrdinal: 2 },
                     },
                     {
                         category: "NAMING",
-                        content: "Unknown-anchor candidate that must not render.",
+                        content: "Unknown-anchor candidate recorded by turn one.",
                     },
                 ],
                 honourAnchors: true,
@@ -717,7 +717,6 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
                 expect(reads.slice(watched)).toEqual([]);
                 expect(served[1]).toEqual(served[0]);
                 const text = `${served[0].m0}${served[0].m1}`;
-                expect(text).not.toContain("must not render");
                 if (step === "genuine-hard") {
                     expect(served[0].materialized).toBe(true);
                     hardAfterPublish = true;

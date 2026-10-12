@@ -444,13 +444,7 @@ pub fn parse_compartment_output(
 
     for (category, block) in paired_elements(&facts_scope, category_open_regex()) {
         if !HISTORIAN_CATEGORIES.contains(&category) {
-            let count = fact_item_regex()
-                .captures_iter(block)
-                .filter(|caps| {
-                    caps.get(1)
-                        .is_some_and(|m| !unescape_xml(m.as_str().trim()).is_empty())
-                })
-                .count();
+            let count = fact_items(block).len();
             if count == 0 {
                 continue;
             }
@@ -459,11 +453,8 @@ pub fn parse_compartment_output(
             tracing::warn!("{}", format_dropped_fact_category(category, count));
             continue;
         }
-        for item_caps in fact_item_regex().captures_iter(block) {
-            let raw = item_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-            let unescaped = unescape_xml(raw.trim());
-            let (origin_compartment_index, source_range, content) =
-                split_fact_anchor_prefix(&unescaped);
+        for item in fact_items(block) {
+            let (origin_compartment_index, source_range, content) = split_fact_anchor_prefix(&item);
             if !content.is_empty() {
                 facts.push(FactCandidate {
                     category: category.to_string(),
@@ -706,22 +697,29 @@ pub fn validate_historian_output(
     }
 
     let persisted_count = compartments.len() as u64;
+    // A fact bound to a persisted compartment of this reply is kept. A fact anchored to
+    // the discarded tail, to the weak final compartment of a forced keep, or past the
+    // persisted compartments is dropped, and so is an unanchored fact of a reply with
+    // either kind of weak tail: the next run re-derives those lines and may emit the
+    // fact again.
+    let weak_final_index = options
+        .force_keep_last_compartment
+        .then_some(emitted_count as u64);
     let facts = parsed
         .facts
         .into_iter()
         .filter(|fact| {
-            !options.force_keep_last_compartment
-                && keep_side_channel(
-                    fact.origin_compartment_index,
-                    persisted_count,
-                    discarded_last,
-                )
+            keep_side_channel(
+                fact.origin_compartment_index,
+                persisted_count,
+                discarded_last,
+                weak_final_index,
+            )
         })
         .collect();
-    // A discarded lookahead compartment invalidates the whole producer output's anchors.
-    // Keeping any side channel here would make a later re-read double-store it. A forced final
-    // wrapup chunk has the same weak lookahead for promotions, while retaining earlier anchored
-    // events that do not point at the final compartment.
+    // Events, primer candidates and observations use a stricter rule than facts: a
+    // discarded lookahead compartment invalidates every one of them, and a forced final
+    // keep retains only events anchored before the final compartment.
     let events = parsed
         .events
         .into_iter()
@@ -729,7 +727,8 @@ pub fn validate_historian_output(
             if options.force_keep_last_compartment {
                 matches!(event.at_compartment, Some(index) if (1..persisted_count).contains(&index))
             } else {
-                keep_side_channel(event.at_compartment, persisted_count, discarded_last)
+                !discarded_last
+                    && keep_side_channel(event.at_compartment, persisted_count, false, None)
             }
         })
         .collect();
@@ -738,10 +737,12 @@ pub fn validate_historian_output(
         .into_iter()
         .filter(|candidate| {
             !options.force_keep_last_compartment
+                && !discarded_last
                 && keep_side_channel(
                     candidate.origin_compartment_index,
                     persisted_count,
-                    discarded_last,
+                    false,
+                    None,
                 )
         })
         .take(1)
@@ -751,10 +752,12 @@ pub fn validate_historian_output(
         .into_iter()
         .filter(|observation| {
             !options.force_keep_last_compartment
+                && !discarded_last
                 && keep_side_channel(
                     observation.origin_compartment_index,
                     persisted_count,
-                    discarded_last,
+                    false,
+                    None,
                 )
         })
         .collect();
@@ -1213,17 +1216,24 @@ fn validate_parsed_compartments(
     None
 }
 
-fn keep_side_channel(
+/// Whether a side channel of a validated reply is published. A side channel
+/// anchored to compartment `index` is kept when that compartment is one of the
+/// `persisted_count` published ones and is not the weak final compartment of a
+/// forced keep (`weak_final_index`); one anchored past them points at a discarded
+/// tail. An unanchored side channel is kept only when the reply has no weak tail:
+/// none was discarded (`discarded_last`) and no final compartment was kept without
+/// lookahead. Mirrors `keepPublishedFact` in
+/// packages/plugin/src/features/magic-context/memory/turn-one-publication.ts, and
+/// both are pinned by the `keep` cases of tests/fixtures/turn-one-anchor-goldens.json.
+pub fn keep_side_channel(
     origin_compartment_index: Option<u64>,
     persisted_count: u64,
     discarded_last: bool,
+    weak_final_index: Option<u64>,
 ) -> bool {
-    if discarded_last {
-        return false;
-    }
     match origin_compartment_index {
-        Some(index) => (1..=persisted_count).contains(&index),
-        None => !discarded_last,
+        Some(index) => (1..=persisted_count).contains(&index) && Some(index) != weak_final_index,
+        None => !discarded_last && weak_final_index.is_none(),
     }
 }
 
@@ -1410,6 +1420,48 @@ fn text_outside_compartments(text: &str, elements: &[CompartmentElement<'_>]) ->
     outside
 }
 
+/// Largest anchor index or ordinal accepted: JavaScript's `Number.MAX_SAFE_INTEGER`
+/// (2^53 - 1), so this parser and the TypeScript one (`splitFactAnchorPrefix` in
+/// packages/plugin/src/hooks/magic-context/compartment-parser.ts) accept the same
+/// values. A larger value rejects the whole anchor.
+const MAX_ANCHOR_ORDINAL: u64 = (1 << 53) - 1;
+
+fn parse_anchor_ordinal(digits: &str) -> Option<u64> {
+    digits
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value <= MAX_ANCHOR_ORDINAL)
+}
+
+/// Whitespace trimmed from fact text: Unicode White_Space without U+0085. U+0085
+/// and U+FEFF stay ordinary text, as in `trimFactText` in
+/// packages/plugin/src/hooks/magic-context/compartment-parser.ts.
+fn is_fact_trim_char(character: char) -> bool {
+    character.is_whitespace() && character != '\u{85}'
+}
+
+fn trim_fact_text(text: &str) -> &str {
+    text.trim_matches(is_fact_trim_char)
+}
+
+/// The bullet items of a fact category block, XML-unescaped. A bullet is one
+/// `\n`-terminated line (the `\r` of a CRLF ending is trimmed) that starts with `*`
+/// after optional whitespace. U+2028, U+2029, U+0085 and a lone `\r` are ordinary
+/// text inside a bullet, never a line end. Mirrors `factItems` in
+/// packages/plugin/src/hooks/magic-context/compartment-parser.ts.
+fn fact_items(block: &str) -> Vec<String> {
+    block
+        .split('\n')
+        .filter_map(|line| {
+            let body = line
+                .trim_start_matches(is_fact_trim_char)
+                .strip_prefix('*')?;
+            let item = trim_fact_text(body);
+            (!item.is_empty()).then(|| unescape_xml(item))
+        })
+        .collect()
+}
+
 fn split_anchor_prefix(text: &str) -> (Option<u64>, String) {
     let (anchor, _, content) = split_fact_anchor_prefix(text);
     (anchor, content)
@@ -1417,28 +1469,32 @@ fn split_anchor_prefix(text: &str) -> (Option<u64>, String) {
 
 /// Split a side-channel bullet's optional anchor prefix from its text:
 /// `[at_compartment=N messages=A-B] text`, `[at_compartment=N] text`, or
-/// `[at_compartment=unknown] text`. An unknown or unparsable index yields no
-/// anchor and no range. Mirrors `splitFactAnchorPrefix` in
+/// `[at_compartment=unknown] text`. An unknown index, or an index or range past
+/// 2^53, yields no anchor and no range. Mirrors `splitFactAnchorPrefix` in
 /// packages/plugin/src/hooks/magic-context/compartment-parser.ts.
 pub fn split_fact_anchor_prefix(text: &str) -> (Option<u64>, Option<FactSourceRange>, String) {
-    if let Some(caps) = side_channel_anchor_regex().captures(text) {
-        let anchor = caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok());
-        let content = caps
-            .get(4)
-            .map(|m| m.as_str().trim().to_string())
-            .unwrap_or_default();
-        let start = caps.get(2).and_then(|m| m.as_str().parse::<u64>().ok());
-        let end = match caps.get(3) {
-            Some(m) => m.as_str().parse::<u64>().ok(),
-            None => start,
-        };
-        let range = match (anchor, start, end) {
-            (Some(_), Some(start), Some(end)) => Some(FactSourceRange { start, end }),
-            _ => None,
-        };
-        return (anchor, range, content);
+    let Some(caps) = side_channel_anchor_regex().captures(text) else {
+        return (None, None, trim_fact_text(text).to_string());
+    };
+    let content = caps
+        .get(4)
+        .map(|m| trim_fact_text(m.as_str()).to_string())
+        .unwrap_or_default();
+    let Some(anchor) = caps.get(1).and_then(|m| parse_anchor_ordinal(m.as_str())) else {
+        return (None, None, content);
+    };
+    let Some(start) = caps.get(2) else {
+        return (Some(anchor), None, content);
+    };
+    let start = parse_anchor_ordinal(start.as_str());
+    let end = match caps.get(3) {
+        Some(m) => parse_anchor_ordinal(m.as_str()),
+        None => start,
+    };
+    match (start, end) {
+        (Some(start), Some(end)) => (Some(anchor), Some(FactSourceRange { start, end }), content),
+        _ => (None, None, content),
     }
-    (None, None, text.trim().to_string())
 }
 
 /// Decode the five predefined XML entities in a single left-to-right pass, so
@@ -1624,11 +1680,6 @@ fn paired_elements<'a>(text: &'a str, open_regex: &Regex) -> Vec<(&'a str, &'a s
     elements
 }
 
-fn fact_item_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"(?m)^\s*\*\s*(.+)$"#).unwrap())
-}
-
 fn unprocessed_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"<unprocessed_from>(\d+)</unprocessed_from>"#).unwrap())
@@ -1672,11 +1723,15 @@ fn event_field_open_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"<([a-z_]+)\s*>").unwrap())
 }
 
+/// A side-channel bullet's optional anchor prefix. Only ASCII space and tab separate
+/// its parts, and the text after it may hold any character (`(?s)`), so JavaScript
+/// and Rust classify the same input the same way; see `FACT_ANCHOR_PREFIX_REGEX` in
+/// packages/plugin/src/hooks/magic-context/compartment-parser.ts.
 fn side_channel_anchor_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"^\s*[\[(]\s*(?:at_compartment|origin_compartment)\s*=\s*"?([0-9]+|unknown)"?(?:\s+messages\s*=\s*"?([0-9]+)(?:\s*-\s*([0-9]+))?"?)?\s*[\])]\s*(.+)$"#,
+            r#"^[ \t]*[\[(][ \t]*(?:at_compartment|origin_compartment)[ \t]*=[ \t]*"?([0-9]+|unknown)"?(?:[ \t]+messages[ \t]*=[ \t]*"?([0-9]+)(?:[ \t]*-[ \t]*([0-9]+))?"?)?[ \t]*[\])][ \t]*(?s:(.+))$"#,
         )
         .unwrap()
     })
@@ -2296,7 +2351,7 @@ full narrative
     }
 
     #[test]
-    fn discarded_last_suppresses_every_side_channel_for_the_whole_run() {
+    fn discarded_last_keeps_bound_facts_and_suppresses_the_other_side_channels() {
         let extra = r#"
 <facts>
 <PROJECT_RULES>
@@ -2323,7 +2378,14 @@ full narrative
                 .expect("discard-last should still make forward progress");
 
         assert!(result.discarded_last);
-        assert!(result.facts.is_empty());
+        // A fact bound to the persisted compartment survives: the next run re-reads
+        // only the discarded tail, so it cannot emit that fact again.
+        let facts: Vec<&str> = result
+            .facts
+            .iter()
+            .map(|fact| fact.content.as_str())
+            .collect();
+        assert_eq!(facts, vec!["Keep the earlier rule."]);
         assert!(result.events.is_empty());
         assert!(result.user_observations.is_empty());
         assert!(result.primer_candidates.is_empty());
@@ -2356,6 +2418,87 @@ full narrative
         compartments: Vec<(u64, u64)>,
         blocks: Vec<(u64, u64)>,
         cases: Vec<AnchorGoldenCase>,
+        keep: Vec<KeepGoldenCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct KeepGoldenCase {
+        name: String,
+        index: Option<u64>,
+        persisted: u64,
+        dropped_tail: bool,
+        weak_final: Option<u64>,
+        keep: bool,
+    }
+
+    /// Which facts a validated reply publishes matches the TypeScript runners'
+    /// `keepPublishedFact` on the shared `keep` cases.
+    #[test]
+    fn published_fact_policy_matches_the_typescript_runners() {
+        let golden: AnchorGolden = serde_json::from_str(include_str!(
+            "../tests/fixtures/turn-one-anchor-goldens.json"
+        ))
+        .expect("parse turn-one anchor goldens");
+        assert!(golden.keep.len() >= 10);
+        for case in &golden.keep {
+            assert_eq!(
+                keep_side_channel(
+                    case.index,
+                    case.persisted,
+                    case.dropped_tail,
+                    case.weak_final
+                ),
+                case.keep,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    fn validated_fact_texts(options: ValidateOptions) -> Vec<String> {
+        let facts = "<facts><PROJECT_RULES>\n* [at_compartment=1 messages=2] Head fact.\n* [at_compartment=2 messages=5] Tail fact.\n* Unanchored fact.\n</PROJECT_RULES></facts>";
+        let text = xml(&[(1, 3, "head"), (4, 6, "tail")], 7, facts);
+        validate_historian_output(&text, &chunk(1, 6), &[], options)
+            .expect("valid reply")
+            .facts
+            .into_iter()
+            .map(|fact| fact.content)
+            .collect()
+    }
+
+    #[test]
+    fn discard_last_keeps_facts_bound_to_persisted_compartments_only() {
+        assert_eq!(
+            validated_fact_texts(ValidateOptions::default()),
+            vec!["Head fact.".to_string()]
+        );
+    }
+
+    #[test]
+    fn forced_final_keep_drops_facts_of_the_weak_final_compartment_and_unanchored_ones() {
+        assert_eq!(
+            validated_fact_texts(ValidateOptions {
+                force_keep_last_compartment: true,
+                ..ValidateOptions::default()
+            }),
+            vec!["Head fact.".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_reply_without_a_weak_tail_keeps_unanchored_facts() {
+        assert_eq!(
+            validated_fact_texts(ValidateOptions {
+                in_emergency: true,
+                ..ValidateOptions::default()
+            }),
+            vec![
+                "Head fact.".to_string(),
+                "Tail fact.".to_string(),
+                "Unanchored fact.".to_string()
+            ]
+        );
     }
 
     #[derive(Debug, Deserialize)]
@@ -2627,12 +2770,11 @@ full narrative
         );
     }
 
-    /// The same comparison over the whole corpus, including non-portable input. It
-    /// fails today because the two parsers classify U+0085, U+FEFF, a lone `\r`,
-    /// U+2028, U+2029 and integers past 2^53 differently, so it documents a known
-    /// defect and runs only with `--ignored` (see docs/reports/memory-s5-review.md).
+    /// Compares this parser with the TypeScript one over the whole fuzz corpus,
+    /// including non-portable input (U+0085, U+FEFF, a lone `\r`, U+2028, U+2029 and
+    /// integers past 2^53), which both must classify the same way (see
+    /// `split_fact_anchor_prefix` and `fact_items`).
     #[test]
-    #[ignore = "review witness: TS/Rust fact-anchor parity gaps, docs/reports/memory-s5-review.md"]
     fn review_witness_turn_one_anchor_fuzz_matches_typescript_on_all_input() {
         let (parsed, resolved, documents, _) = anchor_fuzz_mismatches(false);
         assert!(

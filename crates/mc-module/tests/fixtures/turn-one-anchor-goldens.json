@@ -1,5 +1,5 @@
 {
-  "description": "Historian turn-one fact anchors. `line` is a <facts> bullet without its leading '* '. `expect.compartment` and `expect.range` are the parsed anchor (null when absent); `expect.resolved` is the anchor resolved against `compartments` (the published compartments of the same reply, in order) and `blocks` (the [N]/[N-M] lines sent to the historian). The TypeScript parser and resolver (packages/plugin/src/features/magic-context/memory/turn-one-publication.test.ts) and the Rust parser and validator (crates/mc-module/src/historian_validate.rs) must both produce exactly these values.",
+  "description": "Historian turn-one fact anchors. `line` is a <facts> bullet without its leading '* '. `expect.compartment` and `expect.range` are the parsed anchor (null when absent); `expect.resolved` is the anchor resolved against `compartments` (the published compartments of the same reply, in order) and `blocks` (the [N]/[N-M] lines sent to the historian). The TypeScript parser and resolver (packages/plugin/src/features/magic-context/memory/turn-one-publication.test.ts) and the Rust parser and validator (crates/mc-module/src/historian_validate.rs) must both produce exactly these values. `keep` cases pin which facts of a validated reply are published (`keepPublishedFact` in TypeScript, `keep_side_channel` in Rust): `index` is the fact's anchor index (null when unanchored), `persisted` the number of published compartments, `droppedTail` whether a compartment of the reply was dropped, and `weakFinal` the index of a final compartment kept without lookahead (null when none).",
   "compartments": [[10, 14], [15, 22]],
   "blocks": [[10, 10], [11, 12], [13, 14], [15, 15], [16, 19], [20, 22]],
   "cases": [
@@ -84,5 +84,19 @@
       "blocks": [[10, 10], [11, 12]],
       "expect": { "content": "Past the cut.", "compartment": 1, "range": [13, 14], "resolved": null }
     }
+  ],
+  "keep": [
+    {"name": "anchored to a published compartment", "index": 1, "persisted": 2, "droppedTail": false, "weakFinal": null, "keep": true},
+    {"name": "anchored past the published compartments", "index": 3, "persisted": 2, "droppedTail": false, "weakFinal": null, "keep": false},
+    {"name": "zero index", "index": 0, "persisted": 2, "droppedTail": false, "weakFinal": null, "keep": false},
+    {"name": "unanchored, no weak tail", "index": null, "persisted": 2, "droppedTail": false, "weakFinal": null, "keep": true},
+    {"name": "discard-last: anchored to a published compartment", "index": 1, "persisted": 1, "droppedTail": true, "weakFinal": null, "keep": true},
+    {"name": "discard-last: anchored to the discarded tail", "index": 2, "persisted": 1, "droppedTail": true, "weakFinal": null, "keep": false},
+    {"name": "discard-last: unanchored", "index": null, "persisted": 1, "droppedTail": true, "weakFinal": null, "keep": false},
+    {"name": "forced keep: anchored before the weak final compartment", "index": 1, "persisted": 2, "droppedTail": false, "weakFinal": 2, "keep": true},
+    {"name": "forced keep: anchored to the weak final compartment", "index": 2, "persisted": 2, "droppedTail": false, "weakFinal": 2, "keep": false},
+    {"name": "forced keep: unanchored", "index": null, "persisted": 2, "droppedTail": false, "weakFinal": 2, "keep": false},
+    {"name": "forced keep whose final compartment was snapped away: anchored to a published compartment", "index": 2, "persisted": 2, "droppedTail": true, "weakFinal": 3, "keep": true},
+    {"name": "forced keep whose final compartment was snapped away: unanchored", "index": null, "persisted": 2, "droppedTail": true, "weakFinal": 3, "keep": false}
   ]
 }

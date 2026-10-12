@@ -82,6 +82,9 @@ export function allocateTurnOneSend(db: Database, input: TurnOneSendInput): Turn
                 )
                 .get(input.projectPath, publicationId) as { attempt: number };
             const runAttempt = prior.attempt + 1;
+            // Only the newest send of a publication is live; an older one never
+            // published and is never resumed, so it is closed here.
+            supersedeTurnOneSends(db, input.projectPath, publicationId);
             const stageKey = JSON.stringify([
                 input.projectPath,
                 publicationId,
@@ -111,6 +114,46 @@ export function allocateTurnOneSend(db: Database, input: TurnOneSendInput): Turn
         .immediate();
 }
 
+/**
+ * Close every `dispatched` turn-one send of a publication except `liveStageKey`:
+ * a later attempt replaced it, so no recovery step may treat it as in flight.
+ */
+function supersedeTurnOneSends(
+    db: Database,
+    projectPath: string,
+    publicationId: string,
+    liveStageKey?: string,
+): void {
+    db.prepare(
+        `UPDATE memory_stage_attempts SET state='superseded'
+         WHERE project_path=? AND publication_id=? AND stage='turn_one' AND state='dispatched'
+           AND stage_key IS NOT ?`,
+    ).run(projectPath, publicationId, liveStageKey ?? null);
+}
+
+/**
+ * Delete the uncommitted publications of sessions being deleted, before their send
+ * records go. Without a send record no run can reuse or commit such a publication.
+ * Committed publications are project history and stay. With `harness`, a
+ * publication another harness also sent under is kept.
+ */
+export function deleteUncommittedPublications(
+    db: Database,
+    sessionIds: readonly string[],
+    harness?: string,
+): void {
+    if (sessionIds.length === 0) return;
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_publications'").get()) return;
+    const placeholders = sessionIds.map(() => "?").join(",");
+    const otherHarness =
+        harness === undefined
+            ? ""
+            : " AND NOT EXISTS (SELECT 1 FROM memory_stage_attempts s WHERE s.publication_id=memory_publications.publication_id AND s.harness!=?)";
+    db.prepare(
+        `DELETE FROM memory_publications WHERE commit_order IS NULL AND source_session_id IN (${placeholders})${otherHarness}`,
+    ).run(...sessionIds, ...(harness === undefined ? [] : [harness]));
+}
+
 /** A fact's source anchor as written by the historian (see `splitFactAnchorPrefix`). */
 export interface TurnOneFactAnchor {
     compartmentIndex: number;
@@ -122,6 +165,53 @@ export interface TurnOneFact {
     category: string;
     content: string;
     anchor?: TurnOneFactAnchor;
+    /** The fact's position in the reply; defaults to its position in the list given. */
+    factIndex?: number;
+}
+
+/**
+ * Whether a fact of a validated reply is published (promoted or recorded as a
+ * candidate). A fact anchored to compartment N is kept when N is one of the
+ * `persistedCount` published compartments and is not the weak final compartment of
+ * a forced keep (`weakFinalIndex`); one anchored past them points at a discarded
+ * tail. An unanchored fact is kept only when the reply has no weak tail: none was
+ * discarded (`droppedTail`) and no final compartment was kept without lookahead.
+ * Dropped facts come back when the next run re-derives those lines. Mirrors
+ * `keep_side_channel` in crates/mc-module/src/historian_validate.rs; both are
+ * pinned by the `keep` cases of
+ * crates/mc-module/tests/fixtures/turn-one-anchor-goldens.json.
+ */
+export function keepPublishedFact(
+    compartmentIndex: number | undefined,
+    persistedCount: number,
+    droppedTail: boolean,
+    weakFinalIndex: number | null,
+): boolean {
+    if (compartmentIndex === undefined) return !droppedTail && weakFinalIndex === null;
+    return (
+        compartmentIndex >= 1 &&
+        compartmentIndex <= persistedCount &&
+        compartmentIndex !== weakFinalIndex
+    );
+}
+
+/** The facts of a reply that `keepPublishedFact` keeps, each with its reply position. */
+export function publishedFacts<T extends TurnOneFact>(
+    facts: readonly T[],
+    persistedCount: number,
+    droppedTail: boolean,
+    weakFinalIndex: number | null,
+): T[] {
+    return facts
+        .map((fact, factIndex) => ({ ...fact, factIndex: fact.factIndex ?? factIndex }))
+        .filter((fact) =>
+            keepPublishedFact(
+                fact.anchor?.compartmentIndex,
+                persistedCount,
+                droppedTail,
+                weakFinalIndex,
+            ),
+        );
 }
 
 /** A `[N]`/`[N-M]` line of the chunk text the historian was sent. */
@@ -207,10 +297,11 @@ export interface TurnOnePublicationInput {
     sessionId: string;
     /**
      * The durable rows just appended for this reply, in reply order. Each carries its
-     * stored range (`startMessage`/`endMessage`) and the range the reply gave that
-     * compartment (`replyStartMessage`/`replyEndMessage`). If any row's two ranges
-     * differ, the rows cannot be trusted to be this reply's compartments, so no fact
-     * anchor is resolved to them and every candidate is stored with an unknown anchor.
+     * stored range (`startMessage`/`endMessage`) and the range of the validated
+     * compartment it was appended from (`replyStartMessage`/`replyEndMessage`, after
+     * gap healing and boundary snapping). If any row's two ranges differ, the rows
+     * are misaligned with the reply's compartments, so no fact anchor is resolved to
+     * them and every candidate is stored with an unknown anchor.
      */
     compartments: ReadonlyArray<{
         id: number;
@@ -281,6 +372,7 @@ export function commitTurnOnePublication(
     db.prepare("UPDATE memory_stage_attempts SET state='published' WHERE stage_key=?").run(
         input.send.stageKey,
     );
+    supersedeTurnOneSends(db, input.projectPath, input.send.publicationId, input.send.stageKey);
 
     let activityIncrements = 0;
     const ledger = db.prepare(
@@ -320,8 +412,9 @@ export function commitTurnOnePublication(
     let candidatesInserted = 0;
     let anchoredCandidates = 0;
     let blocksStored = 0;
-    input.candidateFacts.forEach((fact, factIndex) => {
+    input.candidateFacts.forEach((fact, position) => {
         if (!isPromotableFact(fact)) return;
+        const factIndex = fact.factIndex ?? position;
         const resolved =
             input.honourAnchors && bound
                 ? resolveTurnOneFactAnchor(fact.anchor, ranges, input.blocks)

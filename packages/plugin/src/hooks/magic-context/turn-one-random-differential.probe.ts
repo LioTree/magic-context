@@ -988,9 +988,10 @@ async function main(): Promise<void> {
             !summary.exactlyOnce;
         if (failing) totals.failing += 1;
         console.log(
-            `${failing ? "FAIL" : "ok  "} ${summary.label}: ${summary.identicalServing}/${summary.servingPasses} serving passes identical (${summary.materialized} materialized), prompts ${summary.identicalPrompts}/${summary.publishes} identical, restarts=${summary.restarts}, promoted=${summary.promoted} shownTokens=${summary.shownTokens} bindings=${JSON.stringify(summary.bindings)} turnOne=${JSON.stringify(summary.turnOne)} commitOrders=${JSON.stringify(summary.commitOrders)}`,
+            `${failing ? "FAIL" : "ok  "} ${summary.label}: ${summary.identicalServing}/${summary.servingPasses} serving passes identical (${summary.materialized} materialized), prompts ${summary.identicalPrompts}/${summary.publishes} identical, violations=${summary.violations.length}, restarts=${summary.restarts}, promoted=${summary.promoted} shownTokens=${summary.shownTokens} bindings=${JSON.stringify(summary.bindings)} turnOne=${JSON.stringify(summary.turnOne)} commitOrders=${JSON.stringify(summary.commitOrders)}`,
         );
-        for (const line of [...summary.differences, ...summary.violations].slice(0, 8)) {
+        // Violations first: a scenario with many byte differences must not hide one.
+        for (const line of [...summary.violations, ...summary.differences].slice(0, 8)) {
             console.log(`     ${line.slice(0, 600)}`);
         }
         if (summary.foreignFiles.length > 0)

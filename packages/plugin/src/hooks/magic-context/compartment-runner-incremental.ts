@@ -23,6 +23,7 @@ import {
     allocateTurnOneSend,
     blocksSentToHistorian,
     commitTurnOnePublication,
+    publishedFacts,
     resolveTurnOneLane,
     type TurnOneFact,
     type TurnOneSend,
@@ -67,7 +68,7 @@ import {
     resolveOpenCodeDbPath,
 } from "../../shared/opencode-db-path";
 import { toModelEntry } from "../../shared/resolve-fallbacks";
-import { beginSqliteWriterAsync } from "../../shared/sqlite";
+import { beginSqliteWriterAsync, isTransientSqliteError } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt, COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
@@ -794,15 +795,32 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const publicationProjectPath = publicationDirectory
             ? resolveProjectIdentity(publicationDirectory)
             : projectPath;
-        const turnOneSend: TurnOneSend = allocateTurnOneSend(db, {
-            projectPath: publicationProjectPath,
-            sessionId,
-            harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
-            carrier: deps.hiddenCompletionExecutor ? "hidden-completion" : "opencode-session",
-            lane: turnOneLane,
-            chunkStart: chunk.startIndex,
-            chunkEnd: chunk.endIndex,
-        });
+        let turnOneSend: TurnOneSend;
+        try {
+            turnOneSend = allocateTurnOneSend(db, {
+                projectPath: publicationProjectPath,
+                sessionId,
+                harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
+                carrier: deps.hiddenCompletionExecutor ? "hidden-completion" : "opencode-session",
+                lane: turnOneLane,
+                chunkStart: chunk.startIndex,
+                chunkEnd: chunk.endIndex,
+            });
+        } catch (error) {
+            if (!isTransientSqliteError(error)) throw error;
+            // The store stayed busy past its timeout before anything was sent. This
+            // is contention, not a historian failure: skip the run without touching
+            // the failure count or its backoff, release the drain budget, and let the
+            // next trigger try again.
+            telemetry.status = "noop";
+            telemetry.failureReason = "turn_one_send_store_busy";
+            sessionLog(
+                sessionId,
+                `historian skipped: store busy while recording turn one's send (${describeError(error).brief}); retrying on the next trigger`,
+            );
+            rollbackDrainReservation();
+            return;
+        }
 
         // Defensive: use MAX(sequence) + 1 rather than .length. These only
         // differ when the current DB state has a gap or non-zero-indexed
@@ -1109,30 +1127,34 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             // embedding. Pure DB read — cheap, no message mutation.
             const durableRows = getCompartments(db, sessionId).slice(-persistedCompartments.length);
             persistedIds = durableRows.map((c) => c.id);
-            // v2 faithful fact lifecycle: facts are NOT a REPLACE-the-whole-list
-            // store anymore. The historian emits only THIS chunk's facts (deduped
-            // against <project-memory> in the prompt); they flow to project memory
-            // via in-transaction durable promotion. session_facts is no longer
-            // written/bumped. Promotion is in the SAME transaction as the boundary
-            // floor below so a crash cannot advance past facts that never became
-            // project memories.
-            //
-            // The publication also commits here, once: the activity ledger counts the
-            // new compartments, and candidate facts are recorded
-            // - on an `enabled` lane, every fact with its resolved anchor; none is
-            //   promoted here, a later reconcile step decides each one;
-            // - on a `dormant` lane whose project memory the Rust module owns, each fact
-            //   the promotion below would otherwise have attempted, with an unknown
-            //   anchor, since this process may not write that project's memories.
+            // The historian emits only this chunk's facts. This transaction also commits
+            // turn one's publication, once: the activity ledger counts the new
+            // compartments, and the reply's published facts (see `keepPublishedFact`:
+            // one tied to a discarded or weak final compartment is dropped and comes
+            // back when the next run re-derives those lines) go to one of three places.
+            // - `enabled` lane: every published fact becomes a candidate with its
+            //   resolved anchor; nothing is promoted, a later reconcile step decides.
+            // - `dormant` lane, project memory owned by the Rust module: each fact
+            //   becomes a candidate with an unknown anchor, since this process may not
+            //   write those memories.
+            // - `dormant` lane, project memory owned here: facts are promoted to
+            //   project memory below, in the same transaction as the protected-tail
+            //   publication floor (`recordProtectedTailPublicationFloor`), so a crash
+            //   cannot advance past facts that never became memories.
             const memoryAuthorityHere = tsOwnsMemory(db, publicationProjectPath);
-            const facts: TurnOneFact[] = validatedPass.facts ?? [];
+            const keptFacts: TurnOneFact[] = publishedFacts(
+                validatedPass.facts ?? [],
+                persistedCompartments.length,
+                discardedLast,
+                weakLookaheadFinalCompartment ? emittedCompartments.length : null,
+            );
             const candidateFacts =
                 turnOneLane === "enabled"
                     ? deps.memoryEnabled !== false
-                        ? facts
+                        ? keptFacts
                         : []
-                    : promotionActive && !skipUnanchoredPromotion && !memoryAuthorityHere
-                      ? facts
+                    : promotionActive && !memoryAuthorityHere
+                      ? keptFacts
                       : [];
             const turnOnePublication = commitTurnOnePublication(db, {
                 send: turnOneSend,
@@ -1162,14 +1184,14 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 turnOneLane === "dormant" &&
                 memoryAuthorityHere &&
                 promotionActive &&
-                !skipUnanchoredPromotion
+                keptFacts.length > 0
             ) {
                 try {
                     const promotion = promoteSessionFactsDurable(
                         db,
                         sessionId,
                         promotionProjectIdentity,
-                        validatedPass.facts ?? [],
+                        keptFacts,
                     );
                     promotedFactRefs = promotion.newMemoryRefs;
                     promotedFactCount = promotion.factsPromoted;

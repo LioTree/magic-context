@@ -17,7 +17,11 @@ import {
     getMemoriesByProject,
     insertMemory,
 } from "../../features/magic-context/memory/storage-memory";
-import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
+import {
+    closeDatabase,
+    getHistorianFailureState,
+    openDatabase,
+} from "../../features/magic-context/storage";
 import type { PluginContext } from "../../plugin/types";
 import { __resetNotificationStateForTests } from "../../shared/rpc-notifications";
 import { Database } from "../../shared/sqlite";
@@ -489,12 +493,72 @@ describe("historian turn one on an enabled lane", () => {
         expect(
             turnOneSends(db).map((send) => [send.publication_id, send.run_attempt, send.state]),
         ).toEqual([
-            [abandoned!.publication_id, 1, "dispatched"],
+            [abandoned!.publication_id, 1, "superseded"],
             [abandoned!.publication_id, 2, "published"],
         ]);
         expect(pendingFacts(db)).toHaveLength(2);
         expect(db.prepare("SELECT COUNT(*) AS n FROM memory_activity_ledger").get()).toEqual({
             n: 1,
         });
+    });
+});
+
+describe("historian turn one when the store is busy before dispatch", () => {
+    it("skips the run without counting a failure when turn one's send cannot be recorded, and retries on the next trigger", async () => {
+        useTempDataHome("turn-one-busy-");
+        const sessionId = "ses-busy";
+        const directory = "/tmp/turn-one-busy";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        const { client, prompt } = historianClient(directory, () => REPLY_WITH_FACTS);
+
+        // Every statement that would record the send reports a store that stayed busy
+        // past its timeout, as SQLite does when another writer holds the lock.
+        const prepare = db.prepare.bind(db);
+        Object.defineProperty(db, "prepare", {
+            configurable: true,
+            writable: true,
+            value: (sql: string) => {
+                if (/INSERT INTO memory_stage_attempts/.test(sql)) {
+                    throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+                }
+                return prepare(sql);
+            },
+        });
+        try {
+            await runHistorian(db, sessionId, client, directory, { forceDrainQuota: true });
+        } finally {
+            Object.defineProperty(db, "prepare", {
+                configurable: true,
+                writable: true,
+                value: prepare,
+            });
+        }
+
+        expect(sentPrompts(prompt)).toEqual([]);
+        expect(getCompartments(db, sessionId)).toHaveLength(1);
+        expect(publications(db)).toEqual([]);
+        expect(getHistorianFailureState(db, sessionId).failureCount).toBe(0);
+        expect(
+            db
+                .prepare(
+                    "SELECT historian_drain_failure_at AS at, compartment_in_progress AS busy FROM session_meta WHERE session_id = ?",
+                )
+                .get(sessionId),
+        ).toEqual({ at: 0, busy: 0 });
+        expect(
+            db
+                .prepare(
+                    "SELECT status, failure_reason FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                )
+                .get(sessionId),
+        ).toEqual({ status: "noop", failure_reason: "turn_one_send_store_busy" });
+
+        // The next trigger runs normally.
+        await runHistorian(db, sessionId, client, directory, { forceDrainQuota: true });
+        expect(sentPrompts(prompt)).toHaveLength(1);
+        expect(getCompartments(db, sessionId)).toHaveLength(2);
+        expect(publications(db).map((row) => row.commit_order)).toEqual([1]);
     });
 });
