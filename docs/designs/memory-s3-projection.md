@@ -15,17 +15,29 @@ subtraction cannot be made exact. The redesign deletes the recompute.
 1. **Only a HARD fold reads memory.** A HARD fold reads memory rows (and the
    mutation log) to build m[0] and its m[1], and records the session's applied
    tuple in the same writer transaction as the cached pair.
-2. **A busting SOFT reads no memory rows and no mutation log** (TS OpenCode 1/2,
-   Pi, Rust). It replays the memory blocks the HARD fold rendered byte for byte and
-   appends this session's own agent fragments (TS and Pi). New compartments and the
-   user-profile delta render as before.
+2. **The memory pair is a pure function of the session's shown state plus its own
+   fragments.** On a busting SOFT and on a defer, nothing that decides, renders or
+   commits the m[0]/m[1] pair (the materialization decision, the m[1] composer, the
+   mural and the cache commit) reads memory rows, the mutation log, or their `MAX(id)`
+   heads, in TS OpenCode 1/2, Pi and Rust. A SOFT replays the memory blocks the HARD
+   fold rendered byte for byte and appends this session's own agent fragments (TS and
+   Pi). New compartments and the user-profile delta render as before.
 3. **A defer replays stored bytes.** Unchanged.
+3a. **Two named memory readers sit outside the pair.** Explicit `ctx_search`, and
+   automatic search. Automatic search reads current memory only while it computes a
+   new hint for a new user message (its visibility check is resolved lazily, at that
+   point); the hint is persisted and replayed on every later pass for that message,
+   which reads no memory. A hint is attached to the user message in the tail and never
+   changes m[0]/m[1]. The Rust hint producer (`maybe_decide_live_user_hint`) is the same
+   exception.
 4. **Automated writers apply directly** to canonical rows once their deterministic
    gates pass, with `memory_history` for undo, and write no mutation-log row and no
    fragment. They reach a prompt only at that session's next natural HARD fold.
    - dreamer verify `update`: applies directly (`recordAutomatedMemoryEdit`).
    - dreamer expiry archive: applies directly (its `expires_at` was declared when
-     the memory was written).
+     the memory was written). Through the module it calls `memory.expire`, which
+     rechecks ownership, active status and the declared expiry inside the transaction
+     and archives with history and no log row; it is not the agent archive port.
    - dreamer verify `archive`: a pending proposal in `memory_tool_proposals`; the
      row stays live.
    - curate: proposals only (update, merge and archive), in OpenCode and Pi.
@@ -37,11 +49,22 @@ subtraction cannot be made exact. The redesign deletes the recompute.
 5. **Agent `ctx_memory` edits apply immediately** through the shared applier
    (save, update, merge, archive) and record one immutable, pre-rendered fragment
    (`memory_agent_fragments`) for the session that made them. That session's next
-   busting SOFT appends the fragment to m[1] inside the correction allowance
-   (25% of the memory budget, at most 40 full lines, and the refold headroom). A
-   fragment that does not fit appends one short `<stale-memory … read-with="ctx_search"/>`
-   marker; fragments already shown never move or shrink. Pi's primary-agent paths
-   now use the same applier.
+   busting SOFT appends the fragment to m[1]. Every fragment leaves a visible trace:
+   - its full lines when they fit the correction allowance (25% of the memory budget)
+     minus a marker reserve, at most 40 full lines, and the refold headroom;
+   - otherwise one short `<stale-memory … read-with="ctx_search"/>` marker, paid from a
+     fixed marker reserve inside the allowance (200 tokens, or half the allowance when
+     that is smaller) that full fragments never use;
+   - once the reserve is spent, it joins one aggregate
+     `<more-memory-edits count="N" ids="…" note="N more memory edits apply at the next
+     rebuild; …"/>` line at the end, which lists ids up to 120 characters. Its bytes
+     change as N grows (an m[1] change on a busting SOFT, like any append).
+
+   Fragments and markers already shown never move or shrink. A merge shows the
+   survivor's text unless this session's served manifest or committed fragments
+   already show exactly that text (new, changed or unchanged survivor alike). An
+   agent save that matches an existing memory this session does not show also gets a
+   fragment. Pi's primary-agent paths use the same applier.
 6. **`ctx_search` returns current database text, unlabelled.** A hit is hidden only
    while its *current* text is fully visible in the served pair (m[0] text, a fold
    m[1] addition, or a full agent fragment). A mural cue or a stale marker never
@@ -50,6 +73,24 @@ subtraction cannot be made exact. The redesign deletes the recompute.
 7. **Memory corrections never authorize a HARD fold.** The refold backstop measures
    m[1] without its `<memory-updates>` block, and the old "more than 40 corrections"
    trigger is gone (TS and Pi). In Rust the SOFT correction count is always 0.
+
+### Memory aggregates that remain, and the decision each feeds
+
+All of these are read by a HARD fold only; none is read on a SOFT or defer pass.
+
+| Aggregate | Host | Decision it feeds |
+| --- | --- | --- |
+| `MAX(memories.id)` in the fold's marker read | TS, Pi | The fold's `maxMemoryId` watermark, persisted with the cached pair; the fold's own m[1] admits rows above it (read under its writer). |
+| `MAX(memory_mutation_log.id)` in the fold's marker read and under its writer | TS, Pi | The fold's mutation cursor, and the fold's stale check: a log row written between the fold's read and its writer retries the fold (contention). |
+| Memory revision of the m0 composition (`max_memory_id`, mutation cursor) and its commit fence | Rust | Recorded with a HARD fold (including a pressure refold), and checked at that fold's commit. |
+
+Removed from non-HARD passes: the memory and log heads in the TS marker-change probe
+and uncached marker read used by the materialization decision, the same reads in Pi's
+decision, and in Rust the heads in `load_m1_revision_snapshot`, their slots in the m1
+revision digest (now constant zeros) and the memory fence on SOFT commits. One-time
+upgrade cost in Rust: a session whose stored digest was taken with nonzero memory heads
+sees one pending m1 revision after upgrading, so at most one execute-band SOFT
+re-records it (the memory bytes it serves are unchanged).
 
 ## Storage (v99 edited in place; v99 is unreleased)
 
@@ -128,6 +169,21 @@ S4), `dashboard_approval_does_not_bump_epoch` (dashboard; slice 11),
 `privacy_revocation_still_invalidates` (no TS privacy-revocation path exists to
 exercise; the workspace-fingerprint HARD is unchanged), `concurrent_write_cannot_split_text_and_mural_manifest`
 and `cue_only_correction_overrides_frozen_image` (need a rendered mural).
+
+### Round-4 review witnesses (`docs/reports/memory-s3-cache-review-r4.md`)
+
+Each finding's witness is now a permanent package test, and each fix was shown to
+turn its test red when removed:
+
+| Finding | Permanent test(s) | Status |
+| --- | --- | --- |
+| P1 automatic search reads canonical memory | `a defer/busting postprocess pass reads memory only when automatic search computes a new hint` (OpenCode), `a Pi defer/busting context pass …` (Pi), Rust `automatic_hint_producer_is_a_named_memory_reader` | Contract narrowed by ruling: replaying passes read nothing; computing a new hint is the named reader. |
+| P1 module-routed expiry used the agent archive | Rust `module_routed_expiry_writes_history_and_no_mutation_log`; `expire-memories.test.ts` asserts the `memory.expire` call | Fixed. |
+| P2 watermark aggregates on every pass | Shared `SOFT and defer passes read no memory rows, mutation log or their heads` (aggregates now count, TS and Pi); Rust `soft_reads_no_memory_rows_or_watermark`, `soft_plus_reads_no_memory_rows_or_watermark`, `soft_reads_no_mutation_log_rows_or_watermark`, `soft_plus_reads_no_mutation_log_rows_or_watermark`, `memory_only_change_opens_no_execute_band_soft` | Fixed. |
+| P2 full allowance omitted the marker | Shared `a full allowance still traces every rejected edit and never shrinks shown fragments` | Fixed: marker reserve plus aggregate line. The probe's literal expectation (`<stale-memory ids="2"`) stays red by ruling, because by then the reserve is spent and the edit is traced in the aggregate line instead. |
+| P2 merge into an unshown survivor | Shared `a merge into an unshown existing survivor shows the survivor text`, plus the control `a merge into a shown survivor adds only the supersession` | Fixed. |
+| P3 explicit save of an unshown duplicate | Shared `an explicit agent save of an unshown duplicate reaches its session` | Fixed. |
+| Byte stability | Rust `foreign_hards_and_row_churn_preserve_the_served_pair_over_150_rounds`; the probe's 180-round TS/Pi replay, v98-shaped cache, schema and multi-row archive controls | Pass. |
 
 ### Witness tests of the three earlier reviews
 
