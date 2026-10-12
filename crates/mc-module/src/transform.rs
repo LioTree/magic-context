@@ -24194,6 +24194,59 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn signed_thinking_hold_off_ignores_saved_release_obligations() {
+        let mut captures = Vec::new();
+        for seeded in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let mut request = opus_55_request("saved-release-off", "cfg0");
+            request.auto_search_enabled = false;
+            request.usage = Some(ModuleUsage {
+                current_total_input_tokens: 86_000,
+                context_limit_tokens: 100_000,
+                ..Default::default()
+            });
+            let context = pctx("git:hold-off", "/nonexistent-docs", 1000);
+            transform(&store, &request, &context).unwrap();
+            let mut loaded = store.load(&request.session_id).unwrap();
+            loaded.meta.soft_refresh_pending = true;
+            loaded.meta.has_prior_emergency_drop = true;
+            let saved = seeded.then(|| {
+                serde_json::json!({"obligations": {
+                    "soft_refresh": "explicit_flush", "force_episode": "selection"
+                }})
+            });
+            loaded.meta.held_release = saved.clone();
+            store
+                .commit_meta(&request.session_id, loaded.row_version, &loaded.meta)
+                .unwrap();
+            request.messages.push(serde_json::from_value(serde_json::json!({
+                "mid":"signed", "ordinal":2, "ck":{"role":"assistant", "content":[
+                    {"kind":{"type":"reasoning","text":"Continue the tool loop.","signature":"signed-off"}},
+                    {"kind":{"type":"text","text":"Continue."}}
+                ], "meta":{"harness_id":"signed"}}
+            })).unwrap());
+            let response = transform(&store, &request, &context).unwrap();
+            let after = store.load(&request.session_id).unwrap();
+            assert_eq!(
+                after.meta.held_release, saved,
+                "disabled obligations must remain inert"
+            );
+            let mut meta = serde_json::to_value(&after.meta).unwrap();
+            meta.as_object_mut().unwrap().remove("held_release");
+            captures.push((
+                serde_json::to_string(response.messages()).unwrap(),
+                meta,
+                serde_json::to_value(after.core).unwrap(),
+            ));
+        }
+        assert_eq!(
+            captures[0], captures[1],
+            "saved holds must not affect disabled planning or served bytes"
+        );
+    }
+
+    #[test]
     fn opus_55_variant_flip_keeps_render_identity_and_served_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
