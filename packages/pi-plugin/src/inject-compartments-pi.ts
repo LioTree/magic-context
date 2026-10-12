@@ -1036,19 +1036,26 @@ function readCurrentMarkersFromCompartments(
 	state: PiM0M1State,
 	compartments: readonly PiCompartment[],
 	projectDocsHash?: string,
+	/**
+	 * False on a non-HARD decision: the memory-id and memory-mutation heads are not read
+	 * and come back as 0. Only a HARD fold's markers carry them, as its watermarks.
+	 */
+	memoryWatermarks = true,
 ): PiM0SnapshotMarkers {
 	const memPath = memoryProjectPath(state);
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
-	const maxMemoryId = memPath
-		? workspace.isWorkspaced
-			? getMaxMemoryIdForProjects(
-					db,
-					workspace.expandedIdentities,
-					workspace.ownIdentities,
-					workspace.shareCategories,
-				)
-			: getMaxMemoryIdForProjects(db, [memPath])
-		: 0;
+	const maxMemoryId = !memoryWatermarks
+		? 0
+		: memPath
+			? workspace.isWorkspaced
+				? getMaxMemoryIdForProjects(
+						db,
+						workspace.expandedIdentities,
+						workspace.ownIdentities,
+						workspace.shareCategories,
+					)
+				: getMaxMemoryIdForProjects(db, [memPath])
+			: 0;
 	const projectState = memPath ? getProjectState(db, memPath) : undefined;
 	const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
 	return {
@@ -1066,14 +1073,16 @@ function readCurrentMarkersFromCompartments(
 				: EMPTY_MAX_COMPARTMENT_SEQ,
 		maxMemoryId,
 		maxMutationId: getMaxM0MutationId(db, state.sessionId) ?? 0,
-		maxMemoryMutationId: memPath
-			? workspace.isWorkspaced
-				? (getMaxMemoryMutationIdForProjects(
-						db,
-						workspace.expandedIdentities,
-					) ?? 0)
-				: (getMaxMemoryMutationId(db, memPath) ?? 0)
-			: 0,
+		maxMemoryMutationId: !memoryWatermarks
+			? 0
+			: memPath
+				? workspace.isWorkspaced
+					? (getMaxMemoryMutationIdForProjects(
+							db,
+							workspace.expandedIdentities,
+						) ?? 0)
+					: (getMaxMemoryMutationId(db, memPath) ?? 0)
+				: 0,
 		projectMemoryEpoch: projectState?.projectMemoryEpoch ?? 0,
 		workspaceFingerprint: workspace.isWorkspaced
 			? computeWorkspaceEpochFingerprint(db, workspace.identities)
@@ -1140,6 +1149,8 @@ export function mustMaterializePi(
 		// fold. Reuse the persisted hash for the cache decision so defer passes do
 		// not synchronously read and fingerprint docs they cannot materialize.
 		meta.cachedM0ProjectDocsHash ?? undefined,
+		// The decision reads no memory or mutation-log head: none of its triggers uses them.
+		false,
 	);
 	const cached = getCachedMarkers(
 		db,

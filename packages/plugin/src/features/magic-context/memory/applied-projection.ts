@@ -27,8 +27,15 @@ export type AppliedRepresentation = "text" | "delta" | "cue";
 /** One agent fragment as it was committed to this session's m[1]. */
 export interface CommittedFragment {
     id: number;
-    /** `full` shows the operation's lines; `marker` shows only a stale-memory marker. */
-    form: "full" | "marker";
+    /**
+     * `full` shows the operation's lines; `marker` shows only a stale-memory marker;
+     * `overflow` is the one aggregate line for edits that did not fit even as markers
+     * (always the last entry, and the only one whose line is rewritten as it grows).
+     */
+    form: "full" | "marker" | "overflow";
+    /** For `overflow`: every memory id it stands for, and how many edits. */
+    overflowIds?: number[];
+    overflowCount?: number;
     lines: string[];
     /** Full memory texts shown by a `full` fragment; empty for a marker. */
     visibleTexts: Array<{ id: number; text: string }>;
@@ -361,6 +368,73 @@ export function readFullyVisibleMemoryIds(
         }
     }
     return visible;
+}
+
+/**
+ * Whether this session's memory pair already shows `text` as the full text of memory
+ * `memoryId`: rendered by its HARD fold (m[0] text or an m[1] addition) or shown in
+ * full by a committed fragment. Read from the session's own served manifest only,
+ * never from canonical rows. Fragments still waiting for a SOFT do not count (they
+ * may yet become markers), and a session with no applied tuple shows nothing, so a
+ * caller that is unsure includes the text.
+ */
+export function sessionShowsMemoryText(
+    db: Database,
+    sessionId: string,
+    memoryId: number,
+    text: string,
+): boolean {
+    if (!tablesPresent(db)) return false;
+    const harness = getHarness();
+    const rows = db
+        .prepare(
+            "SELECT projected_text, projected_metadata_json FROM memory_applied_rows WHERE session_id=? AND harness=? AND memory_id=?",
+        )
+        .all(sessionId, harness, memoryId) as Array<{
+        projected_text: string;
+        projected_metadata_json: string;
+    }>;
+    for (const row of rows) {
+        if (row.projected_text !== text) continue;
+        try {
+            const metadata = JSON.parse(row.projected_metadata_json) as {
+                representations?: string[];
+            };
+            if (
+                metadata.representations?.includes("text") ||
+                metadata.representations?.includes("delta")
+            )
+                return true;
+        } catch {
+            // A malformed row describes nothing shown.
+        }
+    }
+    const shows = (json: string) => {
+        try {
+            return (JSON.parse(json) as Array<{ id: number; text: string }>).some(
+                (shown) => shown.id === memoryId && shown.text === text,
+            );
+        } catch {
+            return false;
+        }
+    };
+    const snapshot = db
+        .prepare(
+            "SELECT committed_fragments_json FROM memory_applied_snapshots WHERE session_id=? AND harness=? LIMIT 1",
+        )
+        .get(sessionId, harness) as { committed_fragments_json: string } | null;
+    if (snapshot) {
+        try {
+            for (const fragment of JSON.parse(
+                snapshot.committed_fragments_json,
+            ) as CommittedFragment[])
+                if (fragment.form === "full" && shows(JSON.stringify(fragment.visibleTexts)))
+                    return true;
+        } catch {
+            // A malformed fragment list shows nothing.
+        }
+    }
+    return false;
 }
 
 // The m[0]/m[1] texts this process last served for a session when that pair was

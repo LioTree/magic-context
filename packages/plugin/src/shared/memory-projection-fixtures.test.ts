@@ -32,20 +32,17 @@ import { createTestTempDirFromPath } from "./test-temp-dir";
  *   - automated writers and other sessions reach the prompt at its next HARD fold.
  */
 
-/** Thrown when a gated pass tries to load memory rows or mutation-log rows. */
+/** Thrown when a gated pass reads memories or the mutation log (rows or heads). */
 export const MEMORY_LOADER_BLOCKED = "memory loader called on a gated pass";
 
 /**
- * Whether a statement loads rows of memories or of the mutation log. A read whose
- * SELECT only aggregates (a MAX id watermark, a COUNT) is a marker probe, not a load.
+ * Whether a statement reads memories or the mutation log at all, including aggregate
+ * heads such as MAX(id). Nothing that renders the memory pair on a SOFT or defer pass
+ * may read either table; automatic and explicit search are the named exceptions and
+ * are not part of these passes.
  */
-function loadsMemoryRows(sql: string): boolean {
-    for (const match of sql.matchAll(/\bFROM\s+(?:memories|memory_mutation_log)\b/gi)) {
-        const head = sql.slice(0, match.index);
-        const projection = head.slice(head.toUpperCase().lastIndexOf("SELECT"));
-        if (!/^SELECT\s+(?:COALESCE\s*\(\s*)?(?:MAX|MIN|COUNT)\s*\(/i.test(projection)) return true;
-    }
-    return false;
+function readsMemoryTables(sql: string): boolean {
+    return /\b(?:FROM|JOIN)\s+(?:memories|memory_mutation_log)\b/i.test(sql);
 }
 
 export interface ProjectionFixture {
@@ -71,7 +68,7 @@ function installLoaderGate(db: Database, gate: ProjectionFixture["gate"]): void 
         writable: true,
         value: (sql: string) => {
             const statement = prepare(sql);
-            if (!loadsMemoryRows(sql)) return statement;
+            if (!readsMemoryTables(sql)) return statement;
             for (const method of ["all", "get", "iterate", "values"] as const) {
                 const original = (statement as unknown as Record<string, unknown>)[method];
                 if (typeof original !== "function") continue;
@@ -185,6 +182,18 @@ function agentUpdate(f: ProjectionFixture, sessionId: string, id: number, conten
     expect(receipt.state).toBe("applied");
 }
 
+function agentMerge(f: ProjectionFixture, sessionId: string, ids: number[], content: string): void {
+    const receipt = applyAgentMemoryMutation(f.db, {
+        key: `merge:${sessionId}:${ids.join(",")}`,
+        projectPath: f.projectPath,
+        sourceSessionId: sessionId,
+        operation: "merge",
+        targets: ids.map((id) => ({ id, revision: getMemoryRevision(f.db, id)! })),
+        content,
+    });
+    expect(receipt.state).toBe("applied");
+}
+
 /** A gated automated content correction (dreamer verify): row and history, no log row. */
 function automatedEdit(f: ProjectionFixture, id: number, content: string): void {
     const before = getMemoryById(f.db, id)!;
@@ -202,13 +211,20 @@ function gated<T>(f: ProjectionFixture, body: () => T): T {
     }
 }
 
+/** The lines of the `<memory-updates>` block in an m[1] text. */
+function updateLines(m1: string): string[] {
+    const start = m1.indexOf("<memory-updates>\n");
+    const end = m1.indexOf("\n</memory-updates>");
+    return start < 0 || end < start ? [] : m1.slice(start, end).split("\n").slice(1);
+}
+
 export function registerMemoryProjectionRegressions(driver: ProjectionDriver): void {
     const create = (label: string) =>
         createProjectionFixture(`${driver.host}-${label}`, driver.open);
 
     // The acceptance gate: busting SOFT and defer passes never load memory rows or
     // the mutation log. The positive control proves the gate catches a HARD fold.
-    test(`${driver.host} SOFT and defer passes load no memory rows and no mutation log`, () => {
+    test(`${driver.host} SOFT and defer passes read no memory rows, mutation log or their heads`, () => {
         const f = create("gate");
         try {
             const [a] = f.sessions;
@@ -291,6 +307,110 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
             expect(second.m1).not.toContain("fifteen minutes");
             expect(second.m1.indexOf(shown)).toBe(first.m1.indexOf(shown));
             expect(driver.pass(f, a, false, options)).toEqual(second);
+        } finally {
+            f.close();
+        }
+    });
+
+    // Every agent edit that misses the allowance still leaves a visible trace. At the
+    // smallest permitted memory budget, full fragments use the allowance, markers use
+    // a fixed reserve, and once that is spent one aggregate line counts and lists the
+    // rest. Shown fragments and markers never move or shrink as the line grows.
+    test(`${driver.host} a full allowance still traces every rejected edit and never shrinks shown fragments`, () => {
+        const f = create("overflow-trace");
+        try {
+            const [a] = f.sessions;
+            const target = memory(f, "Marker baseline.");
+            const options = { memoryBudget: 500 };
+            driver.hard(f, a, options);
+            let firstFull = "";
+            let previous = "";
+            for (let i = 0; i < 20; i++) {
+                agentUpdate(f, a, target.id, `Adopted receipt ${i}.`);
+                const served = driver.pass(f, a, true, options);
+                expect(served.materialized).toBe(false);
+                if (i === 0) {
+                    expect(served.m1).toContain("Adopted receipt 0.");
+                    firstFull = served.m1.slice(0, served.m1.indexOf("Adopted receipt 0."));
+                }
+                // Every shown line before the aggregate line is an unchanged prefix of
+                // what the next pass serves.
+                const shownBefore = updateLines(previous).filter(
+                    (line) => !line.includes("<more-memory-edits"),
+                );
+                expect(updateLines(served.m1).slice(0, shownBefore.length)).toEqual(shownBefore);
+                previous = served.m1;
+            }
+            const oversized = agentSave(f, a, "oversized ".repeat(500));
+            const served = driver.pass(f, a, true, options);
+            expect(served.materialized).toBe(false);
+            expect(served.m1.startsWith(firstFull)).toBe(true);
+            expect(served.m1).toContain("Adopted receipt 0.");
+            expect(served.m1).toMatch(
+                new RegExp(
+                    `<stale-memory ids="${oversized}"|<more-memory-edits count="\\d+" ids="[^"]*\\b${oversized}\\b`,
+                ),
+            );
+            expect(served.m1).toContain("<more-memory-edits");
+            expect(driver.pass(f, a, false, options)).toEqual(served);
+        } finally {
+            f.close();
+        }
+    });
+
+    // A merge into a survivor this session has never shown carries the survivor's text,
+    // even when the merge leaves that text unchanged.
+    test(`${driver.host} a merge into an unshown existing survivor shows the survivor text`, () => {
+        const f = create("unshown-survivor");
+        try {
+            const [a] = f.sessions;
+            driver.hard(f, a);
+            const source = memory(f, "Foreign source.");
+            const survivor = memory(f, "Existing survivor never shown.");
+            agentMerge(f, a, [source.id, survivor.id], survivor.content);
+            const served = driver.pass(f, a, true);
+            expect(served.materialized).toBe(false);
+            expect(served.m1).toContain(`<superseded id="${source.id}" by="${survivor.id}"/>`);
+            expect(served.m1).toContain(survivor.content);
+        } finally {
+            f.close();
+        }
+    });
+
+    // A merge whose survivor text this session already shows adds only the supersession.
+    test(`${driver.host} a merge into a shown survivor adds only the supersession`, () => {
+        const f = create("shown-survivor");
+        try {
+            const [a] = f.sessions;
+            const survivor = memory(f, "Survivor already in m[0].");
+            driver.hard(f, a);
+            const source = memory(f, "Later source.");
+            agentMerge(f, a, [source.id, survivor.id], survivor.content);
+            const served = driver.pass(f, a, true);
+            expect(served.m1).toContain(`<superseded id="${source.id}" by="${survivor.id}"/>`);
+            expect(served.m1).not.toContain(`<added id="${survivor.id}"`);
+        } finally {
+            f.close();
+        }
+    });
+
+    // The agent asked to save it, so an explicit save that matches a memory this session
+    // does not show reaches the session; one it already shows adds nothing.
+    test(`${driver.host} an explicit agent save of an unshown duplicate reaches its session`, () => {
+        const f = create("duplicate-save");
+        try {
+            const [a] = f.sessions;
+            const shown = memory(f, "Duplicate already shown.");
+            driver.hard(f, a);
+            const unshown = memory(f, "Unshown duplicate manual save.");
+            expect(agentSave(f, a, unshown.content)).toBe(unshown.id);
+            expect(agentSave(f, a, shown.content)).toBe(shown.id);
+            const served = driver.pass(f, a, true);
+            expect(served.materialized).toBe(false);
+            expect(served.m1).toContain(
+                `<added id="${unshown.id}" category="ARCHITECTURE">${unshown.content}</added>`,
+            );
+            expect(served.m1).not.toContain(`<added id="${shown.id}"`);
         } finally {
             f.close();
         }

@@ -8,6 +8,7 @@ import {
     renderSupersededFragmentLine,
     renderUpdatedFragmentLine,
 } from "./agent-fragments";
+import { sessionShowsMemoryText } from "./applied-projection";
 import { CATEGORY_DEFAULT_TTL } from "./constants";
 import { embedTextForProject } from "./embedding";
 import { invalidateMemory } from "./embedding-cache";
@@ -218,14 +219,22 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
                 });
             }
             if (target) linkConflict(db, request.key, memory.id, target.id);
-            // An agent's own save surfaces in its session's m[1] as a fragment. Historian
-            // admissions and dreamer saves are automated: no fragment, so they wait for
-            // the next HARD fold.
+            // An agent's own save surfaces in its session's m[1] as a fragment, including a
+            // save that matched an existing memory this session does not show: the agent
+            // asked for it, so it must reach the agent's own session. Historian admissions
+            // and dreamer saves are automated: no fragment, so they wait for the next HARD
+            // fold.
             if (
                 request.operation === "agent_save" &&
-                !match &&
                 request.input.sourceSessionId &&
-                request.input.sourceType !== "dreamer"
+                request.input.sourceType !== "dreamer" &&
+                (!match ||
+                    !sessionShowsMemoryText(
+                        db,
+                        request.input.sourceSessionId,
+                        memory.id,
+                        memory.content,
+                    ))
             )
                 recordAgentFragment(db, {
                     sessionId: request.input.sourceSessionId,
@@ -381,8 +390,8 @@ function clearAgentMutationDerivedData(db: Database, memory: Memory): void {
 
 /**
  * The m[1] lines an agent operation shows its own session (see agent-fragments.ts).
- * A merge shows every superseded source and, when the survivor is new or its text
- * changed, the survivor's text; an archive shows each removal.
+ * A merge shows every superseded source and, unless this session already shows the
+ * survivor's current text, the survivor's text; an archive shows each removal.
  */
 function agentMutationFragment(
     operation: AgentMemoryMutation["operation"],
@@ -391,6 +400,7 @@ function agentMutationFragment(
     survivorExisted: boolean,
     category: string,
     finalText: string | undefined,
+    survivorShown: boolean,
 ): {
     memoryIds: number[];
     currentId: number | null;
@@ -417,7 +427,10 @@ function agentMutationFragment(
         .filter((source) => source.id !== canonical.id)
         .map((source) => renderSupersededFragmentLine(source.id, canonical.id));
     const original = sources.find((source) => source.id === canonical.id);
-    const survivorChanged = !survivorExisted || original?.content !== finalText;
+    // The survivor's text is shown unless this session's served pair already shows
+    // exactly that text for it. Whether the row is new or changed does not decide it:
+    // an unchanged survivor another writer added is still unknown to this session.
+    const survivorChanged = !survivorShown;
     if (survivorChanged)
         lines.push(
             survivorExisted && original
@@ -630,6 +643,9 @@ export function applyAgentMemoryMutation(
                     duplicate !== null,
                     category,
                     content,
+                    canonical !== null &&
+                        content !== undefined &&
+                        sessionShowsMemoryText(db, request.sourceSessionId, canonical.id, content),
                 ),
             });
             const receipt = record({

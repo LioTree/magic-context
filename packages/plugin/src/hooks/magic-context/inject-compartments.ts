@@ -18,6 +18,7 @@ import {
 } from "../../features/magic-context/memory/agent-fragments";
 import {
     type AppliedProjection,
+    type CommittedFragment,
     clearServedRecoveryTexts,
     hasAppliedSnapshot,
     readAppliedProjection,
@@ -1322,6 +1323,7 @@ const maxCompartmentSeqStatements = new WeakMap<Database, PreparedStatement>();
 const maxMemoryIdStatements = new WeakMap<Database, PreparedStatement>();
 const legacyCompartmentCountStatements = new WeakMap<Database, PreparedStatement>();
 const markerChangeProbeStatements = new WeakMap<Database, PreparedStatement>();
+const markerChangeProbeWithoutMemoryStatements = new WeakMap<Database, PreparedStatement>();
 const markerReadCaches = new WeakMap<Database, BoundedSessionMap<MarkerReadCacheEntry>>();
 const m0CompartmentStatements = new WeakMap<Database, PreparedStatement>();
 const newCompartmentStatements = new WeakMap<Database, PreparedStatement>();
@@ -1420,6 +1422,11 @@ interface M0SnapshotMarkerReadArgs {
     historyBudgetPolicyIdentity?: string;
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
+    /**
+     * False on a non-HARD decision: the memory-id and memory-mutation heads are not read
+     * and come back as 0. Only a HARD fold's markers carry them, as its watermarks.
+     */
+    memoryWatermarks?: boolean;
 }
 
 interface MarkerChangeProbe {
@@ -1455,7 +1462,33 @@ interface MarkerChangeProbeRow {
     alias_signature: string;
 }
 
-const MARKER_CHANGE_PROBE_SQL = `
+// The memory-id and memory-mutation heads of the marker probe. Only a HARD fold reads
+// them: they become the fold's watermarks. A non-HARD pass decides nothing from them (a
+// busting SOFT renders no memory rows), so its probe selects constant zeros instead and
+// never touches memories or memory_mutation_log. The expiry parameter stays bound so both
+// variants take the same arguments.
+const MAX_MEMORY_ID_PROBE = `      COALESCE((
+        SELECT MAX(memory.id)
+          FROM memories AS memory
+         WHERE memory.project_path IN (SELECT project_path FROM expanded)
+           AND memory.status IN ('active', 'permanent')
+           AND (memory.expires_at IS NULL OR memory.expires_at > ?)
+           AND (
+             memory.project_path IN (SELECT project_path FROM own)
+             OR (
+               memory.shareable = 1
+               AND memory.scope IN ('project', 'ecosystem', 'universe')
+               AND memory.category IN (SELECT category FROM shared)
+             )
+           )
+      ), 0) AS max_memory_id,`;
+const MAX_MEMORY_MUTATION_ID_PROBE = `      COALESCE((
+        SELECT MAX(id)
+          FROM memory_mutation_log
+         WHERE project_path IN (SELECT project_path FROM expanded)
+      ), 0) AS max_memory_mutation_id,`;
+
+const markerChangeProbeSql = (memoryWatermarks: boolean) => `
     WITH
       expanded(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
       own(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
@@ -1474,29 +1507,11 @@ const MARKER_CHANGE_PROBE_SQL = `
       (
         SELECT COUNT(*) FROM compartments WHERE session_id = ? AND legacy = 1
       ) AS legacy_compartment_count,
-      COALESCE((
-        SELECT MAX(memory.id)
-          FROM memories AS memory
-         WHERE memory.project_path IN (SELECT project_path FROM expanded)
-           AND memory.status IN ('active', 'permanent')
-           AND (memory.expires_at IS NULL OR memory.expires_at > ?)
-           AND (
-             memory.project_path IN (SELECT project_path FROM own)
-             OR (
-               memory.shareable = 1
-               AND memory.scope IN ('project', 'ecosystem', 'universe')
-               AND memory.category IN (SELECT category FROM shared)
-             )
-           )
-      ), 0) AS max_memory_id,
+${memoryWatermarks ? MAX_MEMORY_ID_PROBE : "      (SELECT 0 WHERE ? IS NOT NULL) AS max_memory_id,"}
       COALESCE((
         SELECT MAX(id) FROM m0_mutation_log WHERE session_id = ?
       ), 0) AS max_mutation_id,
-      COALESCE((
-        SELECT MAX(id)
-          FROM memory_mutation_log
-         WHERE project_path IN (SELECT project_path FROM expanded)
-      ), 0) AS max_memory_mutation_id,
+${memoryWatermarks ? MAX_MEMORY_MUTATION_ID_PROBE : "      0 AS max_memory_mutation_id,"}
       COALESCE((
         SELECT GROUP_CONCAT(signature, char(30))
           FROM (
@@ -1549,7 +1564,7 @@ function markerReadCacheKey(args: M0SnapshotMarkerReadArgs): string {
               ),
           })
         : "auto";
-    return `${args.sessionId}\u0000${args.projectPath ?? ""}\u0000${suppliedWorkspace}`;
+    return `${args.sessionId}\u0000${args.projectPath ?? ""}\u0000${suppliedWorkspace}\u0000${args.memoryWatermarks !== false}`;
 }
 
 function getMarkerReadCache(db: Database): BoundedSessionMap<MarkerReadCacheEntry> {
@@ -1565,10 +1580,11 @@ function readMarkerChangeProbe(
     args: M0SnapshotMarkerReadArgs,
     workspace: WorkspaceRenderContext,
 ): MarkerChangeProbe {
+    const memoryWatermarks = args.memoryWatermarks !== false;
     const statement = cachedStatement(
-        markerChangeProbeStatements,
+        memoryWatermarks ? markerChangeProbeStatements : markerChangeProbeWithoutMemoryStatements,
         args.db,
-        MARKER_CHANGE_PROBE_SQL,
+        markerChangeProbeSql(memoryWatermarks),
     );
     const row = statement.get(
         JSON.stringify(workspace.expandedIdentities),
@@ -1632,21 +1648,28 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
                 : null,
             projectUserProfileVersion: getGlobalUserProfileVersion(args.db),
             maxCompartmentSeq: getMaxCompartmentSeq(args.db, args.sessionId),
-            maxMemoryId: workspace.isWorkspaced
-                ? getMaxMemoryIdForProjects(
-                      args.db,
-                      workspace.expandedIdentities,
-                      workspace.ownIdentities,
-                      workspace.shareCategories,
-                      materializedAt,
-                  )
-                : getMaxMemoryId(args.db, args.projectPath, materializedAt),
+            maxMemoryId:
+                args.memoryWatermarks === false
+                    ? 0
+                    : workspace.isWorkspaced
+                      ? getMaxMemoryIdForProjects(
+                            args.db,
+                            workspace.expandedIdentities,
+                            workspace.ownIdentities,
+                            workspace.shareCategories,
+                            materializedAt,
+                        )
+                      : getMaxMemoryId(args.db, args.projectPath, materializedAt),
             maxMutationId: getMaxM0MutationId(args.db, args.sessionId) ?? 0,
-            maxMemoryMutationId: workspace.isWorkspaced
-                ? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
-                : args.projectPath
-                  ? (getMaxMemoryMutationId(args.db, args.projectPath) ?? 0)
-                  : 0,
+            maxMemoryMutationId:
+                args.memoryWatermarks === false
+                    ? 0
+                    : workspace.isWorkspaced
+                      ? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ??
+                        0)
+                      : args.projectPath
+                        ? (getMaxMemoryMutationId(args.db, args.projectPath) ?? 0)
+                        : 0,
             // Project docs are not a materialization trigger. The HARD renderer
             // replaces this placeholder with the hash of the bytes it actually read.
             projectDocsHash: "",
@@ -1831,7 +1854,8 @@ export function mustMaterialize(args: {
     // `current.workspaceFingerprint` is resolved inside readCurrentM0SnapshotMarkers
     // (it resolves its own workspace context); the later workspace-identity HARD
     // gate compares it with the cached fingerprint, so no local context is needed.
-    const current = readCurrentM0SnapshotMarkers(args);
+    // The decision reads no memory or mutation-log head: none of its triggers uses them.
+    const current = readCurrentM0SnapshotMarkers({ ...args, memoryWatermarks: false });
     const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(args.state.cachedM0UpgradeState);
 
     // The system-prompt hook runs after the message transform, so its changed hash
@@ -3362,15 +3386,47 @@ export function m1PressureHeadroom(args: {
 }
 
 /**
+ * Tokens set aside inside the correction allowance for stale-memory markers only:
+ * this fixed amount, or half the allowance when the allowance is smaller than twice it.
+ */
+export const M1_MARKER_RESERVE_TOKENS = 200;
+/** The aggregate overflow line lists ids up to about this many characters. */
+export const M1_OVERFLOW_ID_LIST_CHARS = 120;
+
+/**
+ * The one aggregate line that stands for every agent edit this session could not
+ * show even as a marker. It names how many edits wait for the next rebuild and as
+ * many of their memory ids as fit a bounded length.
+ */
+export function renderMemoryEditOverflowLine(memoryIds: readonly number[], count: number): string {
+    const unique = [...new Set(memoryIds)];
+    let listed = "";
+    for (const id of unique) {
+        const next = listed ? `${listed},${id}` : `${id}`;
+        if (next.length > M1_OVERFLOW_ID_LIST_CHARS) {
+            listed = `${listed},…`;
+            break;
+        }
+        listed = next;
+    }
+    return `  <more-memory-edits count="${count}" ids="${listed}" note="${count} more memory edits apply at the next rebuild; read them with ctx_search"/>`;
+}
+
+/**
  * The memory <memory-updates> block of a busting SOFT pass, built without reading
  * memory rows or the mutation log. It is the replayed HARD lines, every fragment
  * committed by an earlier SOFT (unchanged), and then this session's newer agent
- * fragments in order. Each new fragment is all-or-nothing: its full lines when
- * they fit the correction allowance (a share of the memory budget, header
- * included), the 40-line cap and the refold headroom; otherwise one stale-memory
- * marker if that fits; otherwise it and every later fragment wait for a later
- * pass or the next HARD fold. Committed fragments never move or shrink.
- * Shared by the OpenCode and Pi renderers.
+ * fragments in order. Every new fragment leaves a visible trace:
+ *   1. its full lines when they fit the correction allowance (a share of the memory
+ *      budget, header included, minus the marker reserve), the 40-line cap and the
+ *      refold headroom;
+ *   2. otherwise one stale-memory marker, paid from a fixed marker reserve that full
+ *      fragments never use;
+ *   3. once the reserve is spent, it joins one aggregate overflow line at the end,
+ *      which counts and lists every such edit. Later fragments join that line too,
+ *      so it stays last; its bytes grow with its count.
+ * Committed full fragments and markers never move or shrink. Shared by the OpenCode
+ * and Pi renderers.
  */
 export function composeSoftMemoryUpdates(args: {
     db: Database;
@@ -3382,11 +3438,20 @@ export function composeSoftMemoryUpdates(args: {
     m0Tokens: () => number | null;
 }): { block: string; projection: AppliedProjection; newFragments: number } {
     const hard = parseHardMemoryBlock(args.projection.hardMemoryBlock);
-    const committed = [...args.projection.committed];
-    const lines = [...hard.updateLines, ...committed.flatMap((fragment) => fragment.lines)];
+    const committed = args.projection.committed.filter((fragment) => fragment.form !== "overflow");
+    const overflowEntry = args.projection.committed.find(
+        (fragment) => fragment.form === "overflow",
+    );
+    let overflow = overflowEntry
+        ? {
+              id: overflowEntry.id,
+              memoryIds: [...(overflowEntry.overflowIds ?? [])],
+              count: overflowEntry.overflowCount ?? 0,
+          }
+        : null;
     const processedThrough = Math.max(
         args.projection.fragmentWatermark,
-        ...committed.map((fragment) => fragment.id),
+        ...args.projection.committed.map((fragment) => fragment.id),
     );
     const pending = loadAgentFragmentsAfter(args.db, args.sessionId, processedThrough);
     if (pending.length > 0) {
@@ -3395,14 +3460,24 @@ export function composeSoftMemoryUpdates(args: {
         );
         const lineTokens = (items: readonly string[]) =>
             items.reduce((sum, line) => sum + estimateTokens(`${line}\n`), 0);
-        let used = lines.length === 0 ? 0 : headerTokens + lineTokens(lines);
+        let usedFull =
+            headerTokens +
+            lineTokens(hard.updateLines) +
+            lineTokens(committed.filter((f) => f.form === "full").flatMap((f) => f.lines));
+        let usedMarkers = lineTokens(
+            committed.filter((f) => f.form === "marker").flatMap((f) => f.lines),
+        );
         let fullLines =
             hard.updateLines.length +
             committed
                 .filter((fragment) => fragment.form === "full")
                 .reduce((sum, fragment) => sum + fragment.lines.length, 0);
-        const budget = Math.min(
-            Math.floor(args.memoryBudgetTokens * M1_CORRECTION_ALLOWANCE_RATIO),
+        const allowance = Math.floor(args.memoryBudgetTokens * M1_CORRECTION_ALLOWANCE_RATIO);
+        const markerReserve = Math.min(M1_MARKER_RESERVE_TOKENS, Math.floor(allowance / 2));
+        // The reserve is carved out of the allowance; the refold headroom limits only
+        // full fragments, so markers keep their reserve whatever the headroom.
+        const fullBudget = Math.min(
+            allowance - markerReserve,
             m1PressureHeadroom({
                 independentTokens: args.independentTokens,
                 m0Tokens: args.m0Tokens(),
@@ -3410,41 +3485,58 @@ export function composeSoftMemoryUpdates(args: {
             }),
         );
         for (const fragment of pending) {
-            const header = lines.length === 0 ? headerTokens : 0;
-            const fullCost = header + lineTokens(fragment.lines);
-            if (
-                used + fullCost <= budget &&
-                fullLines + fragment.lines.length <= M1_CORRECTION_RECORD_CAP
-            ) {
-                committed.push({
-                    id: fragment.id,
-                    form: "full",
-                    lines: fragment.lines,
-                    visibleTexts: fragment.visibleTexts,
-                });
-                lines.push(...fragment.lines);
-                used += fullCost;
-                fullLines += fragment.lines.length;
-                continue;
+            if (!overflow) {
+                const fullCost = lineTokens(fragment.lines);
+                if (
+                    usedFull + fullCost <= fullBudget &&
+                    fullLines + fragment.lines.length <= M1_CORRECTION_RECORD_CAP
+                ) {
+                    committed.push({
+                        id: fragment.id,
+                        form: "full",
+                        lines: fragment.lines,
+                        visibleTexts: fragment.visibleTexts,
+                    });
+                    usedFull += fullCost;
+                    fullLines += fragment.lines.length;
+                    continue;
+                }
+                const marker = renderStaleFragmentMarker(fragment);
+                const markerCost = lineTokens([marker]);
+                if (usedMarkers + markerCost <= markerReserve) {
+                    committed.push({
+                        id: fragment.id,
+                        form: "marker",
+                        lines: [marker],
+                        visibleTexts: [],
+                    });
+                    usedMarkers += markerCost;
+                    continue;
+                }
+                overflow = { id: fragment.id, memoryIds: [], count: 0 };
             }
-            const marker = renderStaleFragmentMarker(fragment);
-            const markerCost = header + estimateTokens(`${marker}\n`);
-            if (used + markerCost > budget) {
-                sessionLog(
-                    args.sessionId,
-                    `m[1] memory fragments from #${fragment.id} wait for a later pass: no room even for a stale-memory marker`,
-                );
-                break;
-            }
-            committed.push({ id: fragment.id, form: "marker", lines: [marker], visibleTexts: [] });
-            lines.push(marker);
-            used += markerCost;
+            overflow.id = fragment.id;
+            overflow.memoryIds.push(...fragment.memoryIds);
+            overflow.count += 1;
         }
     }
+    const nextCommitted: CommittedFragment[] = [...committed];
+    if (overflow)
+        nextCommitted.push({
+            id: overflow.id,
+            form: "overflow",
+            lines: [renderMemoryEditOverflowLine(overflow.memoryIds, overflow.count)],
+            visibleTexts: [],
+            overflowIds: overflow.memoryIds,
+            overflowCount: overflow.count,
+        });
     return {
-        block: renderMemoryUpdatesFromLines(lines),
-        projection: { ...args.projection, committed },
-        newFragments: committed.length - args.projection.committed.length,
+        block: renderMemoryUpdatesFromLines([
+            ...hard.updateLines,
+            ...nextCommitted.flatMap((fragment) => fragment.lines),
+        ]),
+        projection: { ...args.projection, committed: nextCommitted },
+        newFragments: nextCommitted.length - args.projection.committed.length,
     };
 }
 
