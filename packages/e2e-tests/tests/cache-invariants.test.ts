@@ -248,7 +248,8 @@ function emitMemoryToolOnce(input: Record<string, unknown>): () => boolean {
             .map((tool) =>
                 tool && typeof tool === "object" ? (tool as { name?: unknown }).name : null,
             )
-            .find((value) => value === "ctx_memory");
+            // Oh My Pi prefixes extension tools with "_".
+            .find((value) => value === "ctx_memory" || value === "_ctx_memory");
         if (typeof name !== "string") return null;
         emitted = true;
         return {
@@ -596,9 +597,9 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
         });
     });
 
-    describe("#given an additive memory write after m[0] materialized (B10 — maxMemoryId is not a HARD trigger)", () => {
-        describe("#when a new memory is added and an execute pass surfaces it", () => {
-            it("#then it rides m[1] <new-memories> and m[0] stays byte-identical (SOFT)", async () => {
+    describe("#given another writer's memory added after m[0] materialized (B10 — stays out until HARD)", () => {
+        describe("#when an execute (SOFT) pass follows the write", () => {
+            it("#then neither m[0] nor m[1] shows it, and the next genuine HARD folds it into m[0]", async () => {
                 //#given — seed a baseline memory, then force m[0] to materialize
                 // WITH that memory in the baseline (early execute pass). This
                 // freezes cachedM0MaxMemoryId at the baseline's id.
@@ -639,33 +640,24 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 const m0Baseline = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body);
                 expect(m0Baseline).toContain("B10 baseline rule");
 
-                //#when — add a NEW memory after the baseline froze, then drive an
-                // execute pass to surface it. The execute DECISION for a turn is
-                // read from the PREVIOUS turn's recorded usage, so turn 4 records
-                // high usage to make turn 5 the cache-busting (execute) pass.
-                // maxMemoryId advances when the new memory is seeded, but it must
-                // NOT re-materialize m[0] (not a HARD trigger); the new memory is
-                // an m[1] delta via the readNewMemoriesForM1 watermark.
+                //#when — another writer (a historian promotion here) adds a memory after
+                // the baseline froze, then an execute pass runs. The execute DECISION for
+                // a turn is read from the PREVIOUS turn's recorded usage, so turn 4
+                // records high usage to make turn 5 the cache-busting (SOFT) pass. A
+                // busting SOFT reads no memory rows: the memory waits for the next HARD.
                 h.mock.setDefault({ text: "B10 pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B10 turn 4: high usage marks the next pass execute.");
+                const firstAfterWrite = mainAgentRequests(h.mock.requests()).length;
                 seedMemory("B10 fresh rule: always run the full gate before a release.");
-                setDefer("B10 surface");
-                await h.sendPrompt(sessionId, "B10 turn 5: execute pass surfaces the new memory.");
+                setDefer("B10 soft");
+                await h.sendPrompt(sessionId, "B10 turn 5: execute pass after another writer's memory.");
 
-                //#then
-                const requests = mainAgentRequests(h.mock.requests());
-                const surfaceReq = requests.find((r) => extractM1(r.body)?.includes("B10 fresh rule"));
-                expect(surfaceReq).toBeDefined();
-                const m1 = extractM1(surfaceReq!.body)!;
-                const m0 = extractM0(surfaceReq!.body)!;
-                // Delta invariant: the new memory rides m[1] <new-memories>.
-                expect(m1).toContain("<new-memories>");
-                expect(m1).toContain("B10 fresh rule");
-                // SOFT invariant: m[0] still holds ONLY the baseline memory; the
-                // new one was NOT folded into the m[0] baseline.
-                expect(m0).toContain("B10 baseline rule");
-                expect(m0).not.toContain("B10 fresh rule");
-                expect(m0).toBe(m0Baseline!);
+                //#then — no pass after the write shows it, and m[0] is byte-identical.
+                let requests = mainAgentRequests(h.mock.requests());
+                for (const request of requests.slice(firstAfterWrite)) {
+                    expect(extractM1(request.body) ?? "").not.toContain("B10 fresh rule");
+                    expect(extractM0(request.body)).toBe(m0Baseline!);
+                }
 
                 // Trailing pure-defer replay pair must be byte-stable.
                 setDefer("B10 replay 1");
@@ -676,17 +668,104 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 const busts = findBusts(replayPair);
                 if (busts.length > 0) {
                     console.error(
-                        `[cache-invariant:B10-additive-memory] ${busts.length} bust(s):\n${formatBustReport(busts)}`,
+                        `[cache-invariant:B10-foreign-memory] ${busts.length} bust(s):\n${formatBustReport(busts)}`,
                     );
                 }
                 expect(busts.length).toBe(0);
+                for (const request of replayPair)
+                    expect(extractM1(request.body) ?? "").not.toContain("B10 fresh rule");
+
+                //#then — a genuine HARD trigger (an epoch bump) folds it into m[0].
+                h.mock.setDefault({ text: "B10 hard-pressure", usage: EXECUTE_USAGE });
+                await h.sendPrompt(sessionId, "B10 turn 8: high usage marks the next pass execute.");
+                bumpProjectEpoch();
+                setDefer("B10 refold");
+                await h.sendPrompt(sessionId, "B10 turn 9: execute pass HARD-refolds m[0].");
+                requests = mainAgentRequests(h.mock.requests());
+                expect(extractM0(requests.at(-1)!.body)).toContain("B10 fresh rule");
             }, 220_000);
         });
     });
 
-    describe("#given a non-additive memory mutation (B11 — supersede-delta)", () => {
-        describe("#when a rendered memory is updated and an execute pass reconciles it", () => {
-            it("#then a <memory-updates> delta rides m[1] and m[0] stays byte-identical (stale-but-frozen)", async () => {
+    describe("#given this session's own agent memory save after m[0] materialized (B10 — agent fragment)", () => {
+        describe("#when an execute (SOFT) pass follows the save", () => {
+            it(
+                RUST_MODE
+                    ? "#then the Rust SOFT does not show it yet (fragments land in S4) and a fresh session's HARD does"
+                    : "#then m[1] shows it as an <added> fragment and m[0] stays byte-identical",
+                async () => {
+                    const sessionId = await h.createSession();
+                    const ownRule = "B10 own rule: name every cache bust in the release notes.";
+                    if (RUST_MODE) {
+                        // The Rust renderer replays served memory blocks and has no agent
+                        // fragments yet (S4), so the agent's save waits for a HARD fold in
+                        // its own session; a fresh session's first render is one.
+                        setDefer("B10 own Rust warm");
+                        await h.sendPrompt(sessionId, "B10 own Rust turn 1: materialize the baseline.");
+                        await runMemoryTool(
+                            sessionId,
+                            { action: "write", category: "PROJECT_RULES", content: ownRule },
+                            "B10 own Rust turn: save the release-notes rule.",
+                        );
+                        setDefer("B10 own Rust after save");
+                        await h.sendPrompt(sessionId, "B10 own Rust turn 2: continue after the save.");
+                        const last = mainAgentRequests(h.mock.requests()).at(-1)!.body;
+                        expect(extractM1(last) ?? "").not.toContain(ownRule);
+                        expect(extractM0(last) ?? "").not.toContain(ownRule);
+                        const readerSessionId = await h.createSession();
+                        h.mock.reset();
+                        setDefer("B10 own Rust reader");
+                        await h.sendPrompt(readerSessionId, "B10 own Rust reader: load project memory.");
+                        expect(extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)).toContain(ownRule);
+                        return;
+                    }
+                    seedMemory("B10 own-write baseline: prefer small, reviewed changes.");
+                    setDefer("B10 own warm 1");
+                    await h.sendPrompt(sessionId, "B10 own turn 1: warmup.");
+                    h.mock.setDefault({ text: "B10 own high", usage: EXECUTE_USAGE });
+                    await h.sendPrompt(sessionId, "B10 own turn 2: high usage marks next pass execute.");
+                    setDefer("B10 own materialize");
+                    await h.sendPrompt(sessionId, "B10 own turn 3: execute pass materializes m[0].");
+                    const m0Baseline = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body);
+                    expect(m0Baseline).toContain("B10 own-write baseline");
+
+                    //#when — the agent itself saves a memory through ctx_memory, then an
+                    // execute pass runs (turn 4 records high usage, turn 5 busts).
+                    await runMemoryTool(
+                        sessionId,
+                        { action: "write", category: "PROJECT_RULES", content: ownRule },
+                        "B10 own turn: save the release-notes rule.",
+                    );
+                    h.mock.setDefault({ text: "B10 own pressure", usage: EXECUTE_USAGE });
+                    await h.sendPrompt(sessionId, "B10 own turn 4: high usage marks the next pass execute.");
+                    setDefer("B10 own soft");
+                    await h.sendPrompt(sessionId, "B10 own turn 5: execute pass after the agent's own save.");
+
+                    const last = mainAgentRequests(h.mock.requests()).at(-1)!.body;
+                    expect(extractM0(last)).toBe(m0Baseline!);
+                    const m1 = extractM1(last) ?? "";
+                    expect(m1).toContain("<memory-updates>");
+                    expect(m1).toMatch(
+                        new RegExp(`<added id="\\d+" category="PROJECT_RULES">${ownRule}</added>`),
+                    );
+
+                    // The fragment replays byte-identically on the defer pair.
+                    setDefer("B10 own replay 1");
+                    await h.sendPrompt(sessionId, "B10 own turn 6: defer replay.");
+                    setDefer("B10 own replay 2");
+                    await h.sendPrompt(sessionId, "B10 own turn 7: defer replay again.");
+                    const replayPair = mainAgentRequests(h.mock.requests()).slice(-2);
+                    expect(findBusts(replayPair).length).toBe(0);
+                    for (const request of replayPair) expect(extractM1(request.body)).toBe(m1);
+                },
+                220_000,
+            );
+        });
+    });
+
+    describe("#given another writer's update to a rendered memory (B11 — stays out until HARD)", () => {
+        describe("#when an execute (SOFT) pass follows the update", () => {
+            it("#then m[1] is unchanged, m[0] keeps the old text, and the next genuine HARD shows the new text", async () => {
                 //#given — seed a memory and materialize m[0] WITH it in the
                 // baseline (so it's a rendered memory the mutation can target).
                 const sessionId = await h.createSession();
@@ -741,35 +820,28 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 setDefer("B11 materialize");
                 await h.sendPrompt(sessionId, "B11 turn 3: execute pass materializes m[0] with the memory.");
 
-                const m0Baseline = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body);
+                const baselineBody = mainAgentRequests(h.mock.requests()).at(-1)!.body;
+                const m0Baseline = extractM0(baselineBody);
+                const m1Baseline = extractM1(baselineBody);
                 expect(m0Baseline).toContain("B11 original rule");
 
-                //#when — a non-additive mutation (update). This queues a
-                // memory_mutation_log row WITHOUT bumping the project epoch, so
-                // m[0] must NOT re-materialize: the stale baseline still shows the
-                // ORIGINAL text, and m[1] carries a <memory-updates> correction.
-                // Turn 4 records high usage so turn 5 is the cache-busting pass.
+                //#when — another writer updates the rendered memory (a mutation-log row
+                // and new row text), then an execute pass runs. A busting SOFT reads
+                // neither memory rows nor the mutation log, so nothing changes until HARD.
                 h.mock.setDefault({ text: "B11 pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B11 turn 4: high usage marks the next pass execute.");
+                const firstAfterUpdate = mainAgentRequests(h.mock.requests()).length;
                 queueMemoryUpdate(memId, "B11 revised rule: deploys go straight to production with a feature flag.");
-                setDefer("B11 reconcile");
-                await h.sendPrompt(sessionId, "B11 turn 5: execute pass renders the memory-updates delta.");
+                setDefer("B11 soft");
+                await h.sendPrompt(sessionId, "B11 turn 5: execute pass after another writer's update.");
 
                 //#then
-                const requests = mainAgentRequests(h.mock.requests());
-                const reconcileReq = requests.find((r) => extractM1(r.body)?.includes("<memory-updates>"));
-                expect(reconcileReq).toBeDefined();
-                const m1 = extractM1(reconcileReq!.body)!;
-                const m0 = extractM0(reconcileReq!.body)!;
-                // Delta invariant: m[1] carries the correction targeting this id.
-                expect(m1).toContain("<memory-updates>");
-                expect(m1).toContain(`<updated id="${memId}">`);
-                expect(m1).toContain("B11 revised rule");
-                // Stale-but-frozen invariant: m[0] is byte-identical and STILL
-                // shows the original text (the mutation did NOT HARD-refold m[0]).
-                expect(m0).toContain("B11 original rule");
-                expect(m0).not.toContain("B11 revised rule");
-                expect(m0).toBe(m0Baseline!);
+                let requests = mainAgentRequests(h.mock.requests());
+                for (const request of requests.slice(firstAfterUpdate)) {
+                    expect(extractM1(request.body)).toBe(m1Baseline);
+                    expect(extractM1(request.body) ?? "").not.toContain("<memory-updates>");
+                    expect(extractM0(request.body)).toBe(m0Baseline!);
+                }
 
                 // Trailing pure-defer replay pair must be byte-stable.
                 setDefer("B11 replay 1");
@@ -780,19 +852,30 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 const busts = findBusts(replayPair);
                 if (busts.length > 0) {
                     console.error(
-                        `[cache-invariant:B11-supersede-delta] ${busts.length} bust(s):\n${formatBustReport(busts)}`,
+                        `[cache-invariant:B11-foreign-update] ${busts.length} bust(s):\n${formatBustReport(busts)}`,
                     );
                 }
                 expect(busts.length).toBe(0);
+
+                //#then — a genuine HARD trigger (an epoch bump) shows the new text.
+                h.mock.setDefault({ text: "B11 hard-pressure", usage: EXECUTE_USAGE });
+                await h.sendPrompt(sessionId, "B11 turn 8: high usage marks the next pass execute.");
+                bumpProjectEpoch();
+                setDefer("B11 refold");
+                await h.sendPrompt(sessionId, "B11 turn 9: execute pass HARD-refolds m[0].");
+                requests = mainAgentRequests(h.mock.requests());
+                const refoldM0 = extractM0(requests.at(-1)!.body)!;
+                expect(refoldM0).toContain("B11 revised rule");
+                expect(refoldM0).not.toContain("B11 original rule");
             }, 220_000);
         });
     });
 
     describe("#given a genuine HARD trigger — project epoch bump (B12 — the fold direction)", () => {
-        describe("#when a memory rode m[1], then the epoch bumps", () => {
-            it("#then m[0] re-materializes folding the delta in, m[1] resets, and defer re-stabilizes", async () => {
-                //#given — get a memory riding m[1] (the B10 setup): materialize an
-                // empty m[0], then add a memory and surface it as an m[1] delta.
+        describe("#when another writer's memory waited out a SOFT, then the epoch bumps", () => {
+            it("#then m[0] re-materializes with the memory, m[1] stays the placeholder, and defer re-stabilizes", async () => {
+                //#given — materialize an empty m[0], add a memory from another writer,
+                // and run an execute (SOFT) pass: the memory stays out of the prompt.
                 const sessionId = await h.createSession();
                 if (RUST_MODE) {
                     const deltaRule =
@@ -832,15 +915,15 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 h.mock.setDefault({ text: "B12 pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B12 turn 4: high usage marks next pass execute.");
                 seedMemory("B12 delta rule: keep the cache prefix byte-identical across defer passes.");
-                setDefer("B12 surface");
-                await h.sendPrompt(sessionId, "B12 turn 5: execute pass surfaces the memory into m[1].");
+                setDefer("B12 soft");
+                await h.sendPrompt(sessionId, "B12 turn 5: execute pass after another writer's memory.");
 
                 let requests = mainAgentRequests(h.mock.requests());
-                const surfaceReq = requests.find((r) => extractM1(r.body)?.includes("B12 delta rule"));
-                expect(surfaceReq).toBeDefined();
-                // Pre-bump: memory is in m[1], NOT in the empty m[0].
-                expect(extractM0(surfaceReq!.body)).toContain("<session-history></session-history>");
-                expect(extractM1(surfaceReq!.body)).toContain("B12 delta rule");
+                const surfaceReq = requests.at(-1)!;
+                // Pre-bump: the memory is neither in the empty m[0] nor in m[1].
+                expect(extractM0(surfaceReq.body)).toContain("<session-history></session-history>");
+                expect(extractM0(surfaceReq.body)).not.toContain("B12 delta rule");
+                expect(extractM1(surfaceReq.body) ?? "").not.toContain("B12 delta rule");
 
                 //#when — a HARD trigger fires (epoch bump = external/dashboard
                 // mutation). Turn 6 records high usage so turn 7 is cache-busting;
@@ -851,12 +934,12 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 setDefer("B12 refold");
                 await h.sendPrompt(sessionId, "B12 turn 7: execute pass HARD-refolds m[0].");
 
-                //#then — the memory has folded INTO the m[0] baseline, and m[1]
-                // reset to the empty placeholder (delta reconciled away).
+                //#then — the memory has folded INTO the m[0] baseline, and m[1] is the
+                // empty placeholder.
                 requests = mainAgentRequests(h.mock.requests());
                 const refoldReq = requests.find(
                     (r, i) =>
-                        i > requests.indexOf(surfaceReq!) &&
+                        i > requests.indexOf(surfaceReq) &&
                         (extractM0(r.body)?.includes("B12 delta rule") ?? false),
                 );
                 expect(refoldReq).toBeDefined();
@@ -864,7 +947,7 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 const m1 = extractM1(refoldReq!.body)!;
                 // Fold invariant: the memory is now in the m[0] baseline...
                 expect(m0).toContain("B12 delta rule");
-                // ...and m[1] reset to the empty placeholder (no <new-memories>).
+                // ...and m[1] is the empty placeholder (no <new-memories>).
                 expect(m1).toContain("(no new content since last materialization)");
                 expect(m1).not.toContain("B12 delta rule");
 
