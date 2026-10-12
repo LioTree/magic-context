@@ -1149,7 +1149,7 @@ export function mustMaterializePi(
 		// fold. Reuse the persisted hash for the cache decision so defer passes do
 		// not synchronously read and fingerprint docs they cannot materialize.
 		meta.cachedM0ProjectDocsHash ?? undefined,
-		// The decision reads no memory or mutation-log head: none of its triggers uses them.
+		// The materialization decision reads no memory or mutation-log head: none of its HARD triggers uses them.
 		false,
 	);
 	const cached = getCachedMarkers(

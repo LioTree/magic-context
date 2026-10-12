@@ -1854,7 +1854,7 @@ export function mustMaterialize(args: {
     // `current.workspaceFingerprint` is resolved inside readCurrentM0SnapshotMarkers
     // (it resolves its own workspace context); the later workspace-identity HARD
     // gate compares it with the cached fingerprint, so no local context is needed.
-    // The decision reads no memory or mutation-log head: none of its triggers uses them.
+    // The materialization decision reads no memory or mutation-log head: none of its HARD triggers uses them.
     const current = readCurrentM0SnapshotMarkers({ ...args, memoryWatermarks: false });
     const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(args.state.cachedM0UpgradeState);
 
@@ -3390,7 +3390,7 @@ export function m1PressureHeadroom(args: {
  * this fixed amount, or half the allowance when the allowance is smaller than twice it.
  */
 export const M1_MARKER_RESERVE_TOKENS = 200;
-/** The aggregate overflow line lists ids up to about this many characters. */
+/** The aggregate overflow line lists memory ids until the list would exceed this many characters. */
 export const M1_OVERFLOW_ID_LIST_CHARS = 120;
 
 /**
