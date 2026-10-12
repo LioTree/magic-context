@@ -1,24 +1,24 @@
-//! The store → m1 delta producer for bust arms, in TWO tiers (the
-//! compose-on-opportunity discipline):
+//! Compose the delta prompt block (m1) beside the frozen baseline (m0).
+//! HARD means an independently required full rebuild; SOFT is an authorized delta
+//! refresh, while a defer replays the stored blocks without composing new bytes.
+//! Permission is decided before the expensive composition work:
 //!
 //!  - [`m1_revision_signal`] is the CHEAP per-pass read: split in-session and external
 //!    fingerprints run EVERY pass to tell the classifier whether work is pending and whether
 //!    a render-config HARD is due, WITHOUT composing the body. In-session changes are allowed
 //!    to remain pending so ordinary turns replay frozen bytes; external workspace changes stay
 //!    eager-HARD.
-//!  - [`compose_m1_from_store`] is the EXPENSIVE bust-only read: it composes the actual m1
-//!    delta body (memory-updates + new-compartments + new-memories) from the store and
-//!    reports whether a newly-published compartment EXTENDS coverage (so the bust must
-//!    advance the boundary anchor). Runs ONLY on a bust opportunity — never on a defer (a
-//!    defer replays the frozen m1 verbatim; re-composing from the now-possibly-mutated store
-//!    on a defer would change bytes on a defer, violating the deferred-work invariant).
-//!  - [`compose_soft_m1`] is what a busting SOFT actually runs. It recomposes compartments
-//!    and the user profile but reads no memory rows and no mutation log: the memory blocks
-//!    of the m1 body the session is serving are replayed byte for byte, so automated
-//!    writers, other sessions and agent edits reach the prompt only at the next HARD fold.
-//!    `compose_m1_from_store`, which renders memory blocks from rows, has no production
-//!    caller any more (a HARD fold resets m1 to the placeholder); it stays as the fold-time
-//!    renderer the byte-parity fixtures pin.
+//!  - [`compose_soft_m1`] recomposes compartments and a pending user-profile delta,
+//!    but replays the served memory blocks without reading canonical memory rows,
+//!    the mutation log or their heads.
+//!  - [`compose_projected_soft_m1`] extends that body on an independently authorized
+//!    SOFT with this session's immutable agent fragments. Those pending lines do not
+//!    authorize a SOFT or HARD, and another session's fragments are not selected.
+//!    Automated and foreign canonical memory changes remain pending until HARD.
+//!  - [`compose_m1_from_store`] is the row-reading comparison renderer retained for
+//!    byte-parity fixtures. It has no production caller; a production HARD captures
+//!    canonical memory into m0 and resets the m1 fragment ledger. A defer never runs
+//!    either composer: it replays the frozen m1 bytes verbatim.
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -369,9 +369,9 @@ fn served_memory_blocks(served: &str) -> (String, String) {
 
 /// The m1 of a busting SOFT. New compartments and a pending user-profile delta render as
 /// in [`compose_m1_from_store`], but the memory blocks are those of `served_m1`, the body
-/// this session is serving now: nothing here loads memory rows or the mutation log. The
-/// Rust renderer does not yet append the session's own agent fragments the way the
-/// OpenCode and Pi renderers do, so agent edits also wait for the next HARD fold here.
+/// this session is serving now: nothing here loads memory rows or the mutation log.
+/// [`compose_projected_soft_m1`] then appends this session's pending immutable agent
+/// fragments to the independently authorized SOFT, subject to its rendering budget.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_soft_m1(
     store: &McStore,

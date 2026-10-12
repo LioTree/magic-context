@@ -2717,8 +2717,10 @@ pub const TABLES: &[TableInventory] = &[
         None
     ),
     // A session's agent memory fragments. Their ids are referenced by the
-    // session's applied snapshot (its fragment watermark and committed list), so a
-    // move keeps them or refuses rather than renumbering.
+    // session's applied snapshot (its fragment watermark and committed list).
+    // Collision refusal for this Context entry must be enforced by the future
+    // agent-move context-half importer: the current module-half installer never
+    // runs this entry. Export preserves ids; it does not enforce destination refusal.
     table!(
         Context,
         "memory_agent_fragments",

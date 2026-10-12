@@ -33827,9 +33827,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    // token and token-additive resolve to scope and additive_scope, the cache keys
-    // served by transform routes 8 and 9. SOFT+ means defer: cached prompt bytes stay
-    // unchanged while the editing session's pre-rendered lines wait for a real SOFT.
+    // The Rust facade commits each agent edit's pre-rendered lines for the editing
+    // session. token and token-additive resolve to the cache keys served by routes 8
+    // and 9. SOFT+ is a defer, not an m1 refresh: an independently authorized SOFT
+    // appends those own-session lines while keeping the m0 baseline unchanged.
     async fn facade_same_session_memory_edits_wait_for_an_independent_soft() {
         let producer = Arc::new(ProducerState::default());
         let project_root = "/repo/cache-project";

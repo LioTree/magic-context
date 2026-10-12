@@ -86,6 +86,66 @@ both sessions replay their complete serialized outputs on the following defer.
 `crates/mc-store/src/move_inventory.rs` records supported store version 69 and
 classifies which data is exported with a session. The tuple is shipped through
 the already-classified, session-owned `mc_cache_state.meta` column; fragment IDs
-are also shipped, preserving their references or refusing collisions. A populated
+are exported unchanged. Their inventory declares collision refusal, but the
+current module-half installer does not import Context entries. A populated
 v68-to-v69 step-through test preserves old cache bytes, persists/reopens the tuple,
 and confirms that a v68-only binary refuses the upgraded store.
+
+## Open integration items
+
+### HARD mural/text source coherence — owner: Rust parity slice S7
+
+The mural/text source-revision check remains open in this Rust projection release.
+A real HARD can currently combine newer canonical text
+with an older host image. An opaque mural `content_hash` does not identify the
+memory revisions that produced the image. The permanent
+`review_hard_requires_mural_revision_coherence` witness stays ignored until S7
+closes this host-manifest gap; it must not be weakened to accept mixed revisions.
+
+The Rust parity slice (S7) must implement this host/Rust wire contract:
+
+1. Whenever an enabled host mural supplies `data_url`, the host must also send
+   `mural.source_manifest`: a versioned **memory source manifest** captured from
+   the same read snapshot and tier
+   selection that rendered that artifact. It binds the reader project and
+   workspace membership, and identifies each source memory by
+   `{project_path, memory_id, revision, content_sha256, cue_sha256}` (the cue hash is
+   nullable). The manifest also binds the effective selection metadata, text/cue
+   tier decision, policy/budgets and frozen expiry clock used for that selection.
+   The host must persist and forward the manifest with its image bytes, not attach
+   current row metadata to an older cached artifact. A compact source-revision
+   token may replace the manifest only if it identifies that exact complete source
+   snapshot; a project epoch, numeric ID watermark or image hash alone cannot.
+2. Before committing or serving a new HARD tuple, Rust must validate the artifact
+   identity and source manifest against the immutable memory source snapshot and
+   tier decision used for that candidate's text. Missing, malformed or mismatched
+   provenance is a source-mismatch refusal, not permission to mix sources.
+3. On a mismatch, Rust rejects the candidate without advancing its cache
+   generation, applied manifest, clocks or fragment watermark, and requests that
+   the host re-render the mural from the agreed source snapshot. It may replay the
+   prior complete tuple only where the existing recovery/privacy policy permits
+   that fallback; a cold request without a safe prior tuple returns a retry/refusal
+   rather than a mixed baseline. The regenerated artifact is validated again
+   before adoption. A concurrent source change requires another capture/validation
+   or safe replay, never a partial text/image commit.
+
+This validation belongs only to an independently authorized HARD. It must not
+create a HARD/SOFT opportunity, refresh flag, epoch bump or image regeneration on
+an ordinary SOFT, defer or byte-identical marker-only commit.
+
+### Context fragment-ID collisions — owner: agent-move campaign
+
+`memory_agent_fragments` uses `PreserveOrRefuseCollision` because the applied
+tuple's watermark and committed list refer to the exported integer IDs. The
+current exporter preserves them and the module move preserves the tuple bytes.
+The future **context-half importer** must enforce the collision policy before
+making a complete move live. This is not an implemented end-to-end refusal
+guarantee in S4, and integer remapping cannot be substituted without rewriting
+every corresponding tuple reference atomically.
+
+`context_fragment_collision_query_detects_foreign_id_without_reserving_or_writing`
+exercises the same inventory-key query used by module preflight against an actual
+destination Context fragment row: a foreign session owning the incoming ID is
+detected as `key_collision`; an unused ID is the positive control. It checks that
+the query writes no row, overwrites no foreign fragment and creates no reservation
+or cache state. This is read-only collision-query coverage, not a context importer.

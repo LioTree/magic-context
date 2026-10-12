@@ -4079,8 +4079,9 @@ fn apply_additive_only(
             let mut additive_meta = meta.clone();
             additive_meta.folded_compartment_seq = m1_signal.max_compartment_seq;
             additive_meta.coverage_ordinal = None;
-            // A busting SOFT replays the memory blocks it is serving and reads no memory
-            // rows or mutation log; memory changes reach the prompt at the next HARD fold.
+            // This already-authorized SOFT replays served memory and appends only this
+            // session's immutable agent fragments. It reads no canonical memory rows or
+            // mutation log; automated and foreign changes still wait for HARD.
             let m1 = compose_projected_soft_m1(
                 store,
                 ctx.project_path,
@@ -6789,13 +6790,13 @@ fn apply_once(
                 // No memory fence: this SOFT renders no memory rows, so a concurrent memory
                 // write cannot make its bytes stale. A pressure refold below sets its own.
                 commit_memory_revision = None;
-                // EXPENSIVE bust-only: compose the m1 delta body from the store against the
-                // watermarks the last HARD froze (incl. the FROZEN expiry cutoff). A
-                // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
-                // the m1 unit stays stable; a new compartment extends coverage → advance the
-                // boundary anchor in this same commit.
-                // The memory blocks replay what this session is serving; nothing here reads
-                // memory rows or the mutation log (see `compose_soft_m1`).
+                // Compose the independent compartment/profile delta and any pending
+                // own-session fragments. A reduction-only SOFT with no other pending
+                // content keeps m1 byte-identical. New compartment coverage advances
+                // the boundary anchor in this same cache commit.
+                // Replay the served memory blocks and append this session's immutable
+                // agent fragments. No canonical memory or mutation-log read is involved
+                // (see `compose_projected_soft_m1`).
                 let m1 = compose_projected_soft_m1(
                     store,
                     ctx.project_path,

@@ -426,7 +426,9 @@ fn review_stale_host_mural_is_frozen_on_soft_but_accepted_at_hard() {
 }
 
 #[test]
-#[ignore = "known host-wire snapshot limitation: this stricter HARD coherence witness is expected to fail"]
+// The host mural has no source revision manifest. S7 must add and validate that
+// wire field before HARD can reject an image rendered from stale memory revisions.
+#[ignore = "S7 host-manifest gap: HARD mural/text source revision coherence is not enforced yet"]
 fn review_hard_requires_mural_revision_coherence() {
     let hard = hard_with_stale_host_mural();
     assert!(!serde_json::to_string(hard.messages()).unwrap().contains(NO_GLYPH_PNG),
