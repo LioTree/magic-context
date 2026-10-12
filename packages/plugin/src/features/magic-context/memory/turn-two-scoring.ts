@@ -52,7 +52,8 @@ function publishedThrough(db: Database, sessionId: string): number {
 
 /**
  * Store the excerpt of every pending item whose save session has been published
- * through S+`EXCERPT_AFTER`, so the item becomes due. The excerpt covers
+ * through S+`EXCERPT_AFTER`, where S is the item's save ordinal (the message
+ * ordinal of the `ctx_memory` save), so the item becomes due. The excerpt covers
  * S-`EXCERPT_BEFORE` through S+`EXCERPT_AFTER` across chunk boundaries, clipped
  * only at the session start and at unreadable ordinals (recorded in
  * `clipping_json`). An item whose save ordinal itself cannot be read stays pending.
@@ -116,7 +117,8 @@ export function promptItems(db: Database, sequences: readonly number[]): TurnTwo
 }
 
 /**
- * Record the scores of a reply for the items that send carried. Recording is a
+ * Record a turn-two reply's scores, only for items whose sequence is in
+ * `sentSequences` (the items that send carried). Recording is a
  * compare-and-swap on the item's state: a score for an item another run already
  * scored is discarded. A recorded score puts importance and the proposed class on
  * the item and copies only the importance onto the memory row. That copy writes no

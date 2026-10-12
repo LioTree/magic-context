@@ -271,9 +271,10 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
     let publishCommitted = false;
     let retainDrainReservationForRetryThrottle = false;
     let issueNotified = false;
-    // On an enabled lane the child that produced the published turn-one reply stays
-    // open for turn two. It is closed in `finally` unless turn two left a stage in
-    // flight, in which case recovery or the child's deletion closes it later.
+    // On an enabled memory-lifecycle lane, the hidden historian child that produced
+    // the published turn-one reply stays open so turn two runs in the same session.
+    // `finally` closes it, unless turn two is still awaiting an outcome (its facts
+    // stay `in_flight`); a later run's recovery or the child's deletion closes it.
     let retainedChild: RetainedHistorianChild | undefined;
     let drainReservation: ReturnType<typeof reserveProtectedTailDrainTokens>["reservation"] = null;
 

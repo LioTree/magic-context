@@ -10,15 +10,19 @@
  *   through the reply, every narrow check and the resolving transaction. While the
  *   outcome is unknown (a crash, a lost reply) it stays, and recovery reattaches the
  *   original stage key and `run_attempt` instead of sending again.
- * - `applied`, `covered`, `decided_pending`: terminal this release.
+ * - `applied` (written through the applier), `covered` (an existing memory already
+ *   says it; only the mapping is kept) and `decided_pending` (left for the read-only
+ *   review list): terminal, never sent again.
  *
  * Outcomes that consume an attempt (`fact_attempts` +1, `decided_pending` once it
  * reaches `MAX_STAGE2_ATTEMPTS`): a stage-2 transport failure, an unparseable,
  * length-capped or schema-invalid envelope (every fact of the send), a check
  * transport failure, an unvalidated reported profile for an edit, a CAS loss, and a
  * carrier that reports on recovery that the send or child no longer exists.
- * Pre-send skips (dormant lane, a carrier that cannot continue the child,
- * `authority_elsewhere`, the backlog limit) consume nothing.
+ * Pre-send skips consume nothing: a dormant lane (one whose carrier has no
+ * provider-enforced response schema), a carrier that cannot continue the child,
+ * `authority_elsewhere` (the Rust module, not this process, owns the project's
+ * memory), and backlog facts beyond `RETRY_BACKLOG_PER_RUN`.
  */
 import type { Database } from "../../../shared/sqlite";
 import {
@@ -68,7 +72,8 @@ export interface TurnTwoStageReply {
     /**
      * The profile the provider reported for this reply (provider, the model id it
      * actually answered with, variant, temperature, and the historian system hash).
-     * Null when the carrier could not tell; edits then defer.
+     * Null when the carrier could not tell; an edit, merge or replacement is
+     * then deferred (`retryable`, one attempt consumed) instead of applied.
      */
     profile: ReportedProfile | null;
     usage?: unknown;
@@ -98,7 +103,9 @@ export interface TurnTwoCheckCarrier {
     /**
      * Reattach a check an earlier run dispatched under `request.key`, without
      * sending it again. Absent when this process cannot reach such a check; the
-     * check then stays dispatched and its fact stays reserved.
+     * check then stays dispatched and the fact it belongs to stays `in_flight` (never
+     * selected for a send) until a run that can reach the check, or the deletion of
+     * the stage's session, resolves it.
      */
     reattachCheck?(request: CheckRequest): Promise<CheckReply>;
 }
@@ -136,18 +143,24 @@ export interface TurnTwoStageRecord {
     baseline: string | null;
 }
 
-/** Reaches the carrier of an earlier stage, or null when this process cannot. */
+/**
+ * Returns a handle on the carrier of an earlier stage, or null when this process
+ * cannot reach that carrier (another carrier kind or harness, or no child id).
+ */
 export type TurnTwoRecoveryResolver = (record: TurnTwoStageRecord) =>
     | (TurnTwoCheckCarrier & {
           reattach(): Promise<TurnTwoReattach>;
-          /** Close the stage's child once nothing of it is in flight any more. */
+          /** Close the stage's hidden child session once none of its facts is in flight. */
           close?(): Promise<void>;
       })
     | null;
 
 export interface TurnTwoRunInput {
     projectPath: string;
-    /** The publication turn one just committed; its facts and this stage's key. */
+    /**
+     * The publication turn one just committed: its `retryable` facts are sent, and its
+     * id is part of this turn-two stage's key.
+     */
     publicationId: string;
     /** The session the historian ran for (the stage record's owner). */
     sessionId: string;
@@ -155,7 +168,10 @@ export interface TurnTwoRunInput {
     carrier: TurnTwoCarrier;
     memoryEnabled: boolean;
     autoPromote: boolean;
-    /** Replay-validated profiles; an edit on any other reported profile defers. */
+    /**
+     * Profiles a recorded replay validated. An edit, merge or replacement whose
+     * reported profile is not among them is deferred (`retryable`, one attempt).
+     */
     validatedProfiles: readonly ReportedProfile[];
     embedQuery?: TurnTwoQueryEmbedder;
     readExcerpt?: TurnTwoExcerptReader;
@@ -167,7 +183,10 @@ export interface TurnTwoRunResult {
     status: "skipped" | "nothing_to_send" | "resolved" | "in_flight" | "failed";
     reason?: string;
     stageKey?: string;
-    /** True while any stage of this run's child is still in flight: keep it open. */
+    /**
+     * True while a fact reserved by this run's stage is still `in_flight`; the caller
+     * must then leave turn one's child session open.
+     */
     childInFlight: boolean;
 }
 
@@ -256,7 +275,12 @@ export function selectTurnTwoFacts(
     return [...current, ...backlog];
 }
 
-/** The decision key: one receipt per (fact, attempt, decision position, targets read). */
+/**
+ * The decision key: (project, fact, `fact_attempts` at send, the decision's position
+ * in the reply, and the target ids with the revisions the decision read). The
+ * resolving transaction records a receipt under it, so recovery never applies the
+ * same decision twice, and a resend after a retry gets a new key.
+ */
 export function turnTwoDecisionKey(
     projectPath: string,
     factId: number,
@@ -554,7 +578,8 @@ async function resolveFact(
             if (!context.autoPromote) {
                 const target = liveTarget(db, fact.project_path, decision.targetId);
                 if (!target) return pending(db, fact, key, "conflict_target");
-                // Nothing is admitted, but the disagreement with N stays recorded.
+                // auto_promote is off: nothing is admitted, but the fact keeps the id of the
+                // memory it disagrees with.
                 return pending(db, fact, key, "auto_promote_disabled", target.memory.id, {
                     conflictWith: target.memory.id,
                 });
@@ -579,9 +604,11 @@ async function resolveFact(
 }
 
 /**
- * `covered by #N`: the fact is retained with its clause mapping and written nowhere
- * else. A recitation (evidence with no user or tool part, or an excerpt that is a
- * current clause of N) and unknown lineage are not coverage.
+ * A `covered` decision (an existing memory N already states the fact): the fact keeps
+ * its mapping to N's clauses and nothing else is written. Coverage needs evidence the
+ * user or a tool produced; a recitation (blocks with no user or tool part, or an
+ * excerpt that is just a current clause of N) or a fact with no stored blocks
+ * (unknown anchor) could be the model repeating memory back, so it stays pending.
  */
 function resolveCovered(
     db: Database,
@@ -654,8 +681,9 @@ async function resolveRevision(
         evidence: { blockStartOrdinal: clause.block, excerpt: clause.excerpt },
     }));
     // The decision names its kept clauses; they must be exactly the clauses it does
-    // not change, read at the revisions it cites. A stale source is left to the
-    // applier, which reports it as a CAS loss.
+    // not change, read at the revisions it cites. When a source revision changed
+    // since, this comparison is skipped: the applier detects the stale revision and
+    // retries the fact as a compare-and-swap loss.
     const current = expectedSources.map((source) => liveTarget(db, fact.project_path, source.id));
     if (
         current.every(
@@ -783,7 +811,8 @@ export async function recoverTurnTwoStages(
         const done = await resolveStage(db, record.stageKey, {
             memoryEnabled: input.memoryEnabled,
             autoPromote: input.autoPromote,
-            // A reply was only ever recorded on an enabled lane.
+            // A reply is only recorded by a run on an enabled lane, which requires a
+            // provider-enforced response schema.
             enforcedJson: true,
             validatedProfiles: input.validatedProfiles,
             checks: carrier ?? {
@@ -811,8 +840,9 @@ export async function runTurnTwo(db: Database, input: TurnTwoRunInput): Promise<
     if (input.lane !== "enabled" || !input.carrier.enforcedJson) return skip("lane_dormant");
     if (!input.memoryEnabled) return skip("memory_disabled");
     if (!tsOwnsMemory(db, input.projectPath)) {
-        // The module owns this project's memory: no provider call, and the
-        // candidates wait as backlog for a turn two run under that authority.
+        // The Rust module owns this project's memory, so this process may not apply
+        // anything: no provider call, and the candidates wait as backlog for a turn
+        // two run by the module.
         db.prepare(
             "UPDATE memory_pending_facts SET reason='authority_elsewhere' WHERE project_path=? AND publication_id=? AND state='retryable'",
         ).run(input.projectPath, input.publicationId);

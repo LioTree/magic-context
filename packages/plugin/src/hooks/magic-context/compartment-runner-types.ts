@@ -202,8 +202,10 @@ export interface CompartmentRunnerDeps<
      */
     memoryLifecycleLane?: TurnOneLane;
     /**
-     * Replay-validated historian and check profiles for turn two. None exist yet, so
-     * on an enabled lane every edit, merge and replacement defers; tests supply them.
+     * Historian and check model profiles (`ReportedProfile`) that a recorded replay
+     * validated for turn two. None is validated yet, so on an enabled lane every
+     * edit, merge and replacement is deferred (retried, then left pending) rather
+     * than applied; tests pass profiles here to exercise those paths.
      */
     memoryLifecycleValidatedProfiles?: readonly import("../../features/magic-context/memory/lifecycle-gates").ReportedProfile[];
     /** Overrides the turn-two neighbour embedder (tests). */

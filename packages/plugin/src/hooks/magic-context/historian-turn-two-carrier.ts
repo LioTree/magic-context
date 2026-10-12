@@ -1,5 +1,6 @@
 /**
- * The OpenCode (1 and 2) carrier for historian turn two: it continues the retained
+ * The carrier for historian turn two on OpenCode 1 and OpenCode 2 hosts (both run the
+ * historian through a `HiddenCompletionExecutor`): it continues the retained
  * turn-one child with a second prompt on the same session id, and sends each narrow
  * check as a fresh single-turn child of its own.
  *
@@ -89,7 +90,10 @@ function parseCheckVerdicts(text: string | null): CheckReply["verdicts"] {
     return parsed.verdicts as CheckReply["verdicts"];
 }
 
-/** The check input as the provider sees it: operands by identity, then the input. */
+/**
+ * The check prompt: an `Operands:` section listing each operand (or, for a
+ * compatibility check, each A/B pair) under its identity, then the `Input:` text.
+ */
 export function renderCheckInput(request: CheckRequest): string {
     const operands =
         request.kind === "compatibility"
@@ -185,7 +189,8 @@ async function sendCheck(
             }),
             timeoutMs,
         ).catch((error) => {
-            // A check timing out is a known check failure: it is retried later.
+            // A timed-out check is a known check transport failure (the fact is retried
+            // with one attempt consumed), not an unknown outcome that keeps it reserved.
             if (error instanceof TurnTwoOutcomeUnknownError) throw new Error("check timed out");
             throw error;
         });
@@ -197,7 +202,9 @@ async function sendCheck(
         try {
             verdicts = parseCheckVerdicts(completion.text);
         } catch {
-            // Malformed check output is a refusal, not a transport failure.
+            // Unparseable check output becomes an empty verdict list, which the gates
+            // treat as a malformed verdict (the decision is refused), not a transport
+            // failure (which would retry it).
             verdicts = [];
         }
         return { verdicts, profile, usage: completion.usage };
@@ -253,8 +260,9 @@ export function createOpenCodeTurnTwoRecovery(args: {
                     },
                 };
             },
-            // A check session of an earlier process cannot be found again, so the
-            // check counts as a known transport failure and its fact is retried.
+            // A check child opened by an earlier process cannot be found again.
+            // Rejecting makes the gates treat the check as a transport failure, so
+            // the fact it belongs to is retried rather than left reserved forever.
             reattachCheck: () => Promise.reject(new Error("check session is not recoverable")),
             check: () => Promise.reject(new Error("recovered stage cannot open checks")),
             async close() {

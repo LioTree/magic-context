@@ -20,7 +20,8 @@ export const TURN_TWO_ACTIONS = [
     "merge",
     "replaces",
     "abstain",
-    // Approval-gated operations this release: recorded as pending, never applied.
+    // Operations that need a human approval no review-list action can give yet: they are
+    // recorded as `decided_pending` and never applied automatically.
     "retire",
     "promote_rule",
 ] as const;
@@ -263,7 +264,10 @@ export interface TurnTwoPromptFact {
     content: string;
     sourceSessionId: string;
     anchorKnown: boolean;
-    /** True for a fact carried over from an earlier publication. */
+    /**
+     * True for a fact of an earlier historian publication (an earlier committed turn
+     * one) that is still `retryable`, sent again as backlog.
+     */
     backlog: boolean;
     blocks: TurnTwoPromptBlock[];
     neighbours: TurnTwoPromptNeighbour[];

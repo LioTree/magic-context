@@ -273,7 +273,8 @@ describe("memory lifecycle applier", () => {
                 ),
             ).toEqual({ ok: true });
             expect(calls).toBe(4);
-            // The checks are answered from the ledger: no canonical write yet.
+            // The four check calls are recorded only in memory_check_attempts; no memory row or
+            // history row is written until applyHistorianRevision commits the edit.
             expect(db.prepare("SELECT * FROM memories").all()).toEqual(before);
             expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({ n: 0 });
             const receipt = await applyHistorianRevision(

@@ -54,7 +54,10 @@ export interface ApplierReceipt {
     inserted?: boolean;
     adoptionClass: AdoptionClass;
     supersededIds?: number[];
-    /** The profile the provider reported, when a profile gate deferred the decision. */
+    /**
+     * The model profile the provider reported, recorded when the decision was deferred
+     * because that profile (or one of its checks) is not a replay-validated one.
+     */
     reportedProfile?: ReportedProfile;
 }
 export interface AdmissionRequest {
