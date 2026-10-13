@@ -482,8 +482,17 @@ async fn missing_cached_m1_repair_cannot_be_skipped() {
         .unwrap();
     // Bypass only the predicate, preserving all host engine inputs. A predicate
     // table made from can_skip_engine's own booleans cannot catch this omission.
-    let repaired =
-        execute_host(&s, &work, &c, &mut setup, &normalized, &lineage, "repair").unwrap();
+    let repaired = execute_host(
+        &s,
+        &work,
+        &c,
+        &mut setup,
+        &normalized,
+        &lineage,
+        "repair",
+        None,
+    )
+    .unwrap();
     assert!(
         repaired.is_some(),
         "the real engine must produce its missing-m1 repair"
@@ -566,9 +575,17 @@ async fn pressure_flush_model_and_cold_match_the_real_engine_with_queued_drops_a
                     .load_provider_lineage(&ok.store_key(), "L")
                     .unwrap()
                     .unwrap();
-                let expected =
-                    execute_host(&os, &work, &c, &mut setup, &normalized, &lineage, "oracle")
-                        .unwrap();
+                let expected = execute_host(
+                    &os,
+                    &work,
+                    &c,
+                    &mut setup,
+                    &normalized,
+                    &lineage,
+                    "oracle",
+                    None,
+                )
+                .unwrap();
                 assert_eq!(
                     actual["answer"],
                     if expected.is_some() {

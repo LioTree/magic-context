@@ -339,3 +339,141 @@ async fn cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes
         );
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_geometry_reserve_and_continuation_reach_the_real_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    setup(&h).await;
+    transform::compaction::LAST_NATIVE_REQUEST.with(|slot| slot.borrow_mut().take());
+    let mut status = step(r#"{"role":"user","content":"native text"}"#);
+    status["geometry"] = json!({"usable_soft":50000,"usable_hard":60000,"absolute_wall":100000,"derivation":"gateway"});
+    status["output_reserve"] = json!(40000);
+    status["mid_turn"] = json!(true);
+    let answer = response(call(&h, "compaction.step", status).await);
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+    let (profile, geometry, mid_turn) = transform::compaction::LAST_NATIVE_REQUEST
+        .with(|slot| slot.borrow_mut().take())
+        .expect("actual engine call");
+    assert_eq!(profile, "claude-code-anthropic");
+    assert_eq!(
+        geometry,
+        Some(transform::TransformGeometry {
+            usable_soft: 50000,
+            usable_hard: 60000,
+            absolute_wall: 100000,
+            derivation: "gateway".into()
+        })
+    );
+    assert!(mid_turn);
+}
+
+#[tokio::test]
+async fn cc_invalid_geometry_and_unsupported_evidence_refuse_before_ingest() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    setup(&h).await;
+    let base = step(r#"{"role":"user","content":"native text"}"#);
+    for (field, extra) in [
+        (
+            "geometry",
+            json!({"geometry":{"usable_soft":0,"usable_hard":60000,"absolute_wall":100000,"derivation":"gateway"}}),
+        ),
+        (
+            "geometry",
+            json!({"geometry":{"usable_soft":50000,"usable_hard":90000,"absolute_wall":100000,"derivation":"gateway"},"output_reserve":20000}),
+        ),
+        ("geometry", json!({"output_reserve":1})),
+        (
+            "fill",
+            json!({"fill":{"input_tokens":1,"basis":"measured","observed_request_id":"unadmitted"}}),
+        ),
+        (
+            "channel2_receipt",
+            json!({"channel2_delivered_id":"unsupported"}),
+        ),
+    ] {
+        let mut status = base.clone();
+        status
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert!(
+            matches!(call(&h,"compaction.step",status).await,HandlerOutcome::ErrorWithDetail { code,detail,.. } if code=="invalid_params" && detail["field"]==field)
+        );
+    }
+    let key = Key::new(&binding(dir.path(), thalamus()), "cc", "claude-code").unwrap();
+    assert!(h
+        .store
+        .get()
+        .unwrap()
+        .load_provider_messages(&key.store_key(), "L")
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn cc_partial_engine_boundary_refuses_instead_of_snapping_whole_message() {
+    for (part, expected) in [(0, "refuse"), (1, "compaction_message")] {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        setup(&h).await;
+        let mut status = step(
+            r#"{"role":"user","content":[{"type":"text","text":"covered"},{"type":"text","text":"must remain"}]}"#,
+        );
+        status["messages"].as_array_mut().unwrap().push(json!({"mid":"tail","ordinal":1,"message":{"role":"user","content":"live tail"},"raw_message":r#"{"role":"user","content":"live tail"}"#}));
+        status["newest"] = json!({"mid":"tail","ordinal":1});
+        status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+        let first = response(call(&h, "compaction.step", status.clone()).await);
+        let key = Key::new(&binding(dir.path(), thalamus()), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        store
+            .replace_compartments(
+                &key.engine_key(),
+                &[mc_store::StoredCompartment {
+                    sequence: 1,
+                    start_message: 0,
+                    end_message: 0,
+                    end_message_id: format!("m#{part}"),
+                    title: "history".into(),
+                    content: "summary".into(),
+                    p1: Some("summary".into()),
+                    importance: 50,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        status["request_id"] = json!("cold");
+        status["prefix_rebuilding"] = json!({"reason":"expired_cache"});
+        if first["answer"] == "compaction_message" {
+            status["last_applied"] = json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
+        }
+        let answer = response(call(&h, "compaction.step", status).await);
+        assert_eq!(answer["answer"], expected);
+        if part == 0 {
+            assert_eq!(answer["provider_code"], "native_endpoint_unrepresentable");
+        } else {
+            assert_eq!(
+                answer["coverage"]["endpoint"],
+                json!({"message_id":"m","part_index":1})
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cc_original_inbound_envelope_size_is_checked_before_normalized_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    let request =
+        json!({"method":"compaction.step","params":step(r#"{"role":"user","content":"small"}"#)});
+    let result = h
+        .dispatch_value_with_inbound_bytes(7, request, Some(HOST_ENVELOPE_BYTES))
+        .await;
+    assert!(
+        matches!(result,HandlerOutcome::ErrorWithDetail { code,detail,.. } if code=="invalid_params" && detail["field"]=="messages")
+    );
+}

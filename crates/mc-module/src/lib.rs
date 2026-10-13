@@ -14832,6 +14832,18 @@ impl McHandler {
             .get("method")
             .and_then(Value::as_str)
             .or_else(|| request.get("kind").and_then(Value::as_str));
+        let provider_operation = if method == Some("tools/call") {
+            request.pointer("/params/name").and_then(Value::as_str)
+        } else {
+            method.or_else(|| request.get("name").and_then(Value::as_str))
+        };
+        if let Ok(binding) = self.facade_binding(channel) {
+            if let Some(refusal) =
+                providers::inbound_ceiling(&binding, provider_operation, inbound_bytes)
+            {
+                return refusal;
+            }
+        }
         let catalog_request = method.is_none()
             && request.get("name").and_then(Value::as_str) == Some("tool.catalog")
             && request.get("arguments").is_some();

@@ -99,6 +99,8 @@ struct HostView {
 struct HostCoverage {
     end_mid: String,
     ordinal: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<compact::view::NativeEndpoint>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -566,6 +568,7 @@ fn execute_host(
     status: &transform::compaction::Status,
     lineage: &ProviderLineage,
     request_id: &str,
+    native_status: Option<&compact::status::StepStatus>,
 ) -> Result<Option<HostView>, HandlerOutcome> {
     let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
     let messages = non_tag_messages(store, &work.key, lineage)?;
@@ -574,6 +577,21 @@ fn execute_host(
         "render_config":serde_json::to_string(&setup.setup.request.params).map_err(transient)?,
         "model_key":setup.setup.request.model,"messages":[],"tool_present":true,"auto_search_enabled":false}))?;
     codec.prepare_request(&mut template, &messages)?;
+    if codec == Codec::ClaudeCodeAnthropic {
+        if let Some(native_status) = native_status {
+            template.geometry =
+                native_status
+                    .geometry
+                    .as_ref()
+                    .map(|geometry| transform::TransformGeometry {
+                        usable_soft: geometry.usable_soft,
+                        usable_hard: geometry.usable_hard,
+                        absolute_wall: geometry.absolute_wall,
+                        derivation: geometry.derivation.clone(),
+                    });
+            template.mid_turn = native_status.mid_turn.unwrap_or(false);
+        }
+    }
     let meta = store
         .load_meta(&conversation.engine_namespace)
         .map_err(transient)?
@@ -687,13 +705,18 @@ fn execute_host(
     let transform::compaction::Answer::Replacement(engine) = output.answer else {
         return Ok(None);
     };
-    let (wire, coverage, raw_replacement, head_slots) = if let Some(previous) =
+    let (wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) =
         previous.filter(|p| {
             status
                 .last_not_applied
                 .is_some_and(|n| !n.structural && n.version == p.engine.version)
                 && p.engine.replacement == engine.replacement
                 && p.engine.range == engine.range
+                && coverage_replay_matches(
+                    codec,
+                    p.coverage.as_ref().map(|coverage| coverage.ordinal),
+                    output.engine.response.coverage_ordinal,
+                )
         }) {
         let mut wire = previous.wire;
         wire.version = engine.version;
@@ -728,6 +751,7 @@ fn execute_host(
                 .map(|m| HostCoverage {
                     end_mid: m.mid.clone(),
                     ordinal,
+                    endpoint: None,
                 })
         });
         let head_slots = raw_replacement
@@ -735,6 +759,33 @@ fn execute_host(
             .map(|raw| super::cache_policy::head_slots(&engine, raw, setup.setup.state.preset));
         (wire, coverage, raw_replacement, head_slots)
     };
+    if codec == Codec::ClaudeCodeAnthropic {
+        if output.engine.response.coverage_ordinal.is_some() && coverage.is_none() {
+            return Err(error(
+                "native_endpoint_unrepresentable",
+                "covered native message is missing",
+            ));
+        }
+        if let Some(coverage) = &mut coverage {
+            let message = messages
+                .iter()
+                .find(|m| m.mid == coverage.end_mid && m.ordinal == coverage.ordinal)
+                .ok_or_else(|| {
+                    error(
+                        "native_endpoint_unrepresentable",
+                        "covered native message is missing",
+                    )
+                })?;
+            let boundary = store
+                .load(&conversation.engine_namespace)
+                .map_err(transient)?
+                .core
+                .boundary_id;
+            coverage.endpoint = Some(super::codec_claude_code::whole_message_endpoint(
+                message, &boundary,
+            )?);
+        }
+    }
     Ok(Some(HostView {
         engine,
         wire,
@@ -1108,11 +1159,15 @@ impl McHandler {
         params: &Value,
         request: compact::status::StepStatus,
     ) -> Result<Vec<u8>, HandlerOutcome> {
-        if serde_json::to_vec(&json!({"method":"compaction.step","params":params}))
-            .map_err(transient)?
-            .len()
-            > 3 * 1024 * 1024
-        {
+        let envelope_bytes =
+            serde_json::to_vec(&json!({"method":"compaction.step","params":params}))
+                .map_err(transient)?
+                .len();
+        if if attested_claude_code(&work.binding) {
+            envelope_bytes >= HOST_ENVELOPE_BYTES
+        } else {
+            envelope_bytes > HOST_ENVELOPE_BYTES
+        } {
             return Err(invalid_field("messages"));
         }
         let mut setup: HostSetup =
@@ -1121,6 +1176,34 @@ impl McHandler {
             })?)
             .map_err(transient)?;
         let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
+        if codec == Codec::ClaudeCodeAnthropic {
+            if let Some(geometry) = &request.geometry {
+                if !geometry.is_valid(request.context_window)
+                    || request.output_reserve.is_some_and(|reserve| {
+                        geometry
+                            .usable_hard
+                            .checked_add(reserve)
+                            .is_none_or(|reserved| reserved > geometry.absolute_wall)
+                    })
+                {
+                    return Err(invalid_field("geometry"));
+                }
+            } else if request.output_reserve.is_some() {
+                return Err(invalid_field("geometry"));
+            }
+            if request.fill.is_some() {
+                return Err(invalid_field("fill"));
+            }
+            if request.channel2_receipt.is_some() || request.channel2_delivered_id.is_some() {
+                return Err(invalid_field("channel2_receipt"));
+            }
+            if request.messages.iter().any(|message| {
+                serde_json::to_vec(message)
+                    .map_or(true, |bytes| bytes.len() > HOST_ENVELOPE_BYTES - 1)
+            }) {
+                return Err(invalid_field("messages"));
+            }
+        }
         let lineage = host_lineage(store, &work.key, params, &request)?;
         // An acknowledgement names a frozen object, not just a sequence number.
         // Validate both components before admission can promote or burn anything.
@@ -1383,14 +1466,15 @@ impl McHandler {
                     .is_some_and(|v| v.version == n.version)
                     && setup.applied.as_ref().is_none_or(|v| v.version < n.version)
             });
-            let skip = can_skip_host_step(
-                store,
-                work,
-                &conversation.engine_namespace,
-                &request.model,
-                &normalized,
-                relevant,
-            )?;
+            let skip = !(codec == Codec::ClaudeCodeAnthropic && request.geometry.is_some())
+                && can_skip_host_step(
+                    store,
+                    work,
+                    &conversation.engine_namespace,
+                    &request.model,
+                    &normalized,
+                    relevant,
+                )?;
             if skip {
                 json!({"answer":"noop","request_id":request.request_id})
             } else {
@@ -1409,12 +1493,15 @@ impl McHandler {
                     &normalized,
                     &lineage,
                     &request.request_id,
+                    Some(&request),
                 ) {
                     Err(HandlerOutcome::Error { code, message })
                         if codec == Codec::ClaudeCodeAnthropic
                             && matches!(
                                 code.as_str(),
-                                "signed_prefix_edit" | "invalid_signed_tool_boundary"
+                                "signed_prefix_edit"
+                                    | "invalid_signed_tool_boundary"
+                                    | "native_endpoint_unrepresentable"
                             ) =>
                     {
                         return bytes(
@@ -3620,5 +3707,38 @@ mod terminal_refusal_tests {
         assert!(
             matches!(claude_code_engine_failure(transform::TransformError::AssistantTerminalRetry,"r"),HandlerOutcome::Error { code,.. } if code=="transient")
         );
+    }
+}
+
+fn coverage_replay_matches(codec: Codec, previous: Option<u64>, current: Option<u64>) -> bool {
+    codec != Codec::ClaudeCodeAnthropic || previous == current
+}
+
+#[cfg(test)]
+mod native_replay_tests {
+    use super::*;
+    #[test]
+    fn native_coverage_replay_requires_the_current_boundary_ordinal() {
+        assert!(!coverage_replay_matches(
+            Codec::ClaudeCodeAnthropic,
+            Some(2),
+            None
+        ));
+        assert!(!coverage_replay_matches(
+            Codec::ClaudeCodeAnthropic,
+            Some(2),
+            Some(3)
+        ));
+        assert!(coverage_replay_matches(
+            Codec::ClaudeCodeAnthropic,
+            Some(2),
+            Some(2)
+        ));
+        assert!(coverage_replay_matches(
+            Codec::ClaudeCodeAnthropic,
+            None,
+            None
+        ));
+        assert!(coverage_replay_matches(Codec::OpencodeAiSdk, Some(2), None));
     }
 }

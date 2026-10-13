@@ -285,7 +285,7 @@ impl McHandler {
         if serde_json::to_vec(&json!({"method":"transform.hook","params":params}))
             .map_err(invalid)?
             .len()
-            > 3 * 1024 * 1024
+            >= HOST_ENVELOPE_BYTES
         {
             return Err(invalid_field("message", "host hook exceeds 3 MiB"));
         }
@@ -309,6 +309,12 @@ impl McHandler {
             .as_ref()
             .ok_or_else(|| invalid_field("message", "CC hooks require a message"))?;
         let message = super::codec_claude_code::from_wire(native, call.raw_message.as_deref())?;
+        if serde_json::to_vec(&message).map_err(invalid)?.len() > HOST_ENVELOPE_BYTES - 1 {
+            return Err(invalid_field(
+                "message",
+                "native message exceeds the single-message ceiling",
+            ));
+        }
         let part = checked_part(fields.subject_part.as_deref())?;
         let hook = call.subject.hook();
         let hook_name = match hook {
@@ -794,7 +800,7 @@ impl McHandler {
         if serde_json::to_vec(&json!({"method":"transform.hook","params":params}))
             .map_err(invalid)?
             .len()
-            > 3 * 1024 * 1024
+            > HOST_ENVELOPE_BYTES
         {
             return Err(invalid_field("message", "host hook exceeds 3 MiB"));
         }

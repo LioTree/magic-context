@@ -3,6 +3,7 @@
 //! response completion times, so it alone detects expiry and requests a rebuild.
 use super::*;
 use crate::config::CacheTtlProvenance;
+pub(super) const REVISION: u64 = 1;
 
 pub(super) fn resolve(
     binding: &SessionBinding,
@@ -42,7 +43,7 @@ pub(super) fn resolve(
         resolved.value
     };
     Ok(
-        json!({"revision":1,"marker_ttl":marker,"assumed_lifetime":assumed,
+        json!({"revision":REVISION,"marker_ttl":marker,"assumed_lifetime":assumed,
         "provenance":match resolved.provenance { CacheTtlProvenance::Default=>"default", CacheTtlProvenance::ConfiguredDefault=>"configured_default", CacheTtlProvenance::Explicit=>"explicit" },
         "expiry_owner":"runner"}),
     )

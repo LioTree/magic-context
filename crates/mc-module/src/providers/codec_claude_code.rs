@@ -7,6 +7,14 @@ use std::ops::Range;
 
 const EXTRAS: &str = "mc-claude-code";
 
+// Proposed revisions of the first native codec and raw JSON envelope formats.
+// Only the test-only candidate uses them: live calls do not yet negotiate or
+// freeze these revisions through the Claude Code capability selection.
+#[cfg(test)]
+pub(super) const CODEC_FORMAT_EPOCH: u64 = 1;
+#[cfg(test)]
+pub(super) const RAW_PROVENANCE_FORMAT_EPOCH: u64 = 1;
+
 fn invalid_raw(reason: &str) -> HandlerOutcome {
     HandlerOutcome::ErrorWithDetail {
         code: "invalid_params".into(),
@@ -441,6 +449,41 @@ fn same_identity_prefix(
             .all(|(output, input)| output.as_ref() == Some(input))
 }
 
+pub(super) fn whole_message_endpoint(
+    entry: &compact::status::StatusMessage,
+    boundary: &str,
+) -> Result<compact::view::NativeEndpoint, HandlerOutcome> {
+    let native = envelope(&entry.message["message"], entry.message.get("raw_message"))?;
+    let content = &native["message"]["content"];
+    let part = if content.is_string() {
+        Some(0)
+    } else {
+        content
+            .as_array()
+            .and_then(|blocks| blocks.len().checked_sub(1))
+    };
+    let part = part
+        .and_then(|part| u64::try_from(part).ok())
+        .ok_or_else(|| {
+            error(
+                "native_endpoint_unrepresentable",
+                "native message has no representable final part",
+            )
+        })?;
+    // Whole-message-only cuts must end at the actual final original block.
+    // An earlier engine boundary cannot be snapped forward over retained data.
+    if boundary != format!("{}#{part}", entry.mid) {
+        return Err(error(
+            "native_endpoint_unrepresentable",
+            "coverage does not end at a whole native message boundary",
+        ));
+    }
+    Ok(compact::view::NativeEndpoint {
+        message_id: entry.mid.clone(),
+        part_index: part,
+    })
+}
+
 pub(super) fn encode_view(
     view: &transform::compaction::View,
     request: &TransformRequest,
@@ -602,6 +645,13 @@ pub(super) fn answer_bytes(answer: &Value, raw: &[String]) -> Result<Vec<u8>, Ha
     }
     let mut output = String::new();
     write(answer, raw, &mut output)?;
+    if output.len() >= HOST_ENVELOPE_BYTES {
+        return Err(HandlerOutcome::ErrorWithDetail {
+            code: "invalid_params".into(),
+            message: "native replacement exceeds the inline reply ceiling".into(),
+            detail: json!({"field":"raw_view"}),
+        });
+    }
     Ok(output.into_bytes())
 }
 
@@ -732,6 +782,18 @@ mod tests {
         assert_eq!(
             render(&decode_message(&entry(unknown, 0)).unwrap().ck).unwrap(),
             unknown
+        );
+    }
+
+    #[test]
+    fn oversized_inline_reply_is_named_refusal_not_unbounded_bytes() {
+        let raw = serde_json::to_string(
+            &json!({"role":"user","content":"x".repeat(HOST_ENVELOPE_BYTES)}),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            matches!(answer_bytes(&json!({"replacement":[parsed]}),&[raw]),Err(HandlerOutcome::ErrorWithDetail { code,detail,.. }) if code=="invalid_params" && detail["field"]=="raw_view")
         );
     }
 

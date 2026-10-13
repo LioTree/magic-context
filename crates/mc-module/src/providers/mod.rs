@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod cache_policy;
 #[cfg(test)]
+mod capability_candidate;
+#[cfg(test)]
 #[path = "../../../../docs/reports/cc-step-lane-witnesses.rs"]
 mod cc_step_lane_review;
 #[cfg(test)]
@@ -31,6 +33,28 @@ pub(crate) use records::{Catalog, Storage};
 use step_transform::declaration;
 
 pub const HOOK_BUDGET_MS: u64 = 1_500;
+const HOST_ENVELOPE_BYTES: usize = hooks::hook::DEFAULT_HOOK_CAP_BYTES;
+const CLAUDE_CODE_HARNESS: &str = "claude-code";
+const CLAUDE_CODE_MODULE: &str = "thalamus";
+
+pub(crate) fn inbound_ceiling(
+    binding: &SessionBinding,
+    operation: Option<&str>,
+    bytes: Option<usize>,
+) -> Option<HandlerOutcome> {
+    if attested_claude_code(binding) && bytes.is_some_and(|bytes| bytes >= HOST_ENVELOPE_BYTES) {
+        let field = match operation {
+            Some("compaction.step") => "messages",
+            Some("transform.hook") => "message",
+            _ => return None,
+        };
+        return Some(invalid_field(
+            field,
+            "native request exceeds the encoded envelope ceiling",
+        ));
+    }
+    None
+}
 
 pub fn runner_groups() -> [&'static str; 1] {
     ["transcript_reads"]
@@ -82,9 +106,9 @@ fn answer_observation(params: &Value) -> bool {
 }
 
 fn attested_claude_code(binding: &SessionBinding) -> bool {
-    binding.harness == "claude-code"
+    binding.harness == CLAUDE_CODE_HARNESS
         && matches!(&binding.principal,
-        Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "thalamus")
+        Some(subc_protocol::Principal::Reserved { module_id }) if module_id == CLAUDE_CODE_MODULE)
 }
 
 fn host_binding(binding: &SessionBinding) -> bool {
@@ -99,18 +123,32 @@ fn admit_claude_code(
     method: &str,
     params: &Value,
 ) -> Result<(), HandlerOutcome> {
-    let thalamus = matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "thalamus");
+    // Claude Code capability selection is not offered yet. Reject a supplied
+    // bundle by name instead of ignoring it and running the existing codec path
+    // that checks only caller identity, serializer profile and observation mode.
+    if params
+        .get("claude_code")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(invalid_field(
+            "claude_code",
+            "native capability publication is held",
+        ));
+    }
+    let thalamus = matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == CLAUDE_CODE_MODULE);
     let profile = params
         .pointer("/params/serializer_profile")
         .and_then(Value::as_str);
-    if (profile == Some("claude-code-anthropic") || binding.harness == "claude-code") && !thalamus {
+    if (profile == Some("claude-code-anthropic") || binding.harness == CLAUDE_CODE_HARNESS)
+        && !thalamus
+    {
         return Err(error(
             "claude_code_lane_requires_attested_host",
             "Claude Code provider lane requires reserved:thalamus",
         ));
     }
     if thalamus
-        && (binding.harness != "claude-code"
+        && (binding.harness != CLAUDE_CODE_HARNESS
             || profile.is_some_and(|p| p != "claude-code-anthropic")
             || (matches!(method, "transform.declare" | "compaction.setup")
                 && profile != Some("claude-code-anthropic")))
