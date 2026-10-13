@@ -136,10 +136,22 @@ fn admit_claude_code(
         .get("claude_code")
         .is_some_and(|value| !value.is_null())
     {
+        #[cfg(not(feature = "advertise-claude-code-candidate"))]
         return Err(invalid_field(
             "claude_code",
             "native capability publication is held",
         ));
+
+        #[cfg(feature = "advertise-claude-code-candidate")]
+        if params["claude_code"]
+            != serde_json::to_value(&*capability_candidate::CANDIDATE)
+                .expect("candidate is serializable")
+        {
+            return Err(invalid_field(
+                "claude_code",
+                "selection does not match the advertised candidate",
+            ));
+        }
     }
     let thalamus = matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == CLAUDE_CODE_MODULE);
     let profile = params
@@ -181,6 +193,26 @@ pub fn describe() -> HandlerOutcome {
     );
     answer["runner_groups"] = json!(runner_groups());
     HandlerOutcome::Response(serde_jcs::to_vec(&answer).expect("build-only role JSON"))
+}
+
+/// Return provider discovery data and add the pinned Claude Code attachment bundle only when
+/// the default-off `advertise-claude-code-candidate` feature is enabled.
+pub fn describe_for_discovery() -> HandlerOutcome {
+    let described = describe();
+    #[cfg(not(feature = "advertise-claude-code-candidate"))]
+    {
+        described
+    }
+    #[cfg(feature = "advertise-claude-code-candidate")]
+    {
+        let HandlerOutcome::Response(bytes) = described else {
+            return described;
+        };
+        let mut answer: Value = serde_json::from_slice(&bytes).expect("compiled role description");
+        answer["claude_code"] = serde_json::to_value(&*capability_candidate::CANDIDATE)
+            .expect("candidate is serializable");
+        HandlerOutcome::Response(serde_jcs::to_vec(&answer).expect("build-only role JSON"))
+    }
 }
 
 pub fn error(code: &str, message: impl ToString) -> HandlerOutcome {

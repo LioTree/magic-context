@@ -13153,7 +13153,7 @@ impl McHandler {
             cortexkit_role_tool_provider::ops::TOOL_CATALOG => {
                 self.handle_tool_catalog_value(channel, &request).await
             }
-            cortexkit_role_tool_provider::ops::ROLE_DESCRIBE => providers::describe(),
+            cortexkit_role_tool_provider::ops::ROLE_DESCRIBE => providers::describe_for_discovery(),
             // A consumer that declared tool-provider/v1 gets the role's refusal for a
             // name Magic Context does not serve; every other route keeps the legacy
             // error code it has always had.
@@ -15003,7 +15003,7 @@ impl McHandler {
         }
         if let Some(method) = method {
             return match method {
-                "role.describe" => providers::describe(),
+                "role.describe" => providers::describe_for_discovery(),
                 "compaction.setup"
                 | "compaction.step"
                 | "compaction.view.read"
@@ -19550,13 +19550,17 @@ pub fn supported_fences_line() -> String {
 /// substring — the fleet's placement-acceptance contract. A bare `cargo build`
 /// prints the crate version alone rather than a fabricated sha.
 pub fn version_line() -> String {
-    match option_env!("MC_BUILD_SHA")
+    let version = match option_env!("MC_BUILD_SHA")
         .map(str::trim)
         .filter(|sha| !sha.is_empty())
     {
         Some(sha) => format!("ck-mc {} ({sha})", env!("CARGO_PKG_VERSION")),
         None => format!("ck-mc {}", env!("CARGO_PKG_VERSION")),
-    }
+    };
+    #[cfg(feature = "advertise-claude-code-candidate")]
+    return format!("{version} [claude-code-candidate-advertised]");
+    #[cfg(not(feature = "advertise-claude-code-candidate"))]
+    version
 }
 
 /// The module manifest registered at HELLO. The startup manifest owns stable tool IDs and schemas;
@@ -21235,14 +21239,30 @@ mod tests {
         let line = version_line();
         let expected_prefix = format!("ck-mc {}", env!("CARGO_PKG_VERSION"));
         assert!(line.starts_with(&expected_prefix), "got {line}");
+        #[cfg(feature = "advertise-claude-code-candidate")]
+        assert!(line.contains("claude-code-candidate-advertised"));
+        #[cfg(not(feature = "advertise-claude-code-candidate"))]
+        assert!(!line.contains("claude-code-candidate-advertised"));
         match option_env!("MC_BUILD_SHA") {
             Some(sha) if !sha.trim().is_empty() => {
-                assert_eq!(line, format!("{expected_prefix} ({})", sha.trim()));
+                let suffix = if cfg!(feature = "advertise-claude-code-candidate") {
+                    " [claude-code-candidate-advertised]"
+                } else {
+                    ""
+                };
+                assert_eq!(line, format!("{expected_prefix} ({}){suffix}", sha.trim()));
                 // A train tag id is a short prefix of the full sha; acceptance
                 // checks the tag id as a substring of this line.
                 assert!(line.contains(&sha.trim()[..8.min(sha.trim().len())]));
             }
-            _ => assert_eq!(line, expected_prefix),
+            _ => {
+                let suffix = if cfg!(feature = "advertise-claude-code-candidate") {
+                    " [claude-code-candidate-advertised]"
+                } else {
+                    ""
+                };
+                assert_eq!(line, format!("{expected_prefix}{suffix}"));
+            }
         }
     }
 
