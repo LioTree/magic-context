@@ -169,3 +169,146 @@ rustTest(
 	},
 	1800000,
 );
+
+for (const harness of ["opencode", "pi"] as const) {
+	const label = harness === "opencode" ? "OpenCode" : "Pi";
+	test(`${label} cold signed-thinking bootstrap matches master bytes and decisions`, () => {
+		const parent = join(
+			tmpdir(),
+			"magic-context",
+			"signed-thinking-hold-cold-differential",
+		);
+		mkdirSync(parent, { recursive: true });
+		const root = mkdtempSync(join(parent, "run-"));
+		const oracle = join(root, "oracle");
+		mkdirSync(oracle);
+		run(
+			[
+				"bash",
+				"-c",
+				'set -o pipefail; git archive "$1" | tar -x -C "$2"',
+				"--",
+				base,
+				oracle,
+			],
+			repository,
+		);
+		for (const name of ["plugin", "pi-plugin", "retina-local-fs"]) {
+			symlinkSync(
+				join(repository, "packages", name, "node_modules"),
+				join(oracle, "packages", name, "node_modules"),
+			);
+		}
+		const driver = "scripts/signed-thinking-hold-cold-corpus.ts";
+		copyFileSync(join(repository, driver), join(oracle, driver));
+		const capture = (source: string, name: string) => {
+			const home = join(root, name);
+			mkdirSync(home);
+			const output = join(root, `${name}.json`);
+			console.log(
+				run(["bun", driver], source, {
+					HOME: home,
+					XDG_CONFIG_HOME: join(home, "config"),
+					XDG_DATA_HOME: join(home, "data"),
+					MC_HOLD_CORPUS_ROOT: join(root, "projects"),
+					MC_HOLD_CORPUS_OUTPUT: output,
+					MC_HOLD_HARNESS: harness,
+				}).trim(),
+			);
+			return JSON.parse(readFileSync(output, "utf8"));
+		};
+		const expected = capture(oracle, "master");
+		const actual = capture(repository, "hold-off");
+		expect(expected.rowBefore).toEqual({
+			cached_m0_bytes: null,
+			cached_m1_bytes: null,
+		});
+		expect(expected.pending).toEqual([]);
+		expect(expected.compressedDepth).toBeGreaterThan(0);
+		expect(actual).toEqual(expected);
+	}, 60000);
+}
+
+const rustColdTest =
+	process.env.MC_HOLD_RUST_COLD_DIFFERENTIAL === "1" ? test : test.skip;
+rustColdTest(
+	"Rust cold signed-thinking bootstrap matches master bytes and decisions",
+	() => {
+		const parent = join(
+			tmpdir(),
+			"magic-context",
+			"signed-thinking-hold-cold-rust-differential",
+		);
+		mkdirSync(parent, { recursive: true });
+		const root = mkdtempSync(join(parent, "run-"));
+		const oracle = join(root, "oracle");
+		mkdirSync(oracle);
+		run(
+			[
+				"bash",
+				"-c",
+				'set -o pipefail; git archive "$1" | tar -x -C "$2"',
+				"--",
+				base,
+				oracle,
+			],
+			repository,
+		);
+		const path = "crates/mc-module/tests/signed_thinking_hold_off_corpus.rs";
+		const fixture = readFileSync(join(repository, path), "utf8").replace(
+			/\s*signed_thinking_hold: mc_module::config::SignedThinkingHold::Off,/,
+			"",
+		);
+		require("node:fs").writeFileSync(join(oracle, path), fixture);
+		const revision = run(["git", "rev-parse", base], repository).trim();
+		const capture = (source: string, label: string) => {
+			const output = join(root, `${label}.json`);
+			console.log(
+				run(
+					[
+						"cargo",
+						"test",
+						"-p",
+						"mc-module",
+						"--test",
+						"signed_thinking_hold_off_corpus",
+						"signed_thinking_hold_off_cold_bootstrap",
+						"--",
+						"--exact",
+						"--nocapture",
+					],
+					source,
+					{
+						MC_HOLD_RUST_COLD_OUTPUT: output,
+						TMPDIR: root,
+						CARGO_NET_OFFLINE: "true",
+						CARGO_TARGET_DIR:
+							label === "master"
+								? join(
+										process.env.CARGO_TARGET_DIR ?? join(repository, "target"),
+										"hold-oracle",
+										revision,
+									)
+								: (process.env.CARGO_TARGET_DIR ?? join(repository, "target")),
+					},
+				).trim(),
+			);
+			return JSON.parse(readFileSync(output, "utf8"));
+		};
+		const expected = capture(oracle, "master");
+		const actual = capture(repository, "hold-off");
+		expect(expected.length).toBe(3);
+		for (const record of expected) {
+			expect(record.meta.initialized).toBe(true);
+			for (const key of ["m0", "m1"]) {
+				expect(
+					record.core.frozen_units.some(
+						(unit: { key: string }) => unit.key === key,
+					),
+				).toBe(true);
+			}
+		}
+		expect(actual).toEqual(expected);
+	},
+	1800000,
+);

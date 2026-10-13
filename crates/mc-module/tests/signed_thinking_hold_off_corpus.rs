@@ -147,3 +147,64 @@ fn signed_thinking_hold_off_randomized_pass_corpus() {
         captures.len()
     );
 }
+
+/// Rust classifies an empty cache as HARD to freeze its first m[0]/m[1] head.
+/// TS/Pi have a separate firstRenderBust check that prices cleanup. Compare
+/// Rust's actual cold served bytes and cache writes against master instead.
+#[test]
+fn signed_thinking_hold_off_cold_bootstrap() {
+    let root = std::env::temp_dir().join("magic-context/signed-thinking-hold-cold-rust");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut captures = Vec::new();
+    for profile in ["opencode-aisdk", "claude-code-anthropic", "owned-broca"] {
+        let dir = tempfile::tempdir_in(&root).unwrap();
+        let store = McStore::open_for_test(&StorageDescriptor {
+            module_id: "cold-hold-off".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into(),
+            },
+        })
+        .unwrap();
+        let before = store.load("cold").unwrap();
+        assert!(!before.meta.initialized);
+        assert!(!before
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "m0" || unit.key == "m1"));
+        let request: TransformRequest = serde_json::from_value(json!({
+            "v":2, "serializer_profile":profile, "session_id":"cold", "render_config":"stable",
+            "provider_id":"anthropic", "model_key":"anthropic/claude-opus-5-5",
+            "tool_present":true, "todo_tool_present":false, "auto_search_enabled":false,
+            "keep_reasoning_tokens_effective":1_000_000, "protected_tokens_effective":4000,
+            "usage":{"current_total_input_tokens":20000,"context_limit_tokens":100000},
+            "messages":[
+                message("u",1,"user",vec![json!({"type":"text","text":"Inspect the parser."})]),
+                message("signed",2,"assistant",vec![json!({"type":"reasoning","text":"Keep inspecting.","signature":"cold-signed"}),json!({"type":"text","text":"Keep inspecting."})]),
+                message("tail",3,"assistant",vec![json!({"type":"text","text":"Continue after the signed boundary."})])
+            ]
+        })).unwrap();
+        let response = transform(&store, &request, &context()).unwrap();
+        let after = store.load("cold").unwrap();
+        let mut meta = serde_json::to_value(&after.meta).unwrap();
+        let fields = meta.as_object_mut().unwrap();
+        assert!(fields.get("held_release").is_none_or(Value::is_null));
+        for key in [
+            "held_release",
+            "memory_projection",
+            "score_selection_watermark",
+        ] {
+            fields.remove(key);
+        }
+        captures.push(
+            json!({"profile":profile,"served":serde_json::to_string(response.messages()).unwrap(),
+            "meta":meta,"core":serde_json::to_value(after.core).unwrap()}),
+        );
+    }
+    if let Some(path) = std::env::var_os("MC_HOLD_RUST_COLD_OUTPUT") {
+        std::fs::write(path, serde_json::to_vec(&captures).unwrap()).unwrap();
+    }
+    println!("cold Rust signed-thinking: 3 profiles; no prior head, flush, force or history");
+}

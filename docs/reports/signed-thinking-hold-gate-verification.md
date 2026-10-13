@@ -269,3 +269,65 @@ lockfile/package changes were installed with `bun install --frozen-lockfile` (fo
 installed), and the package suites above were rerun in the isolated worktree. All resumed
 verification commands explicitly requested `linux,4c`; no live stores or external checkout
 were used.
+
+## Directed cold-bootstrap coverage (first-render gap closed)
+
+The randomized corpus did not start with signed thinking already present and both
+cached head columns missing. A directed source-oracle case now covers that state
+through the real OpenCode and Pi transforms, with `signedThinkingHold: "off"`:
+
+- Fresh in-memory session; `cached_m0_bytes` and `cached_m1_bytes` are both null.
+- A real user message followed by signed Opus 5.5 thinking and eligible text after
+  that boundary. Twenty later tool results put the text outside the protected tail.
+- No previous transform pass, no pending materialization or operations, no history
+  publication, no subagent execute, no idle expiry and no force-band pressure.
+  OpenCode's scheduler is explicitly deferred; Pi has warm TTL, 20% usage and an
+  already-current stable-ID scheme, so migration does not supply another trigger.
+- The independent master baseline `62f20c02` selects the strongest stored text
+  compression tier (`caveman_depth=3`) solely on the first-render opportunity.
+  The candidate must match the complete served bytes and stored
+  decisions, not just a derived permission flag. Independent HOME/XDG roots and
+  the same project path are retained.
+
+The corresponding Rust first-render path is an uninitialized-cache HARD classifier
+bootstrap, not a separate TS/Pi `firstRenderBust` permission expression. The directed
+Rust corpus covers OpenCode, Claude Code and owned-Broca profiles with no prior
+m[0]/m[1], no flush/force/history trigger and signed thinking already present. Both
+master and the disabled candidate initialize the cache and freeze m[0]/m[1]; their
+complete served bytes, metadata and core decisions must match. The test compares
+actual output and stored state, rather than treating a permission predicate as proof
+that bootstrap did or did not happen.
+
+Command, on Linux with four requested CPUs (Bun 1.4.2, cargo 1.99.0):
+
+```sh
+MC_HOLD_RUST_COLD_DIFFERENTIAL=1 bun test scripts/signed-thinking-hold-differential.test.ts
+```
+
+### Exact first-render mutation receipts
+
+| Applied control | Only failing test | Other executed tests that stayed green | Observable difference |
+|---|---|---|---|
+| TS: replace `!(holdEnabled && freezeM0M1)` with `!freezeM0M1` in `firstRenderBust` | `OpenCode cold signed-thinking bootstrap matches master bytes and decisions` | Existing randomized TS/Pi differential (1008 request records), Pi cold case, Rust cold case | Served text differs; compression depth 3 → 0; reclaim watermark 23 → 0 |
+| Pi: replace `!(holdEnabled && protectedSignedPrefix)` with `!protectedSignedPrefix` in `firstRenderBust` | `Pi cold signed-thinking bootstrap matches master bytes and decisions` | Existing randomized TS/Pi differential (1008 request records), OpenCode cold case, Rust cold case | Served text differs; compression depth 3 → 0; reclaim watermark 23 → 0; protection-floor decisions differ |
+| Rust: force the newly classified cold signed bootstrap to `PassPlan::Defer` | `Rust cold signed-thinking bootstrap matches master bytes and decisions` | Existing randomized TS/Pi differential (1008 request records) and both host cold cases | Synthetic head bytes disappear, m[0]/m[1] units are absent, and initialization/fold metadata differ |
+
+Every control was applied over staged live files with an empty working diff. A
+`NON-VACUITY BREAK` comment marked each temporary source edit as a deliberate
+break proving the corresponding comparison could fail. The controls ran separately.
+TS and Pi each produced a one-file
++2/-1 diff; Rust produced a one-file +4/-0 diff. Each run reported exactly three
+passes and one failure, with the unrelated long Rust randomized differential
+explicitly skipped. Each mutant was restored from the index and touched, with an
+empty working diff afterward. No production change is committed for this coverage.
+
+The originally undefended TS first-render control is now defended by its directed
+cold case; the earlier green result in the **Mutation controls** table remains only
+as historical evidence of the coverage gap that prompted this addition.
+
+Final restored verification: **4 passed / 1 skipped / 0 failed**, 1029 assertions
+(the existing TS/Pi randomized differential and all three directed cold cases).
+The skipped test is only the separate long randomized Rust differential; the
+three-profile directed Rust fixture executes in both independent source trees.
+TypeScript 5.9.3 checks, Biome 2.5.1 checks for the touched scripts, Rust formatting
+and targeted mc-module cold-corpus clippy all pass.
