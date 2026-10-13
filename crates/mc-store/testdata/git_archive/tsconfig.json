@@ -1,0 +1,16 @@
+{
+    "extends": "../../../../packages/plugin/tsconfig.json",
+    "compilerOptions": {
+        "rootDir": "../../../..",
+        "noEmit": true,
+        "typeRoots": [
+            "../../../../packages/plugin/node_modules/@types",
+            "../../../../packages/plugin/node_modules"
+        ]
+    },
+    "include": [
+        "oracle.ts",
+        "../../../../packages/plugin/src/**/*.d.ts"
+    ],
+    "exclude": []
+}

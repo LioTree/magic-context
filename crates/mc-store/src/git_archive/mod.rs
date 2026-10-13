@@ -1,5 +1,8 @@
 //! Git archive extension. The git owner registers index and FTS modules here.
 
+pub mod fts;
+pub mod index;
+
 use crate::parity_schema_manifest::*;
 
 pub struct UnavailableGitArchive;

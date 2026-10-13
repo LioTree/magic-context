@@ -1,0 +1,8 @@
+diff --git a/crates/mc-store/src/git_archive/mod.rs b/crates/mc-store/src/git_archive/mod.rs
+--- a/crates/mc-store/src/git_archive/mod.rs
++++ b/crates/mc-store/src/git_archive/mod.rs
+@@ -3 +3,4 @@
++pub mod fts;
++pub mod index;
++
+ use crate::parity_schema_manifest::*;
