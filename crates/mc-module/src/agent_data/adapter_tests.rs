@@ -10,6 +10,9 @@ use subc_protocol::{BindIdentity, RouteTarget};
 #[path = "vectors.rs"]
 mod vectors;
 
+#[path = "review_witness_tests.rs"]
+mod review_witnesses;
+
 const CUT: &str = "0123456789abcdef0123456789abcdef";
 const ROOT: &str = "/portable/project";
 const SESSION: &str = "native-old";
