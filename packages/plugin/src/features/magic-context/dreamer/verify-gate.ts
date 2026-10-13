@@ -10,6 +10,7 @@ import {
     resolveGitTopLevel,
     verificationFileExists,
 } from "../memory";
+import { getMemoryRevision } from "../memory/lifecycle-applier";
 import { runLeaseGuardedWrite } from "./lease";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
 import type { VerifyPromptMemory } from "./verify-prompt";
@@ -48,6 +49,7 @@ export interface VerifyGateResult {
     inScope: VerifyPromptMemory[];
     inScopeIds: number[];
     skippedIds: number[];
+    unmapped?: VerifyPromptMemory[];
     reason: string;
     /** The persisted broad-cycle watermark used for this run, when broad. */
     broadCycleStartAt?: number;
@@ -135,8 +137,12 @@ export async function partitionVerifyScope(args: {
             mappedFiles: verById.get(m.id)?.files ?? [],
             verifiedAt,
             verifiedCommit,
+            revision: getMemoryRevision(args.db, m.id) ?? undefined,
+            contentHash: m.normalizedHash,
         };
     };
+
+    const unmapped = active.filter((m) => !candidates.includes(m)).map(toPrompt);
 
     if (args.forceBroad) {
         const broadCycleStartAt = ensureBroadCycleStart({
@@ -158,6 +164,7 @@ export async function partitionVerifyScope(args: {
             runStartedAt,
             mode: "broad",
             inScope: broadCandidates.map(toPrompt),
+            unmapped,
             inScopeIds: broadCandidates.map((m) => m.id),
             skippedIds: candidates.filter((m) => !broadIds.has(m.id)).map((m) => m.id),
             broadCycleStartAt,
@@ -170,6 +177,7 @@ export async function partitionVerifyScope(args: {
             runStartedAt,
             mode: "incremental",
             inScope: [],
+            unmapped,
             inScopeIds: [],
             skippedIds: [],
             reason: "no file-mapped memories in scope",
@@ -180,6 +188,7 @@ export async function partitionVerifyScope(args: {
         runStartedAt,
         mode,
         inScope: candidates.map(toPrompt),
+        unmapped,
         inScopeIds: candidates.map((m) => m.id),
         skippedIds: [],
         reason,
@@ -239,6 +248,7 @@ export async function partitionVerifyScope(args: {
         runStartedAt,
         mode: "incremental",
         inScope,
+        unmapped,
         inScopeIds: inScope.map((m) => m.id),
         skippedIds,
         reason: `incremental verification (${inScope.length} changed of ${candidates.length} mapped)`,

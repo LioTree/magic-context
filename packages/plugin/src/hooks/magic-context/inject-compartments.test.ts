@@ -15,6 +15,7 @@ import { leaseKeyFor } from "../../features/magic-context/dreamer/task-registry"
 import {
     applyAgentMemoryMutation,
     applyMemoryAdmission,
+    applyMemoryVerification,
 } from "../../features/magic-context/memory/lifecycle-applier";
 import {
     archiveMemory,
@@ -4752,3 +4753,169 @@ describe("m[0]/m[1] materialization", () => {
         });
     });
 });
+
+for (const host of ["opencode", "opencode2"] as const) {
+    it(`${host} verification leaves served m0 m1 and mural frozen until natural HARD`, () => {
+        _resetHarnessForTesting();
+        setHarness(host);
+        db = makeDb();
+        const older = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "PROJECT_RULES",
+            content: "OLDER_VERIFY_MEMORY: Run focused tests.",
+            importance: 50,
+        });
+        const newer = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "PROJECT_RULES",
+            content: "NEWER_VERIFY_MEMORY: Run lint checks.",
+            importance: 50,
+        });
+        db.prepare("UPDATE memories SET last_seen_at=? WHERE id=?").run(1, older.id);
+        db.prepare("UPDATE memories SET last_seen_at=? WHERE id=?").run(2, newer.id);
+        let budget = 1;
+        while (
+            budget < 500 &&
+            trimMemoriesToBudgetV2(SESSION_ID, getMemoriesByProject(db, PROJECT_PATH), budget)
+                .selected.length !== 1
+        )
+            budget++;
+        expect(budget).toBeLessThan(500);
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            memoryInjectionBudgetTokens: budget,
+            mural: {
+                enabled: true,
+                supportsVision: true,
+                dataUrl: "data:image/png;base64,c29tZS1tdXJhbA==",
+            },
+            hardSignals: {
+                systemHash: "verify-system",
+                modelKey: "verify-model",
+                cacheExpired: false,
+                lastResponseTime: 0,
+            },
+        };
+        const first = [userMessage("verify-first", "hello")];
+        injectM0M1({ ...options, messages: first });
+        expect(renderedText(first[0])).toContain("NEWER_VERIFY_MEMORY");
+        const prefix = JSON.stringify(first.slice(0, 2));
+        expect(prefix).toContain("data:image/png;base64,c29tZS1tdXJhbA==");
+        expect(
+            applyMemoryVerification(db, {
+                key: `verify-prefix:${host}`,
+                projectPath: PROJECT_PATH,
+                memoryId: older.id,
+                expectedRevision: 1,
+                contentHashAtPrompt: older.normalizedHash,
+                kind: "verified",
+                files: ["src/test.ts"],
+                checkedCommit: null,
+                sourceCommitMatches: true,
+                checkedAt: Date.now(),
+            }).verificationResult,
+        ).toBe("confirmed");
+        expect(mustMaterialize(options)).toEqual({ value: false, reason: null });
+        for (const busting of [false, true]) {
+            const messages = [userMessage(`verify-next-${busting}`, "after check")];
+            const result = injectM0M1({ ...options, messages, isCacheBustingPass: busting });
+            expect(result.m0RematerializedThisPass).toBe(false);
+            expect(JSON.stringify(messages.slice(0, 2))).toBe(prefix);
+        }
+        const hardMessages = [userMessage("verify-hard", "independent system change")];
+        const hard = injectM0M1({
+            ...options,
+            messages: hardMessages,
+            hardSignals: { ...options.hardSignals, systemHash: "natural-hard" },
+        });
+        expect(hard.m0RematerializedThisPass).toBe(true);
+        expect(renderedText(hardMessages[0])).toContain("OLDER_VERIFY_MEMORY");
+        expect(renderedText(hardMessages[0])).not.toContain("NEWER_VERIFY_MEMORY");
+        _resetHarnessForTesting();
+    });
+}
+
+for (const host of ["opencode", "opencode2"] as const) {
+    for (const operation of ["update", "archive"] as const) {
+        it(`${host} direct verify ${operation} preserves served m0 m1 and mural until natural HARD`, () => {
+            _resetHarnessForTesting();
+            setHarness(host);
+            db = makeDb();
+            const target = insertMemory(db, {
+                projectPath: PROJECT_PATH,
+                category: "ARCHITECTURE",
+                content: "OLD_VERIFIED_CLAIM: Source limit is five minutes.",
+            });
+            const options = {
+                db,
+                sessionId: SESSION_ID,
+                state: readStateFromMeta(),
+                projectPath: PROJECT_PATH,
+                mural: {
+                    enabled: true,
+                    supportsVision: true,
+                    dataUrl: "data:image/png;base64,dmVyaWZ5LW11cmFs",
+                },
+                hardSignals: {
+                    systemHash: "verify-direct",
+                    modelKey: "verify-model",
+                    cacheExpired: false,
+                    lastResponseTime: 0,
+                },
+            };
+            const first = [userMessage("verify-direct-first", "hello")];
+            injectM0M1({ ...options, messages: first });
+            expect(renderedText(first[0])).toContain("OLD_VERIFIED_CLAIM");
+            const prefix = JSON.stringify(first.slice(0, 2));
+            expect(prefix).toContain("data:image/png;base64,dmVyaWZ5LW11cmFs");
+            const corrected = "CORRECTED_VERIFIED_CLAIM: Source limit is ten minutes.";
+            const receipt = applyMemoryVerification(db, {
+                key: `verify-direct:${host}:${operation}`,
+                projectPath: PROJECT_PATH,
+                memoryId: target.id,
+                expectedRevision: 1,
+                contentHashAtPrompt: target.normalizedHash,
+                kind: operation,
+                content: operation === "update" ? corrected : undefined,
+                reason: "the files refute this memory",
+                files: ["src/test.ts"],
+                checkedCommit: null,
+                sourceCommitMatches: true,
+                checkedAt: Date.now(),
+            });
+            expect(receipt.state).toBe("applied");
+            expect(receipt.verificationResult).toBe(
+                operation === "update" ? "updated" : "archived",
+            );
+            expect(
+                db
+                    .prepare("SELECT previous_text FROM memory_history WHERE memory_id=?")
+                    .all(target.id),
+            ).toEqual([{ previous_text: target.content }]);
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual({
+                n: 0,
+            });
+            expect(mustMaterialize(options)).toEqual({ value: false, reason: null });
+            for (const busting of [false, true]) {
+                const messages = [userMessage(`verify-direct-next-${busting}`, "after check")];
+                const result = injectM0M1({ ...options, messages, isCacheBustingPass: busting });
+                expect(result.m0RematerializedThisPass).toBe(false);
+                expect(JSON.stringify(messages.slice(0, 2))).toBe(prefix);
+            }
+            const messages = [userMessage("verify-direct-hard", "independent system change")];
+            const hard = injectM0M1({
+                ...options,
+                messages,
+                hardSignals: { ...options.hardSignals, systemHash: "natural-direct-hard" },
+            });
+            expect(hard.m0RematerializedThisPass).toBe(true);
+            expect(renderedText(messages[0])).not.toContain("OLD_VERIFIED_CLAIM");
+            if (operation === "update")
+                expect(renderedText(messages[0])).toContain("CORRECTED_VERIFIED_CLAIM");
+            _resetHarnessForTesting();
+        });
+    }
+}

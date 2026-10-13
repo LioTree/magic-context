@@ -36,6 +36,7 @@ import {
     updateMemorySeenCount,
 } from "./storage-memory";
 import { saveEmbeddingIfHashMatches } from "./storage-memory-embeddings";
+import { recordMemoryVerifications } from "./storage-memory-verifications";
 import type { Memory, MemoryInput } from "./types";
 
 export type AdoptionClass = "live" | "deferred" | null;
@@ -59,6 +60,171 @@ export interface ApplierReceipt {
      * because that profile (or one of its checks) is not a replay-validated one.
      */
     reportedProfile?: ReportedProfile;
+    verificationResult?: VerificationResult;
+}
+
+export type VerificationResult =
+    | "confirmed"
+    | "unmapped"
+    | "skipped"
+    | "refused"
+    | "failed"
+    | "stale"
+    | "updated"
+    | "archived";
+export interface MemoryVerificationRequest {
+    key: string;
+    projectPath: string;
+    memoryId: number;
+    expectedRevision: number;
+    contentHashAtPrompt: string;
+    kind: "verified" | "update" | "archive" | "skipped" | "unmapped" | "failed";
+    files: string[];
+    checkedCommit: string | null;
+    sourceCommitMatches: boolean;
+    checkedAt: number;
+    content?: string;
+    reason?: string;
+    refusalReason?: string;
+}
+
+/** Apply code-check results and authorized automated corrections under one revision-bound transaction. */
+export function applyMemoryVerification(
+    db: Database,
+    request: MemoryVerificationRequest,
+): ApplierReceipt {
+    return db
+        .transaction(() => {
+            const recovered = readReceipt(db, request.key);
+            if (recovered) return recovered;
+            const record = (
+                state: ApplierReceipt["state"],
+                reason: string,
+                result: VerificationResult,
+            ) =>
+                recordReceipt(
+                    db,
+                    {
+                        key: request.key,
+                        projectPath: request.projectPath,
+                        operation: "verification",
+                    },
+                    {
+                        state,
+                        reason,
+                        memoryId: request.memoryId,
+                        adoptionClass: "deferred",
+                        verificationResult: result,
+                    },
+                );
+            if (!tsOwnsMemory(db, request.projectPath))
+                throw new ModuleMemoryAuthorityError(request.projectPath);
+            const memory = getMemoryById(db, request.memoryId);
+            if (
+                !memory ||
+                normalizeStoredProjectPath(memory.projectPath) !==
+                    normalizeStoredProjectPath(request.projectPath)
+            )
+                return record("decided_pending", "target_not_owned", "stale");
+            if (
+                memory.status === "archived" ||
+                memory.supersededByMemoryId !== null ||
+                getMemoryRevision(db, memory.id) !== request.expectedRevision ||
+                memory.normalizedHash !== request.contentHashAtPrompt
+            )
+                return record("decided_pending", "stale_revision", "stale");
+            const mutation = request.kind === "update" || request.kind === "archive";
+            let refusalReason = request.refusalReason;
+            if (
+                request.kind === "update" &&
+                (!request.content?.trim() || request.content.trim().length > 20_000)
+            )
+                refusalReason = "invalid_content";
+            let result: VerificationResult = !request.sourceCommitMatches
+                ? "failed"
+                : refusalReason
+                  ? "refused"
+                  : request.kind === "update"
+                    ? request.files.length > 0
+                        ? "updated"
+                        : "unmapped"
+                    : request.kind === "archive"
+                      ? "archived"
+                      : request.kind === "verified"
+                        ? request.files.length > 0
+                            ? "confirmed"
+                            : "unmapped"
+                        : request.kind;
+            if (mutation && request.sourceCommitMatches && !refusalReason) {
+                try {
+                    const receipt = applyMemoryMutation(
+                        db,
+                        {
+                            key: `${request.key}:mutation`,
+                            projectPath: request.projectPath,
+                            operation: request.kind as "update" | "archive",
+                            targets: [{ id: memory.id, revision: request.expectedRevision }],
+                            content: request.content,
+                            reason: request.reason ?? `verify_${request.kind}`,
+                            sourceSessionId: "",
+                        },
+                        true,
+                        "verify",
+                    );
+                    if (receipt.state !== "applied") refusalReason = receipt.reason;
+                    else if (request.kind === "update")
+                        db.prepare(
+                            "UPDATE memories SET verification_status='unverified',verified_at=NULL WHERE id=?",
+                        ).run(memory.id);
+                } catch (error) {
+                    if (!(error instanceof MemoryContentDuplicateError)) throw error;
+                    refusalReason = `duplicate_of:${error.memoryId}`;
+                }
+                if (refusalReason) result = "refused";
+            }
+            db.prepare(
+                "UPDATE memories SET verify_result=?,verify_files_json=?,verify_commit=? WHERE id=?",
+            ).run(result, JSON.stringify(request.files), request.checkedCommit, memory.id);
+            if (result === "refused")
+                return record("decided_pending", refusalReason ?? "refused", result);
+            if (result === "confirmed" || (result === "updated" && request.files.length > 0)) {
+                recordMemoryVerifications(db, memory.id, request.files, request.checkedAt);
+                let metadata: Record<string, unknown> = {};
+                try {
+                    metadata = JSON.parse(memory.metadataJson ?? "{}");
+                } catch {
+                    /* Legacy metadata may be malformed. */
+                }
+                if (!metadata || typeof metadata !== "object" || Array.isArray(metadata))
+                    metadata = {};
+                db.prepare(
+                    "UPDATE memories SET verification_status='verified',verified_at=?,metadata_json=? WHERE id=?",
+                ).run(
+                    request.checkedAt,
+                    JSON.stringify({
+                        ...metadata,
+                        dreamerVerifiedAt: request.checkedAt,
+                        dreamerVerifiedCommit: request.checkedCommit,
+                    }),
+                    memory.id,
+                );
+            }
+            const receipt = record(
+                "applied",
+                request.sourceCommitMatches ? result : "source_commit_changed",
+                result,
+            );
+            db.prepare("UPDATE memory_journal SET after_json=? WHERE decision_key=?").run(
+                JSON.stringify({
+                    files: request.files,
+                    checkedCommit: request.checkedCommit,
+                    revision: request.expectedRevision,
+                }),
+                request.key,
+            );
+            return receipt;
+        })
+        .immediate();
 }
 
 export interface MemoryFactReservation {
@@ -360,10 +526,11 @@ export function resolveFactDecision(
 }
 
 /**
- * Record an automated writer's direct edit of one memory (a verify content
- * correction, an expiry archive) as undo history. The caller has already changed
+ * Record an automated writer's direct edit of one memory (such as an expiry
+ * archive) as undo history. The caller has already changed
  * the row inside the same transaction. Automated edits write no mutation-log row
- * and no agent fragment: they reach a prompt only at the next natural HARD fold.
+ * and no agent fragment: cached prompts adopt them only at the next independently
+ * authorized full history rebuild (HARD fold).
  */
 export function recordAutomatedMemoryEdit(
     db: Database,
@@ -521,8 +688,8 @@ function applyMemoryMutation(
     db: Database,
     request: AgentMemoryMutation,
     automated: boolean,
+    writer = automated ? "curate" : "ctx_memory",
 ): ApplierReceipt {
-    const writer = automated ? "curate" : "ctx_memory";
     const adoptionClass = automated ? "deferred" : "live";
     const queue = (mutation: Parameters<typeof queueMemoryMutation>[1]) => {
         if (!automated) queueMemoryMutation(db, mutation);

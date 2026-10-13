@@ -6734,6 +6734,25 @@ pub struct FacadeMutationTxn<'a> {
     automated: bool,
 }
 
+/// Compose an automated memory mutation with its caller's accounting writes in an
+/// existing context.db transaction. Errors must propagate to the transaction owner
+/// so the memory, undo history, outcomes and replay receipts roll back together.
+pub fn with_automated_memory_mutation_tx<T>(
+    conn: &rusqlite::Connection,
+    apply: impl FnOnce(&FacadeMutationTxn<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    if conn.is_autocommit() {
+        return Err("automated memory mutation requires an active transaction".into());
+    }
+    apply(
+        &FacadeMutationTxn {
+            tx: conn,
+            automated: false,
+        }
+        .automated(),
+    )
+}
+
 impl<'a> FacadeMutationTxn<'a> {
     /// Automated curation validates targets and saves their prior versions for undo,
     /// but does not enqueue a prompt update or record an agent fragment.
@@ -19975,6 +19994,64 @@ mod tests {
             0
         );
         assert_eq!(store.max_memory_id(&[project.to_string()]).unwrap(), 1);
+    }
+
+    fn assert_automated_memory_accounting_rollback(outcome_fails: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let project = "git:automated-atomic";
+        let id = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "original claim", 1))
+            .unwrap();
+        let snapshot = || {
+            store.with_context_conn_for_test(|conn| conn.query_row(
+            "SELECT content,revision,verify_result,(SELECT COUNT(*) FROM memory_history),(SELECT COUNT(*) FROM memory_decision_receipts) FROM memories WHERE id=?1",
+            [id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?)),
+        )).unwrap()
+        };
+        let before = snapshot();
+        store.with_context_conn_for_test(|conn| conn.execute_batch(if outcome_fails {
+            "CREATE TEMP TRIGGER fail_outcome BEFORE INSERT ON memory_decision_receipts BEGIN SELECT RAISE(ABORT,'outcome failed'); END;"
+        } else {
+            "CREATE TEMP TRIGGER fail_memory BEFORE UPDATE OF content ON memories BEGIN SELECT RAISE(ABORT,'memory failed'); END;"
+        })).unwrap();
+        let attempted = store.with_context_conn_for_test(|conn| {
+            with_automated_memory_mutation_tx(conn, |applier| {
+                let write_outcome = || -> Result<(), String> {
+                    conn.execute("UPDATE memories SET verify_result='updated' WHERE id=?1", [id]).map_err(|error| error.to_string())?;
+                    conn.execute("INSERT INTO memory_decision_receipts(decision_key,project_path,receipt_json,resolved_at) VALUES('atomic-outcome',?1,'{}',2)", [project]).map_err(|error| error.to_string())?;
+                    Ok(())
+                };
+                if !outcome_fails { write_outcome()?; }
+                applier.check_memory_revisions(&[(id, 1)])?;
+                applier.update_memory_content(project, id, "corrected claim", None, 2).map_err(|error| error.to_string())?;
+                if outcome_fails { write_outcome()?; }
+                Ok(())
+            }).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error))))
+        });
+        assert!(attempted
+            .unwrap_err()
+            .to_string()
+            .contains(if outcome_fails {
+                "outcome failed"
+            } else {
+                "memory failed"
+            }));
+        assert_eq!(
+            snapshot(),
+            before,
+            "both the memory and its accounting must roll back"
+        );
+    }
+
+    #[test]
+    fn automated_memory_outcome_failure_rolls_back_update_and_history() {
+        assert_automated_memory_accounting_rollback(true);
+    }
+
+    #[test]
+    fn automated_memory_failure_rolls_back_outcome_and_receipt() {
+        assert_automated_memory_accounting_rollback(false);
     }
 
     #[test]

@@ -405,6 +405,7 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
                     expect(operation === "verify-archive" ? result.archived : result.updated).toBe(
                         1,
                     );
+                    expect(result.refused).toBe(0);
                 } else {
                     expect(
                         await archiveExpiredMemories({

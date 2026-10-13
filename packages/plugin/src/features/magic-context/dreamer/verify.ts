@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
@@ -16,22 +16,13 @@ import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
+import { normalizeVerificationFiles, readGitHead } from "../memory";
 import {
-    archiveMemory,
-    clearMemoryVerifications,
-    getMemoryByHash,
-    getMemoryById,
-    hasMemoryClassifiedAtColumn,
-    hasMemoryShareableColumn,
-    invalidateMemory,
-    type Memory,
-    normalizeVerificationFiles,
-    readGitHead,
-    recordMemoryVerifications,
-} from "../memory";
-import { recordAutomatedMemoryEdit, tsOwnsMemory } from "../memory/lifecycle-applier";
+    applyMemoryVerification,
+    getMemoryRevision,
+    type MemoryVerificationRequest,
+} from "../memory/lifecycle-applier";
 import { computeNormalizedHash } from "../memory/normalize-hash";
-import { ModuleMemoryAuthorityError } from "../memory/storage-memory";
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
 import { readFailedChildMessages } from "./failed-invocation-evidence";
@@ -39,11 +30,7 @@ import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertNoDuplicateManifestIds } from "./manifest-parser";
 import { isDirectiveShapedProjectRule } from "./memory-claim-safety";
-import {
-    DreamerModuleFailureError,
-    type DreamerModuleRoute,
-    getModuleMemoryIdentities,
-} from "./module-apply";
+import { DreamerModuleFailureError, type DreamerModuleRoute } from "./module-apply";
 import {
     DreamerProviderOutputFailureError,
     providerOutputFailureFromInvalidManifest,
@@ -63,19 +50,19 @@ import {
 } from "./verify-prompt";
 
 /**
- * verify / verify-broad: check file-mapped memories against the CURRENT source
- * and apply the agent's verified/update/archive manifest HOST-side.
+ * verify / verify-broad: check file-mapped memories against current source and
+ * apply the agent's verified/update/archive results on the host.
  *
- * Per-memory verified_at (no global watermark): a timed-out batch banks what it
- * checked; the next run continues. Cost is unique-file-bounded like map, but
- * verify reads DEEPER (it checks claims, not just locates files), so it batches
- * SMALLER than map because deeper reads replay more prompt tokens. No max-turns;
- * a batch that fails to emit a manifest banks nothing and is retried next run.
+ * Progress is tracked by each memory's verified_at, not a global watermark.
+ * A timed-out batch saves only complete reported results; unreported memories
+ * remain eligible for the next run. A missing or incomplete manifest saves nothing.
+ * Batches are bounded by unique files and are smaller than map batches because
+ * checking claims needs deeper source reads and replays more prompt tokens.
  *
- * Apply is cache-NEUTRAL: an update changes the row with undo history and no
- * mutation-log row, an archive becomes a pending proposal, and neither bumps the
- * project memory epoch. Prompts see an update only at their next natural HARD
- * fold; the dreamer must never bust the prompt cache.
+ * Confirmations, corrections and archives are bound to the checked revision.
+ * Content/status changes save prior state for undo without appending live prompt
+ * updates. Selection changes only at an independently authorized full prompt
+ * rebuild (HARD fold); verification never forces a cache rebuild.
  */
 
 // A 14-day Gemini fit predicts ~1.73M prompt tokens for 20 memories, including
@@ -213,6 +200,18 @@ async function runVerifyWithCooldown(args: VerifyArgs): Promise<VerifyResult> {
     result.broadCycleStartAt = gate.broadCycleStartAt;
     result.inScope = gate.inScope.length;
     result.remaining = gate.inScope.length;
+    if (gate.unmapped?.length) {
+        await commitVerificationWrites(
+            args,
+            gate.unmapped,
+            gate.unmapped.map((memory) => ({
+                kind: "unmapped",
+                id: memory.id,
+                files: [],
+            })),
+            await readGitHead(args.sessionDirectory),
+        );
+    }
     log(
         `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"} gate: mode=${gate.mode} in_scope=${gate.inScope.length} skipped=${gate.skippedIds.length} reason=${gate.reason}`,
     );
@@ -335,12 +334,13 @@ async function verifyOneBatch(
     let promptSettled = false;
     const startedAt = Date.now();
     let budgetFinalized = false;
+    let headAtPrompt: string | null = null;
     const onBudgetUpdate: NonNullable<VerifyArgs["onBudgetUpdate"]> = (state) => {
         budgetFinalized ||= state.finalizeFired;
         args.onBudgetUpdate?.(state);
     };
     try {
-        const headAtPrompt = await readGitHead(args.sessionDirectory);
+        headAtPrompt = await readGitHead(args.sessionDirectory);
         const evidence =
             !args.forceBroad && batch.every((m) => m.verifiedAt)
                 ? await buildVerifyDiffEvidence(args.sessionDirectory, batch)
@@ -488,6 +488,19 @@ async function verifyOneBatch(
             signal.aborted
         )
             throw error;
+        await commitVerificationWrites(
+            args,
+            batch,
+            await Promise.all(
+                batch.map(async (memory) => ({
+                    kind: "failed" as const,
+                    id: memory.id,
+                    files: await normalizeFiles(args, memory.mappedFiles),
+                    reason: desc.brief,
+                })),
+            ),
+            headAtPrompt,
+        );
         // A timeout is a budget verdict, not a failure of this run: report it so the
         // run can stop cleanly with its earlier batches banked.
         if (
@@ -532,21 +545,15 @@ async function verifyOneBatch(
 }
 
 /**
- * Parse a complete manifest and commit the entries that belong to this batch.
- * A closed root proves the parser did not see a truncated prefix, so omitted ids
- * remain silent for the per-memory gate to select next run; unknown ids are never written.
- * - verified: re-record the (normalized) backing files with verified_at = now
- *   (banks the per-memory verify progress).
- * - update: rewrite the memory content with an undo-history row (no mutation-log
- *   row), then clear old file mappings and embeddings so the new content is mapped
- *   and verified again next cycle.
- * - archive: archive directly with undo history and no prompt delta. Skipped when
- *   the memory is no longer primary-mutable (already archived/superseded), so a
- *   stale manifest can't fight a concurrent change.
- * - skip/refusal: count the verdict for progress without changing the memory.
- * Directive-shaped PROJECT_RULES and unsafe content-loss rewrites are refused
- * before either the local or MODULE authority write path is built.
- * All writes happen under ONE lease-guarded transaction.
+ * Parse a complete manifest and commit only entries belonging to this batch.
+ * A closed root rules out a truncated reply. Unreported memories remain eligible
+ * for the next verification run, and unknown ids are never written.
+ * Confirmations replace the complete file set and stamp the checked revision.
+ * Updates and archives save prior content/status for undo; skips and refusals
+ * record outcomes without advancing confirmation timestamps. Both the local
+ * TypeScript and module-owned routes use their automated memory applier, and
+ * stale revisions never advance verification timestamps. Local writes use one
+ * lease-guarded transaction; module writes use its fenced transaction.
  */
 export async function applyVerifyManifest(
     args: VerifyArgs,
@@ -563,8 +570,14 @@ async function applyParsedVerifyManifest(
     headAtPrompt?: string | null,
     budgetFinalized = false,
 ): Promise<VerifyVerdictCounts> {
-    const batchIds = new Set(batch.map((m) => m.id));
-    const batchById = new Map(batch.map((memory) => [memory.id, memory]));
+    batch = batch.map((memory) => ({
+        ...memory,
+        revision: memory.revision ?? getMemoryRevision(args.db, memory.id) ?? 0,
+        contentHash: memory.contentHash ?? computeNormalizedHash(memory.content),
+    }));
+    const batchIds = new Set(batch.map((memory) => memory.id));
+    const checkedCommit =
+        headAtPrompt === undefined ? await readGitHead(args.sessionDirectory) : headAtPrompt;
     const valid = {
         verified: parsed.verified.filter((entry) => batchIds.has(entry.id)),
         updated: parsed.updated.filter((entry) => batchIds.has(entry.id)),
@@ -577,128 +590,146 @@ async function applyParsedVerifyManifest(
         ...parsed.archived,
         ...parsed.skipped,
     ].filter((entry) => !batchIds.has(entry.id));
-    if (unknown.length > 0) {
+    if (unknown.length)
         log(
-            `[dreamer] verify warning: dropping ${unknown.length} unknown verification entr${unknown.length === 1 ? "y" : "ies"} outside the current batch (${unknown.map((entry) => entry.id).join(", ")})`,
+            `[dreamer] verify warning: dropping ${unknown.length} unknown verification entries outside the current batch (${unknown.map((entry) => entry.id).join(", ")})`,
         );
-    }
     const validIds = [...valid.verified, ...valid.updated, ...valid.archived, ...valid.skipped].map(
         (entry) => entry.id,
     );
     assertNoDuplicateManifestIds(validIds, "verify");
-
-    // The token guard asks the child to stop investigating and return only ids it
-    // checked, so low coverage is expected then. Without that stop request, reject
-    // low coverage before writes: the child may have answered a different batch.
-    if (!budgetFinalized && validIds.length * 2 < batch.length) {
+        // When the verification agent reaches its token budget, a partial reply is
+        // expected; otherwise low coverage may mean it answered a different batch.
+    if (!budgetFinalized && validIds.length * 2 < batch.length)
         throw new Error(
             `verify manifest covers ${validIds.length}/${batch.length} batch ids after filtering unknown entries; rejecting mostly-wrong manifest`,
         );
-    }
-    if (budgetFinalized && validIds.length < batch.length) {
-        log(
-            `[dreamer] verify: accepted partial manifest after token budget: ${validIds.length}/${batch.length}`,
-        );
-    }
-    if (validIds.length === 0) {
-        return { verified: 0, updated: 0, archived: 0, skipped: 0, refused: 0 };
-    }
-    const now = Date.now();
-    const verifiedHead =
-        headAtPrompt === undefined ? await readGitHead(args.sessionDirectory) : headAtPrompt;
-
-    // Pre-normalize files OUTSIDE the transaction (git/realpath I/O). For each
-    // affected id, the COMPLETE backing set the agent reports.
-    type VerifyWrite =
-        | { kind: "verify"; id: number; files: string[] }
-        | { kind: "update"; id: number; files: string[]; content: string; hash: string }
-        | { kind: "archive"; id: number; reason: string };
     const writes: VerifyWrite[] = [];
-    let refused = 0;
-    const skipped = valid.skipped.length;
-    for (const v of valid.verified) {
-        const files = await normalizeFiles(args, v.files);
-        writes.push({ kind: "verify", id: v.id, files });
-    }
-    for (const u of valid.updated) {
-        const original = batchById.get(u.id);
-        if (!original) continue;
-        if (isDirectiveShapedProjectRule(original.category, original.content)) {
+    const originals = new Map(batch.map((memory) => [memory.id, memory]));
+    for (const entry of valid.verified)
+        writes.push({
+            kind: "verified",
+            id: entry.id,
+            files: await normalizeFiles(args, entry.files),
+        });
+    for (const entry of valid.updated) {
+        const original = originals.get(entry.id);
+        if (!original) throw new Error("verification target missing from batch");
+        const content = entry.content.trim();
+        const reason = isDirectiveShapedProjectRule(original.category, original.content)
+            ? "directive-shaped-project-rule"
+            : !content || content.length > 20_000
+              ? "invalid_content"
+              : !entry.consolidation && content.length * 2 < original.content.trim().length
+                ? "content-loss"
+                : undefined;
+        if (reason)
             log(
-                `[dreamer] verify safety refusal: memory_id=${u.id} verdict=update reason=directive-shaped-project-rule`,
+                `[dreamer] verify safety refusal: memory_id=${entry.id} verdict=update reason=${reason}`,
             );
-            refused += 1;
-            continue;
-        }
-        const content = u.content.trim();
-        // An empty/oversized "update" is unsafe — fall back to a plain re-verify
-        // (bank the progress, keep the old content) rather than wipe a memory.
-        if (!content || content.length > 20_000) {
-            const files = await normalizeFiles(args, u.files);
-            writes.push({ kind: "verify", id: u.id, files });
-            continue;
-        }
-        const originalLength = original.content.trim().length;
-        // Losing more than half the claim is the characteristic denaturing shape.
-        // A model may cross this conservative belt only by explicitly declaring
-        // that the shorter rewrite is an intentional consolidation.
-        if (!u.consolidation && content.length * 2 < originalLength) {
-            log(
-                `[dreamer] verify safety refusal: memory_id=${u.id} verdict=update reason=content-loss original_chars=${originalLength} replacement_chars=${content.length}`,
-            );
-            refused += 1;
-            continue;
-        }
-        const files = await normalizeFiles(args, u.files);
         writes.push({
             kind: "update",
-            id: u.id,
-            files,
+            id: entry.id,
+            files: await normalizeFiles(args, entry.files),
             content,
-            hash: computeNormalizedHash(content),
+            refusalReason: reason,
         });
     }
-    for (const a of valid.archived) {
-        const original = batchById.get(a.id);
-        if (!original) continue;
-        if (isDirectiveShapedProjectRule(original.category, original.content)) {
+    for (const entry of valid.archived) {
+        const original = originals.get(entry.id);
+        if (!original) throw new Error("verification target missing from batch");
+        const refusalReason = isDirectiveShapedProjectRule(original.category, original.content)
+            ? "directive-shaped-project-rule"
+            : undefined;
+        if (refusalReason)
             log(
-                `[dreamer] verify safety refusal: memory_id=${a.id} verdict=archive reason=directive-shaped-project-rule`,
+                `[dreamer] verify safety refusal: memory_id=${entry.id} verdict=archive reason=${refusalReason}`,
             );
-            refused += 1;
-            continue;
-        }
-        writes.push({ kind: "archive", id: a.id, reason: a.reason });
-    }
-
-    let verified = 0;
-    let updated = 0;
-    let archived = 0;
-    if (writes.length === 0) return { verified, updated, archived, skipped, refused };
-    if (args.moduleRoute) {
-        const identities = getModuleMemoryIdentities(
-            args.db,
-            args.projectIdentity,
-            writes.map((write) => write.id),
-        );
-        const rows = writes.map((write) => {
-            const identity = identities.get(write.id);
-            if (!identity)
-                throw new DreamerModuleFailureError(
-                    "memory.set_verification",
-                    new Error(`shared memory no longer belongs to the project: ${write.id}`),
-                );
-            return {
-                memory_id: identity.moduleId,
-                content_hash_at_prompt: identity.normalizedHash,
-                verification_status: write.kind === "verify" ? "verified" : write.kind,
-                ...(write.kind === "update" ? { updated_content: write.content } : {}),
-                ...(write.kind === "archive" ? { archive_reason: write.reason } : {}),
-            };
+        writes.push({
+            kind: "archive",
+            id: entry.id,
+            files: await normalizeFiles(args, original.mappedFiles),
+            reason: entry.reason,
+            refusalReason,
         });
-        let response: unknown;
+    }
+    for (const entry of valid.skipped)
+        writes.push({
+            kind: "skipped",
+            id: entry.id,
+            files: await normalizeFiles(args, originals.get(entry.id)?.mappedFiles ?? []),
+            reason: entry.reason,
+        });
+    return commitVerificationWrites(args, batch, writes, checkedCommit);
+}
+
+type VerifyWrite = {
+    kind: MemoryVerificationRequest["kind"];
+    id: number;
+    files: string[];
+    content?: string;
+    reason?: string;
+    refusalReason?: string;
+};
+
+async function commitVerificationWrites(
+    args: VerifyArgs,
+    batch: VerifyPromptMemory[],
+    writes: VerifyWrite[],
+    checkedCommit: string | null,
+): Promise<VerifyVerdictCounts> {
+    const counts = { verified: 0, updated: 0, archived: 0, skipped: 0, refused: 0 };
+    if (!writes.length) return counts;
+    const checkedAt = Date.now();
+    const batchKey = randomUUID();
+    const currentHead = await readGitHead(args.sessionDirectory);
+    const originals = new Map(batch.map((memory) => [memory.id, memory]));
+    const requests: MemoryVerificationRequest[] = writes.map((write) => {
+        const original = originals.get(write.id);
+        if (!original) throw new Error("verification target missing from batch");
+        return {
+            key: `verify:${batchKey}:${write.id}`,
+            projectPath: args.projectIdentity,
+            memoryId: write.id,
+            expectedRevision: original.revision ?? getMemoryRevision(args.db, write.id) ?? 0,
+            contentHashAtPrompt: original.contentHash ?? computeNormalizedHash(original.content),
+            kind: write.kind,
+            files: write.files,
+            checkedCommit,
+            sourceCommitMatches: currentHead === checkedCommit,
+            checkedAt,
+            content: write.content,
+            reason: write.reason,
+            refusalReason: write.refusalReason,
+        };
+    });
+    const count = (result: string, kind: VerifyWrite["kind"], state?: string) => {
+        if (
+            state === "applied" &&
+            kind === "update" &&
+            (result === "updated" || result === "unmapped")
+        )
+            counts.updated += 1;
+        else if (result === "archived" && state === "applied") counts.archived += 1;
+        else if (result === "confirmed") counts.verified += 1;
+        else if (kind === "skipped") counts.skipped += 1;
+        else if (kind !== "failed" && kind !== "unmapped") counts.refused += 1;
+    };
+    if (args.moduleRoute) {
+        const rows = requests.map((request) => ({
+            memory_id: request.memoryId,
+            expected_revision: request.expectedRevision,
+            content_hash_at_prompt: request.contentHashAtPrompt,
+            verification_status: request.kind,
+            files: request.files,
+            checked_commit: request.checkedCommit,
+            source_commit_matches: request.sourceCommitMatches,
+            updated_content: request.content,
+            archive_reason: request.reason,
+            refusal_reason: request.refusalReason,
+        }));
         try {
-            response = await args.moduleRoute.moduleClient.call({
+            const response = await args.moduleRoute.moduleClient.call({
                 sessionId: args.moduleRoute.moduleSessionId,
                 projectRoot: args.moduleRoute.moduleProjectRoot,
                 method: "memory.set_verification",
@@ -706,139 +737,48 @@ async function applyParsedVerifyManifest(
                     name: "memory.set_verification",
                     arguments: {
                         memory_project: args.projectIdentity,
-                        command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256")
-                            .update(rows.map((row) => row.memory_id).join(","))
-                            .digest("hex")
-                            .slice(0, 16)}`,
+                        command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256").update(JSON.stringify(rows)).digest("hex").slice(0, 16)}`,
                         rows,
                     },
                 },
             });
+            const result = ((response as { result?: unknown })?.result ?? response) as {
+                results?: Array<{ memory_id: number; result: string; state?: string }>;
+            };
+            if (!Array.isArray(result?.results) || result.results.length !== requests.length)
+                throw new Error("invalid verification response");
+            for (const request of requests) {
+                const matches = result.results.filter((row) => row.memory_id === request.memoryId);
+                if (matches.length !== 1)
+                    throw new Error("invalid verification response identities");
+                count(matches[0].result, request.kind, matches[0].state);
+            }
         } catch (error) {
             throw new DreamerModuleFailureError("memory.set_verification", error);
         }
-        const result = ((response as { result?: unknown })?.result ?? response) as {
-            accepted?: unknown;
-        };
-        if (!Array.isArray(result?.accepted))
-            throw new DreamerModuleFailureError(
-                "memory.set_verification",
-                new Error("invalid response"),
-            );
-        const accepted = new Set(
-            result.accepted.filter((id): id is number => typeof id === "number"),
-        );
-        for (const write of writes) {
-            const identity = identities.get(write.id);
-            if (!identity || !accepted.has(identity.moduleId)) continue;
-            if (write.kind === "verify") verified += 1;
-            else if (write.kind === "update") updated += 1;
-            else archived += 1;
-        }
-        return { verified, updated, archived, skipped, refused };
-    }
-    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
-        if (!tsOwnsMemory(args.db, args.projectIdentity))
-            throw new ModuleMemoryAuthorityError(args.projectIdentity);
-        for (const w of writes) {
-            const memory = getMemoryById(args.db, w.id);
-            if (!isPrimaryMutable(memory)) continue;
-            if (w.kind === "verify") {
-                recordMemoryVerifications(args.db, w.id, w.files, now);
-                if (verifiedHead) recordVerifiedCommit(args.db, memory, now, verifiedHead);
-                verified += 1;
-            } else if (w.kind === "update") {
-                // memories has UNIQUE(project_path, category, normalized_hash).
-                // A rewrite that lands on another memory's exact content would
-                // throw and roll back the whole batch, so skip it instead. Two
-                // memories saying the same thing is a merge, which verify does
-                // not decide; curate or an agent can merge them.
-                const duplicate = getMemoryByHash(
-                    args.db,
-                    memory.projectPath,
-                    memory.category,
-                    w.hash,
-                );
-                if (duplicate && duplicate.id !== memory.id) {
+    } else {
+        runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
+            for (const request of requests) {
+                const receipt = applyMemoryVerification(args.db, request);
+                if (receipt.reason.startsWith("duplicate_of:"))
                     log(
-                        `[dreamer] verify safety refusal: memory_id=${w.id} verdict=update reason=duplicate-of duplicate_id=${duplicate.id}`,
+                        `[dreamer] verify safety refusal: memory_id=${request.memoryId} verdict=update reason=duplicate-of duplicate_id=${receipt.reason.slice("duplicate_of:".length)}`,
                     );
-                    refused += 1;
-                    continue;
-                }
-                // A gated content correction applies directly with undo history. It
-                // writes no mutation-log row, so it reaches prompts only at the next
-                // natural HARD fold.
-                rewriteMemoryContent(args.db, memory, w.content, w.hash);
-                recordAutomatedMemoryEdit(args.db, {
-                    writer: "verify",
-                    before: memory,
-                    reason: "verify_update",
-                });
-                updated += 1;
-            } else {
-                archiveMemory(args.db, w.id, w.reason);
-                recordAutomatedMemoryEdit(args.db, {
-                    writer: "verify",
-                    before: memory,
-                    reason: w.reason,
-                });
-                archived += 1;
+                count(receipt.verificationResult ?? "failed", request.kind, receipt.state);
             }
-        }
-    });
-    return { verified, updated, archived, skipped, refused };
-}
-
-function recordVerifiedCommit(db: Database, memory: Memory, at: number, head: string): void {
-    let metadata: Record<string, unknown> = {};
-    try {
-        const parsed: unknown = JSON.parse(memory.metadataJson ?? "{}");
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
-            metadata = parsed as Record<string, unknown>;
-    } catch {
-        /* Preserve verification even when old metadata is malformed. */
+        });
     }
-    db.prepare("UPDATE memories SET metadata_json = ? WHERE id = ?").run(
-        JSON.stringify({ ...metadata, dreamerVerifiedAt: at, dreamerVerifiedCommit: head }),
-        memory.id,
-    );
+    return counts;
 }
 
 async function normalizeFiles(args: VerifyArgs, rawFiles: readonly string[]): Promise<string[]> {
     if (rawFiles.length === 0) return [];
-    if (args.normalizeFiles) return args.normalizeFiles(rawFiles);
+    if (args.normalizeFiles) return [...new Set(await args.normalizeFiles(rawFiles))].sort();
     const normalized = await normalizeVerificationFiles({
         cwd: args.sessionDirectory,
         files: rawFiles,
     });
-    return normalized.files;
-}
-
-function isPrimaryMutable(memory: Memory | null): memory is Memory {
-    return (
-        memory !== null &&
-        (memory.status === "active" || memory.status === "permanent") &&
-        memory.supersededByMemoryId === null
-    );
-}
-
-/** Cache-neutral content rewrite (mirrors ctx_memory's in-transaction update):
- *  new content + hash, reset shareable + classified_at (re-scored later by
- *  classify), drop stale embeddings/cache, and clear old file mappings. */
-function rewriteMemoryContent(db: Database, memory: Memory, content: string, hash: string): void {
-    db.prepare(
-        "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-    ).run(content, hash, Date.now(), memory.id);
-    if (hasMemoryShareableColumn(db)) {
-        db.prepare("UPDATE memories SET shareable = 0 WHERE id = ?").run(memory.id);
-    }
-    if (hasMemoryClassifiedAtColumn(db)) {
-        db.prepare("UPDATE memories SET classified_at = NULL WHERE id = ?").run(memory.id);
-    }
-    db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(memory.id);
-    clearMemoryVerifications(db, memory.id);
-    invalidateMemory(memory.projectPath, memory.id);
+    return [...new Set(normalized.files)].sort();
 }
 
 function recordInvocation(
