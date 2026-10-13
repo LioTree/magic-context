@@ -1,0 +1,9 @@
+[
+  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\u001fUppercase rejected\u001fauthor\u001f1700000000\u001fbody\u001e",
+  "\n\ufeffaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001f  Subject  \u001f  author@example.com \u001f 1700000000 \u001f  Body\u001fretained  \u001e\n",
+  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u001fSHA256\u001f\u001f+1700000000suffix\u001f\u001e",
+  "badsha\u001fignored\u001fauthor\u001f1700000000\u001fbody\u001eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fzero\u001fauthor\u001f0\u001fbody\u001eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fnegative\u001fauthor\u001f-123\u001fbody\u001e",
+  "truncated\u001frecord\u001e\u001e\n",
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001f\ufeffTrimmed\ufeff\u001f\ufeff\u001f1700000000\u001f\u0085not JS whitespace\u0085\u001e",
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fEmpty body\u001f\u001f1700000000\u001f \n\t\u001eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fSecond\u001fsecond@example.com\u001f1700000010\u001fline one\n\nline two\u001e"
+]
