@@ -339,3 +339,36 @@ rustColdTest(
 	},
 	1800000,
 );
+
+// Compare with the commit that integrated the default-off hold, before stale-reduce admission.
+test("stale-reduce admission off matches step 1 served bytes and frozen decisions", () => {
+	const root = mkdtempSync(join(tmpdir(), "stale-reduce-off-"));
+	const oracle = join(root, "oracle");
+	mkdirSync(oracle);
+	run(["bash", "-c", 'set -o pipefail; git archive "$1" | tar -x -C "$2"', "--", "346def281635ea71d796e996b2672972edc5cafc", oracle], repository);
+	for (const name of ["plugin", "pi-plugin", "retina-local-fs"])
+		symlinkSync(join(repository, "packages", name, "node_modules"), join(oracle, "packages", name, "node_modules"));
+	const driver = "scripts/signed-thinking-hold-cold-corpus.ts";
+	copyFileSync(join(repository, driver), join(oracle, driver));
+	const capture = (source: string, label: string) => {
+		const home = join(root, label);
+		mkdirSync(home);
+		const output = join(root, `${label}.json`);
+		run(["bun", driver], source, {
+			HOME: home,
+			XDG_CONFIG_HOME: join(home, "config"),
+			XDG_DATA_HOME: join(home, "data"),
+			MC_HOLD_CORPUS_ROOT: join(root, "projects"),
+			MC_HOLD_CORPUS_OUTPUT: output,
+			MC_HOLD_HARNESS: "opencode",
+			MC_HOLD_SETTING: "off",
+			MC_HOLD_STALE_CORPUS: "1",
+		});
+		return JSON.parse(readFileSync(output, "utf8"));
+	};
+	const expected = capture(oracle, "step1");
+	const actual = capture(repository, "step2");
+	expect(actual).toEqual(expected);
+	expect(actual.served).not.toContain('"tool":"ctx_reduce"');
+	expect(JSON.stringify(actual.decisions)).toContain("stale-reduce");
+}, 60000);

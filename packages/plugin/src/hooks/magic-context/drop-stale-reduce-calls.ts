@@ -118,6 +118,8 @@ export function dropStaleReduceCalls(
         protectedCount?: number;
         /** Per-tool keep counts apply on first stripping a call, not when replaying a saved strip. */
         protectedCallIds?: ReadonlySet<string>;
+        /** Admit the first reduce part before editing or freezing any part of this message. */
+        admitFirstApplication?: (message: MessageLike, partIndex: number) => boolean;
         /** Reports only newly edited locations, never frozen-id replay. */
         onFirstApplication?: (message: MessageLike, partIndex: number) => void;
     } = {},
@@ -151,6 +153,13 @@ export function dropStaleReduceCalls(
 
         if (!inFrozen && !isNewDetection) continue;
 
+        if (isNewDetection) {
+            const firstReducePart = message.parts.findIndex(
+                (part) => !isSentinel(part) && isReduceToolPart(part),
+            );
+            if (options.admitFirstApplication?.(message, firstReducePart) === false) continue;
+        }
+
         const touched = sentinelizeReduceParts(
             message,
             isNewDetection ? options.onFirstApplication : undefined,
@@ -162,4 +171,12 @@ export function dropStaleReduceCalls(
     }
 
     return { didDrop, newlyStrippedIds };
+}
+
+/** Return the new-strip admission callback only when signed_thinking_hold is enabled. */
+export function gateStaleReduceAdmission(
+    enabled: boolean,
+    admit: (message: MessageLike, partIndex: number) => boolean,
+): ((message: MessageLike, partIndex: number) => boolean) | undefined {
+    return enabled ? admit : undefined;
 }

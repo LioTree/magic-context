@@ -117,6 +117,13 @@ const raw: (MessageLike | PiMessage)[] =
 // Put enough tool results after the long text to age it out of recent protection,
 // while leaving it after the signed-thinking block. No transform has run yet,
 // so there is still no cached m[0]/m[1] pair when cleanup first sees that text.
+if (harness === "opencode" && process.env.MC_HOLD_STALE_CORPUS === "1") {
+	ids.splice(1, 0, "stale-reduce");
+	raw.splice(1, 0, {
+		info: { id: "stale-reduce", role: "assistant", sessionID: sid },
+		parts: [{ type: "tool", tool: "ctx_reduce", callID: "stale-call", state: { status: "completed", input: { drop: "1" }, output: "Queued" } }],
+	});
+}
 for (let index = 0; index < 20; index++) {
 	const mid = `tail-${index}`;
 	const call = `read-${index}`;
@@ -165,6 +172,7 @@ if (harness === "opencode") {
 		db,
 		tagger: createTagger(),
 		signedThinkingHold: hold,
+		protectedTools: process.env.MC_HOLD_STALE_CORPUS === "1" ? { ctx_reduce: 0 } : undefined,
 		storeGeneration: "v2",
 		scheduler: { shouldExecute: () => "defer" } as never,
 		liveModelBySession: new Map([
