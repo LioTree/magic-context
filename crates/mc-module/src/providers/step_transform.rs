@@ -1641,16 +1641,21 @@ mod host_tests {
         for (channel, session) in [(7, "s"), (8, "t")] {
             h.bind_route(
                 channel,
-                SessionBinding { connection_incarnation: 0, native_generation: None, principal: None, project_root: dir.into(),
-                harness: "opencode".into(),
-                session: session.into(),
-                model_key: None,
-                config: McModuleConfig {
-                    inject_docs: false,
-                    memory_enabled: false,
-                    ..Default::default()
+                SessionBinding {
+                    connection_incarnation: 0,
+                    native_generation: None,
+                    principal: None,
+                    project_root: dir.into(),
+                    harness: "opencode".into(),
+                    session: session.into(),
+                    model_key: None,
+                    config: McModuleConfig {
+                        inject_docs: false,
+                        memory_enabled: false,
+                        ..Default::default()
+                    },
+                    history_budget_tokens: 4000.0,
                 },
-                history_budget_tokens: 4000.0, },
             );
         }
         h

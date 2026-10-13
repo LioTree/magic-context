@@ -480,37 +480,76 @@ async fn cc_original_inbound_envelope_size_is_checked_before_normalized_params()
     );
 }
 
-#[tokio::test(flavor="current_thread")]
+#[tokio::test(flavor = "current_thread")]
 async fn cc_without_fill_uses_request_estimate_and_soft_geometry_and_folds() {
-    let dir=tempfile::tempdir().unwrap(); let h=handler(dir.path(),thalamus());
-    let mut b=binding(dir.path(),thalamus()); b.config.execute_threshold_percentage=65.0; h.bind_route(7,b);
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    let mut b = binding(dir.path(), thalamus());
+    b.config.execute_threshold_percentage = 65.0;
+    h.bind_route(7, b);
     setup(&h).await;
-    let mut status=step(r#"{"role":"user","content":"history"}"#);
+    let mut status = step(r#"{"role":"user","content":"history"}"#);
     status["messages"].as_array_mut().unwrap().push(json!({"mid":"tail","ordinal":1,"message":{"role":"user","content":"tail"},"raw_message":r#"{"role":"user","content":"tail"}"#}));
-    status["newest"]=json!({"mid":"tail","ordinal":1}); status["prefix_rebuilding"]=json!({"reason":"pipeline_switch"});
-    status["geometry"]=json!({"usable_soft":50000,"usable_hard":60000,"absolute_wall":100000,"derivation":"gateway"});
-    let first=response(call(&h,"compaction.step",status.clone()).await);
-    let key=Key::new(&h.facade_binding(7).unwrap(),"cc","claude-code").unwrap(); let store=h.store.get().unwrap();
-    store.replace_compartments(&key.engine_key(),&[mc_store::StoredCompartment { sequence:1,start_message:0,end_message:0,end_message_id:"m#0".into(),title:"history".into(),content:"fold without fill".into(),p1:Some("fold without fill".into()),importance:50,..Default::default() }]).unwrap();
+    status["newest"] = json!({"mid":"tail","ordinal":1});
+    status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+    status["geometry"] = json!({"usable_soft":50000,"usable_hard":60000,"absolute_wall":100000,"derivation":"gateway"});
+    let first = response(call(&h, "compaction.step", status.clone()).await);
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    let store = h.store.get().unwrap();
+    store
+        .replace_compartments(
+            &key.engine_key(),
+            &[mc_store::StoredCompartment {
+                sequence: 1,
+                start_message: 0,
+                end_message: 0,
+                end_message_id: "m#0".into(),
+                title: "history".into(),
+                content: "fold without fill".into(),
+                p1: Some("fold without fill".into()),
+                importance: 50,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
     status.as_object_mut().unwrap().remove("prefix_rebuilding");
-    if first["answer"]=="compaction_message" { status["last_applied"]=json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]}); }
-    for (tokens,soft,hard) in [(40000,80.0,40000.0/60000.0*100.0),(44000,88.0,44000.0/60000.0*100.0),(58000,116.0,58000.0/60000.0*100.0)] {
-        status["request_id"]=json!(format!("estimate-{tokens}")); status["estimate"]["request_tokens"]=json!(tokens);
-        assert!(status.get("fill").is_none()); assert!(status.get("previous_usage").is_none());
-        let answer=response(call(&h,"compaction.step",status.clone()).await);
-        let actual=transform::compaction::LAST_NATIVE_PRESSURE.with(|slot|slot.borrow_mut().take()).unwrap();
-        assert!((actual.0-soft).abs()<0.001); assert!((actual.1-hard).abs()<0.001);
-        if tokens==40000 { assert_eq!(answer["answer"],"compaction_message"); assert!(answer.to_string().contains("fold without fill")); }
+    if first["answer"] == "compaction_message" {
+        status["last_applied"] = json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
+    }
+    for (tokens, soft, hard) in [
+        (40000, 80.0, 40000.0 / 60000.0 * 100.0),
+        (44000, 88.0, 44000.0 / 60000.0 * 100.0),
+        (58000, 116.0, 58000.0 / 60000.0 * 100.0),
+    ] {
+        status["request_id"] = json!(format!("estimate-{tokens}"));
+        status["estimate"]["request_tokens"] = json!(tokens);
+        assert!(status.get("fill").is_none());
+        assert!(status.get("previous_usage").is_none());
+        let answer = response(call(&h, "compaction.step", status.clone()).await);
+        let actual = transform::compaction::LAST_NATIVE_PRESSURE
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap();
+        assert!((actual.0 - soft).abs() < 0.001);
+        assert!((actual.1 - hard).abs() < 0.001);
+        if tokens == 40000 {
+            assert_eq!(answer["answer"], "compaction_message");
+            assert!(answer.to_string().contains("fold without fill"));
+        }
     }
 }
 
-#[tokio::test(flavor="current_thread")]
+#[tokio::test(flavor = "current_thread")]
 async fn cc_raw_history_size_does_not_silently_replace_the_supplied_pressure_estimate() {
-    let dir=tempfile::tempdir().unwrap(); let h=handler(dir.path(),thalamus()); setup(&h).await;
-    let raw=json!({"role":"user","content":"not a measured sample ".repeat(6000)}).to_string();
-    assert!(mc_tokenizer::estimate_tokens(&raw)>10000);
-    let mut status=step(&raw); status["geometry"]=json!({"usable_soft":50000,"usable_hard":60000,"absolute_wall":100000,"derivation":"gateway"});
-    response(call(&h,"compaction.step",status).await);
-    let pressure=transform::compaction::LAST_NATIVE_PRESSURE.with(|slot|slot.borrow_mut().take()).unwrap();
-    assert!((pressure.0-0.002).abs()<0.000001);
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    setup(&h).await;
+    let raw = json!({"role":"user","content":"not a measured sample ".repeat(6000)}).to_string();
+    assert!(mc_tokenizer::estimate_tokens(&raw) > 10000);
+    let mut status = step(&raw);
+    status["geometry"] = json!({"usable_soft":50000,"usable_hard":60000,"absolute_wall":100000,"derivation":"gateway"});
+    response(call(&h, "compaction.step", status).await);
+    let pressure = transform::compaction::LAST_NATIVE_PRESSURE
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap();
+    assert!((pressure.0 - 0.002).abs() < 0.000001);
 }

@@ -65,12 +65,17 @@ pub(super) fn head_slots(
 mod tests {
     use super::*;
     fn binding() -> SessionBinding {
-        SessionBinding { connection_incarnation: 0, native_generation: None, principal: None, project_root: PathBuf::from("/fixture"),
-        harness: "claude-code".into(),
-        session: "cc".into(),
-        model_key: None,
-        config: McModuleConfig::default(),
-        history_budget_tokens: 4000.0, }
+        SessionBinding {
+            connection_incarnation: 0,
+            native_generation: None,
+            principal: None,
+            project_root: PathBuf::from("/fixture"),
+            harness: "claude-code".into(),
+            session: "cc".into(),
+            model_key: None,
+            config: McModuleConfig::default(),
+            history_budget_tokens: 4000.0,
+        }
     }
     #[test]
     fn marker_intents_preserve_absent_provider_default_and_authored() {

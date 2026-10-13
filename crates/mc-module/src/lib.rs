@@ -3940,7 +3940,8 @@ pub struct McHandler {
     native_route_plans: Mutex<HashMap<u16, providers::NativeConnectionPlan>>,
     native_connection_sequence: std::sync::atomic::AtomicU64,
     #[cfg(test)]
-    native_bundle_override: Mutex<Option<cortexkit_role_step_transform_provider::claude_code::ClaudeCodeCapabilities>>,
+    native_bundle_override:
+        Mutex<Option<cortexkit_role_step_transform_provider::claude_code::ClaudeCodeCapabilities>>,
     threshold_logged_routes: Mutex<HashSet<u16>>,
     /// Per-project evaluator capability asserted by the host's state-sync payload. Absence is
     /// fail-closed so a Rust-authority smart note cannot become permanently pending.
@@ -5096,8 +5097,14 @@ impl McHandler {
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
     fn bind_route(&self, channel: u16, mut binding: SessionBinding) {
-        binding.connection_incarnation = self.native_connection_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed)+1;
-        self.native_route_plans.lock().expect("native route plans mutex").remove(&channel);
+        binding.connection_incarnation = self
+            .native_connection_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.native_route_plans
+            .lock()
+            .expect("native route plans mutex")
+            .remove(&channel);
         DISPATCH_HEALTH.route_open(channel);
         self.threshold_logged_routes
             .lock()
@@ -5527,7 +5534,10 @@ impl McHandler {
 
     /// Remove a route and evict process-local session state after its final binding closes.
     fn unbind_route(&self, channel: u16) {
-        self.native_route_plans.lock().expect("native route plans mutex").remove(&channel);
+        self.native_route_plans
+            .lock()
+            .expect("native route plans mutex")
+            .remove(&channel);
         self.threshold_logged_routes
             .lock()
             .expect("threshold log mutex")
@@ -14989,14 +14999,19 @@ impl ModuleHandler for McHandler {
         let config = self.effective_config(&req.identity.project_root);
         self.bind_route(
             req.handle.channel,
-            SessionBinding { connection_incarnation: 0, native_generation: None, principal: req.principal.clone(), project_root: req.identity.project_root.clone(),
-            harness: req.identity.harness.clone(),
-            session: req.identity.session.clone(),
-            model_key: None,
-            config,
-            // Older callers may omit the per-pass budget. Keep a safe fallback on the
-            // route, while authority requests carry the harness-resolved value.
-            history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS, },
+            SessionBinding {
+                connection_incarnation: 0,
+                native_generation: None,
+                principal: req.principal.clone(),
+                project_root: req.identity.project_root.clone(),
+                harness: req.identity.harness.clone(),
+                session: req.identity.session.clone(),
+                model_key: None,
+                config,
+                // Use the default until a request supplies the history budget
+                // computed by the harness for that pass.
+                history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+            },
         );
         self.record_route_role_versions(req.handle.channel, req.role_versions.as_ref());
         subc_client_rs::BindDecision::accept()
@@ -21627,12 +21642,17 @@ mod tests {
     }
 
     fn binding_with_harness(root: &str, harness: &str, session: &str) -> SessionBinding {
-        SessionBinding { connection_incarnation: 0, native_generation: None, principal: None, project_root: PathBuf::from(root),
-        harness: harness.to_string(),
-        session: session.to_string(),
-        model_key: None,
-        config: default_test_config(),
-        history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS, }
+        SessionBinding {
+            connection_incarnation: 0,
+            native_generation: None,
+            principal: None,
+            project_root: PathBuf::from(root),
+            harness: harness.to_string(),
+            session: session.to_string(),
+            model_key: None,
+            config: default_test_config(),
+            history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+        }
     }
 
     // Diagnostic driver: replays captured module-request JSONs from a dump directory

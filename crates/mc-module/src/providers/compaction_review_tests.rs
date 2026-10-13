@@ -46,19 +46,24 @@ fn fixture(
     let mut handler = McHandler::new();
     handler.store.set(store.clone()).ok().unwrap();
     handler.provider_runner = runner.clone();
-    let binding = SessionBinding { connection_incarnation: 0, native_generation: None, principal: None, project_root: dir.into(),
-    harness: "opencode".into(),
-    session: "s".into(),
-    model_key: None,
-    history_budget_tokens: 4000.0,
-    config: McModuleConfig {
-        inject_docs: false,
-        memory_enabled: false,
-        protected_tokens_user: Some(0),
-        protected_tools: BTreeMap::new(),
-        cache_ttl: "10m".into(),
-        ..Default::default()
-    }, };
+    let binding = SessionBinding {
+        connection_incarnation: 0,
+        native_generation: None,
+        principal: None,
+        project_root: dir.into(),
+        harness: "opencode".into(),
+        session: "s".into(),
+        model_key: None,
+        history_budget_tokens: 4000.0,
+        config: McModuleConfig {
+            inject_docs: false,
+            memory_enabled: false,
+            protected_tokens_user: Some(0),
+            protected_tools: BTreeMap::new(),
+            cache_ttl: "10m".into(),
+            ..Default::default()
+        },
+    };
     let key = Key::new(&binding, "s", "opencode").unwrap();
     (handler, binding, store, key, runner)
 }

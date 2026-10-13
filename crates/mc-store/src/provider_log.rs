@@ -33,17 +33,26 @@ impl From<rusqlite::Error> for ProviderError {
 
 impl ProviderSessionKey {
     pub fn conversation_key(&self) -> String {
-        if let Some(generation)=&self.generation {
-            serde_json::to_string(&(&self.project_root,&self.session,&self.harness,&generation.profile,&generation.provider)).unwrap()
-        } else { serde_json::to_string(&(&self.project_root, &self.session, &self.harness)).unwrap() }
+        if let Some(generation) = &self.generation {
+            serde_json::to_string(&(
+                &self.project_root,
+                &self.session,
+                &self.harness,
+                &generation.profile,
+                &generation.provider,
+            ))
+            .unwrap()
+        } else {
+            serde_json::to_string(&(&self.project_root, &self.session, &self.harness)).unwrap()
+        }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderConversation {
-    #[serde(default, skip_serializing_if="Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_pins_json: Option<String>,
-    #[serde(default, skip_serializing_if="Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_plan_json: Option<String>,
     pub lineage_id: String,
     pub preset: Option<String>,
@@ -1487,9 +1496,12 @@ mod lineage_metadata_tests {
             },
         })
         .unwrap();
-        let key = ProviderSessionKey { generation: None, project_root: "/project".into(),
-        session: "session".into(),
-        harness: "opencode".into(), };
+        let key = ProviderSessionKey {
+            generation: None,
+            project_root: "/project".into(),
+            session: "session".into(),
+            harness: "opencode".into(),
+        };
         let root = ProviderLineage {
             lineage_id: "root".into(),
             first_ordinal: 4_000,
@@ -1537,9 +1549,12 @@ mod policy_tests {
             },
         })
         .unwrap();
-        let key = ProviderSessionKey { generation: None, project_root: "/project".into(),
-        session: "s".into(),
-        harness: "opencode".into(), };
+        let key = ProviderSessionKey {
+            generation: None,
+            project_root: "/project".into(),
+            session: "s".into(),
+            harness: "opencode".into(),
+        };
         store
             .save_provider_conversation(
                 &key,
@@ -1579,8 +1594,11 @@ mod policy_tests {
             Some("engine#0".into())
         );
         assert_eq!(store.provider_engine_tag_block(&key, 2).unwrap(), None);
-        let foreign_project = ProviderSessionKey { generation: None, project_root: "/another-project".into(),
-        ..key.clone() };
+        let foreign_project = ProviderSessionKey {
+            generation: None,
+            project_root: "/another-project".into(),
+            ..key.clone()
+        };
         assert_eq!(
             store
                 .provider_engine_tag_block(&foreign_project, 1)

@@ -1912,18 +1912,23 @@ mod host_tests {
         let mut handler = McHandler::new();
         handler.store.set(store.clone()).ok().unwrap();
         handler.provider_runner = runner;
-        let binding = SessionBinding { connection_incarnation: 0, native_generation: None, principal: None, project_root: dir.into(),
-        harness: "opencode".into(),
-        session: "s".into(),
-        model_key: None,
-        history_budget_tokens: 4000.0,
-        config: McModuleConfig {
-            inject_docs: false,
-            memory_enabled: false,
-            protected_tokens_user: Some(0),
-            protected_tools: BTreeMap::new(),
-            ..Default::default()
-        }, };
+        let binding = SessionBinding {
+            connection_incarnation: 0,
+            native_generation: None,
+            principal: None,
+            project_root: dir.into(),
+            harness: "opencode".into(),
+            session: "s".into(),
+            model_key: None,
+            history_budget_tokens: 4000.0,
+            config: McModuleConfig {
+                inject_docs: false,
+                memory_enabled: false,
+                protected_tokens_user: Some(0),
+                protected_tools: BTreeMap::new(),
+                ..Default::default()
+            },
+        };
         handler.bind_route(7, binding.clone());
         let key = Key::new(&binding, "s", "opencode").unwrap();
         (handler, binding, store, key)
@@ -3675,12 +3680,7 @@ mod terminal_refusal_tests {
             );
             assert_eq!(reason,"The tool results kept by protected_tools are larger than this model's context window, so this turn was not sent. Lower the protected_tools counts.");
         }
-        let key = Key::new(
-            &h.facade_binding(7).unwrap(),
-            "cc",
-            "claude-code",
-        )
-        .unwrap();
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
         let store = h.store.get().unwrap();
         assert!(store
             .load_provider_view(&key.store_key(), 2)

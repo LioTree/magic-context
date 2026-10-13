@@ -28,10 +28,10 @@ use codec::{checked_view, decode_message};
 #[cfg(test)]
 use codec::{encode_message, validate_replacement};
 pub(crate) use historian::RunCompletion;
+pub(crate) use native_plan::NativeConnectionPlan;
 use records::{frontier, ingest, scan, HookRecord, HookState, Key, Record, Setup};
 pub(crate) use records::{Catalog, Storage};
 use step_transform::declaration;
-pub(crate) use native_plan::NativeConnectionPlan;
 
 pub const HOOK_BUDGET_MS: u64 = 1_500;
 const HOST_ENVELOPE_BYTES: usize = hooks::hook::DEFAULT_HOOK_CAP_BYTES;
@@ -299,8 +299,16 @@ impl McHandler {
                 }
             }
             if attested_claude_code(&binding) {
-                binding = match self.admit_native_plan(channel,&binding,method,params).await { Ok(binding)=>binding, Err(error)=>return error };
-            } else if let Err(error) = self.admit_host_plan(&binding, method, params).await { return error; }
+                binding = match self
+                    .admit_native_plan(channel, &binding, method, params)
+                    .await
+                {
+                    Ok(binding) => binding,
+                    Err(error) => return error,
+                };
+            } else if let Err(error) = self.admit_host_plan(&binding, method, params).await {
+                return error;
+            }
         }
         if method == "transform.declare" {
             return match declaration(params).and_then(|d| bytes(&d)) {

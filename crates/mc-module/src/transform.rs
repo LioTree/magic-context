@@ -5208,13 +5208,14 @@ fn apply_once(
         Some(&mut m1_revision_read_timings),
     )?;
     let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
-    let context_limit_tokens = if req.serializer_profile == "claude-code-anthropic" && req.geometry.is_some() {
-        req.geometry.as_ref().expect("native geometry").usable_soft as f64
-    } else if req.kind == compaction::PASS_KIND || compaction::host_pass(req) {
-        effective_usage.context_limit_tokens as f64
-    } else {
-        effective_context_limit_tokens(&effective_usage, req.geometry.as_ref())
-    };
+    let context_limit_tokens =
+        if req.serializer_profile == "claude-code-anthropic" && req.geometry.is_some() {
+            req.geometry.as_ref().expect("native geometry").usable_soft as f64
+        } else if req.kind == compaction::PASS_KIND || compaction::host_pass(req) {
+            effective_usage.context_limit_tokens as f64
+        } else {
+            effective_context_limit_tokens(&effective_usage, req.geometry.as_ref())
+        };
     let hard_context_limit_tokens =
         effective_hard_context_limit_tokens(req.geometry.as_ref(), context_limit_tokens);
     let usage_input_tokens = effective_usage.current_total_input_tokens as f64;
@@ -5229,7 +5230,10 @@ fn apply_once(
         usage_percentage
     };
     #[cfg(test)]
-    if req.serializer_profile == "claude-code-anthropic" { compaction::LAST_NATIVE_PRESSURE.with(|slot| *slot.borrow_mut()=Some((usage_percentage,hard_wall_usage_percentage))); }
+    if req.serializer_profile == "claude-code-anthropic" {
+        compaction::LAST_NATIVE_PRESSURE
+            .with(|slot| *slot.borrow_mut() = Some((usage_percentage, hard_wall_usage_percentage)));
+    }
     // A legacy row with no frozen publication floor receives no estimator-derived tolerance on a
     // replay pass. If a real gap exists, the conservative recut is already HARD and backfills the
     // floor atomically; an ordinary defer remains tokenizer-free until a natural HARD arrives.

@@ -18,9 +18,12 @@ fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
 }
 
 fn key() -> ProviderSessionKey {
-    ProviderSessionKey { generation: None, project_root: "/review".into(),
-    session: "s".into(),
-    harness: "opencode".into(), }
+    ProviderSessionKey {
+        generation: None,
+        project_root: "/review".into(),
+        session: "s".into(),
+        harness: "opencode".into(),
+    }
 }
 
 fn lineage() -> ProviderLineage {
@@ -79,8 +82,7 @@ fn count(store: &McStore, sql: &str) -> i64 {
     scalar(store, sql)
 }
 
-/// Writes through the public provider APIs a version-67 binary offers: a
-/// conversation, an admitted pass with messages and policy parts, and a hook.
+/// Populate a current store through its public provider writer.
 fn populate(store: &McStore) {
     store
         .save_provider_conversation(
@@ -117,6 +119,26 @@ fn populate(store: &McStore) {
         )
         .unwrap();
     hook(store, None);
+}
+
+/// Seed the historical schema directly: current writers require generation
+/// columns that did not exist in version 67. The upgrade must preserve these
+/// conversation, lineage, message and policy rows without new-format writes.
+fn populate_v67(store: &McStore) {
+    store.inner.with_conn_fenced(|tx| {
+        let key = key();
+        let conv = key.conversation_key();
+        tx.execute("INSERT INTO mc_provider_conversations_v2(conv_key,project_root,session,harness,lineage_id,engine_namespace) VALUES(?1,?2,?3,?4,'L','s')", params![conv,key.project_root,key.session,key.harness])?;
+        tx.execute("INSERT INTO mc_provider_lineages_v1(conv_key,lineage_id,first_ordinal,session) VALUES(?1,'L',1,?2)", params![conv,key.session])?;
+        for ordinal in 1..=3u64 {
+            let mid = format!("m{ordinal}");
+            tx.execute("INSERT INTO mc_provider_messages_v1 VALUES(?1,'L',?2,?3,?4,?5)", params![conv,ordinal,mid,b"{}".as_slice(),key.session])?;
+            for policy in [part(&mid,ordinal,0,None),part(&mid,ordinal,1,Some(ordinal as i64))] {
+                tx.execute("INSERT INTO mc_provider_policy_parts_v1 VALUES(?1,'L',?2,?3,?4,?5)", params![conv,ordinal,policy.block_id,serde_json::to_string(&policy).unwrap(),key.session])?;
+            }
+        }
+        Ok(())
+    }).unwrap();
 }
 
 /// One hook that stores `summary` (or keeps the stored one when `None`).
@@ -172,7 +194,7 @@ fn migration_68_steps_a_populated_v67_provider_store_and_fences_v67() {
     let before = {
         let older = McStore::open_with_migrations(&descriptor, false, &chain_67).unwrap();
         assert_eq!(older.module_store_schema_version().unwrap(), 67);
-        populate(&older);
+        populate_v67(&older);
         assert_eq!(
             count(&older, "SELECT count(*) FROM sqlite_master WHERE name LIKE 'mc_provider_policy_summar%' OR name LIKE 'mc_provider_policy_change%'"),
             0
@@ -259,7 +281,16 @@ fn migration_68_steps_a_populated_v67_provider_store_and_fences_v67() {
     );
 
     // A summary stored by a hook turns logging on; the first pre-change copy is kept.
-    hook(&current, Some(r#"{"probe":true}"#));
+    current
+        .inner
+        .with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO mc_provider_policy_summaries_v1 VALUES(?1,?2,?3)",
+                params![key().conversation_key(), r#"{"probe":true}"#, key().session],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(
         count(
             &current,

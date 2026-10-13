@@ -64,17 +64,22 @@ fn handler(dir: &Path, runner: Arc<Runner>) -> McHandler {
     for (channel, session) in [(7, "project-route"), (8, "s"), (9, "unknown")] {
         handler.bind_route(
             channel,
-            SessionBinding { connection_incarnation: 0, native_generation: None, principal: None, project_root: dir.to_path_buf(),
-            harness: session_resolver::RUNNER_BIND_HARNESS.into(),
-            session: session.into(),
-            model_key: None,
-            config: McModuleConfig {
-                inject_docs: false,
-                protected_tokens_user: Some(0),
-                protected_tools: BTreeMap::new(),
-                ..Default::default()
+            SessionBinding {
+                connection_incarnation: 0,
+                native_generation: None,
+                principal: None,
+                project_root: dir.to_path_buf(),
+                harness: session_resolver::RUNNER_BIND_HARNESS.into(),
+                session: session.into(),
+                model_key: None,
+                config: McModuleConfig {
+                    inject_docs: false,
+                    protected_tokens_user: Some(0),
+                    protected_tools: BTreeMap::new(),
+                    ..Default::default()
+                },
+                history_budget_tokens: 4_000.0,
             },
-            history_budget_tokens: 4_000.0, },
         );
     }
     handler
