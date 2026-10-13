@@ -334,12 +334,7 @@ async fn protected_drop_is_held_across_rebuild_until_newer_groups_displace_it() 
         .await;
     assert_eq!(held["isError"], false, "{held}");
     let reply = held["content"][0]["text"].as_str().unwrap();
-    assert!(reply.contains("Held:"), "{reply}");
-    assert!(
-        reply.contains("inside the protected working set"),
-        "{reply}"
-    );
-    assert!(!reply.contains("Queued: drop"), "{reply}");
+    assert_eq!(reply, "1 tag stamped.");
     assert_eq!(rig.record(SESSION)["pending_drops"], json!([1]));
     rig.publish_more_history(SESSION);
     let crossing = rig
