@@ -172,6 +172,7 @@ describe("signed-thinking s03a review: Pi", () => {
 			)!;
 			expect(guarded.get(tag.tagNumber)?.thinkingRewriteProtected).toBe(true);
 			const result = applyPiHeuristicCleanup(sessionId, db, guarded, messages, {
+				signedThinkingHold: "off",
 				protectedTags: 0,
 				staleReduceStripEnabled: false,
 			});
@@ -262,7 +263,11 @@ describe("signed-thinking s03a review: Pi", () => {
 				db,
 				refusing,
 				messages,
-				{ protectedTags: 0, staleReduceStripEnabled: false },
+				{
+					protectedTags: 0,
+					staleReduceStripEnabled: false,
+					signedThinkingHold: "off",
+				},
 			);
 			expect(result.droppedInjections).toBe(0);
 			expect(
@@ -452,7 +457,11 @@ function requestWire(messages: PiMessage[]): Wire {
 	});
 }
 
-async function historyFixture(sessionId: string, legacy = false) {
+async function historyFixture(
+	sessionId: string,
+	legacy = false,
+	signedThinkingHold: "off" | "on" = "on",
+) {
 	const db = createTestDb();
 	getOrCreateSessionMeta(db, sessionId);
 	updateSessionMeta(db, sessionId, {
@@ -474,6 +483,7 @@ async function historyFixture(sessionId: string, legacy = false) {
 	const register = () =>
 		registerPiContextHandler(fake.pi as never, {
 			db,
+			signedThinkingHold,
 			protectedTokens: 4000,
 			onPostprocess: (result) => {
 				busted = result.bustedThisPass;
@@ -567,7 +577,7 @@ async function historyFixture(sessionId: string, legacy = false) {
 
 describe("signed-thinking s03a review: Pi stable-id migration", () => {
 	test("handler stable-id migration preserves a sent placeholder under thinking", async () => {
-		const f = await historyFixture("s03a-handler-cutover", true);
+		const f = await historyFixture("s03a-handler-cutover", true, "off");
 		try {
 			const before = await f.pass();
 			expect(f.mock.check(requestWire(before.messages))).toBeNull();

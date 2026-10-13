@@ -1,4 +1,5 @@
-//! Opt-in tests for system-text stripping profile scope and protection before signed thinking.
+//! Set MC_S03A_REVIEW=1 to check which serializer profiles strip system text and
+//! whether newly frozen removals preserve the prefix before signed thinking.
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 use mc_module::config::CacheTtlProvenance;
 use mc_module::transform::{transform, ProducerContext, TransformRequest};
@@ -25,6 +26,7 @@ fn context() -> ProducerContext<'static> {
         protected_tokens_floor: 4_000,
         protected_tokens_provenance: "config",
         compaction_enabled: true,
+        signed_thinking_hold: mc_module::config::SignedThinkingHold::On,
         smart_drops: false,
         protected_tools: Default::default(),
         cache_ttl: "5m".into(),

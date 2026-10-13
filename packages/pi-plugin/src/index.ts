@@ -1495,6 +1495,7 @@ async function startPiMagicContextRuntime(
 		db: database,
 		cacheTtlConfig: cfg.cache_ttl,
 		cacheTtlConfigured: cfg.cacheTtlConfigured,
+		signedThinkingHold: cfg.signed_thinking_hold,
 		protectedTools: cfg.protected_tools,
 		protectedTokens: cfg.protected_tokens,
 		protectedTokenTierOverrides: getProtectedTokensTierOverrides(cfg) ?? {},

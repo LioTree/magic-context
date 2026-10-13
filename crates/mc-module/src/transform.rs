@@ -570,6 +570,8 @@ struct LegacyCkItemWire {
 /// transform. Production ALWAYS supplies it; it carries the render inputs (budget,
 /// expiry cutoff) so the frozen render decision preserves them and later passes replay identical bytes.
 pub struct ProducerContext<'a> {
+    /// Resolved from trusted user configuration, never from a project or transcript.
+    pub signed_thinking_hold: crate::config::SignedThinkingHold,
     /// The project identity the store reads key off (memories, mutation log, workspace).
     pub project_path: &'a str,
     /// The note owner key resolved for this route's notes authority. Keeping it separate
@@ -5596,22 +5598,34 @@ fn apply_once(
     // below can authorize new provider-visible mutations.
     // Subagents execute a reductions-only branch, not the prefix plan. Inherited
     // HARD/reconcile advisories cannot price automatic reductions without a fold.
-    // On a signed-thinking reset retry the admission reads the reset's strip units too, so
-    // no stripped thinking block is still treated as kept.
-    let admission = edit_admission_for_request(planning_core, req);
-    let protected_signed_prefix = !admission.admit(crate::edit_admission::EditCoord::Prefix);
+    // Reset retries include persisted omissions, so removed signatures do not hold the prefix.
+    let retained_admission = edit_admission_for_request(planning_core, req);
+    let protected_signed_prefix =
+        !retained_admission.admit(crate::edit_admission::EditCoord::Prefix);
+    let hold_enabled = ctx.signed_thinking_hold == crate::config::SignedThinkingHold::On;
+    let admission = if hold_enabled {
+        retained_admission
+    } else {
+        crate::edit_admission::EditAdmission::new(&[], false)
+    };
     // For models whose signatures bind thinking to preceding bytes, Anthropic rejects
     // changes before a resent block. The Claude Code serializer keeps completed-turn
     // blocks, so releasing a parked /ctx-flush at the next user turn would be rejected.
     // Rollout step 8 in docs/designs/signed-thinking-hold.md removes completed-turn
     // thinking before parking withheld flushes. Until then, consume flushes without parking.
-    let trigger_holds_enabled = serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic);
-    let mut held_release = HeldRelease::from_meta(&loaded.meta);
-    held_release.cancel_inactive(
-        loaded.meta.soft_refresh_pending,
-        usage_percentage,
-        ctx.execute_threshold_percentage,
-    );
+    let trigger_holds_enabled =
+        hold_enabled && serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic);
+    let mut held_release = if trigger_holds_enabled {
+        let mut release = HeldRelease::from_meta(&loaded.meta);
+        release.cancel_inactive(
+            loaded.meta.soft_refresh_pending,
+            usage_percentage,
+            ctx.execute_threshold_percentage,
+        );
+        release
+    } else {
+        HeldRelease::default()
+    };
     let flush_armed = loaded.meta.soft_refresh_pending
         && !(trigger_holds_enabled && protected_signed_prefix && held_release.has("soft_refresh"));
     let prefix_materialization_enabled = !req.is_subagent && !protected_signed_prefix;
@@ -8009,7 +8023,7 @@ fn apply_once(
             (unit.key.starts_with("red:")
                 || unit.key.starts_with(CAV_KEY_PREFIX)
                 || (unit.key.starts_with("strip:")
-                    && !unit.key.starts_with("strip:trailing_blank_")
+                    && (!hold_enabled || !unit.key.starts_with("strip:trailing_blank_"))
                     && !unit.kind.ends_with("_keep")
                     && unit.reset_rule != SYSTEM_STRIP_PENDING))
                 && !loaded.core.frozen_units.iter().any(|old| {
@@ -22439,6 +22453,7 @@ pub(crate) mod tests {
             protected_tokens_floor: 16_000,
             protected_tokens_provenance: "derived",
             compaction_enabled: true,
+            signed_thinking_hold: crate::config::SignedThinkingHold::Off,
             smart_drops: false,
             protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
@@ -24719,6 +24734,61 @@ pub(crate) mod tests {
         request.model_key = Some("anthropic/claude-opus-5-5".to_string());
         request.system_prompt_hash = "5364d9e7f78d5cee3aadbc8f2ce85aa7".to_string();
         request
+    }
+
+    #[test]
+    fn signed_thinking_hold_off_ignores_saved_release_obligations() {
+        let root = std::env::temp_dir().join("magic-context/signed-thinking-hold-off-obligations");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut captures = Vec::new();
+        for seeded in [false, true] {
+            let dir = tempfile::tempdir_in(&root).unwrap();
+            let store = store(dir.path());
+            let mut request = opus_55_request("saved-release-off", "cfg0");
+            request.auto_search_enabled = false;
+            request.usage = Some(ModuleUsage {
+                current_total_input_tokens: 86_000,
+                context_limit_tokens: 100_000,
+                ..Default::default()
+            });
+            let context = pctx("git:hold-off", "/nonexistent-docs", 1000);
+            transform(&store, &request, &context).unwrap();
+            let mut loaded = store.load(&request.session_id).unwrap();
+            loaded.meta.soft_refresh_pending = true;
+            loaded.meta.has_prior_emergency_drop = true;
+            let saved = seeded.then(|| {
+                serde_json::json!({"obligations": {
+                    "soft_refresh": "explicit_flush", "force_episode": "selection"
+                }})
+            });
+            loaded.meta.held_release = saved.clone();
+            store
+                .commit_meta(&request.session_id, loaded.row_version, &loaded.meta)
+                .unwrap();
+            request.messages.push(serde_json::from_value(serde_json::json!({
+                "mid":"signed", "ordinal":2, "ck":{"role":"assistant", "content":[
+                    {"kind":{"type":"reasoning","text":"Continue the tool loop.","signature":"signed-off"}},
+                    {"kind":{"type":"text","text":"Continue."}}
+                ], "meta":{"harness_id":"signed"}}
+            })).unwrap());
+            let response = transform(&store, &request, &context).unwrap();
+            let after = store.load(&request.session_id).unwrap();
+            assert_eq!(
+                after.meta.held_release, saved,
+                "disabled obligations must remain inert"
+            );
+            let mut meta = serde_json::to_value(&after.meta).unwrap();
+            meta.as_object_mut().unwrap().remove("held_release");
+            captures.push((
+                serde_json::to_string(response.messages()).unwrap(),
+                meta,
+                serde_json::to_value(after.core).unwrap(),
+            ));
+        }
+        assert_eq!(
+            captures[0], captures[1],
+            "saved holds must not affect disabled planning or served bytes"
+        );
     }
 
     #[test]

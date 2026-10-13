@@ -456,6 +456,7 @@ fn producer_context<'a>(
     let protected = config.resolve_protected_tokens(window);
     let ttl = config.resolve_cache_ttl_with_provenance(Some(model));
     transform::ProducerContext {
+        signed_thinking_hold: config.signed_thinking_hold,
         project_path: &work.project_path,
         note_project_path: &work.note_project_path,
         project_directory: &work.project_directory,

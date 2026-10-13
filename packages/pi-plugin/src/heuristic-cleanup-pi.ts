@@ -104,6 +104,7 @@ const DEDUP_SAFE_TOOLS = new Set([
 ]);
 
 export interface PiHeuristicCleanupConfig {
+	signedThinkingHold?: "off" | "on";
 	/** Bulk-freeze native removal decisions before measuring the active wire tools. */
 	prepareToolRemovalMeasurements?: (callIds: readonly string[]) => void;
 	protectedTools?: Readonly<Record<string, number>>;
@@ -600,9 +601,14 @@ export function applyPiHeuristicCleanup(
 				} else {
 					// A replay decision may exist only for an edit that was applied: replay
 					// strips the reminder on every later pass, so a decision left behind by
-					// a refused edit would change text that was sent unstripped. A rewrite
-					// before kept current-turn signed thinking is refused, so skip it.
-					if (target.thinkingRewriteProtected) continue;
+					// a refused edit would change text that was sent unstripped. With the
+					// hold on, skip protected targets early. Regardless of the setting,
+					// target.setContent can refuse; only a newly added decision is withdrawn.
+					if (
+						config.signedThinkingHold === "on" &&
+						target.thinkingRewriteProtected
+					)
+						continue;
 					existingDecisions ??= getPiContentDecisions(db, sessionId);
 					const alreadyDecided = existingDecisions.has(
 						encodePiContentDecision("reminder-strip", tag.messageId),
@@ -628,7 +634,7 @@ export function applyPiHeuristicCleanup(
 								),
 							});
 						} else if (!alreadyDecided) {
-							// Any other refusal: take back the decision this call added.
+							// Undo this call's refused edit, never an earlier applied decision.
 							withdrawPiContentDecision(
 								db,
 								sessionId,

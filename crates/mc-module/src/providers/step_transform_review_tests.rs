@@ -57,6 +57,7 @@ fn engine_context<'a>(project: &'a str, directory: &'a str) -> transform::Produc
         protected_tokens_floor: 100_000,
         protected_tokens_provenance: "absolute",
         compaction_enabled: true,
+        signed_thinking_hold: crate::config::SignedThinkingHold::Off,
         smart_drops: false,
         protected_tools: Default::default(),
         cache_ttl: "never".into(),

@@ -206,6 +206,7 @@ fn context() -> ProducerContext<'static> {
         protected_tokens_floor: 4_000,
         protected_tokens_provenance: "config",
         compaction_enabled: true,
+        signed_thinking_hold: mc_module::config::SignedThinkingHold::On,
         smart_drops: false,
         protected_tools: Default::default(),
         cache_ttl: "5m".into(),

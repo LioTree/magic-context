@@ -187,6 +187,7 @@ describe("MagicContextConfigSchema", () => {
             expect(result).toEqual({
                 ...input,
                 rust_pipeline: "full_request",
+                signed_thinking_hold: "off",
                 protected_tools: { todowrite: 1, ctx_reduce: 3 },
             });
         });

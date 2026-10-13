@@ -205,6 +205,7 @@ const DEV_ONLY_KEYS = new Set<string>([
     // gate calcify into a de-facto public mode before the cutover release.
     "transform_mode",
     "rust_pipeline",
+    "signed_thinking_hold",
 ]);
 
 export function buildConfigDocs(): string {

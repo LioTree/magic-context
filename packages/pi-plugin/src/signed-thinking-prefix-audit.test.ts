@@ -69,10 +69,6 @@ const MODEL = {
 	contextWindow: 100_000,
 };
 
-// Keep the strict thinking-identity assertion disabled until older-turn thinking is stripped
-// only alongside an admitted prefix edit, rather than alongside every bust permission.
-const THINKING_STRIP_GATED = false;
-
 /**
  * What Pi's Anthropic provider sends: thinking with its signature, tool calls
  * as tool_use, tool results as user tool_result blocks; empty text and empty
@@ -159,7 +155,6 @@ type Lane =
  */
 const EXPOSED = new Set<Lane>([
 	"m[0]/m[1] re-render after a recomp clears the cached pair",
-	"synthetic todo",
 ]);
 
 const PRIMARY_LANES: Lane[] = [
@@ -195,20 +190,6 @@ const RESTART_LANES: Lane[] = [
  * (`signalPiPendingMaterialization`, `signalPiHistoryRefresh`).
  */
 const RESTART_GAP = new Set<Lane>(["/ctx-flush"]);
-
-/**
- * Held primary lanes whose bust pass strips the previous turn's thinking today, although it
- * applies nothing before the kept thinking: Pi's proactive strip rides the pass's bust
- * permission (`cacheBustingPass`), not an admitted edit.
- */
-const STRIPS_THINKING_WHEN_HELD = new Set<Lane>([
-	"emergency 95% wall",
-	"/ctx-flush",
-	"HARD fold after historian publication",
-	// Pi discovers placeholder-only messages only on a history-refresh pass, and that
-	// refresh also lets the pass rebuild the request, which runs the thinking strip.
-	"frozen-sentinel first application",
-]);
 
 // Pi discovers placeholder-only messages on a history refresh, which a
 // subagent (no historian) does not receive; subagents also get no synthetic
@@ -295,6 +276,7 @@ async function fixture(
 		},
 		db,
 		protectedTokens: 4000,
+		signedThinkingHold: "on",
 		todowriteEnabled: true,
 		injection: injectionEnabled
 			? {
@@ -768,20 +750,8 @@ for (const subagent of [false, true]) {
 						expect(JSON.stringify(after)).toContain("[dropped §");
 						expect(beforeLastThinking(after)).toBe(beforeLastThinking(before));
 					} else expect(nonThinkingEdit).toBe(false);
-					// A pass that applies nothing before the kept thinking changes no
-					// thinking either: the strip of older-turn thinking is the companion
-					// of an admitted edit before kept older-turn thinking, which a pass
-					// with kept current-turn thinking never has.
-					if (lane !== "reasoning clearing (keep_reasoning_tokens)") {
-						const thinkingChanged =
-							thinkingBlocks(after) !== thinkingBlocks(before);
-						if (STRICT_AUDIT && THINKING_STRIP_GATED)
-							expect(thinkingChanged).toBe(false);
-						else if (!STRICT_AUDIT)
-							expect(thinkingChanged).toBe(
-								!subagent && STRIPS_THINKING_WHEN_HELD.has(lane),
-							);
-					}
+					// A held pass preserves every signed block, including completed turns.
+					expect(thinkingBlocks(after)).toBe(thinkingBlocks(before));
 					// A held edit is never recorded as served: repeating the pass with
 					// no new response serves exactly the same bytes.
 					expect(wire((await f.pass()).messages)).toEqual(after);

@@ -85,6 +85,7 @@ fn context(dir: &str) -> ProducerContext<'_> {
         protected_tokens_floor: 16_000,
         protected_tokens_provenance: "derived",
         compaction_enabled: true,
+        signed_thinking_hold: mc_module::config::SignedThinkingHold::Off,
         smart_drops: false,
         protected_tools: [("todowrite".to_string(), 1), ("ctx_reduce".to_string(), 3)].into(),
         cache_ttl: "5m".to_string(),

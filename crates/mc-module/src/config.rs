@@ -79,8 +79,17 @@ impl Default for CavemanConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SignedThinkingHold {
+    #[default]
+    Off,
+    On,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct McModuleConfig {
+    /// User-only opt-in; existing signed-thinking byte protections are independent of this setting.
+    pub signed_thinking_hold: SignedThinkingHold,
     /// Historian-only previews, with project entries overriding user entries.
     pub historian_expand_tools: crate::historian_tool_template::ExpansionMap,
     // No model chain lives here. The host resolves the historian's and each dreamer
@@ -175,6 +184,7 @@ pub struct CatalogConfigInputs {
 impl Default for McModuleConfig {
     fn default() -> Self {
         Self {
+            signed_thinking_hold: SignedThinkingHold::Off,
             historian_temperature: None,
             historian_expand_tools: Default::default(),
             historian_runner: None,
@@ -754,6 +764,14 @@ fn merge_tiers_with_warnings(
     }
 
     if let Some(user) = user {
+        if let Some(value) = user.get("signed_thinking_hold") {
+            match value.as_str() {
+                Some("on") => cfg.signed_thinking_hold = SignedThinkingHold::On,
+                Some("off") => cfg.signed_thinking_hold = SignedThinkingHold::Off,
+                _ => warnings
+                    .push("invalid signed_thinking_hold in user tier; expected off or on".into()),
+            }
+        }
         if let Some(temperature) = number_at(user, "/historian/temperature") {
             cfg.historian_temperature = Some(temperature);
         }
@@ -854,6 +872,7 @@ fn merge_tiers_with_warnings(
     }
 
     if let Some(project) = project {
+        warn_ignored_project_key(project, "/signed_thinking_hold", &mut warnings);
         // Cache lifetime controls idle-expiry scheduling, not prompt text, so project config may
         // set it. Project entries replace user entries with the same key.
         apply_cache_ttl_config(&mut cfg, project.get("cache_ttl"));
@@ -1384,6 +1403,32 @@ mod cache_ttl_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signed_thinking_hold_is_off_by_default_and_user_only() {
+        use super::{merge_tiers_with_warnings, SignedThinkingHold};
+        use serde_json::json;
+        assert_eq!(
+            merge_tiers_with_warnings(None, None).0.signed_thinking_hold,
+            SignedThinkingHold::Off
+        );
+        for value in ["off", "on"] {
+            let (cfg, warnings) =
+                merge_tiers_with_warnings(None, Some(&json!({"signed_thinking_hold":value})));
+            assert_eq!(cfg.signed_thinking_hold, SignedThinkingHold::Off);
+            assert_eq!(warnings.len(), 1);
+        }
+        let (cfg, warnings) = merge_tiers_with_warnings(
+            Some(&json!({"signed_thinking_hold":"on"})),
+            Some(&json!({"signed_thinking_hold":"off"})),
+        );
+        assert_eq!(cfg.signed_thinking_hold, SignedThinkingHold::On);
+        assert_eq!(warnings.len(), 1);
+        let (cfg, warnings) =
+            merge_tiers_with_warnings(Some(&json!({"signed_thinking_hold":true})), None);
+        assert_eq!(cfg.signed_thinking_hold, SignedThinkingHold::Off);
+        assert_eq!(warnings.len(), 1);
+    }
+
     #[test]
     fn smart_notes_enabled_is_user_only_and_frozen_after_initial_resolution() {
         let user = serde_json::json!({"smart_notes": {"enabled": false}});

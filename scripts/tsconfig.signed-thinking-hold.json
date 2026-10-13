@@ -1,0 +1,24 @@
+{
+	"extends": "../packages/plugin/tsconfig.json",
+	"compilerOptions": {
+		"rootDir": "..",
+		"noEmit": true,
+		"composite": false,
+		"baseUrl": "..",
+		"typeRoots": [
+			"../packages/plugin/node_modules/@types",
+			"../packages/plugin/node_modules"
+		],
+		"paths": {
+			"@magic-context/core/*": ["packages/plugin/src/*"],
+			"@cortexkit/retina-local-fs/*": ["packages/retina-local-fs/src/*"]
+		}
+	},
+	"include": [
+		"signed-thinking-hold-cold-corpus.ts",
+		"signed-thinking-hold-corpus.ts",
+		"signed-thinking-hold-differential.test.ts",
+		"signed-thinking-hold-audits.test.ts"
+	],
+	"exclude": []
+}

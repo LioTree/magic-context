@@ -251,12 +251,12 @@ describe("source contract: peek-then-drain in runPipeline (pending materializati
 		// happens AFTER applyPendingOperations succeeds.
 		// Match across formatter line wraps with a tolerant regex.
 		expect(code).toMatch(
-			/(?:const|let)\s+hasPendingMaterializeSignal\s*=\s*!protectedSignedPrefix\s*&&\s*hasPendingMaterialization\(/,
+			/(?:const|let)\s+hasPendingMaterializeSignal\s*=\s*\(holdEnabled\s*\|\|\s*!protectedSignedPrefix\)\s*&&\s*hasPendingMaterialization\(/,
 		);
 		// And confirm the variable is NOT directly assigned from the
 		// draining helper (regression guard for the pre-fix pattern).
 		expect(code).not.toMatch(
-			/const\s+hasPendingMaterializeSignal\s*=\s*consumePendingMaterialization\(/,
+			/(?:const|let)\s+hasPendingMaterializeSignal\s*=\s*consumePendingMaterialization\(/,
 		);
 	});
 

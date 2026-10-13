@@ -1697,6 +1697,7 @@ interface RunPostTransformPhaseArgs {
     restoreLatestTurnOriginals?: () => void;
     activeThinkingTurn?: boolean;
     resolvedModelID?: string;
+    signedThinkingHold?: "off" | "on";
     /**
      * True only when the live request uses a model whose signed thinking is
      * bound to its prefix (isPrefixBoundThinkingModel: Anthropic Fable 5.1 or
@@ -2078,6 +2079,7 @@ export async function runPostTransformPhase(
     const protectedThinkingMessages = new Set(
         args.messages.filter((message) => message.parts.some((part) => retainedThinking.has(part))),
     );
+    const holdEnabled = args.signedThinkingHold === "on";
     // Edit admission. On prefix-bound models a signed thinking block is valid only while
     // every byte before it is unchanged, so an edit before the last current-turn thinking
     // block still sent is held: not applied and not persisted. The frame uses the same
@@ -2089,7 +2091,7 @@ export async function runPostTransformPhase(
             stableId: (message) => message.info.id,
             partsOf: (message) => message.parts,
             isRealUser: isAdmissionUser,
-            prefixBound: args.thinkingBindingRecoveryEnabledForModel === true,
+            prefixBound: holdEnabled && args.thinkingBindingRecoveryEnabledForModel === true,
             isRetainedThinking: (_message, part) => retainedThinking.has(part),
             anchorOf: thinkingAnchor,
             onUnresolved: (reason) =>
@@ -2103,7 +2105,10 @@ export async function runPostTransformPhase(
     const admitWholeMessage =
         (lane: string) =>
         (message: MessageLike): boolean => {
-            if (editAdmission.admit({ kind: "message", id: message.info.id, block: "whole" }))
+            if (
+                !editAdmission ||
+                editAdmission.admit({ kind: "message", id: message.info.id, block: "whole" })
+            )
                 return true;
             const held = heldWholeMessages.get(lane) ?? [];
             held.push(message.info.id ?? "<no id>");
@@ -2111,7 +2116,7 @@ export async function runPostTransformPhase(
             return false;
         };
     const logHeldWholeMessages = (): void => {
-        if (editAdmission.frame.kind !== "boundary") return;
+        if (editAdmission?.frame.kind !== "boundary") return;
         for (const [lane, ids] of heldWholeMessages) {
             sessionLog(
                 args.sessionId,
@@ -2138,14 +2143,18 @@ export async function runPostTransformPhase(
         args.activeThinkingPrefixHold === true ||
         (activeThinkingTurn && args.thinkingBindingRecoveryEnabledForModel === true);
     let freezeM0M1 = args.freezeM0M1 === true || activeThinkingPrefixHold;
-    const parkedTriggers =
-        parkedBustTriggersBySession.get(args.sessionId) ?? new ParkedBustTriggers();
-    parkedBustTriggersBySession.set(args.sessionId, parkedTriggers);
-    const triggerPermissions = parkedTriggers.permissions(
+    // Cached-head and tag-target protection is always enabled. Only the experimental
+    // trigger parking changes which independent bust permissions remain available.
+    if (!holdEnabled) parkedBustTriggersBySession.delete(args.sessionId);
+    const parkedTriggers = holdEnabled
+        ? (parkedBustTriggersBySession.get(args.sessionId) ?? new ParkedBustTriggers())
+        : undefined;
+    if (parkedTriggers) parkedBustTriggersBySession.set(args.sessionId, parkedTriggers);
+    const triggerPermissions = parkedTriggers?.permissions(
         freezeM0M1,
         pendingMaterializationAtPassStart || deferredMaterializationAtPassStart,
         emergencyDropEligible,
-    );
+    ) ?? { materialization: true, force: true };
     isExplicitFlush &&= triggerPermissions.materialization;
     materializationRequested =
         isExplicitFlush || (deferredMaterialize && triggerPermissions.materialization);
@@ -2203,8 +2212,13 @@ export async function runPostTransformPhase(
         (m0M1EnabledForFold &&
             !shouldCaptureCachedPrefix &&
             hasCompleteCachedM0M1(args.db, args.sessionId));
-    const firstRenderBust = m0M1EnabledForFold && !completeCachedPrefixAvailable;
+    const firstRenderBust =
+        !(holdEnabled && freezeM0M1) && m0M1EnabledForFold && !completeCachedPrefixAvailable;
     const servedBeforeFirstRender = firstRenderBust ? args.readLastServedMessages?.() : null;
+    if (holdEnabled && freezeM0M1 && m0M1EnabledForFold && !completeCachedPrefixAvailable) {
+        args.pendingMaterializationSessions.add(args.sessionId);
+        parkedTriggers?.holdMaterialization();
+    }
     let foldExecutedThisPass = false;
     // The one bust permission an executed fold grants: true only when the fold
     // also loses the provider's cached prefix (see foldBustsServedPrefix). Every
@@ -2383,6 +2397,7 @@ export async function runPostTransformPhase(
             args.targets.get(tag.tagNumber)?.canDrop?.(),
     );
     if (
+        !holdEnabled &&
         activeThinkingPrefixHold &&
         (args.forceSignedRebuildForFit ||
             (args.contextUsage.percentage >= 95 &&
@@ -2414,13 +2429,13 @@ export async function runPostTransformPhase(
     // cache policy, prevents this batch. The next real user releases the veto.
     if (
         args.schedulerDecision === "execute" &&
-        !emergencyDropEligible &&
+        (!holdEnabled || !emergencyDropEligible) &&
         pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
     ) {
         args.pendingMaterializationSessions.add(args.sessionId);
         // Retaining a scheduler-requested drop must not let the materialization
         // signal authorize unrelated cleanup on the next pass of this signed turn.
-        parkedTriggers.holdMaterialization();
+        parkedTriggers?.holdMaterialization();
     }
     const formatPendingOpsDepth = (): string => {
         const depth = getPendingOpsCount(args.db, args.sessionId);
@@ -2495,8 +2510,8 @@ export async function runPostTransformPhase(
         (m0M1EnabledForFold ||
             pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected))
     )
-        parkedTriggers.holdMaterialization();
-    if (freezeM0M1 && rideSignals.force && shouldRunHeuristics) parkedTriggers.holdForce();
+        parkedTriggers?.holdMaterialization();
+    if (freezeM0M1 && rideSignals.force && shouldRunHeuristics) parkedTriggers?.holdForce();
     const canEditWholePrefix = isCacheBustingPass && !activeThinkingPrefixHold;
     const previousTemporalDecisions =
         args.temporalCandidates && !compactionOff
@@ -3142,7 +3157,7 @@ export async function runPostTransformPhase(
             // head, so an empty request has no remaining work and must be consumed.
             if (
                 pendingMaterializationAtPassStart &&
-                !(freezeM0M1 && m0M1EnabledForFold) &&
+                !(freezeM0M1 && (!holdEnabled || m0M1EnabledForFold)) &&
                 !pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
             ) {
                 args.pendingMaterializationSessions.delete(args.sessionId);
@@ -3593,8 +3608,8 @@ export async function runPostTransformPhase(
                 admitWholeMessage("system-injected"),
             );
             logHeldWholeMessages();
-            // Messages hidden behind the compaction marker are not in the request this
-            // pass sends, so storing a decision for them changes nothing sent now.
+            // Persist strip results for messages already hidden by the compaction marker.
+            // These messages are not sent, so the record changes no current request bytes.
             const hiddenMessages = args.hiddenMessagesAtCompactionSeam ?? [];
             const hiddenDroppedResult = stripDroppedPlaceholderMessages(
                 hiddenMessages,
@@ -3943,7 +3958,7 @@ export async function runPostTransformPhase(
     if (
         args.fullFeatureMode &&
         isCacheBustingPass &&
-        !freezeM0M1 &&
+        !(holdEnabled && freezeM0M1) &&
         args.m0M1 &&
         (!!args.m0M1.projectPath || !!args.m0M1.projectDirectory)
     ) {
@@ -4705,12 +4720,15 @@ export async function runPostTransformPhase(
     }
 
     logTransformTiming(args.sessionId, "pp.tailGuard", tTailGuard);
-    parkedTriggers.settle(
+    // A subagent has no leading history-summary messages; an empty flush has nothing to defer.
+    if (holdEnabled && !m0M1EnabledForFold && getPendingOps(args.db, args.sessionId).length === 0)
+        args.pendingMaterializationSessions.delete(args.sessionId);
+    parkedTriggers?.settle(
         args.pendingMaterializationSessions.has(args.sessionId) ||
             args.deferredMaterializationSessions.has(args.sessionId),
         emergencyDropEligible && getEmergencyInputSample(args.db, args.sessionId) === 0,
     );
-    if (!parkedTriggers.pending) parkedBustTriggersBySession.delete(args.sessionId);
+    if (!parkedTriggers?.pending) parkedBustTriggersBySession.delete(args.sessionId);
     return {
         explicitMaterializedSuccessfully,
         deferredMaterializedSuccessfully,

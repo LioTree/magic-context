@@ -66,10 +66,6 @@ import { hasParkedBustTrigger, resetDegradedCacheCount } from "./transform-postp
 
 const MODEL = { providerID: "anthropic", modelID: process.env.MC_AUDIT_MODEL ?? "claude-opus-5-5" };
 
-// Keep the strict thinking-identity assertion disabled until older-turn thinking is stripped
-// only alongside an admitted prefix edit, rather than alongside every bust permission.
-const THINKING_STRIP_GATED = false;
-
 /**
  * What OpenCode's `@ai-sdk/anthropic` path sends for a message array: empty
  * text and empty or unsigned reasoning are dropped by the adapter, a completed
@@ -142,12 +138,7 @@ type Lane =
  * Lanes whose mid-loop bust changes the request before a signed thinking block the
  * request still carries, which a strict-binding provider rejects.
  */
-const EXPOSED = new Set<Lane>([
-    "m[0]/m[1] re-render after a recomp clears the cached pair",
-    "synthetic todo",
-    "processed image strip",
-    "stale ctx_reduce strip",
-]);
+const EXPOSED = new Set<Lane>(["m[0]/m[1] re-render after a recomp clears the cached pair"]);
 
 const PRIMARY_LANES: Lane[] = [
     "ctx_reduce drop (full removal)",
@@ -213,6 +204,7 @@ interface Fixture {
     userTurn: (id: string, text: string) => void;
     setUsage: (percentage: number) => void;
     execute: (on: boolean) => void;
+    armReasoning: () => void;
     setModel: (modelID: string) => void;
     lastHeuristicsTurnId: Map<string, string>;
     pendingMaterialization: Set<string>;
@@ -309,6 +301,7 @@ async function fixture(
     const capture = new GoldenCapture(auditName(generation, subagent, lane, scenario));
     // A new transform with fresh in-memory release signals over the same database is what
     // the plugin has after a process restart (see `Fixture.restart`).
+    let reasoningBudget = 1_000_000;
     const makeTransform = () =>
         createTransform({
             onPostprocess: (result) => {
@@ -316,6 +309,7 @@ async function fixture(
             },
             db,
             storeGeneration: generation,
+            signedThinkingHold: "on",
             tagger: createTagger(),
             scheduler: { shouldExecute: () => decision } as never,
             liveModelBySession: liveModel,
@@ -330,8 +324,9 @@ async function fixture(
             pendingMaterializationSessions: pendingMaterialization,
             lastHeuristicsTurnId,
             smartDrops: true,
-            keepReasoningTokens:
-                lane === "reasoning clearing (keep_reasoning_tokens)" ? 0 : 1_000_000,
+            get keepReasoningTokens() {
+                return reasoningBudget;
+            },
             ...(lane === "caveman text compression"
                 ? { cavemanTextCompression: { enabled: true, minChars: 40 } }
                 : {}),
@@ -500,6 +495,9 @@ async function fixture(
         userTurn,
         setUsage,
         execute,
+        armReasoning: () => {
+            reasoningBudget = 0;
+        },
         lastHeuristicsTurnId,
         setModel: (modelID) => liveModel.set(sessionId, { ...MODEL, modelID }),
         pendingMaterialization,
@@ -582,6 +580,9 @@ async function prepareLane(f: Fixture, lane: Lane): Promise<void> {
 /** Queue or arm whatever the lane needs, then offer the bust it rides. */
 function armAndBust(f: Fixture, lane: Lane, subagent: boolean): void {
     switch (lane) {
+        case "reasoning clearing (keep_reasoning_tokens)":
+            f.armReasoning();
+            break;
         case "ctx_reduce drop (full removal)":
         case "/ctx-flush":
             queuePendingOp(f.db, f.sessionId, f.tag("old-read-b"), "drop");
@@ -681,7 +682,9 @@ function landed(f: Fixture, lane: Lane, after: Wire): boolean {
         case "caveman text compression":
             return !text.includes(SUMMARY_TEXT);
         case "reasoning clearing (keep_reasoning_tokens)":
-            return getReasoningRemovalState(f.db, f.sessionId).messageIds.size > 0;
+            return !after.some((message) =>
+                message.content.some((block) => block.type === "thinking"),
+            );
         case "processed image strip":
             return !text.includes('"type":"image"');
         case "stale ctx_reduce strip":
@@ -752,20 +755,8 @@ for (const generation of ["v1", "v2"] as const) {
                         if (lane === "emergency 95% wall")
                             expect(beforeLastThinking(after)).toBe(beforeLastThinking(before));
                         else expect(nonThinkingEdit).toBe(false);
-                        // A pass that applies nothing changes no thinking either. The strip of
-                        // older-turn thinking is the companion of an admitted edit before kept
-                        // older-turn thinking, which a pass with kept current-turn thinking never
-                        // has. Today the strip rides every bust permission of a primary session
-                        // (prefixEditBesidesReasoningTrim), so in a primary session every lane
-                        // that reaches this check strips the previous turn's blocks; a subagent
-                        // has no previous turn.
-                        if (lane !== "reasoning clearing (keep_reasoning_tokens)") {
-                            const thinkingChanged =
-                                thinkingBlocks(after) !== thinkingBlocks(before);
-                            if (STRICT_AUDIT && THINKING_STRIP_GATED)
-                                expect(thinkingChanged).toBe(false);
-                            else if (!STRICT_AUDIT) expect(thinkingChanged).toBe(!subagent);
-                        }
+                        // A held pass preserves every signed block, including completed turns.
+                        expect(thinkingBlocks(after)).toBe(thinkingBlocks(before));
                         if (lane !== "reasoning clearing (keep_reasoning_tokens)")
                             expect(edit).toBe(false);
                         if (lane.startsWith("ctx_reduce") || lane === "/ctx-flush")
@@ -817,6 +808,12 @@ for (const generation of ["v1", "v2"] as const) {
                             await toolLoop(f, 4, loopParts(lane));
                             await nextUserTurn(f, "prompt-next");
                             const before = wire(f.served);
+                            if (lane === "reasoning clearing (keep_reasoning_tokens)")
+                                expect(
+                                    before.some((message) =>
+                                        message.content.some((block) => block.type === "thinking"),
+                                    ),
+                                ).toBe(true);
                             armAndBust(f, lane, false);
                             const afterMessages = (await f.pass()).messages;
                             const after = wire(afterMessages);
@@ -1055,11 +1052,6 @@ for (const generation of ["v1", "v2"] as const) {
                         console.log(
                             `AUDIT-MARKER ${host} | mid tool loop: ${error ?? "accepted"}; summaryRetired=${retired}`,
                         );
-                        if (!GOLDEN && !STRICT_AUDIT) {
-                            expect(retired).toBe(true);
-                            expect(error).toBe(PREFIX_ERROR);
-                            return;
-                        }
                         expect(error).toBeNull();
                         expect(retired).toBe(false);
                         expect(withoutThinking(after)).toBe(withoutThinking(before));

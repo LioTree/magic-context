@@ -365,6 +365,12 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  */
 export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknown>): string[] {
     const warnings: string[] = [];
+    if ("signed_thinking_hold" in projectRaw) {
+        delete projectRaw.signed_thinking_hold;
+        warnings.push(
+            "Ignoring signed_thinking_hold from project config (security: only user-level config may enable the experimental signed-thinking hold).",
+        );
+    }
     if ("rust_pipeline" in projectRaw) {
         delete projectRaw.rust_pipeline;
         warnings.push(

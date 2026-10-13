@@ -1473,6 +1473,7 @@ export interface PiSchedulerOptions {
 }
 
 export interface PiContextHandlerOptions {
+	signedThinkingHold?: "off" | "on";
 	/** Report postprocessing's actual cache-bust permission; changed bytes alone do not authorize a bust. */
 	onPostprocess?: (result: { bustedThisPass: boolean }) => void;
 	cacheTtlConfig?: import("@magic-context/core/shared/model-cache-ttl").CacheTtlConfig;
@@ -5292,6 +5293,7 @@ export function registerPiContextHandler(
 				protectedTools: options.protectedTools,
 				protectedTags: options.protectedTags ?? 20,
 				protectedTokens: options.protectedTokens,
+				signedThinkingHold: options.signedThinkingHold,
 				protectedTokenTierOverrides: options.protectedTokenTierOverrides,
 				usableSoft: windowGeometry?.usableSoft ?? usageContextLimit ?? 200_000,
 				heuristics: options.heuristics,
@@ -7414,6 +7416,7 @@ interface RunPipelineArgs {
 	tryReplayHeldIdentityRebuild?: () => void;
 	readLastServedMessages?: () => readonly unknown[] | null;
 	forceSignedRebuildForFit?: boolean;
+	signedThinkingHold?: "off" | "on";
 	resolvedProviderID?: string;
 	resolvedModelID?: string;
 	assertCurrentPass?: () => void;
@@ -7804,6 +7807,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	);
 	let protectedSignedPrefix =
 		activeThinkingTurn && args.reasoningClearing?.prefixBound === true;
+	const holdEnabled = args.signedThinkingHold === "on";
 	let rewritingSignedPrefix = false;
 	let workingForRewrite: unknown[] | undefined;
 	const stripForPrefixRewrite = () => {
@@ -7834,7 +7838,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		activeThinkingTurn = false;
 		protectedSignedPrefix = false;
 	};
-	if (args.forceSignedRebuildForFit && protectedSignedPrefix)
+	if (!holdEnabled && args.forceSignedRebuildForFit && protectedSignedPrefix)
 		stripForPrefixRewrite();
 	// Messages without a real entry id get a position-independent fallback id
 	// computed once from this pass's input, before any stage edits content.
@@ -8040,6 +8044,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			)
 		: { value: false, reason: null };
 	const firstRenderBust =
+		!(holdEnabled && protectedSignedPrefix) &&
 		piM0State !== undefined &&
 		!(
 			injectionPassSnapshot?.cachedRow?.cached_m0_bytes &&
@@ -8312,7 +8317,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let deferredMaterializeEligible =
 		canConsumeDeferredLate &&
 		deferredMaterializationSessions.has(args.sessionId) &&
-		!protectedSignedPrefix;
+		(holdEnabled || !protectedSignedPrefix);
 	// Primary sessions run routine age-sensitive cleanup only once during an
 	// unbroken stretch of execute/emergency pressure. Later passes still evaluate
 	// emergency drops, but another batch requires pressure to clear and rise again.
@@ -8327,26 +8332,40 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		!args.sessionMeta.isSubagent &&
 		executePressureEligible &&
 		routinePressureAppliedBySession.get(args.sessionId) === true;
-	const firstRenderHeld = protectedSignedPrefix && firstRenderBust;
-	const parkedTriggers =
-		parkedBustTriggersBySession.get(args.sessionId) ?? new ParkedBustTriggers();
-	parkedBustTriggersBySession.set(args.sessionId, parkedTriggers);
+	const firstRenderHeld =
+		holdEnabled &&
+		protectedSignedPrefix &&
+		piM0State !== undefined &&
+		!(
+			injectionPassSnapshot?.cachedRow?.cached_m0_bytes &&
+			injectionPassSnapshot.cachedRow.cached_m1_bytes
+		);
+	if (!holdEnabled) parkedBustTriggersBySession.delete(args.sessionId);
+	const parkedTriggers = holdEnabled
+		? (parkedBustTriggersBySession.get(args.sessionId) ??
+			new ParkedBustTriggers())
+		: undefined;
+	if (parkedTriggers)
+		parkedBustTriggersBySession.set(args.sessionId, parkedTriggers);
 	let hasPendingMaterializeSignal =
-		!protectedSignedPrefix && hasPendingMaterialization(args.sessionId);
-	const triggerPermissions = parkedTriggers.permissions(
+		(holdEnabled || !protectedSignedPrefix) &&
+		hasPendingMaterialization(args.sessionId);
+	const triggerPermissions = parkedTriggers?.permissions(
 		protectedSignedPrefix,
 		hasPendingMaterializeSignal ||
 			deferredMaterializationSessions.has(args.sessionId),
 		emergencyDropEligible,
 		args.isCacheBusting,
-	);
+	) ?? { materialization: true, force: true, history: args.isCacheBusting };
 	// The history-refresh signal as this pass may use it. It differs from
 	// `args.isCacheBusting` only after a held pass parked the signal: later passes
 	// of the same turn that still keep current-turn thinking get no refresh from it.
 	const historyRefreshPermitted = triggerPermissions.history;
+	if (holdEnabled && protectedSignedPrefix && historyRefreshPermitted)
+		parkedTriggers?.holdHistory();
 	if (firstRenderHeld) {
 		signalPiPendingMaterialization(args.sessionId);
-		parkedTriggers.holdMaterialization();
+		parkedTriggers?.holdMaterialization();
 	}
 	// Subagents have no history fold to ride. Their execute pass admits every
 	// eligible cleanup lane together, without rewriting bytes when none acts.
@@ -8382,9 +8401,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		heldIdleExpiryRebuild ||
 		emergencyDropEligible;
 	let isCacheBustingPass = prefixMutationAllowed && hasReclaimRide(rideSignals);
-	const materializationHeld = protectedSignedPrefix && piM0State !== undefined;
+	const materializationHeld =
+		holdEnabled && protectedSignedPrefix && piM0State !== undefined;
 	if (materializationHeld && rideSignals.explicitFlush)
-		parkedTriggers.holdMaterialization();
+		parkedTriggers?.holdMaterialization();
 	if (args.temporalAwareness && isCacheBustingPass) {
 		temporalDecisions = freezeTemporalDecisions(
 			args.db,
@@ -8430,7 +8450,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			rideSignals.subagentExecute ||
 			(args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn));
 	if (protectedSignedPrefix && rideSignals.force && shouldRunHeuristics)
-		parkedTriggers.holdForce();
+		parkedTriggers?.holdForce();
 	let unavoidableCarriedIdentityRebuild = false;
 	if (
 		protectedSignedPrefix &&
@@ -8744,7 +8764,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			},
 			isRealUser: isAdmissionUser,
 			prefixBound:
-				!rewritingSignedPrefix && args.reasoningClearing?.prefixBound === true,
+				(holdEnabled || args.stableIdSchemeCutover === true) &&
+				!rewritingSignedPrefix &&
+				args.reasoningClearing?.prefixBound === true,
 			isRetainedThinking: (_message, part) => retainedThinkingParts.has(part),
 			anchorOf: thinkingAnchor,
 			onUnresolved: (reason) =>
@@ -8765,7 +8787,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			args.reasoningClearing?.prefixBound === true,
 		),
 	);
-	if (protectedSignedPrefix && args.contextUsage.percentage >= 95) {
+	if (
+		!holdEnabled &&
+		protectedSignedPrefix &&
+		args.contextUsage.percentage >= 95
+	) {
 		const candidates = getActiveTagsBySession(args.db, args.sessionId).filter(
 			(tag) => tag.type === "tool" && targets.get(tag.tagNumber)?.canDrop?.(),
 		);
@@ -8934,14 +8960,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		rideSignals.explicitFlush &&
 		pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
 	)
-		parkedTriggers.holdMaterialization();
+		parkedTriggers?.holdMaterialization();
 	if (
+		holdEnabled &&
 		args.schedulerDecision === "execute" &&
 		!emergencyDropEligible &&
 		pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
 	) {
 		signalPiPendingMaterialization(args.sessionId);
-		parkedTriggers.holdMaterialization();
+		parkedTriggers?.holdMaterialization();
 	}
 	const protectedToolTags = protectedToolTagNumbers(
 		getActiveTagsBySession(args.db, args.sessionId),
@@ -9281,6 +9308,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.messages,
 				{
 					protectedTags: args.protectedTags,
+					signedThinkingHold: args.signedThinkingHold,
 					prepareToolRemovalMeasurements:
 						transcript.prepareToolRemovalMeasurements,
 					protectedToolTags,
@@ -9320,6 +9348,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					args.messages,
 					{
 						protectedTags: args.protectedTags,
+						signedThinkingHold: args.signedThinkingHold,
 						protectedToolTags,
 						protectedCutoff: usesTokenProtection
 							? protectionWindowForPass.cutoff
@@ -9909,7 +9938,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				// placeholder discovery that rides it happened. Keep the signal, parked,
 				// for the first pass after the next real user message instead of
 				// draining it here.
-				if (materializationHeld) parkedTriggers.holdHistory();
+				if (materializationHeld) parkedTriggers?.holdHistory();
 				else historyRefreshSessions.delete(args.sessionId);
 				historyWasConsumedThisPass = true;
 			}
@@ -9943,11 +9972,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// stable-id cutover below). Frozen discoveries still replay every pass.
 		isCacheBusting: historyRefreshPermitted && prefixMutationAllowed,
 		stableIdByRef: postCommitStableIdByRef,
-		// Stable-id cutover: when the stable-id scheme just changed, force rediscovery so
-		// previously-stripped placeholders get re-keyed under the new scheme this
-		// pass (discovery is otherwise gated on isCacheBusting = history-refresh).
-		// Only placeholders stored under their old positional id are re-keyed
-		// without admission; any other placeholder found here is a new removal.
+		// A stable-ID migration rekeys previously omitted placeholders even without
+		// a history refresh. Only a saved old-ID omission proves this is replay;
+		// other discoveries are new removals and always need the migration safety check.
 		forceDiscovery: args.stableIdSchemeCutover === true,
 		legacyIdByRef: legacyStableIdByRef,
 		// Frozen ids whose message owns a tool call are forgotten only on a pass
@@ -9965,7 +9992,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				message && typeof message === "object"
 					? postCommitStableIdByRef.get(message)
 					: undefined;
-			if (editAdmission.admit({ kind: "message", id, block: "whole" }))
+			if (
+				!editAdmission ||
+				editAdmission.admit({ kind: "message", id, block: "whole" })
+			)
 				return true;
 			heldPlaceholderIds.push(id ?? "<no id>");
 			return false;
@@ -9973,7 +10003,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	});
 	if (
 		heldPlaceholderIds.length > 0 &&
-		editAdmission.frame.kind === "boundary"
+		editAdmission?.frame.kind === "boundary"
 	) {
 		sessionLog(
 			args.sessionId,
@@ -10347,14 +10377,21 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				servedTagNumbers.add(tag.tagNumber);
 		}
 	}
-	parkedTriggers.settle(
+	// A subagent has no leading history-summary messages; an empty flush has nothing to defer.
+	if (
+		holdEnabled &&
+		args.sessionMeta.isSubagent &&
+		getPendingOps(args.db, args.sessionId).length === 0
+	)
+		consumePendingMaterialization(args.sessionId);
+	parkedTriggers?.settle(
 		hasPendingMaterialization(args.sessionId) ||
 			deferredMaterializationSessions.has(args.sessionId),
 		emergencyDropEligible &&
 			getEmergencyInputSample(args.db, args.sessionId) === 0,
 		historyRefreshSessions.has(args.sessionId),
 	);
-	if (!parkedTriggers.pending)
+	if (!parkedTriggers?.pending)
 		parkedBustTriggersBySession.delete(args.sessionId);
 	return {
 		messages: outputMessages,
@@ -10383,7 +10420,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			prefixEditBesidesReasoningTrim ||
 			firstRenderBust ||
 			historyRefreshPermitted ||
-			(isCacheBustingPass && hasPendingMaterializeSignal) ||
+			((!holdEnabled || isCacheBustingPass) && hasPendingMaterializeSignal) ||
 			deferredMaterializationConsumedThisPass ||
 			foldBustsServedPrefixThisPass ||
 			publishedM1RefreshedThisPass ||

@@ -1003,6 +1003,7 @@ impl McHandler {
             request.auto_search_score_threshold = score;
         }
         let context = transform::ProducerContext {
+            signed_thinking_hold: config.signed_thinking_hold,
             project_path: &project,
             note_project_path: &project,
             project_directory: &directory,

@@ -414,6 +414,7 @@ export async function sendEmergencyRefusalNotice(
 
 export interface TransformDeps {
     rustPipeline?: "full_request" | "provider";
+    signedThinkingHold?: "off" | "on";
     cacheTtlConfig?: import("../../shared/model-cache-ttl").CacheTtlConfig;
     cacheTtlConfigured?: boolean;
     sampleCacheTtlConfig?: () => {
@@ -2935,6 +2936,7 @@ export function createTransform(deps: TransformDeps) {
                 modelForBudget?.providerID,
                 modelForBudget?.modelID,
             ),
+            signedThinkingHold: deps.signedThinkingHold,
             trailingBlankSourceDecisions,
             passOutcome,
             historyRefreshSessions: deps.historyRefreshSessions,
