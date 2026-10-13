@@ -102,6 +102,7 @@ import { createModuleToolBackends } from "./module-tool-backends";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import { runManagedRecomp } from "./recomp-orchestrator";
+import { openCodeRescoreCommand } from "./rescore-opencode";
 import { type RustModeModuleClient, rustWrapupHistorianFields } from "./rust-mode-transform";
 import { createRustRefusalRecovery } from "./rust-refusal-recovery";
 import { createTextCompleteHandler } from "./text-complete";
@@ -977,6 +978,22 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         });
     };
 
+    const sendCommandNotification = async (
+        sessionId: string,
+        text: string,
+        params: NotificationParams = {},
+    ) => {
+        await sendCommandResult(deps.client, sessionId, text, {
+            ...getLiveNotificationParams(
+                sessionId,
+                liveModelBySession,
+                variantBySession,
+                agentBySession,
+                (deps.sampleDreamConfig?.() ?? deps.config).toast_duration_ms,
+            ),
+            ...params,
+        });
+    };
     const commandHandler = createMagicContextCommandHandler({
         smartNotesEnabled: deps.config.smart_notes?.enabled,
         db,
@@ -1056,21 +1073,17 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             ? async (sessionId, options) =>
                   runManagedRecomp(buildManagedRecompCtx(sessionId), sessionId, options)
             : undefined,
+        executeRescore: openCodeRescoreCommand({
+            db,
+            directory: deps.directory,
+            client: deps.client,
+            sampleConfig: () => deps.sampleHistorianConfig?.() ?? deps.config,
+            notify: sendCommandNotification,
+        }),
         executeEmbedHistory,
         pauseEmbedDrain,
         getEmbedStatusText,
-        sendNotification: async (sessionId, text, params) => {
-            await sendCommandResult(deps.client, sessionId, text, {
-                ...getLiveNotificationParams(
-                    sessionId,
-                    liveModelBySession,
-                    variantBySession,
-                    agentBySession,
-                    (deps.sampleDreamConfig?.() ?? deps.config).toast_duration_ms,
-                ),
-                ...params,
-            });
-        },
+        sendNotification: sendCommandNotification,
         dreamer: dreamerConfig
             ? {
                   config: dreamerConfig,

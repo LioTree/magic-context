@@ -251,3 +251,16 @@ describe("version notice", () => {
         );
     });
 });
+test("score visibility survives the RPC check and reaches the shared status view", () => {
+    const view = render({
+        ...CURRENT_DETAIL,
+        compartmentScores: {
+            appliedWatermark: 0,
+            effectiveWatermark: 1,
+            scores: [{ compartmentId: 7, base: 73, effective: 10, applied: 73, pending: true }],
+        },
+    });
+    expect(
+        view.sections.find((section) => section.title === "History Scores")?.rows[0]?.value,
+    ).toBe("base 73 · effective 10 · applied 73 — pending next natural rebuild");
+});

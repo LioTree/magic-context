@@ -298,6 +298,27 @@ export function checkStatusViewSource(candidate: unknown):
         isSubagent: candidate.isSubagent === true,
         cacheExpired: candidate.cacheExpired === true,
         cacheTtl,
+        compartmentScores: optional.read(
+            "compartmentScores",
+            (value): value is NonNullable<StatusViewSource["compartmentScores"]> =>
+                isRecord(value) &&
+                isNumber(value.appliedWatermark) &&
+                isNumber(value.effectiveWatermark) &&
+                Array.isArray(value.scores) &&
+                value.scores.every(
+                    (row) =>
+                        isRecord(row) &&
+                        isNumber(row.compartmentId) &&
+                        [row.base, row.effective, row.applied].every(
+                            (score) =>
+                                typeof score === "number" &&
+                                Number.isInteger(score) &&
+                                score >= 1 &&
+                                score <= 100,
+                        ) &&
+                        isBoolean(row.pending),
+                ),
+        ),
         // Older servers leave these out; the view reads a missing budget as "no budget".
         compressionBudget: optional.read("compressionBudget", isNullableNumber) ?? null,
         compressionUsage: optional.read("compressionUsage", isNullableString) ?? null,

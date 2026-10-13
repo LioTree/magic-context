@@ -189,6 +189,7 @@ export interface RunnerStatus {
 }
 
 export interface StatusDetail extends SidebarSnapshot {
+    compartmentScores?: import("./score-visibility").CompartmentScoreVisibility;
     /**
      * Version of the Magic Context package the answering server runs. The TUI
      * compares it with its own so the status dialog can say when the two differ

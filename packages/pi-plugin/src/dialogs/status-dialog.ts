@@ -140,6 +140,7 @@ export interface StatusDialogDeps {
 }
 
 export interface StatusDialogDetail {
+	compartmentScores?: import("@magic-context/core/shared/score-visibility").CompartmentScoreVisibility;
 	reasoningBudgetLine?: string;
 	sessionId: string;
 	activeProfile: string | null;
@@ -422,6 +423,7 @@ export function formatPiStatusSummary(s: StatusDialogDetail): string {
 	const summary = `${renderUserStatusSummary(
 		{
 			inputTokens: s.inputTokens,
+			compartmentScores: s.compartmentScores,
 			usableContextTokens: s.contextLimit,
 			usagePercentage: s.usagePercentage,
 			cacheLifetime: formatCacheTtlDisplay({
@@ -1196,6 +1198,7 @@ function buildStatusDetail(
 
 	return {
 		sessionId,
+		compartmentScores: readCompartmentScoreVisibility(deps.db, sessionId),
 		reasoningBudgetLine: reasoningBudgetStatusLine(sessionId),
 		activeProfile: deps.activeProfile ?? null,
 		configGeneration: deps.configGeneration,
@@ -1428,3 +1431,5 @@ function colorHex(hex: string, text: string): string {
 	const b = Number.parseInt(clean.slice(4, 6), 16);
 	return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`;
 }
+
+import { readCompartmentScoreVisibility } from "@magic-context/core/hooks/magic-context/score-visibility";

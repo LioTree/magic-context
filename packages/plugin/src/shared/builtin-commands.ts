@@ -21,6 +21,11 @@ export function getMagicContextBuiltinCommands(compactionEnabled = true) {
                 ? "Rebuild compressed history from raw history (full or <start>-<end> range); memories are not changed"
                 : unavailableInCompactionOff("ctx-recomp"),
         },
+        "ctx-rescore": {
+            template: "ctx-rescore",
+            description:
+                "Preview or control stored history rescoring; scores apply at the next natural rebuild",
+        },
         "ctx-wrapup": {
             template: "ctx-wrapup",
             description: compactionEnabled

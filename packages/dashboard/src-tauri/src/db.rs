@@ -10,6 +10,8 @@ use crate::broca_wal;
 use crate::external_cache_sessions;
 use crate::pi_sessions;
 use crate::project_identity::{basename, normalize_stored_project_path};
+#[path = "compartment_scores.rs"]
+mod compartment_scores;
 #[path = "historian_telemetry.rs"]
 mod historian_telemetry;
 pub use historian_telemetry::{count_historian_runs, get_subagent_invocations, SubagentInvocation};
@@ -1140,6 +1142,12 @@ pub struct Compartment {
     /// v2 decay-rate score (1–100). Higher = decays into lower render tiers
     /// more slowly. Default 50.
     pub importance: i64,
+    pub effective_importance: Option<i64>,
+    pub applied_importance: Option<i64>,
+    /// TypeScript and Rust keep their frozen prompt-history bytes in different
+    /// caches. If both exist, show both committed score views; a database row
+    /// alone cannot identify which runtime last sent the prompt.
+    pub rust_applied_importance: Option<i64>,
     /// v2 episode classification — may be comma-joined (e.g. "design,bug").
     /// `None` for legacy rows.
     pub episode_type: Option<String>,
@@ -7374,11 +7382,14 @@ pub fn get_compartments(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Vec<Compartment>, rusqlite::Error> {
+    let rust_watermark = compartment_scores::rust_watermark(conn, session_id)?;
+    let tx = conn.unchecked_transaction()?;
+    let scores = compartment_scores::read(&tx, session_id, rust_watermark)?;
     // v2 tiered compartments: read the paraphrase tiers (p1–p4), the
     // decay-rate `importance`, and `episode_type` directly off the row.
     // `legacy=1` rows predate the tiered format (p1–p4 NULL) and render
     // degraded on the frontend. `content` mirrors p1 for v2 rows.
-    let mut stmt = conn.prepare(
+    let mut stmt = tx.prepare(
         "SELECT c.id, c.session_id, c.sequence, c.start_message, c.end_message,
                 c.start_message_id, c.end_message_id, c.title, c.content, c.created_at,
                 c.importance, c.episode_type, c.p1, c.p2, c.p3, c.p4, c.legacy
@@ -7388,6 +7399,9 @@ pub fn get_compartments(
     )?;
     let mut compartments: Vec<Compartment> = stmt
         .query_map(rusqlite::params![session_id], |row| {
+            let id: i64 = row.get(0)?;
+            let base = row.get::<_, Option<i64>>(10)?.unwrap_or(50);
+            let selected = scores.selected.contains(&id);
             Ok(Compartment {
                 id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -7402,6 +7416,14 @@ pub fn get_compartments(
                 start_time: None,
                 end_time: None,
                 importance: row.get::<_, Option<i64>>(10)?.unwrap_or(50),
+                effective_importance: selected
+                    .then(|| scores.effective.get(&id).copied().unwrap_or(base)),
+                applied_importance: selected
+                    .then(|| scores.applied.get(&id).copied().unwrap_or(base)),
+                rust_applied_importance: scores
+                    .rust_applied
+                    .as_ref()
+                    .and_then(|view| selected.then(|| view.get(&id).copied().unwrap_or(base))),
                 episode_type: row.get(11)?,
                 p1: row.get(12)?,
                 p2: row.get(13)?,
@@ -7411,6 +7433,8 @@ pub fn get_compartments(
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    tx.commit()?;
 
     // Resolve message timestamps from OpenCode DB
     if let Some(opencode_db_path) = resolve_opencode_db_path() {

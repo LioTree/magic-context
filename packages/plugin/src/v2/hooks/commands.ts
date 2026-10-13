@@ -1,3 +1,4 @@
+import { parseRescoreCommand } from "../../features/magic-context/rescore-service";
 import { getMagicContextBuiltinCommands } from "../../shared/builtin-commands";
 import { log } from "../../shared/logger";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
@@ -112,6 +113,27 @@ function reportRpcReply(
 
 function buildV2Commands(rpc: MagicContextRpcServer, directory: string): V2Command[] {
     return [
+        {
+            name: "ctx-rescore",
+            execute: async (input) => {
+                const argument = commandArgument(input, "ctx-rescore");
+                try {
+                    parseRescoreCommand(argument);
+                } catch (error) {
+                    reportUsage(
+                        input.sessionID,
+                        error instanceof Error ? error.message : "Invalid rescore arguments",
+                    );
+                    return;
+                }
+                const reply = await rpc.dispatch("rescore", {
+                    sessionId: input.sessionID,
+                    arguments: argument,
+                    directory,
+                });
+                reportRpcReply(input.sessionID, "Rescore", reply, "Rescore started");
+            },
+        },
         {
             name: "ctx-status",
             execute: async (input) => {

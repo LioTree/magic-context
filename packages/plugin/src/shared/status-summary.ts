@@ -1,12 +1,14 @@
 import { formatCacheTtlDisplay } from "./cache-ttl-display";
 import { primaryQuotaDiagnostic } from "./quota-diagnostic";
 import type { RunnerStatus, StatusDetail } from "./rpc-types";
+import { type CompartmentScoreVisibility, compartmentScoreStatusRows } from "./score-visibility";
 import { renderUserFacingFailure, type UserFacingFailureKey } from "./user-facing-codes";
 
 export type StatusCompressionState = "off" | "compressing" | "ready" | "waiting";
 export type StatusEmbeddingState = "off" | "running" | "paused" | "stopped" | "ready" | "waiting";
 
 export interface UserStatusSummary {
+    compartmentScores?: CompartmentScoreVisibility;
     inputTokens: number;
     usableContextTokens: number;
     usagePercentage: number;
@@ -100,6 +102,7 @@ export function statusSummaryFromDetail(detail: StatusDetail): UserStatusSummary
 
     return {
         inputTokens: detail.inputTokens,
+        compartmentScores: detail.compartmentScores,
         usableContextTokens: detail.contextLimit,
         usagePercentage: detail.usagePercentage,
         cacheLifetime: formatCacheTtlDisplay({
@@ -224,6 +227,7 @@ export function renderUserStatusSummary(
         ],
         ["Search indexing", embeddingText(summary)],
     ];
+    values.push(...compartmentScoreStatusRows(summary.compartmentScores));
     if (summary.historianRunner) {
         values.push(["Historian runner", runnerText(summary.historianRunner)]);
     }
