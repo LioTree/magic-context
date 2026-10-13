@@ -103,9 +103,11 @@ expect_message = 'expect(received).not.toBe(expected)'
 
 [[control]]
 id = 'ts-image-strip-detects-only-on-bust'
-guards = 'processed images are newly stripped only when the prefix is eligible for editing; a defer only replays the frozen ids'
+guards = 'processed images are newly stripped only when the current mode permits first application; a defer only replays the frozen ids'
 file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
-old = 'detect: canEditWholePrefix && args.watermark > 0,'
+old = '''
+                detect:
+                    (holdEnabled ? isCacheBustingPass : canEditWholePrefix) && args.watermark > 0,'''
 new = 'detect: args.watermark > 0,'
 test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
 runner = 'command'
