@@ -1,0 +1,16 @@
+{
+  "extends": "../../../../packages/plugin/tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "../../../..",
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "noEmit": true,
+    "typeRoots": [
+      "../../../../packages/plugin/node_modules/@types",
+      "../../../../packages/plugin/node_modules"
+    ]
+  },
+  "include": ["generate.ts", "../../../../packages/plugin/src/**/*.d.ts"],
+  "exclude": ["../../../../node_modules"]
+}
