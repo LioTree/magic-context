@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 mod cache_policy;
 mod capability_candidate;
 #[cfg(test)]
+mod cc_native_review_tests;
+#[cfg(test)]
 #[path = "../../../../docs/reports/cc-step-lane-witnesses.rs"]
 mod cc_step_lane_review;
 #[cfg(test)]
