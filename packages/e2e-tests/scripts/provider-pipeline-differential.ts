@@ -198,6 +198,60 @@ fn provider_pipeline_driver() {
                      json!({"settled":true})
                  } else if op == "reads" {
                     json!(rig.reads.0.load(Ordering::SeqCst))
+                } else if op == "resident" {
+                    let key = mc_store::ProviderSessionKey { project_root: rig.binding.project_root.to_string_lossy().into(), session: "session".into(), harness: rig.binding.harness.clone() };
+                    let authority = rig.store.read_provider_resident_authority(&key, 100000, 500, 128*1024*1024).unwrap();
+                    let namespace = &authority.conversation.engine_namespace;
+                    let loaded = rig.store.load(namespace).unwrap();
+                    let membership = rig.store.resolve_workspace_membership(key.project_root.as_str()).unwrap();
+                    let memory = rig.store.load_memory_render_snapshot(key.project_root.as_str(), membership.as_ref(), loaded.meta.expiry_cutoff_ms).unwrap();
+                    let scores = rig.store.load_compartment_score_snapshot(namespace, mc_store::ScoreSelector::Latest).unwrap();
+                    let tags = rig.store.load_tags_for_session(namespace).unwrap();
+                    let answers = rig.store.load_provider_hook_answers(&key).unwrap();
+                    let domains = json!({"engine":{"row_version":loaded.row_version,"core":loaded.core,"meta":loaded.meta},
+                        "tags":tags.iter().map(|tag|json!({"number":tag.tag_number,"block_id":tag.block_id,"kind":tag.kind,"tokens":tag.token_count,"created_at_ms":tag.created_at_ms,"source_bytes":tag.source_bytes.as_ref()})).collect::<Vec<_>>(),
+                        "memory":{"memories":memory.memories,"revisions":memory.revisions,"fragment_watermark":memory.fragment_watermark,
+                            "project_paths":memory.revision.project_paths,"reader_project_path":memory.revision.reader_project_path,"expiry_cutoff_ms":memory.revision.expiry_cutoff_ms,"max_memory_id":memory.revision.max_memory_id,"mutation_cursor":memory.revision.mutation_cursor},
+                        "compartments":scores.compartments,"scores":scores.importance_by_sequence,"score_watermark":scores.watermark,
+                        "workspace":membership.as_ref().map(|m|json!({"union_identities":m.union_identities,"own_identity":m.own_identity,"share_categories":m.share_categories,"display_name_by_path":m.display_name_by_path})),
+                        "answers":answers.iter().map(|a|json!({"lineage_id":a.lineage_id,"state":a.state,"ordinal":a.answer.ordinal,"ops_json":a.answer.ops_json,"tags":a.answer.tags,
+                            "subject_mid":a.answer.subject.subject_mid,"hook":a.answer.subject.hook,"subject_part":a.answer.subject.subject_part})).collect::<Vec<_>>(),
+                        "pending_drops":rig.store.load_provider_pending_drops(&key).unwrap()});
+                    let importance = scores.importance_by_sequence.iter().map(|(k,v)|(*k,*v)).collect();
+                    let started = std::time::Instant::now();
+                    let resident = crate::providers::resident::ResidentState::build(&authority, &domains, &scores.compartments, &importance,
+                        "offline-renderer-v1", "offline-tokenizer-v1", 128*1024*1024).unwrap();
+                    let build_ms = started.elapsed().as_secs_f64()*1000.0;
+                    let snapshot = resident.snapshot();
+                    assert_eq!(snapshot["domains"], domains);
+                    let conv = key.conversation_key();
+                    // The oracle reads physical rows independently of the new
+                    // capture/index packing; effective ancestry and consumption
+                    // are resolved before comparing every field, not just totals.
+                    let consumed = rig.sql.prepare("SELECT tag_number FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1").unwrap()
+                        .query_map([namespace], |r|r.get::<_,i64>(0)).unwrap().map(Result::unwrap).collect::<BTreeSet<_>>();
+                    let mut expected = BTreeMap::<String,(usize,Value)>::new();
+                    let mut q = rig.sql.prepare("SELECT lineage_id,ordinal,policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1").unwrap();
+                    for row in q.query_map([&conv], |r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,String>(2)?))).unwrap() {
+                        let (lineage, ordinal, raw) = row.unwrap();
+                        if let Some(depth) = authority.ancestry.iter().position(|(id,cut)|*id==lineage && ordinal<=*cut) {
+                            let mut part: Value = serde_json::from_str(&raw).unwrap();
+                            if part["tag_number"].as_i64().is_some_and(|n|consumed.contains(&n)) {part["active"]=json!(false);}
+                            let id=part["block_id"].as_str().unwrap().to_string();
+                            if expected.get(&id).is_none_or(|(held,_)|depth<*held) {expected.insert(id,(depth,part));}
+                        }
+                    }
+                    let mut expected = expected.into_values().map(|(_,part)|part).collect::<Vec<_>>();
+                    expected.sort_by_key(|part|(part["ordinal"].as_u64().unwrap(),part["block_index"].as_i64().unwrap()));
+                    assert_eq!(snapshot["parts"].as_array().unwrap().iter().map(|p|p["part"].clone()).collect::<Vec<_>>(),expected);
+                    let full = rig.store.load_provider_messages(&key, &authority.conversation.lineage_id).unwrap();
+                    let tail = full.iter().filter(|m|authority.coverage.is_none_or(|cut|m.ordinal>cut)).collect::<Vec<_>>();
+                    assert_eq!(tail.len(),authority.tail.len());
+                    for (at, message) in tail.iter().enumerate() {assert_eq!(snapshot["tail"][at]["native_bytes"],json!(message.message_bytes));}
+                    assert_eq!(authority.policy_revision,rig.store.provider_policy_revision(namespace).unwrap());
+                    json!({"parts":authority.parts.len(),"tail_blob_rows":authority.tail_blob_rows,"tail_bytes":authority.tail_blob_bytes,"fragments":snapshot["fragments"].as_array().unwrap().len(),
+                        "memories":memory.memories.len(),"compartments":scores.compartments.len(),"retained_bytes":resident.retained_bytes(),"build_ms":build_ms,
+                        "snapshot_sha256":mc_store::move_snapshot::digest(&serde_json::to_vec(&snapshot).unwrap()),"independent_parts_equal":true,"independent_tail_equal":true,"domains_equal":true,"policy_revision":authority.policy_revision})
                 } else if op == "inspect" {
                     let state = rig.store.load("session").unwrap();
                     let tags = rig.store.load_tags_for_session("session").unwrap();

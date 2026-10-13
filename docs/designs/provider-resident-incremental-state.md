@@ -1,6 +1,7 @@
 # Provider-only resident incremental state
 
-Status: **proposal for review, not implementation authorization**. Ordinary
+Status: **resident boundary approved; offline builder/inventory/schema proposal
+only; migration and serving consumption await a separate review**. Ordinary
 provider hooks must finish within 10 ms in the Rust `ck-mc` module handler
 (network excluded); a provider
 fold/rebuild must finish in less than 100 ms. The 1,500 ms product hook fence is
@@ -23,24 +24,23 @@ Compartment rendering is only one contributor. The proposed boundary is a new
 **provider fold operation over maintained state**, not a cached invocation of
 `transform_with_projection` with the old full-array inputs.
 
-There are two contract questions that need project-owner approval before implementation:
+The following items state the approved effective-identity and bounded-output
+contract used by the offline builder and the later serving design:
 
 1. **Durable measurement representation.** Exact served bytes, acknowledgement
    bytes and every effective per-part measurement, policy decision and baseline
-   scalar read from durable authority must remain unchanged. But a fold/refreeze
-   which changes 57,000 physical measurement rows cannot guarantee a sub-100 ms
-   transaction, and cannot guarantee a sub-10 ms first hook. A generation/cut-based
-   baseline overlay and delta checkpoint would replace eager physical row
-   restatement. If literal old-table cell identity is still required at every cut,
-   that optimization is forbidden: report the target as unattainable rather than
-   silently replacing the durable-state differential with a weaker one.
+   scalar read from durable authority must remain unchanged. The owner approved
+   generation/cut overlays and point overrides instead of eager physical-row
+   restatement, provided **every reader** resolves through them, including export,
+   diagnostics and dashboard paths. Literal private-cell identity is not the gate;
+   every effective measurement remains an independent per-part assertion.
 2. **Bounded output and delta.** No implementation returning a complete JSON answer
    can have a constant time bound independent of arbitrary output size or of an
-   arbitrarily large mutation. It must at least write the answer's bytes. Global
-   budget/decay changes can also move every compartment to another tier. The
-   proposed targets apply to the stated fixture with bounded rendered head,
-   <=500 raw messages and bounded changes; worst-case all-tier changes and large
-   bodies require a separately specified bound, not a hidden deadline increase.
+   arbitrarily large mutation. It must at least write the answer's bytes. Normal
+   all-tier decay at 2,300 compartments is explicitly in the <100 ms population
+   and must use cached per-tier fragments. Truly unbounded body/all-new-content
+   changes after model/renderer upgrades have separate measured bounds, never a
+   hidden deadline increase.
 
 No migration, resident serving cache, baseline overlay or response protocol change
 has been implemented in this increment.
@@ -175,12 +175,12 @@ On restart:
    state may occur during startup, but must be reported as startup recovery cost,
    not excluded from a purported fast first-hook result.
 
-Cold-start latency, migration/bootstrap of existing sessions and recovery after an
-external mode-2 writer are separate acceptance populations. A restart cannot
-both read an unbounded legacy state and honestly promise constant first-request
-latency. The design needs either a ready-state admission boundary with an explicit
-availability contract, or a bounded compact checkpoint that satisfies the first
-request target too. Review this choice explicitly.
+A compact checkpoint restores only the active header and bounded needed pages,
+not the whole historical arena. Valid-checkpoint restart is
+its own population and targets the same <=10 ms / <100 ms. Missing/corrupt/stale
+checkpoints recover off the serving path and refuse with a named retryable code.
+Recovery startup cost and refusal count must be reported. Loading the entire cold
+legacy state on that first request does not meet this contract.
 
 ## One fold gate: what it reads and renders
 
@@ -269,8 +269,11 @@ No serving consumption until the following controls pass:
   SQL rows/writes, CPU PSI/load, startup/ready-state recovery and refusal counts.
   The target is absolute latency, not a ratio to the full-array side column.
 
-Review decisions needed: approve the provider-only resident/delta boundary; settle
-physical versus effective durable-state identity; settle bounded-output/delta and
-cold-start admission contracts; then approve a specific checkpoint/journal schema
-if existing sections and revisions cannot express it. Until those decisions and
-proofs, the canary remains blocked and production paths remain unchanged.
+The next review must establish resolver coverage, journal publication and compact
+recovery before any migration or serving consumption. Review
+`provider-checkpoint-journal-schema.md` and
+`../reports/provider-resident-reader-writer-inventory.md`, plus the offline
+resident snapshot proofs. The boundary/effective-identity/ordinary-decay and
+compact valid-restart contracts are approved; concrete migrations and serving
+consumption are not. Until those later proofs and review, the canary remains
+blocked and production serving paths remain unchanged.

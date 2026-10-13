@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "scope": "offline resident builder and read-only capture, not a serving-cache proof",
+  "tool_versions": {
+    "rustc": "1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "1.99.0 (5f94df478 2026-08-27)"
+  },
+  "controls": [
+    {
+      "control": "Neutralize final retained-capacity refusal (NON-VACUITY BREAK)",
+      "expected_red": "providers::resident::tests::resident_retained_capacity_cap_refuses_instead_of_truncating",
+      "captured_output": "resident_retained_capacity_cap_refuses_instead_of_truncating ... FAILED; test result: FAILED. 3 passed; 1 failed; no other failures",
+      "applied_evidence": "crates/mc-module/src/providers/resident.rs: during 1 file changed, 1 insertion(+), 1 deletion(-); after git checkout -- path && touch path: git diff --stat empty",
+      "unaffected": [
+        "providers::resident::tests::resident_snapshot_preserves_every_effective_part_fact",
+        "providers::resident::header_tests::resident_header_binds_runtime_store_conversation_and_revision",
+        "providers::resident::tests::resident_fragment_keys_cover_source_and_render_inputs"
+      ],
+      "outcome": "reddened"
+    },
+    {
+      "control": "Replace complete compartment source key with null (NON-VACUITY BREAK)",
+      "expected_red": "providers::resident::tests::resident_fragment_keys_cover_source_and_render_inputs",
+      "captured_output": "resident_fragment_keys_cover_source_and_render_inputs ... FAILED; assertion left != right failed: title; test result: FAILED. 3 passed; 1 failed; no other failures",
+      "applied_evidence": "crates/mc-module/src/providers/resident.rs: during 1 file changed, 1 insertion(+), 1 deletion(-); after git checkout -- path && touch path: git diff --stat empty",
+      "unaffected": [
+        "providers::resident::tests::resident_retained_capacity_cap_refuses_instead_of_truncating",
+        "providers::resident::tests::resident_snapshot_preserves_every_effective_part_fact",
+        "providers::resident::header_tests::resident_header_binds_runtime_store_conversation_and_revision"
+      ],
+      "outcome": "reddened"
+    },
+    {
+      "control": "Remove coverage lower bound from native-tail SQL (NON-VACUITY BREAK)",
+      "expected_red": "provider_resident_read::tests::resident_authority_covered_history_is_not_materialized",
+      "captured_output": "resident_authority_covered_history_is_not_materialized ... FAILED; Err Transient(\"resident native tail exceeds cap\"); test result: FAILED. 2 passed; 1 failed; no other failures",
+      "applied_evidence": "crates/mc-store/src/provider_resident_read.rs: during 1 file changed, 1 insertion(+), 1 deletion(-); after git checkout -- path && touch path: git diff --stat empty",
+      "unaffected": [
+        "provider_resident_read::tests::resident_authority_read_transaction_has_no_writes",
+        "provider_resident_read::tests::resident_authority_native_limits_refuse_instead_of_truncating"
+      ],
+      "outcome": "reddened"
+    },
+    {
+      "control": "Force queued=false while packing full policy part (NON-VACUITY BREAK)",
+      "expected_red": "providers::resident::tests::resident_snapshot_preserves_every_effective_part_fact",
+      "captured_output": "resident_snapshot_preserves_every_effective_part_fact ... FAILED; literal expected queued=true, packed queued=false; test result: FAILED. 3 passed; 1 failed; no other failures",
+      "applied_evidence": "crates/mc-module/src/providers/resident.rs: during 1 file changed, 3 insertions(+), 1 deletion(-); after git checkout -- path && touch path: git diff --stat empty",
+      "unaffected": [
+        "providers::resident::tests::resident_retained_capacity_cap_refuses_instead_of_truncating",
+        "providers::resident::header_tests::resident_header_binds_runtime_store_conversation_and_revision",
+        "providers::resident::tests::resident_fragment_keys_cover_source_and_render_inputs"
+      ],
+      "outcome": "reddened"
+    }
+  ]
+}

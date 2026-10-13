@@ -11,6 +11,8 @@ mod compaction;
 mod historian;
 mod policy_summary;
 mod records;
+#[cfg(test)]
+pub(crate) mod resident;
 mod step_transform;
 #[cfg(test)]
 mod tests;

@@ -31,9 +31,13 @@ mod provider_legacy;
 mod provider_log;
 pub mod provider_meters;
 mod provider_preparation;
+#[cfg(any(test, feature = "test-support"))]
+mod provider_resident_read;
 pub use provider_preparation::{
     ProviderPreparationWrite, ProviderStoredPreparation, MAX_PROVIDER_PREPARATION_BYTES,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use provider_resident_read::ProviderResidentAuthority;
 pub mod provider_records;
 pub use provider_records::ProviderSessionKey;
 pub mod score_projection;
