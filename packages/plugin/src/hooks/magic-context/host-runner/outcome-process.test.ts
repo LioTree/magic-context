@@ -8,7 +8,7 @@ import type { HookOutcome } from "./record";
 for (const host of ["v1", "v2"]) {
     test(`OpenCode ${host} SIGKILL between steps replays durable per-subject ops and unavailable identically`, async () => {
         const root = createTestTempDirFromPath(join(tmpdir(), "mc-outcome-kill-"));
-        const fixture = join(import.meta.dir, "fixtures", "outcome-process.ts");
+        const fixture = join(import.meta.dir, "fixtures", "outcome-process.fixture.ts");
         const args = [
             process.execPath,
             fixture,
