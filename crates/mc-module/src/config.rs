@@ -590,6 +590,12 @@ fn parse_config_text(raw: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(&strip_jsonc(without_bom))
 }
 
+/// Convert TypeScript-compatible validated settings to the fields McModuleConfig consumes.
+/// ConfigCache still reads and merges its own raw tiers; only TrustedConfigResolver uses this.
+pub(crate) fn parity_projection(validated: &Value) -> McModuleConfig {
+    merge_tiers_with_warnings(Some(validated), None).0
+}
+
 #[cfg(test)]
 fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig {
     let (cfg, warnings) = merge_tiers_with_warnings(user, project);
