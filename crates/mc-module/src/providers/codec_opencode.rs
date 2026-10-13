@@ -133,6 +133,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, message)| compact::status::StatusMessage {
+                raw_message: None,
                 mid: message["info"]["id"].as_str().unwrap().into(),
                 ordinal: 4_000 + index as u64,
                 message: message.clone(),
@@ -415,6 +416,7 @@ mod tests {
             json!({"info":{"id":"other","role":"user"},"parts":[]}),
         ] {
             let entry = compact::status::StatusMessage {
+                raw_message: None,
                 mid: "m".into(),
                 ordinal: 1,
                 message: native,

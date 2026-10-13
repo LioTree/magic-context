@@ -1,0 +1,80 @@
+{
+  "toolchain": {
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "runner": "linux,4c",
+    "cargo_jobs": 4
+  },
+  "mutation_evidence": [
+    {
+      "control": "Author M1: neutralize raw kept-signed-prefix comparison in encode_view",
+      "expected_red": "providers::codec_claude_code::tests::every_kept_signed_prefix_is_fenced_including_historical_turns",
+      "captured_output": "every_kept_signed_prefix_is_fenced_including_historical_turns ... FAILED; assertion expected signed_prefix_edit. raw_provenance_and_transport_markers_are_required, identical_signed_messages_remain_distinct_by_gateway_mid, complete_signed_tool_run_can_be_covered_but_split_or_tail_removal_refuses, synthetic_noncanonical_signed_redacted_scalar_and_opaque_roundtrip ... ok. 4 passed; 1 failed.",
+      "applied_evidence": "crates/mc-module/src/providers/codec_claude_code.rs: during git diff --stat = 1 file changed, 3 insertions(+), 2 deletions(-); after git checkout -- path && touch path = empty git diff --stat",
+      "outcome": "reddened",
+      "command": "cargo test -p mc-module -j 4 --lib providers::codec_claude_code::tests:: -- --skip opaque_native_thinking_shapes_still_fence_their_signed_prefix --skip real_claude_code_capture_roundtrips_actual_raw_replacement_bytes",
+      "task": "bash-106384f7ee49e5a6",
+      "output": "author-signed-prefix.{stdout,stderr}.txt"
+    },
+    {
+      "control": "Author M7: replace the terminal protected-tail adapter arm with transient",
+      "expected_red": "providers::compaction::terminal_refusal_tests::protected_tail_refusal_precedes_outage_pass_and_never_publishes_a_view",
+      "captured_output": "protected_tail_refusal_precedes_outage_pass_and_never_publishes_a_view ... FAILED: typed engine refusal became an outage. unrelated_engine_errors_remain_transient_not_terminal_refusals ... ok. test result: FAILED. 1 passed; 1 failed.",
+      "applied_evidence": "crates/mc-module/src/providers/compaction.rs: during git diff --stat = 1 file changed, 2 insertions(+), 4 deletions(-); after git checkout -- path && touch path = empty git diff --stat",
+      "outcome": "reddened",
+      "command": "cargo test -p mc-module -j 4 --lib providers::compaction::terminal_refusal_tests:: -- --nocapture",
+      "task": "bash-a0d8c962f105c9f6",
+      "output": "author-terminal-refusal.{stdout,stderr}.txt"
+    },
+    {
+      "control": "Independent: neutralize recognized transport cache_control rejection in envelope",
+      "expected_red": "providers::cc_step_lane_review::marker_transport_positions_are_exhaustively_refused",
+      "captured_output": "marker_transport_positions_are_exhaustively_refused ... FAILED: top-level text. marker_tool_inputs_and_unknown_blocks_are_kept ... ok. test result: FAILED. 1 passed; 1 failed.",
+      "applied_evidence": "crates/mc-module/src/providers/codec_claude_code.rs: during git diff --stat = 1 file changed, 2 insertions(+), 1 deletion(-); after git checkout -- path && touch path = empty git diff --stat",
+      "outcome": "reddened",
+      "command": "cargo test -p mc-module -j 4 --lib providers::cc_step_lane_review::marker_ -- --nocapture",
+      "task": "bash-191a72019ceed4bc",
+      "output": "review-marker.{stdout,stderr}.txt"
+    },
+    {
+      "control": "Independent: reserialize parsed replacement instead of substituting committed raw JSON",
+      "expected_red": "providers::cc_step_lane_review::raw_fuzz_setup_step_admission_hook_and_identity_replacement",
+      "captured_output": "raw_fuzz_setup_step_admission_hook_and_identity_replacement ... FAILED: raw answer seed 0. raw_canonical_control_has_no_noncanonical_bytes ... ok. test result: FAILED. 1 passed; 1 failed.",
+      "applied_evidence": "crates/mc-module/src/providers/codec_claude_code.rs: during git diff --stat = 1 file changed, 2 insertions(+), 3 deletions(-); after git checkout -- path && touch path = empty git diff --stat",
+      "outcome": "reddened",
+      "command": "cargo test -p mc-module -j 4 --lib providers::cc_step_lane_review::raw_ -- --nocapture",
+      "task": "bash-63665f1918b94e82",
+      "output": "review-raw-answer.{stdout,stderr}.txt"
+    }
+  ],
+  "counterexample_run": {
+    "command": "cargo test -p mc-module -j 4 --lib providers::cc_step_lane_review::duplicate_ -- --ignored --nocapture",
+    "task": "bash-20cddd9195a2f485",
+    "result": "0 passed; 3 expected failures; 0 ignored",
+    "failed_tests": [
+      "providers::cc_step_lane_review::duplicate_content_cannot_edit_bytes_before_effective_kept_thinking",
+      "providers::cc_step_lane_review::duplicate_content_cannot_hide_transport_marker",
+      "providers::cc_step_lane_review::duplicate_text_splice_must_change_effective_text_or_refuse"
+    ],
+    "output": "duplicate-counterexamples.{stdout,stderr}.txt"
+  },
+  "restored_run": {
+    "commands": [
+      "cargo check -p mc-module -j 4 --all-targets",
+      "MC_CC_CAPTURE=$PWD/local-ignore/cc-thinking-fixtures-20261012/14047-req-body cargo test -p mc-module -j 4 --lib providers:: -- --skip providers::historian:: --nocapture"
+    ],
+    "task": "bash-8841001a339319b0",
+    "result": "check passed; 165 tests passed; 0 failed; 5 ignored",
+    "output": "restored-suite.{stdout,stderr}.txt",
+    "diagnostic_correction": "The fuzz diagnostic printed 655360 raw signature bytes; actual input is 9 * 65536 = 589824 raw bytes, 262144 decoded bytes. Only the diagnostic was corrected afterward."
+  },
+  "conformance_run": {
+    "commands": [
+      "cargo test -p mc-module -j 4 --test broca_conformance --features drive-fault",
+      "cargo test -p mc-module -j 4 --lib tests::tool_catalog_conformance::the_role_conformance_suite_passes_every_case_magic_context_can_run -- --exact"
+    ],
+    "task": "bash-b633dcfdb71cccaa",
+    "result": "Broca 14 passed; tool-provider enclosing test 1 passed",
+    "output": "broca-conformance.{stdout,stderr}.txt"
+  }
+}

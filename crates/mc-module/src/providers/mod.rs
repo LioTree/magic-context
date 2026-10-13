@@ -5,7 +5,16 @@ use cortexkit_role_step_transform_provider as hooks;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod cache_policy;
+#[cfg(test)]
+mod capability_candidate;
+#[cfg(test)]
+#[path = "../../../../docs/reports/cc-step-lane-witnesses.rs"]
+mod cc_step_lane_review;
+#[cfg(test)]
+mod claude_code_tests;
 mod codec;
+mod codec_claude_code;
 mod codec_opencode;
 mod compaction;
 mod historian;
@@ -24,6 +33,28 @@ pub(crate) use records::{Catalog, Storage};
 use step_transform::declaration;
 
 pub const HOOK_BUDGET_MS: u64 = 1_500;
+const HOST_ENVELOPE_BYTES: usize = hooks::hook::DEFAULT_HOOK_CAP_BYTES;
+const CLAUDE_CODE_HARNESS: &str = "claude-code";
+const CLAUDE_CODE_MODULE: &str = "thalamus";
+
+pub(crate) fn inbound_ceiling(
+    binding: &SessionBinding,
+    operation: Option<&str>,
+    bytes: Option<usize>,
+) -> Option<HandlerOutcome> {
+    if attested_claude_code(binding) && bytes.is_some_and(|bytes| bytes >= HOST_ENVELOPE_BYTES) {
+        let field = match operation {
+            Some("compaction.step") => "messages",
+            Some("transform.hook") => "message",
+            _ => return None,
+        };
+        return Some(invalid_field(
+            field,
+            "native request exceeds the encoded envelope ceiling",
+        ));
+    }
+    None
+}
 
 pub fn runner_groups() -> [&'static str; 1] {
     ["transcript_reads"]
@@ -68,8 +99,66 @@ fn invalid_field(field: &str, message: impl ToString) -> HandlerOutcome {
 }
 
 fn answer_observation(params: &Value) -> bool {
-    params.get("serializer_profile").and_then(Value::as_str) == Some("opencode-aisdk")
-        && params.get("observation").and_then(Value::as_str) == Some("answer")
+    matches!(
+        params.get("serializer_profile").and_then(Value::as_str),
+        Some("opencode-aisdk" | "claude-code-anthropic")
+    ) && params.get("observation").and_then(Value::as_str) == Some("answer")
+}
+
+fn attested_claude_code(binding: &SessionBinding) -> bool {
+    binding.harness == CLAUDE_CODE_HARNESS
+        && matches!(&binding.principal,
+        Some(subc_protocol::Principal::Reserved { module_id }) if module_id == CLAUDE_CODE_MODULE)
+}
+
+fn host_binding(binding: &SessionBinding) -> bool {
+    matches!(binding.harness.as_str(), "opencode" | "opencode2") || attested_claude_code(binding)
+}
+
+/// Claude Code requires the daemon-confirmed Thalamus caller and a plan choosing
+/// the Anthropic serializer with gateway-observed answers. Additional negotiated
+/// capabilities belong here, never in a caller-supplied principal field.
+fn admit_claude_code(
+    binding: &SessionBinding,
+    method: &str,
+    params: &Value,
+) -> Result<(), HandlerOutcome> {
+    // Claude Code capability selection is not offered yet. Reject a supplied
+    // bundle by name instead of ignoring it and running the existing codec path
+    // that checks only caller identity, serializer profile and observation mode.
+    if params
+        .get("claude_code")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(invalid_field(
+            "claude_code",
+            "native capability publication is held",
+        ));
+    }
+    let thalamus = matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == CLAUDE_CODE_MODULE);
+    let profile = params
+        .pointer("/params/serializer_profile")
+        .and_then(Value::as_str);
+    if (profile == Some("claude-code-anthropic") || binding.harness == CLAUDE_CODE_HARNESS)
+        && !thalamus
+    {
+        return Err(error(
+            "claude_code_lane_requires_attested_host",
+            "Claude Code provider lane requires reserved:thalamus",
+        ));
+    }
+    if thalamus
+        && (binding.harness != CLAUDE_CODE_HARNESS
+            || profile.is_some_and(|p| p != "claude-code-anthropic")
+            || (matches!(method, "transform.declare" | "compaction.setup")
+                && profile != Some("claude-code-anthropic")))
+    {
+        return Err(error(
+            "claude_code_lane_profile_mismatch",
+            "reserved:thalamus must use the Claude Code provider profile",
+        ));
+    }
+    Ok(())
 }
 
 pub fn describe() -> HandlerOutcome {
@@ -156,9 +245,12 @@ impl McHandler {
                 )
             }
         };
-        // Until the daemon supplies attested caller identity, bind is the same
-        // trust boundary as full-request transform. Body harness never grants it.
-        let host = matches!(binding.harness.as_str(), "opencode" | "opencode2");
+        if let Err(error) = admit_claude_code(&binding, method, params) {
+            return error;
+        }
+        // OpenCode keeps its existing authorization by bound harness. Claude Code
+        // also requires the caller identity confirmed by the daemon at route bind.
+        let host = host_binding(&binding);
         if !host && binding.harness != session_resolver::RUNNER_BIND_HARNESS {
             return error(
                 "route_unbound",
@@ -185,7 +277,7 @@ impl McHandler {
             } else if !answer_observation(plan) {
                 return invalid_field(
                     "params.observation",
-                    "host lane requires both answer observation and opencode-aisdk",
+                    "host lane requires its native profile and answer observation",
                 );
             }
         }

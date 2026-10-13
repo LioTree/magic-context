@@ -2293,6 +2293,12 @@ pub fn transform_with_projection(
 /// The caller resolves `template.session_id` from (project_root, session, harness);
 /// this engine seam neither resolves handles nor calls a gateway.
 pub mod compaction {
+    #[cfg(test)]
+    thread_local! {
+        // Observe the exact request passed to the real engine, not a separate
+        // adapter projection that production might never consume.
+        pub(crate) static LAST_NATIVE_REQUEST: std::cell::RefCell<Option<(String, Option<super::TransformGeometry>, bool)>> = const { std::cell::RefCell::new(None) };
+    }
     use super::*;
 
     pub(super) const PASS_KIND: &str = "compaction.step";
@@ -2596,8 +2602,17 @@ pub mod compaction {
                     .is_none_or(|v| v.version < rejected.version)
         });
         let usage = status.usage();
+        let native_cc = template.serializer_profile == "claude-code-anthropic";
+        let execute_window = if native_cc {
+            template
+                .geometry
+                .as_ref()
+                .map_or(status.context_window, |geometry| geometry.usable_soft)
+        } else {
+            status.context_window
+        };
         let execute_due = usage.current_total_input_tokens as f64 * 100.0
-            >= status.context_window as f64 * ctx.execute_threshold_percentage;
+            >= execute_window as f64 * ctx.execute_threshold_percentage;
         // A cold prefix, or an unapplied view on an execute opportunity, is concrete
         // rebuild work. Retain the epoch on later calls so it causes only one HARD.
         let host = template.serializer_profile == "opencode-aisdk";
@@ -2619,12 +2634,16 @@ pub mod compaction {
             PASS_KIND
         }
         .to_string();
-        if !host {
+        if !host && !native_cc {
             req.serializer_profile = "owned-broca".to_string();
         }
         req.is_subagent = state.preset != Preset::Head;
         req.usage = Some(usage);
-        req.geometry = None;
+        req.geometry = if native_cc {
+            template.geometry.clone()
+        } else {
+            None
+        };
         if !host {
             req.serve_native = false;
             req.native_messages = None;
@@ -2641,6 +2660,16 @@ pub mod compaction {
             "{}|broca-compaction:{}",
             req.render_config, state.rebuild_epoch
         );
+        #[cfg(test)]
+        LAST_NATIVE_REQUEST.with(|slot| {
+            if native_cc {
+                *slot.borrow_mut() = Some((
+                    req.serializer_profile.clone(),
+                    req.geometry.clone(),
+                    req.mid_turn,
+                ));
+            }
+        });
         let engine = transform_with_projection(store, &req, ctx)?;
         let permitted = engine.response.prefix_bust_permitted;
         let mut answer = Answer::Noop;

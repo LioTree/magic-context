@@ -26,13 +26,17 @@ fn host_plan(
     harness: &str,
     params: &Value,
 ) -> Result<bool, HandlerOutcome> {
-    let profile =
-        params.get("serializer_profile").and_then(Value::as_str) == Some("opencode-aisdk");
+    let expected = if attested_claude_code(binding) {
+        "claude-code-anthropic"
+    } else {
+        "opencode-aisdk"
+    };
+    let profile = params.get("serializer_profile").and_then(Value::as_str) == Some(expected);
     let answer = params.get("observation").and_then(Value::as_str) == Some("answer");
-    if !profile && !answer && !matches!(binding.harness.as_str(), "opencode" | "opencode2") {
+    if !profile && !answer && !host_binding(binding) {
         return Ok(false);
     }
-    if !matches!(binding.harness.as_str(), "opencode" | "opencode2") {
+    if !host_binding(binding) {
         return Err(invalid_field(if answer {
             "params.observation"
         } else {
@@ -77,6 +81,8 @@ struct HostSetup {
     invalidated: bool,
     #[serde(default)]
     repair_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_policy: Option<Value>,
 }
 #[derive(Serialize, Deserialize)]
 struct HostView {
@@ -84,11 +90,17 @@ struct HostView {
     wire: compact::answer::CompactionMessage,
     #[serde(default)]
     coverage: Option<HostCoverage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_replacement: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_slots: Option<Vec<Value>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct HostCoverage {
     end_mid: String,
     ordinal: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<compact::view::NativeEndpoint>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -204,6 +216,7 @@ fn non_tag_messages(
         .into_iter()
         .map(|m| {
             Ok(compact::status::StatusMessage {
+                raw_message: None,
                 ordinal: m.ordinal,
                 mid: m.mid,
                 message: serde_json::from_slice(&m.message_bytes).map_err(transient)?,
@@ -246,6 +259,15 @@ fn non_tag_messages(
         let message = &mut messages[position];
         let mut ops: Vec<hooks::answer::Operation> =
             serde_json::from_str(&answer.ops_json).map_err(transient)?;
+        if message.message.get("raw_message").is_some() {
+            // Claude Code hooks currently record unchanged messages. They do not
+            // authorize tool reductions or delivery notices, and OpenCode's part
+            // operations cannot be applied to Anthropic content blocks.
+            if !ops.is_empty() {
+                return Err(invalid_field("message"));
+            }
+            continue;
+        }
         // The host record keeps its earlier hook answer unchanged when a step
         // does not replace history. Remove Channel 1 Appends from live post_tool
         // answers before engine ingestion: tagged CHANNEL1_NOTE operations and
@@ -493,6 +515,53 @@ fn producer_context<'a>(
     }
 }
 
+fn claude_code_engine_failure(
+    error: transform::TransformError,
+    request_id: &str,
+) -> HandlerOutcome {
+    // An impossible protected tail is a terminal compaction answer, not a hook
+    // outage. Classify the typed error before the generic transient conversion.
+    if matches!(
+        error,
+        transform::TransformError::ProtectedToolResultsOverLimit
+    ) {
+        let answer = compact::answer::StepAnswer::Refuse {
+            request_id: request_id.into(),
+            code: compact::errors::RefuseCode::WindowTooSmall,
+            reason: transform::PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE.into(),
+            provider_code: Some(transform::PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE.into()),
+            detail: None,
+        };
+        return match bytes(&answer) {
+            Ok(bytes) => HandlerOutcome::Response(bytes),
+            Err(error) => error,
+        };
+    }
+    transient(error)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Inject only at the actual engine-return boundary so adapter tests cannot
+    // pass by checking a separate refusal serializer that dispatch never uses.
+    static CC_ENGINE_REFUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn host_engine_step(
+    store: &McStore,
+    request: &TransformRequest,
+    context: &transform::ProducerContext<'_>,
+    status: &transform::compaction::Status,
+    state: &mut transform::compaction::State,
+) -> Result<transform::compaction::Output, transform::TransformError> {
+    #[cfg(test)]
+    if CC_ENGINE_REFUSAL.with(|flag| flag.replace(false)) {
+        return Err(transform::TransformError::ProtectedToolResultsOverLimit);
+    }
+    transform::compaction::step(store, request, context, status, state)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_host(
     store: &McStore,
     work: &Work,
@@ -500,13 +569,31 @@ fn execute_host(
     setup: &mut HostSetup,
     status: &transform::compaction::Status,
     lineage: &ProviderLineage,
+    request_id: &str,
+    native_status: Option<&compact::status::StepStatus>,
 ) -> Result<Option<HostView>, HandlerOutcome> {
+    let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
     let messages = non_tag_messages(store, &work.key, lineage)?;
     let mut template: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
-        "serializer_profile":"opencode-aisdk","session_id":conversation.engine_namespace,
+        "serializer_profile":codec.serializer_profile().wire_id(),"session_id":conversation.engine_namespace,
         "render_config":serde_json::to_string(&setup.setup.request.params).map_err(transient)?,
         "model_key":setup.setup.request.model,"messages":[],"tool_present":true,"auto_search_enabled":false}))?;
-    Codec::OpencodeAiSdk.prepare_request(&mut template, &messages)?;
+    codec.prepare_request(&mut template, &messages)?;
+    if codec == Codec::ClaudeCodeAnthropic {
+        if let Some(native_status) = native_status {
+            template.geometry =
+                native_status
+                    .geometry
+                    .as_ref()
+                    .map(|geometry| transform::TransformGeometry {
+                        usable_soft: geometry.usable_soft,
+                        usable_hard: geometry.usable_hard,
+                        absolute_wall: geometry.absolute_wall,
+                        derivation: geometry.derivation.clone(),
+                    });
+            template.mid_turn = native_status.mid_turn.unwrap_or(false);
+        }
+    }
     let meta = store
         .load_meta(&conversation.engine_namespace)
         .map_err(transient)?
@@ -605,8 +692,14 @@ fn execute_host(
     store
         .append_pending_agent_drops(&conversation.engine_namespace, &targets, now_ms())
         .map_err(transient)?;
-    let output = transform::compaction::step(store, &template, &context, status, &mut state)
-        .map_err(transient)?;
+    let output =
+        host_engine_step(store, &template, &context, status, &mut state).map_err(|error| {
+            if codec == Codec::ClaudeCodeAnthropic {
+                claude_code_engine_failure(error, request_id)
+            } else {
+                transient(error)
+            }
+        })?;
     // Keep only scalars in Setup. Engine and native bytes are committed together
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
@@ -614,22 +707,45 @@ fn execute_host(
     let transform::compaction::Answer::Replacement(engine) = output.answer else {
         return Ok(None);
     };
-    let (wire, coverage) = if let Some(previous) = previous.filter(|p| {
-        status
-            .last_not_applied
-            .is_some_and(|n| !n.structural && n.version == p.engine.version)
-            && p.engine.replacement == engine.replacement
-            && p.engine.range == engine.range
-    }) {
+    let (wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) =
+        previous.filter(|p| {
+            status
+                .last_not_applied
+                .is_some_and(|n| !n.structural && n.version == p.engine.version)
+                && p.engine.replacement == engine.replacement
+                && p.engine.range == engine.range
+                && coverage_replay_matches(
+                    codec,
+                    p.coverage.as_ref().map(|coverage| coverage.ordinal),
+                    output.engine.response.coverage_ordinal,
+                )
+        }) {
         let mut wire = previous.wire;
         wire.version = engine.version;
-        (wire, previous.coverage)
+        (
+            wire,
+            previous.coverage,
+            previous.raw_replacement,
+            previous.head_slots,
+        )
     } else {
-        let wire = Codec::OpencodeAiSdk.encode_view(
-            &engine,
-            &template,
-            &super::codec_opencode::NativeRenderContext::from(&output.engine),
-        )?;
+        let (wire, raw_replacement) = if codec == Codec::ClaudeCodeAnthropic {
+            let (wire, raw) = super::codec_claude_code::encode_view(
+                &engine,
+                &template,
+                output.engine.response.coverage_ordinal,
+            )?;
+            (wire, Some(raw))
+        } else {
+            (
+                codec.encode_view(
+                    &engine,
+                    &template,
+                    &super::codec_opencode::NativeRenderContext::from(&output.engine),
+                )?,
+                None,
+            )
+        };
         let coverage = output.engine.response.coverage_ordinal.and_then(|ordinal| {
             messages
                 .iter()
@@ -637,14 +753,47 @@ fn execute_host(
                 .map(|m| HostCoverage {
                     end_mid: m.mid.clone(),
                     ordinal,
+                    endpoint: None,
                 })
         });
-        (wire, coverage)
+        let head_slots = raw_replacement
+            .as_ref()
+            .map(|raw| super::cache_policy::head_slots(&engine, raw, setup.setup.state.preset));
+        (wire, coverage, raw_replacement, head_slots)
     };
+    if codec == Codec::ClaudeCodeAnthropic {
+        if output.engine.response.coverage_ordinal.is_some() && coverage.is_none() {
+            return Err(error(
+                "native_endpoint_unrepresentable",
+                "covered native message is missing",
+            ));
+        }
+        if let Some(coverage) = &mut coverage {
+            let message = messages
+                .iter()
+                .find(|m| m.mid == coverage.end_mid && m.ordinal == coverage.ordinal)
+                .ok_or_else(|| {
+                    error(
+                        "native_endpoint_unrepresentable",
+                        "covered native message is missing",
+                    )
+                })?;
+            let boundary = store
+                .load(&conversation.engine_namespace)
+                .map_err(transient)?
+                .core
+                .boundary_id;
+            coverage.endpoint = Some(super::codec_claude_code::whole_message_endpoint(
+                message, &boundary,
+            )?);
+        }
+    }
     Ok(Some(HostView {
         engine,
         wire,
         coverage,
+        raw_replacement,
+        head_slots,
     }))
 }
 
@@ -832,6 +981,7 @@ impl McHandler {
         request: compact::setup::SetupRequest,
         chosen: transform::compaction::Preset,
     ) -> Result<Vec<u8>, HandlerOutcome> {
+        let codec = Codec::from_params(&Value::Object(request.params.clone()))?;
         if !binding.config.compaction_enabled {
             return bytes(&compact::setup::SetupAnswer::Refuse {
                 request_id: request.request_id,
@@ -845,7 +995,11 @@ impl McHandler {
             .map_err(transient)?
             .unwrap_or_default();
         if conversation.engine_namespace.is_empty() {
-            conversation.engine_namespace = binding.session.clone();
+            conversation.engine_namespace = if codec == Codec::ClaudeCodeAnthropic {
+                key.engine_key()
+            } else {
+                binding.session.clone()
+            };
         }
         let mut setup: HostSetup = if let Some(raw) = &conversation.setup_json {
             serde_json::from_str(raw).map_err(transient)?
@@ -864,7 +1018,9 @@ impl McHandler {
                 setup: Setup {
                     request: request.clone(),
                     state: transform::compaction::State::new(id, chosen),
-                    stability: if chosen == transform::compaction::Preset::Head {
+                    stability: if chosen == transform::compaction::Preset::Head
+                        && codec != Codec::ClaudeCodeAnthropic
+                    {
                         vec![
                             compact::setup::StabilityRank { index: 0, rank: 2 },
                             compact::setup::StabilityRank { index: 1, rank: 1 },
@@ -884,6 +1040,15 @@ impl McHandler {
                 produced: None,
                 invalidated: false,
                 repair_pending: false,
+                cache_policy: if codec == Codec::ClaudeCodeAnthropic {
+                    Some(super::cache_policy::resolve(
+                        &binding,
+                        &request.model,
+                        chosen,
+                    )?)
+                } else {
+                    None
+                },
             };
             conversation.params_json = serde_json::to_string(&request.params).map_err(transient)?;
             conversation.preset = request.preset.clone();
@@ -891,6 +1056,13 @@ impl McHandler {
             fault("SetupRecorded");
             setup
         };
+        if codec == Codec::ClaudeCodeAnthropic && setup.cache_policy.is_none() {
+            setup.cache_policy = Some(super::cache_policy::resolve(
+                &binding,
+                &setup.setup.request.model,
+                chosen,
+            )?);
+        }
         // Setup is an insertion, not an engine opportunity. In particular, it
         // must not seed or mutate frozen full-request state during a switch.
         let high = conversation
@@ -912,7 +1084,9 @@ impl McHandler {
                     from: 0,
                     to: 0,
                 },
-                replacement: if chosen == transform::compaction::Preset::Head {
+                replacement: if chosen == transform::compaction::Preset::Head
+                    && codec != Codec::ClaudeCodeAnthropic
+                {
                     vec![
                         ck_wire::CkWireMessage::synthetic_user_text(
                             transform::compaction::M0_EMPTY_PLACEHOLDER,
@@ -928,9 +1102,9 @@ impl McHandler {
             let mut template: TransformRequest = decode(
                 &json!({"v":2,"kind":"compaction.step","session_id":conversation.engine_namespace,"messages":[],"render_config":"","tool_present":false,"auto_search_enabled":false}),
             )?;
-            Codec::OpencodeAiSdk.prepare_request(&mut template, &[])?;
+            codec.prepare_request(&mut template, &[])?;
             let tags = BTreeMap::new();
-            let wire = Codec::OpencodeAiSdk.encode_view(
+            let wire = codec.encode_view(
                 &engine,
                 &template,
                 &super::codec_opencode::NativeRenderContext {
@@ -946,12 +1120,16 @@ impl McHandler {
                 engine,
                 wire,
                 coverage: None,
+                raw_replacement: (codec == Codec::ClaudeCodeAnthropic).then(Vec::new),
+                head_slots: (codec == Codec::ClaudeCodeAnthropic).then(Vec::new),
             }
         };
         save_host_view(store, key, &view, "applied")?;
         setup.setup.state.version_high_water = high;
         setup.applied = Some(ViewSummary::from(&view.engine));
         setup.produced = setup.applied.clone();
+        let raw_replacement = view.raw_replacement.clone();
+        let head_slots = view.head_slots.clone();
         let answer = compact::setup::SetupAnswer::Ready {
             request_id: request.request_id,
             initial: view.wire,
@@ -961,7 +1139,18 @@ impl McHandler {
         conversation.last_answer_json = Some(serde_json::to_string(&answer).map_err(transient)?);
         save_host_setup(store, key, &mut conversation, &setup)?;
         fault("AnswerRecorded");
-        bytes(&answer)
+        match raw_replacement {
+            Some(raw) => {
+                let mut answer = serde_json::to_value(answer).map_err(transient)?;
+                answer["cache_policy"] = setup
+                    .cache_policy
+                    .clone()
+                    .ok_or_else(|| invalid_field("cache_policy"))?;
+                answer["head_slots"] = json!(head_slots.unwrap_or_default());
+                super::codec_claude_code::answer_bytes(&answer, &raw)
+            }
+            None => bytes(&answer),
+        }
     }
 
     fn host_step(
@@ -972,11 +1161,15 @@ impl McHandler {
         params: &Value,
         request: compact::status::StepStatus,
     ) -> Result<Vec<u8>, HandlerOutcome> {
-        if serde_json::to_vec(&json!({"method":"compaction.step","params":params}))
-            .map_err(transient)?
-            .len()
-            > 3 * 1024 * 1024
-        {
+        let envelope_bytes =
+            serde_json::to_vec(&json!({"method":"compaction.step","params":params}))
+                .map_err(transient)?
+                .len();
+        if if attested_claude_code(&work.binding) {
+            envelope_bytes >= HOST_ENVELOPE_BYTES
+        } else {
+            envelope_bytes > HOST_ENVELOPE_BYTES
+        } {
             return Err(invalid_field("messages"));
         }
         let mut setup: HostSetup =
@@ -984,6 +1177,35 @@ impl McHandler {
                 error("setup_missing", "compaction.step requires a Setup record")
             })?)
             .map_err(transient)?;
+        let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
+        if codec == Codec::ClaudeCodeAnthropic {
+            if let Some(geometry) = &request.geometry {
+                if !geometry.is_valid(request.context_window)
+                    || request.output_reserve.is_some_and(|reserve| {
+                        geometry
+                            .usable_hard
+                            .checked_add(reserve)
+                            .is_none_or(|reserved| reserved > geometry.absolute_wall)
+                    })
+                {
+                    return Err(invalid_field("geometry"));
+                }
+            } else if request.output_reserve.is_some() {
+                return Err(invalid_field("geometry"));
+            }
+            if request.fill.is_some() {
+                return Err(invalid_field("fill"));
+            }
+            if request.channel2_receipt.is_some() || request.channel2_delivered_id.is_some() {
+                return Err(invalid_field("channel2_receipt"));
+            }
+            if request.messages.iter().any(|message| {
+                serde_json::to_vec(message)
+                    .map_or(true, |bytes| bytes.len() > HOST_ENVELOPE_BYTES - 1)
+            }) {
+                return Err(invalid_field("messages"));
+            }
+        }
         let lineage = host_lineage(store, &work.key, params, &request)?;
         // An acknowledgement names a frozen object, not just a sequence number.
         // Validate both components before admission can promote or burn anything.
@@ -1019,7 +1241,12 @@ impl McHandler {
             .messages
             .iter()
             .map(|m| {
-                Codec::OpencodeAiSdk.decode_message(m)?;
+                let mut m = m.clone();
+                if codec == Codec::ClaudeCodeAnthropic {
+                    m.message =
+                        super::codec_claude_code::from_wire(&m.message, m.raw_message.as_deref())?;
+                }
+                codec.decode_message(&m)?;
                 Ok(ProviderMessage {
                     ordinal: m.ordinal,
                     mid: m.mid.clone(),
@@ -1224,6 +1451,7 @@ impl McHandler {
                 }
             }
         }
+        let mut raw_replacement = None;
         let answer = if incomplete {
             // Host paging never owns asynchronous wait work or a ready callback.
             // The lock's guard belongs to the request and drops at this return.
@@ -1240,14 +1468,15 @@ impl McHandler {
                     .is_some_and(|v| v.version == n.version)
                     && setup.applied.as_ref().is_none_or(|v| v.version < n.version)
             });
-            let skip = can_skip_host_step(
-                store,
-                work,
-                &conversation.engine_namespace,
-                &request.model,
-                &normalized,
-                relevant,
-            )?;
+            let skip = !(codec == Codec::ClaudeCodeAnthropic && request.geometry.is_some())
+                && can_skip_host_step(
+                    store,
+                    work,
+                    &conversation.engine_namespace,
+                    &request.model,
+                    &normalized,
+                    relevant,
+                )?;
             if skip {
                 json!({"answer":"noop","request_id":request.request_id})
             } else {
@@ -1258,14 +1487,31 @@ impl McHandler {
                     .checked_add(1)
                     .ok_or_else(|| transient("version exhausted"))?;
                 save_host_setup(store, &work.key, &mut conversation, &setup)?;
-                let view = execute_host(
+                let view = match execute_host(
                     store,
                     work,
                     &conversation,
                     &mut setup,
                     &normalized,
                     &lineage,
-                )?;
+                    &request.request_id,
+                    Some(&request),
+                ) {
+                    Err(HandlerOutcome::Error { code, message })
+                        if codec == Codec::ClaudeCodeAnthropic
+                            && matches!(
+                                code.as_str(),
+                                "signed_prefix_edit"
+                                    | "invalid_signed_tool_boundary"
+                                    | "native_endpoint_unrepresentable"
+                            ) =>
+                    {
+                        return bytes(
+                            &json!({"answer":"refuse","request_id":request.request_id,"code":"misconfigured","reason":message,"provider_code":code}),
+                        );
+                    }
+                    result => result?,
+                };
                 let current = store
                     .load_provider_conversation(&work.key.store_key())
                     .map_err(transient)?
@@ -1275,9 +1521,13 @@ impl McHandler {
                 counters["channel1_hook_append_pending"] = json!(false);
                 conversation.hook_counters_json = counters.to_string();
                 if let Some(view) = view {
+                    raw_replacement = view.raw_replacement.clone();
                     save_host_view(store, &work.key, &view, "produced")?;
                     setup.produced = Some(ViewSummary::from(&view.engine));
                     let mut answer = json!({"answer":"compaction_message","request_id":request.request_id,"compaction":view.wire});
+                    if let Some(slots) = view.head_slots {
+                        answer["head_slots"] = json!(slots);
+                    }
                     if let Some(coverage) = view.coverage {
                         answer["coverage"] = serde_json::to_value(coverage).map_err(transient)?;
                     }
@@ -1287,12 +1537,22 @@ impl McHandler {
                 }
             }
         };
+        let mut answer = answer;
+        if codec == Codec::ClaudeCodeAnthropic {
+            answer["cache_policy"] = setup
+                .cache_policy
+                .clone()
+                .ok_or_else(|| invalid_field("cache_policy"))?;
+        }
         conversation.cursor_frontier = frontier;
         conversation.wait_request = None;
         conversation.last_answer_json = Some(answer_receipt(&answer));
         save_host_setup(store, &work.key, &mut conversation, &setup)?;
         fault("AnswerRecorded");
-        bytes(&answer)
+        match raw_replacement {
+            Some(raw) => super::codec_claude_code::answer_bytes(&answer, &raw),
+            None => bytes(&answer),
+        }
     }
 
     fn provider_work(
@@ -1456,6 +1716,18 @@ impl McHandler {
         // Usage can omit unreported fields. Decode the remainder with the role
         // type, but normalize the original measurements without filling holes.
         let mut wire = params.clone();
+        // Only a reserved:thalamus binding for Claude Code uses raw_message.
+        // Drop it for other bindings before typed decoding: those callers used
+        // to send it as an ignored extra, including values that are not strings.
+        if !attested_claude_code(&binding) {
+            if let Some(messages) = wire.get_mut("messages").and_then(Value::as_array_mut) {
+                for message in messages {
+                    if let Some(object) = message.as_object_mut() {
+                        object.remove("raw_message");
+                    }
+                }
+            }
+        }
         wire.as_object_mut()
             .ok_or_else(|| invalid("step params must be an object"))?
             .remove("previous_usage");
@@ -1580,10 +1852,14 @@ impl McHandler {
         }
         let answer = match produced {
             transform::compaction::Answer::Noop => compact::answer::StepAnswer::Noop {
+                channel2_directive: None,
+                bootstrap_complete: None,
                 request_id: request.request_id,
             },
             transform::compaction::Answer::Replacement(view) => {
                 compact::answer::StepAnswer::CompactionMessage {
+                    channel2_directive: None,
+                    bootstrap_complete: None,
                     request_id: request.request_id,
                     compaction: checked_view(&view, &record)?,
                     coverage: None,
@@ -1639,6 +1915,7 @@ mod host_tests {
         handler.store.set(store.clone()).ok().unwrap();
         handler.provider_runner = runner;
         let binding = SessionBinding {
+            principal: None,
             project_root: dir.into(),
             harness: "opencode".into(),
             session: "s".into(),
@@ -1680,6 +1957,7 @@ mod host_tests {
             .iter()
             .enumerate()
             .map(|(i, m)| compact::status::StatusMessage {
+                raw_message: None,
                 ordinal: i as u64 + 1,
                 mid: m["info"]["id"].as_str().unwrap().into(),
                 message: m.clone(),
@@ -3342,5 +3620,127 @@ mod host_tests {
             answer(h.provider_step(b, &foreign).await)["detail"]["history_gap_from"],
             3
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_refusal_tests {
+    use super::*;
+    use crate::providers::claude_code_tests as cc;
+
+    struct ClearInjection;
+    impl Drop for ClearInjection {
+        fn drop(&mut self) {
+            CC_ENGINE_REFUSAL.with(|flag| flag.set(false));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn protected_tail_refusal_precedes_outage_pass_and_never_publishes_a_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = cc::handler(dir.path(), cc::thalamus());
+        cc::setup(&h).await;
+        let declaration=declaration(&json!({"params":{"serializer_profile":"claude-code-anthropic","observation":"answer"}})).unwrap();
+        assert!(declaration
+            .subscriptions
+            .iter()
+            .all(|s| s.on_unavailable == Some(hooks::subscription::OnUnavailable::Pass)));
+        let mut status = cc::step(r#"{"role":"user","content":"tail"}"#);
+        status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+        let _clear = ClearInjection;
+        for request_id in ["lost-answer", "fresh-answer"] {
+            status["request_id"] = json!(request_id);
+            CC_ENGINE_REFUSAL.with(|flag| flag.set(true));
+            let HandlerOutcome::Response(bytes) =
+                cc::call(&h, "compaction.step", status.clone()).await
+            else {
+                panic!("typed engine refusal became an outage")
+            };
+            assert!(
+                !CC_ENGINE_REFUSAL.with(|flag| flag.get()),
+                "actual engine-return boundary was not reached"
+            );
+            let answer: compact::answer::StepAnswer = serde_json::from_slice(&bytes).unwrap();
+            let compact::answer::StepAnswer::Refuse {
+                request_id: echoed,
+                code,
+                reason,
+                provider_code,
+                ..
+            } = answer
+            else {
+                panic!("refusal was swallowed by pass/fallback")
+            };
+            assert_eq!(echoed, request_id);
+            assert_eq!(code, compact::errors::RefuseCode::WindowTooSmall);
+            assert!(!code.retryable());
+            assert_eq!(
+                provider_code.as_deref(),
+                Some("protected_tool_results_over_limit")
+            );
+            assert_eq!(reason,"The tool results kept by protected_tools are larger than this model's context window, so this turn was not sent. Lower the protected_tools counts.");
+        }
+        let key = Key::new(
+            &cc::binding(dir.path(), cc::thalamus()),
+            "cc",
+            "claude-code",
+        )
+        .unwrap();
+        let store = h.store.get().unwrap();
+        assert!(store
+            .load_provider_view(&key.store_key(), 2)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_provider_view(&key.store_key(), 3)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .load_provider_messages(&key.store_key(), "L")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unrelated_engine_errors_remain_transient_not_terminal_refusals() {
+        assert!(
+            matches!(claude_code_engine_failure(transform::TransformError::AssistantTerminalRetry,"r"),HandlerOutcome::Error { code,.. } if code=="transient")
+        );
+    }
+}
+
+fn coverage_replay_matches(codec: Codec, previous: Option<u64>, current: Option<u64>) -> bool {
+    codec != Codec::ClaudeCodeAnthropic || previous == current
+}
+
+#[cfg(test)]
+mod native_replay_tests {
+    use super::*;
+    #[test]
+    fn native_coverage_replay_requires_the_current_boundary_ordinal() {
+        assert!(!coverage_replay_matches(
+            Codec::ClaudeCodeAnthropic,
+            Some(2),
+            None
+        ));
+        assert!(!coverage_replay_matches(
+            Codec::ClaudeCodeAnthropic,
+            Some(2),
+            Some(3)
+        ));
+        assert!(coverage_replay_matches(
+            Codec::ClaudeCodeAnthropic,
+            Some(2),
+            Some(2)
+        ));
+        assert!(coverage_replay_matches(
+            Codec::ClaudeCodeAnthropic,
+            None,
+            None
+        ));
+        assert!(coverage_replay_matches(Codec::OpencodeAiSdk, Some(2), None));
     }
 }

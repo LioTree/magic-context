@@ -75,6 +75,7 @@ fn request(messages: &[Value], search: bool) -> TransformRequest {
         .iter()
         .enumerate()
         .map(|(n, m)| compact::status::StatusMessage {
+            raw_message: None,
             ordinal: n as u64 + 1,
             mid: m["info"]["id"].as_str().unwrap().into(),
             message: m.clone(),
@@ -417,6 +418,7 @@ async fn drive_overlay_corpus_with(queued: bool, calibrated: bool, run: &CorpusR
                 .iter()
                 .enumerate()
                 .map(|(n, m)| compact::status::StatusMessage {
+                    raw_message: None,
                     mid: m["info"]["id"].as_str().unwrap().into(),
                     ordinal: n as u64 + 1,
                     message: m.clone(),

@@ -194,6 +194,8 @@ use transform::{
 /// the daemon controls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
+    /// Identity stamped by the daemon at bind, never supplied by an RPC body.
+    pub principal: Option<subc_protocol::Principal>,
     pub project_root: PathBuf,
     pub harness: String,
     pub session: String,
@@ -14971,6 +14973,7 @@ impl ModuleHandler for McHandler {
         self.bind_route(
             req.handle.channel,
             SessionBinding {
+                principal: req.principal.clone(),
                 project_root: req.identity.project_root.clone(),
                 harness: req.identity.harness.clone(),
                 session: req.identity.session.clone(),
@@ -15025,6 +15028,18 @@ impl McHandler {
             .get("method")
             .and_then(Value::as_str)
             .or_else(|| request.get("kind").and_then(Value::as_str));
+        let provider_operation = if method == Some("tools/call") {
+            request.pointer("/params/name").and_then(Value::as_str)
+        } else {
+            method.or_else(|| request.get("name").and_then(Value::as_str))
+        };
+        if let Ok(binding) = self.facade_binding(channel) {
+            if let Some(refusal) =
+                providers::inbound_ceiling(&binding, provider_operation, inbound_bytes)
+            {
+                return refusal;
+            }
+        }
         let catalog_request = method.is_none()
             && request.get("name").and_then(Value::as_str) == Some("tool.catalog")
             && request.get("arguments").is_some();
@@ -21599,6 +21614,7 @@ mod tests {
 
     fn binding_with_harness(root: &str, harness: &str, session: &str) -> SessionBinding {
         SessionBinding {
+            principal: None,
             project_root: PathBuf::from(root),
             harness: harness.to_string(),
             session: session.to_string(),

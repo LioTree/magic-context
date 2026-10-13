@@ -10,6 +10,7 @@ use serde::Deserialize;
 pub(super) enum Codec {
     OwnedBroca,
     OpencodeAiSdk,
+    ClaudeCodeAnthropic,
 }
 
 #[allow(dead_code)]
@@ -20,6 +21,9 @@ impl Codec {
             None => Ok(Self::OwnedBroca),
             Some(Value::String(profile)) if profile == "owned-broca" => Ok(Self::OwnedBroca),
             Some(Value::String(profile)) if profile == "opencode-aisdk" => Ok(Self::OpencodeAiSdk),
+            Some(Value::String(profile)) if profile == "claude-code-anthropic" => {
+                Ok(Self::ClaudeCodeAnthropic)
+            }
             _ => Err(HandlerOutcome::ErrorWithDetail {
                 code: "invalid_params".into(),
                 message: "unknown provider serializer profile".into(),
@@ -32,6 +36,7 @@ impl Codec {
         match self {
             Self::OwnedBroca => SerializerProfile::OwnedBroca,
             Self::OpencodeAiSdk => SerializerProfile::OpencodeAiSdk,
+            Self::ClaudeCodeAnthropic => SerializerProfile::ClaudeCodeAnthropic,
         }
     }
 
@@ -41,6 +46,7 @@ impl Codec {
     ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
         match self {
             Self::OwnedBroca => decode_message(message),
+            Self::ClaudeCodeAnthropic => super::codec_claude_code::decode_message(message),
             Self::OpencodeAiSdk => {
                 let decoded =
                     super::codec_opencode::decode_messages(std::slice::from_ref(message))?;
@@ -61,6 +67,13 @@ impl Codec {
         messages: &[compact::status::StatusMessage],
     ) -> Result<(), HandlerOutcome> {
         let (ingress, native) = match self {
+            Self::ClaudeCodeAnthropic => (
+                messages
+                    .iter()
+                    .map(super::codec_claude_code::decode_message)
+                    .collect::<Result<Vec<_>, _>>()?,
+                Some(messages.iter().map(|m| m.message.clone()).collect()),
+            ),
             Self::OwnedBroca => (
                 messages
                     .iter()
@@ -96,6 +109,9 @@ impl Codec {
     ) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
         match self {
             Self::OwnedBroca => encode_view(view),
+            Self::ClaudeCodeAnthropic => {
+                super::codec_claude_code::encode_view(view, request, None).map(|v| v.0)
+            }
             Self::OpencodeAiSdk => super::codec_opencode::encode_view(view, request, context),
         }
     }
@@ -486,6 +502,7 @@ mod dispatch_tests {
                 );
             }
             let invalid_entry = compact::status::StatusMessage {
+                raw_message: None,
                 mid: "m".into(),
                 ordinal: 1,
                 message: json!({"role":"user","content":[{"type":"future","text":"a"}]}),

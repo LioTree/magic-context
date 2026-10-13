@@ -1,0 +1,24 @@
+rustc 1.99.0 (b940084d7 2026-09-28)
+cargo 1.99.0 (5f94df478 2026-08-27)
+
+running 5 tests
+test providers::codec_claude_code::tests::raw_provenance_and_transport_markers_are_required ... ok
+test providers::codec_claude_code::tests::identical_signed_messages_remain_distinct_by_gateway_mid ... ok
+test providers::codec_claude_code::tests::every_kept_signed_prefix_is_fenced_including_historical_turns ... FAILED
+test providers::codec_claude_code::tests::complete_signed_tool_run_can_be_covered_but_split_or_tail_removal_refuses ... ok
+test providers::codec_claude_code::tests::synthetic_noncanonical_signed_redacted_scalar_and_opaque_roundtrip ... ok
+
+failures:
+
+---- providers::codec_claude_code::tests::every_kept_signed_prefix_is_fenced_including_historical_turns stdout ----
+
+thread 'providers::codec_claude_code::tests::every_kept_signed_prefix_is_fenced_including_historical_turns' (362) panicked at crates/mc-module/src/providers/codec_claude_code.rs:569:9:
+assertion failed: matches!(encode_view(&output,&request,None),Err(HandlerOutcome::Error
+    { code, .. }) if code=="signed_prefix_edit")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    providers::codec_claude_code::tests::every_kept_signed_prefix_is_fenced_including_historical_turns
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 1973 filtered out; finished in 0.00s

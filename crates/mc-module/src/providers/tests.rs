@@ -65,6 +65,7 @@ fn handler(dir: &Path, runner: Arc<Runner>) -> McHandler {
         handler.bind_route(
             channel,
             SessionBinding {
+                principal: None,
                 project_root: dir.to_path_buf(),
                 harness: session_resolver::RUNNER_BIND_HARNESS.into(),
                 session: session.into(),
@@ -918,4 +919,20 @@ async fn allocated_unsent_work_is_retried_above_its_version_without_runner_rejec
         handler.provider_store.load(&key).unwrap().messages["L"].len(),
         2
     );
+}
+
+#[tokio::test]
+async fn non_claude_code_wire_sidecars_are_ignored_even_when_not_strings() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), Arc::new(Runner::default()));
+    response(dispatch(&h, "compaction.setup", setup("s", "head")).await);
+    let mut entry = user(0, "plain Broca text");
+    entry["raw_message"] = json!({"ignored":true});
+    let answer = response(dispatch(&h, "compaction.step", step("s", vec![entry], Some(0))).await);
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+    let hook=response(dispatch(&h,"transform.hook",json!({"session":"s","harness":"broca","lineage_id":"L","hook":"post_assistant","step_id":"step","blocks":["plain"],"raw_message":{"ignored":true}})).await);
+    assert!(matches!(hook["answer"].as_str(), Some("pass" | "ops")));
 }

@@ -267,15 +267,230 @@ pub fn declaration(params: &Value) -> Result<hooks::subscription::Declaration, H
             .with_on_unavailable(OnUnavailable::Pass),
         );
     }
-    Ok(Declaration { subscriptions })
+    Ok(Declaration {
+        subscriptions,
+        claude_code: None,
+    })
 }
 
 impl McHandler {
+    async fn provider_claude_code_hook(
+        &self,
+        _binding: SessionBinding,
+        key: Key,
+        call: &hooks::hook::HookCall,
+        params: &Value,
+    ) -> Result<Vec<u8>, HandlerOutcome> {
+        use hooks::{answer::HookAnswer, subscription::Hook};
+        if serde_json::to_vec(&json!({"method":"transform.hook","params":params}))
+            .map_err(invalid)?
+            .len()
+            >= HOST_ENVELOPE_BYTES
+        {
+            return Err(invalid_field("message", "host hook exceeds 3 MiB"));
+        }
+        let fields: HostHookFields = decode(params)?;
+        if fields.pass_complete == Some(false) {
+            return Err(invalid_field(
+                "pass_complete",
+                "omit pass_complete unless true",
+            ));
+        }
+        let mid = fields
+            .subject_mid
+            .as_deref()
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| invalid_field("subject_mid", "CC hooks require a MID"))?;
+        let ordinal = fields
+            .subject_ordinal
+            .ok_or_else(|| invalid_field("subject_ordinal", "CC hooks require an ordinal"))?;
+        let native = call
+            .message
+            .as_ref()
+            .ok_or_else(|| invalid_field("message", "CC hooks require a message"))?;
+        let message = super::codec_claude_code::from_wire(native, call.raw_message.as_deref())?;
+        if serde_json::to_vec(&message).map_err(invalid)?.len() > HOST_ENVELOPE_BYTES - 1 {
+            return Err(invalid_field(
+                "message",
+                "native message exceeds the single-message ceiling",
+            ));
+        }
+        let part = checked_part(fields.subject_part.as_deref())?;
+        let hook = call.subject.hook();
+        let hook_name = match hook {
+            Hook::PreUser => "pre_user",
+            Hook::PostAssistant => "post_assistant",
+            Hook::PostTool => "post_tool",
+            _ => return Err(error("not_subscribed", "CC hook is not declared")),
+        };
+        if (hook == Hook::PostTool) != fields.subject_part.is_some() {
+            return Err(invalid_field(
+                "subject_part",
+                "only post_tool addresses a tool result",
+            ));
+        }
+        let entry = compact::status::StatusMessage {
+            raw_message: None,
+            mid: mid.into(),
+            ordinal,
+            message: message.clone(),
+        };
+        let ingress = codec::Codec::ClaudeCodeAnthropic.decode_message(&entry)?;
+        let mut source = Vec::new();
+        for block in &ingress.ck.content {
+            match (&block.kind, hook) {
+                (ck_wire::CkKind::Text { text }, Hook::PreUser) if ingress.ck.role == "user" => {
+                    source.push(text.clone())
+                }
+                (ck_wire::CkKind::Text { text }, Hook::PostAssistant)
+                    if ingress.ck.role == "assistant" =>
+                {
+                    source.push(text.clone())
+                }
+                (ck_wire::CkKind::ToolResult { id, output, .. }, Hook::PostTool) if id == part => {
+                    match &output.kind {
+                        ck_wire::CkOutputKind::Text { text }
+                        | ck_wire::CkOutputKind::ErrorText { text } => source.push(text.clone()),
+                        ck_wire::CkOutputKind::Json { value }
+                        | ck_wire::CkOutputKind::ErrorJson { value } => {
+                            if let Some(children) = value.as_array() {
+                                source.extend(
+                                    children
+                                        .iter()
+                                        .filter(|b| b["type"] == "text")
+                                        .filter_map(|b| b["text"].as_str().map(str::to_owned)),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        if source != call.subject.blocks().unwrap_or_default() {
+            return Err(invalid_field(
+                "message",
+                "subject blocks differ from native message",
+            ));
+        }
+        let lineage_id = call
+            .lineage_id
+            .as_deref()
+            .filter(|l| !l.is_empty())
+            .ok_or_else(|| invalid_field("lineage_id", "CC hooks require a lineage"))?;
+        let store = self
+            .store_for_request()
+            .await
+            .map_err(StoreRefusal::into_outcome)?;
+        let _serial = self.provider_serial.lock_for(&key).await;
+        let held = store
+            .load_provider_conversation(&key.store_key())
+            .map_err(transient)?
+            .ok_or_else(|| invalid_field("params", "CC plan is not frozen"))?;
+        let plan: Value = serde_json::from_str(&held.params_json).map_err(transient)?;
+        let declared = declaration(&json!({"params":plan,"preset":held.preset}))?;
+        if !declared
+            .subscriptions
+            .iter()
+            .any(|s| s.hook == hook && s.phase == call.subject.phase())
+        {
+            return Err(error("not_subscribed", "CC hook is not declared"));
+        }
+        let lineage = store
+            .load_provider_lineage(&key.store_key(), lineage_id)
+            .map_err(transient)?
+            .unwrap_or(ProviderLineage {
+                lineage_id: lineage_id.into(),
+                first_ordinal: fields
+                    .descends_from
+                    .as_ref()
+                    .map_or(ordinal, |d| d.through_ordinal.saturating_add(1)),
+                descends_from: fields.descends_from.as_ref().map(|d| d.lineage_id.clone()),
+                through_ordinal: fields.descends_from.as_ref().map(|d| d.through_ordinal),
+            });
+        if fields.descends_from.as_ref().is_some_and(|d| {
+            lineage.descends_from.as_deref() != Some(&d.lineage_id)
+                || lineage.through_ordinal != Some(d.through_ordinal)
+        }) {
+            return Err(invalid_field("descends_from", "descent changed"));
+        }
+        let subject = ProviderSubject {
+            subject_mid: mid.into(),
+            hook: hook_name.into(),
+            subject_part: part.into(),
+        };
+        let unserved = fields
+            .unserved_subjects
+            .iter()
+            .map(|s| {
+                Ok(ProviderSubject {
+                    subject_mid: s.subject_mid.clone(),
+                    hook: s.hook.clone(),
+                    subject_part: checked_part(s.subject_part.as_deref())?.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, HandlerOutcome>>()?;
+        let mut request: TransformRequest = decode(
+            &json!({"v":2,"kind":"transform.hook","serializer_profile":"claude-code-anthropic","session_id":key.engine_key(),"render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}),
+        )?;
+        codec::Codec::ClaudeCodeAnthropic.prepare_request(&mut request, &[entry])?;
+        let projection = ck_wire::project_messages(&request.messages).map_err(transient)?;
+        let mut parts = admission_policy_parts(&request, &projection);
+        for p in &mut parts {
+            if let Some(ck_wire::CkKind::ToolResult { id, .. }) = ingress
+                .ck
+                .content
+                .get(p.block_index as usize)
+                .map(|b| &b.kind)
+            {
+                p.subject_part = id.clone();
+            }
+        }
+        let input = ProviderMessage {
+            mid: mid.into(),
+            ordinal,
+            message_bytes: serde_json::to_vec(&message).map_err(transient)?,
+        };
+        // Claude Code does not yet authorize tool reductions or delivery notices
+        // through this plan. Record an unchanged hook result instead of proposing
+        // edits that could change the prefix bound to a thinking signature.
+        let answer = store
+            .commit_provider_hook_with_parts(
+                &key.store_key(),
+                ProviderHookRequest {
+                    lineage: &lineage,
+                    message: Some(&input),
+                    served_through_ordinal: fields.served_through_ordinal,
+                    unserved_subjects: &unserved,
+                    repeat_subject: Some(&subject),
+                },
+                &parts,
+                |ctx| {
+                    Ok((
+                        ProviderHookWrite {
+                            answer: Some(ProviderHookAnswer {
+                                subject: subject.clone(),
+                                ordinal,
+                                ops_json: "[]".into(),
+                                tags: vec![],
+                            }),
+                            counters: ctx.counters.clone(),
+                            policy_summary: Default::default(),
+                        },
+                        HookAnswer::Pass,
+                    ))
+                },
+            )
+            .map_err(provider_policy_error)?;
+        bytes(&answer)
+    }
+
     pub(crate) fn host_provider_conversation(
         &self,
         binding: &SessionBinding,
     ) -> Option<(Key, mc_store::provider_records::ProviderConversation)> {
-        if !matches!(binding.harness.as_str(), "opencode" | "opencode2") {
+        if !host_binding(binding) {
             return None;
         }
         let key = Key::new(binding, &binding.session, &binding.harness).ok()?;
@@ -285,7 +500,12 @@ impl McHandler {
             .load_provider_conversation(&key.store_key())
             .ok()??;
         let plan: Value = serde_json::from_str(&c.params_json).ok()?;
-        answer_observation(&plan).then_some((key, c))
+        let expected = if attested_claude_code(binding) {
+            "claude-code-anthropic"
+        } else {
+            "opencode-aisdk"
+        };
+        (answer_observation(&plan) && plan["serializer_profile"] == expected).then_some((key, c))
     }
 
     pub(crate) fn sync_provider_pass_inputs(
@@ -580,7 +800,7 @@ impl McHandler {
         if serde_json::to_vec(&json!({"method":"transform.hook","params":params}))
             .map_err(invalid)?
             .len()
-            > 3 * 1024 * 1024
+            > HOST_ENVELOPE_BYTES
         {
             return Err(invalid_field("message", "host hook exceeds 3 MiB"));
         }
@@ -677,6 +897,7 @@ impl McHandler {
             }
         };
         let entry = compact::status::StatusMessage {
+            raw_message: None,
             mid: mid.into(),
             ordinal,
             message: message.clone(),
@@ -1079,7 +1300,11 @@ impl McHandler {
                                 .get("preset")
                                 .and_then(Value::as_str)
                                 .map(str::to_owned),
-                            engine_namespace: binding.session.clone(),
+                            engine_namespace: if attested_claude_code(binding) {
+                                key.engine_key()
+                            } else {
+                                binding.session.clone()
+                            },
                             ..Default::default()
                         },
                     )
@@ -1122,9 +1347,22 @@ impl McHandler {
             subscription::Hook,
         };
         let deadline = Instant::now() + Duration::from_millis(HOOK_BUDGET_MS);
-        let call: hooks::hook::HookCall = decode(params)?;
+        let mut wire = params.clone();
+        // Drop raw_message before typed decoding for other profiles. It remains
+        // an ignored extra for them, so a non-string value is not a new error.
+        if !attested_claude_code(&binding) {
+            if let Some(object) = wire.as_object_mut() {
+                object.remove("raw_message");
+            }
+        }
+        let call: hooks::hook::HookCall = decode(&wire)?;
         preset(call.preset.as_deref())?;
         let key = Key::new(&binding, &call.session, &call.harness)?;
+        if attested_claude_code(&binding) {
+            return self
+                .provider_claude_code_hook(binding, key, &call, params)
+                .await;
+        }
         if matches!(binding.harness.as_str(), "opencode" | "opencode2") {
             return self.provider_host_hook(binding, key, &call, params).await;
         }
@@ -1405,6 +1643,7 @@ mod host_tests {
             h.bind_route(
                 channel,
                 SessionBinding {
+                    principal: None,
                     project_root: dir.into(),
                     harness: "opencode".into(),
                     session: session.into(),
@@ -1625,6 +1864,7 @@ mod host_tests {
             (41, "u#0", "message")
         );
         let entry = compact::status::StatusMessage {
+            raw_message: None,
             mid: "a".into(),
             ordinal: 2,
             message: p["message"].clone(),

@@ -1,0 +1,19 @@
+   Compiling mc-module v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_3fe238420bb412f9/crates/mc-module)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+     --> crates/mc-module/src/lib.rs:16182:31
+      |
+16182 |         DRIVE_FAULT_REMAINING.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)),
+      |                               ^^^^^^^^^^^^
+      |
+      = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+      |
+16182 -         DRIVE_FAULT_REMAINING.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)),
+16182 +         DRIVE_FAULT_REMAINING.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)),
+      |
+
+warning: `mc-module` (lib) generated 1 warning (run `cargo fix --lib -p mc-module` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.46s
+     Running tests/broca_conformance/main.rs (/run/motor/target/debug/deps/broca_conformance-d52be7b540b556c6)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (/run/motor/target/debug/deps/mc_module-5ca59ececab7f8a0)
