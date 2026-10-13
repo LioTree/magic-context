@@ -4,6 +4,8 @@ use super::*;
 
 pub(super) fn binding(root: &Path, principal: Option<subc_protocol::Principal>) -> SessionBinding {
     SessionBinding {
+        connection_incarnation: 0,
+        native_generation: None,
         principal,
         project_root: root.into(),
         harness: "claude-code".into(),
@@ -176,7 +178,7 @@ async fn cc_frozen_plan_session_harness_and_raw_mid_are_fenced() {
         answer["answer"].as_str(),
         Some("noop" | "compaction_message")
     ));
-    let key = Key::new(&binding(dir.path(), thalamus()), "cc", "claude-code").unwrap();
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
     let held = h
         .store
         .get()
@@ -240,7 +242,7 @@ async fn cc_hook_pass_is_durable_and_raw_retries_do_not_rewrite_signed_bytes() {
     let answer = response(call(&h, "transform.hook", params.clone()).await);
     assert_eq!(answer["answer"], "pass");
     assert_eq!(response(call(&h, "transform.hook", params).await), answer);
-    let key = Key::new(&binding(dir.path(), thalamus()), "cc", "claude-code").unwrap();
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
     let store = h.store.get().unwrap();
     let held = store.load_provider_messages(&key.store_key(), "L").unwrap();
     assert_eq!(
@@ -283,7 +285,7 @@ async fn cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes
     bootstrap["messages"].as_array_mut().unwrap().push(json!({"mid":"tail","ordinal":1,"message":{"role":"user","content":"live tail"},"raw_message":r#"{"role":"user","content":"live tail"}"#}));
     bootstrap["newest"] = json!({"mid":"tail","ordinal":1});
     let first = response(call(&h, "compaction.step", bootstrap.clone()).await);
-    let key = Key::new(&b, "cc", "claude-code").unwrap();
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
     let store = h.store.get().unwrap();
     store
         .replace_compartments(
@@ -330,6 +332,77 @@ async fn cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes
     assert!(String::from_utf8(bytes).unwrap().contains(&raw.join(",")));
     assert_eq!(answer["head_slots"], committed["head_slots"]);
     assert_eq!(answer["head_slots"].as_array().unwrap().len(), 2);
+    let frozen: compact::view::FrozenView =
+        serde_json::from_value(answer["compaction"]["raw_view"].clone()).unwrap();
+    frozen.validate().unwrap();
+    let full = format!("[{}]", raw.join(","));
+    assert_eq!(
+        frozen.payload,
+        compact::view::RawPayload::Inline {
+            bytes: full.clone()
+        }
+    );
+    assert_eq!(
+        frozen.endpoint,
+        compact::view::NativeEndpoint {
+            message_id: "m".into(),
+            part_index: 0
+        }
+    );
+    let mut read = json!({"request_id":"read","view_id":frozen.view.view_id,"version":frozen.view.version,"sha256":frozen.view.sha256,"byte_cursor":0});
+    let page = response(call(&h, "compaction.view.read", read.clone()).await);
+    assert_eq!(page["answer"], "page");
+    assert_eq!(page["bytes"], full);
+    read["sha256"] = json!("0".repeat(64));
+    let rejected = response(call(&h, "compaction.view.read", read).await);
+    assert_eq!(rejected["code"], "digest_mismatch");
+    let cut = frozen
+        .cut_replacement_ref
+        .as_ref()
+        .expect("native hook head reference");
+    let cut_read = json!({"request_id":"head","view_id":cut.view_id,"version":cut.version,"sha256":cut.sha256,"byte_cursor":0});
+    let head = response(call(&h, "compaction.view.read", cut_read.clone()).await);
+    assert_eq!(head["answer"], "page");
+    let prefix: Vec<Value> = serde_json::from_str(head["bytes"].as_str().unwrap()).unwrap();
+    assert_eq!(prefix.len(), 2);
+    assert!(!head["bytes"].as_str().unwrap().contains("live tail"));
+    assert_eq!(
+        frozen.retained_tail.as_ref().unwrap(),
+        &vec![compact::view::RetainedPart {
+            endpoint: compact::view::NativeEndpoint {
+                message_id: "tail".into(),
+                part_index: 0
+            },
+            engine_handle: "tail#0".into()
+        }]
+    );
+    let mut applied = step(r#"{ "content":"unsigned live text", "role":"user" }"#);
+    applied["newest"] = json!({"mid":"tail","ordinal":1});
+    applied["last_applied"] = json!({"compaction_id":answer["compaction"]["compaction_id"],"version":answer["compaction"]["version"]});
+    response(call(&h, "compaction.step", applied).await);
+    h.bind_route(7, b.clone());
+    setup(&h).await;
+    let replay = response(call(&h, "compaction.view.read", cut_read.clone()).await);
+    assert_eq!(replay["bytes"], head["bytes"]);
+    drop(h);
+    let h = handler(dir.path(), thalamus());
+    h.bind_route(7, b.clone());
+    setup(&h).await;
+    let replay = response(call(&h, "compaction.view.read", cut_read.clone()).await);
+    assert_eq!(replay["bytes"], head["bytes"]);
+    let mut sibling = b.clone();
+    sibling.session = "subagent".into();
+    h.bind_route(7, sibling);
+    response(
+        call(
+            &h,
+            "transform.declare",
+            json!({"session":"subagent","harness":"claude-code","preset":"head","params":plan()}),
+        )
+        .await,
+    );
+    let borrowed = response(call(&h, "compaction.view.read", cut_read).await);
+    assert_eq!(borrowed["code"], "unknown_version");
     for slot in answer["head_slots"].as_array().unwrap() {
         let index = slot["index"].as_u64().unwrap() as usize;
         assert_eq!(slot["bytes_sha256"], sha256_hex(raw[index].as_bytes()));
@@ -405,7 +478,7 @@ async fn cc_invalid_geometry_and_unsupported_evidence_refuse_before_ingest() {
             matches!(call(&h,"compaction.step",status).await,HandlerOutcome::ErrorWithDetail { code,detail,.. } if code=="invalid_params" && detail["field"]==field)
         );
     }
-    let key = Key::new(&binding(dir.path(), thalamus()), "cc", "claude-code").unwrap();
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
     assert!(h
         .store
         .get()
@@ -428,7 +501,7 @@ async fn cc_partial_engine_boundary_refuses_instead_of_snapping_whole_message() 
         status["newest"] = json!({"mid":"tail","ordinal":1});
         status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
         let first = response(call(&h, "compaction.step", status.clone()).await);
-        let key = Key::new(&binding(dir.path(), thalamus()), "cc", "claude-code").unwrap();
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
         let store = h.store.get().unwrap();
         store
             .replace_compartments(
@@ -476,4 +549,78 @@ async fn cc_original_inbound_envelope_size_is_checked_before_normalized_params()
     assert!(
         matches!(result,HandlerOutcome::ErrorWithDetail { code,detail,.. } if code=="invalid_params" && detail["field"]=="messages")
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_without_fill_uses_request_estimate_and_soft_geometry_and_folds() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    let mut b = binding(dir.path(), thalamus());
+    b.config.execute_threshold_percentage = 65.0;
+    h.bind_route(7, b);
+    setup(&h).await;
+    let mut status = step(r#"{"role":"user","content":"history"}"#);
+    status["messages"].as_array_mut().unwrap().push(json!({"mid":"tail","ordinal":1,"message":{"role":"user","content":"tail"},"raw_message":r#"{"role":"user","content":"tail"}"#}));
+    status["newest"] = json!({"mid":"tail","ordinal":1});
+    status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+    status["geometry"] = json!({"usable_soft":50000,"usable_hard":60000,"absolute_wall":100000,"derivation":"gateway"});
+    let first = response(call(&h, "compaction.step", status.clone()).await);
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    let store = h.store.get().unwrap();
+    store
+        .replace_compartments(
+            &key.engine_key(),
+            &[mc_store::StoredCompartment {
+                sequence: 1,
+                start_message: 0,
+                end_message: 0,
+                end_message_id: "m#0".into(),
+                title: "history".into(),
+                content: "fold without fill".into(),
+                p1: Some("fold without fill".into()),
+                importance: 50,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    status.as_object_mut().unwrap().remove("prefix_rebuilding");
+    if first["answer"] == "compaction_message" {
+        status["last_applied"] = json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
+    }
+    for (tokens, soft, hard) in [
+        (40000, 80.0, 40000.0 / 60000.0 * 100.0),
+        (44000, 88.0, 44000.0 / 60000.0 * 100.0),
+        (58000, 116.0, 58000.0 / 60000.0 * 100.0),
+    ] {
+        status["request_id"] = json!(format!("estimate-{tokens}"));
+        status["estimate"]["request_tokens"] = json!(tokens);
+        assert!(status.get("fill").is_none());
+        assert!(status.get("previous_usage").is_none());
+        let answer = response(call(&h, "compaction.step", status.clone()).await);
+        let actual = transform::compaction::LAST_NATIVE_PRESSURE
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap();
+        assert!((actual.0 - soft).abs() < 0.001);
+        assert!((actual.1 - hard).abs() < 0.001);
+        if tokens == 40000 {
+            assert_eq!(answer["answer"], "compaction_message");
+            assert!(answer.to_string().contains("fold without fill"));
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_raw_history_size_does_not_silently_replace_the_supplied_pressure_estimate() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    setup(&h).await;
+    let raw = json!({"role":"user","content":"not a measured sample ".repeat(6000)}).to_string();
+    assert!(mc_tokenizer::estimate_tokens(&raw) > 10000);
+    let mut status = step(&raw);
+    status["geometry"] = json!({"usable_soft":50000,"usable_hard":60000,"absolute_wall":100000,"derivation":"gateway"});
+    response(call(&h, "compaction.step", status).await);
+    let pressure = transform::compaction::LAST_NATIVE_PRESSURE
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap();
+    assert!((pressure.0 - 0.002).abs() < 0.000001);
 }

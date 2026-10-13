@@ -390,6 +390,7 @@ impl Rig {
 
     pub fn record(&self, session: &str) -> Value {
         let key = mc_store::provider_records::ProviderSessionKey {
+            generation: None,
             project_root: self.dir.path().join("project").to_str().unwrap().into(),
             session: session.into(),
             harness: "broca".into(),

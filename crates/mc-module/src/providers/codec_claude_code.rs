@@ -5,14 +5,12 @@ use ck_wire::{
 };
 use std::ops::Range;
 
-const EXTRAS: &str = "mc-claude-code";
+pub(super) const EXTRAS: &str = "mc-claude-code";
 
-// Proposed revisions of the first native codec and raw JSON envelope formats.
-// Only the test-only candidate uses them: live calls do not yet negotiate or
-// freeze these revisions through the Claude Code capability selection.
-#[cfg(test)]
+// Revisions of the native codec and raw JSON envelope formats, frozen internally
+// with each admitted native route/session plan. Public capability advertisement
+// remains disabled until the module and host activate support together.
 pub(super) const CODEC_FORMAT_EPOCH: u64 = 1;
-#[cfg(test)]
 pub(super) const RAW_PROVENANCE_FORMAT_EPOCH: u64 = 1;
 
 fn invalid_raw(reason: &str) -> HandlerOutcome {

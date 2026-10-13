@@ -20,8 +20,7 @@
 // config. Tests that set their own XDG_DATA_HOME or XDG_CONFIG_HOME still work
 // because they override the preload root per test.
 import { afterAll } from "bun:test";
-import { readdirSync } from "node:fs";
-import { join } from "node:path";
+import { findTestStorageLeaks } from "./src/shared/test-storage-leak-guard";
 import {
     createTestTempDir,
     installTestTempDirCleanup,
@@ -53,21 +52,7 @@ process.env.XDG_DATA_HOME = isolatedDataHome;
 process.env.XDG_CONFIG_HOME = isolatedDataHome;
 
 afterAll(() => {
-    const packageDir = process.cwd();
-    const violations: string[] = [];
-    const scan = (directory: string): void => {
-        for (const entry of readdirSync(directory, { withFileTypes: true })) {
-            const path = join(directory, entry.name);
-            if (entry.isDirectory()) {
-                if (entry.name === "node_modules" || entry.name === ".git") continue;
-                if (entry.name === "undefined") violations.push(path);
-                scan(path);
-            } else if (entry.isFile() && entry.name === "context.db") {
-                violations.push(path);
-            }
-        }
-    };
-    scan(packageDir);
+    const violations = findTestStorageLeaks(process.cwd());
     if (violations.length > 0) {
         throw new Error(`Test storage leaked into the package directory:\n${violations.join("\n")}`);
     }

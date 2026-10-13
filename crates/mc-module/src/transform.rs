@@ -2298,6 +2298,7 @@ pub mod compaction {
         // Observe the exact request passed to the real engine, not a separate
         // adapter projection that production might never consume.
         pub(crate) static LAST_NATIVE_REQUEST: std::cell::RefCell<Option<(String, Option<super::TransformGeometry>, bool)>> = const { std::cell::RefCell::new(None) };
+        pub(crate) static LAST_NATIVE_PRESSURE: std::cell::RefCell<Option<(f64,f64)>> = const { std::cell::RefCell::new(None) };
     }
     use super::*;
 
@@ -3812,6 +3813,7 @@ fn apply_additive_only(
     } else {
         usage_percentage
     };
+
     let decide_scheduler_started_at = Instant::now();
     let mut scheduler_outcome = scheduler::decide(&SchedulerInputs {
         config: scheduler_config(ctx.execute_threshold_percentage),
@@ -5208,7 +5210,12 @@ fn apply_once(
         Some(&mut m1_revision_read_timings),
     )?;
     let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
-    let context_limit_tokens = if req.kind == compaction::PASS_KIND || compaction::host_pass(req) {
+    let context_limit_tokens = if let (true, Some(geometry)) = (
+        req.serializer_profile == "claude-code-anthropic",
+        req.geometry.as_ref(),
+    ) {
+        geometry.usable_soft as f64
+    } else if req.kind == compaction::PASS_KIND || compaction::host_pass(req) {
         effective_usage.context_limit_tokens as f64
     } else {
         effective_context_limit_tokens(&effective_usage, req.geometry.as_ref())
@@ -5226,6 +5233,11 @@ fn apply_once(
     } else {
         usage_percentage
     };
+    #[cfg(test)]
+    if req.serializer_profile == "claude-code-anthropic" {
+        compaction::LAST_NATIVE_PRESSURE
+            .with(|slot| *slot.borrow_mut() = Some((usage_percentage, hard_wall_usage_percentage)));
+    }
     // A legacy row with no frozen publication floor receives no estimator-derived tolerance on a
     // replay pass. If a real gap exists, the conservative recut is already HARD and backfills the
     // floor atomically; an ordinary defer remains tokenizer-free until a natural HARD arrives.

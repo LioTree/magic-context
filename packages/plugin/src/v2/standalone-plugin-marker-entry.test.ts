@@ -17,7 +17,7 @@ test("loading the OpenCode 2 entry registers Magic Context", async () => {
             assert.deepEqual(registry.get("magic-context"), { version: packageMetadata.version });
         `,
         ],
-        { cwd: import.meta.dir, stdout: "pipe", stderr: "pipe" },
+        { cwd: import.meta.dir, stdout: "pipe", stderr: "pipe", windowsHide: true },
     );
     const stderr = await new Response(child.stderr).text();
     expect(await child.exited, stderr).toBe(0);

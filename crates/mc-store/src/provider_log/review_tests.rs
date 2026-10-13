@@ -13,6 +13,7 @@ fn fixture(dir: &std::path::Path) -> (McStore, ProviderSessionKey, ProviderLinea
     })
     .unwrap();
     let key = ProviderSessionKey {
+        generation: None,
         project_root: "/review".into(),
         session: "s".into(),
         harness: "opencode".into(),

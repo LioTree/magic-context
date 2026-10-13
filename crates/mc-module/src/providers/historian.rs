@@ -1025,6 +1025,8 @@ mod tests {
         h.bind_route(
             7,
             SessionBinding {
+                connection_incarnation: 0,
+                native_generation: None,
                 principal: None,
                 project_root: path.into(),
                 harness: "opencode".into(),

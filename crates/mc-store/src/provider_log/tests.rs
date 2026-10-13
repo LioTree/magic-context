@@ -14,6 +14,7 @@ fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
 }
 fn key() -> ProviderSessionKey {
     ProviderSessionKey {
+        generation: None,
         project_root: "/project".into(),
         session: "session".into(),
         harness: "opencode".into(),

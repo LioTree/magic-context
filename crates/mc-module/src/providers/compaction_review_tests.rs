@@ -47,6 +47,8 @@ fn fixture(
     handler.store.set(store.clone()).ok().unwrap();
     handler.provider_runner = runner.clone();
     let binding = SessionBinding {
+        connection_incarnation: 0,
+        native_generation: None,
         principal: None,
         project_root: dir.into(),
         harness: "opencode".into(),

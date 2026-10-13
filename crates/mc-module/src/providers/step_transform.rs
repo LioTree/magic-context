@@ -276,7 +276,7 @@ pub fn declaration(params: &Value) -> Result<hooks::subscription::Declaration, H
 impl McHandler {
     async fn provider_claude_code_hook(
         &self,
-        _binding: SessionBinding,
+        binding: SessionBinding,
         key: Key,
         call: &hooks::hook::HookCall,
         params: &Value,
@@ -384,6 +384,7 @@ impl McHandler {
             .await
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
+        let _route = self.native_publication_fence(&binding)?;
         let held = store
             .load_provider_conversation(&key.store_key())
             .map_err(transient)?
@@ -1670,6 +1671,8 @@ mod host_tests {
             h.bind_route(
                 channel,
                 SessionBinding {
+                    connection_incarnation: 0,
+                    native_generation: None,
                     principal: None,
                     project_root: dir.into(),
                     harness: "opencode".into(),

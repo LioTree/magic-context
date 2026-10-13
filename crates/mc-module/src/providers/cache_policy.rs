@@ -66,6 +66,8 @@ mod tests {
     use super::*;
     fn binding() -> SessionBinding {
         SessionBinding {
+            connection_incarnation: 0,
+            native_generation: None,
             principal: None,
             project_root: PathBuf::from("/fixture"),
             harness: "claude-code".into(),

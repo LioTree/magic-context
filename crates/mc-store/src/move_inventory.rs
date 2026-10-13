@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// Section-inventory protocol version serialized in move manifests.
 pub const INVENTORY_VERSION: u32 = 5;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 100;
-pub const STORE_SCHEMA_VERSION: u32 = 69;
+pub const STORE_SCHEMA_VERSION: u32 = 70;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2815,7 +2815,11 @@ pub const TABLES: &[TableInventory] = &[
             "served_through_ordinal",
             "historian_model_chain_json",
             "record_json",
-            "legacy_shape_json"
+            "legacy_shape_json",
+            "profile_generation",
+            "provider_generation",
+            "native_pins_json",
+            "native_plan_json"
         ],
         &[],
         Some(KeyPolicy::PreserveOrRefuseCollision),

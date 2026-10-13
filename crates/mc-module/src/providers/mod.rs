@@ -6,8 +6,9 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod cache_policy;
-#[cfg(test)]
 mod capability_candidate;
+#[cfg(test)]
+mod cc_native_review_tests;
 #[cfg(test)]
 #[path = "../../../../docs/reports/cc-step-lane-witnesses.rs"]
 mod cc_step_lane_review;
@@ -18,6 +19,9 @@ mod codec_claude_code;
 mod codec_opencode;
 mod compaction;
 mod historian;
+mod native_cut;
+mod native_plan;
+mod native_view;
 mod policy_summary;
 mod records;
 mod step_transform;
@@ -28,6 +32,7 @@ use codec::{checked_view, decode_message};
 #[cfg(test)]
 use codec::{encode_message, validate_replacement};
 pub(crate) use historian::RunCompletion;
+pub(crate) use native_plan::NativeConnectionPlan;
 use records::{frontier, ingest, scan, HookRecord, HookState, Key, Record, Setup};
 pub(crate) use records::{Catalog, Storage};
 use step_transform::declaration;
@@ -46,6 +51,7 @@ pub(crate) fn inbound_ceiling(
         let field = match operation {
             Some("compaction.step") => "messages",
             Some("transform.hook") => "message",
+            Some("compaction.view.read") => "raw_view",
             _ => return None,
         };
         return Some(invalid_field(
@@ -236,7 +242,7 @@ impl McHandler {
         method: &str,
         params: &Value,
     ) -> HandlerOutcome {
-        let binding = match self.facade_binding(channel) {
+        let mut binding = match self.facade_binding(channel) {
             Ok(binding) => binding,
             Err(_) => {
                 return error(
@@ -297,7 +303,15 @@ impl McHandler {
                     );
                 }
             }
-            if let Err(error) = self.admit_host_plan(&binding, method, params).await {
+            if attested_claude_code(&binding) {
+                binding = match self
+                    .admit_native_plan(channel, &binding, method, params)
+                    .await
+                {
+                    Ok(binding) => binding,
+                    Err(error) => return error,
+                };
+            } else if let Err(error) = self.admit_host_plan(&binding, method, params).await {
                 return error;
             }
         }
@@ -315,6 +329,9 @@ impl McHandler {
         let result = match method {
             "compaction.setup" => self.provider_setup(binding, params).await,
             "compaction.step" => self.provider_step(binding, params).await,
+            "compaction.view.read" if attested_claude_code(&binding) => {
+                self.provider_native_view_read(binding, params).await
+            }
             "transform.hook" => self.provider_hook(binding, params).await,
             _ => Err(invalid("unknown provider method")),
         };
