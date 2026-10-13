@@ -1578,7 +1578,7 @@ describe("runPiHistorian turn one", () => {
 		}
 	});
 
-	it("omits the memory block and stores anchored candidates on an enabled lane", async () => {
+	it("keeps the memory block and promotes when enabled is requested without an RPC carrier", async () => {
 		const { db, runner } = await runHistorianWith({
 			outputs: [anchoredXml],
 			memoryLifecycleLane: "enabled",
@@ -1593,46 +1593,25 @@ describe("runPiHistorian turn one", () => {
 		});
 		try {
 			const [sent] = sentUserMessages(runner);
-			expect(sent).not.toContain("Pi memory hidden from turn one.");
-			expect(sent).toContain("<fact_anchors>required</fact_anchors>");
-			const compartmentId = getCompartments(db, "ses-historian")[0]!.id;
-			expect(pendingFacts(db)).toEqual([
-				{
-					fact_index: 0,
-					compartment_id: compartmentId,
-					content: "Pi turn-one facts carry anchors.",
-					anchor_known: 1,
-					state: "retryable",
-					fact_attempts: 0,
-					reason: null,
-				},
-				{
-					fact_index: 1,
-					compartment_id: null,
-					content: "Pi unknown anchors are not guessed.",
-					anchor_known: 0,
-					state: "retryable",
-					fact_attempts: 0,
-					reason: null,
-				},
-			]);
+			expect(sent).toContain("Pi memory hidden from turn one.");
+			expect(sent).not.toContain("<fact_anchors>required</fact_anchors>");
+			expect(pendingFacts(db)).toEqual([]);
 			expect(
 				db
 					.prepare(
 						"SELECT start_ordinal, end_ordinal, role, joined_text FROM memory_fact_blocks",
 					)
 					.all(),
-			).toEqual([
-				{
-					start_ordinal: 1,
-					end_ordinal: 1,
-					role: "U",
-					joined_text: "User request 1",
-				},
-			]);
+			).toEqual([]);
 			expect(
 				getMemoriesByProject(db, projectPath).map((m) => m.content),
-			).toEqual(["Pi memory hidden from turn one."]);
+			).toEqual(
+				expect.arrayContaining([
+					"Pi memory hidden from turn one.",
+					"Pi turn-one facts carry anchors.",
+					"Pi unknown anchors are not guessed.",
+				]),
+			);
 		} finally {
 			closeQuietly(db);
 		}

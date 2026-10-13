@@ -51,6 +51,7 @@ import {
 	promoteSessionFactsDurable,
 } from "@magic-context/core/features/magic-context/memory";
 import { tsOwnsMemory } from "@magic-context/core/features/magic-context/memory/lifecycle-applier";
+import type { ReportedProfile } from "@magic-context/core/features/magic-context/memory/lifecycle-gates";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
@@ -119,6 +120,7 @@ import {
 	fitHistorianPrompt,
 	PRODUCER_PROMPT_FIT_FAILURE_PATTERN,
 } from "@magic-context/core/hooks/magic-context/historian-prompt-fit";
+import { readTurnTwoExcerpt } from "@magic-context/core/hooks/magic-context/historian-turn-two-step";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { persistFilteredNoise } from "@magic-context/core/hooks/magic-context/persist-filtered-noise";
 import {
@@ -165,9 +167,14 @@ import type {
 } from "@magic-context/core/shared/subagent-runner";
 import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
-
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
+import {
+	isPiRpcHistorianRunner,
+	PI_RPC_CARRIER,
+	recoverLostPiRpcStages,
+	schedulePiHistorianTurnTwo,
+} from "./pi-historian-turn-two";
 import {
 	isPiOrdinalAlignmentUnanchored,
 	resolvePiOrdinalAlignment,
@@ -176,6 +183,7 @@ import {
 	iterateEntriesToRawMessageRange,
 	SYNTH_USER_ID_PREFIX,
 } from "./read-session-pi";
+import type { PiRpcHistorianChild } from "./subagent-runner";
 import { isPiSystemEntry } from "./system-entry-pi";
 
 const HISTORIAN_AGENT_NAME = "magic-context-historian";
@@ -502,9 +510,15 @@ export interface PiHistorianDeps {
 	 * the provider enforce a JSON response schema, which it does not yet.
 	 */
 	memoryLifecycleLane?: TurnOneLane;
+	/** Provider/model/variant/temperature and system-prompt hashes whose recorded replay tests passed. Production Pi sends no reconciliation turn. */
+	validatedProfiles?: readonly ReportedProfile[];
+	/** Headless sessions may release lost reservations, but must not run or apply a historian. */
+	hasUI?: boolean;
 }
 
 export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
+	recoverLostPiRpcStages(deps.db);
+	if (deps.hasUI === false) return;
 	const {
 		db,
 		sessionId,
@@ -620,6 +634,13 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		status: "failed",
 	};
 	let completedSuccessfully = false;
+	let retained: {
+		child: PiRpcHistorianChild;
+		options: SubagentRunOptions;
+		text: string;
+	} | null = null;
+	let continuation: Parameters<typeof schedulePiHistorianTurnTwo>[0] | null =
+		null;
 	let retainDrainReservationForRetryThrottle = false;
 	let producerDispatched = false;
 	let drainReservation: ReturnType<
@@ -755,7 +776,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// historian gets no project-memory block and anchors every fact to its
 			// source lines; the anchor is stored with the fact's candidate row, and a
 			// later reconcile step compares the fact with existing memory instead.
-			const turnOneLane = resolveTurnOneLane(deps.memoryLifecycleLane);
+			const rpcRunner = isPiRpcHistorianRunner(runner) ? runner : null;
+			const turnOneLane = resolveTurnOneLane(
+				rpcRunner ? deps.memoryLifecycleLane : "dormant",
+			);
 			const anchoredFacts =
 				turnOneLane === "enabled" && memoryEnabled !== false;
 			const memories =
@@ -1069,7 +1093,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					projectPath,
 					sessionId,
 					harness: resolvePiHarnessKind(),
-					carrier: "pi-subagent",
+					carrier: turnOneLane === "enabled" ? PI_RPC_CARRIER : "pi-subagent",
 					lane: turnOneLane,
 					chunkStart: chunk.startIndex,
 					chunkEnd: chunk.endIndex,
@@ -1096,10 +1120,43 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				deps.language,
 				{ preserveUserQuotes: true },
 			);
+			const publicationRunner: SubagentRunner =
+				turnOneLane === "enabled" && rpcRunner
+					? {
+							harness: runner.harness,
+							run: async (options) => {
+								await retained?.child.close();
+								retained = null;
+								// PiSubagentRunner selects RPC when a call has a token budget and
+								// subagent-entry.js is available to reject tools after that budget.
+								// This effectively unlimited budget selects RPC without adding a
+								// historian token-spend limit.
+								const guarded = {
+									...options,
+									tokenBudget: Number.MAX_SAFE_INTEGER,
+								};
+								const reply = await rpcRunner.runRetainedHistorian(
+									guarded,
+									turnOneSend.stageKey,
+								);
+								if (reply.child && reply.result.ok) {
+									retained = {
+										child: reply.child,
+										options: guarded,
+										text: reply.result.assistantText,
+									};
+									db.prepare(
+										"UPDATE memory_stage_attempts SET child_session_id=? WHERE stage_key=?",
+									).run(reply.child.id, turnOneSend.stageKey);
+								} else await reply.child?.close();
+								return reply.result;
+							},
+						}
+					: runner;
 
 			// First pass.
 			const firstResult = await runHistorianSubagentWithTransientRetries({
-				runner,
+				runner: publicationRunner,
 				sessionId,
 				passLabel: "first",
 				retryBackoffMs,
@@ -1152,7 +1209,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					deps.language,
 				);
 				const repairResult = await runHistorianSubagentWithTransientRetries({
-					runner,
+					runner: publicationRunner,
 					sessionId,
 					passLabel: "repair",
 					retryBackoffMs,
@@ -1213,7 +1270,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						`historian: escalating to ${candidate.kind === "session" ? "session-model last resort" : "configured fallback model"} ${candidate.entry.model}`,
 					);
 					const fbResult = await runHistorianSubagentWithTransientRetries({
-						runner,
+						runner: publicationRunner,
 						sessionId,
 						passLabel:
 							candidate.kind === "session" ? "fallback-session" : "fallback",
@@ -1297,53 +1354,75 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				// instead of the repaired one. See parity audit Round 7.
 				const draftAssistantText = validatedDraftText ?? "";
 				if (draftAssistantText.trim().length > 0) {
-					sessionLog(sessionId, "historian two-pass: running editor on draft");
-					const editorResult = await runHistorianSubagentWithTransientRetries({
-						runner,
-						sessionId,
-						passLabel: "editor",
-						retryBackoffMs,
-						options: {
-							agent: HISTORIAN_AGENT_NAME,
-							systemPrompt: historianEditorSystemPrompt,
-							userMessage: buildHistorianEditorPrompt(draftAssistantText),
-							model: historianModel,
-							timeoutMs: historianTimeoutMs,
-							cwd: directory,
-							signal,
-							thinkingLevel,
-							temperature,
-							maxOutputTokens,
-							onProgress: buildProgressLogger("editor"),
-							accountingSessionId: sessionId,
-							accountingSubagent: "historian_editor",
-						},
-					});
-					const editorPass = await validateHistorianResult(
-						editorResult,
-						sessionId,
-						chunk,
-						priorCompartments,
-						sequenceOffset,
-					);
-					if (editorPass.kind === "ok") {
+					const draftRetained = retained;
+					retained = null;
+					let editorAccepted = false;
+					try {
 						sessionLog(
 							sessionId,
-							`historian two-pass: editor accepted, replacing draft`,
+							"historian two-pass: running editor on draft",
 						);
-						validatedPass = editorPass;
-					} else {
-						const editorErr =
-							editorPass.kind === "validation-failed"
-								? editorPass.error
-								: editorPass.kind === "spawn-failed"
-									? `subagent run failed (${editorPass.reason}): ${editorPass.error}`
-									: "editor returned no usable text";
-						sessionLog(
+						const editorResult = await runHistorianSubagentWithTransientRetries(
+							{
+								runner: publicationRunner,
+								sessionId,
+								passLabel: "editor",
+								retryBackoffMs,
+								options: {
+									agent: HISTORIAN_AGENT_NAME,
+									systemPrompt: historianEditorSystemPrompt,
+									userMessage: buildHistorianEditorPrompt(draftAssistantText),
+									model: historianModel,
+									timeoutMs: historianTimeoutMs,
+									cwd: directory,
+									signal,
+									thinkingLevel,
+									temperature,
+									maxOutputTokens,
+									onProgress: buildProgressLogger("editor"),
+									accountingSessionId: sessionId,
+									accountingSubagent: "historian_editor",
+								},
+							},
+						);
+						const editorPass = await validateHistorianResult(
+							editorResult,
 							sessionId,
-							`historian two-pass: editor failed (${editorErr}), falling back to draft`,
+							chunk,
+							priorCompartments,
+							sequenceOffset,
 						);
-						// Keep validatedPass as the first-pass result.
+						if (editorPass.kind === "ok") {
+							editorAccepted = true;
+							sessionLog(
+								sessionId,
+								`historian two-pass: editor accepted, replacing draft`,
+							);
+							validatedPass = editorPass;
+						} else {
+							const editorErr =
+								editorPass.kind === "validation-failed"
+									? editorPass.error
+									: editorPass.kind === "spawn-failed"
+										? `subagent run failed (${editorPass.reason}): ${editorPass.error}`
+										: "editor returned no usable text";
+							sessionLog(
+								sessionId,
+								`historian two-pass: editor failed (${editorErr}), falling back to draft`,
+							);
+							// Keep the validated draft's compartments and facts when the editor fails.
+						}
+					} finally {
+						if (editorAccepted)
+							await (
+								draftRetained as { child: PiRpcHistorianChild } | null
+							)?.child.close();
+						else {
+							await (
+								retained as { child: PiRpcHistorianChild } | null
+							)?.child.close();
+							retained = draftRetained;
+						}
 					}
 				}
 			}
@@ -1846,6 +1925,33 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				telemetry.importanceAvg = imp.avg;
 				telemetry.discardedLast = discardedLast;
 			}
+			if (published && retained && rpcRunner) {
+				const child = retained as {
+					child: PiRpcHistorianChild;
+					options: SubagentRunOptions;
+					text: string;
+				};
+				continuation = {
+					db,
+					projectPath,
+					publicationId: turnOneSend.publicationId,
+					sessionId,
+					child: child.child,
+					runner: rpcRunner,
+					options: child.options,
+					turnOneText: child.text,
+					memoryEnabled: memoryEnabled !== false,
+					autoPromote: autoPromote !== false,
+					validatedProfiles: deps.validatedProfiles ?? [],
+					readExcerpt: (sourceSession, from, to) =>
+						sourceSession === sessionId
+							? withRawMessageProvider(sessionId, provider, () =>
+									readTurnTwoExcerpt(sourceSession, from, to),
+								)
+							: null,
+					log: (message) => sessionLog(sessionId, message),
+				};
+			}
 		});
 	} catch (error) {
 		const desc = describeError(error);
@@ -1905,6 +2011,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		} catch {
 			/* telemetry must not break compaction */
 		}
+		if (continuation) schedulePiHistorianTurnTwo(continuation);
+		else if (retained)
+			await (retained as { child: PiRpcHistorianChild }).child.close();
 	}
 }
 
