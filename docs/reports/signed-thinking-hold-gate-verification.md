@@ -10,7 +10,7 @@ before current signed thinking (issue 630), or
 strict thinking-binding recovery. The context.db v100 columns and store.db v67
 fence are retained.
 
-## Independent default-off differential
+## Independent default-off differential before reconciliation
 
 The source oracle is the commit shared by master and the train before the hold changes,
 `9d26c87081a9925217fa09698ce08e7a092e1f4d`, extracted with `git archive` into an
@@ -156,20 +156,116 @@ A 4-core package-scoped retry compiled and ran the differential;
 later module/store suites and clippy ran with 16 requested cores. No Rust test or
 build was run on macOS.
 
-## Pending reconciliation follow-up
+## Reconciliation follow-up completed for the supplied tip
 
-This delivery covers the standalone default-off gate at train base
-`3549c4340ef37066f6690fb466824ac752ba0cbb`. The reconciled train was not yet
-available when this checkpoint was requested for delivery. These three steps
-remain pending for the resumed item:
+Merged `85319552a5b6523470d2a79da4194ff9ca133a35` and the placeholder/system-injection
+slice (s5), `2d19947cb6bd3724dad74f05073e1db08323f621`, directly so its new runtime
+could be gated without waiting for a separate train integration. The resolutions retain master's
+stable Pi identity resolver, mutable reclaim permission and atomic served-number publication.
+New strip admission (refusing new removals before kept thinking) and consumers that spend
+queued history-refresh permission are behind `signed_thinking_hold`.
 
-1. Merge the reconciled train plus the placeholder/system-injection admission
-   slice (s5) when its SHA is supplied.
-2. Gate s5 placeholder/system-injection admission and history-trigger consumers
-   under the same setting, while keeping the Pi stable-ID cutover preservation
-   and refused-reminder decision withdrawal fixes always enabled.
-3. Compare the resulting code against current master's fixes for held thinking
-   turns (issue 665) and prove those protections remain outside the experimental switch.
+Two Pi repairs remain always on: stable-ID migration cannot newly omit previously served text,
+and a refused reminder edit withdraws only a decision added by that edit, never an existing
+replay decision. Their handler/cleanup regression cases explicitly use `signedThinkingHold: "off"`.
 
-The pending placeholder/system-injection gating and updated-master merge are
-not claimed as implemented or verified by the before-reconciliation results above.
+The issue-665 Rust change prevents a held signed-thinking request from reporting a cache
+bust and adds its always-on reset handling. Master `62f20c02` does **not** yet include
+that merge, `1c947fb0e8` (the `signed_prefix_hold*` tests); the OpenCode/Pi revision is
+also still pending. This branch neither implements nor verifies that unmerged reset.
+Its preservation target is master's existing protections at `62f20c02`: all 14 focused
+tests for latest-turn protection, rejection recovery and retained historical omissions pass
+with the experimental hold off. Confirmation against the newer always-on Rust hold/reset
+remains for the next train reconciliation. No unlanded implementation or shim was invented.
+
+### Reconciled independent oracle and isolation
+
+The current oracle is the hold-free master source `62f20c02ff99d132dd67d4ad727330f5de855e14`.
+The older `9d26c87081` results above remain historical evidence, not the current comparison:
+master's served-tag publication is deliberately preserved instead of discarding its stored
+`piServedTagNumbers` safety metadata. Both sources use the same project directory path,
+but independent HOME/XDG roots so the candidate cannot inherit the oracle's session ledgers.
+Expected bytes and decisions still come from independent archived source, with exact equality.
+
+Rust oracle build caches are keyed by the source revision. `git archive` preserved old
+source-file modification times, so Cargo initially reused stale tokenizer metadata lacking
+`history_render_paragraph_counts` and `estimate_history_render_tokens`, although both
+functions were in the archived source. A revision-isolated cache fixes the build without
+changing source or expected output. The final Rust comparison passes all 1008 records
+and 1009 assertions.
+
+All resumed checks used Linux with four requested CPUs. The TS/Pi differential passes all
+1008 records and 1010 assertions. Forcing the reconciled TS consumer's `holdEnabled = true`
+reddens only that differential, first diverging at its OpenCode record 37: served bytes,
+the highest reclaimed tool-tag number (watermark), and text-compression depth differ.
+This proves the comparison notices the enabled hold, rather than passing vacuously.
+The applied mutation was +1/-1 in one file, with an empty working diff before applying it
+and after restoring/touching the staged file; no mutant remains. The restored comparison passes.
+
+### Reconciled opt-in audit comparison
+
+The source baseline for enabled behavior is the unmodified placeholder/system-injection
+admission tip (s5), `2d19947cb6bd`. Normal audits pin known unfinished behavior; strict
+mode (`MC_AUDIT_STRICT=1`) instead makes those open binding violations red. The
+comparison test passes with 16 assertions: default audits are **179 pass / 0 fail** before
+and after; strict audits are **154 pass / 25 fail** before and after. All 25 strict failures
+already existed at the baseline, and their exact unchanged names are listed below.
+
+
+| Exact current test name | Before s5 source | After gated merge |
+|---|---|---|
+| signed prefix audit: OpenCode 1 TS mode, primary mid tool loop > compaction-marker summary retired by a bust: mid tool loop | fail | fail |
+| signed prefix audit: OpenCode 1 TS mode, primary mid tool loop > m[0]/m[1] re-render after a recomp clears the cached pair | fail | fail |
+| signed prefix audit: OpenCode 1 TS mode, primary mid tool loop > mixed pass: a 95% tail reduction on a parallel tool arc lands while an older drop stays held | fail | fail |
+| signed prefix audit: OpenCode 1 TS mode, primary mid tool loop > prefix cut moved by a compartment rewrite that keeps the cached pair: defer pass at a new user turn | fail | fail |
+| signed prefix audit: OpenCode 1 TS mode, primary mid tool loop > prefix cut moved by a compartment rewrite that keeps the cached pair: mid tool loop | fail | fail |
+| signed prefix audit: OpenCode 1 TS mode, primary mid tool loop > processed image strip | fail | fail |
+| signed prefix audit: OpenCode 1 TS mode, primary mid tool loop > release survives a restart: /ctx-flush | fail | fail |
+| signed prefix audit: OpenCode 1 TS mode, primary mid tool loop > stale ctx_reduce strip | fail | fail |
+| signed prefix audit: OpenCode 1 TS mode, primary mid tool loop > synthetic todo | fail | fail |
+| signed prefix audit: OpenCode 1 TS mode, subagent run > stale ctx_reduce strip | fail | fail |
+| signed prefix audit: OpenCode 2, primary mid tool loop > compaction-marker summary retired by a bust: mid tool loop | fail | fail |
+| signed prefix audit: OpenCode 2, primary mid tool loop > m[0]/m[1] re-render after a recomp clears the cached pair | fail | fail |
+| signed prefix audit: OpenCode 2, primary mid tool loop > mixed pass: a 95% tail reduction on a parallel tool arc lands while an older drop stays held | fail | fail |
+| signed prefix audit: OpenCode 2, primary mid tool loop > prefix cut moved by a compartment rewrite that keeps the cached pair: defer pass at a new user turn | fail | fail |
+| signed prefix audit: OpenCode 2, primary mid tool loop > prefix cut moved by a compartment rewrite that keeps the cached pair: mid tool loop | fail | fail |
+| signed prefix audit: OpenCode 2, primary mid tool loop > processed image strip | fail | fail |
+| signed prefix audit: OpenCode 2, primary mid tool loop > release survives a restart: /ctx-flush | fail | fail |
+| signed prefix audit: OpenCode 2, primary mid tool loop > stale ctx_reduce strip | fail | fail |
+| signed prefix audit: OpenCode 2, primary mid tool loop > synthetic todo | fail | fail |
+| signed prefix audit: OpenCode 2, subagent run > stale ctx_reduce strip | fail | fail |
+| signed prefix audit: Pi/OMP, primary mid tool loop > m[0]/m[1] re-render after a recomp clears the cached pair | fail | fail |
+| signed prefix audit: Pi/OMP, primary mid tool loop > prefix cut moved by a compartment rewrite that keeps the cached pair: defer pass at a new user turn | fail | fail |
+| signed prefix audit: Pi/OMP, primary mid tool loop > prefix cut moved by a compartment rewrite that keeps the cached pair: mid tool loop | fail | fail |
+| signed prefix audit: Pi/OMP, primary mid tool loop > release survives a restart: /ctx-flush | fail | fail |
+| signed prefix audit: Pi/OMP, primary mid tool loop > synthetic todo | fail | fail |
+
+### Reconciled package and focused checks
+
+| Gate | Current result |
+|---|---|
+| Package typechecks and dedicated driver typecheck | Pass, TypeScript 5.9.3 |
+| `bun run build:dists` | Pass; both built distributions load; 9 TUI compiled files unchanged |
+| `bun run lint` | Pass, Biome 2.5.1; 1461 plugin, 318 Pi, 138 CLI and 6 retina files checked |
+| Full plugin suite | 8655 pass, 30 skip, 1 baseline WASM fixture failure (8686 tests) |
+| Full Pi suite | 2157 pass, 43 skip, 0 fail (2200 tests) |
+| CLI suite | 640 pass, 2 skip in main run; separate repair subprocess 9 pass, 1 unchanged SQLite `.recover` failure |
+| Rust compilation, `cargo test -p mc-module --no-run` | Pass; all 21 module test executables compiled |
+| Enabled Rust signed-thinking prefix audit | 17 pass, 0 fail |
+| Disabled Rust saved-obligation regression | 1 pass, 0 fail |
+| Rust fmt and all-target mc-module/mc-store clippy | Pass |
+| Existing master latest-turn, rejection-recovery and historical-omission regressions | 14 pass, 0 fail |
+| Reconciled `mc-store` suite | 333 pass, 5 ignored, 0 fail |
+| Enabled s5 strip, history, reminder and trigger-parking probes | 27 pass; the single known restart-durability reproducer remains red |
+
+The s5 opt-in reproducer `a kept history refresh survives restart until safe release`
+is a documented pre-existing limitation in `docs/reports/signed-thinking-s03a-review.md`:
+the history-refresh trigger is process-local. Its assertion is unchanged. The full opt-in
+probe run reports 27 pass / 1 fail; the positive-control run excludes only that named
+reproducer and reports 27 pass / 0 fail / 1 filtered. No hold durability work was added.
+
+The source comments were reviewed and unclear new explanations rewritten. The merged
+lockfile/package changes were installed with `bun install --frozen-lockfile` (four packages
+installed), and the package suites above were rerun in the isolated worktree. All resumed
+verification commands explicitly requested `linux,4c`; no live stores or external checkout
+were used.

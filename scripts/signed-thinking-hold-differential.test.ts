@@ -125,6 +125,10 @@ rustTest(
 			"",
 		);
 		require("node:fs").writeFileSync(join(oracle, testPath), fixture);
+		// git archive keeps the source files' old timestamps, which can make Cargo
+		// treat another revision's cached build as fresh. Key artifacts by revision
+		// so the oracle never reuses another baseline's tokenizer or module metadata.
+		const oracleRevision = run(["git", "rev-parse", base], repository).trim();
 		const capture = (source: string, label: string) => {
 			const output = join(root, `${label}.json`);
 			console.log(
@@ -149,6 +153,7 @@ rustTest(
 								? join(
 										process.env.CARGO_TARGET_DIR ?? join(repository, "target"),
 										"hold-oracle",
+										oracleRevision,
 									)
 								: (process.env.CARGO_TARGET_DIR ?? join(repository, "target")),
 					},
