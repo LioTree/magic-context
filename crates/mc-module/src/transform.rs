@@ -6147,10 +6147,11 @@ fn apply_once(
                 reclaim_pending_now
             })
             && !todo_injection_pending
-            // A subagent's pending tag-surface transition is spent as soon as the always-on
-            // `signed_prefix_hold` lifts (force band, Emergency95, expired cache). Admission
+            // A subagent's pending tag-surface transition is spent on any pass where
+            // `signed_prefix_hold` is false (force band, Emergency95, expired cache). Admission
             // still keeps every block up to the kept signed thinking unchanged, so the tags
-            // land only after it, which strict binding allows.
+            // land only after it; a provider that binds signed thinking to the bytes before it
+            // accepts edits after the signed block.
             && !(req.is_subagent && surface_transition && !signed_prefix_hold)
             && pass_already_busting
         {
@@ -6582,8 +6583,10 @@ fn apply_once(
             .is_none_or(|date| *date == loaded.meta.guidance_date)
         && !releases_native_reasoning_keep
         && !applies_held_system_strip;
-    // Clear a pending explicit flush only when this pass refreshed m1. A frozen signed head
-    // replays m1 unchanged, so the flush stays pending for the first pass after the turn.
+    // Clear a pending explicit flush (`soft_refresh_pending`) only when this pass refreshed m1.
+    // A preserved prefix replay, a parked trigger under kept signed thinking, or a frozen
+    // signed head all replay m1 unchanged, so the flush stays pending until the first pass
+    // after the open signed turn ends.
     if loaded.meta.soft_refresh_pending
         && !prefix_replay_must_be_preserved
         && !(trigger_holds_enabled && protected_signed_prefix)

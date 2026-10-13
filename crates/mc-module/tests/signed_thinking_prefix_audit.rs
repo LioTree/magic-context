@@ -732,9 +732,10 @@ impl Fixture {
 }
 
 /// Lanes whose mid-loop bust changes the request before a signed thinking block the request
-/// still carries, which a strict-binding provider rejects. A primary's HardFold is no longer
-/// one: the signed-prefix head freeze replays m0/m1 unchanged for the whole open signed turn,
-/// so the fold is held (no edit, no error) and lands at the next user turn.
+/// still carries, which a strict-binding provider rejects. Only a primary's Todo lane is
+/// exposed. A primary's HardFold is not: the signed-prefix head freeze replays m0/m1
+/// unchanged for the whole open signed turn, so the fold is held (no edit, no error) and
+/// lands at the next user turn.
 fn exposed(subagent: bool, lane: Lane) -> bool {
     !subagent && matches!(lane, Lane::Todo)
 }
@@ -1196,8 +1197,8 @@ fn assert_claude_code_flush_held_mid_turn(f: &Fixture) {
 
 /// Ends the turn and serves the first pass of the next one, where the held flush lands.
 /// Unlike `next_user_turn`, this does not require the provider mock to accept the release:
-/// Claude Code keeps older-turn thinking, so every bust at a new user turn is rejected today
-/// (see `control`).
+/// Claude Code keeps thinking blocks from older turns, so the provider mock rejects every
+/// prefix rewrite at a new user turn on that profile (the `control` audit records this).
 fn claude_code_flush_release(f: &mut Fixture, mid: &str) {
     let text = format!(
         "Step {}: this part of the work is done and verified.",

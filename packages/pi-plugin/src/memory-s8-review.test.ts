@@ -403,9 +403,10 @@ describe.skipIf(!enabled)("S8 independent review", () => {
 				path,
 				childProcess.execFileSync(
 					"git",
-					// The pre-S8 sources on the migration train (S8's own merge parent there).
-					// The branch's original base predates master's fallback accounting, which
-					// the train already carries independently of S8.
+					// Baseline: these files as they were immediately before the Pi turn-two
+					// parity change merged (158074fac812). The change's original base is older
+					// and lacks the fallback/session-fallback accounting task that the merged
+					// code records, so comparing against it would flag that unrelated column.
 					["show", `158074fac812:packages/pi-plugin/src/${file}.ts`],
 					{ encoding: "utf8" },
 				),

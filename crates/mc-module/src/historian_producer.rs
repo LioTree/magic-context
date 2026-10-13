@@ -910,8 +910,9 @@ impl HistorianProducer {
         let route = self.ensure_command_route().await?;
         // Stage sends carry no retention: recovery rebuilds this exact body from the
         // persisted stage request to derive the same submission handle, and that request
-        // does not record a retention. Choosing a retention for stage sessions is part of
-        // enabling the Rust stage lifecycle.
+        // does not record a retention. Giving stage sessions a retention would first require
+        // persisting it in that stage request. Stage sends happen only while
+        // `historian_stage::RUST_LIFECYCLE_ENABLED` is on, which it is not in production.
         let request = serde_json::to_value(session_send_request(
             stage_key,
             system,

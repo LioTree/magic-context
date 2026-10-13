@@ -585,8 +585,8 @@ export async function createV2HiddenCompletionExecutor(
                 requestModel(request, run.child.model),
                 run.identity.kind === "rescore",
             );
-            // A rescore runs on its frozen sampling profile, so a configured historian
-            // temperature is not added to it.
+            // A rescore sends the temperature fixed in its rescore profile (set when the
+            // job was confirmed), so the configured historian temperature is not added to it.
             if (
                 run.identity.kind !== "dreamer-task" &&
                 run.identity.kind !== "rescore" &&

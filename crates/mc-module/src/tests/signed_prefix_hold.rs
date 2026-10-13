@@ -820,7 +820,8 @@ fn signed_prefix_hold_subagent_tag_surface_transition_waits() {
     assert_eq!(released.action, "SOFT");
     assert!(s.load(session).unwrap().meta.tagging_surface_active);
     // The force band lifts the hold but does not strip the turn's signed thinking: the
-    // transition tags only blocks after the kept signed block, which strict binding allows.
+    // transition tags only blocks after the kept signed block; a provider that binds signed
+    // thinking to the bytes before it accepts edits after it.
     // Everything up to and including that block is byte-identical to the held serve.
     let flat = |response: &TransformResponse| -> Vec<Value> {
         response
