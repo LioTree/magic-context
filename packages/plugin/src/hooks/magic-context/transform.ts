@@ -71,6 +71,7 @@ import type { ModelInput } from "../../shared/model-resolution";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
+import { isRecord } from "../../shared/record-type-guard";
 import { withoutSqliteTransformPass } from "../../shared/sqlite";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import type { CavemanWordRules } from "./caveman";
@@ -134,7 +135,7 @@ import {
     captureLatestTurnOriginals,
     prepareLatestThinkingRecovery,
 } from "./latest-thinking-recovery";
-import { saveLkgSlotToDb } from "./lkg-persist";
+import { loadPersistedLkgSlot, saveLkgSlotToDb } from "./lkg-persist";
 import { captureLkgSlot, createLkgEntryProjector, resolveLkgModelKeys } from "./lkg-replay";
 import { recordServedCapture } from "./lkg-served-marker";
 import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
@@ -671,6 +672,12 @@ export interface TransformDeps {
      * keeps them (Pi in particular) out of the coordinate rebase entirely.
      */
     storeGeneration?: CoordinateGeneration;
+    /**
+     * Passed to tagging for assistant text restored from a saved source copy (see
+     * `TagMessagesOptions.normalizeRestoredAssistantText`). Only the OpenCode 2
+     * adapter supplies it.
+     */
+    normalizeRestoredAssistantText?: (text: string) => string;
 }
 
 export function resolveTransformHostSeams(
@@ -702,6 +709,11 @@ export function createTransform(deps: TransformDeps) {
     const finalWireUsage = createFinalWireUsageTracker();
     const host = resolveTransformHostSeams(deps);
     const loadedSessions = new Set<string>();
+    const prefixHoldLogTurnIds = new Map<string, string | null>();
+    const thinkingFitRetries = new Set<string>();
+    const clearSessionLogState = (sessionId: string): void => {
+        prefixHoldLogTurnIds.delete(sessionId);
+    };
     // Sessions whose history was clearly over the model's window, with no
     // Magic Context state to send in its place, on a pass that could not bring
     // it under. Each later pass is checked again until one is served under the
@@ -769,6 +781,15 @@ export function createTransform(deps: TransformDeps) {
         const startTime = performance.now();
         const historianRun = deps.resolveHistorianRun?.();
         const messages = output.messages as MessageLike[];
+        const originalForThinkingFit = messages.some((message) =>
+            message.parts.some(
+                (part) =>
+                    isRecord(part) &&
+                    ["reasoning", "thinking", "redacted_thinking"].includes(String(part.type)),
+            ),
+        )
+            ? structuredClone(messages)
+            : null;
         const passOutcome = createPassOutcome();
         const tSessionId = performance.now();
         const sessionId = findSessionId(messages);
@@ -1228,29 +1249,25 @@ export function createTransform(deps: TransformDeps) {
             activeThinkingModel?.providerID,
             activeThinkingModel?.modelID,
         );
-        let freezeM0M1 =
-            (activeThinkingTurn &&
-                isPrefixBoundThinkingModel(
-                    activeThinkingModel?.providerID,
-                    activeThinkingModel?.modelID,
-                )) ||
-            (sessionDirectoryFellBack &&
-                sessionMeta.cachedM0Bytes != null &&
-                sessionMeta.cachedM1Bytes != null &&
-                (() => {
-                    try {
-                        return hasRecordedSessionProjectIdentity(db, sessionId);
-                    } catch {
-                        // Unknown: keep the frozen pair rather than risk a rebuild.
-                        return true;
-                    }
-                })());
-        if (freezeM0M1) {
-            sessionLog(
-                sessionId,
-                "session directory unresolved; replaying the frozen m[0]/m[1] and deferring any rebuild",
+        const unresolvedDirectoryHold =
+            sessionDirectoryFellBack &&
+            sessionMeta.cachedM0Bytes != null &&
+            sessionMeta.cachedM1Bytes != null &&
+            (() => {
+                try {
+                    return hasRecordedSessionProjectIdentity(db, sessionId);
+                } catch {
+                    // Unknown: keep the frozen pair rather than risk a rebuild.
+                    return true;
+                }
+            })();
+        let activeThinkingPrefixHold =
+            activeThinkingTurn &&
+            isPrefixBoundThinkingModel(
+                activeThinkingModel?.providerID,
+                activeThinkingModel?.modelID,
             );
-        }
+        let freezeM0M1 = unresolvedDirectoryHold || activeThinkingPrefixHold;
         const compartmentDirectory = sessionDirectory;
         const historianRunnable = deps.historianRunnable !== false;
         const canRunCompartments =
@@ -1609,9 +1626,20 @@ export function createTransform(deps: TransformDeps) {
             resolvedProviderID,
             modelForBudget?.modelID,
         );
-        freezeM0M1 ||=
+        activeThinkingPrefixHold ||=
             activeThinkingTurn &&
             isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID);
+        freezeM0M1 ||= activeThinkingPrefixHold;
+        if (freezeM0M1 && prefixHoldLogTurnIds.get(sessionId) !== currentTurnId) {
+            prefixHoldLogTurnIds.set(sessionId, currentTurnId);
+            const reason = activeThinkingPrefixHold
+                ? "active thinking turn (prefix-bound model)"
+                : "session directory unresolved";
+            sessionLog(
+                sessionId,
+                `m[0]/m[1] frozen: ${reason}; replaying the frozen prefix and deferring any rebuild`,
+            );
+        }
         const canUseEmptySentinels = modelAcceptsEmptyContent(resolvedProviderID);
         const protectedThinkingMessages =
             activeThinkingTurn ||
@@ -2364,6 +2392,7 @@ export function createTransform(deps: TransformDeps) {
                     skipPrefixInjection,
                     scopedToolSweep,
                     servedMessages: messages,
+                    normalizeRestoredAssistantText: deps.normalizeRestoredAssistantText,
                 });
                 targets = result.targets;
                 if (thinkingRecovery.restore)
@@ -2813,7 +2842,9 @@ export function createTransform(deps: TransformDeps) {
             client: deps.client,
             activeAgent,
             batch,
-            contextUsage,
+            contextUsage: thinkingFitRetries.has(sessionId)
+                ? { ...contextUsage, percentage: Math.max(95, contextUsage.percentage) }
+                : contextUsage,
             usableWindow: resolvedContextLimit ?? 0,
             schedulerDecision,
             schedulerDeferReason,
@@ -2828,6 +2859,17 @@ export function createTransform(deps: TransformDeps) {
             compartmentInProgress,
             historyRefreshExplicitBeforePrepare,
             freezeM0M1,
+            activeThinkingPrefixHold,
+            directoryPrefixHold: unresolvedDirectoryHold,
+            forceSignedRebuildForFit: thinkingFitRetries.has(sessionId),
+            readLastServedMessages: () => {
+                const slot = getInMemorySlot(sessionId) ?? loadPersistedLkgSlot(db, sessionId);
+                try {
+                    return slot ? JSON.parse(slot.jsonPrefix) : null;
+                } catch {
+                    return null;
+                }
+            },
             deferredHistoryWasPendingAtPassStart,
             compartmentInjectionRebuiltFromDb: pendingCompartmentInjection?.rebuiltFromDb === true,
             rebuiltHistoryFromInitialPrepare,
@@ -2973,6 +3015,38 @@ export function createTransform(deps: TransformDeps) {
                     sessionId,
                     `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"} tail=${finalWireTail}`,
                 );
+            }
+            if (
+                (finalWireEstimate?.refusalGrade ||
+                    (finalWireEstimate?.refusalBasis === "byte-bound" &&
+                        finalWireEstimate.refusalTokens !== undefined)) &&
+                boundaryContextLimit > 0 &&
+                (finalWireEstimate.refusalTokens ?? finalWireEstimate.tokens) > boundaryContextLimit
+            ) {
+                if (
+                    !thinkingFitRetries.has(sessionId) &&
+                    activeThinkingPrefixHold &&
+                    originalForThinkingFit &&
+                    hasActiveAnthropicThinkingTurn(
+                        messages,
+                        resolvedProviderID,
+                        modelForBudget?.modelID,
+                    )
+                ) {
+                    thinkingFitRetries.add(sessionId);
+                    deps.pendingMaterializationSessions.add(sessionId);
+                    messages.splice(0, messages.length, ...originalForThinkingFit);
+                    try {
+                        await transform({}, output);
+                    } finally {
+                        thinkingFitRetries.delete(sessionId);
+                    }
+                    return;
+                }
+                if (thinkingFitRetries.has(sessionId) || postTransformResult.thinkingReleasedForFit)
+                    throw contextRefusalError(
+                        "The request remains over the model window after stripping signed thinking and reclaiming context",
+                    );
             }
             // The prefix trim could not find the history boundary, so the whole
             // window is about to go out uncut. That is harmless while it fits and
@@ -3466,10 +3540,12 @@ export function createTransform(deps: TransformDeps) {
         recoverProviderOutput: (id: string, output: { messages: unknown[] }) =>
             providerTransform?.recoverOutput(id, output) ?? false,
         providerOrdinals: (id: string) => providerForSession(id)?.ordinals(id),
+        clearSessionLogState,
         invalidateRustWireState(sessionId: string): void {
             rustModeTransform?.invalidateWireState(sessionId);
         },
         async clearRustSession(sessionId: string): Promise<void> {
+            clearSessionLogState(sessionId);
             await rustModeTransform?.clearSession(sessionId);
         },
         /** The host disposed this instance; release the Rust adapter's process-wide registrations. */

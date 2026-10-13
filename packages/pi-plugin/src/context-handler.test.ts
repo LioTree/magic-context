@@ -779,11 +779,11 @@ describe("Pi pressure guards", () => {
 			expect(src).toContain("let pendingOpsDidMutate = false");
 			expect(src).toContain("let heuristicOrReasoningDidMutate = false");
 			expect(src).toContain(
-				"let isCacheBustingPass = hasReclaimRide(rideSignals)",
+				"let isCacheBustingPass = prefixMutationAllowed && hasReclaimRide(rideSignals)",
 			);
 			expect(src).toContain("if (identityRebuild) {");
-			expect(src).toContain(
-				'args.schedulerDecision = "execute"; isCacheBustingPass = true;',
+			expect(src).toMatch(
+				/if \(identityRebuild\)[\s\S]*?args\.schedulerDecision = "execute";[\s\S]*?isCacheBustingPass = prefixMutationAllowed;/,
 			);
 			expect(src).toContain(
 				"const toolReclaimApplicationOpportunity = isCacheBustingPass",
@@ -8672,10 +8672,9 @@ describe("Pi proactive strip of invalidated thinking", () => {
 		}
 	});
 
-	// Anthropic's "What counts as an edit" table
-	// (https://platform.claude.com/docs/en/build-with-claude/preserved-thinking):
-	// "Remove `thinking` blocks from the start of the history" is valid.
-	it('"Remove `thinking` blocks from the start of the history" is valid, so a trim-only busting pass keeps every newer signed block and the defer pass replays it', async () => {
+	// Strict binding does not permit removing an older block while a newer
+	// signature is kept. Only a real prefix rewrite can remove them together.
+	it("a pressure pass alone keeps every signed block; an actual prefix rewrite strips all of them", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-trim-only";
 		const fake = createFakePi();
@@ -8711,8 +8710,16 @@ describe("Pi proactive strip of invalidated thinking", () => {
 				}
 				return { messages, entryIds };
 			};
-			const pass = async (turns: number, percent: number) => {
+			const pass = async (
+				turns: number,
+				percent: number,
+				completed = false,
+			) => {
 				const { messages, entryIds } = build(turns);
+				if (completed) {
+					messages.push(userMessage(`request ${turns}`, turns * 2 + 1));
+					entryIds.push(`entry-u${turns}`);
+				}
 				const result = await handler({ messages: messages as never[] }, {
 					...fakeContext(sessionId, process.cwd(), entryIds, messages as never),
 					model: { provider: "anthropic", id: "claude-opus-5-5" },
@@ -8725,8 +8732,9 @@ describe("Pi proactive strip of invalidated thinking", () => {
 				return (result?.messages ?? messages) as unknown[];
 			};
 
-			// The first render busts and strips the two turns it serves.
-			await pass(2, 10);
+			// Price the initial strip after the two turns have ended, not inside
+			// a held thinking turn whose work would spill into the force pass.
+			await pass(2, 10, true);
 			// Eight newer turns arrive on defer passes and keep their thinking.
 			const served = await pass(10, 10);
 			expect(served.slice(4).map(liveThinking)).toEqual(
@@ -8734,13 +8742,13 @@ describe("Pi proactive strip of invalidated thinking", () => {
 			);
 			const strippedBefore = getMergedReasoningStrippedIds(db, sessionId);
 
-			// A force-band pass whose only edit is the oldest-prefix thinking clear.
+			// Pressure without a preceding-byte rewrite keeps all signed blocks.
 			const trim = await pass(10, 96);
 			const cleared = trim.filter(
 				(message, index) =>
 					index % 2 === 1 && index >= 4 && liveThinking(message) === 0,
 			);
-			expect(cleared.length).toBeGreaterThan(0);
+			expect(cleared.length).toBe(0);
 			// Cleared thinking is a contiguous oldest prefix of the kept turns...
 			const kept = trim
 				.map((message, index) => ({ index, thinking: liveThinking(message) }))
@@ -8772,10 +8780,12 @@ describe("Pi proactive strip of invalidated thinking", () => {
 			if (!dropped) throw new Error("missing tag for an older user message");
 			updateTagStatus(db, sessionId, dropped.tagNumber, "dropped");
 			signalPiPendingMaterialization(sessionId);
-			const dropPass = await pass(10, 96);
-			// A legacy edit may repair completed turns, never strip the active
-			// turn's latest signed response. Its original thinking stays.
-			expect(dropPass.map(liveThinking)).toEqual([...Array(19).fill(0), 1]);
+			const dropPass = await pass(10, 96, true);
+			// Complete the active turn before introducing the external old-user
+			// drop. Its genuine prefix rewrite must omit every older signature.
+			expect(dropPass.map(liveThinking).every((count) => count === 0)).toBe(
+				true,
+			);
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);

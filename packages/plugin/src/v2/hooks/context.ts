@@ -156,6 +156,7 @@ import {
     syntheticCandidates,
 } from "./channel2";
 import { registerV2Commands } from "./commands";
+import { stripCopiedTagNotation } from "./copied-tag-notation";
 import { DeletedSessionTombstones } from "./deleted-session-tombstones";
 import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
 import { registerV2DreamScheduleTimer } from "./dream-timer";
@@ -1260,6 +1261,7 @@ export async function registerContext(context: V2Context) {
                 }
                 if (event.type === "session.deleted") {
                     deletedSessions.add(sessionID);
+                    transform?.clearSessionLogState(sessionID);
                     if (db) {
                         markSessionCleanupPending(db, sessionID);
                         clearSession(db, sessionID);
@@ -1707,6 +1709,10 @@ export async function registerContext(context: V2Context) {
                 // conversation differently from the v1 tables a converted store
                 // still carries.
                 storeGeneration: "v2",
+                // The host stores copied `§N§` notation unchanged (no hook runs before
+                // it writes a finished reply), so assistant text restored from a saved
+                // source copy gets the same strip `adaptPayload` gives the live text.
+                normalizeRestoredAssistantText: stripCopiedTagNotation,
                 // GA owns its native checkpoints; this adapter never writes the v1
                 // synthetic marker rows that the shared off-transition deletes.
                 hostCleanupCompactionMarkers: () => ({
