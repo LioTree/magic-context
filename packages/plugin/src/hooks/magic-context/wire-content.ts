@@ -1,0 +1,193 @@
+import {
+    estimateImageTokensFromDataUrl,
+    estimateToolAttachmentImageTokens,
+} from "./image-token-estimate";
+import type { MessageLike } from "./transform-operations";
+
+export interface MessageTokenEstimate {
+    conversation: number;
+    toolCall: number;
+}
+
+export function serializedWireText(value: unknown): string {
+    if (value === undefined) return "";
+    return (typeof value === "string" ? value : JSON.stringify(value)) ?? "";
+}
+
+/** Walk only provider-visible fields, for both token estimates and byte budgets. */
+export function visitWireContent(
+    message: MessageLike,
+    visit: {
+        text: (bucket: keyof MessageTokenEstimate, value: unknown) => void;
+        image: (bucket: keyof MessageTokenEstimate, tokens: number) => void;
+    },
+): void {
+    for (const part of message.parts) {
+        if (!part || typeof part !== "object") continue;
+        const p = part as {
+            type?: string;
+            text?: string;
+            thinking?: string;
+            signature?: string;
+            data?: string;
+            ignored?: boolean;
+            state?: { input?: unknown; output?: unknown; content?: unknown; error?: unknown };
+            args?: unknown;
+            input?: unknown;
+            content?: unknown;
+            output?: unknown;
+            result?: unknown;
+            mime?: string;
+            url?: unknown;
+            metadata?: { anthropic?: { signature?: string } };
+        };
+        if (p.ignored) continue;
+        const text = (value: unknown) => {
+            if (typeof value === "string") visit.text("conversation", value);
+        };
+        const tool = (value: unknown) => visit.text("toolCall", value);
+        switch (p.type) {
+            case "text":
+                text(p.text);
+                break;
+            case "reasoning":
+                text(p.text);
+                text(p.metadata?.anthropic?.signature);
+                break;
+            case "thinking":
+                text(p.thinking);
+                text(p.signature);
+                break;
+            case "redacted_thinking":
+                text(p.data);
+                break;
+            case "file":
+                if (typeof p.mime === "string" && p.mime.startsWith("image/")) {
+                    visit.image(
+                        "conversation",
+                        typeof p.url === "string" && p.url.startsWith("data:")
+                            ? estimateImageTokensFromDataUrl(p.url)
+                            : 1200,
+                    );
+                }
+                break;
+            case "tool":
+                tool(p.state?.input ?? p.input ?? p.args);
+                tool(p.state?.output ?? p.state?.content ?? p.output ?? p.result ?? p.content);
+                tool(p.state?.error);
+                visit.image("toolCall", estimateToolAttachmentImageTokens(p.state));
+                break;
+            case "tool-call":
+                tool(p.input ?? p.args);
+                break;
+            case "tool-invocation":
+                tool(p.args ?? p.input);
+                tool(p.result ?? p.output ?? p.state?.output);
+                tool(p.state?.error);
+                break;
+            case "tool-result":
+                tool(p.result ?? p.content ?? p.output);
+                break;
+            case "tool_use":
+                tool(p.input ?? p.args);
+                break;
+            case "tool_result":
+                tool(p.content ?? p.result ?? p.output);
+                break;
+        }
+    }
+}
+
+/** A UTF-8 byte per text token is the estimator's conservative bounded-count mode. */
+export function estimateByteBoundedMessageTokens(message: MessageLike): MessageTokenEstimate {
+    const total: MessageTokenEstimate = { conversation: 0, toolCall: 0 };
+    visitWireContent(message, {
+        text: (bucket, value) => {
+            total[bucket] += Buffer.byteLength(serializedWireText(value));
+        },
+        image: (bucket, tokens) => {
+            total[bucket] += tokens;
+        },
+    });
+    return total;
+}
+
+export function wireContentBytes(
+    messages: readonly MessageLike[],
+    abortAboveBytes: number,
+    bytesPerToken: number,
+): { bytes: number; aborted: boolean } | null {
+    let bytes = 0;
+    try {
+        for (const message of messages) {
+            visitWireContent(message, {
+                text: (_bucket, value) => {
+                    bytes += Buffer.byteLength(serializedWireText(value));
+                },
+                image: (_bucket, tokens) => {
+                    bytes += tokens * bytesPerToken;
+                },
+            });
+            if (bytes > abortAboveBytes) return { bytes, aborted: true };
+        }
+    } catch {
+        return null;
+    }
+    return { bytes, aborted: false };
+}
+
+export function hasCountableParts(message: MessageLike): boolean {
+    return message.parts.every((part) => {
+        if (!part || typeof part !== "object") return false;
+        const p = part as unknown as Record<string, unknown>;
+        if (p.ignored === true) return true;
+        switch (p.type) {
+            case "text":
+            case "reasoning":
+                return typeof p.text === "string";
+            case "thinking":
+                return typeof p.thinking === "string";
+            case "redacted_thinking":
+                return typeof p.data === "string";
+            case "tool": {
+                const state =
+                    p.state !== null && typeof p.state === "object"
+                        ? (p.state as Record<string, unknown>)
+                        : undefined;
+                const hasInput =
+                    state?.input !== undefined || p.input !== undefined || p.args !== undefined;
+                const hasResult =
+                    state?.output !== undefined ||
+                    state?.content !== undefined ||
+                    state?.error !== undefined ||
+                    p.output !== undefined ||
+                    p.result !== undefined ||
+                    p.content !== undefined;
+                return hasInput && hasResult;
+            }
+            case "tool-call":
+                return p.input !== undefined || p.args !== undefined;
+            case "tool-invocation":
+                return (
+                    (p.args !== undefined || p.input !== undefined) &&
+                    (p.result !== undefined ||
+                        p.output !== undefined ||
+                        (p.state !== null && typeof p.state === "object"))
+                );
+            case "tool-result":
+                return p.result !== undefined || p.content !== undefined || p.output !== undefined;
+            case "tool_use":
+                return p.input !== undefined || p.args !== undefined;
+            case "tool_result":
+                return p.content !== undefined || p.result !== undefined || p.output !== undefined;
+            case "step-start":
+            case "step-finish":
+                return true;
+            // Inline images use the shared dimension-based estimate; other attachments have no bound.
+            case "file":
+                return typeof p.url === "string" && p.url.startsWith("data:image/");
+            default:
+                return false;
+        }
+    });
+}

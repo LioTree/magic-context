@@ -4,7 +4,7 @@ import { readFileSync, statSync } from "node:fs";
 import { detectConfigFile, parseJsoncRecovering } from "../shared/jsonc-parser";
 import {
     cortexKitProjectConfigBasePath,
-    cortexKitUserConfigBasePath,
+    resolveMagicContextUserConfig,
 } from "./migrate-config-location";
 
 export interface ConfigSnapshot<T> {
@@ -71,9 +71,9 @@ export class LiveConfigReader<T> {
 
     poll(): ConfigSnapshot<T> {
         const paths = [
-            cortexKitUserConfigBasePath(),
-            cortexKitProjectConfigBasePath(this.directory),
-        ].map((base) => detectConfigFile(base).path);
+            resolveMagicContextUserConfig().path,
+            detectConfigFile(cortexKitProjectConfigBasePath(this.directory)).path,
+        ];
         const next = new Map<string, FileState>();
         let changed = paths.some((path) => !this.files.has(path));
         for (const path of paths) {

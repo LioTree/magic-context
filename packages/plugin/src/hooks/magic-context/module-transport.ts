@@ -294,6 +294,7 @@ export class SubcModuleTransport {
         moduleId = DEFAULT_MODULE_ID,
         requestTimeoutMs = MODULE_SEND_TIMEOUT_MS,
         routeSessionPrefix = "",
+        private readonly harness?: BindIdentity["harness"],
     ) {
         this.connectionFile = connectionFile;
         this.moduleId = moduleId;
@@ -777,6 +778,15 @@ export class SubcModuleTransport {
         });
     }
 
+    private closed = false;
+
+    /** Release this transport's connection; future calls must not reconnect after disposal. */
+    close(): void {
+        if (this.closed) return;
+        this.closed = true;
+        this.invalidateConnection();
+    }
+
     closeSession(sessionId: string): void {
         const client = this.client;
         const prefix = `${sessionId}\0`;
@@ -830,7 +840,7 @@ export class SubcModuleTransport {
             const target: RouteTarget = { kind: "tool_provider", module_id: this.moduleId };
             const identity: BindIdentity = {
                 project_root: projectRoot,
-                harness: getHarness(),
+                harness: this.harness ?? getHarness(),
                 session: `${this.routeSessionPrefix}${sessionId}`,
             };
             const route = await this.beforeDeadline(
@@ -929,6 +939,7 @@ export class SubcModuleTransport {
     }
 
     private async ensureConnected(signal?: AbortSignal): Promise<SubcClient> {
+        if (this.closed) throw new Error("Module transport is closed");
         if (this.client) return this.client;
         if (this.connectionPromise) return await this.connectionPromise;
         let now = Date.now();
@@ -942,6 +953,7 @@ export class SubcModuleTransport {
             // — so sibling sessions' passes wait or fail on their own schedule.
             const jitterMs = Math.floor(Math.random() * CONNECT_BACKOFF_WAIT_JITTER_MS);
             await this.sleepAbortable(remainingMs + jitterMs, signal);
+            if (this.closed) throw new Error("Module transport is closed");
             // Another pass may have connected (or started connecting) while we slept.
             if (this.client) return this.client;
             if (this.connectionPromise) return await this.connectionPromise;
