@@ -2,6 +2,7 @@
 
 pub mod bootstrap;
 pub mod fingerprints;
+pub mod migrations_legacy;
 
 pub use bootstrap::{BootstrapContextSchema, BOOTSTRAP, BOOTSTRAP_VERSION};
 

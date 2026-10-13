@@ -598,8 +598,8 @@ async function applyParsedVerifyManifest(
         (entry) => entry.id,
     );
     assertNoDuplicateManifestIds(validIds, "verify");
-        // When the verification agent reaches its token budget, a partial reply is
-        // expected; otherwise low coverage may mean it answered a different batch.
+    // When the verification agent reaches its token budget, a partial reply is
+    // expected; otherwise low coverage may mean it answered a different batch.
     if (!budgetFinalized && validIds.length * 2 < batch.length)
         throw new Error(
             `verify manifest covers ${validIds.length}/${batch.length} batch ids after filtering unknown entries; rejecting mostly-wrong manifest`,
