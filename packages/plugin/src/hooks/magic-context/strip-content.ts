@@ -1,4 +1,5 @@
 import {
+    type FrozenReasoningPart,
     MERGED_REASONING_PARTS_PREFIX,
     readFrozenMergedReasoningParts,
 } from "../../features/magic-context/merged-reasoning-decisions";
@@ -8,6 +9,7 @@ import {
     makeSentinel,
     makeWholeMessageSentinel,
     modelAcceptsEmptyContent,
+    neutralizeWholeMessage,
 } from "./sentinel";
 import { stripWellFormedLeadingTagPrefix } from "./tag-content-primitives";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
@@ -56,7 +58,9 @@ function isSystemInjectedText(text: string): boolean {
  * length so proxy providers that hash message-array structure see a stable
  * prefix. For Anthropic/Bedrock, the provider's upstream filter drops
  * empty-content messages on the wire anyway — same effective behavior, no
- * mid-pipeline array mutation.
+ * mid-pipeline array mutation. An OpenCode 2 `system` row on canonical
+ * Anthropic is left with no parts instead and omitted when the payload goes
+ * back to the host (see `wholeMessageNeutralizationRemoves`).
  */
 export function stripSystemInjectedMessages(
     messages: MessageLike[],
@@ -116,8 +120,7 @@ export function stripSystemInjectedMessages(
 
         if (hasContentPart && allContentIsSystemInjection) {
             onFirstApplication?.(msg, 0);
-            msg.parts.length = 0;
-            msg.parts.push(makeWholeMessageSentinel(providerID));
+            neutralizeWholeMessage(msg, providerID);
             stripped++;
             if (typeof msg.info.id === "string") sentineledIds.push(msg.info.id);
         }
@@ -170,7 +173,8 @@ const METADATA_PART_TYPES = new Set([
  * length so proxy providers that hash message-array structure see a stable
  * prefix. For Anthropic/Bedrock, OpenCode's upstream filter drops empty
  * content messages on the wire — same effective behavior, no mid-pipeline
- * array mutation.
+ * array mutation. An OpenCode 2 `system` row on canonical Anthropic is left
+ * with no parts instead (see `wholeMessageNeutralizationRemoves`).
  *
  * Returns both count and sentineled IDs so callers can persist-and-replay.
  */
@@ -236,8 +240,7 @@ export function stripDroppedPlaceholderMessages(
 
         if (hasContentPart && !hasNonDroppedContent) {
             onFirstApplication?.(msg, 0);
-            msg.parts.length = 0;
-            msg.parts.push(makeWholeMessageSentinel(providerID));
+            neutralizeWholeMessage(msg, providerID);
             stripped++;
             if (typeof msg.info.id === "string") sentineledIds.push(msg.info.id);
         }
@@ -914,6 +917,14 @@ export function stripReasoningFromMergedAssistants(
     options?: {
         mutationExemptMessage?: MessageLike;
         frozenMessageIds?: ReadonlySet<string>;
+        /**
+         * `readFrozenMergedReasoningParts(frozenMessageIds)` and its key set,
+         * when the caller already decoded them. A caller that strips one message
+         * at a time passes these so each call does not decode every frozen
+         * decision again. They must describe the same `frozenMessageIds`.
+         */
+        frozenParts?: ReadonlyMap<string, readonly FrozenReasoningPart[]>;
+        frozenPartMessageIds?: ReadonlySet<string>;
         protectedMessages?: ReadonlySet<MessageLike>;
         restoreMessages?: ReadonlySet<MessageLike>;
     },
@@ -927,7 +938,9 @@ export function stripReasoningFromMergedAssistants(
     if (providerID !== "anthropic") return 0;
 
     let stripped = 0;
-    const frozenParts = readFrozenMergedReasoningParts(options?.frozenMessageIds ?? new Set());
+    const frozenParts =
+        options?.frozenParts ??
+        readFrozenMergedReasoningParts(options?.frozenMessageIds ?? new Set());
     // Replay the exact persisted selection without reconsidering adjacency.
     // Dropping empty preceding assistants can make a stripped thinking part
     // look eligible to keep on the next request. Only legacy bare ids still
@@ -952,7 +965,7 @@ export function stripReasoningFromMergedAssistants(
     for (const entry of planMergedAssistantReasoningStrip(
         messages,
         options?.mutationExemptMessage,
-        new Set(frozenParts.keys()),
+        options?.frozenPartMessageIds ?? new Set(frozenParts.keys()),
         options?.frozenMessageIds ? options.restoreMessages : options?.protectedMessages,
     )) {
         if (options?.frozenMessageIds) {

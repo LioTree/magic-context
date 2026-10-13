@@ -24,6 +24,9 @@ use serde_json::{json, Value};
 use subc_client_rs::{CallOptions, ConsumerOptions, RetryBackoff, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+#[path = "support/executable.rs"]
+mod executable_staging;
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MODULE_ID: &str = "magic-context";
@@ -569,7 +572,8 @@ fn spawn_daemon(
     config_dir: &Path,
     data_home: &Path,
 ) -> LiveDaemon {
-    let child = Command::new(daemon_bin)
+    let mut command = Command::new(daemon_bin);
+    command
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env("XDG_CONFIG_HOME", config_dir)
         // The daemon derives `cortexkit/run` (including `logs/`) from the data home, not
@@ -586,8 +590,8 @@ fn spawn_daemon(
         .env("SUBC_PORT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let child = executable_staging::retry_spawn(|| command.spawn())
         .unwrap_or_else(|e| panic!("failed to spawn daemon {}: {e}", daemon_bin.display()));
     assert_dev_process_name(child.id());
     LiveDaemon {
@@ -608,7 +612,8 @@ fn spawn_module_with_differential(
     data_home: &Path,
     differential: bool,
 ) -> ModuleProcess {
-    let mut child = Command::new(module_bin)
+    let mut command = Command::new(module_bin);
+    command
         .arg("--subc")
         .arg(connection_file)
         .env(subc_protocol::SUBC_MODULE_ID_ENV, MODULE_ID)
@@ -632,8 +637,8 @@ fn spawn_module_with_differential(
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = executable_staging::retry_spawn(|| command.spawn())
         .unwrap_or_else(|e| panic!("failed to spawn module {}: {e}", module_bin.display()));
     assert_dev_process_name(child.id());
     // The module logs to stderr; an undrained pipe fills its 64KB buffer and the module
@@ -1070,32 +1075,18 @@ fn dev_named_binary(path: &Path) -> PathBuf {
 
 fn dev_named_binary_as(path: &Path, suffix: &str) -> PathBuf {
     assert!(path.is_file(), "expected binary at {}", path.display());
-    let dev_dir = std::env::temp_dir()
-        .join("magic-context/mc-module-test-binaries")
-        .join(std::process::id().to_string());
-    fs::create_dir_all(&dev_dir).expect("create isolated binary staging directory");
-    let dev_path = dev_dir.join(format!("ckdev-{suffix}"));
-    if path == dev_path.as_path() {
-        return dev_path;
-    }
-    let _ = fs::remove_file(&dev_path);
-    // A copy, never a hard link: on macOS a daemon exec'd through a hard link to
-    // cargo's output was occasionally SIGKILLed at startup, while a copy never was.
-    fs::copy(path, &dev_path)
-        .map(|_| ())
+    let filename = path.file_name().and_then(|name| name.to_str()).unwrap();
+    let identifier = filename
+        .strip_prefix("ckdev-")
+        .map(|name| format!("ck-{}", name.split('-').next().unwrap_or(name)))
+        .unwrap_or_else(|| filename.to_string());
+    executable_staging::stage_executable(path, &format!("ckdev-{suffix}"), &identifier)
         .unwrap_or_else(|error| {
             panic!(
-                "failed to stage test binary {} as {}: {error}",
-                path.display(),
-                dev_path.display()
+                "failed to stage test binary {} as ckdev-{suffix}: {error}",
+                path.display()
             )
-        });
-    assert!(
-        fs::read(path).unwrap() == fs::read(&dev_path).unwrap(),
-        "staged binary must be byte-identical to {}",
-        path.display()
-    );
-    dev_path
+        })
 }
 
 fn workspace_root() -> PathBuf {

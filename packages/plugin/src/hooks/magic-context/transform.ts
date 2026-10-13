@@ -48,6 +48,7 @@ import {
     resetProtectedTailNoEligibleHead,
     resolveEpochFloorForPass,
 } from "../../features/magic-context/storage-meta-persisted";
+import { isTagOwnerSummaryReady } from "../../features/magic-context/storage-tags";
 import type { CoordinateGeneration } from "../../features/magic-context/store-generation-rebase";
 import {
     readCoordinateGeneration,
@@ -152,7 +153,7 @@ import {
     recordHighPressureNoEligibleHead,
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
-import { readRawSessionMessages } from "./read-session-chunk";
+import { prepareRawSessionOrdinals, readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import { extractInMemoryMessageViews } from "./read-session-raw";
 import {
@@ -168,6 +169,7 @@ import {
     snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
 } from "./strip-content";
+import { prewarmTagOwners, waitForTagOwners } from "./tag-owner-warmup";
 import { collectTemporalCandidates, injectTemporalMarkers } from "./temporal-awareness";
 import { readServedTemporalDecisions } from "./temporal-served-projection";
 import { createPreAdoptionToolSweepResolver, useScopedToolSweep } from "./tool-sweep-policy";
@@ -426,6 +428,11 @@ export interface TransformDeps {
     /** Host storage and cancellation adapters; omitted callbacks retain OpenCode 1 behavior. */
     hostRawMessages?: (sessionId: string) => ReturnType<typeof readRawSessionMessages>;
     hostMessageReconciliationSource?: MessageReconciliationSource;
+    /**
+     * Resolves once canonical ordinal counts of the session no longer scan it
+     * on this thread (false when the off-thread warm-up failed).
+     */
+    hostPrepareRawOrdinals?: (sessionId: string) => Promise<boolean>;
     hostProtectedTailBoundary?: typeof resolveOpenCodeProtectedTailBoundary;
     hostModelFallback?: typeof findLastAssistantModelFromOpenCodeDb;
     hostRefusalNotice?: HostRefusalNotice;
@@ -671,6 +678,7 @@ export function resolveTransformHostSeams(
         TransformDeps,
         | "hostRawMessages"
         | "hostMessageReconciliationSource"
+        | "hostPrepareRawOrdinals"
         | "hostProtectedTailBoundary"
         | "hostModelFallback"
         | "hostRefusalNotice"
@@ -681,6 +689,7 @@ export function resolveTransformHostSeams(
         hostRawMessages: deps.hostRawMessages ?? readRawSessionMessages,
         hostMessageReconciliationSource:
             deps.hostMessageReconciliationSource ?? readRawSessionMessages,
+        hostPrepareRawOrdinals: deps.hostPrepareRawOrdinals ?? prepareRawSessionOrdinals,
         hostProtectedTailBoundary:
             deps.hostProtectedTailBoundary ?? resolveOpenCodeProtectedTailBoundary,
         hostModelFallback: deps.hostModelFallback ?? findLastAssistantModelFromOpenCodeDb,
@@ -821,6 +830,18 @@ export function createTransform(deps: TransformDeps) {
         clearOpenCodePendingTransformDecision(sessionId);
 
         const db = deps.db;
+
+        // Every newly touched session prepares its rank checkpoints off-thread.
+        // Preparation has a bounded asynchronous deadline. An unavailable rank
+        // never triggers a full count here: a required read degrades the pass to
+        // the last-good replay path instead of serving an approximate ordinal.
+        try {
+            const tPrepare = performance.now();
+            const ready = await host.hostPrepareRawOrdinals(sessionId);
+            logTransformTiming(sessionId, "rawOrdinals.prepare", tPrepare, `ready=${ready}`);
+        } catch (error) {
+            sessionLog(sessionId, "transform: canonical ordinal warm-up threw:", error);
+        }
 
         // A stage this pass cannot be served without has failed: the session's
         // saved drops, truncations, history cut or emergency state would be
@@ -1239,6 +1260,21 @@ export function createTransform(deps: TransformDeps) {
             (deps.client !== undefined || deps.hiddenCompletionExecutor !== undefined) &&
             compartmentDirectory.length > 0;
         const fallbackModelId = deps.getFallbackModelId?.(sessionId);
+
+        // A foreign commit (including message indexing) invalidates even a warm
+        // owner digest. Preparing it without waiting can skip the only pass with
+        // enough pressure to start the historian. Wait before taking usage and
+        // decision snapshots, not after preparing the render from those snapshots.
+        if (fullFeatureMode && !compactionOff && historianRunnable) {
+            const tOwners = performance.now();
+            await waitForTagOwners(
+                db,
+                sessionId,
+                sessionDecisionCalibration(db, sessionId).proseRatio,
+            );
+            sessionMeta = getOrCreateSessionMeta(db, sessionId);
+            logTransformTiming(sessionId, "tagOwners.prepare", tOwners);
+        }
 
         const tModelDetect = performance.now();
         // Snapshot persisted usage BEFORE any reset this pass. Both the
@@ -2108,11 +2144,19 @@ export function createTransform(deps: TransformDeps) {
             );
         }
 
+        const ownerRatio = sessionDecisionCalibration(db, sessionId).proseRatio;
+        // Do not await after snapshotting usage, model limits and protected-tail
+        // state: the trigger must use that same decision state. The earlier owner
+        // preparation waited at most 250ms. Recheck its digest here; if a peer
+        // invalidated it, warm it again and defer the trigger until the next pass.
+        void prewarmTagOwners(db, sessionId, ownerRatio);
+        const tagOwnersReady = isTagOwnerSummaryReady(db, sessionId, ownerRatio);
         let triggerBoundarySnapshot: ProtectedTailBoundarySnapshot | undefined;
         if (
             fullFeatureMode &&
             !compactionOff &&
             historianRunnable &&
+            tagOwnersReady &&
             !sessionMeta.compartmentInProgress
         ) {
             const tTrigger = performance.now();
