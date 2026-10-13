@@ -15660,6 +15660,13 @@ fn new_frozen_strip_units(
             block: crate::edit_admission::BlockPos::Whole,
         })
     };
+    // Stale-reduce discovery freezes a whole message's reduce parts together. Its earliest
+    // reduce block must be admitted before minting the replay unit, never during replay.
+    let admit_stale_reduce = |message: &CkIngressMessage| {
+        let first = message.ck.content.iter().position(is_reduce_block).unwrap();
+        let target = ck_wire::block_id(&message.mid, first);
+        (admit_block_id(admission, &target), target)
+    };
 
     for index in (0..req.messages.len()).rev() {
         let message = &req.messages[index];
@@ -15757,7 +15764,12 @@ fn new_frozen_strip_units(
             {
                 let unit = strip_unit("stale_reduce", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
-                    units.insert(unit.key.clone(), unit);
+                    let (admitted, target) = admit_stale_reduce(message);
+                    if admitted {
+                        units.insert(unit.key.clone(), unit);
+                    } else {
+                        held_blocks.push(format!("stale_reduce:{target}"));
+                    }
                 }
             }
             if whole_marker_or_blank_message(blocks)
@@ -15781,7 +15793,12 @@ fn new_frozen_strip_units(
         if is_stale_reduce {
             let unit = strip_unit("stale_reduce", &message.mid, &sentinel);
             if !existing_keys.contains(unit.key.as_str()) {
-                units.insert(unit.key.clone(), unit);
+                let (admitted, target) = admit_stale_reduce(message);
+                if admitted {
+                    units.insert(unit.key.clone(), unit);
+                } else {
+                    held_blocks.push(format!("stale_reduce:{target}"));
+                }
             }
         }
         if has_assistant_response
@@ -15825,7 +15842,7 @@ fn new_frozen_strip_units(
             held_whole_messages = ?held_whole,
             held_blocks = ?held_blocks,
             held_edits = held_whole.len() + held_blocks.len(),
-            "mc-module: held placeholder and system-injected strips before kept current-turn thinking"
+            "mc-module: held placeholder, system-injected and stale-reduce strips before kept current-turn thinking"
         );
     }
     units.into_values().collect()
@@ -32492,6 +32509,7 @@ pub(crate) mod tests {
 
     include!("transform/reasoning_clear_tests.rs");
     include!("transform/reasoning_clear_gate_tests.rs");
+    include!("transform/stale_reduce_tests.rs");
     include!("tests/signed_prefix_hold.rs");
     include!("tests/signed_prefix_hold_review.rs");
     include!("tests/signed_prefix_hold_review_r2.rs");

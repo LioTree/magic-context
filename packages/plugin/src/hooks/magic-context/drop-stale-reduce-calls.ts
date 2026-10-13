@@ -118,6 +118,8 @@ export function dropStaleReduceCalls(
         protectedCount?: number;
         /** Per-tool keep counts apply on first stripping a call, not when replaying a saved strip. */
         protectedCallIds?: ReadonlySet<string>;
+        /** Admit the first reduce part before editing or freezing any part of this message. */
+        admitFirstApplication?: (message: MessageLike, partIndex: number) => boolean;
         /** Reports only newly edited locations, never frozen-id replay. */
         onFirstApplication?: (message: MessageLike, partIndex: number) => void;
     } = {},
@@ -150,6 +152,13 @@ export function dropStaleReduceCalls(
             !message.parts.some(toolPartHasUserAnswer);
 
         if (!inFrozen && !isNewDetection) continue;
+
+        if (isNewDetection) {
+            const firstReducePart = message.parts.findIndex(
+                (part) => !isSentinel(part) && isReduceToolPart(part),
+            );
+            if (options.admitFirstApplication?.(message, firstReducePart) === false) continue;
+        }
 
         const touched = sentinelizeReduceParts(
             message,

@@ -3244,6 +3244,7 @@ export async function runPostTransformPhase(
         try {
             const t8 = performance.now();
             const frozenStaleReduceIds = replaySnapshot.staleReduceStrippedIds;
+            const heldReduceCoords: string[] = [];
             const staleReduceResult = dropStaleReduceCalls(args.messages, frozenStaleReduceIds, {
                 detect: isCacheBustingPass,
                 protectedCount: args.protectedCount,
@@ -3252,8 +3253,20 @@ export async function runPostTransformPhase(
                         .filter((tag) => protectedToolTags.has(tag.tagNumber))
                         .map((tag) => tag.messageId),
                 ),
+                admitFirstApplication: (message, block) => {
+                    if (editAdmission.admit({ kind: "message", id: message.info.id, block }))
+                        return true;
+                    heldReduceCoords.push(`${message.info.id ?? "<no id>"}:${block}`);
+                    return false;
+                },
                 onFirstApplication: recordFirstApplicationAt,
             });
+            if (heldReduceCoords.length > 0 && editAdmission.frame.kind === "boundary") {
+                sessionLog(
+                    args.sessionId,
+                    `edit admission: held lane=stale_reduce coords=${heldReduceCoords.join(",")} boundary=${editAdmission.frame.messageId ?? "<unresolved>"} held_edits=${heldReduceCoords.length}`,
+                );
+            }
             if (isCacheBustingPass && staleReduceResult.newlyStrippedIds.length > 0) {
                 addStaleReduceStrippedIds(
                     args.db,

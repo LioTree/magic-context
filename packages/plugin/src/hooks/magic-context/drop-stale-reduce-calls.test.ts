@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 import { describe, expect, it } from "bun:test";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
+import { createEditAdmission, isAdmissionUser, thinkingAnchor } from "./edit-admission";
 import { isSentinel } from "./sentinel";
 import type { MessageLike } from "./tag-messages";
 
@@ -20,6 +21,104 @@ function makeTextPart(text: string) {
 const NO_FROZEN = new Set<string>();
 
 describe("dropStaleReduceCalls (frozen-set replay)", () => {
+    it("holds detection before kept thinking without freezing an id, then releases on a permitted new-turn pass", () => {
+        const signed = {
+            type: "reasoning",
+            text: "kept thinking",
+            metadata: { anthropic: { signature: "signed" } },
+        };
+        const raw = [
+            makeMessage("user", [makeTextPart("task")], "u"),
+            makeMessage(
+                "assistant",
+                [makeTextPart("note"), makeToolPart("ctx_reduce", "queued")],
+                "old",
+            ),
+            makeMessage("assistant", [signed, makeTextPart("continue")], "boundary"),
+        ];
+        const frame = (messages: MessageLike[]) =>
+            createEditAdmission({
+                messages,
+                stableId: (m) => m.info.id,
+                partsOf: (m) => m.parts,
+                isRealUser: isAdmissionUser,
+                prefixBound: true,
+                isRetainedThinking: (_m, p) => (p as { type?: string }).type === "reasoning",
+                anchorOf: thinkingAnchor,
+            });
+        const frozen = new Set<string>();
+        const applied: number[] = [];
+        const pass = (detect: boolean) => {
+            const messages = structuredClone(raw);
+            const admission = frame(messages);
+            const result = dropStaleReduceCalls(messages, frozen, {
+                detect,
+                admitFirstApplication: (m, block) =>
+                    admission.admit({ kind: "message", id: m.info.id, block }),
+                onFirstApplication: (_m, block) => {
+                    applied.push(block);
+                },
+            });
+            for (const id of result.newlyStrippedIds) frozen.add(id);
+            return { messages, result };
+        };
+        const before = JSON.stringify(raw);
+        expect(pass(true).result).toEqual({ didDrop: false, newlyStrippedIds: [] });
+        expect(JSON.stringify(pass(false).messages)).toBe(before);
+        expect(frozen.size).toBe(0);
+        expect(applied).toEqual([]);
+        raw.push(makeMessage("user", [makeTextPart("next task")], "next-user"));
+        expect(pass(false).result.newlyStrippedIds).toEqual([]);
+        const release = pass(true);
+        expect(release.result.newlyStrippedIds).toEqual(["old"]);
+        expect(applied).toEqual([1]);
+        expect(pass(false).messages).toEqual(release.messages);
+    });
+
+    it("admits detection after the boundary part and replays frozen ids without consulting admission", () => {
+        const messages = [
+            makeMessage(
+                "assistant",
+                [
+                    { type: "reasoning", signature: "signed", text: "kept" },
+                    makeToolPart("ctx_reduce", "first", "c1"),
+                    makeToolPart("ctx_reduce", "second", "c2"),
+                ],
+                "boundary",
+            ),
+        ];
+        const raw = structuredClone(messages);
+        const admission = createEditAdmission({
+            messages,
+            stableId: (m) => m.info.id,
+            partsOf: (m) => m.parts,
+            isRealUser: isAdmissionUser,
+            prefixBound: true,
+            isRetainedThinking: (_m, p) => (p as { type?: string }).type === "reasoning",
+            anchorOf: thinkingAnchor,
+        });
+        const coordinates: number[] = [];
+        expect(
+            dropStaleReduceCalls(messages, NO_FROZEN, {
+                detect: true,
+                admitFirstApplication: (m, block) => {
+                    coordinates.push(block);
+                    return admission.admit({ kind: "message", id: m.info.id, block });
+                },
+            }).newlyStrippedIds,
+        ).toEqual(["boundary"]);
+        expect(coordinates).toEqual([1]);
+        expect(
+            dropStaleReduceCalls(raw, new Set(["boundary"]), {
+                detect: true,
+                admitFirstApplication: () => {
+                    throw new Error("replay must not ask admission");
+                },
+            }).newlyStrippedIds,
+        ).toEqual([]);
+        expect(raw).toEqual(messages);
+    });
+
     describe("#given a detect pass over aged ctx_reduce messages", () => {
         describe("#when detect=true and the call is past the protected window", () => {
             it("#then sentinels the ctx_reduce part, preserves length, and reports the id", () => {

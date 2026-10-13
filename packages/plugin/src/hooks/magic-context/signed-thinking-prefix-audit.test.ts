@@ -146,7 +146,6 @@ const EXPOSED = new Set<Lane>([
     "m[0]/m[1] re-render after a recomp clears the cached pair",
     "synthetic todo",
     "processed image strip",
-    "stale ctx_reduce strip",
 ]);
 
 const PRIMARY_LANES: Lane[] = [
