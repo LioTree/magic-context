@@ -1,0 +1,5 @@
+{
+  "extends": "../memory-s7-review/tsconfig.json",
+  "include": ["footprint.test.ts"],
+  "exclude": []
+}
