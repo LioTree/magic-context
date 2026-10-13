@@ -1,0 +1,74 @@
+{
+  "baseline_sha": "d56295e9096fb0c2f883058a4d82709d8773c023",
+  "candidate_sha": "89e11baee3c7ebaa49c3aac8248059d24df1e956",
+  "dependency_control": "both source arms use candidate frozen npm installation",
+  "captures": [
+    {
+      "arm": "golden-base",
+      "model": "rejected",
+      "passes_per_mode": 3543,
+      "files": 7086,
+      "hosts": [
+        "claude-code-anthropic",
+        "opencode-aisdk",
+        "pi",
+        "v1",
+        "v2"
+      ],
+      "manifest_sha256": "1675a9e47c9d0c4c0e3bf6aed41403825d24ade4d9fd12c0c4df29749c05eeea"
+    },
+    {
+      "arm": "golden-base",
+      "model": "prefix-bound",
+      "passes_per_mode": 3543,
+      "files": 7086,
+      "hosts": [
+        "claude-code-anthropic",
+        "opencode-aisdk",
+        "pi",
+        "v1",
+        "v2"
+      ],
+      "manifest_sha256": "28c579bf91eba87f7c321e58c6e1a66b2f8b61903d8a6c5dda126b76e70a604c"
+    },
+    {
+      "arm": "golden-head",
+      "model": "rejected",
+      "passes_per_mode": 3543,
+      "files": 7086,
+      "hosts": [
+        "claude-code-anthropic",
+        "opencode-aisdk",
+        "pi",
+        "v1",
+        "v2"
+      ],
+      "manifest_sha256": "1675a9e47c9d0c4c0e3bf6aed41403825d24ade4d9fd12c0c4df29749c05eeea"
+    },
+    {
+      "arm": "golden-head",
+      "model": "prefix-bound",
+      "passes_per_mode": 3543,
+      "files": 7086,
+      "hosts": [
+        "claude-code-anthropic",
+        "opencode-aisdk",
+        "pi",
+        "v1",
+        "v2"
+      ],
+      "manifest_sha256": "28c579bf91eba87f7c321e58c6e1a66b2f8b61903d8a6c5dda126b76e70a604c"
+    }
+  ],
+  "runner": "linux,4c",
+  "bun": "1.4.2",
+  "cargo": "1.99.0 (5f94df478 2026-08-27)",
+  "checks": "Each arm: four configurations (two model classes x default/strict), each with 171 TS/Pi tests and 17 Rust audit tests; no failures.",
+  "comparator_result": [
+    "INVENTORY rejected: base=7086 head=7086",
+    "INVENTORY prefix-bound: base=7086 head=7086",
+    "Compared 7892 wire files; PASS"
+  ],
+  "exceptions": [],
+  "new_fixtures": []
+}

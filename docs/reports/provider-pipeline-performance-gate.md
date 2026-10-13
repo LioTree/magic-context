@@ -882,3 +882,209 @@ full-array functional stored-state differential, clean before/after timing and
 reconciliation merge/rerun. The 706-pass signed-thinking comparison still needs its
 independent baseline capture. The follow-up design is delivered for review only;
 no cache/prewarm implementation, deadline change or default switch is included.
+
+
+## Preparation continuation after the landed reconciliation (2026-10-13)
+
+This section supersedes the *execution status* in the previous update, not the
+live-session acceptance criteria. The retry starts from the reviewed revision
+fence in `d56295e9` and the preserved preparation implementation in `8a1779717b`.
+The landed train `85319552a5b6523470d2a79da4194ff9ca133a35` was merged in
+`429da816c3`; the larger `train/check-stack2` integration was not merged. Cargo
+allocation is **Linux, 4 vCPUs**, as specified in the retry ruling. No Rust build
+or test ran on the Mac.
+
+### Deferred preparation and independent controls
+
+The successful rebuild step prepares derived policy only when the new user-only,
+**off-by-default** `rust_provider_preparation` control is enabled. The actual hook
+validates the stored namespace revision before its own admission, checks settings,
+original baseline, ancestry, format/checksum/caps and cut, replays its admitted
+changes, and finalizes the actual newest cut. Any mismatch uses the existing cold
+computation. Preparation does not publish a baseline, hook summary, served
+watermark, cadence/grace or acknowledgement. The `rust_pipeline` default, the
+full-array implementation and migrations were not changed by this continuation;
+migration 70 is the previously committed revision fence, not a new retry edit.
+
+The positive R1 witness independently retains the old engine baseline, admits
+ordinal 3, **actually consumes** preparation, freezes nine parts (not one), counts
+one reclaimable tool output, and matches cold baseline and channel-1 append bytes.
+Fifteen companion cases cover namespace sibling/settings revision changes, shared
+consumed and covered tags, invalid key/original baseline/cut, cap/checksum, eviction,
+restart, disabled consumption, cache bust, ancestry change and an unadvanced cut.
+A reopened valid preparation can be reused only after the same revision checks;
+an absent/evicted entry follows the cold path. The changed-log test separately
+proves the builder is not invoked and the unaccounted frontier is not cleared.
+
+`MC_HOOKCOST_REVIEW=1 cargo test -p mc-module --lib hookcost_review -- --nocapture`
+passed **19 tests**: the 16 positive/mismatch cases and all three unchanged review
+witnesses. `provider-preparation-mutations.json` records five staged, individually
+reddened and restored controls: early baseline publication, omitted admitted parts,
+revision equality bypass, erased unaccounted changes and settings validation bypass.
+Each focused mutant run selected one test and failed exactly that test; all other
+tests were filtered, not claimed to pass. The restored hook/store suites passed.
+
+`bun packages/e2e-tests/scripts/provider-preparation-differential.ts 48` passed
+**96/96 same-pre-rebuild-snapshot pairs**, 48 per binding, with **96 actual
+consumptions**. It compares raw rebuilt, first-hook and acknowledgement/next-step
+answers, exact append ops, policy measurements, bounded summaries, baseline/settings/
+grace, functional answer/tag state and receipts. The disabled arm writes zero
+preparation rows, and preparation leaves pre-admission measurements and normal
+summaries identical to the cold arm. Independent tag allocation wall-clock
+`created_at_ms` fields and asynchronous `historian_*` bookkeeping are excluded
+from *functional state* comparisons; no field is excluded from served-answer byte
+comparisons. Acknowledgement replay uses valid unique tool-use IDs; repeated-call
+subjects remain covered by the unchanged 90-check suite. The offline fixture
+predeclares pass model/carrier controls before the fork: it does not prove a live
+host's synchronization will preserve a preparation hit. Synchronization writes
+still invalidate the revision conservatively.
+
+### Reconciliation gates
+
+Tool versions: Bun **1.4.2**, TypeScript **5.9.3**, Biome **2.5.1**, Cargo/Rust
+**1.99.0**, rustfmt **1.10.0-stable**.
+
+- `cargo test --workspace` passed **1,965 module unit tests** (29 ignored), including
+  the **720+48 = 768** randomized/HARD byte corpus, bounded-policy full/replay
+  identity controls, and the new preparation tests. The run then stopped at four
+  unrelated `real_daemon` integration tests: `subconscious_root` at
+  `tests/real_daemon.rs:1101` requires an absent sibling `subconscious` checkout.
+  The changed provider behavior is independently exercised by the unit tests and
+  real-handler fixture driver; no sibling checkout or live store was substituted.
+- `cargo test -p mc-store -p mc-core -p mc-tokenizer` passed **345 store** (5 ignored),
+  **22 core**, and **7 tokenizer unit + 2 history-cache + 4 golden + 1 allocation**
+  tests. `cargo fmt --all --check` and
+  `cargo clippy -p mc-store -p mc-module --all-targets -- -D warnings` passed.
+- `bun packages/e2e-tests/scripts/pure-replay-differential.ts --provider-pipeline`
+  passed **90/90**, including scratch 17k bootstrap totals of **5,897 / 5,007 ms**
+  and maximum pages of **3,558 / 3,427 ms** for OpenCode 1 / 2.
+- The complete plugin suite ran **8,692 tests**: **8,653 pass, 27 skip, 12 fail**.
+  Two failures were missing generated configuration/schema updates for the new
+  opt-in; both generators were run and the follow-up seven-file configuration/
+  provider suite passed **183/183**. The remaining ten match the previous baseline
+  limitations: Node-WASM offline import and worker-bundle checks requiring ignored
+  built distribution files. No unrelated test assertion was changed.
+- Plugin `typecheck` passed its three configured TypeScript checks. Plugin `lint`
+  passed **1,462 files** with 59 existing warnings and nine infos. The additional
+  E2E provider-pipeline typecheck includes both preparation scripts and reported
+  only two pre-existing import-closure errors (`rust-harness.ts:805` missing
+  `session.get`, `command-handler.ts:223` read-only ignore marker). Scoped diagnostics
+  for all three edited E2E scripts were authoritative: **zero errors/warnings**.
+- The reconciliation lockfile was installed locally with
+  `bun install --frozen-lockfile`: four packages installed, no lockfile changes.
+  A concurrent remote gate was refused while another job owned this workspace;
+  it was rerun sequentially on Linux, not locally.
+
+The production-meter limitation remains explicit: store row/write scopes are still
+partial, the complete physical/logical ledger and historian fire/no-fire cadence
+are not delivered by this preparation experiment. Existing missing counters must
+not be treated as zero. The ALF canary and the **≤1.10×** rebuild/full-array sign-off
+remain separate, blocked acceptance decisions.
+
+
+### 17k paired setting-off / setting-on results
+
+Candidate `89e11baee3`, after the train merge, ran
+`bun packages/e2e-tests/scripts/provider-preparation-timing.ts 100` on Linux/4c.
+There were **100 pairs per binding**, **400 measured arms**, **200 actual
+consumptions**, and **200 exact rebuilt/first-hook answer-byte comparisons**.
+Every pair branches *before* rebuild from the same durable snapshot; arm order
+alternates off/on and on/off. Before the fork, the fixture records the upcoming
+model ID, lineage and appended-message ID in the stored pass context, which the
+hook uses to select its policy settings and append carrier. It uses the same
+17,000-message population as the earlier profile and waits directly
+for the real handler. It does not increase the production hook's **1,500 ms**
+deadline or test live-host synchronization/cache-hit frequency. Quantiles are
+nearest-rank over all 100 observations; deadline misses are not excluded.
+
+| Binding / metric (ms) | Before: preparation off | After: preparation on |
+|---|---:|---:|
+| OpenCode 1 first-hook module p50 | 1,019.10 | 752.43 |
+| OpenCode 1 first-hook module p99 | 1,327.00 | 1,026.61 |
+| OpenCode 1 first-hook wall p50 / p99 | 1,019.43 / 1,327.37 | 752.66 / 1,027.11 |
+| OpenCode 1 complete rebuild module p50 / p99 | 7,948.02 / 11,731.50 | 8,306.49 / 11,839.50 |
+| OpenCode 1 preparation inside rebuild p50 / p99 | 0 / 0 | 420.19 / 623.65 |
+| OpenCode 1 hooks beyond 1,500 ms (of 100) | 1 | 0 |
+| OpenCode 2 first-hook module p50 | 1,112.41 | 823.75 |
+| OpenCode 2 first-hook module p99 | 1,320.68 | 1,515.24 |
+| OpenCode 2 first-hook wall p50 / p99 | 1,112.74 / 1,321.08 | 823.93 / 1,515.50 |
+| OpenCode 2 complete rebuild module p50 / p99 | 8,086.91 / 10,236.34 | 8,640.26 / 11,481.59 |
+| OpenCode 2 preparation inside rebuild p50 / p99 | 0 / 0 | 441.91 / 530.64 |
+| OpenCode 2 hooks beyond 1,500 ms (of 100) | 0 | 2 |
+
+The first-hook p50 falls about **26%** for both bindings, but preparation costs
+**420–442 ms p50 inside rebuild**. Complete rebuild p50 rises **4.5% / 6.8%**
+(on/off ratios **1.045 / 1.068**); these are **not** ratios to the full-array path.
+OpenCode 2's prepared p99 still exceeds the product hook fence. This is useful
+reuse evidence, not a canary approval or a ≤250 ms module-p99 result.
+
+The 4,444-second run observed `nproc=4`, host load1 **1.78–26.71**, and host CPU
+PSI `some avg10` **0.08–60.88%**. Hook and rebuild pressure deltas are captured
+separately. The pressure reader reported the same host and cgroup PSI text,
+`cpuset=0-31` and no `cpu.max`; do not interpret those fields as independent
+per-job throttling measurements. The summary retains quantiles, all per-arm
+pressure ranges/totals and representative raw before/after snapshots in
+`provider-preparation-timing.json`. The complete sample stream is reproducibly
+emitted by the harness; it is not claimed to be retained in that summary.
+An earlier 100-sample attempt hit the caller's 30-minute hard timeout, not a stuck
+compile lock. The completed run used a two-hour cap and was awaited to exit zero.
+The five-pair smoke run was not used for a p99 acceptance claim.
+
+**Stop point for P2:** this policy-only preparation does not reduce the rebuild's
+full history replay, engine request conversion or response/native encoding, and
+adds measured work to that step. No new paired full-array ratio is claimed; the
+original **1.25–1.47× versus ≤1.10×** failure remains unclosed. Reaching that target
+requires a separately reviewed design reducing rebuild replay/conversion/encoding
+or reusing the *exact response-wire* view/native material, with revision/ancestry/
+cut validity, acknowledgements and lexical serialization independently proved.
+The durable typed fragment is already known to be JSON-equal but byte-unequal to
+the response fragment; substituting it is not an acceptable optimization. The
+current implementation still decompresses/decodes retained measurements and
+restates a potentially large admitted baseline in the hook. It does not implement
+native/view caching or a process-wide retained-preparation budget. No such design
+change, deadline relaxation, full-array edit or live enablement is included.
+
+### Independent signed-thinking capture and packaging follow-up
+
+The signed-thinking gate was recaptured from independent source trees:
+`d56295e9096fb0c2f883058a4d82709d8773c023` versus candidate `89e11baee3`, with
+separate Cargo target directories. Remote `.git` is read-only, so the ancestor
+was archived locally and expanded inside this worktree's scratch directory rather
+than creating a remote git worktree. The ancestor frozen npm install could not
+fetch in the offline runner. For the source differential, both arms therefore
+used the candidate's frozen installed npm dependency set, explicitly controlling
+that factor; this is **not** a verification of the ancestor's packaged dependency
+resolution. Rust source and targets remained independent. Explicit `./` Bun test
+paths prevented the candidate from discovering the nested ancestor's tests.
+An earlier filter-style invocation accidentally selected both trees (171 extra
+failing tests); that capture was rejected, not treated as a behavioral regression.
+
+Each arm ran **four configurations** (rejected/prefix-bound model classes × default/
+strict), each with **171 TS/Pi tests and 17 Rust audit tests**, all passing in the
+final isolated capture. The previously named 706-pass audit now emits **3,543
+captured passes per model/mode**, covering all five hosts. The unchanged
+`scripts/signed-thinking-differential.sh --compare-only` inventory/eligibility/
+exact-wire comparator passed **7,892 comparisons**, with **no additions or
+exceptions**. Both model-class inventories were **7,086 files per arm**, and
+independently captured manifest hashes matched. `provider-preparation-signed-thinking.json`
+retains those counts, source SHAs, dependency-control limitation and manifest hashes.
+No signed-thinking test contract or comparator exception was changed.
+
+Finally, Linux `bun run build` passed the plugin/v2, Pi and CLI bundles and checked
+nine unchanged TUI files. Rechecking `auto-search-bundle-review.test.ts` after that
+build passed **9 tests, 2 skips**, with its normal `lsof` scratch-store evidence.
+Together with the regenerated-schema/configuration follow-up, only the original
+unrelated Node-WASM scratch-module resolution failure remains from the complete
+plugin run. Root `bun run typecheck` also passed all **seven configured TypeScript
+checks across four packages**; root `bun run lint` passed **1,923 files** with 123
+existing warnings and ten infos, no errors. Final scoped diagnostics again covered
+all three E2E scripts with zero errors/warnings (two deprecated-API hints).
+Offline real-handler runs also used the driver's `lsof` fence: every
+observed `.db`, WAL and SHM path was beneath its declared throwaway
+`$TMPDIR/magic-context/provider-preparation-*/run-*/stores` root. No live store,
+configuration or session directory was opened, read, migrated or written.
+
+**Delivery scope:** the five-step guarded-preparation experiment is implemented
+and its correctness/timing gates are recorded. Complete production meters, live
+ALF canary approval, a full packaged-ancestor audit and the ≤1.10× rebuild sign-off
+are **not delivered**. Keep both provider/preparation rollout defaults unchanged.

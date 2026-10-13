@@ -1,0 +1,262 @@
+{
+  "schema": 1,
+  "lanes": [
+    {
+      "host": "OpenCode1",
+      "setting": false,
+      "samples": 100,
+      "consumed": 0,
+      "module_p50_ms": 1019.0978200000001,
+      "module_p99_ms": 1327.003586,
+      "wall_p50_ms": 1019.4317549999105,
+      "wall_p99_ms": 1327.3692000000156,
+      "rebuild_module_p50_ms": 7948.0157770000005,
+      "rebuild_module_p99_ms": 11731.496052,
+      "preparation_p50_ms": 0,
+      "preparation_p99_ms": 0,
+      "over_product_fence": 1
+    },
+    {
+      "host": "OpenCode1",
+      "setting": true,
+      "samples": 100,
+      "consumed": 100,
+      "module_p50_ms": 752.428981,
+      "module_p99_ms": 1026.612397,
+      "wall_p50_ms": 752.6567379999906,
+      "wall_p99_ms": 1027.1095070000156,
+      "rebuild_module_p50_ms": 8306.487535,
+      "rebuild_module_p99_ms": 11839.498264,
+      "preparation_p50_ms": 420.192919,
+      "preparation_p99_ms": 623.645439,
+      "over_product_fence": 0
+    },
+    {
+      "host": "OpenCode2",
+      "setting": false,
+      "samples": 100,
+      "consumed": 0,
+      "module_p50_ms": 1112.4084759999998,
+      "module_p99_ms": 1320.678457,
+      "wall_p50_ms": 1112.7414490003139,
+      "wall_p99_ms": 1321.0774539997801,
+      "rebuild_module_p50_ms": 8086.911582999999,
+      "rebuild_module_p99_ms": 10236.342386,
+      "preparation_p50_ms": 0,
+      "preparation_p99_ms": 0,
+      "over_product_fence": 0
+    },
+    {
+      "host": "OpenCode2",
+      "setting": true,
+      "samples": 100,
+      "consumed": 100,
+      "module_p50_ms": 823.748109,
+      "module_p99_ms": 1515.243919,
+      "wall_p50_ms": 823.9259520000778,
+      "wall_p99_ms": 1515.4967219997197,
+      "rebuild_module_p50_ms": 8640.262151,
+      "rebuild_module_p99_ms": 11481.588176000001,
+      "preparation_p50_ms": 441.907377,
+      "preparation_p99_ms": 530.642655,
+      "over_product_fence": 2
+    }
+  ],
+  "base_messages": 17000,
+  "cpu_request": "linux,4c",
+  "work": "/motor-home/tmp/magic-context/provider-preparation-timing/run-iKQh9n",
+  "bun": "1.4.2",
+  "setting": "rust_provider_preparation=false/true via real request control; same pre-rebuild snapshot",
+  "product_hook_fence_ms": 1500,
+  "measurement_kind": "synthetic_real_handler_first_post_rebuild",
+  "quantile": "nearest-rank; report misses, do not exclude them",
+  "pressure": [
+    {
+      "host": "OpenCode1",
+      "setting": false,
+      "load1_min": 1.85,
+      "load1_max": 25.2,
+      "host_cpu_some_avg10_min": 0.09,
+      "host_cpu_some_avg10_max": 59.9,
+      "hook_some_total_usec": 4914248,
+      "rebuild_some_total_usec": 39771583,
+      "nproc": [
+        4
+      ],
+      "first_at": "2026-10-13T06:31:36.733Z",
+      "last_at": "2026-10-13T07:05:57.932Z"
+    },
+    {
+      "host": "OpenCode1",
+      "setting": true,
+      "load1_min": 1.78,
+      "load1_max": 26.71,
+      "host_cpu_some_avg10_min": 0.08,
+      "host_cpu_some_avg10_max": 59.9,
+      "hook_some_total_usec": 2492633,
+      "rebuild_some_total_usec": 35529332,
+      "nproc": [
+        4
+      ],
+      "first_at": "2026-10-13T06:31:48.085Z",
+      "last_at": "2026-10-13T07:05:47.702Z"
+    },
+    {
+      "host": "OpenCode2",
+      "setting": false,
+      "load1_min": 2.01,
+      "load1_max": 26.32,
+      "host_cpu_some_avg10_min": 0.09,
+      "host_cpu_some_avg10_max": 60.88,
+      "hook_some_total_usec": 5514091,
+      "rebuild_some_total_usec": 47217635,
+      "nproc": [
+        4
+      ],
+      "first_at": "2026-10-13T07:06:23.854Z",
+      "last_at": "2026-10-13T07:41:50.825Z"
+    },
+    {
+      "host": "OpenCode2",
+      "setting": true,
+      "load1_min": 2.01,
+      "load1_max": 26.32,
+      "host_cpu_some_avg10_min": 0.1,
+      "host_cpu_some_avg10_max": 54.08,
+      "hook_some_total_usec": 5404372,
+      "rebuild_some_total_usec": 52826285,
+      "nproc": [
+        4
+      ],
+      "first_at": "2026-10-13T07:06:33.550Z",
+      "last_at": "2026-10-13T07:41:40.814Z"
+    }
+  ],
+  "exact_answer_pairs": 200,
+  "sample_order": "even samples off/on; odd samples on/off",
+  "representative_pressure": [
+    {
+      "host": "OpenCode1",
+      "setting": true,
+      "sample": 0,
+      "before": {
+        "at": "2026-10-13T06:32:00.538Z",
+        "uptime": "06:32:00 up 8 days, 14:18,  0 users,  load average: 9.16, 6.21, 6.56",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3566795159000,
+          "user_usec": 2983890616000,
+          "system_usec": 582904543000,
+          "nice_usec": 188626975000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=10.51 avg60=4.93 avg300=4.41 total=18257676724\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=10.51 avg60=4.93 avg300=4.41 total=18257676724\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "9.16 6.21 6.56 26/1337 1009"
+      },
+      "after": {
+        "at": "2026-10-13T06:32:01.569Z",
+        "uptime": "06:32:01 up 8 days, 14:18,  0 users,  load average: 9.16, 6.21, 6.56",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3566815506000,
+          "user_usec": 2983908421000,
+          "system_usec": 582907085000,
+          "nice_usec": 188640672000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=11.14 avg60=5.23 avg300=4.48 total=18257769587\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=11.14 avg60=5.23 avg300=4.48 total=18257769587\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "9.16 6.21 6.56 23/1329 1012"
+      },
+      "psi": {
+        "host_some_total_usec": 92863,
+        "cgroup_some_total_usec": 92863,
+        "wall_ms": 1031
+      },
+      "rebuild_psi": {
+        "host_some_total_usec": 1553608,
+        "cgroup_some_total_usec": 1553608,
+        "wall_ms": 12453
+      }
+    },
+    {
+      "host": "OpenCode2",
+      "setting": true,
+      "sample": 0,
+      "before": {
+        "at": "2026-10-13T07:06:42.247Z",
+        "uptime": "07:06:42 up 8 days, 14:53,  0 users,  load average: 3.32, 4.20, 5.62",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3576830424000,
+          "user_usec": 2993136063000,
+          "system_usec": 583694361000,
+          "nice_usec": 189977969000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=0.29 avg60=0.83 avg300=1.75 total=18351735109\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=0.29 avg60=0.83 avg300=1.75 total=18351735109\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "3.32 4.20 5.62 6/1331 3104"
+      },
+      "after": {
+        "at": "2026-10-13T07:06:43.064Z",
+        "uptime": "07:06:43 up 8 days, 14:53,  0 users,  load average: 3.32, 4.20, 5.62",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3576834614000,
+          "user_usec": 2993140039000,
+          "system_usec": 583694575000,
+          "nice_usec": 189977969000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=0.29 avg60=0.83 avg300=1.75 total=18351735247\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=0.29 avg60=0.83 avg300=1.75 total=18351735247\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "3.32 4.20 5.62 5/1331 3106"
+      },
+      "psi": {
+        "host_some_total_usec": 138,
+        "cgroup_some_total_usec": 138,
+        "wall_ms": 817
+      },
+      "rebuild_psi": {
+        "host_some_total_usec": 3010,
+        "cgroup_some_total_usec": 3010,
+        "wall_ms": 8697
+      }
+    }
+  ],
+  "candidate_sha": "89e11baee3c7ebaa49c3aac8248059d24df1e956",
+  "train_sha": "85319552a5b6523470d2a79da4194ff9ca133a35",
+  "command": "bun packages/e2e-tests/scripts/provider-preparation-timing.ts 100",
+  "elapsed_seconds": 4444,
+  "evidence_scope": "Full 400-sample result was reduced to reported quantiles, observed pressure ranges/totals and two representative raw pressure snapshots; complete sample stream is emitted by the reproducible harness, not retained in this summary."
+}
