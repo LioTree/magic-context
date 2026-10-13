@@ -51,6 +51,8 @@ import { resolveTransformMode } from "../../plugin/src/config/transform-mode";
 import type { MessageLike } from "../../plugin/src/hooks/magic-context/transform-operations";
 import { encodeOpenCodeMessagesToCk } from "../../plugin/src/hooks/magic-context/module-wire";
 import { decodeProviderAnswer } from "../../plugin/src/hooks/magic-context/host-runner/provider-client";
+import { adaptPayload } from "../../plugin/src/v2/hooks/payload";
+import type { SessionContext } from "../../plugin/src/v2/hooks/types";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const PREFIX = "PROVIDER_DRIVER=";
@@ -119,6 +121,7 @@ fn provider_pipeline_driver() {
                     config.clone(), Arc::new(MissingSessionResolver));
                 handler.store.set(store.clone()).ok().unwrap();
                 let binding = SessionBinding {
+                    connection_incarnation: 0, native_generation: None, principal: None,
                     project_root: project, harness: cmd["harness"].as_str().unwrap().into(),
                     session: "session".into(), model_key: None, config,
                     history_budget_tokens: 100000.0,
@@ -851,6 +854,48 @@ async function moduleCrashCase(parent: Fixture, point: (typeof faultPoints)[numb
 }
 const cases: Case[] = [
     {
+        name: "A12.question-answer-policy-survives-native-projection",
+        async run(f) {
+            let answer: MessageLike;
+            if (f.deps.storeGeneration === "v2") {
+                const draft: SessionContext = {
+                    sessionID: "session", model: { providerID: "openai", id: "gpt-5.6" },
+                    agent: "build", system: [], tools: {}, options: {},
+                    messages: [
+                        { id: "answer", role: "assistant", content: [{ type: "tool-call", id: "question-call", name: "question", input: {} }] },
+                        { role: "tool", content: [{ type: "tool-result", id: "question-call", name: "question", result: { type: "text", value: "keep-user-answer ".repeat(20000) } }] },
+                    ],
+                } as SessionContext;
+                answer = adaptPayload(draft).messages[0] as MessageLike;
+            } else {
+                answer = tools("answer");
+                answer.parts.pop();
+                (answer.parts[1] as any).tool = "question";
+                (answer.parts[1] as any).state.output = "keep-user-answer ".repeat(20000);
+                (answer.parts[1] as any).state.metadata = { userAnswer: true, diagnostics: "display-only-diagnostic" };
+            }
+            const ordinary = tools("ordinary");
+            ordinary.parts.pop();
+            (ordinary.parts[1] as any).tool = "question";
+            (ordinary.parts[1] as any).state.output = "reclaimable-output ".repeat(10000);
+            const recent = tools("recent");
+            for (const part of recent.parts.slice(1)) (part as any).tool = "question";
+            const raw = [message("base"), answer, ordinary, message("turn"), recent, message("latest")];
+            await f.full(raw);
+            await f.full(raw);
+            await f.pass(raw);
+            f.deps.contextUsageMap.set("session", { usage: { inputTokens: 195000 } } as any);
+            raw.push(message("switch"));
+            (raw.at(-1)!.info as any).model = { providerID: "openai", modelID: "new-model" };
+            const served = await f.pass(raw);
+            const output = (id: string) => served.find((message) => message.info.id === id)?.parts
+                .filter((part: any) => part.type === "tool").map((part: any) => part.state.output).join("") ?? "";
+            assert.ok(output("answer").includes("keep-user-answer"), "the answer must survive automatic reclaim");
+            assert.ok(!output("ordinary").includes("reclaimable-output"), "ordinary output must be reclaimed in the same HARD pass");
+            assert.ok(!JSON.stringify(served).includes("display-only-diagnostic"), "diagnostics must never be served or stored");
+        },
+    },
+    {
         name: "T2.timing-boundary",
         async run(f) {
             const input = [message("timed-first")];
@@ -1068,11 +1113,8 @@ const cases: Case[] = [
                 arguments: { session_id: "session", command_id: "queue-differential", drop: "3" },
             };
             const queued = await f.call(drop);
-            assert.match(
-                JSON.stringify(queued),
-                /Queued/,
-                `real provider reduction queues a tag: ${JSON.stringify(queued)}`,
-            );
+            assert.equal(queued.isError, false);
+            assert.deepEqual(queued.content, [{ text: "1 tag stamped.", type: "text" }]);
             assert.deepEqual(
                 (await f.inspect()).pending,
                 ["a#2"],

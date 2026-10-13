@@ -5,6 +5,7 @@ import {
     providerSubjectPart,
     rememberOpenCodeHostReplay,
 } from "../../hooks/magic-context/host-runner/opencode-adapter";
+import { providerNativePart } from "../../hooks/magic-context/provider-visible-parts";
 import { modelAcceptsEmptyContent } from "../../hooks/magic-context/sentinel";
 import type { MessageLike } from "../../hooks/magic-context/tag-messages";
 import { log, sessionLog } from "../../shared/logger";
@@ -463,6 +464,9 @@ export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<str
                 id,
                 {
                     ...bridge,
+                    // The restart sidecar can carry a native tool as well as the
+                    // mapped part. Neither copy may persist display-only state.
+                    ...(bridge.native ? { native: providerNativePart(bridge.native) } : {}),
                     resultMessage: bridge.resultMessage
                         ? metadataOnly(bridge.resultMessage)
                         : undefined,
