@@ -1,0 +1,11 @@
+diff --git a/crates/mc-store/src/retrieval_vectors/mod.rs b/crates/mc-store/src/retrieval_vectors/mod.rs
+--- a/crates/mc-store/src/retrieval_vectors/mod.rs
++++ b/crates/mc-store/src/retrieval_vectors/mod.rs
+@@ -1,3 +1,6 @@
+ //! Vector persistence extension; register store and drain implementations in this namespace.
+-
++
++pub mod drain;
++pub mod store;
++
+ use crate::parity_schema_manifest::*;
