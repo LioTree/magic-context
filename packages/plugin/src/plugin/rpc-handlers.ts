@@ -825,6 +825,11 @@ export function buildStatusDetail(
     const liveTtlConfig = liveConfig?.poll().effective;
     const liveFailure = liveConfig?.lastFailure();
     const detail: StatusDetail = {
+        compartmentScores: readCompartmentScoreVisibility(
+            db,
+            sessionId,
+            rustMode ? readRustAppliedScoreWatermark(db, sessionId) : undefined,
+        ),
         ...base,
         configGeneration: liveConfig?.current().generation,
         configAdoptedAt: liveConfig?.current().adoptedAt,
@@ -1492,6 +1497,44 @@ export function registerRpcHandlers(
 
     const injectionBudgetTokens = config.memory?.injection_budget_tokens;
 
+    rpcServer.handle("rescore", async (params) => {
+        const sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
+        const raw = typeof params.arguments === "string" ? params.arguments : "";
+        try {
+            const { parseRescoreCommand } = await importPluginModule(
+                () => import("../features/magic-context/rescore-service"),
+            );
+            parseRescoreCommand(raw);
+            if (!sessionId) return { ok: false, error: "no session" };
+            const db = readDatabase();
+            if (!db) return { ok: false, error: "db unavailable" };
+            const { openCodeRescoreCommand } = await importPluginModule(
+                () => import("../hooks/magic-context/rescore-opencode"),
+            );
+            const execute = openCodeRescoreCommand({
+                db,
+                directory,
+                client: args.client as ManagedRecompContext["client"],
+                executor: args.hiddenCompletionExecutor,
+                sampleConfig: () =>
+                    historianRunConfig(
+                        config,
+                        currentPluginConfigReader(directory)?.poll().effective ?? config,
+                    ),
+                notify: async (id, message) => {
+                    pushNotification(
+                        "action",
+                        { action: "show-result-dialog", title: "Rescore", message },
+                        id,
+                    );
+                },
+            });
+            return { ok: true, message: await execute(sessionId, raw) };
+        } catch (error) {
+            return { ok: false, error: rescoreCommandErrorText(error) };
+        }
+    });
+
     if (isDebugRpcEnabled(config)) {
         const readMemory = () => buildDebugMemoryUsage(args.getDebugMemoryHolders?.());
         rpcServer.handle("debug.memoryUsage", async () => ({ ...readMemory() }));
@@ -1907,3 +1950,9 @@ export function registerRpcHandlers(
         return { ok: true } as unknown as Record<string, unknown>;
     });
 }
+
+import { rescoreCommandErrorText } from "../hooks/magic-context/rescore-command";
+import {
+    readCompartmentScoreVisibility,
+    readRustAppliedScoreWatermark,
+} from "../hooks/magic-context/score-visibility";

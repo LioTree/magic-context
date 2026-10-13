@@ -19,6 +19,8 @@ import ts from "typescript";
  * block every writer for the length of the read.
  */
 const READ_ONLY_DEFERRED_TRANSACTIONS: Record<string, string> = {
+    "packages/plugin/src/hooks/magic-context/score-visibility.ts#readCompartmentScoreVisibility":
+        "reads base rows, sidecar selections and the cached watermark for display-only copies; never writes",
     "packages/plugin/src/hooks/magic-context/inject-compartments.ts#renderFreshM0NonPersisted":
         "reads base compartments, score revisions, selections and the committed watermark; hashes and copies rows without writing",
     "packages/plugin/src/hooks/magic-context/score-projection.ts#readEffectiveReferenceCompartments":

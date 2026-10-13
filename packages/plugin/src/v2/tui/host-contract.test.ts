@@ -162,6 +162,7 @@ test("GA 2.0.5 registers each /ctx-* command once on the server, not the TUI key
             "ctx-embed",
             "ctx-flush",
             "ctx-recomp",
+            "ctx-rescore",
             "ctx-status",
             "ctx-wrapup",
         ];

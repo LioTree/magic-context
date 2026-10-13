@@ -100,6 +100,7 @@ export interface StatusView {
  * same shape from its own detail (see `statusViewSourceFromPiDetail`).
  */
 export interface StatusViewSource {
+    readonly compartmentScores?: CompartmentScoreVisibility;
     readonly usagePercentage: number;
     readonly inputTokens: number;
     readonly contextLimit: number;
@@ -674,6 +675,17 @@ function statusSections(source: StatusViewSource, now: number): StatusSection[] 
         },
         { title: "Cache TTL", labelWidth: 14, rows: cacheRows(source, now) },
         { title: "History Compression", labelWidth: 14, rows: historyRows(source, now) },
+        ...(source.compartmentScores?.scores.length
+            ? [
+                  {
+                      title: "History Scores",
+                      labelWidth: 18,
+                      rows: compartmentScoreStatusRows(source.compartmentScores).map(
+                          ([label, value]) => ({ label, value, tone: "text" as const }),
+                      ),
+                  },
+              ]
+            : []),
         ...configSection,
         {
             title: "Memory",
@@ -902,3 +914,5 @@ export function formatStatusRowText(row: StatusRow, labelWidth: number, width: n
     const room = Math.max(1, width - label.length);
     return `${label}${row.value.padStart(room)}`.trimEnd();
 }
+
+import { type CompartmentScoreVisibility, compartmentScoreStatusRows } from "./score-visibility";

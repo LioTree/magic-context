@@ -27,6 +27,7 @@ import {
   updateSessionFact,
 } from "../../lib/api";
 import { LoadMoreTrigger } from "../../lib/load-more";
+import { CompartmentScores, scoreLabel } from "./CompartmentScores";
 import {
   formatHistorianDuration,
   formatHistorianProviderModel,
@@ -1203,18 +1204,23 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                               #{comp.sequence}
                             </span>
                             Messages {comp.start_message}–{comp.end_message}
-                            {(() => {
-                              const info = importanceInfo(comp.importance);
-                              return (
-                                <span
-                                  class={`pill ${info.pillColor}`}
-                                  style={{ "margin-left": "8px" }}
-                                  title={info.title}
-                                >
-                                  imp {comp.importance} · {info.label}
-                                </span>
-                              );
-                            })()}
+                            <Show
+                              when={scoreLabel(comp)}
+                              fallback={(() => {
+                                const info = importanceInfo(comp.importance);
+                                return (
+                                  <span
+                                    class={`pill ${info.pillColor}`}
+                                    style={{ "margin-left": "8px" }}
+                                    title={info.title}
+                                  >
+                                    imp {comp.importance} · {info.label}
+                                  </span>
+                                );
+                              })()}
+                            >
+                              <CompartmentScores row={comp} />
+                            </Show>
                             <For each={episodeTags(comp.episode_type)}>
                               {(tag) => (
                                 <span

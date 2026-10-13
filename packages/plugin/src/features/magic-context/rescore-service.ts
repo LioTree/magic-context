@@ -29,11 +29,13 @@ export type RescoreCommand =
 
 export function parseRescoreCommand(input: string): RescoreCommand {
     const args = input.trim().split(/\s+/).filter(Boolean);
+    const opaqueId = (value: string) => /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(value);
     if (!args.length) return { kind: "preview", project: false };
     if (args.length === 1 && args[0] === "--project") return { kind: "preview", project: true };
     if (args.length === 1 && ["status", "pause", "resume", "cancel"].includes(args[0]))
         return { kind: args[0] as "status" | "pause" | "resume" | "cancel" };
-    if (args.length === 2 && args[0] === "confirm") return { kind: "confirm", snapshotId: args[1] };
+    if (args.length === 2 && args[0] === "confirm" && opaqueId(args[1]))
+        return { kind: "confirm", snapshotId: args[1] };
     if (
         args[0] === "undo" &&
         args.length === 3 &&
@@ -51,6 +53,7 @@ export function parseRescoreCommand(input: string): RescoreCommand {
     if (
         args[0] === "undo" &&
         (args.length === 2 || (args.length === 3 && args[2] === "base")) &&
+        opaqueId(args[1]) &&
         !/^\d+$/.test(args[1])
     )
         return { kind: "undo-job", jobId: args[1], base: args[2] === "base" };
@@ -934,6 +937,13 @@ export class RescoreService {
             attempts: attempts.map(({ payload: _payload, ...attempt }) => attempt),
             waitingForLease: job.pause_reason === "recomp-lease",
         };
+    }
+    listJobs(): RescoreJob[] {
+        return this.db
+            .prepare(
+                "SELECT * FROM rescore_jobs WHERE project_path = ? ORDER BY created_at DESC, rowid DESC",
+            )
+            .all(this.options.projectPath) as RescoreJob[];
     }
     pause(authority: RescoreAuthority): boolean {
         return this.write(() => {

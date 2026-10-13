@@ -304,6 +304,7 @@ export function executeStatus(
             return renderUserStatusSummary(
                 {
                     inputTokens: displayInputTokens,
+                    compartmentScores: readCompartmentScoreVisibility(db, sessionId),
                     usableContextTokens: displayContextLimit,
                     usagePercentage: displayPercentage,
                     cacheLifetime: formatCacheTtlDisplay(ttlDisplay).replace(/^Cache TTL:\s*/, ""),
@@ -394,3 +395,5 @@ export function executeStatus(
         return `Error: ${renderUserFacingFailure("status_unavailable")}`;
     }
 }
+
+import { readCompartmentScoreVisibility } from "./score-visibility";

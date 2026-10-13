@@ -25,6 +25,7 @@ import {
 import { registerCtxDreamCommand } from "./ctx-dream";
 import { registerCtxFlushCommand } from "./ctx-flush";
 import { registerCtxRecompCommand } from "./ctx-recomp";
+import { registerCtxRescoreCommand } from "./ctx-rescore";
 import { registerCtxStatusCommand } from "./ctx-status";
 import { registerCtxWrapupCommand } from "./ctx-wrapup";
 
@@ -93,6 +94,37 @@ function createMockPi() {
 		sent,
 	};
 }
+
+it("rescore shares grammar and refuses malformed input before Pi runtime resolution", async () => {
+	const { pi, handlers, sent } = createMockPi();
+	let resolved = 0;
+	const calls: string[] = [];
+	registerCtxRescoreCommand(pi as never, () => {
+		resolved++;
+		return async (_sessionId, raw) => {
+			calls.push(raw);
+			return "preview";
+		};
+	});
+	const ctx = createCtx();
+	const handler = handlers.get("ctx-rescore")!;
+	for (const text of [
+		"confirm",
+		"confirm --project",
+		"--force",
+		"pause now",
+		"undo 1 0",
+	])
+		await handler(text, ctx);
+	expect(resolved).toBe(0);
+	expect(calls).toEqual([]);
+	expect(sent.length).toBe(5);
+	expect(sent.every((entry) => entry.data.text.includes("ctx-rescore"))).toBe(
+		true,
+	);
+	await handler("--project", ctx);
+	expect(calls).toEqual(["--project"]);
+});
 
 function createCtx(sessionId = "ses-1"): MockCommandContext {
 	const customCalls: Array<{ factory: unknown; options: unknown }> = [];

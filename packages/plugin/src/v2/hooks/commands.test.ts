@@ -64,6 +64,7 @@ test("every /ctx-* command is registered with the host, with its description", a
 
     expect(ok).toBe(true);
     expect(registered.map((command) => command.name)).toEqual([
+        "ctx-rescore",
         "ctx-status",
         "ctx-recomp",
         "ctx-dream",
@@ -76,6 +77,28 @@ test("every /ctx-* command is registered with the host, with its description", a
     for (const command of registered) {
         expect(command.description ?? "").not.toBe("");
     }
+});
+
+test("rescore shares grammar and refuses malformed input before RPC dispatch", async () => {
+    const { domain, registered } = hostCommandDomain();
+    const { rpc, calls } = rpcWithCalls({ rescore: { ok: true, message: "preview" } });
+    await registerV2Commands({
+        command: domain,
+        rpc,
+        directory: "/repo/project",
+        compactionEnabled: false,
+    });
+    const rescore = registered.find((command) => command.name === "ctx-rescore")!;
+    for (const text of ["confirm", "confirm --project", "--force", "pause now", "undo 1 0"])
+        await rescore.execute(invocation(text));
+    expect(calls).toEqual([]);
+    await rescore.execute(invocation("/ctx-rescore --project"));
+    expect(calls).toEqual([
+        {
+            method: "rescore",
+            params: { sessionId: "session-1", arguments: "--project", directory: "/repo/project" },
+        },
+    ]);
 });
 
 test("a registered command runs the same RPC handler the terminal UI calls", async () => {

@@ -16,6 +16,7 @@ import {
     isCanonicalDreamTask,
 } from "../../features/magic-context/dreamer/task-registry";
 import type { ManualRunResult } from "../../features/magic-context/dreamer/task-scheduler";
+import { parseRescoreCommand } from "../../features/magic-context/rescore-service";
 import { getCompartments, getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import type { RustSessionStatus } from "../../plugin/rpc-handlers";
 import { sessionLog } from "../../shared";
@@ -44,6 +45,7 @@ import { executeFlush } from "./execute-flush";
 import { executeStatus } from "./execute-status";
 import { RUST_PARTIAL_RECOMP_REFUSAL } from "./maintenance-authority";
 import { MAX_WRAPUP_REQUEST_BUDGET_MS } from "./module-transport";
+import { rescoreCommandErrorText } from "./rescore-command";
 import type { RustModeModuleClient } from "./rust-mode-transform";
 import type { NotificationParams } from "./send-session-notification";
 
@@ -152,6 +154,14 @@ const commandArgumentValidators: Record<MagicContextBuiltinCommandName, (raw: st
             return mode === "" || mode === "diagnostics";
         },
         "ctx-recomp": (raw) => parseRecompArgs(raw).kind !== "error",
+        "ctx-rescore": (raw) => {
+            try {
+                parseRescoreCommand(raw);
+                return true;
+            } catch {
+                return false;
+            }
+        },
         "ctx-wrapup": (raw) => parseWrapupArgs(raw).ok,
         "ctx-flush": (raw) => raw.trim() === "",
         "ctx-dream": (raw) => {
@@ -499,6 +509,7 @@ export function createMagicContextCommandHandler(deps: {
         sessionId: string,
         options?: { range?: PartialRecompRange },
     ) => Promise<string>;
+    executeRescore?: (sessionId: string, args: string) => Promise<string>;
     /** Runs /ctx-wrapup over the live raw tail, keeping the newest N raw messages. */
     executeWrapup?: (sessionId: string, options: { messagesToKeep: number }) => Promise<string>;
     /** `/ctx-embed start` — backfill this session's compartment embeddings. */
@@ -586,13 +597,35 @@ export function createMagicContextCommandHandler(deps: {
             const isWrapup = isWrapupCommand(input.command);
             const isDream = isDreamCommand(input.command);
             const isEmbed = isEmbedCommand(input.command);
+            const isRescore = input.command === "ctx-rescore";
 
-            if (!isStatus && !isFlush && !isRecomp && !isWrapup && !isDream && !isEmbed) {
+            if (
+                !isStatus &&
+                !isFlush &&
+                !isRecomp &&
+                !isWrapup &&
+                !isDream &&
+                !isEmbed &&
+                !isRescore
+            ) {
                 return;
             }
 
             const sessionId = input.sessionID;
             let result = "";
+
+            if (isRescore) {
+                try {
+                    parseRescoreCommand(input.arguments);
+                    result = deps.executeRescore
+                        ? await deps.executeRescore(sessionId, input.arguments)
+                        : "Rescoring is unavailable in this host.";
+                } catch (error) {
+                    result = rescoreCommandErrorText(error);
+                }
+                await deps.sendNotification(sessionId, result, {});
+                throwSentinel(input.command);
+            }
 
             if (deps.compactionOff && (isFlush || isRecomp || isWrapup)) {
                 const command = `/${input.command}`;

@@ -2027,6 +2027,54 @@ async function startPiMagicContextRuntime(
 	// Step 5c: register the diagnostic/admin slash commands so Pi reaches
 	// command-surface parity with the OpenCode plugin. Their user-facing output
 	// uses model-invisible custom entries when the runtime can render them.
+	const rescoreControllers = new Map<
+		string,
+		ReturnType<typeof createRescoreCommandController>
+	>();
+	registerCtxRescoreCommand(pi, (ctx) => {
+		const current = resolveCurrentProjectDeps(ctx);
+		const existing = rescoreControllers.get(current.projectIdentity);
+		if (!current.projectIdentity)
+			throw new Error("No canonical project for rescore");
+		if (existing) return existing;
+		const sample = () =>
+			historianRunConfig(
+				current.config,
+				liveReaderFor(current.projectDir, current.config).poll().effective,
+			);
+		const controller = createRescoreCommandController({
+			serviceOptions: (sessionId) => ({
+				db,
+				sessionId,
+				projectPath: current.projectIdentity,
+				harness: PI_HARNESS_KIND,
+				admissionFailure: rescoreAdmissionFailure(sessionId),
+			}),
+			resolveProfile: () => {
+				const fresh = sample();
+				const historian = resolveHistorianFromConfig(
+					fresh,
+					PI_HARNESS_KIND,
+					activeModelRegistry,
+				);
+				return {
+					model: historian?.model ?? null,
+					variant: historian?.thinkingLevel,
+					temperature: fresh.historian?.temperature ?? 0,
+					maxOutputTokens: fresh.historian?.maxTokens ?? 4096,
+				};
+			},
+			createCarrier: (sessionId) =>
+				createPiRescoreCarrier({
+					runner: new PiSubagentRunner(),
+					sessionId,
+					directory: current.projectDir,
+					timeoutMs: sample().historian_timeout_ms ?? 600_000,
+				}),
+		});
+		rescoreControllers.set(current.projectIdentity, controller);
+		return controller;
+	});
 	const recompRunner = new PiSubagentRunner();
 	const wrapupRunner = new PiSubagentRunner();
 	registerCtxStatusCommand(pi, {
@@ -3205,3 +3253,8 @@ function formatExecuteThresholdForLog(
 	const base = `${value.default}%`;
 	return overrides.length > 0 ? `${base} (${overrides.join(", ")})` : base;
 }
+
+import { createRescoreCommandController } from "@magic-context/core/hooks/magic-context/rescore-command";
+import { rescoreAdmissionFailure } from "@magic-context/core/hooks/magic-context/rescore-driver";
+import { registerCtxRescoreCommand } from "./commands/ctx-rescore";
+import { createPiRescoreCarrier } from "./rescore-carrier";
