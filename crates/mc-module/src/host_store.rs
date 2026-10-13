@@ -106,6 +106,9 @@ pub const DOMAIN_TABLES: &[&str] = &[
     "memory_journal",
     "memory_mutation_log",
     "memory_pending_facts",
+    "memory_publications",
+    "memory_stage_attempts",
+    "memory_activity_ledger",
     "memory_verifications",
     "notes",
     "primer_candidates",
@@ -381,6 +384,18 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     (
         "memory_mutation_log",
         "3df65a4de3a311e953e06adbe65c53f168c51e9847322130b5adff823ff6bb91",
+    ),
+    (
+        "memory_publications",
+        "366cf8bd34848e91be75433186cac20f902d40edf826ecbd24249ab28702fd43",
+    ),
+    (
+        "memory_stage_attempts",
+        "dbc66bedb9f92ff24ca83cb734892c2f2fea6c8d195912e869f68cfa26fabaa6",
+    ),
+    (
+        "memory_activity_ledger",
+        "7f73fa2ad2d786d34b29998e0d5250608c7c1fb9a22b9001c537928804feaa58",
     ),
     (
         "memory_pending_facts",

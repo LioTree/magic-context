@@ -4206,6 +4206,9 @@ pub struct TruncateOutcome {
 }
 
 pub struct HistorianPublishRequest<'a> {
+    /// Optional durable publication identity for the historian lifecycle lane. With
+    /// no identity, publication preserves the legacy writes exactly.
+    pub lifecycle_publication_id: Option<&'a str>,
     pub session_id: &'a str,
     /// The harness label the session's `context.db` rows carry. `None` takes the label the
     /// host recorded for the session in `session_projects`, or `opencode`.
@@ -13862,6 +13865,7 @@ impl McStore {
         // Side channels are best effort: a test can make one fail, and the fold's
         // compartments must still land.
         let fold = context_writes::FoldWrite {
+            lifecycle_publication_id: request.lifecycle_publication_id.map(str::to_owned),
             project_path: request.project_path.to_string(),
             harness: request.harness.map(str::to_string),
             compartments: numbered.clone(),
@@ -24312,6 +24316,7 @@ mod tests {
 
         let first = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24345,6 +24350,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24401,6 +24407,7 @@ mod tests {
 
         let error = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24469,6 +24476,7 @@ mod tests {
 
             store
                 .publish_historian_chunk(HistorianPublishRequest {
+                    lifecycle_publication_id: None,
                     harness: None,
                     session_id: "ses",
                     expected_row_version: expected,
@@ -24548,6 +24556,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24596,6 +24605,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24636,6 +24646,7 @@ mod tests {
         };
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: Some(99),
@@ -24685,6 +24696,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24728,6 +24740,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24782,6 +24795,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -25120,6 +25134,7 @@ mod tests {
 
         let error = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -25172,6 +25187,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -25213,6 +25229,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -25333,6 +25350,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -25384,6 +25402,7 @@ mod tests {
     ) -> Result<HistorianPublishResult, HistorianPublishError> {
         let expected = store.load(session_id).unwrap().row_version;
         store.publish_historian_chunk(HistorianPublishRequest {
+            lifecycle_publication_id: None,
             harness: None,
             session_id,
             expected_row_version: expected,

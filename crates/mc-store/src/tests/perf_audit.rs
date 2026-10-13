@@ -81,6 +81,7 @@ fn fold_upsert_and_replace_preserve_retained_row_ids_and_bytes() {
     appended.start_message = 220;
     appended.end_message = 239;
     let fold = context_writes::PendingContextWrite::Fold(context_writes::FoldWrite {
+        lifecycle_publication_id: None,
         project_path: "p".into(),
         harness: None,
         compartments: vec![changed.clone(), appended.clone()],
@@ -292,6 +293,7 @@ fn measure_store_findings() {
         let mut tail = compartments.last().unwrap().clone();
         tail.sequence += 1;
         let fold = context_writes::PendingContextWrite::Fold(context_writes::FoldWrite {
+            lifecycle_publication_id: None,
             project_path: "p".into(),
             harness: Some("opencode".into()),
             compartments: vec![tail],

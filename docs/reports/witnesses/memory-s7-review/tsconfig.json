@@ -1,0 +1,13 @@
+{
+	"extends": "../../../../packages/plugin/tsconfig.json",
+	"compilerOptions": {
+		"rootDir": "../../../..",
+		"noEmit": true,
+		"typeRoots": [
+			"../../../../packages/plugin/node_modules/@types",
+			"../../../../packages/plugin/node_modules"
+		]
+	},
+	"include": ["host-claim.test.ts"],
+	"exclude": []
+}
