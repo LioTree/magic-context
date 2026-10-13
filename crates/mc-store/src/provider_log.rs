@@ -1100,7 +1100,7 @@ impl McStore {
         decide: impl FnOnce(&ProviderHookContext<'_>) -> Result<(ProviderHookWrite, T), ProviderError>,
     ) -> Result<T, ProviderError> {
         let messages = request.message.map(std::slice::from_ref).unwrap_or(&[]);
-        self.commit_provider_delta(key, request, messages, None, &[], None, decide)
+        self.commit_provider_delta(key, request, messages, None, &[], None, false, decide)
     }
 
     pub fn commit_provider_hook_with_parts<T>(
@@ -1111,7 +1111,23 @@ impl McStore {
         decide: impl FnOnce(&ProviderHookContext<'_>) -> Result<(ProviderHookWrite, T), ProviderError>,
     ) -> Result<T, ProviderError> {
         let messages = request.message.map(std::slice::from_ref).unwrap_or(&[]);
-        self.commit_provider_delta(key, request, messages, None, parts, None, decide)
+        self.commit_provider_delta(key, request, messages, None, parts, None, false, decide)
+    }
+
+    /// Load preparation only if its saved revision equals the store's current
+    /// revision before admitting the message in `request`. A mismatch gives the
+    /// callback no preparation. Its later admission changes and cache cleanup
+    /// remain in this same transaction, so failure rolls all of them back.
+    pub fn commit_provider_hook_with_preparation<T>(
+        &self,
+        key: &ProviderSessionKey,
+        request: ProviderHookRequest<'_>,
+        parts: &[ProviderPolicyPart],
+        consume: bool,
+        decide: impl FnOnce(&ProviderHookContext<'_>) -> Result<(ProviderHookWrite, T), ProviderError>,
+    ) -> Result<T, ProviderError> {
+        let messages = request.message.map(std::slice::from_ref).unwrap_or(&[]);
+        self.commit_provider_delta(key, request, messages, None, parts, None, consume, decide)
     }
 
     pub fn admit_provider_pass(
@@ -1135,6 +1151,7 @@ impl McStore {
             None,
             parts,
             Some(context),
+            false,
             |ctx| {
                 Ok((
                     ProviderHookWrite {
@@ -1171,6 +1188,7 @@ impl McStore {
             None,
             &[],
             None,
+            false,
             |ctx| {
                 Ok((
                     ProviderHookWrite {
@@ -1205,6 +1223,7 @@ impl McStore {
             if page.more { None } else { page.newest },
             &[],
             None,
+            false,
             |ctx| {
                 Ok((
                     ProviderHookWrite {
@@ -1240,6 +1259,7 @@ impl McStore {
         complete_through: Option<u64>,
         parts: &[ProviderPolicyPart],
         pass_context: Option<&Value>,
+        consume_preparation: bool,
         decide: impl FnOnce(&ProviderHookContext<'_>) -> Result<(ProviderHookWrite, T), ProviderError>,
     ) -> Result<T, ProviderError> {
         let mut meter = crate::provider_meters::WriteMeter::begin();
@@ -1248,6 +1268,9 @@ impl McStore {
             let operation = || -> Result<T,ProviderError> {
                 let conv = key.conversation_key();
                 let c = conversation_tx(conn,key)?.ok_or_else(||ProviderError::Transient("provider conversation is not initialized".into()))?;
+                let preparation = if consume_preparation {
+                    crate::provider_preparation::matching_preparation_tx(conn, key, &c.engine_namespace)?
+                } else { None };
                 let new_lineage = lineage_tx(conn,&conv,&request.lineage.lineage_id)?.is_none();
                 ensure_lineage_tx(conn,&conv,request.lineage)?;
                 for m in messages {insert_message_tx(conn,&conv,&request.lineage.lineage_id,m)?;}
@@ -1290,7 +1313,7 @@ impl McStore {
                 admit_policy_parts_tx(conn,&conv,&request.lineage.lineage_id,&c.engine_namespace,parts,&mut reserved_high,request.repeat_subject,pass_context.is_some())?;
                 counters["reserved_tag_high_water"]=json!(reserved_high);
                 if let Some(context)=pass_context {counters["pass_context"]=context.clone();}
-                let policy_index=ProviderPolicyIndex::new(conn,&conv,&request.lineage.lineage_id)?;
+                let policy_index=ProviderPolicyIndex::new(conn,&conv,&request.lineage.lineage_id)?.with_preparation(preparation);
                 let mut mids=BTreeSet::new();
                 if let Some(m)=request.message {
                     mids.insert(m.mid.clone());
@@ -1330,6 +1353,9 @@ impl McStore {
                 if let Some(metrics) = answer_policy.get("metrics") {
                     let metrics: ProviderPolicyTotals = serde_json::from_value(metrics.clone()).map_err(sql_json)?;
                     adjust_policy_tx(conn,&conv,&metrics,1)?;
+                }
+                if consume_preparation {
+                    conn.execute("DELETE FROM mc_provider_policy_preparations_v1 WHERE conv_key=?1", [&conv])?;
                 }
                 Ok(value)
             };

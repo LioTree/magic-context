@@ -30,6 +30,10 @@ pub mod private_permissions;
 mod provider_legacy;
 mod provider_log;
 pub mod provider_meters;
+mod provider_preparation;
+pub use provider_preparation::{
+    ProviderPreparationWrite, ProviderStoredPreparation, MAX_PROVIDER_PREPARATION_BYTES,
+};
 pub mod provider_records;
 pub use provider_records::ProviderSessionKey;
 pub mod score_projection;
@@ -3268,6 +3272,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 69,
         statements: include_str!("migrations/store_069_memory_projection.sql"),
+    },
+    Migration {
+        version: 70,
+        statements: include_str!("migrations/store_070_provider_policy_revision.sql"),
     },
 ];
 

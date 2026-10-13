@@ -1196,6 +1196,15 @@ fn rewind_to_62(store: &McStore) {
         for name in names {
             conn.execute_batch(&format!("DROP TRIGGER temp.\"{name}\""))?;
         }
+        // Version 70 installs policy-revision triggers on older tag/cache
+        // tables too. Remove them before deleting the provider tables that
+        // their namespace lookups reference in this version-62 fixture.
+        let names = conn.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE '%_revision_%' OR name LIKE 'mc_provider_preparation_%')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for name in names {
+            conn.execute_batch(&format!("DROP TRIGGER \"{name}\""))?;
+        }
         Ok(())
     }).unwrap();
     exec(
@@ -1205,6 +1214,8 @@ fn rewind_to_62(store: &McStore) {
          DROP TABLE mc_cache_frozen_chunks;
          DROP TABLE mc_cache_sections;
           DROP TABLE mc_provider_conversations_v2;
+          DROP TABLE mc_provider_policy_preparations_v1;
+          DROP TABLE mc_provider_policy_revisions_v1;
           DROP TABLE mc_provider_lineages_v1;
           DROP TABLE mc_provider_messages_v1;
           DROP TABLE mc_provider_hook_answers_v1;
