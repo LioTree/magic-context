@@ -132,11 +132,14 @@ pub(super) fn envelope(message: &Value, raw: Option<&Value>) -> Result<Value, Ha
     Ok(json!({"message":message,"raw_message":raw}))
 }
 
-/// Read the raw JSON string beside the parsed message on Claude Code requests.
-/// Keep this lookup separate so a typed commons field can later replace it;
-/// validation and stored provenance must remain the same.
-pub(super) fn from_wire(fields: &Value) -> Result<Value, HandlerOutcome> {
-    envelope(&fields["message"], fields.get("raw_message"))
+/// Build and validate {message, raw_message} from the decoded commons fields.
+/// Keeping this existing JSON shape lets MC's message blobs and immutable views
+/// retain the original bytes without changing the store schema.
+pub(super) fn from_wire(
+    message: &Value,
+    raw_message: Option<&str>,
+) -> Result<Value, HandlerOutcome> {
+    envelope(message, raw_message.map(|raw| json!(raw)).as_ref())
 }
 
 pub(super) fn decode_message(
@@ -609,6 +612,7 @@ mod tests {
 
     fn entry(raw: &str, ordinal: u64) -> compact::status::StatusMessage {
         compact::status::StatusMessage {
+            raw_message: None,
             mid: format!("cc-{ordinal}"),
             ordinal,
             message: envelope(&serde_json::from_str(raw).unwrap(), Some(&json!(raw))).unwrap(),
@@ -620,6 +624,56 @@ mod tests {
             .prepare_request(&mut request, messages)
             .unwrap();
         request
+    }
+
+    #[test]
+    fn commons_0_2_native_sidecars_reach_the_mc_codec_without_reserializing() {
+        // Source: cortexkit/commons@77f10f0f, test-vectors/{compaction-provider-v1,
+        // step-transform-provider-v1}/claude-code-native-ingress.json. Expected
+        // bytes come from the role owner, not MC's renderer, and cover typed
+        // status/hook fields with signed and redacted blocks.
+        let status: Value = serde_json::from_str(include_str!(
+            "../../testdata/codec/claude-code-status-77f10f0f.json"
+        ))
+        .unwrap();
+        let hooks: Value = serde_json::from_str(include_str!(
+            "../../testdata/codec/claude-code-hooks-77f10f0f.json"
+        ))
+        .unwrap();
+        for case in status["messages"].as_array().unwrap() {
+            let mut entry: compact::status::StatusMessage =
+                serde_json::from_value(case["message"].clone()).unwrap();
+            let raw = entry.raw_message.clone().unwrap();
+            assert_eq!(serde_json::to_value(&entry).unwrap(), case["message"]);
+            entry.message = from_wire(&entry.message, entry.raw_message.as_deref()).unwrap();
+            let request = request(&[entry]);
+            let (wire, rendered) = encode_view(&view(&request), &request, None).unwrap();
+            assert_eq!(rendered, vec![raw.clone()]);
+            assert!(String::from_utf8(
+                answer_bytes(&json!({"compaction":wire}), &rendered).unwrap()
+            )
+            .unwrap()
+            .contains(&raw));
+        }
+        for case in hooks["hooks"].as_array().unwrap() {
+            let call: hooks::hook::HookCall =
+                serde_json::from_value(case["request"].clone()).unwrap();
+            assert_eq!(serde_json::to_value(&call).unwrap(), case["request"]);
+            let admitted =
+                from_wire(call.message.as_ref().unwrap(), call.raw_message.as_deref()).unwrap();
+            let entry = compact::status::StatusMessage {
+                mid: "hook".into(),
+                ordinal: 0,
+                message: admitted,
+                raw_message: None,
+            };
+            assert_eq!(
+                render(&decode_message(&entry).unwrap().ck).unwrap(),
+                call.raw_message.unwrap()
+            );
+        }
+        assert_eq!(status["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(hooks["hooks"].as_array().unwrap().len(), 3);
     }
     fn view(request: &TransformRequest) -> transform::compaction::View {
         transform::compaction::View {

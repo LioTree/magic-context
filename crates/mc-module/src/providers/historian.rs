@@ -444,6 +444,7 @@ impl McHandler {
                     .into_iter()
                     .map(|m| {
                         Ok(compact::status::StatusMessage {
+                            raw_message: None,
                             mid: m.mid,
                             ordinal: m.ordinal,
                             message: serde_json::from_slice(&m.message_bytes).map_err(transient)?,
@@ -1060,6 +1061,7 @@ mod tests {
     fn text(ordinal: u64, role: &str, words: usize) -> compact::status::StatusMessage {
         let mid = format!("m{ordinal}");
         compact::status::StatusMessage {
+            raw_message: None,
             mid: mid.clone(),
             ordinal,
             message: json!({"info":{"id":mid,"role":role,"time":{"created":ordinal*1000}},"parts":[{"id":format!("p{ordinal}"),"type":"text","text":format!("message {ordinal} {}", "word ".repeat(words))}]}),
@@ -1592,7 +1594,7 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        let tools = (2..=26).map(|ordinal| { let mid = format!("m{ordinal}"); compact::status::StatusMessage { ordinal, mid: mid.clone(), message: json!({"info":{"id":mid,"role":"assistant"},"parts":[{"id":format!("p{ordinal}"),"type":"tool","tool":"read","callID":format!("call{ordinal}"),"state":{"status":"completed","input":{},"output":"result"}}]}) } }).collect::<Vec<_>>();
+        let tools = (2..=26).map(|ordinal| { let mid = format!("m{ordinal}"); compact::status::StatusMessage { raw_message: None, ordinal, mid: mid.clone(), message: json!({"info":{"id":mid,"role":"assistant"},"parts":[{"id":format!("p{ordinal}"),"type":"tool","tool":"read","callID":format!("call{ordinal}"),"state":{"status":"completed","input":{},"output":"result"}}]}) } }).collect::<Vec<_>>();
         sync(&h, &tools[..24], &[], true, json!({}));
         assert!(worker
             .prepare_provider_historian(&binding(&h), &key(&h))
@@ -1918,7 +1920,7 @@ mod tests {
             signature(&oracle(&baseline, &entries, &chain, inputs.clone())).0,
             "full-request control crosses the trigger before the delayed evaluation"
         );
-        let tools = (81..=105).map(|ordinal| { let mid = format!("m{ordinal}"); compact::status::StatusMessage { ordinal, mid: mid.clone(), message: json!({"info":{"id":mid,"role":"assistant"},"parts":[{"id":format!("p{ordinal}"),"type":"tool","tool":"read","callID":format!("call{ordinal}"),"state":{"status":"completed","input":{},"output":"result"}}]}) } }).collect::<Vec<_>>();
+        let tools = (81..=105).map(|ordinal| { let mid = format!("m{ordinal}"); compact::status::StatusMessage { raw_message: None, ordinal, mid: mid.clone(), message: json!({"info":{"id":mid,"role":"assistant"},"parts":[{"id":format!("p{ordinal}"),"type":"tool","tool":"read","callID":format!("call{ordinal}"),"state":{"status":"completed","input":{},"output":"result"}}]}) } }).collect::<Vec<_>>();
         sync(&h, &tools, &chain, true, inputs.clone());
         entries.extend(tools);
         let actual = worker

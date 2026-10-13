@@ -920,3 +920,19 @@ async fn allocated_unsent_work_is_retried_above_its_version_without_runner_rejec
         2
     );
 }
+
+#[tokio::test]
+async fn non_claude_code_wire_sidecars_are_ignored_even_when_not_strings() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), Arc::new(Runner::default()));
+    response(dispatch(&h, "compaction.setup", setup("s", "head")).await);
+    let mut entry = user(0, "plain Broca text");
+    entry["raw_message"] = json!({"ignored":true});
+    let answer = response(dispatch(&h, "compaction.step", step("s", vec![entry], Some(0))).await);
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+    let hook=response(dispatch(&h,"transform.hook",json!({"session":"s","harness":"broca","lineage_id":"L","hook":"post_assistant","step_id":"step","blocks":["plain"],"raw_message":{"ignored":true}})).await);
+    assert!(matches!(hook["answer"].as_str(), Some("pass" | "ops")));
+}

@@ -502,6 +502,7 @@ mod dispatch_tests {
                 );
             }
             let invalid_entry = compact::status::StatusMessage {
+                raw_message: None,
                 mid: "m".into(),
                 ordinal: 1,
                 message: json!({"role":"user","content":[{"type":"future","text":"a"}]}),

@@ -27,6 +27,7 @@ fn engine_request(messages: &[Value], auto_search: bool) -> TransformRequest {
         .iter()
         .enumerate()
         .map(|(n, message)| compact::status::StatusMessage {
+            raw_message: None,
             mid: message["info"]["id"].as_str().unwrap().into(),
             ordinal: n as u64 + 1,
             message: message.clone(),

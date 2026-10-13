@@ -214,6 +214,7 @@ fn non_tag_messages(
         .into_iter()
         .map(|m| {
             Ok(compact::status::StatusMessage {
+                raw_message: None,
                 ordinal: m.ordinal,
                 mid: m.mid,
                 message: serde_json::from_slice(&m.message_bytes).map_err(transient)?,
@@ -1154,11 +1155,11 @@ impl McHandler {
         let messages = request
             .messages
             .iter()
-            .enumerate()
-            .map(|(index, m)| {
+            .map(|m| {
                 let mut m = m.clone();
                 if codec == Codec::ClaudeCodeAnthropic {
-                    m.message = super::codec_claude_code::from_wire(&params["messages"][index])?;
+                    m.message =
+                        super::codec_claude_code::from_wire(&m.message, m.raw_message.as_deref())?;
                 }
                 codec.decode_message(&m)?;
                 Ok(ProviderMessage {
@@ -1626,6 +1627,18 @@ impl McHandler {
         // Usage can omit unreported fields. Decode the remainder with the role
         // type, but normalize the original measurements without filling holes.
         let mut wire = params.clone();
+        // Only a reserved:thalamus binding for Claude Code uses raw_message.
+        // Drop it for other bindings before typed decoding: those callers used
+        // to send it as an ignored extra, including values that are not strings.
+        if !attested_claude_code(&binding) {
+            if let Some(messages) = wire.get_mut("messages").and_then(Value::as_array_mut) {
+                for message in messages {
+                    if let Some(object) = message.as_object_mut() {
+                        object.remove("raw_message");
+                    }
+                }
+            }
+        }
         wire.as_object_mut()
             .ok_or_else(|| invalid("step params must be an object"))?
             .remove("previous_usage");
@@ -1750,10 +1763,14 @@ impl McHandler {
         }
         let answer = match produced {
             transform::compaction::Answer::Noop => compact::answer::StepAnswer::Noop {
+                channel2_directive: None,
+                bootstrap_complete: None,
                 request_id: request.request_id,
             },
             transform::compaction::Answer::Replacement(view) => {
                 compact::answer::StepAnswer::CompactionMessage {
+                    channel2_directive: None,
+                    bootstrap_complete: None,
                     request_id: request.request_id,
                     compaction: checked_view(&view, &record)?,
                     coverage: None,
@@ -1851,6 +1868,7 @@ mod host_tests {
             .iter()
             .enumerate()
             .map(|(i, m)| compact::status::StatusMessage {
+                raw_message: None,
                 ordinal: i as u64 + 1,
                 mid: m["info"]["id"].as_str().unwrap().into(),
                 message: m.clone(),

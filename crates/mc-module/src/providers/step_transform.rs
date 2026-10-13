@@ -267,7 +267,10 @@ pub fn declaration(params: &Value) -> Result<hooks::subscription::Declaration, H
             .with_on_unavailable(OnUnavailable::Pass),
         );
     }
-    Ok(Declaration { subscriptions })
+    Ok(Declaration {
+        subscriptions,
+        claude_code: None,
+    })
 }
 
 impl McHandler {
@@ -301,11 +304,11 @@ impl McHandler {
         let ordinal = fields
             .subject_ordinal
             .ok_or_else(|| invalid_field("subject_ordinal", "CC hooks require an ordinal"))?;
-        fields
+        let native = call
             .message
             .as_ref()
             .ok_or_else(|| invalid_field("message", "CC hooks require a message"))?;
-        let message = super::codec_claude_code::from_wire(params)?;
+        let message = super::codec_claude_code::from_wire(native, call.raw_message.as_deref())?;
         let part = checked_part(fields.subject_part.as_deref())?;
         let hook = call.subject.hook();
         let hook_name = match hook {
@@ -321,6 +324,7 @@ impl McHandler {
             ));
         }
         let entry = compact::status::StatusMessage {
+            raw_message: None,
             mid: mid.into(),
             ordinal,
             message: message.clone(),
@@ -887,6 +891,7 @@ impl McHandler {
             }
         };
         let entry = compact::status::StatusMessage {
+            raw_message: None,
             mid: mid.into(),
             ordinal,
             message: message.clone(),
@@ -1335,7 +1340,15 @@ impl McHandler {
             subscription::Hook,
         };
         let deadline = Instant::now() + Duration::from_millis(HOOK_BUDGET_MS);
-        let call: hooks::hook::HookCall = decode(params)?;
+        let mut wire = params.clone();
+        // Drop raw_message before typed decoding for other profiles. It remains
+        // an ignored extra for them, so a non-string value is not a new error.
+        if !attested_claude_code(&binding) {
+            if let Some(object) = wire.as_object_mut() {
+                object.remove("raw_message");
+            }
+        }
+        let call: hooks::hook::HookCall = decode(&wire)?;
         preset(call.preset.as_deref())?;
         let key = Key::new(&binding, &call.session, &call.harness)?;
         if attested_claude_code(&binding) {
@@ -1844,6 +1857,7 @@ mod host_tests {
             (41, "u#0", "message")
         );
         let entry = compact::status::StatusMessage {
+            raw_message: None,
             mid: "a".into(),
             ordinal: 2,
             message: p["message"].clone(),

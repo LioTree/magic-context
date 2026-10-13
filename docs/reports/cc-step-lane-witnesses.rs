@@ -21,6 +21,7 @@ fn error_code(outcome: HandlerOutcome) -> String {
 }
 fn entry(raw: &str, ordinal: u64) -> compact::status::StatusMessage {
     compact::status::StatusMessage {
+        raw_message: None,
         mid: format!("m{ordinal}"),
         ordinal,
         message: codec_claude_code::envelope(
@@ -128,6 +129,7 @@ async fn raw_fuzz_setup_step_admission_hook_and_identity_replacement() {
             serde_json::from_str::<Value>(&raw).unwrap()
         );
         let request = request(&[compact::status::StatusMessage {
+            raw_message: None,
             mid: "m".into(),
             ordinal: 0,
             message: stored,
