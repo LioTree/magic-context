@@ -13,11 +13,9 @@ fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
     }
 }
 fn key() -> ProviderSessionKey {
-    ProviderSessionKey {
-        project_root: "/project".into(),
-        session: "session".into(),
-        harness: "opencode".into(),
-    }
+    ProviderSessionKey { generation: None, project_root: "/project".into(),
+    session: "session".into(),
+    harness: "opencode".into(), }
 }
 fn store(dir: &std::path::Path) -> McStore {
     let store = McStore::open_for_test(&descriptor(dir)).unwrap();

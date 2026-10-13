@@ -7,6 +7,8 @@ pub struct Key {
     pub project: PathBuf,
     pub session: String,
     pub harness: String,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub generation: Option<mc_store::provider_records::ProviderGeneration>,
 }
 
 impl Key {
@@ -21,10 +23,14 @@ impl Key {
         if harness.trim().is_empty() {
             return Err(invalid("harness must be non-empty"));
         }
+        if attested_claude_code(binding) && binding.native_generation.is_none() {
+            return Err(HandlerOutcome::ErrorWithDetail { code:"invalid_params".into(), message:"native route has no frozen generation".into(), detail:json!({"field":"claude_code"}) });
+        }
         Ok(Self {
             project: binding.project_root.clone(),
             session: session.trim().into(),
             harness: harness.into(),
+            generation: if attested_claude_code(binding) { binding.native_generation.clone() } else { None },
         })
     }
 
@@ -283,6 +289,7 @@ impl Key {
             project_root: self.project.to_string_lossy().into_owned(),
             session: self.session.clone(),
             harness: self.harness.clone(),
+            generation: self.generation.clone(),
         }
     }
 }
@@ -579,6 +586,7 @@ mod namespace_tests {
         slot.set(Arc::clone(&store)).ok().unwrap();
         let storage = Storage::new(slot);
         let host = Key {
+            generation: None,
             project: dir.path().into(),
             session: "host-session".into(),
             harness: "opencode".into(),

@@ -111,7 +111,7 @@ async fn raw_fuzz_setup_step_admission_hook_and_identity_replacement() {
             "seed {seed}: {answer}"
         );
         let key = Key::new(
-            &cc::binding(dir.path(), cc::thalamus()),
+            &h.facade_binding(7).unwrap(),
             "cc",
             "claude-code",
         )
@@ -371,7 +371,7 @@ async fn provider_committed_replacement_keeps_noncanonical_unsigned_tail() {
         status["newest"] = json!({"mid":"tail","ordinal":1});
         let (first, _) = response(cc::call(&h, "compaction.step", status.clone()).await);
         let key = Key::new(
-            &cc::binding(dir.path(), cc::thalamus()),
+            &h.facade_binding(7).unwrap(),
             "cc",
             "claude-code",
         )

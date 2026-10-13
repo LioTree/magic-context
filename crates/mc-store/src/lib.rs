@@ -3276,6 +3276,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 69,
         statements: include_str!("migrations/store_069_memory_projection.sql"),
     },
+    Migration {
+        version: 70,
+        statements: include_str!("migrations/store_070_provider_generations.sql"),
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -11384,8 +11388,8 @@ impl McStore {
             if !consumed_drop_ids.is_empty() {
                 // The engine and provider queues describe the same release in
                 // different coordinates. Drain both only with this engine CAS.
-                let mut query=tx.prepare("SELECT project_root,session,harness FROM mc_provider_conversations_v2 WHERE engine_namespace=?1")?;
-                let keys=query.query_map([session_id],|row|Ok(provider_records::ProviderSessionKey {project_root:row.get(0)?,session:row.get(1)?,harness:row.get(2)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut query=tx.prepare("SELECT project_root,session,harness,profile_generation,provider_generation FROM mc_provider_conversations_v2 WHERE engine_namespace=?1")?;
+                let keys=query.query_map([session_id],|row|Ok(provider_records::ProviderSessionKey {project_root:row.get(0)?,session:row.get(1)?,harness:row.get(2)?,generation:{let profile:String=row.get(3)?; let provider:String=row.get(4)?; (!profile.is_empty()).then_some(provider_records::ProviderGeneration {profile,provider})}}))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 if !keys.is_empty() {
                     let mut numbers=Vec::new();
                     for drop_id in consumed_drop_ids {

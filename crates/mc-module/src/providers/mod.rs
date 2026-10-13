@@ -6,7 +6,6 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod cache_policy;
-#[cfg(test)]
 mod capability_candidate;
 #[cfg(test)]
 #[path = "../../../../docs/reports/cc-step-lane-witnesses.rs"]
@@ -18,6 +17,7 @@ mod codec_claude_code;
 mod codec_opencode;
 mod compaction;
 mod historian;
+mod native_plan;
 mod policy_summary;
 mod records;
 mod step_transform;
@@ -31,6 +31,7 @@ pub(crate) use historian::RunCompletion;
 use records::{frontier, ingest, scan, HookRecord, HookState, Key, Record, Setup};
 pub(crate) use records::{Catalog, Storage};
 use step_transform::declaration;
+pub(crate) use native_plan::NativeConnectionPlan;
 
 pub const HOOK_BUDGET_MS: u64 = 1_500;
 const HOST_ENVELOPE_BYTES: usize = hooks::hook::DEFAULT_HOOK_CAP_BYTES;
@@ -236,7 +237,7 @@ impl McHandler {
         method: &str,
         params: &Value,
     ) -> HandlerOutcome {
-        let binding = match self.facade_binding(channel) {
+        let mut binding = match self.facade_binding(channel) {
             Ok(binding) => binding,
             Err(_) => {
                 return error(
@@ -297,9 +298,9 @@ impl McHandler {
                     );
                 }
             }
-            if let Err(error) = self.admit_host_plan(&binding, method, params).await {
-                return error;
-            }
+            if attested_claude_code(&binding) {
+                binding = match self.admit_native_plan(channel,&binding,method,params).await { Ok(binding)=>binding, Err(error)=>return error };
+            } else if let Err(error) = self.admit_host_plan(&binding, method, params).await { return error; }
         }
         if method == "transform.declare" {
             return match declaration(params).and_then(|d| bytes(&d)) {

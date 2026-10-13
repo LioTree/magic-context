@@ -1024,15 +1024,12 @@ mod tests {
             .unwrap();
         h.bind_route(
             7,
-            SessionBinding {
-                principal: None,
-                project_root: path.into(),
-                harness: "opencode".into(),
-                session: "s".into(),
-                model_key: None,
-                config: h.fixed_config.clone().unwrap(),
-                history_budget_tokens: 4000.0,
-            },
+            SessionBinding { connection_incarnation: 0, native_generation: None, principal: None, project_root: path.into(),
+            harness: "opencode".into(),
+            session: "s".into(),
+            model_key: None,
+            config: h.fixed_config.clone().unwrap(),
+            history_budget_tokens: 4000.0, },
         );
         h
     }

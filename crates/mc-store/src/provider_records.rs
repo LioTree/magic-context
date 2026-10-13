@@ -3,7 +3,7 @@
 use crate::provider_legacy;
 pub use crate::provider_log::*;
 use rusqlite::functions::FunctionFlags;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use sha2::{Digest, Sha256};
 
 pub(crate) fn register_migration_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -39,6 +39,14 @@ pub struct ProviderSessionKey {
     pub project_root: String,
     pub session: String,
     pub harness: String,
+    pub generation: Option<ProviderGeneration>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderGeneration {
+    pub profile: String,
+    pub provider: String,
 }
 
 impl McStore {
@@ -72,10 +80,10 @@ impl McStore {
         session: &str,
     ) -> Result<Vec<(String, String)>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut query = conn.prepare("SELECT harness FROM mc_provider_conversations_v2 WHERE project_root=?1 AND session=?2")?;
+            let mut query = conn.prepare("SELECT harness FROM mc_provider_conversations_v2 WHERE project_root=?1 AND session=?2 AND profile_generation='' AND provider_generation=''")?;
             let harnesses = query.query_map(params![project_root,session], |r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
             harnesses.into_iter().map(|harness| {
-                let key=ProviderSessionKey {project_root:project_root.into(),session:session.into(),harness:harness.clone()};
+                let key=ProviderSessionKey {project_root:project_root.into(),session:session.into(),harness:harness.clone(),generation:None};
                 Ok((harness,provider_legacy::load_tx(conn,&key)?.unwrap()))
             }).collect()
         })?)
@@ -142,6 +150,7 @@ mod tests {
 
     fn key(project: &str, session: &str, harness: &str) -> ProviderSessionKey {
         ProviderSessionKey {
+            generation: None,
             project_root: project.into(),
             session: session.into(),
             harness: harness.into(),
@@ -357,5 +366,38 @@ mod tests {
             .unwrap(),
             serde_json::from_str::<serde_json::Value>(before).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod generation_migration_tests {
+    use super::*;
+    use crate::{open_sqlite,register_legacy_trigger_functions,MIGRATIONS,NS};
+    use cortexkit_store_types::{Isolation,StorageBackend,StorageDescriptor};
+    #[test]
+    fn migration_70_preserves_legacy_keys_payloads_views_and_reopens() {
+        let dir=tempfile::tempdir().unwrap(); let descriptor=StorageDescriptor { module_id:"magic-context".into(),storage_namespace:NS.into(),isolation:Isolation::Module,backend:StorageBackend::Sqlite {path:dir.path().join("store.db").to_string_lossy().into()} };
+        let legacy=ProviderSessionKey {project_root:"/project".into(),session:"s".into(),harness:"opencode".into(),generation:None}; let key=legacy.conversation_key();
+        let raw=b"{ \"content\":\"opaque\\u0021\", \"role\":\"user\" }";
+        let inner=open_sqlite(&descriptor).unwrap(); inner.with_conn(register_legacy_trigger_functions).unwrap(); inner.with_conn(register_migration_functions).unwrap();
+        inner.migrate(NS,&MIGRATIONS.iter().filter(|m|m.version<=69).cloned().collect::<Vec<_>>()).unwrap();
+        inner.with_conn(|conn| {
+            conn.execute("INSERT INTO mc_provider_conversations_v2(conv_key,project_root,session,harness,engine_namespace) VALUES(?1,'/project','s','opencode','legacy-engine')",[&key])?;
+            conn.execute("INSERT INTO mc_provider_messages_v1 VALUES(?1,'L',0,'m',?2,'s')",params![key,raw.as_slice()])?;
+            conn.execute("INSERT INTO mc_provider_views_v1 VALUES(?1,1,'L',0,1,' [ ] ','applied','{}','s')",[&key])?;
+            conn.execute("INSERT INTO mc_provider_policy_summaries_v1 VALUES(?1,'{\"kept\":true}','s')",[&key])?;
+            Ok(())
+        }).unwrap(); drop(inner);
+        let store=McStore::open_for_test(&descriptor).unwrap(); assert_eq!(store.module_store_schema_version().unwrap(),70);
+        let conversation=store.load_provider_conversation(&legacy).unwrap().unwrap(); assert_eq!(conversation.engine_namespace,"legacy-engine"); assert!(conversation.native_pins_json.is_none());
+        assert_eq!(store.load_provider_messages(&legacy,"L").unwrap()[0].message_bytes,raw);
+        assert_eq!(store.load_provider_view(&legacy,1).unwrap().unwrap().replacement_json," [ ] ");
+        store.inner.with_conn(|conn| {
+            assert_eq!(conn.query_row("SELECT summary_json FROM mc_provider_policy_summaries_v1 WHERE conv_key=?1",[&key],|r|r.get::<_,String>(0))?,"{\"kept\":true}");
+            crate::move_inventory::validate_schema(conn,crate::move_inventory::Store::Module).unwrap();
+            assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('mc_provider_native_contract_immutable','mc_provider_consumed_tags_change','mc_provider_conversations_policy_namespace_change')",[],|r|r.get::<_,u64>(0))?,3);
+            Ok(())
+        }).unwrap(); drop(store);
+        let reopened=McStore::open_for_test(&descriptor).unwrap(); assert_eq!(reopened.load_provider_messages(&legacy,"L").unwrap()[0].message_bytes,raw);
     }
 }

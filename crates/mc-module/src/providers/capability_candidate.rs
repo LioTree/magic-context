@@ -1,11 +1,10 @@
-//! Build-only candidate for discussion, not a production capability advertisement.
-//! The module is test-only because live calls do not yet satisfy the generation
-//! and frozen raw-view obligations of `claude-code-step/v1`.
+//! Compiled native format pins, used internally without advertising the capability.
+//! Discovery/declaration publication remains held until scoped raw views and cuts ship.
 use super::*;
 use hooks::claude_code::{ClaudeCodeCapabilities, PayloadCaps};
 use std::sync::LazyLock;
 
-static CANDIDATE: LazyLock<ClaudeCodeCapabilities> = LazyLock::new(build_candidate);
+pub(super) static CANDIDATE: LazyLock<ClaudeCodeCapabilities> = LazyLock::new(build_candidate);
 
 fn locked_package(name: &str) -> (String, String) {
     let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
@@ -44,9 +43,8 @@ fn build_candidate() -> ClaudeCodeCapabilities {
         revision, transform_revision,
         "provider roles must share their commons pin"
     );
-    // These fingerprints identify source formats, not isolated stored data.
-    // Conversation/message/view rows do not yet use profile/provider generation
-    // in their keys, so publishing these identifiers would overclaim isolation.
+    // The format fingerprints also select native conversation/message/view keys.
+    // Legacy keys omit generations and retain their previous bytes and namespaces.
     let profile_generation = format!(
         "codec-sha256:{}",
         sha256_hex(include_bytes!("codec_claude_code.rs"))
@@ -119,10 +117,12 @@ fn build_candidate() -> ClaudeCodeCapabilities {
     }
 }
 
+#[cfg(test)]
 fn canonical_bytes() -> Vec<u8> {
     serde_jcs::to_vec(&*CANDIDATE).expect("candidate canonical JSON")
 }
 
+#[cfg(test)]
 fn discovery_candidate(binding: &SessionBinding) -> Result<Value, HandlerOutcome> {
     if !attested_claude_code(binding) {
         return Err(invalid_field(
@@ -138,6 +138,7 @@ fn discovery_candidate(binding: &SessionBinding) -> Result<Value, HandlerOutcome
     Ok(reply)
 }
 
+#[cfg(test)]
 fn declaration_candidate(
     binding: &SessionBinding,
     params: &Value,

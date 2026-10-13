@@ -33,12 +33,18 @@ impl From<rusqlite::Error> for ProviderError {
 
 impl ProviderSessionKey {
     pub fn conversation_key(&self) -> String {
-        serde_json::to_string(&(&self.project_root, &self.session, &self.harness)).unwrap()
+        if let Some(generation)=&self.generation {
+            serde_json::to_string(&(&self.project_root,&self.session,&self.harness,&generation.profile,&generation.provider)).unwrap()
+        } else { serde_json::to_string(&(&self.project_root, &self.session, &self.harness)).unwrap() }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderConversation {
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub native_pins_json: Option<String>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub native_plan_json: Option<String>,
     pub lineage_id: String,
     pub preset: Option<String>,
     pub params_json: String,
@@ -56,6 +62,8 @@ pub struct ProviderConversation {
 impl Default for ProviderConversation {
     fn default() -> Self {
         Self {
+            native_pins_json: None,
+            native_plan_json: None,
             lineage_id: String::new(),
             preset: None,
             params_json: "{}".into(),
@@ -500,8 +508,8 @@ pub(crate) fn conversation_tx(
     conn: &Connection,
     key: &ProviderSessionKey,
 ) -> rusqlite::Result<Option<ProviderConversation>> {
-    conn.query_row("SELECT lineage_id,preset,params_json,setup_json,engine_namespace,version_high_water,rebuild_epoch,hook_counters_json,last_answer_json,wait_request,cursor_frontier,served_through_ordinal,historian_model_chain_json FROM mc_provider_conversations_v2 WHERE conv_key=?1", [key.conversation_key()], |r| Ok(ProviderConversation {
-        lineage_id:r.get(0)?, preset:r.get(1)?, params_json:r.get(2)?, setup_json:r.get(3)?, engine_namespace:r.get(4)?, version_high_water:r.get(5)?, rebuild_epoch:r.get(6)?, hook_counters_json:r.get(7)?, last_answer_json:r.get(8)?, wait_request:r.get(9)?, cursor_frontier:r.get(10)?, served_through_ordinal:r.get(11)?, historian_model_chain_json:r.get(12)?,
+    conn.query_row("SELECT lineage_id,preset,params_json,setup_json,engine_namespace,version_high_water,rebuild_epoch,hook_counters_json,last_answer_json,wait_request,cursor_frontier,served_through_ordinal,historian_model_chain_json,native_pins_json,native_plan_json FROM mc_provider_conversations_v2 WHERE conv_key=?1", [key.conversation_key()], |r| Ok(ProviderConversation {
+        lineage_id:r.get(0)?, preset:r.get(1)?, params_json:r.get(2)?, setup_json:r.get(3)?, engine_namespace:r.get(4)?, version_high_water:r.get(5)?, rebuild_epoch:r.get(6)?, hook_counters_json:r.get(7)?, last_answer_json:r.get(8)?, wait_request:r.get(9)?, cursor_frontier:r.get(10)?, served_through_ordinal:r.get(11)?, historian_model_chain_json:r.get(12)?, native_pins_json:r.get(13)?,native_plan_json:r.get(14)?,
     })).optional()
 }
 pub(crate) fn save_conversation_tx(
@@ -509,10 +517,10 @@ pub(crate) fn save_conversation_tx(
     key: &ProviderSessionKey,
     c: &ProviderConversation,
 ) -> rusqlite::Result<()> {
-    conn.execute("INSERT INTO mc_provider_conversations_v2 (conv_key,project_root,session,harness,lineage_id,preset,params_json,setup_json,engine_namespace,version_high_water,rebuild_epoch,hook_counters_json,last_answer_json,wait_request,cursor_frontier,served_through_ordinal,historian_model_chain_json)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
-        ON CONFLICT(conv_key) DO UPDATE SET lineage_id=excluded.lineage_id,preset=excluded.preset,params_json=excluded.params_json,setup_json=excluded.setup_json,engine_namespace=excluded.engine_namespace,version_high_water=max(version_high_water,excluded.version_high_water),rebuild_epoch=excluded.rebuild_epoch,hook_counters_json=excluded.hook_counters_json,last_answer_json=excluded.last_answer_json,wait_request=excluded.wait_request,cursor_frontier=excluded.cursor_frontier,served_through_ordinal=excluded.served_through_ordinal,historian_model_chain_json=excluded.historian_model_chain_json",
-        params![key.conversation_key(),key.project_root,key.session,key.harness,c.lineage_id,c.preset,c.params_json,c.setup_json,c.engine_namespace,as_i64(c.version_high_water)?,as_i64(c.rebuild_epoch)?,c.hook_counters_json,c.last_answer_json,c.wait_request,as_i64(c.cursor_frontier)?,c.served_through_ordinal.map(as_i64).transpose()?,c.historian_model_chain_json])?;
+    conn.execute("INSERT INTO mc_provider_conversations_v2 (conv_key,project_root,session,harness,lineage_id,preset,params_json,setup_json,engine_namespace,version_high_water,rebuild_epoch,hook_counters_json,last_answer_json,wait_request,cursor_frontier,served_through_ordinal,historian_model_chain_json,profile_generation,provider_generation,native_pins_json,native_plan_json)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
+        ON CONFLICT(conv_key) DO UPDATE SET lineage_id=excluded.lineage_id,preset=excluded.preset,params_json=excluded.params_json,setup_json=excluded.setup_json,engine_namespace=excluded.engine_namespace,version_high_water=max(version_high_water,excluded.version_high_water),rebuild_epoch=excluded.rebuild_epoch,hook_counters_json=excluded.hook_counters_json,last_answer_json=excluded.last_answer_json,wait_request=excluded.wait_request,cursor_frontier=excluded.cursor_frontier,served_through_ordinal=excluded.served_through_ordinal,historian_model_chain_json=excluded.historian_model_chain_json,native_pins_json=excluded.native_pins_json,native_plan_json=excluded.native_plan_json",
+        params![key.conversation_key(),key.project_root,key.session,key.harness,c.lineage_id,c.preset,c.params_json,c.setup_json,c.engine_namespace,as_i64(c.version_high_water)?,as_i64(c.rebuild_epoch)?,c.hook_counters_json,c.last_answer_json,c.wait_request,as_i64(c.cursor_frontier)?,c.served_through_ordinal.map(as_i64).transpose()?,c.historian_model_chain_json,key.generation.as_ref().map_or("",|g|g.profile.as_str()),key.generation.as_ref().map_or("",|g|g.provider.as_str()),c.native_pins_json,c.native_plan_json])?;
     Ok(())
 }
 fn lineage_tx(
@@ -1479,11 +1487,9 @@ mod lineage_metadata_tests {
             },
         })
         .unwrap();
-        let key = ProviderSessionKey {
-            project_root: "/project".into(),
-            session: "session".into(),
-            harness: "opencode".into(),
-        };
+        let key = ProviderSessionKey { generation: None, project_root: "/project".into(),
+        session: "session".into(),
+        harness: "opencode".into(), };
         let root = ProviderLineage {
             lineage_id: "root".into(),
             first_ordinal: 4_000,
@@ -1531,11 +1537,9 @@ mod policy_tests {
             },
         })
         .unwrap();
-        let key = ProviderSessionKey {
-            project_root: "/project".into(),
-            session: "s".into(),
-            harness: "opencode".into(),
-        };
+        let key = ProviderSessionKey { generation: None, project_root: "/project".into(),
+        session: "s".into(),
+        harness: "opencode".into(), };
         store
             .save_provider_conversation(
                 &key,
@@ -1575,10 +1579,8 @@ mod policy_tests {
             Some("engine#0".into())
         );
         assert_eq!(store.provider_engine_tag_block(&key, 2).unwrap(), None);
-        let foreign_project = ProviderSessionKey {
-            project_root: "/another-project".into(),
-            ..key.clone()
-        };
+        let foreign_project = ProviderSessionKey { generation: None, project_root: "/another-project".into(),
+        ..key.clone() };
         assert_eq!(
             store
                 .provider_engine_tag_block(&foreign_project, 1)

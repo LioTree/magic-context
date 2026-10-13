@@ -384,6 +384,7 @@ impl Fixture {
         harness: &str,
     ) -> Self {
         let key = ProviderSessionKey {
+            generation: None,
             project_root: "/review".into(),
             session: NAMESPACE.into(),
             harness: harness.into(),

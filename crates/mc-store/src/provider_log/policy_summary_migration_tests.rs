@@ -18,11 +18,9 @@ fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
 }
 
 fn key() -> ProviderSessionKey {
-    ProviderSessionKey {
-        project_root: "/review".into(),
-        session: "s".into(),
-        harness: "opencode".into(),
-    }
+    ProviderSessionKey { generation: None, project_root: "/review".into(),
+    session: "s".into(),
+    harness: "opencode".into(), }
 }
 
 fn lineage() -> ProviderLineage {
