@@ -5,9 +5,11 @@ import {
 import { expandToolPart } from "../../shared/historian-tool-expansions";
 import type { ToolExpansionMap } from "../../shared/historian-tool-template";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
+import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { isSystemDirective } from "../../shared/system-directive";
 import { isHostUnservedRow, markHostUnservedRow } from "./host-served-rows";
+import { prewarmRawSessionOrdinalsForDb } from "./raw-ordinal-warmup";
 import {
     getMessageTimesFromOpenCodeDb,
     getRawSessionMessageCountFromDb,
@@ -32,11 +34,13 @@ import {
     countRawSessionMessageOrdinalsFromDb,
     countStoredRawSessionMessagesFromDb,
     hasRawSessionMessageByIdFromDb,
+    type RawBoundaryEndpoint,
     type RawMessage,
     type RawMessageOrdinalAnchor,
     type RawMessageOrdinalEntry,
     type RawMessageParts,
     readRawSeedTailFromDb,
+    readRawSessionBoundaryEndpointsFromDb,
     readRawSessionMessageByIdFromDb,
     readRawSessionMessageIdOrdinalsForRangeFromDb,
     readRawSessionMessageOrdinalByIdFromDb,
@@ -604,6 +608,48 @@ export function readRawSessionMessageRange(
 
 readRawSessionMessages.readPage = readRawSessionMessagePage;
 readRawSessionMessages.getCount = getRawSessionMessageOrdinalCount;
+readRawSessionMessages.prepare = prepareRawSessionOrdinals;
+
+/**
+ * Prepare rank checkpoints on a worker for every newly touched file session.
+ * The caller waits at most 250 ms asynchronously; the worker continues after
+ * that deadline. False means defer or retry: a synchronous count never falls
+ * back to an unbounded scan. Registered providers and absent OpenCode stores
+ * need no SQLite preparation.
+ */
+export async function prepareRawSessionOrdinals(sessionId: string): Promise<boolean> {
+    if (sessionProviders.get(sessionId)?.provider) return true;
+    if (!openCodeDbExists()) return true;
+    const db = withReadOnlySessionDb((connection) => connection);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = Date.now() + 250;
+    const prepare = async () => {
+        // Streaming writes can supersede a scan just before a tool reads history.
+        // Retry within the same deadline rather than returning a warming response
+        // after one short race; never install ranks from the superseded snapshot.
+        for (let attempt = 0; attempt < 3 && Date.now() < deadline; attempt++) {
+            if ((await prewarmRawSessionOrdinalsForDb(db, sessionId)) === "warm") return true;
+        }
+        return false;
+    };
+    try {
+        const ready = await Promise.race([
+            prepare(),
+            new Promise<false>((resolve) => {
+                timer = setTimeout(() => resolve(false), 250);
+            }),
+        ]);
+        if (!ready) {
+            sessionLog(
+                sessionId,
+                "WARN canonical ordinal preparation unavailable within 250ms; exact reads must defer or retry",
+            );
+        }
+        return ready;
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 /**
  * Prime the active raw-message cache with a TAIL-ONLY read (only messages
@@ -807,6 +853,23 @@ export function readRawSessionMessagePartsById(
     );
 }
 
+/**
+ * The facts compartment boundary resolution needs about each id (see
+ * RawBoundaryEndpoint), read from the OpenCode store in a bounded batch. Returns null when a raw-message provider
+ * serves the session; the caller then uses the provider-aware readers above.
+ */
+export function readRawSessionBoundaryEndpoints(
+    sessionId: string,
+    ids: readonly string[],
+    blockIds: readonly string[],
+): Map<string, RawBoundaryEndpoint | null> | null {
+    if (sessionProviders.get(sessionId)?.provider) return null;
+    if (!openCodeDbExists()) return new Map(ids.map((id) => [id, null]));
+    return withReadOnlySessionDb((db) =>
+        readRawSessionBoundaryEndpointsFromDb(db, sessionId, ids, blockIds),
+    );
+}
+
 export function hasRawSessionMessageById(sessionId: string, messageId: string): boolean {
     const provider = sessionProviders.get(sessionId)?.provider;
     if (provider?.hasMessageById) return provider.hasMessageById(messageId);
@@ -918,6 +981,7 @@ export function readRawSessionMessageById(sessionId: string, messageId: string):
     if (!openCodeDbExists()) return null;
     return withReadOnlySessionDb((db) => readRawSessionMessageByIdFromDb(db, sessionId, messageId));
 }
+readRawSessionMessageById.prepare = prepareRawSessionOrdinals;
 
 function readRawSessionMessagesFromSource(sessionId: string): RawMessage[] {
     const provider = sessionProviders.get(sessionId)?.provider;

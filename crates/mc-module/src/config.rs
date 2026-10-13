@@ -125,6 +125,8 @@ pub struct McModuleConfig {
     /// Whether compaction is enabled, as resolved during host startup. This determines which
     /// component controls context-window compaction for the request.
     pub compaction_enabled: bool,
+    /// Enable smart-note authoring for the user; frozen when the process first resolves config.
+    pub smart_notes_enabled: bool,
     pub memory_enabled: bool,
     /// Independent transform-time hint controls from `memory.auto_search`.
     pub auto_search: AutoSearchConfig,
@@ -196,6 +198,7 @@ impl Default for McModuleConfig {
             protected_tokens_project: None,
             keep_reasoning_tokens: None,
             compaction_enabled: true,
+            smart_notes_enabled: true,
             memory_enabled: true,
             auto_search: AutoSearchConfig::default(),
             caveman: CavemanConfig::default(),
@@ -400,12 +403,16 @@ struct TierConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigCache {
+    startup_smart_notes_enabled: Option<bool>,
     user: TierConfig,
     project: TierConfig,
     effective: McModuleConfig,
 }
 
 impl ConfigCache {
+    pub fn freeze_smart_notes_enabled(&mut self, enabled: bool) {
+        self.startup_smart_notes_enabled = Some(enabled);
+    }
     pub fn effective_for_project(&mut self, project_root: &Path) -> McModuleConfig {
         let user_path = user_config_path();
         self.effective_for_paths(&user_path, project_root)
@@ -417,6 +424,9 @@ impl ConfigCache {
         let project = read_tier_cached(&mut self.project, project_path);
         let (mut effective, mut warnings) =
             merge_tiers_with_warnings(user.as_ref(), project.as_ref());
+        effective.smart_notes_enabled = *self
+            .startup_smart_notes_enabled
+            .get_or_insert(effective.smart_notes_enabled);
         resolve_user_guidance_override(&mut effective, user.as_ref(), user_path, &mut warnings);
         emit_warnings(warnings);
         self.effective = effective;
@@ -465,6 +475,18 @@ pub struct ConfiguredRunners {
 /// host runner. The optional provider runner route is declared independently.
 pub fn user_configured_runners() -> ConfiguredRunners {
     user_configured_runners_at(&user_config_path())
+}
+
+pub fn user_smart_notes_enabled() -> bool {
+    fs::read_to_string(user_config_path())
+        .ok()
+        .and_then(|raw| parse_config_text(&raw).ok())
+        .and_then(|config| {
+            config
+                .pointer("/smart_notes/enabled")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true)
 }
 
 /// [`user_configured_runners`] against an explicit user config file.
@@ -916,6 +938,13 @@ fn merge_tiers_with_warnings(
     }
 
     apply_catalog_config(&mut cfg.catalog, user, project);
+    cfg.smart_notes_enabled = user
+        .and_then(|value| value.pointer("/smart_notes/enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if let Some(project) = project {
+        warn_ignored_project_key(project, "/smart_notes/enabled", &mut warnings);
+    }
     for tier in [user, project].into_iter().flatten() {
         if let Some(entries) = tier
             .pointer("/historian/expand_tools")
@@ -1398,6 +1427,39 @@ mod tests {
             merge_tiers_with_warnings(Some(&json!({"signed_thinking_hold":true})), None);
         assert_eq!(cfg.signed_thinking_hold, SignedThinkingHold::Off);
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn smart_notes_enabled_is_user_only_and_frozen_after_initial_resolution() {
+        let user = serde_json::json!({"smart_notes": {"enabled": false}});
+        let project = serde_json::json!({"smart_notes": {"enabled": true}});
+        let (config, warnings) = super::merge_tiers_with_warnings(Some(&user), Some(&project));
+        assert!(!config.smart_notes_enabled);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("/smart_notes/enabled")));
+        assert!(super::McModuleConfig::default().smart_notes_enabled);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.jsonc");
+        std::fs::write(&path, user.to_string()).unwrap();
+        let mut cache = super::ConfigCache::default();
+        assert!(
+            !cache
+                .effective_for_paths(&path, dir.path())
+                .smart_notes_enabled
+        );
+        std::fs::write(&path, project.to_string()).unwrap();
+        cache.user.mtime = None;
+        assert!(
+            !cache
+                .effective_for_paths(&path, dir.path())
+                .smart_notes_enabled
+        );
+        assert!(
+            super::ConfigCache::default()
+                .effective_for_paths(&path, dir.path())
+                .smart_notes_enabled
+        );
     }
 
     use super::*;

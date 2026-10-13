@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import todoRideGolden from "../../../../../crates/mc-module/testdata/todo-ride-only.json";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
+import * as embeddingModule from "../../features/magic-context/memory/embedding";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
@@ -65,7 +66,14 @@ import { createTagger } from "../../features/magic-context/tagger";
 import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import {
+    createAutoSearchReplayFixture,
+    replayHint,
+    replayPrompt,
+} from "./auto-search-replay.fixture";
 import * as autoSearchRunner from "./auto-search-runner";
+import { autoSearchTestSnapshot } from "./auto-search-snapshot.fixture";
+import * as searchModule from "./auto-search-worker-client";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { registerActiveCompartmentRun } from "./compartment-runner";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
@@ -78,6 +86,7 @@ import {
     capturePrefixTrimSourceOrder,
     injectM0M1,
     type M0HardSignals,
+    materializeM0,
 } from "./inject-compartments";
 import * as noteNudger from "./note-nudger";
 import { createPassOutcome } from "./pass-outcome";
@@ -332,6 +341,181 @@ function basePostTransformArgs(
 
 function cloneMessages(messages: MessageLike[]): MessageLike[] {
     return structuredClone(messages);
+}
+
+for (const host of ["opencode", "opencode2"] as const) {
+    describe(`${host} auto-search served decisions`, () => {
+        function setup(label: string) {
+            const fixture = createAutoSearchReplayFixture(host, label);
+            const snapshot = spyOn(embeddingModule, "getProjectEmbeddingSnapshot").mockReturnValue(
+                autoSearchTestSnapshot(fixture.projectPath),
+            );
+            const search = spyOn(searchModule, "searchAutoHint").mockResolvedValue([replayHint]);
+            return {
+                ...fixture,
+                search,
+                async invoke(id: string, busting = false) {
+                    const user = {
+                        info: { id, role: "user" },
+                        parts: [{ type: "text", text: replayPrompt }],
+                    } as MessageLike;
+                    const input = basePostTransformArgs(fixture.db, fixture.sessionId, [user], {
+                        currentTurnId: id,
+                        schedulerDecision: busting ? "execute" : "defer",
+                        projectPath: fixture.projectPath,
+                        autoSearch: { enabled: true, scoreThreshold: 0.6, minPromptChars: 12 },
+                        m0M1: fixture.renderOptions(
+                            busting ? "anthropic/other" : "anthropic/claude",
+                        ),
+                    });
+                    const result = await runPostTransformPhase(input);
+                    return { userBytes: JSON.stringify(user), result };
+                },
+                close() {
+                    search.mockRestore();
+                    snapshot.mockRestore();
+                    fixture.close();
+                },
+            };
+        }
+
+        it("full host processor cannot retry a served search exception", async () => {
+            const fixture = setup("host-exception");
+            fixture.search.mockImplementationOnce(async () => {
+                throw new Error("transient host-search failure");
+            });
+            try {
+                const first = await fixture.invoke("u1");
+                expect(first.userBytes).not.toContain("<ctx-search-hint>");
+                expect(fixture.search).toHaveBeenCalledTimes(1);
+                const second = await fixture.invoke("u1");
+                expect(second.userBytes).toBe(first.userBytes);
+                expect(fixture.search).toHaveBeenCalledTimes(1);
+            } finally {
+                fixture.close();
+            }
+        });
+
+        it("full host processor preserves a served hint when a truncated branch is restored", async () => {
+            const fixture = setup("host-restore");
+            try {
+                const first = await fixture.invoke("u1");
+                expect(first.userBytes).toContain("Independent search-only hint");
+                const truncated = await fixture.invoke("u2", true);
+                expect(truncated.result.materialized).toBe(true);
+                expect(truncated.result.bustedThisPass).toBe(true);
+                const retained = replayStorage.getAutoSearchHintDecisions(
+                    fixture.db,
+                    fixture.sessionId,
+                );
+                expect(retained.some((decision) => decision.messageId === "u1")).toBe(true);
+                fixture.search.mockResolvedValue([
+                    { ...replayHint, memoryId: 9001, content: "Recomputed changed hint" },
+                ]);
+                const restored = await fixture.invoke("u1");
+                expect(restored.userBytes).toBe(first.userBytes);
+                expect(restored.userBytes).not.toContain("Recomputed changed hint");
+                expect(fixture.search).toHaveBeenCalledTimes(2);
+            } finally {
+                fixture.close();
+            }
+        });
+
+        it("busting host flushes retirement staged by a prior cached cut", async () => {
+            const fixture = setup("staged-retirement");
+            try {
+                expect((await fixture.invoke("u1")).userBytes).toContain(
+                    "Independent search-only hint",
+                );
+                appendCompartments(fixture.db, fixture.sessionId, [
+                    {
+                        sequence: 0,
+                        startMessage: 0,
+                        endMessage: 0,
+                        startMessageId: "u1",
+                        endMessageId: "u1",
+                        title: "Covered",
+                        content: "Earlier question was answered.",
+                    },
+                ]);
+                materializeM0(fixture.renderOptions());
+                const live = ["u1", "u2"].map(
+                    (id) =>
+                        ({
+                            info: { id, role: "user" },
+                            parts: [{ type: "text", text: replayPrompt }],
+                        }) as MessageLike,
+                );
+                expect(
+                    injectM0M1({
+                        ...fixture.renderOptions(),
+                        messages: live,
+                        isCacheBustingPass: false,
+                    }).prefixTrimStatus,
+                ).toBe("applied");
+                expect(
+                    replayStorage
+                        .getAutoSearchHintDecisions(fixture.db, fixture.sessionId)
+                        .some((entry) => entry.messageId === "u1"),
+                ).toBe(true);
+                await fixture.invoke("u2", true);
+                expect(
+                    replayStorage
+                        .getAutoSearchHintDecisions(fixture.db, fixture.sessionId)
+                        .some((entry) => entry.messageId === "u1"),
+                ).toBe(false);
+            } finally {
+                fixture.close();
+            }
+        });
+
+        it("ordinary pass preserves visible user bytes at the omission cap boundary", async () => {
+            const fixture = setup("visible-cap-boundary");
+            const count = replayStorage.AUTO_SEARCH_DECISION_SOFT_LIMIT + 2;
+            const visibleIds = Array.from({ length: count }, (_, index) => `visible-${index}`);
+            const serve = async () => {
+                const messages = visibleIds.map(
+                    (id) =>
+                        ({
+                            info: { id, role: "user" },
+                            parts: [{ type: "text", text: replayPrompt }],
+                        }) as MessageLike,
+                );
+                await runPostTransformPhase(
+                    basePostTransformArgs(fixture.db, fixture.sessionId, messages),
+                );
+                return JSON.stringify(messages);
+            };
+            try {
+                for (const [index, messageId] of visibleIds.entries())
+                    replayStorage.appendAutoSearchHintDecision(
+                        fixture.db,
+                        fixture.sessionId,
+                        index === 0
+                            ? {
+                                  messageId,
+                                  decision: "hint",
+                                  text: "\n\n<ctx-search-hint>stable cap-boundary hint</ctx-search-hint>",
+                              }
+                            : { messageId, decision: "no-hint", reason: "error" },
+                    );
+                const first = await serve();
+                expect(first).toContain("stable cap-boundary hint");
+                const retired = replayStorage.flushAutoSearchHintDecisionRetirement(
+                    fixture.db,
+                    fixture.sessionId,
+                    new Set(visibleIds),
+                );
+                expect(await serve()).toBe(first);
+                expect(retired).toBe(0);
+                expect(
+                    replayStorage.getAutoSearchHintDecisions(fixture.db, fixture.sessionId),
+                ).toHaveLength(count);
+            } finally {
+                fixture.close();
+            }
+        });
+    });
 }
 
 describe("postprocess replay-or-refuse", () => {
@@ -4420,6 +4604,63 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             hardSignals: BASE_HARD,
         });
     }
+
+    it("consumes an OpenCode flush on a hard fold and replays the next defer byte-identically", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "oc-fold-flush-defer";
+        materializeBaseline(sessionId);
+        insertTag(db, sessionId, "drop-call", "tool", 1000, 1, 0, "bash", 0, "drop-owner");
+        padRecentToolSkeletonWindow(sessionId, 1);
+        queuePendingOp(db, sessionId, 1, "drop");
+        const pendingMaterializationSessions = new Set([sessionId]);
+        const lines: string[] = [];
+        const log = spyOn(loggerModule, "sessionLog").mockImplementation((_id, ...values) => {
+            lines.push(values.join(" "));
+        });
+        const pass = async () => {
+            const message = makeToolMessage("drop-owner");
+            const messages = [
+                message,
+                {
+                    info: { id: "live-user", role: "user" },
+                    parts: [{ type: "text", text: "retained tail" }],
+                } as MessageLike,
+            ];
+            const targets = new Map([[1, makeDropTarget(message)]]);
+            applyFlushedStatuses(sessionId, db, targets, getTagsBySession(db, sessionId));
+            const result = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    targets,
+                    pendingMaterializationSessions,
+                    resolvedProviderID: "anthropic",
+                    m0M1: {
+                        projectPath: FOLD_PROJECT,
+                        projectDirectory: FOLD_PROJECT,
+                        historyBudgetTokens: 98_000,
+                        hardSignals: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
+                    },
+                }),
+            );
+            return { result, wire: JSON.stringify(messages) };
+        };
+        try {
+            const fold = await pass();
+            expect(fold.result.materialized).toBe(true);
+            expect(lines).toContain(
+                "heuristics WILL RUN — reason=explicit_flush, context=20.0%, turn=null",
+            );
+            expect(getPendingOps(db, sessionId)).toHaveLength(0);
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
+            lines.length = 0;
+            const defer = await pass();
+            expect(defer.result.materialized).toBe(false);
+            expect(lines).toContain("heuristics WILL NOT RUN — reason=scheduler_defer");
+            expect(defer.wire).toBe(fold.wire);
+        } finally {
+            log.mockRestore();
+        }
+    });
 
     it("review regression: executed fold must retire the held historian row it actually trims", async () => {
         db = new Database(":memory:");

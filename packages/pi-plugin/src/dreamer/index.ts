@@ -65,6 +65,7 @@ export interface PiDreamerOptions {
 	 */
 	memoryEnabled: boolean;
 	retinaHandoff?: boolean;
+	smartNotesEnabled?: boolean;
 	mural?: { enabled: boolean };
 	language?: string;
 	gitCommitIndexing: {
@@ -155,7 +156,19 @@ export function validatePiDreamerModels(
 			let available = resolved.get(model);
 			if (available === undefined) {
 				available = isPiModelRegistered(model, registry, harness);
-				resolved.set(model, available);
+				// Positives only. OMP hydrates discovery-backed providers such as
+				// `litellm` from a fire-and-forget boot refresh that the startup
+				// path never awaits (config/model-registry.ts
+				// `#refreshRuntimeDiscoveries`, main.ts `refreshInBackground`), and
+				// extension `registerProvider` calls are themselves queued until
+				// after extension loading -- so a miss during registration usually
+				// means "not yet", not "absent". Remembering the miss pinned the
+				// historian off for the whole process even after the model became
+				// visible; OMP's own consumers re-check after awaiting instead
+				// (session/agent-session.ts `#retryInactiveAdvisorAfterModelDiscovery`).
+				// A genuinely absent model costs one extra `find()` per re-resolution,
+				// which happens per transform pass.
+				if (available) resolved.set(model, available);
 			}
 			if (available) return true;
 			if (!warnedUnknownModels.has(model)) {
@@ -306,6 +319,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		memoryEnabled: opts.memoryEnabled,
 		embeddingConfig: opts.embeddingConfig,
 		retinaHandoff: opts.retinaHandoff,
+		smartNotesEnabled: opts.smartNotesEnabled,
 		mural: opts.mural,
 		ensureRegistered: ensureProjectRegisteredFromPiDirectory,
 		// Pi retrospectives read JSONL messages and context.db activity, not
@@ -372,6 +386,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 							dreamerConfig,
 							manualOpts.harness,
 							manualOpts.language,
+							manualOpts.smartNotesEnabled,
 						),
 						manualOpts.modelRegistry,
 						manualOpts.harness,
@@ -380,6 +395,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 						dreamerConfig,
 						manualOpts.harness,
 						manualOpts.language,
+						manualOpts.smartNotesEnabled,
 					),
 			executor: createDreamTaskExecutor({
 				client: manualClient as never,
@@ -394,6 +410,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				language: manualOpts.language,
 				retinaHandoff: manualOpts.retinaHandoff,
+				smartNotesEnabled: manualOpts.smartNotesEnabled,
 				mural,
 			}),
 			task,

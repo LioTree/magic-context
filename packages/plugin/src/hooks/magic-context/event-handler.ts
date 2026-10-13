@@ -45,6 +45,7 @@ import {
 } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage, SessionMeta } from "../../features/magic-context/types";
 import { captureWindowReport } from "../../features/magic-context/window-report-ledger";
+import { forgetUnpublishedAutoSearchNoHint } from "../../shared/auto-search-lifecycle";
 import { log, sessionLog } from "../../shared/logger";
 import {
     getSdkContextLimit,
@@ -88,6 +89,7 @@ import {
     findLastAssistantModelFromOpenCodeDb,
     observeOpenCodeTurnEvent,
 } from "./read-session-db";
+import { forgetRawSessionOrdinalWatermark } from "./read-session-raw";
 import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
 import { type NotificationParams, sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute } from "./sentinel";
@@ -213,7 +215,7 @@ function cleanupRemovedMessageState(
     sessionId: string,
     messageId: string,
 ): MessageRemovedCleanupResult {
-    return deps.db
+    const result = deps.db
         .transaction(() => {
             const removedTagNumbers = deleteTagsByMessageId(deps.db, sessionId, messageId);
             deleteTemporalDecision(deps.db, sessionId, messageId);
@@ -289,6 +291,8 @@ function cleanupRemovedMessageState(
             };
         })
         .immediate();
+    forgetUnpublishedAutoSearchNoHint(sessionId, messageId);
+    return result;
 }
 
 export function createEventHandler(deps: EventHandlerDeps) {
@@ -1168,6 +1172,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             dropSlot(info.sessionID, "message.removed");
+            // A removal can shift the canonical ordinal of every later message.
+            forgetRawSessionOrdinalWatermark(info.sessionID);
             deps.onRustWireInvalidated?.(info.sessionID);
             sessionLog(
                 info.sessionID,
@@ -1292,7 +1298,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     // clearSession's session_meta DELETE wipes it automatically — no
                     // separate CAS-clear needed here.
                     removeCompactionMarkerForSession(deps.db, sessionId);
-                    clearSession(deps.db, sessionId, deps.rustSessionCleanup === true);
+                    clearSession(deps.db, sessionId, deps.rustSessionCleanup === true, true);
                 }
             } catch (error) {
                 sessionLog(sessionId, "event session.deleted persistence failed:", error);

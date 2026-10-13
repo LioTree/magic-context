@@ -8,6 +8,10 @@ use subc_protocol::manifest::{
 };
 use subc_protocol::RouteTarget;
 
+#[cfg(test)]
+#[path = "../tests/support/executable.rs"]
+mod executable_staging;
+
 use crate::config::ConfiguredRunners;
 use crate::historian_runner::HistorianRunnerKind;
 
@@ -210,6 +214,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use super::executable_staging;
     use super::*;
 
     #[test]
@@ -496,23 +501,15 @@ mod tests {
         fs::create_dir_all(&scratch_parent).unwrap();
         let dir = tempfile::tempdir_in(scratch_parent).unwrap();
         let root = dir.path();
-        let dev_binaries = root.join("bin");
-        fs::create_dir_all(&dev_binaries).unwrap();
-        for (source_name, dev_name) in [("ck-subc", "ckdev-subc"), ("ck-mc", "ckdev-mc")] {
-            let source = binaries.join(source_name);
-            let destination = dev_binaries.join(dev_name);
-            // A copy, never a hard link: on macOS a daemon exec'd through a hard link
-            // to cargo's output was occasionally SIGKILLed at startup; a copy never was.
-            fs::copy(&source, &destination)
-                .map(|_| ())
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "failed to stage {} as {}: {error}",
-                        source.display(),
-                        destination.display()
-                    )
-                });
-        }
+        let daemon_binary = executable_staging::stage_executable(
+            &binaries.join("ck-subc"),
+            "ckdev-subc",
+            "ck-subc",
+        )
+        .unwrap();
+        let module_binary =
+            executable_staging::stage_executable(&binaries.join("ck-mc"), "ckdev-mc", "ck-mc")
+                .unwrap();
         for name in ["config/cortexkit", "data", "runtime", "project"] {
             fs::create_dir_all(root.join(name)).unwrap();
         }
@@ -553,8 +550,8 @@ mod tests {
             String::from_utf8_lossy(&provisioned.stdout),
             String::from_utf8_lossy(&provisioned.stderr)
         );
-        let command = |name: &str| {
-            let mut command = Command::new(dev_binaries.join(name));
+        let command = |binary: &Path| {
+            let mut command = Command::new(binary);
             command
                 .current_dir(workspace)
                 .env("XDG_CONFIG_HOME", root.join("config"))
@@ -571,13 +568,12 @@ mod tests {
                 .stderr(Stdio::inherit());
             command
         };
-        let mut daemon = Process(
-            command("ckdev-subc")
-                .env("SUBC_PORT", "0")
-                .env("SUBC_CGROUP_PLACEMENT", "disabled")
-                .spawn()
-                .unwrap(),
-        );
+        let mut daemon_command = command(&daemon_binary);
+        daemon_command
+            .env("SUBC_PORT", "0")
+            .env("SUBC_CGROUP_PLACEMENT", "disabled");
+        let mut daemon =
+            Process(executable_staging::retry_spawn(|| daemon_command.spawn()).unwrap());
         let connection_file = root.join("runtime/subc-connection.json");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         while !connection_file.is_file() {
@@ -591,13 +587,10 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let mut module = Process(
-            command("ckdev-mc")
-                .arg("--subc")
-                .arg(&connection_file)
-                .spawn()
-                .unwrap(),
-        );
+        let mut module_command = command(&module_binary);
+        module_command.arg("--subc").arg(&connection_file);
+        let mut module =
+            Process(executable_staging::retry_spawn(|| module_command.spawn()).unwrap());
         let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
             .await
             .unwrap();
