@@ -1,0 +1,16 @@
+warning: unused variable: `answer`
+   --> crates/mc-module/src/providers/compaction.rs:524:13
+    |
+524 |         let answer = compact::answer::StepAnswer::Refuse {
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_answer`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mc-module` (lib test) generated 1 warning (run `cargo fix --lib -p mc-module --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (/run/motor/target/debug/deps/mc_module-5ca59ececab7f8a0)
+
+thread 'providers::compaction::terminal_refusal_tests::protected_tail_refusal_precedes_outage_pass_and_never_publishes_a_view' (87) panicked at crates/mc-module/src/providers/compaction.rs:3548:17:
+typed engine refusal became an outage
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p mc-module --lib`

@@ -1,0 +1,196 @@
+rustc 1.99.0 (b940084d7 2026-09-28)
+cargo 1.99.0 (5f94df478 2026-08-27)
+
+running 170 tests
+test providers::cc_step_lane_review::duplicate_content_cannot_edit_bytes_before_effective_kept_thinking ... ignored, known duplicate-content signed-prefix defect at 67a49551e3
+test providers::cc_step_lane_review::duplicate_content_cannot_hide_transport_marker ... ignored, known shadowed transport-marker admission defect at 67a49551e3
+test providers::cc_step_lane_review::duplicate_text_splice_must_change_effective_text_or_refuse ... ignored, known duplicate-text splice defect at 67a49551e3
+test providers::cache_policy::tests::marker_intents_preserve_absent_provider_default_and_authored ... ok
+test providers::cache_policy::tests::head_identity_hashes_actual_raw_bytes_and_survives_delta_only_changes ... ok
+test providers::cc_step_lane_review::marker_tool_inputs_and_unknown_blocks_are_kept ... ok
+test providers::cc_step_lane_review::marker_transport_positions_are_exhaustively_refused ... ok
+test providers::cc_step_lane_review::raw_canonical_control_has_no_noncanonical_bytes ... ok
+test providers::cc_step_lane_review::whole_message_cuts_and_opaque_thinking_preserve_fences ... ok
+test providers::claude_code_tests::cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes ... ok
+test providers::claude_code_tests::cc_frozen_plan_session_harness_and_raw_mid_are_fenced ... ok
+test providers::claude_code_tests::cc_hook_pass_is_durable_and_raw_retries_do_not_rewrite_signed_bytes ... ok
+test providers::cc_step_lane_review::admission_spoofs_and_rebind_matrix ... ok
+test providers::claude_code_tests::cc_required_head_edit_before_kept_thinking_is_terminal_not_hook_pass ... ok
+test providers::codec::dispatch_tests::serializer_profile_dispatch_preserves_the_strict_broca_default ... ok
+test providers::codec::dispatch_tests::unknown_serializer_profile_refuses_invalid_params_with_field ... ok
+test providers::codec_claude_code::tests::complete_signed_tool_run_can_be_covered_but_split_or_tail_removal_refuses ... ok
+test providers::codec_claude_code::tests::every_kept_signed_prefix_is_fenced_including_historical_turns ... ok
+test providers::codec_claude_code::tests::identical_signed_messages_remain_distinct_by_gateway_mid ... ok
+test providers::codec_claude_code::tests::opaque_native_thinking_shapes_still_fence_their_signed_prefix ... ok
+test providers::codec_claude_code::tests::raw_provenance_and_transport_markers_are_required ... ok
+test providers::codec_claude_code::tests::real_claude_code_capture_roundtrips_actual_raw_replacement_bytes ... ok
+test providers::codec_claude_code::tests::synthetic_noncanonical_signed_redacted_scalar_and_opaque_roundtrip ... ok
+test providers::codec_opencode::tests::opencode_fixture_views_round_trip_byte_identically_without_ops_or_engine_changes ... ok
+test providers::codec_opencode::tests::opencode_ingress_keeps_distinct_parts_with_a_repeated_tool_call_id ... ok
+test providers::codec_opencode::tests::opencode_ingress_rejects_malformed_envelopes_and_conflicting_native_ids ... ok
+test providers::codec_opencode::tests::opencode_ingress_uses_runner_ordinals_and_ck_block_indexes_not_native_part_indexes ... ok
+test providers::codec_opencode::tests::opencode_rendering_rejects_a_mismatched_engine_profile_or_missing_sidecar ... ok
+test providers::codec_opencode::tests::opencode_rendering_updates_only_unsigned_target_text_and_tool_output ... ok
+test providers::codec_opencode::tests::opencode_source_identities_match_legacy_tool_ingress ... ok
+test providers::codec_opencode::tests::opencode_source_identities_still_detect_tool_content_drift ... ok
+test providers::compaction::compaction_review_tests::acknowledgement_with_a_foreign_compaction_id_cannot_apply_a_view ... ok
+test providers::cc_step_lane_review::provider_committed_replacement_keeps_noncanonical_unsigned_tail ... ok
+test providers::claude_code_tests::cc_principal_and_profile_pair_are_both_required_and_body_cannot_spoof ... ok
+test providers::compaction::compaction_review_tests::final_history_gap_refuses_before_promote_and_burn ... ok
+test providers::compaction::compaction_review_tests::missing_cached_m1_repair_cannot_be_skipped ... ok
+test providers::compaction::compaction_review_tests::module_ahead_descent_after_restart_burns_stranded_tags_without_rewriting_the_view ... ok
+test providers::compaction::compaction_review_tests::first_historian_publication_matches_the_real_full_request_engine ... ok
+test providers::compaction::compaction_review_tests::r3_nonfinal_bootstrap_with_hook_complete_history_waits_without_engine ... ok
+test providers::compaction::compaction_review_tests::r3_pipeline_switch_does_not_exempt_module_render_epoch ... ok
+test providers::compaction::compaction_review_tests::r3_recomp_reset_summary_agrees_with_full_core ... ok
+test providers::compaction::compaction_review_tests::r3_upgrade_epoch_cannot_be_skipped_by_host_preflight ... ok
+test providers::compaction::compaction_review_tests::r3_upgrade_identity_change_is_not_transport_adoption ... ok
+test providers::compaction::compaction_review_tests::r73_late_transport_copy_cannot_hide_independent_model_rebuild ... ok
+test providers::compaction::compaction_review_tests::r73_late_view_without_pipeline_switch_cannot_hide_independent_model_rebuild ... ok
+test providers::compaction::compaction_review_tests::soft_plus_pipeline_switch_preserves_the_full_request_head_bytes ... ok
+test providers::compaction::compaction_review_tests::structural_rejected_view_cannot_be_acknowledged_on_a_later_pass ... ok
+test providers::compaction::host_tests::conflicting_status_refuses_messages_before_promotion_or_burn ... ok
+test providers::compaction::host_tests::coverage_names_the_published_boundary_only_on_a_replacement ... ok
+test providers::compaction::host_tests::descent_keeps_view_at_boundary_and_rebuilds_when_cut_inside ... ok
+test providers::compaction::host_tests::engine_rebase_preserves_boundary_views_and_invalidates_inner_cuts ... ok
+test providers::compaction::host_tests::executed_host_drops_leave_the_provider_queue_and_do_not_reapply ... ok
+test providers::compaction::host_tests::fast_noop_does_not_read_rebuild_payloads_or_commit_frozen_state ... ok
+test providers::compaction::host_tests::fast_path_exhaustive_six_input_table_never_skips_an_opportunity ... ok
+test providers::compaction::compaction_review_tests::pressure_flush_model_and_cold_match_the_real_engine_with_queued_drops_and_historian_veto ... ok
+test providers::compaction::host_tests::fast_path_never_skips_any_engine_hard_or_soft_classifier_trigger ... ok
+test providers::compaction::host_tests::host_cold_signal_folds_below_threshold_without_changing_setup_or_broca_ttl ... ok
+test providers::compaction::host_tests::host_engine_runs_and_saves_only_in_the_conversation_namespace ... ok
+test providers::compaction::host_tests::host_setup_requires_both_opt_ins_and_refuses_runner_spoofing ... ok
+test providers::compaction::host_tests::model_switch_uses_current_step_model_and_matches_full_request_bytes ... ok
+test providers::compaction::host_tests::no_exact_hook_plan_late_hard_and_soft_temporal_views_match_full_engine ... ok
+test providers::compaction::host_tests::paged_bootstrap_wait_releases_lock_and_final_gap_names_first_missing ... ok
+test providers::compaction::host_tests::pipeline_switch_keeps_observed_provider_and_system_identity ... ok
+test providers::compaction::host_tests::published_trimmed_prefix_bootstraps_then_flushes_like_full_request ... ok
+test providers::compaction::host_tests::real_state_trigger_bootstrap ... ok
+test providers::compaction::host_tests::real_state_trigger_cached_m1_repair ... ok
+random seed=0x4d345233 passes=240 event counts=[24, 32, 34, 35, 37, 32, 22, 24] mismatches=0
+test providers::compaction::compaction_review_tests::r3_randomized_host_full_engine_240_passes ... ok
+test providers::compaction::host_tests::real_state_trigger_durable_flush ... ok
+test providers::compaction::host_tests::real_state_trigger_emergency_band ... ok
+test providers::compaction::host_tests::real_state_trigger_external_revision ... ok
+test providers::compaction::host_tests::real_state_trigger_first_publication ... ok
+test providers::compaction::host_tests::real_state_trigger_force_band ... ok
+test providers::compaction::host_tests::real_state_trigger_idle_expiry ... ok
+test providers::compaction::host_tests::real_state_trigger_legacy_migration ... ok
+test providers::compaction::host_tests::real_state_trigger_model_identity ... ok
+test providers::compaction::host_tests::real_state_trigger_previous_module_epoch ... ok
+test providers::compaction::host_tests::real_state_trigger_project_memory_epoch ... ok
+test providers::compaction::host_tests::real_state_trigger_protection_snapshot_survives_preflight ... ok
+test providers::compaction::host_tests::real_state_trigger_reconcile_rematerialization ... ok
+test providers::compaction::host_tests::real_state_trigger_soft_m1_delta ... ok
+test providers::compaction::host_tests::real_state_trigger_soft_reduction ... ok
+test providers::compaction::host_tests::real_state_trigger_unknown_shape_refusal ... ok
+test providers::compaction::host_tests::rebuild_keeps_pre_switch_tag_numbers_and_does_not_mint_raw_fallback_tags ... ok
+test providers::compaction::host_tests::rebuild_replacement_equals_hook_served_bytes_with_one_overlay_tag_per_block ... ok
+test providers::compaction::host_tests::restart_resumes_bootstrap_pages_without_reads_and_setup_reentry_keeps_frozen_view ... ok
+test providers::compaction::host_tests::setup_is_nonmutating_on_full_request_state_and_never_reads_a_host ... ok
+test providers::compaction::host_tests::step_gaps_use_held_history_not_the_claimed_status_cursor ... ok
+test providers::compaction::terminal_refusal_tests::unrelated_engine_errors_remain_transient_not_terminal_refusals ... ok
+test providers::compaction::terminal_refusal_tests::protected_tail_refusal_precedes_outage_pass_and_never_publishes_a_view ... ok
+test providers::policy_summary::review_tests::a_hook_failing_after_the_summary_write_rolls_the_summary_back ... ok
+test providers::policy_summary::review_tests::an_unparsable_summary_is_rebuilt_not_replayed ... ok
+test providers::policy_summary::review_tests::changing_the_kind_flip_row_otherwise_replays_exactly ... ok
+test providers::policy_summary::review_tests::changing_the_moved_row_through_policy_json_replays_exactly ... ok
+test providers::policy_summary::review_tests::consuming_a_shared_tag_replays_both_conversations_exactly ... ok
+test providers::compaction::host_tests::fast_path_matches_full_engine_across_pressure_rebuild_rejection_and_flush ... ok
+test providers::policy_summary::review_tests::consuming_the_same_numbers_in_the_own_namespace_replays_exactly ... ok
+test providers::policy_summary::review_tests::differential_detects_a_tampered_summary ... ok
+test providers::policy_summary::review_tests::kind_flip_is_seen_by_the_replay ... ok
+test providers::policy_summary::review_tests::namespace_switch_is_seen_by_the_replay ... ok
+test providers::policy_summary::review_tests::change_log_cap_replays_at_4096_and_rebuilds_at_4097 ... ok
+test providers::policy_summary::review_tests::row_column_moves_are_seen_by_the_replay ... ok
+test providers::records::namespace_tests::compatibility_save_preserves_host_namespace_and_creates_broca_hash_namespace ... ok
+test providers::records::tests::frontier_starts_at_the_absolute_bootstrap_ordinal ... ok
+test providers::records::tests::held_ordinal_with_another_mid_refuses_by_field ... ok
+test providers::step_transform::confirmation_tests::host_confirmation_is_newest_bounded_monotonic_and_only_descent_clamps ... ok
+test providers::step_transform::golden_tests::owned_broca_declaration_and_hook_corpus_remain_byte_identical ... ok
+test providers::step_transform::host_tests::assistant_text_and_two_repeated_call_id_parts_keep_three_answers_and_one_ingest ... ok
+test providers::step_transform::host_tests::channel1_cadence_and_temporal_bytes_equal_engine_policy_on_corpus ... ok
+test providers::step_transform::host_tests::consumed_hook_tag_is_refused_after_answer_row_deletion ... ok
+test providers::step_transform::host_tests::conversations_run_concurrently_and_same_conversation_setup_step_and_work_serialize ... ok
+test providers::step_transform::host_tests::host_admission_uses_bind_and_frozen_plan_never_body_harness ... ok
+test providers::step_transform::host_tests::host_tags_use_engine_numbers_kinds_blocks_and_overlay_bytes ... ok
+test providers::step_transform::host_tests::pre_switch_engine_tag_from_another_namespace_is_refused ... ok
+test providers::step_transform::host_tests::pre_switch_engine_tags_queue_in_full_request_delivery_lane ... ok
+test providers::step_transform::host_tests::state_sync_records_chain_and_barrier_and_provider_reduce_routes_pending_not_burned_tags ... ok
+test providers::step_transform::host_tests::unserved_subjects_burn_before_promotion_and_descents_burn_only_discarded_suffix ... ok
+test providers::step_transform::overlay_parity_tests::host_temporal_prefix_and_user_hint_match_engine_bytes ... ok
+test providers::step_transform::parity_tests::admitted_pass_followed_by_hook_timeout_has_no_phantom_tag_or_cadence ... ok
+test providers::step_transform::parity_tests::bounded_policy_summary_does_not_return_the_entire_known_metadata_lineage ... ok
+test providers::step_transform::parity_tests::emit_pre_extraction_reference ... ignored, explicit pre-extraction corpus generator
+test providers::step_transform::parity_tests::exact_hard_model_adoption_shows_and_omits_reminders_like_full_engine ... ok
+test providers::cc_step_lane_review::raw_fuzz_setup_step_admission_hook_and_identity_replacement has been running for over 60 seconds
+test providers::policy_summary::review_tests::out_of_band_writes_replay_equals_full_computation_over_600_sequences has been running for over 60 seconds
+test providers::policy_summary::review_tests::production_writes_replay_equals_full_computation_over_600_sequences has been running for over 60 seconds
+test providers::step_transform::parity_tests::frozen_non_neutral_calibration_matches_full_engine_policy_corpus has been running for over 60 seconds
+overlay parity: queued=false, calibrated=true, 4 seeds [329619728, 1925055519, 3405678354, 3490530309], 96 passes, 2788 per-message byte comparisons
+test providers::step_transform::parity_tests::frozen_non_neutral_calibration_matches_full_engine_policy_corpus ... ok
+test providers::step_transform::parity_tests::frozen_reductions_coverage_and_calibration_reuse_the_engine_measurement ... ok
+test providers::step_transform::parity_tests::late_hard_view_covers_new_users_and_renders_full_engine_temporal_marker ... ok
+test providers::step_transform::parity_tests::measure_alf_sized_full_metadata_walk_per_hook_and_three_hook_pass ... ignored, manual correctness-stage walk measurement; performance/enablement gate remains closed
+test providers::step_transform::parity_tests::no_exact_plan_is_defer_even_if_a_preflight_candidate_claims_hard ... ok
+policy hook SQLite steps: rebuild=[365517, 6179917] worst ordinary=[5908, 5908]
+test providers::step_transform::parity_tests::ordinary_hook_store_reads_do_not_grow_with_the_session ... ok
+test providers::step_transform::parity_tests::pass_ingest_is_once_and_changed_hook_ingest_refuses_by_message_name ... ok
+test providers::step_transform::parity_tests::queued_tool_and_sibling_text_releases_match_full_engine_grace_and_oldest_hints has been running for over 60 seconds
+test providers::cc_step_lane_review::raw_fuzz_setup_step_admission_hook_and_identity_replacement ... ok
+out-of-band: 600 sequences, 10488 hooks, 4004 replayed and compared, 0 mismatching sequences
+test providers::policy_summary::review_tests::out_of_band_writes_replay_equals_full_computation_over_600_sequences ... ok
+production: 600 sequences, 10413 hooks, 4651 replayed and compared, 0 mismatching sequences
+test providers::policy_summary::review_tests::production_writes_replay_equals_full_computation_over_600_sequences ... ok
+overlay parity: queued=true, calibrated=false, 4 seeds [329619728, 1925055519, 3405678354, 3490530309], 96 passes, 2788 per-message byte comparisons
+test providers::step_transform::parity_tests::queued_tool_and_sibling_text_releases_match_full_engine_grace_and_oldest_hints ... ok
+test providers::step_transform::review_tests::r2_model_switch_reminder_uses_the_exact_pass_calibration ... ok
+test providers::step_transform::review_tests::r2_replayed_served_hook_does_not_resurrect_a_consumed_drop ... ok
+test providers::step_transform::review_tests::r2_temporal_plan_must_belong_to_the_current_hook_pass ... ok
+test providers::step_transform::review_tests::r2_three_tool_appends_use_full_pass_protection_and_carrier ... ok
+test providers::step_transform::review_tests::review_burning_an_earlier_answer_removes_its_inherited_cadence_effect ... ok
+test providers::step_transform::review_tests::review_channel1_aggregate_respects_the_engine_protected_token_window ... ok
+test providers::step_transform::review_tests::review_channel1_reminder_keeps_the_engine_oldest_tag_hint ... ok
+test providers::step_transform::review_tests::review_conflict_is_side_effect_free_and_descent_burns_the_stranded_answer ... ok
+test providers::step_transform::review_tests::review_disabled_auto_search_produces_no_hint_like_full_engine ... ok
+test providers::step_transform::review_tests::review_hint_excludes_fragments_already_rendered_in_the_memory_head ... ok
+test providers::step_transform::review_tests::review_hint_only_targets_the_physical_user_tail_of_a_multi_append_pass ... ok
+test providers::step_transform::review_tests::review_state_sync_busy_refusal_does_not_commit_half_the_sync ... ok
+test providers::step_transform::review_tests::review_temporal_gap_uses_previous_created_time_when_no_completion_exists ... ok
+test providers::tests::abandoned_hook_tags_are_burned_and_cadence_does_not_advance ... ok
+test providers::tests::allocated_unsent_work_is_retried_above_its_version_without_runner_rejection ... ok
+test providers::tests::broca_real_messages_round_trip_byte_exactly ... ok
+test providers::tests::catalog_and_hook_high_water_survive_a_fresh_handler ... ok
+test providers::tests::codec_rejects_unknown_fields_and_blocks_instead_of_dropping_them ... ok
+test providers::tests::declaration_is_pure_and_first_hook_needs_no_setup ... ok
+test providers::tests::describe_envelopes_are_identical_and_manifest_methods_are_not_tools ... ok
+test providers::tests::every_declared_hook_is_advisory_and_within_broca_budget_cap ... ok
+test providers::tests::fault_points_match_the_pinned_role_vocabulary ... ok
+test providers::tests::incomplete_scan_is_retryable_and_suppresses_cadence_appends ... ok
+test providers::tests::post_assistant_addresses_text_blocks_and_never_nontext_parts ... ok
+test providers::tests::provider_methods_refuse_unbound_and_empty_handles_and_missing_harness ... ok
+test providers::tests::reminder_on_second_page_is_observed_once_and_no_read_when_not_due ... ok
+test providers::tests::setup_is_pure_repeatable_project_bound_and_durable ... ok
+test providers::tests::tags_become_live_on_second_page_and_drops_survive_restart ... ok
+test providers::tests::validator_keeps_carried_cache_markers_but_refuses_unknown_output_fields ... ok
+test providers::tests::validator_preserves_carried_origin_and_omits_authored_origin ... ok
+test providers::tests::validator_refuses_authored_cache_prefix_blocks ... ok
+test providers::tests::validator_refuses_authored_signed_or_encrypted_reasoning ... ok
+test providers::tests::validator_refuses_missing_reversed_and_interrupted_tool_pairs ... ok
+test providers::tests::validator_refuses_system_messages ... ok
+test providers::tests::wait_ready_names_request_only_after_durable_work_and_versions_resume ... ok
+test providers::step_transform::parity_tests::r2_published_hard_failures_and_new_seeded_switch_controls_match_full_engine has been running for over 60 seconds
+r2 HARD companion: 29 published failures plus19 NEW controls, seed=0x3e9bc027,48 passes,113 exact new-message comparisons
+test providers::step_transform::parity_tests::r2_published_hard_failures_and_new_seeded_switch_controls_match_full_engine ... ok
+test providers::step_transform::parity_tests::r2_review_720_pass_differential_with_new_seeds_and_real_reduce has been running for over 60 seconds
+test providers::step_transform::parity_tests::randomized_and_adversarial_host_overlay_bytes_equal_full_engine_and_pre_extraction_corpus has been running for over 60 seconds
+overlay parity: queued=false, calibrated=false, 4 seeds [329619728, 1925055519, 3405678354, 3490530309], 96 passes, 2788 per-message byte comparisons
+test providers::step_transform::parity_tests::randomized_and_adversarial_host_overlay_bytes_equal_full_engine_and_pre_extraction_corpus ... ok
+overlay parity: queued=false, calibrated=false, 4 seeds [2175533091, 1369338528, 2620653922, 2701645969], 240 passes, 15660 per-message byte comparisons
+overlay parity: queued=true, calibrated=false, 4 seeds [2175533091, 1369338528, 2620653922, 2701645969], 240 passes, 15660 per-message byte comparisons
+overlay parity: queued=false, calibrated=true, 4 seeds [2175533091, 1369338528, 2620653922, 2701645969], 240 passes, 15660 per-message byte comparisons
+r2 review append differential: 720 passes, 46980 per-message comparisons, 2116 checked summary replays, seeds=[81ac0023, 519e72a0, 9c340162, a107d891]
+test providers::step_transform::parity_tests::r2_review_720_pass_differential_with_new_seeds_and_real_reduce ... ok
+
+test result: ok. 165 passed; 0 failed; 5 ignored; 0 measured; 1809 filtered out; finished in 1347.51s
