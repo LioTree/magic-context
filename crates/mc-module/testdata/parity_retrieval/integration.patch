@@ -1,0 +1,60 @@
+diff --git a/crates/mc-module/src/retrieval/mod.rs b/crates/mc-module/src/retrieval/mod.rs
+--- a/crates/mc-module/src/retrieval/mod.rs
++++ b/crates/mc-module/src/retrieval/mod.rs
+@@ -4,6 +4,8 @@
+ //! search backend does not call this extension; UnavailableLane below continues
+ //! to report that semantic retrieval lanes have not been implemented.
+
++pub use crate::memory_tool::{compartments, hybrid};
++
+ pub mod embedding_provider;
+
+ use crate::parity_contract::*;
+diff --git a/crates/mc-module/src/lib.rs b/crates/mc-module/src/lib.rs
+--- a/crates/mc-module/src/lib.rs
++++ b/crates/mc-module/src/lib.rs
+@@ -14023,7 +14023,7 @@
+         }
+         let limit = usize_arg(args, "limit")
+             .filter(|value| *value > 0)
+-            .unwrap_or(8)
++            .unwrap_or(10)
+             .clamp(1, 25);
+         let from_ms = match parse_search_date_bound(args, "from", false) {
+             Ok(value) => value,
+@@ -17311,6 +17311,35 @@ fn render_facade_search_results(
+     diagnostics: &memory_tool::MemorySearchDiagnostics,
+     current_session_id: &str,
+     workspace_membership: Option<&mc_store::WorkspaceMembership>,
++) -> String {
++    let mut rendered = render_facade_search_results_body(
++        query,
++        results,
++        diagnostics,
++        current_session_id,
++        workspace_membership,
++    );
++    for (component, availability) in &diagnostics.source_availability {
++        use crate::parity_contract::Availability;
++        let (status, reason) = match availability {
++            Availability::Available => continue,
++            Availability::Degraded { reason } => ("degraded", reason),
++            Availability::Unavailable { reason } => ("unavailable", reason),
++        };
++        rendered.push_str(&format!(
++            "\n\nSearch {component} {status}: {} ({})",
++            reason.message, reason.code,
++        ));
++    }
++    rendered
++}
++
++fn render_facade_search_results_body(
++    query: &str,
++    results: &[memory_tool::MemorySearchResult],
++    diagnostics: &memory_tool::MemorySearchDiagnostics,
++    current_session_id: &str,
++    workspace_membership: Option<&mc_store::WorkspaceMembership>,
+ ) -> String {
+     let visible_ids = &diagnostics.suppressed_visible_memory_ids;
+     if results.is_empty() {

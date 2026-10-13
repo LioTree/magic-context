@@ -16,6 +16,11 @@ use crate::memory_render::MEMORY_CATEGORY_ORDER;
 
 pub use mc_store::FOREIGN_VISIBLE_SQL;
 
+#[path = "retrieval/compartments.rs"]
+pub mod compartments;
+#[path = "retrieval/hybrid.rs"]
+pub mod hybrid;
+
 #[derive(Debug)]
 pub enum MemoryToolError {
     Store(McStoreError),
@@ -151,6 +156,8 @@ pub struct MemorySearchOptions<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemorySearchDiagnostics {
     pub suppressed_visible_memory_ids: Vec<i64>,
+    pub source_availability:
+        std::collections::BTreeMap<String, crate::parity_contract::Availability>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,7 +426,10 @@ pub fn search_available_corpora_for_session_with_diagnostics(
     if query.is_empty() || options.limit == 0 {
         return Ok(MemorySearchOutcome {
             results: Vec::new(),
-            diagnostics: MemorySearchDiagnostics::default(),
+            diagnostics: MemorySearchDiagnostics {
+                source_availability: legacy_search_availability(options),
+                ..Default::default()
+            },
         });
     }
 
@@ -496,6 +506,7 @@ pub fn search_available_corpora_for_session_with_diagnostics(
         results: ranked.into_iter().map(|ranked| ranked.result).collect(),
         diagnostics: MemorySearchDiagnostics {
             suppressed_visible_memory_ids,
+            source_availability: legacy_search_availability(options),
         },
     })
 }
@@ -589,6 +600,7 @@ pub fn resolve_memory_ids_for_search_with_diagnostics(
         results: (!results.is_empty()).then_some(results),
         diagnostics: MemorySearchDiagnostics {
             suppressed_visible_memory_ids,
+            source_availability: std::collections::BTreeMap::new(),
         },
     })
 }
@@ -1567,4 +1579,313 @@ mod tests {
             Err(MemoryToolError::EmptyGet)
         ));
     }
+}
+
+fn legacy_search_availability(
+    options: MemorySearchOptions<'_>,
+) -> std::collections::BTreeMap<String, crate::parity_contract::Availability> {
+    use crate::parity_contract::{Availability, CapabilityReason};
+    let mut components = std::collections::BTreeMap::new();
+    if options.include_memories {
+        components.insert(
+            "memory".into(),
+            Availability::Degraded {
+                reason: CapabilityReason {
+                    code: "literal_only".into(),
+                    message: "Legacy memory search has no BM25 ranking or stored vectors".into(),
+                },
+            },
+        );
+    }
+    if options.include_messages {
+        components.insert(
+            "compartment".into(),
+            Availability::Degraded {
+                reason: CapabilityReason {
+                    code: "literal_only".into(),
+                    message: "Legacy compartment search has no chunk vectors".into(),
+                },
+            },
+        );
+        components.insert(
+            "raw_message".into(),
+            mc_store::parity_schema_manifest::unavailable("raw_message"),
+        );
+    }
+    components
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSource {
+    Memory,
+    Message,
+    GitCommit,
+    Primer,
+    Note,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SupportedSearchOptions {
+    pub limit: Option<f64>,
+    pub dates: hybrid::DateBounds,
+    pub sources: Option<Vec<SearchSource>>,
+    pub memory_enabled: bool,
+    pub embedding_enabled: bool,
+    pub max_message_ordinal: Option<i64>,
+}
+
+impl Default for SupportedSearchOptions {
+    fn default() -> Self {
+        Self {
+            limit: None,
+            dates: Default::default(),
+            sources: None,
+            memory_enabled: true,
+            embedding_enabled: true,
+            max_message_ordinal: None,
+        }
+    }
+}
+
+impl SupportedSearchOptions {
+    pub fn limit(&self) -> usize {
+        self.limit
+            .filter(|v| v.is_finite())
+            .unwrap_or(10.0)
+            .floor()
+            .clamp(1.0, 25.0) as usize
+    }
+    fn has(&self, source: SearchSource) -> bool {
+        self.sources
+            .as_ref()
+            .is_none_or(|sources| sources.contains(&source))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchQueryVector {
+    pub identity: crate::parity_contract::EmbeddingIdentity,
+    pub values: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SupportedSearchOutcome {
+    pub results: Vec<hybrid::SearchHit>,
+    pub diagnostics: hybrid::RetrievalDiagnostics,
+}
+
+/// Rank memory and semantic compressed-history lanes. Raw archive fusion,
+/// literal probes and prose reranking are deliberately separate consumers.
+/// A caller may reuse one certified query vector across these two lanes.
+pub fn search_retrieval_inputs(
+    store: &dyn hybrid::RetrievalInputStore,
+    scope: &crate::parity_contract::StoreScope,
+    query: &str,
+    options: &SupportedSearchOptions,
+    query_vector: Option<&SearchQueryVector>,
+) -> SupportedSearchOutcome {
+    use hybrid::{RetrievalDiagnostics, SearchHit};
+    let mut outcome = SupportedSearchOutcome {
+        results: Vec::new(),
+        diagnostics: RetrievalDiagnostics::default(),
+    };
+    let query = hybrid::trim_query(query);
+    let diagnostics = &mut outcome.diagnostics;
+    for (source, name) in [
+        (SearchSource::Message, "raw_message"),
+        (SearchSource::GitCommit, "git_commit"),
+        (SearchSource::Primer, "primer"),
+        (SearchSource::Note, "note"),
+    ] {
+        if options.has(source) {
+            diagnostics.components.insert(
+                name.into(),
+                mc_store::parity_schema_manifest::unavailable(name),
+            );
+        }
+    }
+    if query.is_empty() {
+        return outcome;
+    }
+    let limit = options.limit();
+    let tier_limit = (limit * 3).max(10);
+    let query_vector = query_vector.filter(|v| {
+        options.embedding_enabled
+            && v.identity.model != "off"
+            && v.values.len() == v.identity.dimensions as usize
+            && !v.values.is_empty()
+            && v.values.iter().all(|v| v.is_finite())
+    });
+    if options.embedding_enabled && query_vector.is_none() {
+        diagnostics.components.insert(
+            "query_embedding".into(),
+            mc_store::parity_schema_manifest::unavailable("query_embedding"),
+        );
+    }
+    if options.has(SearchSource::Memory) && options.memory_enabled {
+        let memories = diagnostics.take(
+            "memory_rows",
+            store.read_search_memories(scope, options.dates),
+        );
+        let visible = diagnostics.take("visibility", store.read_visible_memory_ids(scope));
+        let fts = diagnostics
+            .take(
+                "memory_fts",
+                store.search_memory_fts(scope, query, options.dates, hybrid::FTS_CANDIDATE_LIMIT),
+            )
+            .unwrap_or_default();
+        if let (Some(memories), Some(visible)) = (memories, visible) {
+            let vectors = query_vector
+                .and_then(|query| {
+                    diagnostics.take(
+                        "memory_vectors",
+                        store.read_memory_vectors(
+                            scope,
+                            &memories.iter().map(|m| m.id).collect::<Vec<_>>(),
+                            &query.identity,
+                        ),
+                    )
+                })
+                .unwrap_or_default();
+            let (hits, suppressed) = hybrid::rank_memories(
+                &memories,
+                &fts,
+                &vectors,
+                query_vector.map(|q| (&q.identity, q.values.as_slice())),
+                &visible,
+                options.dates,
+                tier_limit,
+            );
+            diagnostics.suppressed_visible_memory_ids = suppressed;
+            outcome
+                .results
+                .extend(hits.into_iter().map(SearchHit::Memory));
+        }
+    }
+    if options.has(SearchSource::Message) && options.embedding_enabled {
+        if let Some(query) = query_vector {
+            if let Some(chunks) = diagnostics.take(
+                "compartment_vectors",
+                store.read_compartment_chunks(scope, options.dates, &query.identity),
+            ) {
+                outcome.results.extend(
+                    compartments::rank_compartments(
+                        &chunks,
+                        scope,
+                        &query.identity,
+                        &query.values,
+                        options.dates,
+                        options.max_message_ordinal,
+                        tier_limit,
+                    )
+                    .into_iter()
+                    .map(SearchHit::Compartment),
+                );
+            }
+        } else {
+            diagnostics.components.insert(
+                "compartment_vectors".into(),
+                mc_store::parity_schema_manifest::unavailable("query_embedding"),
+            );
+        }
+    }
+    hybrid::sort_supported_hits(&mut outcome.results);
+    outcome.results.truncate(limit);
+    outcome
+}
+
+/// Fetch exactly one query embedding through the provider contract. Failure or
+/// stale generation retains FTS recall and explicitly diagnoses degraded semantics.
+pub async fn search_retrieval_inputs_with_provider(
+    store: &dyn hybrid::RetrievalInputStore,
+    provider: &dyn crate::parity_contract::EmbeddingProvider,
+    context: &crate::parity_contract::RequestContext,
+    query: &str,
+    options: &SupportedSearchOptions,
+    identity: &crate::parity_contract::EmbeddingIdentity,
+) -> SupportedSearchOutcome {
+    use crate::parity_contract::*;
+    let scope = context.route.scope();
+    let query = hybrid::trim_query(query);
+    let needs_embedding = options.embedding_enabled
+        && identity.model != "off"
+        && !query.is_empty()
+        && ((options.has(SearchSource::Memory) && options.memory_enabled)
+            || options.has(SearchSource::Message));
+    let mut captured = None;
+    let mut availability = None;
+    if needs_embedding && !context.control.is_cancelled() {
+        let request = EmbeddingRequest {
+            identity: identity.clone(),
+            kind: EmbeddingInputKind::Query,
+            inputs: vec![EmbeddingInput {
+                text: query.into(),
+                source: Provenance {
+                    origin: InputOrigin::Core,
+                    source_id: context.invocation.0.clone(),
+                    source_revision: "query".into(),
+                    content_hash: ContentHash(format!(
+                        "{:x}",
+                        <sha2::Sha256 as sha2::Digest>::digest(query.as_bytes())
+                    )),
+                    generation: scope.generation,
+                    observed_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            }],
+        };
+        let reply = provider.embed(context, &request).await;
+        availability = Some(reply.availability());
+        let value = match reply {
+            CapabilityResult::Available { value } | CapabilityResult::Degraded { value, .. } => {
+                Some(value)
+            }
+            CapabilityResult::Unavailable { .. } => None,
+        };
+        if let Some(value) = value {
+            if value.identity == *identity
+                && value.generation == context.config_generation
+                && value.vectors.len() == 1
+                && value.vectors[0].embedding == *identity
+                && value.vectors[0].values.len() == identity.dimensions as usize
+                && !value.vectors[0].values.is_empty()
+                && value.vectors[0].values.iter().all(|v| v.is_finite())
+            {
+                captured = Some(SearchQueryVector {
+                    identity: identity.clone(),
+                    values: value.vectors[0].values.clone(),
+                });
+            } else {
+                availability = Some(Availability::Degraded { reason: CapabilityReason {
+                    code: "stale_or_invalid_embedding".into(), message: "Query vector does not match the request model, dimensions or generation".into(),
+                }});
+            }
+        }
+    }
+    if context.control.is_cancelled() {
+        return SupportedSearchOutcome {
+            results: Vec::new(),
+            diagnostics: hybrid::RetrievalDiagnostics {
+                suppressed_visible_memory_ids: Vec::new(),
+                components: std::collections::BTreeMap::from([(
+                    "query_embedding".into(),
+                    Availability::Unavailable {
+                        reason: CapabilityReason {
+                            code: "cancelled".into(),
+                            message: "Search was cancelled".into(),
+                        },
+                    },
+                )]),
+            },
+        };
+    }
+    let mut outcome = search_retrieval_inputs(store, scope, query, options, captured.as_ref());
+    if let Some(availability) = availability {
+        outcome
+            .diagnostics
+            .components
+            .insert("query_embedding".into(), availability);
+    }
+    outcome
 }

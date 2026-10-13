@@ -1,0 +1,2214 @@
+{
+  "now": 1768003200000,
+  "project": "git:parity-own",
+  "session": "retrieval-session",
+  "model": "fixture:model",
+  "vector": [
+    1,
+    0,
+    0
+  ],
+  "visible": [
+    1,
+    3
+  ],
+  "baseline": 1,
+  "delta": 3,
+  "stale": 2,
+  "m0": "<session-history></session-history>\n\n<project-memory>\n<ARCHITECTURE>\n#1: queue backpressure baseline already rendered\n#2: queue original text at fold time\n</ARCHITECTURE>\n</project-memory>",
+  "m1": "<session-history-since>\n<new-memories>\n<ARCHITECTURE>\n#3: queue delta already rendered\n</ARCHITECTURE>\n</new-memories>\n</session-history-since>",
+  "cases": [
+    {
+      "name": "hybrid_visibility",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 1,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "bounded drains absorb saturation",
+          "score": 0.7959497511756478,
+          "memoryId": 5,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "pkg::worker.retry() handles transient saturation",
+          "score": 0.7951069873375396,
+          "memoryId": 15,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Saturation and bounded drains",
+          "score": 0.8,
+          "compartmentId": 1,
+          "sessionId": "retrieval-session",
+          "title": "Saturation and bounded drains",
+          "startOrdinal": 1,
+          "endOrdinal": 5,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Same score later ordinal",
+          "score": 0.8,
+          "compartmentId": 2,
+          "sessionId": "retrieval-session",
+          "title": "Same score later ordinal",
+          "startOrdinal": 6,
+          "endOrdinal": 10,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Unrelated title semantic recall",
+          "score": 0.7959497511756478,
+          "compartmentId": 3,
+          "sessionId": "retrieval-session",
+          "title": "Unrelated title semantic recall",
+          "startOrdinal": 11,
+          "endOrdinal": 20,
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.76,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "hybrid",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.75,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated outside interval",
+          "score": 0.7428571428571428,
+          "memoryId": 14,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue corrected text remains searchable",
+          "score": 0.5933333283265432,
+          "memoryId": 2,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        }
+      ],
+      "reported_scores": [
+        "1.00",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.76",
+        "0.75",
+        "0.74",
+        "0.59"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "no_visibility_filter",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": false,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 1,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue delta already rendered",
+          "score": 0.85,
+          "memoryId": 3,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "bounded drains absorb saturation",
+          "score": 0.7959497511756478,
+          "memoryId": 5,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "pkg::worker.retry() handles transient saturation",
+          "score": 0.7951069873375396,
+          "memoryId": 15,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Saturation and bounded drains",
+          "score": 0.8,
+          "compartmentId": 1,
+          "sessionId": "retrieval-session",
+          "title": "Saturation and bounded drains",
+          "startOrdinal": 1,
+          "endOrdinal": 5,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Same score later ordinal",
+          "score": 0.8,
+          "compartmentId": 2,
+          "sessionId": "retrieval-session",
+          "title": "Same score later ordinal",
+          "startOrdinal": 6,
+          "endOrdinal": 10,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Unrelated title semantic recall",
+          "score": 0.7959497511756478,
+          "compartmentId": 3,
+          "sessionId": "retrieval-session",
+          "title": "Unrelated title semantic recall",
+          "startOrdinal": 11,
+          "endOrdinal": 20,
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.76,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "hybrid",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.75,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated outside interval",
+          "score": 0.7428571428571428,
+          "memoryId": 14,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        }
+      ],
+      "reported_scores": [
+        "1.00",
+        "0.85",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.76",
+        "0.75",
+        "0.74"
+      ],
+      "suppressed_visible_memory_ids": []
+    },
+    {
+      "name": "embedding_disabled",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": false,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 0.8,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue pressure exact identifier",
+          "score": 0.26666666666666666,
+          "memoryId": 4,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue fts only fallback",
+          "score": 0.2,
+          "memoryId": 6,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.16000000000000003,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "fts",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.13333333333333333,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated outside interval",
+          "score": 0.11428571428571428,
+          "memoryId": 14,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue corrected text remains searchable",
+          "score": 0.08888888888888889,
+          "memoryId": 2,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue wrong model must not score semantically",
+          "score": 0.08000000000000002,
+          "memoryId": 7,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue negative cosine still has lexical hybrid",
+          "score": 0.07272727272727274,
+          "memoryId": 8,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue zero vector retains hybrid match type",
+          "score": 0.06666666666666667,
+          "memoryId": 9,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        }
+      ],
+      "reported_scores": [
+        "0.80",
+        "0.27",
+        "0.20",
+        "0.16",
+        "0.13",
+        "0.11",
+        "0.09",
+        "0.08",
+        "0.07",
+        "0.07"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "embedding_failed",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": null,
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 0.8,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue pressure exact identifier",
+          "score": 0.26666666666666666,
+          "memoryId": 4,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue fts only fallback",
+          "score": 0.2,
+          "memoryId": 6,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.16000000000000003,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "fts",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.13333333333333333,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated outside interval",
+          "score": 0.11428571428571428,
+          "memoryId": 14,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue corrected text remains searchable",
+          "score": 0.08888888888888889,
+          "memoryId": 2,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue wrong model must not score semantically",
+          "score": 0.08000000000000002,
+          "memoryId": 7,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue negative cosine still has lexical hybrid",
+          "score": 0.07272727272727274,
+          "memoryId": 8,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue zero vector retains hybrid match type",
+          "score": 0.06666666666666667,
+          "memoryId": 9,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        }
+      ],
+      "reported_scores": [
+        "0.80",
+        "0.27",
+        "0.20",
+        "0.16",
+        "0.13",
+        "0.11",
+        "0.09",
+        "0.08",
+        "0.07",
+        "0.07"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "wrong_model",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:absent",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 0.8,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue pressure exact identifier",
+          "score": 0.26666666666666666,
+          "memoryId": 4,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue fts only fallback",
+          "score": 0.2,
+          "memoryId": 6,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.16000000000000003,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "fts",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.13333333333333333,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated outside interval",
+          "score": 0.11428571428571428,
+          "memoryId": 14,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue corrected text remains searchable",
+          "score": 0.08888888888888889,
+          "memoryId": 2,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue wrong model must not score semantically",
+          "score": 0.08000000000000002,
+          "memoryId": 7,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue negative cosine still has lexical hybrid",
+          "score": 0.07272727272727274,
+          "memoryId": 8,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue zero vector retains hybrid match type",
+          "score": 0.06666666666666667,
+          "memoryId": 9,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        }
+      ],
+      "reported_scores": [
+        "0.80",
+        "0.27",
+        "0.20",
+        "0.16",
+        "0.13",
+        "0.11",
+        "0.09",
+        "0.08",
+        "0.07",
+        "0.07"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "semantic_without_lexical",
+      "query": "overload mitigation",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.8,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 0.8,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated outside interval",
+          "score": 0.8,
+          "memoryId": 14,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.8,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "semantic",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "bounded drains absorb saturation",
+          "score": 0.7959497511756478,
+          "memoryId": 5,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "pkg::worker.retry() handles transient saturation",
+          "score": 0.7951069873375396,
+          "memoryId": 15,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Saturation and bounded drains",
+          "score": 0.8,
+          "compartmentId": 1,
+          "sessionId": "retrieval-session",
+          "title": "Saturation and bounded drains",
+          "startOrdinal": 1,
+          "endOrdinal": 5,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Same score later ordinal",
+          "score": 0.8,
+          "compartmentId": 2,
+          "sessionId": "retrieval-session",
+          "title": "Same score later ordinal",
+          "startOrdinal": 6,
+          "endOrdinal": 10,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Unrelated title semantic recall",
+          "score": 0.7959497511756478,
+          "compartmentId": 3,
+          "sessionId": "retrieval-session",
+          "title": "Unrelated title semantic recall",
+          "startOrdinal": 11,
+          "endOrdinal": 20,
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue corrected text remains searchable",
+          "score": 0.6399999942779542,
+          "memoryId": 2,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        }
+      ],
+      "reported_scores": [
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.64"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "punctuation_relaxed_fts",
+      "query": "pkg::worker.retry()",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "pkg::worker.retry() handles transient saturation",
+          "score": 0.9957186139203471,
+          "memoryId": 15,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.8,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 0.8,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated outside interval",
+          "score": 0.8,
+          "memoryId": 14,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.8,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "semantic",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "bounded drains absorb saturation",
+          "score": 0.7959497511756478,
+          "memoryId": 5,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Saturation and bounded drains",
+          "score": 0.8,
+          "compartmentId": 1,
+          "sessionId": "retrieval-session",
+          "title": "Saturation and bounded drains",
+          "startOrdinal": 1,
+          "endOrdinal": 5,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Same score later ordinal",
+          "score": 0.8,
+          "compartmentId": 2,
+          "sessionId": "retrieval-session",
+          "title": "Same score later ordinal",
+          "startOrdinal": 6,
+          "endOrdinal": 10,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Unrelated title semantic recall",
+          "score": 0.7959497511756478,
+          "compartmentId": 3,
+          "sessionId": "retrieval-session",
+          "title": "Unrelated title semantic recall",
+          "startOrdinal": 11,
+          "endOrdinal": 20,
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue corrected text remains searchable",
+          "score": 0.6399999942779542,
+          "memoryId": 2,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        }
+      ],
+      "reported_scores": [
+        "1.00",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.64"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "inclusive_dates_and_overlap",
+      "query": "queue",
+      "options": {
+        "dates": {
+          "from_ms": 1768003198000,
+          "to_ms": 1768003202000
+        },
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 1,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "bounded drains absorb saturation",
+          "score": 0.7959497511756478,
+          "memoryId": 5,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "pkg::worker.retry() handles transient saturation",
+          "score": 0.7951069873375396,
+          "memoryId": 15,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Saturation and bounded drains",
+          "score": 0.8,
+          "compartmentId": 1,
+          "sessionId": "retrieval-session",
+          "title": "Saturation and bounded drains",
+          "startOrdinal": 1,
+          "endOrdinal": 5,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Same score later ordinal",
+          "score": 0.8,
+          "compartmentId": 2,
+          "sessionId": "retrieval-session",
+          "title": "Same score later ordinal",
+          "startOrdinal": 6,
+          "endOrdinal": 10,
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.76,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "hybrid",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.75,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue corrected text remains searchable",
+          "score": 0.5974999949932098,
+          "memoryId": 2,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue pressure exact identifier",
+          "score": 0.52000000667572,
+          "memoryId": 4,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂…",
+          "score": 0.3092969360640086,
+          "memoryId": 16,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        }
+      ],
+      "reported_scores": [
+        "1.00",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.76",
+        "0.75",
+        "0.60",
+        "0.52",
+        "0.31"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "cutoff_zero",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 0
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 1,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "bounded drains absorb saturation",
+          "score": 0.7959497511756478,
+          "memoryId": 5,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "pkg::worker.retry() handles transient saturation",
+          "score": 0.7951069873375396,
+          "memoryId": 15,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.76,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "hybrid",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.75,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated outside interval",
+          "score": 0.7428571428571428,
+          "memoryId": 14,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue corrected text remains searchable",
+          "score": 0.5933333283265432,
+          "memoryId": 2,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue pressure exact identifier",
+          "score": 0.52000000667572,
+          "memoryId": 4,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂…",
+          "score": 0.3073738591409316,
+          "memoryId": 16,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue fts only fallback",
+          "score": 0.2,
+          "memoryId": 6,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        }
+      ],
+      "reported_scores": [
+        "1.00",
+        "0.80",
+        "0.80",
+        "0.76",
+        "0.75",
+        "0.74",
+        "0.59",
+        "0.52",
+        "0.31",
+        "0.20"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "cutoff_negative",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": -1
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 1,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "bounded drains absorb saturation",
+          "score": 0.7959497511756478,
+          "memoryId": 5,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "pkg::worker.retry() handles transient saturation",
+          "score": 0.7951069873375396,
+          "memoryId": 15,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Saturation and bounded drains",
+          "score": 0.8,
+          "compartmentId": 1,
+          "sessionId": "retrieval-session",
+          "title": "Saturation and bounded drains",
+          "startOrdinal": 1,
+          "endOrdinal": 5,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Same score later ordinal",
+          "score": 0.8,
+          "compartmentId": 2,
+          "sessionId": "retrieval-session",
+          "title": "Same score later ordinal",
+          "startOrdinal": 6,
+          "endOrdinal": 10,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Past compacted cutoff",
+          "score": 0.8,
+          "compartmentId": 5,
+          "sessionId": "retrieval-session",
+          "title": "Past compacted cutoff",
+          "startOrdinal": 26,
+          "endOrdinal": 30,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Unrelated title semantic recall",
+          "score": 0.7959497511756478,
+          "compartmentId": 3,
+          "sessionId": "retrieval-session",
+          "title": "Unrelated title semantic recall",
+          "startOrdinal": 11,
+          "endOrdinal": 20,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Missing endpoint dates",
+          "score": 0.7951069873375396,
+          "compartmentId": 6,
+          "sessionId": "retrieval-session",
+          "title": "Missing endpoint dates",
+          "startOrdinal": 31,
+          "endOrdinal": 40,
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.76,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "hybrid",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.75,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        }
+      ],
+      "reported_scores": [
+        "1.00",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.76",
+        "0.75"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "compartments_without_memory",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": false,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "compartment",
+          "content": "Saturation and bounded drains",
+          "score": 0.8,
+          "compartmentId": 1,
+          "sessionId": "retrieval-session",
+          "title": "Saturation and bounded drains",
+          "startOrdinal": 1,
+          "endOrdinal": 5,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Same score later ordinal",
+          "score": 0.8,
+          "compartmentId": 2,
+          "sessionId": "retrieval-session",
+          "title": "Same score later ordinal",
+          "startOrdinal": 6,
+          "endOrdinal": 10,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Unrelated title semantic recall",
+          "score": 0.7959497511756478,
+          "compartmentId": 3,
+          "sessionId": "retrieval-session",
+          "title": "Unrelated title semantic recall",
+          "startOrdinal": 11,
+          "endOrdinal": 20,
+          "matchType": "semantic"
+        }
+      ],
+      "reported_scores": [
+        "0.80",
+        "0.80",
+        "0.80"
+      ],
+      "suppressed_visible_memory_ids": []
+    },
+    {
+      "name": "sources_empty",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [],
+      "reported_scores": [],
+      "suppressed_visible_memory_ids": []
+    },
+    {
+      "name": "only_memory",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 1,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "bounded drains absorb saturation",
+          "score": 0.7959497511756478,
+          "memoryId": 5,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "pkg::worker.retry() handles transient saturation",
+          "score": 0.7951069873375396,
+          "memoryId": 15,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.76,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "hybrid",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.75,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated outside interval",
+          "score": 0.7428571428571428,
+          "memoryId": 14,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue corrected text remains searchable",
+          "score": 0.5933333283265432,
+          "memoryId": 2,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue pressure exact identifier",
+          "score": 0.52000000667572,
+          "memoryId": 4,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂…",
+          "score": 0.3073738591409316,
+          "memoryId": 16,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue fts only fallback",
+          "score": 0.2,
+          "memoryId": 6,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        }
+      ],
+      "reported_scores": [
+        "1.00",
+        "0.80",
+        "0.80",
+        "0.76",
+        "0.75",
+        "0.74",
+        "0.59",
+        "0.52",
+        "0.31",
+        "0.20"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "only_message",
+      "query": "queue",
+      "options": {
+        "dates": {},
+        "sources": [
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "compartment",
+          "content": "Saturation and bounded drains",
+          "score": 0.8,
+          "compartmentId": 1,
+          "sessionId": "retrieval-session",
+          "title": "Saturation and bounded drains",
+          "startOrdinal": 1,
+          "endOrdinal": 5,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Same score later ordinal",
+          "score": 0.8,
+          "compartmentId": 2,
+          "sessionId": "retrieval-session",
+          "title": "Same score later ordinal",
+          "startOrdinal": 6,
+          "endOrdinal": 10,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Unrelated title semantic recall",
+          "score": 0.7959497511756478,
+          "compartmentId": 3,
+          "sessionId": "retrieval-session",
+          "title": "Unrelated title semantic recall",
+          "startOrdinal": 11,
+          "endOrdinal": 20,
+          "matchType": "semantic"
+        }
+      ],
+      "reported_scores": [
+        "0.80",
+        "0.80",
+        "0.80"
+      ],
+      "suppressed_visible_memory_ids": []
+    },
+    {
+      "name": "fractional_limit",
+      "query": "queue",
+      "options": {
+        "limit": 2.9,
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 1,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "bounded drains absorb saturation",
+          "score": 0.7959497511756478,
+          "memoryId": 5,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        }
+      ],
+      "reported_scores": [
+        "1.00",
+        "0.80"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "minimum_limit",
+      "query": "queue",
+      "options": {
+        "limit": 0,
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 1,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        }
+      ],
+      "reported_scores": [
+        "1.00"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "maximum_limit",
+      "query": "queue",
+      "options": {
+        "limit": 10000,
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "queue dated inclusive upper",
+          "score": 1,
+          "memoryId": 13,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "bounded drains absorb saturation",
+          "score": 0.7959497511756478,
+          "memoryId": 5,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "pkg::worker.retry() handles transient saturation",
+          "score": 0.7951069873375396,
+          "memoryId": 15,
+          "category": "ARCHITECTURE",
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Saturation and bounded drains",
+          "score": 0.8,
+          "compartmentId": 1,
+          "sessionId": "retrieval-session",
+          "title": "Saturation and bounded drains",
+          "startOrdinal": 1,
+          "endOrdinal": 5,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Same score later ordinal",
+          "score": 0.8,
+          "compartmentId": 2,
+          "sessionId": "retrieval-session",
+          "title": "Same score later ordinal",
+          "startOrdinal": 6,
+          "endOrdinal": 10,
+          "matchType": "semantic"
+        },
+        {
+          "source": "compartment",
+          "content": "Unrelated title semantic recall",
+          "score": 0.7959497511756478,
+          "compartmentId": 3,
+          "sessionId": "retrieval-session",
+          "title": "Unrelated title semantic recall",
+          "startOrdinal": 11,
+          "endOrdinal": 20,
+          "matchType": "semantic"
+        },
+        {
+          "source": "memory",
+          "content": "queue shared workspace constraint",
+          "score": 0.76,
+          "memoryId": 87,
+          "category": "CONSTRAINTS",
+          "matchType": "hybrid",
+          "sourceName": "Foreign"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated inclusive lower",
+          "score": 0.75,
+          "memoryId": 12,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue dated outside interval",
+          "score": 0.7428571428571428,
+          "memoryId": 14,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue corrected text remains searchable",
+          "score": 0.5933333283265432,
+          "memoryId": 2,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue pressure exact identifier",
+          "score": 0.52000000667572,
+          "memoryId": 4,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂…",
+          "score": 0.3073738591409316,
+          "memoryId": 16,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue fts only fallback",
+          "score": 0.2,
+          "memoryId": 6,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue wrong model must not score semantically",
+          "score": 0.08000000000000002,
+          "memoryId": 7,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "queue negative cosine still has lexical hybrid",
+          "score": 0.02727272727272727,
+          "memoryId": 8,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        },
+        {
+          "source": "memory",
+          "content": "queue zero vector retains hybrid match type",
+          "score": 0.024999999999999998,
+          "memoryId": 9,
+          "category": "ARCHITECTURE",
+          "matchType": "hybrid"
+        }
+      ],
+      "reported_scores": [
+        "1.00",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.80",
+        "0.76",
+        "0.75",
+        "0.74",
+        "0.59",
+        "0.52",
+        "0.31",
+        "0.20",
+        "0.08",
+        "0.03",
+        "0.02"
+      ],
+      "suppressed_visible_memory_ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "fts_candidate_cap",
+      "query": "capstone",
+      "options": {
+        "limit": 25,
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": false,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "capstone candidate 69",
+          "score": 0.8,
+          "memoryId": 86,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 68",
+          "score": 0.4,
+          "memoryId": 85,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 67",
+          "score": 0.26666666666666666,
+          "memoryId": 84,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 66",
+          "score": 0.2,
+          "memoryId": 83,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 65",
+          "score": 0.16000000000000003,
+          "memoryId": 82,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 64",
+          "score": 0.13333333333333333,
+          "memoryId": 81,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 63",
+          "score": 0.11428571428571428,
+          "memoryId": 80,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 62",
+          "score": 0.1,
+          "memoryId": 79,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 61",
+          "score": 0.08888888888888889,
+          "memoryId": 78,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 60",
+          "score": 0.08000000000000002,
+          "memoryId": 77,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 59",
+          "score": 0.07272727272727274,
+          "memoryId": 76,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 58",
+          "score": 0.06666666666666667,
+          "memoryId": 75,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 57",
+          "score": 0.06153846153846154,
+          "memoryId": 74,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 56",
+          "score": 0.05714285714285714,
+          "memoryId": 73,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 55",
+          "score": 0.05333333333333334,
+          "memoryId": 72,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 54",
+          "score": 0.05,
+          "memoryId": 71,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 53",
+          "score": 0.047058823529411764,
+          "memoryId": 70,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 52",
+          "score": 0.044444444444444446,
+          "memoryId": 69,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 51",
+          "score": 0.042105263157894736,
+          "memoryId": 68,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 50",
+          "score": 0.04000000000000001,
+          "memoryId": 67,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 49",
+          "score": 0.0380952380952381,
+          "memoryId": 66,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 48",
+          "score": 0.03636363636363637,
+          "memoryId": 65,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 47",
+          "score": 0.034782608695652174,
+          "memoryId": 64,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 46",
+          "score": 0.03333333333333333,
+          "memoryId": 63,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 45",
+          "score": 0.032,
+          "memoryId": 62,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        }
+      ],
+      "reported_scores": [
+        "0.80",
+        "0.40",
+        "0.27",
+        "0.20",
+        "0.16",
+        "0.13",
+        "0.11",
+        "0.10",
+        "0.09",
+        "0.08",
+        "0.07",
+        "0.07",
+        "0.06",
+        "0.06",
+        "0.05",
+        "0.05",
+        "0.05",
+        "0.04",
+        "0.04",
+        "0.04",
+        "0.04",
+        "0.04",
+        "0.03",
+        "0.03",
+        "0.03"
+      ],
+      "suppressed_visible_memory_ids": []
+    },
+    {
+      "name": "date_before_fts_cap",
+      "query": "capstone",
+      "options": {
+        "limit": 25,
+        "dates": {
+          "from_ms": 1768003200000,
+          "to_ms": 1768003200010
+        },
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": false,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [
+        {
+          "source": "memory",
+          "content": "capstone candidate 10",
+          "score": 0.8,
+          "memoryId": 27,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 9",
+          "score": 0.4,
+          "memoryId": 26,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 8",
+          "score": 0.26666666666666666,
+          "memoryId": 25,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 7",
+          "score": 0.2,
+          "memoryId": 24,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 6",
+          "score": 0.16000000000000003,
+          "memoryId": 23,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 5",
+          "score": 0.13333333333333333,
+          "memoryId": 22,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 4",
+          "score": 0.11428571428571428,
+          "memoryId": 21,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 3",
+          "score": 0.1,
+          "memoryId": 20,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 2",
+          "score": 0.08888888888888889,
+          "memoryId": 19,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 1",
+          "score": 0.08000000000000002,
+          "memoryId": 18,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        },
+        {
+          "source": "memory",
+          "content": "capstone candidate 0",
+          "score": 0.07272727272727274,
+          "memoryId": 17,
+          "category": "ARCHITECTURE",
+          "matchType": "fts"
+        }
+      ],
+      "reported_scores": [
+        "0.80",
+        "0.40",
+        "0.27",
+        "0.20",
+        "0.16",
+        "0.13",
+        "0.11",
+        "0.10",
+        "0.09",
+        "0.08",
+        "0.07"
+      ],
+      "suppressed_visible_memory_ids": []
+    },
+    {
+      "name": "whitespace_query",
+      "query": "﻿   \n",
+      "options": {
+        "dates": {},
+        "sources": [
+          "memory",
+          "message"
+        ],
+        "memory_enabled": true,
+        "embedding_enabled": true,
+        "max_message_ordinal": 25
+      },
+      "model": "fixture:model",
+      "vector": [
+        1,
+        0,
+        0
+      ],
+      "visibility": true,
+      "results": [],
+      "reported_scores": [],
+      "suppressed_visible_memory_ids": []
+    }
+  ]
+}
