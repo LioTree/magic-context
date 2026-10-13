@@ -67,6 +67,7 @@ pub mod m0_compose;
 pub mod m1_compose;
 pub mod memory_render;
 pub mod memory_tool;
+mod memory_verification;
 pub mod parity_contract;
 pub mod project_docs;
 pub mod project_identity;
@@ -126,8 +127,7 @@ use mc_store::{
     NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
     RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
     StoredChunkTranscript, StoredCompartment, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
-    VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
-    STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
+    WrapupCommandRecord, LATEST_MIGRATION_VERSION, STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -12979,72 +12979,28 @@ impl McHandler {
             .get("command_id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty());
-        if let Some(command_id) = command_id {
-            if let Some(replayed) = replayed_memory_apply_command(
-                store,
-                &binding.session,
-                "set_verification",
-                command_id,
-            ) {
-                return replayed;
-            }
-        }
         let Some(rows) = args.get("rows").and_then(Value::as_array) else {
             return invalid_params_error("memory.set_verification requires rows");
         };
-        let mut updates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let Some(row) = row.as_object() else {
-                return invalid_params_error("verification rows must be objects");
-            };
-            let Some(memory_id) = row.get("memory_id").and_then(Value::as_i64) else {
-                return invalid_params_error("verification row requires memory_id");
-            };
-            let Some(hash) = row.get("content_hash_at_prompt").and_then(Value::as_str) else {
-                return invalid_params_error("verification row requires content_hash_at_prompt");
-            };
-            let Some(status) = row.get("verification_status").and_then(Value::as_str) else {
-                return invalid_params_error("verification row requires verification_status");
-            };
-            updates.push(VerificationUpdate {
-                memory_id,
-                content_hash_at_prompt: hash.to_string(),
-                verification_status: status.to_string(),
-                updated_content: row
-                    .get("updated_content")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                archive_reason: row
-                    .get("archive_reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            });
+        let updates = match memory_verification::validate_rows(&Value::Array(rows.clone())) {
+            Ok(updates) => updates,
+            Err(error) => return invalid_params_error(&error),
+        };
+        match memory_verification::apply(
+            store,
+            memory_project,
+            &route_root,
+            &binding.session,
+            command_id,
+            &updates,
+            now_ms(),
+        ) {
+            Ok(response) => HandlerOutcome::Response(response),
+            Err(error) => HandlerOutcome::Error {
+                code: "verification_apply_failed".into(),
+                message: error,
+            },
         }
-        let now = now_ms();
-        dream_apply_command_outcome(
-            store.with_facade_command(
-                &route_root,
-                memory_project,
-                "memories",
-                &binding.session,
-                "memory",
-                "set_verification",
-                command_id,
-                |tx| {
-                    let result = tx.set_memory_verification(memory_project, &updates, now)?;
-                    serde_json::to_vec(&json!({
-                        "ok": true,
-                        "accepted": result.accepted,
-                        "rejected": result.rejected.iter().map(|row| json!({
-                            "memory_id": row.memory_id,
-                            "reason": row.reason,
-                        })).collect::<Vec<_>>(),
-                    }))
-                    .map_err(|error| error.to_string())
-                },
-            ),
-            "verification_apply_failed",
-        )
     }
 
     async fn handle_memory_set_mapping(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -33218,7 +33174,49 @@ mod tests {
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let descriptor = dev_descriptor_at(_dir.path().join("data").to_str().unwrap());
+        let StorageBackend::Sqlite { path } = descriptor.backend else {
+            panic!("SQLite fixture required")
+        };
+        let context_path = Path::new(&path).parent().unwrap().join("context.db");
+        store.install_context_domain(Arc::new(
+            single_store_reads::ModuleContextDomain::open(&context_path).unwrap(),
+        ));
         let route_root = project.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&project)
+                .env_remove("GIT_CONFIG_COUNT")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(project.join("source.rs"), "source").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Source",
+        ]);
+        let checked_head = git(&["rev-parse", "HEAD"]);
         let identity = "git:dreamer-applies";
         handler.bind_route(7, binding(route_root, "token"));
         activate_module_authority(&store, "context", identity, route_root, "memories");
@@ -33233,10 +33231,10 @@ mod tests {
         let verified = call_facade(&handler, "memory.set_verification", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
             "command_id": "verify-once", "rows": [
-                {"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified"},
-                {"memory_id": updated_id, "content_hash_at_prompt": "stale", "verification_status": "verified"},
-                {"memory_id": 999999, "content_hash_at_prompt": "missing", "verification_status": "verified"},
-                {"memory_id": foreign_id, "content_hash_at_prompt": hash(foreign_id), "verification_status": "verified"}
+                {"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified", "expected_revision": 1, "files": ["./src/lib.rs", "src/lib.rs"], "checked_commit": checked_head},
+                {"memory_id": updated_id, "content_hash_at_prompt": "stale", "verification_status": "verified", "expected_revision": 1, "files": ["./src/lib.rs", "src/lib.rs"], "checked_commit": checked_head},
+                {"memory_id": 999999, "content_hash_at_prompt": "missing", "verification_status": "verified", "expected_revision": 1, "files": ["./src/lib.rs", "src/lib.rs"], "checked_commit": checked_head},
+                {"memory_id": foreign_id, "content_hash_at_prompt": hash(foreign_id), "verification_status": "verified", "expected_revision": 1, "files": ["./src/lib.rs", "src/lib.rs"], "checked_commit": checked_head}
             ]
         })).await;
         let verified_body = match verified {
@@ -33244,6 +33242,9 @@ mod tests {
             other => panic!("verification facade failed: {other:?}"),
         };
         assert_eq!(verified_body["accepted"], json!([verified_id]));
+        assert_eq!(verified_body["results"][0]["result"], "confirmed");
+        assert_eq!(verified_body["results"][0]["files"], json!(["src/lib.rs"]));
+        assert_eq!(verified_body["results"][0]["checked_commit"], checked_head);
         assert_eq!(verified_body["rejected"].as_array().unwrap().len(), 3);
         let after_verified =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
@@ -33253,7 +33254,7 @@ mod tests {
         );
         let replay = call_facade(&handler, "memory.set_verification", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "command_id": "verify-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified"}]
+            "command_id": "verify-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified", "expected_revision": 1, "files": ["./src/lib.rs", "src/lib.rs"], "checked_commit": checked_head}]
         })).await;
         let replay_body = match replay {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
@@ -33268,7 +33269,7 @@ mod tests {
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
         let update = call_facade(&handler, "memory.set_verification", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "rows": [{"memory_id": updated_id, "content_hash_at_prompt": hash(updated_id), "verification_status": "update", "updated_content": "updated by verifier"}]
+            "rows": [{"memory_id": updated_id, "content_hash_at_prompt": hash(updated_id), "verification_status": "update", "expected_revision": 1, "files": ["src/new.rs"], "checked_commit": checked_head, "updated_content": "updated by verifier"}]
         })).await;
         let update_body = match update {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
@@ -33276,10 +33277,9 @@ mod tests {
         };
         let after_update =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        assert_eq!(update_body["accepted"], json!([updated_id]));
-        // A gated verify correction is an automated edit: it changes the row and records
-        // undo history but writes no mutation-log row, so it opens no SOFT and reaches
-        // prompts only at their next natural HARD fold.
+        assert_eq!(update_body["accepted"], json!([]));
+        assert_eq!(update_body["results"][0]["result"], "refused");
+        // A code check saves a correction proposal; changing memory content requires separate authorization.
         assert_eq!(
             after_update, before_update,
             "an automated content update must not move the m1 mutation signal"
@@ -33296,20 +33296,18 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!((history, log_rows, revision), (1, 0, 2));
+        assert_eq!((history, log_rows, revision), (0, 0, 1));
         assert_eq!(
             store.get_memory_full(updated_id).unwrap().unwrap().content,
-            "updated by verifier"
+            "updated"
         );
 
-        // A rewrite onto another memory's exact content (same project and
-        // category) is rejected by name instead of failing the whole batch on the
-        // UNIQUE index; the other row in the same call still applies.
+        // A verifier's proposed text matching a different memory still cannot authorize merging the two memories.
         let duplicate = call_facade(&handler, "memory.set_verification", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
             "rows": [
-                {"memory_id": archived_id, "content_hash_at_prompt": hash(archived_id), "verification_status": "update", "updated_content": "updated by verifier"},
-                {"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified"}
+                {"memory_id": archived_id, "content_hash_at_prompt": hash(archived_id), "verification_status": "update", "expected_revision": 1, "files": ["src/new.rs"], "checked_commit": checked_head, "updated_content": "updated by verifier"},
+                {"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified", "expected_revision": 1, "files": ["./src/lib.rs", "src/lib.rs"], "checked_commit": checked_head}
             ]
         })).await;
         let duplicate_body = match duplicate {
@@ -33319,7 +33317,7 @@ mod tests {
         assert_eq!(duplicate_body["accepted"], json!([verified_id]));
         assert_eq!(
             duplicate_body["rejected"],
-            json!([{"memory_id": archived_id, "reason": format!("duplicate_of:{updated_id}")}])
+            json!([{"memory_id": archived_id, "reason": "approval_required"}])
         );
         assert_eq!(
             store.get_memory_full(archived_id).unwrap().unwrap().content,
@@ -33330,19 +33328,19 @@ mod tests {
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
         let archive = call_facade(&handler, "memory.set_verification", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "rows": [{"memory_id": archived_id, "content_hash_at_prompt": hash(archived_id), "verification_status": "archive", "archive_reason": "obsolete"}]
+            "rows": [{"memory_id": archived_id, "content_hash_at_prompt": hash(archived_id), "verification_status": "archive", "expected_revision": 1, "files": ["src/lib.rs"], "checked_commit": checked_head, "archive_reason": "obsolete"}]
         })).await;
         assert!(matches!(archive, HandlerOutcome::Response(_)));
         let after_archive =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        // Archiving changes the stored memory's status but leaves the m1 revision signal unchanged.
+        // An archive proposal leaves the live row and prompt signals unchanged.
         assert_eq!(
             after_archive, before_archive,
             "a verify archive must not move the m1 mutation signal"
         );
         assert_eq!(
             store.get_memory_full(archived_id).unwrap().unwrap().status,
-            "archived"
+            "active"
         );
         let proposals: Vec<(String, String, String)> = store
             .with_context_conn_for_test(|tx| {
@@ -33355,7 +33353,73 @@ mod tests {
                 rows
             })
             .unwrap();
-        assert_eq!(proposals, vec![]);
+        assert_eq!(proposals.len(), 3);
+        assert!(proposals.iter().all(|proposal| proposal.0 == "verify"));
+
+        let stamped = store.get_memory_full(verified_id).unwrap().unwrap();
+        assert_eq!(stamped.verification_status, "verified");
+        assert!(stamped.verified_at.unwrap() > 0);
+        store.with_context_conn_for_test(|tx| {
+            let result: (String, String, String) = tx.query_row("SELECT verify_result,verify_files_json,verify_commit FROM memories WHERE id=?1", [verified_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            assert_eq!(result, ("confirmed".into(), "[\"src/lib.rs\"]".into(), checked_head.clone()));
+            tx.execute("UPDATE memories SET revision=2 WHERE id=?1", [verified_id])?;
+            Ok(())
+        }).unwrap();
+        let stale = call_facade(&handler, "memory.set_verification", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified", "expected_revision": 1, "files": ["src/new.rs"], "checked_commit": checked_head}]
+        })).await;
+        let HandlerOutcome::Response(stale) = stale else {
+            panic!("stale check failed")
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&stale).unwrap()["results"][0]["result"],
+            "stale"
+        );
+        assert_eq!(
+            store
+                .get_memory_full(verified_id)
+                .unwrap()
+                .unwrap()
+                .verified_at,
+            stamped.verified_at
+        );
+        store
+            .with_context_conn_for_test(|tx| {
+                tx.execute("UPDATE memories SET revision=1 WHERE id=?1", [verified_id])
+            })
+            .unwrap();
+
+        let skipped_id = insert_memory(&store, identity, "CONSTRAINTS", "skip claim", 1);
+        let unmapped_id = insert_memory(&store, identity, "CONSTRAINTS", "unmapped claim", 1);
+        let failed_id = insert_memory(&store, identity, "CONSTRAINTS", "failed claim", 1);
+        let outcomes = call_facade(&handler, "memory.set_verification", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "rows": [
+                {"memory_id": skipped_id, "content_hash_at_prompt": hash(skipped_id), "verification_status": "skipped", "expected_revision": 1, "files": ["src/lib.rs"], "checked_commit": checked_head},
+                {"memory_id": unmapped_id, "content_hash_at_prompt": hash(unmapped_id), "verification_status": "verified", "expected_revision": 1, "files": [], "checked_commit": checked_head},
+                {"memory_id": failed_id, "content_hash_at_prompt": hash(failed_id), "verification_status": "verified", "expected_revision": 1, "files": ["src/lib.rs"], "checked_commit": "b".repeat(40)}
+            ]
+        })).await;
+        let HandlerOutcome::Response(outcomes) = outcomes else {
+            panic!("outcome accounting failed")
+        };
+        let outcomes: Value = serde_json::from_slice(&outcomes).unwrap();
+        assert_eq!(
+            outcomes["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|result| result["result"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["skipped", "unmapped", "failed"]
+        );
+        for id in [skipped_id, unmapped_id, failed_id] {
+            assert_eq!(
+                store.get_memory_full(id).unwrap().unwrap().verified_at,
+                None
+            );
+        }
 
         let mapping = call_facade(&handler, "memory.set_mapping", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,

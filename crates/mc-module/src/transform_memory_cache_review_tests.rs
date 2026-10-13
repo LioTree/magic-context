@@ -909,3 +909,43 @@ fn noprop_agent_m1_fingerprint_matches_baseline() {
     );
     println!("noprop Rust agent m[1] SHA256 {hash}");
 }
+
+#[test]
+fn module_verification_freezes_served_m0_m1_and_mural_until_natural_hard() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")]).unwrap();
+    let id = s.insert_memory(memory_input("git:proj", "CONSTRAINTS", "Verified code claim.", 0)).unwrap();
+    let hash = s.get_memory_full(id).unwrap().unwrap().normalized_hash;
+    let mut request = req("ses", "cfg0", vec![item("a", 1, "raw"), item("tail", 2, "tail")]);
+    request.serializer_profile = "opencode-aisdk".into();
+    request.auto_search_enabled = false;
+    request.mural = Some(crate::m0_compose::M0MuralInput { enabled: true, supports_vision: true, data_url: Some(format!("data:image/png;base64,{NO_GLYPH_PNG}")), content_hash: Some("verification-mural".into()) });
+    let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    let first = transform(&s, &request, &ctx).unwrap();
+    let served = serde_json::to_vec(first.messages()).unwrap();
+    assert!(String::from_utf8_lossy(&served).contains(NO_GLYPH_PNG));
+    let rows = crate::memory_verification::validate_rows(&json!([{
+        "memory_id": id, "expected_revision": 1, "content_hash_at_prompt": hash,
+        "verification_status": "verified", "files": ["source.rs"], "checked_commit": null,
+    }])).unwrap();
+    s.with_context_conn_for_test(|tx| {
+        let receipt = crate::memory_verification::apply_row(tx, "git:proj", "verify-cache", &rows[0], None, 1234)?;
+        assert_eq!(receipt["result"], "confirmed");
+        Ok(())
+    }).unwrap();
+    let deferred = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(deferred.action, "SOFT+");
+    assert_eq!(serde_json::to_vec(deferred.messages()).unwrap(), served);
+    s.arm_soft_refresh("ses").unwrap();
+    let soft = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(soft.action, "SOFT");
+    assert_eq!(m0_bytes(&soft), m0_bytes(&first));
+    assert_eq!(m1_bytes(&soft), m1_bytes(&first));
+    assert_eq!(serde_json::to_vec(soft.messages()).unwrap(), served);
+    request.render_config = "independent-hard".into();
+    let hard = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(hard.action, "HARD");
+    assert!(m0_bytes(&hard).contains("Verified code claim."));
+    assert!(serde_json::to_string(hard.messages()).unwrap().contains(NO_GLYPH_PNG));
+}

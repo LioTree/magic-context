@@ -36,6 +36,7 @@ import {
     updateMemorySeenCount,
 } from "./storage-memory";
 import { saveEmbeddingIfHashMatches } from "./storage-memory-embeddings";
+import { recordMemoryVerifications } from "./storage-memory-verifications";
 import type { Memory, MemoryInput } from "./types";
 
 export type AdoptionClass = "live" | "deferred" | null;
@@ -59,6 +60,143 @@ export interface ApplierReceipt {
      * because that profile (or one of its checks) is not a replay-validated one.
      */
     reportedProfile?: ReportedProfile;
+    verificationResult?: VerificationResult;
+}
+
+export type VerificationResult =
+    | "confirmed"
+    | "unmapped"
+    | "skipped"
+    | "refused"
+    | "failed"
+    | "stale";
+export interface MemoryVerificationRequest {
+    key: string;
+    projectPath: string;
+    memoryId: number;
+    expectedRevision: number;
+    contentHashAtPrompt: string;
+    kind: "verified" | "update" | "archive" | "skipped" | "unmapped" | "failed";
+    files: string[];
+    checkedCommit: string | null;
+    sourceCommitMatches: boolean;
+    checkedAt: number;
+    content?: string;
+    reason?: string;
+}
+
+/** Verification may confirm unchanged prose, but cannot authorize a correction or retirement. */
+export function applyMemoryVerification(
+    db: Database,
+    request: MemoryVerificationRequest,
+): ApplierReceipt {
+    return db
+        .transaction(() => {
+            const recovered = readReceipt(db, request.key);
+            if (recovered) return recovered;
+            const record = (
+                state: ApplierReceipt["state"],
+                reason: string,
+                result: VerificationResult,
+            ) =>
+                recordReceipt(
+                    db,
+                    {
+                        key: request.key,
+                        projectPath: request.projectPath,
+                        operation: "verification",
+                    },
+                    {
+                        state,
+                        reason,
+                        memoryId: request.memoryId,
+                        adoptionClass: "deferred",
+                        verificationResult: result,
+                    },
+                );
+            if (!tsOwnsMemory(db, request.projectPath))
+                throw new ModuleMemoryAuthorityError(request.projectPath);
+            const memory = getMemoryById(db, request.memoryId);
+            if (
+                !memory ||
+                normalizeStoredProjectPath(memory.projectPath) !==
+                    normalizeStoredProjectPath(request.projectPath)
+            )
+                return record("decided_pending", "target_not_owned", "stale");
+            if (
+                memory.status === "archived" ||
+                memory.supersededByMemoryId !== null ||
+                getMemoryRevision(db, memory.id) !== request.expectedRevision ||
+                memory.normalizedHash !== request.contentHashAtPrompt
+            )
+                return record("decided_pending", "stale_revision", "stale");
+            const pending = request.kind === "update" || request.kind === "archive";
+            const result: VerificationResult = !request.sourceCommitMatches
+                ? "failed"
+                : request.kind === "update" || request.kind === "archive"
+                  ? "refused"
+                  : request.kind === "verified"
+                    ? request.files.length > 0
+                        ? "confirmed"
+                        : "unmapped"
+                    : request.kind;
+            db.prepare(
+                "UPDATE memories SET verify_result=?,verify_files_json=?,verify_commit=? WHERE id=?",
+            ).run(result, JSON.stringify(request.files), request.checkedCommit, memory.id);
+            if (pending) {
+                db.prepare(
+                    "INSERT INTO memory_tool_proposals(project_path,proposal_key,writer,operation,target_ids_json,expected_revisions_json,proposal_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ).run(
+                    request.projectPath,
+                    request.key,
+                    "verify",
+                    request.kind,
+                    JSON.stringify([memory.id]),
+                    JSON.stringify([request.expectedRevision]),
+                    JSON.stringify(request),
+                    request.reason ?? "approval_required",
+                    request.checkedAt,
+                );
+                return record("decided_pending", request.reason ?? "approval_required", result);
+            }
+            if (result === "confirmed") {
+                recordMemoryVerifications(db, memory.id, request.files, request.checkedAt);
+                let metadata: Record<string, unknown> = {};
+                try {
+                    metadata = JSON.parse(memory.metadataJson ?? "{}");
+                } catch {
+                    /* Legacy metadata may be malformed. */
+                }
+                if (!metadata || typeof metadata !== "object" || Array.isArray(metadata))
+                    metadata = {};
+                db.prepare(
+                    "UPDATE memories SET verification_status='verified',verified_at=?,metadata_json=? WHERE id=?",
+                ).run(
+                    request.checkedAt,
+                    JSON.stringify({
+                        ...metadata,
+                        dreamerVerifiedAt: request.checkedAt,
+                        dreamerVerifiedCommit: request.checkedCommit,
+                    }),
+                    memory.id,
+                );
+            }
+            const receipt = record(
+                "applied",
+                request.sourceCommitMatches ? result : "source_commit_changed",
+                result,
+            );
+            db.prepare("UPDATE memory_journal SET after_json=? WHERE decision_key=?").run(
+                JSON.stringify({
+                    files: request.files,
+                    checkedCommit: request.checkedCommit,
+                    revision: request.expectedRevision,
+                }),
+                request.key,
+            );
+            return receipt;
+        })
+        .immediate();
 }
 
 export interface MemoryFactReservation {
@@ -360,8 +498,8 @@ export function resolveFactDecision(
 }
 
 /**
- * Record an automated writer's direct edit of one memory (a verify content
- * correction, an expiry archive) as undo history. The caller has already changed
+ * Record an automated writer's direct edit of one memory (such as an expiry
+ * archive) as undo history. The caller has already changed
  * the row inside the same transaction. Automated edits write no mutation-log row
  * and no agent fragment: they reach a prompt only at the next natural HARD fold.
  */

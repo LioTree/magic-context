@@ -57,6 +57,8 @@ export interface VerifyPromptMemory {
     mappedFiles: string[];
     verifiedAt?: number;
     verifiedCommit?: string | null;
+    revision?: number;
+    contentHash?: string;
 }
 
 import type { VerifyDiffEvidence } from "./verify-diff";
