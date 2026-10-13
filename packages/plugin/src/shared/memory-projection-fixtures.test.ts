@@ -323,7 +323,7 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
         "verify-update",
         "expiry-archive",
     ] as const) {
-        test(`${driver.host} ${operation} ${operation.startsWith("verify-") ? "stays pending without changing served memories" : "applies directly with undo history and waits for natural HARD"}`, async () => {
+        test(`${driver.host} ${operation} applies directly with undo history and waits for natural HARD`, async () => {
             const f = createProjectionFixture(`${driver.host}-${operation}`, driver.open);
             try {
                 const [session] = f.sessions;
@@ -402,8 +402,10 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
                         ],
                         `<verify>${verdict}</verify>`,
                     );
-                    expect(result.refused).toBe(1);
-                    expect(result.archived + result.updated).toBe(0);
+                    expect(operation === "verify-archive" ? result.archived : result.updated).toBe(
+                        1,
+                    );
+                    expect(result.refused).toBe(0);
                 } else {
                     expect(
                         await archiveExpiredMemories({
@@ -415,25 +417,6 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
                             now: expiry + 1,
                         }),
                     ).toBe(1);
-                }
-                if (operation.startsWith("verify-")) {
-                    expect(getMemoryById(f.db, target.id)?.content).toBe(target.content);
-                    expect(getMemoryById(f.db, target.id)?.status).toBe("active");
-                    expect(f.db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({
-                        n: 0,
-                    });
-                    expect(
-                        f.db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get(),
-                    ).toEqual({ n: 1 });
-                    expect(
-                        f.db.prepare("SELECT COUNT(*) AS n FROM memory_mutation_log").get(),
-                    ).toEqual({ n: 0 });
-                    expect(driver.pass(f, session, false)).toEqual(before);
-                    expect(driver.pass(f, session, true)).toEqual(before);
-                    const hard = driver.pass(f, session, true, { cacheExpired: true });
-                    expect(hard.materialized).toBe(true);
-                    expect(hard.m0).toContain(target.content);
-                    return;
                 }
                 const history = f.db
                     .prepare(

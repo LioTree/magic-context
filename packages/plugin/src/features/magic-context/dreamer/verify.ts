@@ -59,8 +59,8 @@ import {
  * SMALLER than map because deeper reads replay more prompt tokens. No max-turns;
  * a batch that fails to emit a manifest banks nothing and is retried next run.
  *
- * Confirmations are revision-bound applier writes. Corrections and archives are
- * pending proposals and do not change memory content or status.
+ * Confirmations, corrections and archives are revision-bound applier writes.
+ * Content/status changes save undo history without publishing prompt deltas.
  * Verification metadata affects served memory selection only at a natural HARD
  * fold (an independently authorized prompt rebuild), never by forcing a cache bust.
  */
@@ -549,7 +549,7 @@ async function verifyOneBatch(
  * A closed root proves the parser did not see a truncated prefix, so omitted ids
  * remain silent for the per-memory gate to select next run; unknown ids are never written.
  * Confirmations replace the complete file set and stamp the current revision.
- * Updates and archives retain evidence as pending proposals; skips and refusals
+ * Updates and archives apply with undo history; skips and refusals
  * record outcomes without advancing confirmation timestamps. Both authorities
  * use the applier, and stale revisions cannot bank verification progress.
  * Local writes use one lease-guarded transaction; module writes use its fenced transaction.
@@ -620,32 +620,35 @@ async function applyParsedVerifyManifest(
               ? "invalid_content"
               : !entry.consolidation && content.length * 2 < original.content.trim().length
                 ? "content-loss"
-                : "approval_required";
-        log(
-            `[dreamer] verify safety refusal: memory_id=${entry.id} verdict=update reason=${reason}`,
-        );
+                : undefined;
+        if (reason)
+            log(
+                `[dreamer] verify safety refusal: memory_id=${entry.id} verdict=update reason=${reason}`,
+            );
         writes.push({
             kind: "update",
             id: entry.id,
             files: await normalizeFiles(args, entry.files),
             content,
-            reason,
+            refusalReason: reason,
         });
     }
     for (const entry of valid.archived) {
         const original = originals.get(entry.id);
         if (!original) throw new Error("verification target missing from batch");
-        const reason = isDirectiveShapedProjectRule(original.category, original.content)
+        const refusalReason = isDirectiveShapedProjectRule(original.category, original.content)
             ? "directive-shaped-project-rule"
-            : entry.reason;
-        log(
-            `[dreamer] verify safety refusal: memory_id=${entry.id} verdict=archive reason=${reason}`,
-        );
+            : undefined;
+        if (refusalReason)
+            log(
+                `[dreamer] verify safety refusal: memory_id=${entry.id} verdict=archive reason=${refusalReason}`,
+            );
         writes.push({
             kind: "archive",
             id: entry.id,
             files: await normalizeFiles(args, original.mappedFiles),
-            reason,
+            reason: entry.reason,
+            refusalReason,
         });
     }
     for (const entry of valid.skipped)
@@ -664,6 +667,7 @@ type VerifyWrite = {
     files: string[];
     content?: string;
     reason?: string;
+    refusalReason?: string;
 };
 
 async function commitVerificationWrites(
@@ -694,10 +698,18 @@ async function commitVerificationWrites(
             checkedAt,
             content: write.content,
             reason: write.reason,
+            refusalReason: write.refusalReason,
         };
     });
-    const count = (result: string, kind: VerifyWrite["kind"]) => {
-        if (result === "confirmed") counts.verified += 1;
+    const count = (result: string, kind: VerifyWrite["kind"], state?: string) => {
+        if (
+            state === "applied" &&
+            kind === "update" &&
+            (result === "updated" || result === "unmapped")
+        )
+            counts.updated += 1;
+        else if (result === "archived" && state === "applied") counts.archived += 1;
+        else if (result === "confirmed") counts.verified += 1;
         else if (kind === "skipped") counts.skipped += 1;
         else if (kind !== "failed" && kind !== "unmapped") counts.refused += 1;
     };
@@ -712,6 +724,7 @@ async function commitVerificationWrites(
             source_commit_matches: request.sourceCommitMatches,
             updated_content: request.content,
             archive_reason: request.reason,
+            refusal_reason: request.refusalReason,
         }));
         try {
             const response = await args.moduleRoute.moduleClient.call({
@@ -728,7 +741,7 @@ async function commitVerificationWrites(
                 },
             });
             const result = ((response as { result?: unknown })?.result ?? response) as {
-                results?: Array<{ memory_id: number; result: string }>;
+                results?: Array<{ memory_id: number; result: string; state?: string }>;
             };
             if (!Array.isArray(result?.results) || result.results.length !== requests.length)
                 throw new Error("invalid verification response");
@@ -736,18 +749,21 @@ async function commitVerificationWrites(
                 const matches = result.results.filter((row) => row.memory_id === request.memoryId);
                 if (matches.length !== 1)
                     throw new Error("invalid verification response identities");
-                count(matches[0].result, request.kind);
+                count(matches[0].result, request.kind, matches[0].state);
             }
         } catch (error) {
             throw new DreamerModuleFailureError("memory.set_verification", error);
         }
     } else {
         runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
-            for (const request of requests)
-                count(
-                    applyMemoryVerification(args.db, request).verificationResult ?? "failed",
-                    request.kind,
-                );
+            for (const request of requests) {
+                const receipt = applyMemoryVerification(args.db, request);
+                if (receipt.reason.startsWith("duplicate_of:"))
+                    log(
+                        `[dreamer] verify safety refusal: memory_id=${request.memoryId} verdict=update reason=duplicate-of duplicate_id=${receipt.reason.slice("duplicate_of:".length)}`,
+                    );
+                count(receipt.verificationResult ?? "failed", request.kind, receipt.state);
+            }
         });
     }
     return counts;

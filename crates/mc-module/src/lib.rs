@@ -33277,9 +33277,9 @@ mod tests {
         };
         let after_update =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        assert_eq!(update_body["accepted"], json!([]));
-        assert_eq!(update_body["results"][0]["result"], "refused");
-        // A code check saves a correction proposal; changing memory content requires separate authorization.
+        assert_eq!(update_body["accepted"], json!([updated_id]));
+        assert_eq!(update_body["results"][0]["result"], "updated");
+        // Automated verify corrections use curate's applier and preserve undo history without publishing a prompt delta.
         assert_eq!(
             after_update, before_update,
             "an automated content update must not move the m1 mutation signal"
@@ -33296,13 +33296,13 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!((history, log_rows, revision), (0, 0, 1));
+        assert_eq!((history, log_rows, revision), (1, 0, 2));
         assert_eq!(
             store.get_memory_full(updated_id).unwrap().unwrap().content,
-            "updated"
+            "updated by verifier"
         );
 
-        // A verifier's proposed text matching a different memory still cannot authorize merging the two memories.
+        // Matching another memory's text is a duplicate refusal, not authority to merge the two rows.
         let duplicate = call_facade(&handler, "memory.set_verification", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
             "rows": [
@@ -33317,7 +33317,7 @@ mod tests {
         assert_eq!(duplicate_body["accepted"], json!([verified_id]));
         assert_eq!(
             duplicate_body["rejected"],
-            json!([{"memory_id": archived_id, "reason": "approval_required"}])
+            json!([{"memory_id": archived_id, "reason": format!("duplicate_of:{updated_id}")}])
         );
         assert_eq!(
             store.get_memory_full(archived_id).unwrap().unwrap().content,
@@ -33333,14 +33333,14 @@ mod tests {
         assert!(matches!(archive, HandlerOutcome::Response(_)));
         let after_archive =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        // An archive proposal leaves the live row and prompt signals unchanged.
+        // The archive is durable immediately but reaches served memory bytes only at a natural HARD rebuild.
         assert_eq!(
             after_archive, before_archive,
             "a verify archive must not move the m1 mutation signal"
         );
         assert_eq!(
             store.get_memory_full(archived_id).unwrap().unwrap().status,
-            "active"
+            "archived"
         );
         let proposals: Vec<(String, String, String)> = store
             .with_context_conn_for_test(|tx| {
@@ -33353,8 +33353,7 @@ mod tests {
                 rows
             })
             .unwrap();
-        assert_eq!(proposals.len(), 3);
-        assert!(proposals.iter().all(|proposal| proposal.0 == "verify"));
+        assert!(proposals.is_empty());
 
         let stamped = store.get_memory_full(verified_id).unwrap().unwrap();
         assert_eq!(stamped.verification_status, "verified");
@@ -33420,6 +33419,57 @@ mod tests {
                 None
             );
         }
+
+        let unbacked_update = call_facade(&handler, "memory.set_verification", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "update", "expected_revision": 1, "updated_content": "corrected without local files", "files": [], "checked_commit": checked_head}]
+        })).await;
+        let HandlerOutcome::Response(unbacked_update) = unbacked_update else {
+            panic!("unmapped update failed")
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&unbacked_update).unwrap()["results"][0]["result"],
+            "unmapped"
+        );
+        assert_eq!(
+            store
+                .get_memory_full(verified_id)
+                .unwrap()
+                .unwrap()
+                .verified_at,
+            None
+        );
+        assert_eq!(
+            store
+                .get_memory_full(verified_id)
+                .unwrap()
+                .unwrap()
+                .verification_status,
+            "unverified"
+        );
+        let invalid_update = call_facade(&handler, "memory.set_verification", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "rows": [{"memory_id": unmapped_id, "content_hash_at_prompt": hash(unmapped_id), "verification_status": "update", "expected_revision": 1, "updated_content": "", "files": ["src/lib.rs"], "checked_commit": checked_head}]
+        })).await;
+        let HandlerOutcome::Response(invalid_update) = invalid_update else {
+            panic!("invalid update accounting failed")
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&invalid_update).unwrap()["results"][0]["result"],
+            "refused"
+        );
+        assert_eq!(
+            store
+                .get_memory_full(unmapped_id)
+                .unwrap()
+                .unwrap()
+                .verified_at,
+            None
+        );
+        assert_eq!(
+            store.get_memory_full(unmapped_id).unwrap().unwrap().content,
+            "unmapped claim"
+        );
 
         let mapping = call_facade(&handler, "memory.set_mapping", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,

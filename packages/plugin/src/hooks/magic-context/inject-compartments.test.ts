@@ -4837,3 +4837,85 @@ for (const host of ["opencode", "opencode2"] as const) {
         _resetHarnessForTesting();
     });
 }
+
+for (const host of ["opencode", "opencode2"] as const) {
+    for (const operation of ["update", "archive"] as const) {
+        it(`${host} direct verify ${operation} preserves served m0 m1 and mural until natural HARD`, () => {
+            _resetHarnessForTesting();
+            setHarness(host);
+            db = makeDb();
+            const target = insertMemory(db, {
+                projectPath: PROJECT_PATH,
+                category: "ARCHITECTURE",
+                content: "OLD_VERIFIED_CLAIM: Source limit is five minutes.",
+            });
+            const options = {
+                db,
+                sessionId: SESSION_ID,
+                state: readStateFromMeta(),
+                projectPath: PROJECT_PATH,
+                mural: {
+                    enabled: true,
+                    supportsVision: true,
+                    dataUrl: "data:image/png;base64,dmVyaWZ5LW11cmFs",
+                },
+                hardSignals: {
+                    systemHash: "verify-direct",
+                    modelKey: "verify-model",
+                    cacheExpired: false,
+                    lastResponseTime: 0,
+                },
+            };
+            const first = [userMessage("verify-direct-first", "hello")];
+            injectM0M1({ ...options, messages: first });
+            expect(renderedText(first[0])).toContain("OLD_VERIFIED_CLAIM");
+            const prefix = JSON.stringify(first.slice(0, 2));
+            expect(prefix).toContain("data:image/png;base64,dmVyaWZ5LW11cmFs");
+            const corrected = "CORRECTED_VERIFIED_CLAIM: Source limit is ten minutes.";
+            const receipt = applyMemoryVerification(db, {
+                key: `verify-direct:${host}:${operation}`,
+                projectPath: PROJECT_PATH,
+                memoryId: target.id,
+                expectedRevision: 1,
+                contentHashAtPrompt: target.normalizedHash,
+                kind: operation,
+                content: operation === "update" ? corrected : undefined,
+                reason: "the files refute this memory",
+                files: ["src/test.ts"],
+                checkedCommit: null,
+                sourceCommitMatches: true,
+                checkedAt: Date.now(),
+            });
+            expect(receipt.state).toBe("applied");
+            expect(receipt.verificationResult).toBe(
+                operation === "update" ? "updated" : "archived",
+            );
+            expect(
+                db
+                    .prepare("SELECT previous_text FROM memory_history WHERE memory_id=?")
+                    .all(target.id),
+            ).toEqual([{ previous_text: target.content }]);
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual({
+                n: 0,
+            });
+            expect(mustMaterialize(options)).toEqual({ value: false, reason: null });
+            for (const busting of [false, true]) {
+                const messages = [userMessage(`verify-direct-next-${busting}`, "after check")];
+                const result = injectM0M1({ ...options, messages, isCacheBustingPass: busting });
+                expect(result.m0RematerializedThisPass).toBe(false);
+                expect(JSON.stringify(messages.slice(0, 2))).toBe(prefix);
+            }
+            const messages = [userMessage("verify-direct-hard", "independent system change")];
+            const hard = injectM0M1({
+                ...options,
+                messages,
+                hardSignals: { ...options.hardSignals, systemHash: "natural-direct-hard" },
+            });
+            expect(hard.m0RematerializedThisPass).toBe(true);
+            expect(renderedText(messages[0])).not.toContain("OLD_VERIFIED_CLAIM");
+            if (operation === "update")
+                expect(renderedText(messages[0])).toContain("CORRECTED_VERIFIED_CLAIM");
+            _resetHarnessForTesting();
+        });
+    }
+}

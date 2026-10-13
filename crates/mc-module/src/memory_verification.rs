@@ -1,5 +1,5 @@
 //! Record code-check results against the memory revision that was checked.
-//! Correcting or retiring a memory requires authorization beyond a code-check verdict.
+//! Automated corrections and archives use the shared applier and retain undo history.
 
 use crate::host_store::HostStore;
 use mc_store::memory_lifecycle::{applier::fresh_decision_key, authority::module_owns_memory};
@@ -21,6 +21,7 @@ pub(crate) struct VerificationRow {
     source_commit_matches: bool,
     updated_content: Option<String>,
     archive_reason: Option<String>,
+    refusal_reason: Option<String>,
 }
 
 fn source_matches() -> bool {
@@ -106,7 +107,7 @@ pub(crate) fn apply(
         let key = format!("verification-batch:{}", json!([project, session, command.unwrap_or(&nonce)]));
         let head = git_head(root);
         let mut response = None;
-        writer.with_domain_transaction(&["memories", "memory_verifications", "memory_tool_proposals", "memory_decision_receipts", "memory_journal"], &mut |tx| {
+        writer.with_domain_transaction(&["memories", "memory_verifications", "memory_history", "memory_decision_receipts", "memory_journal"], &mut |tx| {
             if let Some(saved) = tx.query_row("SELECT receipt_json FROM memory_decision_receipts WHERE decision_key=?1", [&key], |row| row.get::<_, String>(0)).optional()? {
                 response = Some(saved.into_bytes());
                 return Ok(());
@@ -146,6 +147,24 @@ pub(crate) fn apply_row(
     head: Option<&str>,
     now: i64,
 ) -> rusqlite::Result<Value> {
+    mc_store::with_automated_memory_mutation_tx(conn, |applier| {
+        apply_row_with_applier(conn, applier, project, batch_key, row, head, now)
+            .map_err(|error| error.to_string())
+    })
+    .map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+    })
+}
+
+fn apply_row_with_applier(
+    conn: &Connection,
+    applier: &mc_store::FacadeMutationTxn<'_>,
+    project: &str,
+    batch_key: &str,
+    row: &VerificationRow,
+    head: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<Value> {
     let memory: Option<VerificationTarget> = conn.query_row(
         "SELECT project_path,normalized_hash,revision,status,superseded_by_memory_id,metadata_json FROM memories WHERE id=?1",
         [row.memory_id], |record| Ok(VerificationTarget { project: record.get(0)?, hash: record.get(1)?, revision: record.get(2)?, status: record.get(3)?, successor: record.get(4)?, metadata: record.get(5)? }),
@@ -167,14 +186,66 @@ pub(crate) fn apply_row(
     let files = normalized_files(&row.files).map_err(|error| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
     })?;
-    let pending = matches!(row.verification_status.as_str(), "update" | "archive");
     let source_matches = row.source_commit_matches && row.checked_commit.as_deref() == head;
+    let mut semantic_refusal = row.refusal_reason.clone();
+    if refusal.is_none() && source_matches && semantic_refusal.is_none() {
+        let mutation = match row.verification_status.as_str() {
+            "update" => {
+                let content = row.updated_content.as_deref().unwrap_or("").trim();
+                if content.is_empty() || content.encode_utf16().count() > 20_000 {
+                    semantic_refusal = Some("invalid_content".into());
+                    None
+                } else {
+                    applier
+                        .check_memory_revisions(&[(row.memory_id, row.expected_revision)])
+                        .map_err(sql_failure)?;
+                    Some(
+                        applier
+                            .update_memory_content(project, row.memory_id, content, None, now)
+                            .map(|_| ()),
+                    )
+                }
+            }
+            "archive" => {
+                applier
+                    .check_memory_revisions(&[(row.memory_id, row.expected_revision)])
+                    .map_err(sql_failure)?;
+                Some(
+                    applier
+                        .archive_memories(
+                            project,
+                            &[row.memory_id],
+                            row.archive_reason.as_deref(),
+                            now,
+                        )
+                        .map(|_| ()),
+                )
+            }
+            _ => None,
+        };
+        if let Some(Err(error)) = mutation {
+            match error {
+                mc_store::FacadeMemoryMutationError::DuplicateContent { id } => {
+                    semantic_refusal = Some(format!("duplicate_of:{id}"))
+                }
+                error => return Err(sql_failure(error.to_string())),
+            }
+        }
+    }
     let result = if refusal.is_some() {
         "stale"
     } else if !source_matches {
         "failed"
-    } else if pending {
+    } else if semantic_refusal.is_some() {
         "refused"
+    } else if row.verification_status == "update" {
+        if files.is_empty() {
+            "unmapped"
+        } else {
+            "updated"
+        }
+    } else if row.verification_status == "archive" {
+        "archived"
     } else if row.verification_status == "verified" {
         if files.is_empty() {
             "unmapped"
@@ -184,14 +255,14 @@ pub(crate) fn apply_row(
     } else {
         row.verification_status.as_str()
     };
-    let reason = refusal.unwrap_or(if pending {
-        "approval_required"
-    } else if !source_matches {
-        "source_commit_changed"
-    } else {
-        result
-    });
-    let state = if refusal.is_some() || pending {
+    let reason = refusal
+        .or(semantic_refusal.as_deref())
+        .unwrap_or(if !source_matches {
+            "source_commit_changed"
+        } else {
+            result
+        });
+    let state = if refusal.is_some() || semantic_refusal.is_some() {
         "decided_pending"
     } else {
         "applied"
@@ -199,12 +270,18 @@ pub(crate) fn apply_row(
     let receipt = json!({"state": state, "reason": reason, "memoryId": row.memory_id, "adoptionClass": "deferred", "verificationResult": result});
     let key = format!("{batch_key}:{}", row.memory_id);
     if refusal.is_none() {
-        conn.execute("UPDATE memories SET verify_result=?1,verify_files_json=?2,verify_commit=?3 WHERE id=?4", params![result, json!(files).to_string(), row.checked_commit, row.memory_id])?;
-        if pending {
-            let proposal = json!({"memoryId": row.memory_id, "expectedRevision": row.expected_revision, "contentHashAtPrompt": row.content_hash_at_prompt, "kind": row.verification_status, "content": row.updated_content, "reason": row.archive_reason, "files": files, "checkedCommit": row.checked_commit});
-            conn.execute("INSERT INTO memory_tool_proposals(project_path,proposal_key,writer,operation,target_ids_json,expected_revisions_json,proposal_json,reason,created_at) VALUES(?1,?2,'verify',?3,?4,?5,?6,?7,?8)", params![project, key, row.verification_status, json!([row.memory_id]).to_string(), json!([row.expected_revision]).to_string(), proposal.to_string(), reason, now])?;
+        if row.verification_status == "update" && matches!(result, "updated" | "unmapped") {
+            conn.execute(
+                "UPDATE memories SET verification_status='unverified',verified_at=NULL WHERE id=?1",
+                [row.memory_id],
+            )?;
+            conn.execute(
+                "DELETE FROM memory_verifications WHERE memory_id=?1",
+                [row.memory_id],
+            )?;
         }
-        if result == "confirmed" {
+        conn.execute("UPDATE memories SET verify_result=?1,verify_files_json=?2,verify_commit=?3 WHERE id=?4", params![result, json!(files).to_string(), row.checked_commit, row.memory_id])?;
+        if result == "confirmed" || result == "updated" {
             conn.execute(
                 "DELETE FROM memory_verifications WHERE memory_id=?1",
                 [row.memory_id],
@@ -230,4 +307,8 @@ pub(crate) fn apply_row(
     Ok(
         json!({"memory_id": row.memory_id, "result": result, "reason": reason, "state": state, "revision": row.expected_revision, "files": files, "checked_commit": row.checked_commit, "receipt": receipt}),
     )
+}
+
+fn sql_failure(error: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
 }

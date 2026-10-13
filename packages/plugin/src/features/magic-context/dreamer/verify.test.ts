@@ -393,7 +393,7 @@ describe("runVerify disposition", () => {
         }
     });
 
-    test("queues changed-file archive proposals, including the PROJECT_RULES boundary", async () => {
+    test("applies changed-file code fact archives with history, including the PROJECT_RULES boundary", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:verify-code-fact-archive";
@@ -429,18 +429,22 @@ describe("runVerify disposition", () => {
 
             expect(scripted.promptIds()).toEqual([[constraint.id, projectRuleCodeFact.id]]);
             expect(result).toMatchObject({
-                archived: 0,
-                refused: 2,
+                archived: 2,
+                refused: 0,
                 remaining: 0,
                 complete: true,
             });
-            expect(getMemoryById(db, constraint.id)?.status).toBe("active");
-            expect(getMemoryById(db, projectRuleCodeFact.id)?.status).toBe("active");
+            expect(getMemoryById(db, constraint.id)?.status).toBe("archived");
+            expect(getMemoryById(db, projectRuleCodeFact.id)?.status).toBe("archived");
             expect(
                 db.prepare("SELECT previous_text FROM memory_history ORDER BY id").all(),
-            ).toEqual([]);
+            ).toEqual(
+                [constraint, projectRuleCodeFact].map((memory) => ({
+                    previous_text: memory.content,
+                })),
+            );
             expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual({
-                n: 2,
+                n: 0,
             });
         } finally {
             closeQuietly(db);
@@ -1015,14 +1019,16 @@ describe("applyVerifyManifest", () => {
             expect(result).toEqual({
                 verified: 0,
                 updated: 0,
-                archived: 0,
+                archived: 1,
                 skipped: 0,
-                refused: 1,
+                refused: 0,
             });
-            expect(getMemoryById(db, archived.id)?.status).toBe("active");
-            expect(db.prepare("SELECT previous_text FROM memory_history").all()).toEqual([]);
+            expect(getMemoryById(db, archived.id)?.status).toBe("archived");
+            expect(db.prepare("SELECT previous_text FROM memory_history").all()).toEqual([
+                { previous_text: archived.content },
+            ]);
             expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual({
-                n: 1,
+                n: 0,
             });
             expect(getMemoryById(db, silent.id)?.status).toBe("active");
             const silentState = getMemoryVerifications(db, [silent.id]).get(silent.id);
@@ -1283,7 +1289,7 @@ describe("applyVerifyManifest", () => {
                     ([message]) =>
                         typeof message === "string" &&
                         message.includes(`memory_id=${target.id} verdict=update`) &&
-                        message.includes("reason=approval_required"),
+                        message.includes(`reason=duplicate-of duplicate_id=${existing.id}`),
                 ),
             ).toBe(true);
         } finally {
@@ -1292,7 +1298,7 @@ describe("applyVerifyManifest", () => {
         }
     });
 
-    test("keeps explicitly marked consolidation pending without rewriting", async () => {
+    test("applies explicitly marked consolidation and records undo history", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:verify-consolidation";
@@ -1321,18 +1327,23 @@ describe("applyVerifyManifest", () => {
 
             expect(result).toEqual({
                 verified: 0,
-                updated: 0,
+                updated: 1,
                 archived: 0,
                 skipped: 0,
-                refused: 1,
+                refused: 0,
             });
-            expect(getMemoryById(db, memory.id)?.content).toBe(memory.content);
+            expect(getMemoryById(db, memory.id)?.content).toBe("Uses src/new.ts.");
+            expect(
+                db
+                    .prepare("SELECT previous_text FROM memory_history WHERE memory_id=?")
+                    .all(memory.id),
+            ).toEqual([{ previous_text: memory.content }]);
         } finally {
             closeQuietly(db);
         }
     });
 
-    test("pending content corrections preserve file mappings and embedding cache", async () => {
+    test("content corrections replace file mappings and clear stale embedding cache", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:test";
@@ -1362,17 +1373,22 @@ describe("applyVerifyManifest", () => {
 
             expect(result).toEqual({
                 verified: 0,
-                updated: 0,
+                updated: 1,
                 archived: 0,
                 skipped: 0,
-                refused: 1,
+                refused: 0,
             });
-            expect(getMemoryById(db, memory.id)?.content).toBe(memory.content);
+            expect(getMemoryById(db, memory.id)?.content).toBe("New value lives in src/new.ts.");
             expect(getMemoryVerifications(db, [memory.id]).get(memory.id)?.files).toEqual([
-                "src/old.ts",
+                "src/new.ts",
             ]);
-            expect(loadAllEmbeddings(db, projectIdentity, "model-a").has(memory.id)).toBe(true);
-            expect(peekProjectEmbeddings(projectIdentity, "model-a")?.has(memory.id)).toBe(true);
+            expect(loadAllEmbeddings(db, projectIdentity, "model-a").has(memory.id)).toBe(false);
+            expect(peekProjectEmbeddings(projectIdentity, "model-a")?.has(memory.id)).toBe(false);
+            expect(
+                db
+                    .prepare("SELECT previous_text FROM memory_history WHERE memory_id=?")
+                    .all(memory.id),
+            ).toEqual([{ previous_text: memory.content }]);
         } finally {
             closeQuietly(db);
         }
@@ -1734,8 +1750,11 @@ test("copied store records confirmed unmapped skipped refused and failed with fi
     const memories = ["confirmed", "unmapped", "skipped", "refused", "failed"].map((name) =>
         insertMemory(source, {
             projectPath: project,
-            category: "ARCHITECTURE",
-            content: `${name} claim lives in src/old.ts.`,
+            category: name === "refused" ? "PROJECT_RULES" : "ARCHITECTURE",
+            content:
+                name === "refused"
+                    ? "Never archive workflow rules because a named file omits them."
+                    : `${name} claim lives in src/old.ts.`,
         }),
     );
     for (const [index, memory] of memories.entries())
@@ -1799,7 +1818,7 @@ test("copied store records confirmed unmapped skipped refused and failed with fi
         ]);
         expect(
             db.prepare("SELECT operation,expected_revisions_json FROM memory_tool_proposals").all(),
-        ).toEqual([{ operation: "update", expected_revisions_json: "[1]" }]);
+        ).toEqual([]);
         for (const memory of memories)
             expect(getMemoryById(db, memory.id)?.content).toBe(memory.content);
         const original = new Database(sourcePath);
@@ -1923,6 +1942,139 @@ test("verification rechecks the checked commit and prompt revision after file no
         ).toBe(0);
         expect(getMemoryVerifications(db, [memory.id]).size).toBe(0);
         expect(getMemoryById(db, memory.id)?.verifiedAt).toBeNull();
+    } finally {
+        db.close();
+    }
+});
+
+test("direct verification mutations are revision-bound idempotent and never propose work", () => {
+    const db = freshDb();
+    try {
+        for (const kind of ["update", "archive"] as const) {
+            const memory = insertMemory(db, {
+                projectPath: "git:verify-direct-cas",
+                category: "ARCHITECTURE",
+                content: `Original ${kind} claim.`,
+            });
+            const request = {
+                key: `verify-direct:${kind}`,
+                projectPath: memory.projectPath,
+                memoryId: memory.id,
+                expectedRevision: 1,
+                contentHashAtPrompt: memory.normalizedHash,
+                kind,
+                content: "Corrected claim.",
+                reason: "the files refute this memory",
+                files: ["src/old.ts"],
+                checkedCommit: null,
+                sourceCommitMatches: true,
+                checkedAt: 1000,
+            };
+            expect(
+                applyMemoryVerification(db, {
+                    ...request,
+                    key: `${request.key}:stale`,
+                    expectedRevision: 9,
+                }).verificationResult,
+            ).toBe("stale");
+            expect(getMemoryById(db, memory.id)?.content).toBe(memory.content);
+            expect(applyMemoryVerification(db, request).verificationResult).toBe(
+                kind === "update" ? "updated" : "archived",
+            );
+            const after = db.prepare("SELECT * FROM memories WHERE id=?").get(memory.id);
+            expect(applyMemoryVerification(db, { ...request, checkedAt: 2000 }).state).toBe(
+                "applied",
+            );
+            expect(db.prepare("SELECT * FROM memories WHERE id=?").get(memory.id)).toEqual(after);
+            expect(
+                db
+                    .prepare("SELECT previous_text FROM memory_history WHERE memory_id=?")
+                    .all(memory.id),
+            ).toEqual([{ previous_text: memory.content }]);
+            expect(db.prepare("SELECT revision FROM memories WHERE id=?").get(memory.id)).toEqual({
+                revision: 2,
+            });
+        }
+        expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual({
+            n: 0,
+        });
+        expect(db.prepare("SELECT COUNT(*) AS n FROM memory_mutation_log").get()).toEqual({ n: 0 });
+    } finally {
+        db.close();
+    }
+});
+
+for (const content of ["", "x".repeat(20_001)]) {
+    test(`invalid ${content.length ? "oversized" : "empty"} verify update never falls back to confirmation`, () => {
+        const db = freshDb();
+        try {
+            const memory = insertMemory(db, {
+                projectPath: "git:verify-invalid",
+                category: "ARCHITECTURE",
+                content: "Original claim.",
+            });
+            expect(
+                applyMemoryVerification(db, {
+                    key: "verify-invalid",
+                    projectPath: memory.projectPath,
+                    memoryId: memory.id,
+                    expectedRevision: 1,
+                    contentHashAtPrompt: memory.normalizedHash,
+                    kind: "update",
+                    content,
+                    files: ["src/old.ts"],
+                    checkedCommit: null,
+                    sourceCommitMatches: true,
+                    checkedAt: 1000,
+                }).verificationResult,
+            ).toBe("refused");
+            expect(getMemoryById(db, memory.id)?.content).toBe(memory.content);
+            expect(getMemoryById(db, memory.id)?.verifiedAt).toBeNull();
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({ n: 0 });
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual({
+                n: 0,
+            });
+        } finally {
+            db.close();
+        }
+    });
+}
+
+test("a direct correction with an empty backing set is unmapped and cannot inherit the old confirmation", () => {
+    const db = freshDb();
+    try {
+        const memory = insertMemory(db, {
+            projectPath: "git:verify-unmapped-update",
+            category: "ARCHITECTURE",
+            content: "Old claim.",
+        });
+        const request = {
+            key: "verify-old",
+            projectPath: memory.projectPath,
+            memoryId: memory.id,
+            expectedRevision: 1,
+            contentHashAtPrompt: memory.normalizedHash,
+            kind: "verified" as const,
+            files: ["src/old.ts"],
+            checkedCommit: null,
+            sourceCommitMatches: true,
+            checkedAt: 1000,
+        };
+        expect(applyMemoryVerification(db, request).verificationResult).toBe("confirmed");
+        expect(
+            applyMemoryVerification(db, {
+                ...request,
+                key: "verify-new",
+                kind: "update",
+                content: "New claim.",
+                files: [],
+                checkedAt: 2000,
+            }).verificationResult,
+        ).toBe("unmapped");
+        expect(getMemoryById(db, memory.id)?.content).toBe("New claim.");
+        expect(getMemoryById(db, memory.id)?.verifiedAt).toBeNull();
+        expect(getMemoryById(db, memory.id)?.verificationStatus).toBe("unverified");
+        expect(getMemoryVerifications(db, [memory.id]).size).toBe(0);
     } finally {
         db.close();
     }

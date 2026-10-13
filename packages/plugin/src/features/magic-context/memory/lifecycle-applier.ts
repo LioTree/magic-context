@@ -69,7 +69,9 @@ export type VerificationResult =
     | "skipped"
     | "refused"
     | "failed"
-    | "stale";
+    | "stale"
+    | "updated"
+    | "archived";
 export interface MemoryVerificationRequest {
     key: string;
     projectPath: string;
@@ -83,9 +85,10 @@ export interface MemoryVerificationRequest {
     checkedAt: number;
     content?: string;
     reason?: string;
+    refusalReason?: string;
 }
 
-/** Verification may confirm unchanged prose, but cannot authorize a correction or retirement. */
+/** Apply code-check results and authorized automated corrections under one revision-bound transaction. */
 export function applyMemoryVerification(
     db: Database,
     request: MemoryVerificationRequest,
@@ -130,36 +133,61 @@ export function applyMemoryVerification(
                 memory.normalizedHash !== request.contentHashAtPrompt
             )
                 return record("decided_pending", "stale_revision", "stale");
-            const pending = request.kind === "update" || request.kind === "archive";
-            const result: VerificationResult = !request.sourceCommitMatches
+            const mutation = request.kind === "update" || request.kind === "archive";
+            let refusalReason = request.refusalReason;
+            if (
+                request.kind === "update" &&
+                (!request.content?.trim() || request.content.trim().length > 20_000)
+            )
+                refusalReason = "invalid_content";
+            let result: VerificationResult = !request.sourceCommitMatches
                 ? "failed"
-                : request.kind === "update" || request.kind === "archive"
+                : refusalReason
                   ? "refused"
-                  : request.kind === "verified"
+                  : request.kind === "update"
                     ? request.files.length > 0
-                        ? "confirmed"
+                        ? "updated"
                         : "unmapped"
-                    : request.kind;
+                    : request.kind === "archive"
+                      ? "archived"
+                      : request.kind === "verified"
+                        ? request.files.length > 0
+                            ? "confirmed"
+                            : "unmapped"
+                        : request.kind;
+            if (mutation && request.sourceCommitMatches && !refusalReason) {
+                try {
+                    const receipt = applyMemoryMutation(
+                        db,
+                        {
+                            key: `${request.key}:mutation`,
+                            projectPath: request.projectPath,
+                            operation: request.kind as "update" | "archive",
+                            targets: [{ id: memory.id, revision: request.expectedRevision }],
+                            content: request.content,
+                            reason: request.reason ?? `verify_${request.kind}`,
+                            sourceSessionId: "",
+                        },
+                        true,
+                        "verify",
+                    );
+                    if (receipt.state !== "applied") refusalReason = receipt.reason;
+                    else if (request.kind === "update")
+                        db.prepare(
+                            "UPDATE memories SET verification_status='unverified',verified_at=NULL WHERE id=?",
+                        ).run(memory.id);
+                } catch (error) {
+                    if (!(error instanceof MemoryContentDuplicateError)) throw error;
+                    refusalReason = `duplicate_of:${error.memoryId}`;
+                }
+                if (refusalReason) result = "refused";
+            }
             db.prepare(
                 "UPDATE memories SET verify_result=?,verify_files_json=?,verify_commit=? WHERE id=?",
             ).run(result, JSON.stringify(request.files), request.checkedCommit, memory.id);
-            if (pending) {
-                db.prepare(
-                    "INSERT INTO memory_tool_proposals(project_path,proposal_key,writer,operation,target_ids_json,expected_revisions_json,proposal_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                ).run(
-                    request.projectPath,
-                    request.key,
-                    "verify",
-                    request.kind,
-                    JSON.stringify([memory.id]),
-                    JSON.stringify([request.expectedRevision]),
-                    JSON.stringify(request),
-                    request.reason ?? "approval_required",
-                    request.checkedAt,
-                );
-                return record("decided_pending", request.reason ?? "approval_required", result);
-            }
-            if (result === "confirmed") {
+            if (result === "refused")
+                return record("decided_pending", refusalReason ?? "refused", result);
+            if (result === "confirmed" || (result === "updated" && request.files.length > 0)) {
                 recordMemoryVerifications(db, memory.id, request.files, request.checkedAt);
                 let metadata: Record<string, unknown> = {};
                 try {
@@ -659,8 +687,8 @@ function applyMemoryMutation(
     db: Database,
     request: AgentMemoryMutation,
     automated: boolean,
+    writer = automated ? "curate" : "ctx_memory",
 ): ApplierReceipt {
-    const writer = automated ? "curate" : "ctx_memory";
     const adoptionClass = automated ? "deferred" : "live";
     const queue = (mutation: Parameters<typeof queueMemoryMutation>[1]) => {
         if (!automated) queueMemoryMutation(db, mutation);

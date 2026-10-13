@@ -910,8 +910,7 @@ fn noprop_agent_m1_fingerprint_matches_baseline() {
     println!("noprop Rust agent m[1] SHA256 {hash}");
 }
 
-#[test]
-fn module_verification_freezes_served_m0_m1_and_mural_until_natural_hard() {
+fn assert_module_verification_cache(kind: &str) {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path());
     s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")]).unwrap();
@@ -927,11 +926,15 @@ fn module_verification_freezes_served_m0_m1_and_mural_until_natural_hard() {
     assert!(String::from_utf8_lossy(&served).contains(NO_GLYPH_PNG));
     let rows = crate::memory_verification::validate_rows(&json!([{
         "memory_id": id, "expected_revision": 1, "content_hash_at_prompt": hash,
-        "verification_status": "verified", "files": ["source.rs"], "checked_commit": null,
+        "verification_status": kind, "updated_content": "Corrected code claim.", "files": ["source.rs"], "checked_commit": null,
     }])).unwrap();
     s.with_context_conn_for_test(|tx| {
         let receipt = crate::memory_verification::apply_row(tx, "git:proj", "verify-cache", &rows[0], None, 1234)?;
-        assert_eq!(receipt["result"], "confirmed");
+        assert_eq!(receipt["result"], if kind == "update" { "updated" } else { "confirmed" });
+        let history: i64 = tx.query_row("SELECT COUNT(*) FROM memory_history WHERE memory_id=?1", [id], |row| row.get(0))?;
+        assert_eq!(history, if kind == "update" { 1 } else { 0 });
+        let proposals: i64 = tx.query_row("SELECT COUNT(*) FROM memory_tool_proposals", [], |row| row.get(0))?;
+        assert_eq!(proposals, 0);
         Ok(())
     }).unwrap();
     let deferred = transform(&s, &request, &ctx).unwrap();
@@ -946,6 +949,17 @@ fn module_verification_freezes_served_m0_m1_and_mural_until_natural_hard() {
     request.render_config = "independent-hard".into();
     let hard = transform(&s, &request, &ctx).unwrap();
     assert_eq!(hard.action, "HARD");
-    assert!(m0_bytes(&hard).contains("Verified code claim."));
+    assert!(m0_bytes(&hard).contains(if kind == "update" { "Corrected code claim." } else { "Verified code claim." }));
+    if kind == "update" { assert!(!m0_bytes(&hard).contains("Verified code claim.")); }
     assert!(serde_json::to_string(hard.messages()).unwrap().contains(NO_GLYPH_PNG));
+}
+
+#[test]
+fn module_verification_freezes_served_m0_m1_and_mural_until_natural_hard() {
+    assert_module_verification_cache("verified");
+}
+
+#[test]
+fn module_verification_direct_update_freezes_served_m0_m1_and_mural_until_natural_hard() {
+    assert_module_verification_cache("update");
 }
