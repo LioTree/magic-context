@@ -53,7 +53,7 @@ const TEXT_REQUIRED_TOOLS: [&str; 3] = ["ctx_expand", "ctx_search", "ctx_note"];
 /// schema both match, so a different digest would silently turn stamping off
 /// there; any change ships together with the gateway change that recognises it.
 pub(crate) const FROZEN_CTX_REDUCE_SCHEMA_DIGEST: &str =
-    "69c7dd3393dc8af19386eb80f849df7a1943126bfe1a14769bfff1182b88abf6";
+    "4aef9a14d5c9c617b7e01c5698c1609dd97c55c30fd552fb64e3236346d21731";
 
 /// The params a tool item may carry: the role's shared vocabulary plus `model`.
 const TOOL_PARAMS: [&str; 5] = ["scope", "tool_descs", "exclude", "behavior", "model"];
@@ -1010,4 +1010,38 @@ fn sha256_hex_bytes(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod parity_runtime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reduce_advertises_optional_drop_but_execution_still_requires_it() {
+        let config = CatalogConfig::from_module_config(&McModuleConfig::default());
+        let reduce = catalog_tool(
+            definition().tool("ctx_reduce").unwrap(),
+            Surface::Full,
+            &config,
+        )
+        .unwrap();
+        assert!(reduce["input_schema"].get("required").is_none());
+        assert_eq!(reduce["schema_digest"], FROZEN_CTX_REDUCE_SCHEMA_DIGEST);
+
+        let handler = crate::McHandler::new();
+        for arguments in [json!({}), json!({ "drop": "  " }), json!({ "drop": 7 })] {
+            let outcome = handler
+                .dispatch_value(7, json!({ "name": "ctx_reduce", "arguments": arguments }))
+                .await;
+            let HandlerOutcome::Response(bytes) = outcome else {
+                panic!("expected tool refusal, got {outcome:?}");
+            };
+            let refused: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(refused["isError"], true);
+            assert_eq!(
+                refused["content"][0]["text"],
+                "Error: 'drop' must be provided."
+            );
+        }
+    }
 }

@@ -32,9 +32,6 @@
             "type": "string"
           }
         },
-        "required": [
-          "drop"
-        ],
         "additionalProperties": false
       }
     },
