@@ -1,0 +1,36 @@
+{
+  "baseline_review_commit": "9b64f83e2816b693a0a7ee0ddfb1c4077cec6573",
+  "tool_versions": {"rustc": "1.99.0 (b940084d7 2026-09-28)", "cargo": "1.99.0 (5f94df478 2026-08-27)"},
+  "verification": [
+    "Linux,4c cargo check -j 4 -p mc-module --all-targets: passed, one package all-target typecheck",
+    "Linux,4c providers::codec: 18 passed, private real capture present",
+    "Linux,4c providers::cc_step_lane_review: 10 passed, zero ignored",
+    "Linux,4c providers::claude_code_tests: 5 passed",
+    "Linux,4c providers::compaction::terminal_refusal_tests: 2 passed",
+    "Linux,4c broca_conformance --features drive-fault: 14 passed, committed-byte joint fixture unchanged",
+    "Linux,4c cargo fmt --all -- --check: passed, rustfmt 1.10.0-stable"
+  ],
+  "mutation_evidence": [
+    {
+      "control": "identity-prefix: disable only the gateway identity/position prefix clause, preserving native byte comparisons",
+      "expected_red": "providers::cc_step_lane_review::duplicate_content_cannot_edit_bytes_before_effective_kept_thinking",
+      "captured_output": "duplicate_content_cannot_edit_bytes_before_effective_kept_thinking ... FAILED: expected signed_prefix_edit for swapped equal-byte messages. Exact run: 0 passed, 1 failed, 1979 filtered out.",
+      "applied_evidence": "crates/mc-module/src/providers/codec_claude_code.rs: empty git diff --stat after staging; mutant 1 file changed, 2 insertions(+), 1 deletion(-); git checkout plus touch restored empty git diff --stat",
+      "outcome": "reddened"
+    },
+    {
+      "control": "duplicate-key-marker: replace unique-key admission parse with last-key-wins serde Value parsing",
+      "expected_red": "providers::cc_step_lane_review::duplicate_content_cannot_hide_transport_marker",
+      "captured_output": "duplicate_content_cannot_hide_transport_marker ... FAILED; REVIEW shadowed marker admitted=true; expected invalid_params naming raw_message. Exact run: 0 passed, 1 failed, 1979 filtered out.",
+      "applied_evidence": "crates/mc-module/src/providers/codec_claude_code.rs: empty git diff --stat after restoring prior control; mutant 1 file changed, 2 insertions(+), 1 deletion(-); git checkout plus touch restored empty git diff --stat",
+      "outcome": "reddened"
+    },
+    {
+      "control": "duplicate-key-text: replace unique-key admission parse with last-key-wins serde Value parsing",
+      "expected_red": "providers::cc_step_lane_review::duplicate_text_splice_must_change_effective_text_or_refuse",
+      "captured_output": "duplicate_text_splice_must_change_effective_text_or_refuse ... FAILED: expected invalid_params naming raw_message for duplicate text keys. Exact run: 0 passed, 1 failed, 1979 filtered out.",
+      "applied_evidence": "crates/mc-module/src/providers/codec_claude_code.rs: empty git diff --stat after restoring prior control; mutant 1 file changed, 2 insertions(+), 1 deletion(-); git checkout plus touch restored empty git diff --stat",
+      "outcome": "reddened"
+    }
+  ]
+}

@@ -19,11 +19,13 @@ COMPACTION = "crates/mc-module/src/providers/compaction.rs"
 CONTROLS = {
     "author-signed-prefix": (
         CODEC,
-        '''if raw[..position] != original[..index]
+        '''if !same_identity_prefix(&input_ids, &output_ids, index, position)
+                || raw[..position] != original[..index]
                 || signed_prefix(&raw[position]) != signed_prefix(&original[index])
             {''',
         '''// NON-VACUITY BREAK: neutralize the kept-prefix comparison.
-            if false && (raw[..position] != original[..index]
+            if false && (!same_identity_prefix(&input_ids, &output_ids, index, position)
+                || raw[..position] != original[..index]
                 || signed_prefix(&raw[position]) != signed_prefix(&original[index]))
             {''',
     ),
@@ -49,6 +51,24 @@ CONTROLS = {
                     out.push(']');''',
         '''// NON-VACUITY BREAK: serialize parsed JSON so original-byte tests must fail.
                     out.push_str(&serde_json::to_string(value).map_err(transient)?);''',
+    ),
+    "identity-prefix": (
+        CODEC,
+        'if !same_identity_prefix(&input_ids, &output_ids, index, position)',
+        '''// NON-VACUITY BREAK: allow equal bytes to stand in for gateway identity.
+            if false && !same_identity_prefix(&input_ids, &output_ids, index, position)''',
+    ),
+    "duplicate-key-marker": (
+        CODEC,
+        'let parsed = parse_unique_json(raw)?;',
+        '''// NON-VACUITY BREAK: choose last duplicate-key values at admission.
+    let parsed: Value = serde_json::from_str(raw).map_err(|_| invalid_raw("invalid JSON"))?;''',
+    ),
+    "duplicate-key-text": (
+        CODEC,
+        'let parsed = parse_unique_json(raw)?;',
+        '''// NON-VACUITY BREAK: choose last duplicate-key values at admission.
+    let parsed: Value = serde_json::from_str(raw).map_err(|_| invalid_raw("invalid JSON"))?;''',
     ),
 }
 

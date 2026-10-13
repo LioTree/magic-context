@@ -7,6 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod cache_policy;
 #[cfg(test)]
+#[path = "../../../../docs/reports/cc-step-lane-witnesses.rs"]
+mod cc_step_lane_review;
+#[cfg(test)]
 mod claude_code_tests;
 mod codec;
 mod codec_claude_code;

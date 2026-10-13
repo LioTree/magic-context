@@ -171,3 +171,39 @@ Toolchain: `rustc 1.99.0 (b940084d7 2026-09-28)`; `cargo 1.99.0 (5f94df478 2026-
 - Final review-artifact validation on Linux, Python 3.14.4: one Python syntax check, four exact mutation anchors, one JSON document and four bounded mutation proofs passed. The diagnostic-only signature-size correction was followed by another passing `cargo check -p mc-module -j 4 --all-targets` (4.26 s).
 - Final head-slot witness strengthening requires exactly two slots instead of allowing an empty hash-check loop: Linux all-target check passed (8.53 s), and `provider_committed_replacement_keeps_noncanonical_unsigned_tail` passed again (1 test, six publications, 5.22 s).
 - No manifests/lockfiles changed; no install required. No live stores, parent checkout, macOS Rust build, architecture/structure edits or private fixture publication occurred.
+
+## Repair and permanent regression gates
+
+The review above records the original implementation at `67a49551e3`. The
+provider suite now includes the witnesses by default; none of the three defect
+witnesses is ignored.
+
+The stricter contract introduced after `67a49551e3` makes Claude Code admission
+refuse duplicate object keys at every depth with
+`invalid_params` naming `raw_message`. Decoded key names are compared, so escaped
+spellings of the same key also conflict. This rule applies to opaque data and
+tool input as well as transport fields: no duplicate-key JSON is spliced or
+forwarded. Native rendering and raw-answer serialization revalidate stored raw
+provenance written before this change, rather than trusting the old admission
+rule that allowed duplicates.
+
+The check that prevents edits before retained signed thinking now compares the
+gateway's message ID (MID), ordinal and position for every preceding message,
+in addition to the original byte-prefix comparison. Equal-content messages
+cannot replace or reorder one another before a retained thinking signature.
+`duplicate_content_cannot_edit_bytes_before_effective_kept_thinking` retains
+its original duplicate-content input as an admission-refusal assertion and
+also swaps two distinct MIDs with identical raw bytes.
+`duplicate_text_splice_must_change_effective_text_or_refuse` now requires
+admission refusal rather than allowing an edit to choose a duplicate-key winner.
+This intentionally tightens the accepted-input contract. The passing raw-byte
+fuzz corpus therefore uses unique object keys;
+noncanonical whitespace, escapes, unknown blocks and large signatures remain.
+
+`cc-step-lane-review-runner.py` offers three repair controls: `identity-prefix`,
+`duplicate-key-marker`, and `duplicate-key-text`. Each temporarily reintroduces
+a codec defect to prove that the corresponding test fails. Stage the live files
+and verify an empty unstaged diff before applying a control. Run the exact named
+test, then restore the mutated codec from the index and touch it. The
+`NON-VACUITY BREAK` marker identifies deliberately damaged source, which must
+never be committed.

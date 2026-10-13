@@ -15,6 +15,79 @@ fn invalid_raw(reason: &str) -> HandlerOutcome {
     }
 }
 
+struct UniqueJson(Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueJson;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("JSON with unique object keys")
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueJson(json!(value)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(json!(value)))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(json!(value)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|n| UniqueJson(Value::Number(n)))
+                    .ok_or_else(|| E::custom("invalid JSON number"))
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value.into())))
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<UniqueJson>()? {
+                    values.push(value.0);
+                }
+                Ok(UniqueJson(Value::Array(values)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    // Decoded names make "text" and "\u0074ext" the same key.
+                    // Reject duplicates even in tool inputs and unknown payloads:
+                    // choosing one value would let later edits of the raw bytes
+                    // disagree with the value read from parsed JSON.
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(
+                            "duplicate object key in raw_message",
+                        ));
+                    }
+                    values.insert(key, map.next_value::<UniqueJson>()?.0);
+                }
+                Ok(UniqueJson(Value::Object(values)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn parse_unique_json(raw: &str) -> Result<Value, HandlerOutcome> {
+    serde_json::from_str::<UniqueJson>(raw)
+        .map(|parsed| parsed.0)
+        .map_err(|_| invalid_raw("raw_message must be valid JSON with no duplicate object keys"))
+}
+
 /// Only Anthropic transport locations are inspected; tool inputs and opaque data
 /// may legitimately contain a user-authored member named `cache_control`.
 fn has_marker(message: &Value) -> bool {
@@ -43,8 +116,7 @@ pub(super) fn envelope(message: &Value, raw: Option<&Value>) -> Result<Value, Ha
     let raw = raw
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_raw("Claude Code requires raw_message"))?;
-    let parsed: Value =
-        serde_json::from_str(raw).map_err(|_| invalid_raw("raw_message is not JSON"))?;
+    let parsed = parse_unique_json(raw)?;
     if &parsed != message || has_marker(&parsed) {
         return Err(invalid_raw(
             "raw_message must equal message and exclude transport cache_control",
@@ -141,6 +213,7 @@ pub(super) fn decode_message(
         BTreeMap::from([
             ("raw_message".into(), validated["raw_message"].clone()),
             ("mid".into(), json!(entry.mid)),
+            ("ordinal".into(), json!(entry.ordinal)),
         ]),
     );
     Ok(ck_wire::CkIngressMessage {
@@ -276,7 +349,7 @@ pub(super) fn render(message: &CkWireMessage) -> Result<String, HandlerOutcome> 
         return serde_json::to_string(&json!({"role":message.role,"content":blocks}))
             .map_err(transient);
     };
-    let original: Value = serde_json::from_str(raw).map_err(transient)?;
+    let original = parse_unique_json(raw)?;
     if original["role"].as_str() != Some(&message.role) {
         return Err(error("signed_prefix_edit", "native role changed"));
     }
@@ -342,7 +415,7 @@ pub(super) fn render(message: &CkWireMessage) -> Result<String, HandlerOutcome> 
 }
 
 fn signed_prefix(raw: &str) -> Option<&str> {
-    let value: Value = serde_json::from_str(raw).ok()?;
+    let value = parse_unique_json(raw).ok()?;
     let last = value["content"]
         .as_array()?
         .iter()
@@ -350,6 +423,19 @@ fn signed_prefix(raw: &str) -> Option<&str> {
     let content = members(raw).into_iter().find(|m| m.0 == "content")?.1;
     let spans = array(&raw[content.clone()]);
     Some(&raw[..content.start + spans[last].end])
+}
+
+fn same_identity_prefix(
+    input: &[(String, u64)],
+    output: &[Option<(String, u64)>],
+    index: usize,
+    position: usize,
+) -> bool {
+    position == index
+        && output[..position]
+            .iter()
+            .zip(&input[..index])
+            .all(|(output, input)| output.as_ref() == Some(input))
 }
 
 pub(super) fn encode_view(
@@ -367,20 +453,63 @@ pub(super) fn encode_view(
         .iter()
         .map(|m| render(&m.ck))
         .collect::<Result<Vec<_>, _>>()?;
+    let identity = |message: &CkWireMessage| {
+        message.provider_extras.get(EXTRAS).and_then(|extras| {
+            Some((
+                extras.get("mid")?.as_str()?.to_owned(),
+                extras.get("ordinal")?.as_u64()?,
+            ))
+        })
+    };
+    let input_ids = request
+        .messages
+        .iter()
+        .map(|entry| (entry.mid.clone(), entry.ordinal))
+        .collect::<Vec<_>>();
+    let output_ids = view.replacement.iter().map(identity).collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    for (position, output) in view.replacement.iter().enumerate() {
+        if output.provider_extras.contains_key(EXTRAS) {
+            let id = output_ids[position].as_ref().ok_or_else(|| {
+                error(
+                    "signed_prefix_edit",
+                    "native replacement lost its gateway identity",
+                )
+            })?;
+            let source = input_ids
+                .iter()
+                .position(|input| input == id)
+                .ok_or_else(|| {
+                    error(
+                        "signed_prefix_edit",
+                        "native replacement has an unknown gateway identity",
+                    )
+                })?;
+            if !seen.insert(id.clone())
+                || output.provider_extras[EXTRAS]
+                    .get("raw_message")
+                    .and_then(Value::as_str)
+                    != Some(original[source].as_str())
+            {
+                return Err(error(
+                    "signed_prefix_edit",
+                    "native replacement changed or duplicated its gateway identity",
+                ));
+            }
+        }
+    }
     // The prefix of every surviving signed block must remain identical, even
     // across a later real user turn. Compare native bytes, not normalized text.
     for (index, entry) in request.messages.iter().enumerate() {
         if signed_prefix(&original[index]).is_none() {
             continue;
         }
-        if let Some(position) = view.replacement.iter().position(|m| {
-            m.provider_extras
-                .get(EXTRAS)
-                .and_then(|e| e.get("mid"))
-                .and_then(Value::as_str)
-                == Some(entry.mid.as_str())
-        }) {
-            if raw[..position] != original[..index]
+        if let Some(position) = output_ids
+            .iter()
+            .position(|id| id.as_ref() == Some(&input_ids[index]))
+        {
+            if !same_identity_prefix(&input_ids, &output_ids, index, position)
+                || raw[..position] != original[..index]
                 || signed_prefix(&raw[position]) != signed_prefix(&original[index])
             {
                 return Err(error(
@@ -450,7 +579,7 @@ pub(super) fn answer_bytes(answer: &Value, raw: &[String]) -> Result<Vec<u8>, Ha
                 if key == "replacement" {
                     let parsed = raw
                         .iter()
-                        .map(|s| serde_json::from_str::<Value>(s).map_err(transient))
+                        .map(|s| parse_unique_json(s))
                         .collect::<Result<Vec<_>, _>>()?;
                     if value != &json!(parsed) {
                         return Err(transient("raw view differs from committed replacement"));
@@ -549,6 +678,27 @@ mod tests {
         assert_eq!(
             render(&decode_message(&entry(unknown, 0)).unwrap().ck).unwrap(),
             unknown
+        );
+    }
+
+    #[test]
+    fn duplicate_object_keys_are_refused_at_every_depth_including_escaped_names() {
+        for raw in [
+            r#"{"role":"user","content":"a","content":"b"}"#,
+            r#"{"role":"user","content":[{"type":"text","text":"a","text":"b"}]}"#,
+            r#"{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"tool","input":{"nested":{"x":1,"x":1}}}]}"#,
+            r#"{"role":"user","content":[{"type":"future","payload":[{"a":null,"\u0061":true}]}]}"#,
+            r#"{"role":"user","content":"a","extra":{"x":[],"x":{}}}"#,
+        ] {
+            let parsed: Value = serde_json::from_str(raw).unwrap();
+            assert!(
+                matches!(envelope(&parsed,Some(&json!(raw))),Err(HandlerOutcome::ErrorWithDetail { code,detail,.. }) if code=="invalid_params" && detail["field"]=="raw_message")
+            );
+        }
+        let raw = r#"{"role":"user","content":[{"type":"future","payload":[{"x":1},{"x":2,"y":[null,true,0,0.5]}]}]}"#;
+        assert_eq!(
+            render(&decode_message(&entry(raw, 0)).unwrap().ck).unwrap(),
+            raw
         );
     }
     #[test]
