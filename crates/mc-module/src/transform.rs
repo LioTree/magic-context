@@ -6049,6 +6049,7 @@ fn apply_once(
                 ),
             },
             &selection_outcome.protected_tool_block_ids,
+            &admission,
         );
         planned_strip_units.extend(signed_thinking_reset_units.iter().cloned());
         if trigger_holds_enabled && protected_signed_prefix && force_episode_available {
@@ -15590,6 +15591,7 @@ fn processed_image_watermark(
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_frozen_strip_units(
     core: &CoreState,
     req: &TransformRequest,
@@ -15598,6 +15600,7 @@ fn new_frozen_strip_units(
     is_bust_pass: bool,
     selection_scope: StripSelectionScope<'_>,
     protected_tools: &HashSet<String>,
+    admission: &crate::edit_admission::EditAdmission,
 ) -> Vec<FrozenUnit> {
     if !is_bust_pass {
         return Vec::new();
@@ -15643,6 +15646,17 @@ fn new_frozen_strip_units(
     let unsafe_content = active_thinking_prefix_edit_ids(core, req);
     let active_turn = active_anthropic_turn_mids(req);
     let mut has_assistant_response = false;
+    // Placeholder and system-injected neutralization is opportunistic: a unit whose
+    // message sits before the last kept current-turn thinking block is not minted, so
+    // nothing is frozen for it and a later busting pass without that block finds it again.
+    let mut held_whole = Vec::<String>::new();
+    let mut held_blocks = Vec::<String>::new();
+    let admit_whole = |mid: &str| {
+        admission.admit(crate::edit_admission::EditCoord::Message {
+            mid: Some(mid),
+            block: crate::edit_admission::BlockPos::Whole,
+        })
+    };
 
     for index in (0..req.messages.len()).rev() {
         let message = &req.messages[index];
@@ -15672,7 +15686,11 @@ fn new_frozen_strip_units(
             {
                 let unit = strip_unit("system_injected", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
-                    units.insert(unit.key.clone(), unit);
+                    if admit_whole(&message.mid) {
+                        units.insert(unit.key.clone(), unit);
+                    } else {
+                        held_whole.push(format!("system_injected:{}", message.mid));
+                    }
                 }
             } else {
                 // Surgical replacements freeze the cleaned text itself on this bust. Later defer
@@ -15694,7 +15712,11 @@ fn new_frozen_strip_units(
                     }
                     let unit = strip_unit("system_injected_block", &target, &cleaned);
                     if !existing_keys.contains(unit.key.as_str()) {
-                        units.insert(unit.key.clone(), unit);
+                        if admit_block_id(admission, &target) {
+                            units.insert(unit.key.clone(), unit);
+                        } else {
+                            held_blocks.push(target);
+                        }
                     }
                 }
             }
@@ -15740,7 +15762,11 @@ fn new_frozen_strip_units(
             {
                 let unit = strip_unit("placeholder", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
-                    units.insert(unit.key.clone(), unit);
+                    if admit_whole(&message.mid) {
+                        units.insert(unit.key.clone(), unit);
+                    } else {
+                        held_whole.push(format!("placeholder:{}", message.mid));
+                    }
                 }
             }
             continue;
@@ -15784,6 +15810,20 @@ fn new_frozen_strip_units(
                 }
             }
         }
+    }
+    if !held_whole.is_empty() || !held_blocks.is_empty() {
+        let boundary = match &admission.frame {
+            crate::edit_admission::Frame::Boundary { mid, .. } => mid.as_deref(),
+            crate::edit_admission::Frame::None => None,
+        };
+        tracing::info!(
+            session = req.session_id,
+            boundary_mid = ?boundary,
+            held_whole_messages = ?held_whole,
+            held_blocks = ?held_blocks,
+            held_edits = held_whole.len() + held_blocks.len(),
+            "mc-module: held placeholder and system-injected strips before kept current-turn thinking"
+        );
     }
     units.into_values().collect()
 }
