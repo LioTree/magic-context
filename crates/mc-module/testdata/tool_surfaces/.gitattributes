@@ -1,0 +1,2 @@
+# Unified diff fixtures encode blank context lines with a mandatory space prefix.
+*.patch -whitespace

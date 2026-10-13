@@ -1,0 +1,10 @@
+{
+	"extends": "../../../../packages/plugin/tsconfig.scripts.json",
+	"compilerOptions": {
+		"rootDir": "../../../..",
+		"typeRoots": ["../../../../packages/plugin/node_modules/@types"],
+		"types": ["node", "bun"]
+	},
+	"include": ["generate.ts"],
+	"exclude": []
+}

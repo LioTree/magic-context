@@ -1,0 +1,86 @@
+--- a/crates/mc-module/src/lib.rs
++++ b/crates/mc-module/src/lib.rs
+@@ -9923,14 +9923,15 @@
+             Err(error) => return error,
+         };
+         if requested_selection.guidance_override.is_none() {
+-            requested_selection.guidance_override = binding.config.prompt_surface_guidance_override;
++            requested_selection.guidance_override = binding.config.prompt_surface_guidance_override.clone();
+         }
+         let selection = self.freeze_prompt_surface_selection(session_id, requested_selection);
+         // Claude Code keys the reduce-capable variant on its acknowledgement contract. A
+         // Broca session gets it whenever its tool array includes ctx_reduce, because the
+         // transform tags that session's messages. OpenCode builds its own guidance.
+-        let active = cc_u1_active(profile, tool_present)
+-            || (matches!(profile, Some(SerializerProfile::OwnedBroca)) && tool_present);
++        let active = binding.config.compaction_enabled
++            && (cc_u1_active(profile, tool_present)
++                || (matches!(profile, Some(SerializerProfile::OwnedBroca)) && tool_present));
+         let expected_variant = if active { "full" } else { "no_reduce" };
+         if let Some(variant) = request.get("variant").and_then(Value::as_str) {
+             if variant != expected_variant {
+@@ -9951,33 +9952,17 @@
+                 };
+             }
+         };
+-        let variant = if active {
+-            prompt_surface::GuidanceVariant::Full
+-        } else {
+-            prompt_surface::GuidanceVariant::NoReduce
++        let mut config = binding.config.clone();
++        if let Some(language) = request.get("language").and_then(Value::as_str) {
++            config.language = Some(language.to_string());
++        }
++        let subagent = match request.get("subagent") {
++            None => false,
++            Some(Value::Bool(value)) => *value,
++            Some(_) => return invalid_params_error("guidance.get subagent must be a boolean"),
+         };
+-        let asset = prompt_surface::guidance_asset(selection.preset, variant);
+-        let base_text = selection
+-            .guidance_override
+-            .as_deref()
+-            .unwrap_or(asset.bytes);
+-        let filtered_text;
+-        let base_text = if binding.config.smart_notes_enabled {
+-            base_text
+-        } else {
+-            filtered_text = prompt_surface::without_smart_note_guidance(base_text);
+-            &filtered_text
+-        };
+-        let language_text = request
+-            .get("language")
+-            .and_then(Value::as_str)
+-            .map(str::trim)
+-            .filter(|language| !language.is_empty());
+-        let language_directive = language_text.and_then(primary_language_directive);
+-        let localized_text = language_directive
+-            .as_deref()
+-            .map(|directive| format!("{base_text}\n\n{directive}"));
+-        let text_for_bytes = localized_text.as_deref().unwrap_or(base_text);
++        let text = prompt_surface::compose_guidance(&selection, &config, subagent, active);
++        let text_for_bytes = text.as_str();
+         let bytes = guidance_bytes_for(text_for_bytes, &date_line);
+         respond(json!({
+             "ok": true,
+@@ -9987,16 +9972,12 @@
+             // selected preset so a future missing-asset fallback cannot reuse the full hash.
+             "content_hash": prompt_surface::guidance_content_hash(text_for_bytes, selection.preset),
+             "preset": selection.preset.as_str(),
+-            "served_preset": if asset.fallback {
+-                "full"
+-            } else {
+-                selection.preset.as_str()
+-            },
+-            "preset_fallback": asset.fallback,
+-            "fallback_notice": asset.fallback.then_some(prompt_surface::LIGHT_FALLBACK_NOTICE),
++            "served_preset": selection.preset.as_str(),
++            "preset_fallback": false,
++            "fallback_notice": Value::Null,
+             "manifest_content_epoch": prompt_surface::manifest_content_epoch(&selection),
+             "manifest_preset_fallback": prompt_surface::tool_manifest_falls_back(selection.preset),
+-            "tool_manifest": prompt_surface::session_tools(&selection),
++            "tool_manifest": prompt_surface::session_tools_for_config(&selection, &config),
+         }))
+     }
+ 

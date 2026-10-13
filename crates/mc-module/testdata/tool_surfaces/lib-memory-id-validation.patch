@@ -1,0 +1,34 @@
+--- a/crates/mc-module/src/lib.rs
++++ b/crates/mc-module/src/lib.rs
+@@ -17034,6 +17034,31 @@
+     // callers populate every declared identifier field with placeholder values;
+     // checking or combining unused fields could fail a valid call or select the
+     // wrong record.
++    if let Some(value) = args.get("ids") {
++        let error = match action {
++            "update" => "'ids' must contain exactly one integer memory ID when action is 'update'",
++            "archive" => "'ids' must contain at least one integer memory ID when action is 'archive'",
++            "merge" => "'ids' must include at least two integer memory IDs when action is 'merge'",
++            "get" => "'ids' must contain at least one integer memory ID when action is 'get'",
++            _ => return Ok(()),
++        };
++        let Some(ids) = value.as_array() else { return Err(error.to_string()); };
++        let count_valid = match action {
++            "update" => ids.len() == 1,
++            "merge" => ids.len() >= 2,
++            _ => !ids.is_empty(),
++        };
++        if !count_valid || ids.iter().any(|id| id.as_i64().is_none()) {
++            return Err(error.to_string());
++        }
++        if action == "merge" {
++            let distinct: std::collections::BTreeSet<i64> = ids.iter().filter_map(Value::as_i64).collect();
++            if distinct.len() < 2 {
++                return Err("'ids' must include at least two distinct memory IDs when action is 'merge'".to_string());
++            }
++        }
++        return Ok(());
++    }
+     let ids_len = args.get("ids").and_then(Value::as_array).map(Vec::len);
+     let (scalar_keys, array_keys): (&[&str], &[&str]) = match action {
+         "update" | "archive" | "get" if args.contains_key("ids") => (&[], &["ids"]),

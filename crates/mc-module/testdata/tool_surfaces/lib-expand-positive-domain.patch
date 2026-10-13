@@ -1,0 +1,34 @@
+--- a/crates/mc-module/src/lib.rs
++++ b/crates/mc-module/src/lib.rs
+@@ -17190,10 +17190,10 @@
+     let message = i64_arg(args, "message");
+     let start = i64_arg(args, "start");
+     let end = i64_arg(args, "end");
+-    let message_present = args.get("message").is_some();
+-    let message_valid = message.filter(|value| *value >= 0);
++    let message_present = args.get("message").is_some_and(|value| !value.is_null());
++    let message_valid = message.filter(|value| *value >= 1);
+     let range_valid = match (start, end) {
+-        (Some(start), Some(end)) if start >= 0 && end >= start => Some((start, end)),
++        (Some(start), Some(end)) if start >= 1 && end >= start => Some((start, end)),
+         _ => None,
+     };
+     let filler_pair = matches!((start, end), (Some(0), Some(0)));
+@@ -17205,7 +17205,7 @@
+         }
+     }
+     if message_present && message_valid.is_none() && range_named.is_none() {
+-        return Err("Error: message must be a non-negative integer.".to_string());
++        return Err("Error: message must be a positive integer.".to_string());
+     }
+     if let Some((start, end)) = range_valid {
+         return Ok(CtxExpandMode::Range {
+@@ -17215,7 +17215,7 @@
+         });
+     }
+     Err(
+-        "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end)."
++        "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end)."
+             .to_string(),
+     )
+ }

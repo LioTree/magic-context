@@ -10006,14 +10006,16 @@ impl McHandler {
             Err(error) => return error,
         };
         if requested_selection.guidance_override.is_none() {
-            requested_selection.guidance_override = binding.config.prompt_surface_guidance_override;
+            requested_selection.guidance_override =
+                binding.config.prompt_surface_guidance_override.clone();
         }
         let selection = self.freeze_prompt_surface_selection(session_id, requested_selection);
         // Claude Code keys the reduce-capable variant on its acknowledgement contract. A
         // Broca session gets it whenever its tool array includes ctx_reduce, because the
         // transform tags that session's messages. OpenCode builds its own guidance.
-        let active = cc_u1_active(profile, tool_present)
-            || (matches!(profile, Some(SerializerProfile::OwnedBroca)) && tool_present);
+        let active = binding.config.compaction_enabled
+            && (cc_u1_active(profile, tool_present)
+                || (matches!(profile, Some(SerializerProfile::OwnedBroca)) && tool_present));
         let expected_variant = if active { "full" } else { "no_reduce" };
         if let Some(variant) = request.get("variant").and_then(Value::as_str) {
             if variant != expected_variant {
@@ -10034,33 +10036,17 @@ impl McHandler {
                 };
             }
         };
-        let variant = if active {
-            prompt_surface::GuidanceVariant::Full
-        } else {
-            prompt_surface::GuidanceVariant::NoReduce
+        let mut config = binding.config.clone();
+        if let Some(language) = request.get("language").and_then(Value::as_str) {
+            config.language = Some(language.to_string());
+        }
+        let subagent = match request.get("subagent") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return invalid_params_error("guidance.get subagent must be a boolean"),
         };
-        let asset = prompt_surface::guidance_asset(selection.preset, variant);
-        let base_text = selection
-            .guidance_override
-            .as_deref()
-            .unwrap_or(asset.bytes);
-        let filtered_text;
-        let base_text = if binding.config.smart_notes_enabled {
-            base_text
-        } else {
-            filtered_text = prompt_surface::without_smart_note_guidance(base_text);
-            &filtered_text
-        };
-        let language_text = request
-            .get("language")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|language| !language.is_empty());
-        let language_directive = language_text.and_then(primary_language_directive);
-        let localized_text = language_directive
-            .as_deref()
-            .map(|directive| format!("{base_text}\n\n{directive}"));
-        let text_for_bytes = localized_text.as_deref().unwrap_or(base_text);
+        let text = prompt_surface::compose_guidance(&selection, &config, subagent, active);
+        let text_for_bytes = text.as_str();
         let bytes = guidance_bytes_for(text_for_bytes, &date_line);
         respond(json!({
             "ok": true,
@@ -10070,16 +10056,12 @@ impl McHandler {
             // selected preset so a future missing-asset fallback cannot reuse the full hash.
             "content_hash": prompt_surface::guidance_content_hash(text_for_bytes, selection.preset),
             "preset": selection.preset.as_str(),
-            "served_preset": if asset.fallback {
-                "full"
-            } else {
-                selection.preset.as_str()
-            },
-            "preset_fallback": asset.fallback,
-            "fallback_notice": asset.fallback.then_some(prompt_surface::LIGHT_FALLBACK_NOTICE),
+            "served_preset": selection.preset.as_str(),
+            "preset_fallback": false,
+            "fallback_notice": Value::Null,
             "manifest_content_epoch": prompt_surface::manifest_content_epoch(&selection),
             "manifest_preset_fallback": prompt_surface::tool_manifest_falls_back(selection.preset),
-            "tool_manifest": prompt_surface::session_tools(&selection),
+            "tool_manifest": prompt_surface::session_tools_for_config(&selection, &config),
         }))
     }
 
@@ -14218,7 +14200,7 @@ impl McHandler {
         }
         let limit = usize_arg(args, "limit")
             .filter(|value| *value > 0)
-            .unwrap_or(8)
+            .unwrap_or(10)
             .clamp(1, 25);
         let from_ms = match parse_search_date_bound(args, "from", false) {
             Ok(value) => value,
@@ -16786,6 +16768,7 @@ fn guidance_bytes_for(text: &str, date_line: &str) -> String {
     format!("{text}\n{date_line}")
 }
 
+#[cfg(test)]
 fn primary_language_directive(language: &str) -> Option<String> {
     let name = crate::content_language::resolve_language_name(Some(language))?;
     Some(format!(
@@ -19609,186 +19592,6 @@ pub fn dev_descriptor_at(data_home: &str) -> StorageDescriptor {
             path: sqlite_store_path(data_home, DEFAULT_MODULE_ID),
         },
     }
-}
-
-fn ctx_memory_description() -> String {
-    r#"Durable facts about this project, shared with every agent working on it and kept for the months this work lasts.
-
-Your active memories are already in <project-memory> as `#id: fact` lines. Write one when you learn something that must not have to be found again — a project rule, an architectural fact, a hard-won constraint, a config value, a naming convention — and especially when it cost you turns to find. One standalone fact per memory, phrased to make sense on its own. A pending intention with its evidence ("do X later, here is what we know") is ctx_note, not memory.
-
-Actions:
-- write: new memory (content + category).
-- update: rewrite one memory whose fact changed (ids: [one], content; category optional to recategorize).
-- archive: retire wrong or obsolete memories (ids: [one or more], optional reason).
-- merge: collapse duplicates into one (ids: [two or more], content).
-- get: fetch by id (ids: 1–20), readable in every status.
-Examples: category="CONFIG_VALUES", content="OpenCode source is at ~/Work/OSS/opencode" · category="CONSTRAINTS", content="Dashboard Tauri build needs RGBA PNGs, not grayscale""#.to_string()
-}
-
-fn ctx_search_description() -> String {
-    r#"Search the archive — everything that ever happened in this project, not just what is on your desk.
-
-Retrieval matches meaning and exact words and fuses them, so phrase `query` as a natural-language question that still carries the exact terms you expect in the answer (paths, symbols, config keys, error strings); a bare keyword stack finds less.
-- "where is the opencode source code path?"  (a location you once knew)
-- "why did we choose SQLite over postgres?"  (a decision and its reasons)
-- "how does the dreamer lease work?"  (a mechanism discussed or implemented earlier)
-- Not: "upload client retry backoff config"
-
-Results only contain what you CANNOT currently see — memories already in <project-memory> and the live tail are filtered out. A query that is just memory ids (`#7234`, `12, 34`) resolves them directly.
-
-Sources (omit for all):
-- memory — rules, constraints, conventions; "what's our convention for X"
-- message — the raw conversation behind compacted history; "did we discuss this"; hits carry ordinals for ctx_expand(start=N-10, end=N+5)
-- git_commit — commit history; "when did this change" (pair with message for regression hunts)
-- note — parked follow-ups with their recorded text; "did we leave a follow-up"
-Use from/to to restrict every source to an inclusive UTC date range."#.to_string()
-}
-
-fn ctx_expand_description() -> String {
-    r#"Recover original content that is no longer on your desk. It takes two kinds of number, and they are never interchangeable:
-- `tag=N`: the number from a §N§ tag or a `[dropped §N§]` placeholder. Returns that one item whole: a text, or a tool call with its full input and output.
-- `message=N`, `start`/`end`: message ordinals, the positions shown in `<session-history>` headings (`## start-end`) and in `ctx_search` hits. An ordinal counts whole messages; a tag counts each text and tool result separately, so the same number points at different things.
-
-Earlier turns are summarized in <session-history> under `## start-end · date · title` headings; each heading stands for the raw messages in that ordinal range. When the summary isn't enough — exact wording, a value, an error message, the reasoning behind a decision — expand the range: ctx_expand(start=120, end=245). Also works around a ctx_search message hit: start=N-10, end=N+5. Ranges after the last compartment are your live tail — already visible, not expandable.
-
-Returns the raw transcript as [N] U:/A: lines, capped at ~15K tokens; an oversized range returns the head and says where to continue.
-
-Finer recovery:
-- verbose=true lists each message separately with its ordinal and a per-part preview (tool calls with output sizes) so you can pick one.
-- message=N returns that one message in full — every text part and every tool call's complete input and output — from stored history. This is the way back to a tool output you released with ctx_reduce; if the message was deleted from history it says so."#.to_string()
-}
-
-fn ctx_note_description() -> String {
-    r#"Session notes are pending intentions: work you intend to return to, with its findings attached.
-
-Use notes for:
-- A finding to revisit when you return to the intended work
-- A decision with its reasoning, when follow-up work remains
-- A backlog item with evidence already found
-- Something the user explicitly asks you to note
-
-Don't use notes for: the next few steps; a plan you are actively executing; restart/fold insurance; or a record of how things stand (world-state, a design at a point in time) with nothing you intend to do about it — that goes stale silently; a fact worth keeping is memory, the rest is nothing. Use todos for active work. If the detail already lives in a file, record the path and what to inspect — don't copy the file into a note. Durable project facts belong in ctx_memory, not notes.
-
-First line is the title (under 80 chars), followed by detail. Operations:
-- write: save a new note (content required)
-- read: one row per note — `#id · age · title` — ready smart notes first, then newest; rows untouched 30+ days are marked stale. Pass note_ids to read full bodies; limit/offset page; filter selects other statuses.
-- update: change one note (note_ids=[N])
-- dismiss: retire 1–50 notes (note_ids). Dismiss a note when its work lands or is abandoned; a queue you never dismiss from stops being read.
-- surface_condition: make it a smart note — an outside checker periodically tests the condition using only externally verifiable signals (GitHub state, files, git, releases, web), never this conversation or future actions; the note is parked until the condition holds."#.to_string()
-}
-
-fn ctx_memory_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": true,
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["write", "update", "archive", "merge", "get"],
-                "description": "write | update | archive | merge | get"
-            },
-            "category": {
-                "type": "string",
-                "description": "Kind of fact (required for write; on update/merge optional, omitted keeps the current category)."
-            },
-            "content": {
-                "type": "string",
-                "maxLength": 65536,
-                "description": "The memory text — one standalone fact (write, update, merge)."
-            },
-            "id": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Single memory id for update or archive."
-            },
-            "ids": {
-                "type": "array",
-                "maxItems": 100,
-                "items": { "type": "integer", "minimum": 1 },
-                "description": "Memory ids from <project-memory>: one for update, one or more for archive, two or more for merge, 1–20 for get."
-            },
-            "target_id": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Merge form: memory id to keep and update."
-            },
-            "source_ids": {
-                "type": "array",
-                "maxItems": 100,
-                "items": { "type": "integer", "minimum": 1 },
-                "description": "Merge form: memory ids to supersede into target_id."
-            },
-            "reason": {
-                "type": "string",
-                "maxLength": 4096,
-                "description": "Why it is being archived (optional)."
-            },
-            "memory_project": {
-                "type": "string",
-                "description": "Resolved MC project identity supplied by the host transport."
-            },
-        }
-    })
-}
-
-fn ctx_search_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": true,
-        "properties": {
-            "query": {
-                "type": "string",
-                "maxLength": 1024,
-                "description": "A natural-language question carrying the exact terms you expect in the answer."
-            },
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 25,
-                "default": 8,
-                "description": "Maximum results (default 10)."
-            },
-            "from": {
-                "type": "string",
-                "description": "Earliest date, YYYY-MM-DD (inclusive)."
-            },
-            "to": {
-                "type": "string",
-                "description": "Latest date, YYYY-MM-DD (inclusive; default open)."
-            },
-        }
-    })
-}
-
-fn ctx_expand_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": true,
-        "properties": {
-            "tag": { "anyOf": [{ "type": "number" }, { "type": "string" }], "description": "Tag number from a §N§ tag or a [dropped §N§] placeholder, not a message ordinal. Returns that one item in full. Use alone." },
-            "start": { "type": "integer", "minimum": 0, "description": "First message ordinal of the range (a <session-history> heading's start, or a ctx_search hit), not a tag number." },
-            "end": { "type": "integer", "minimum": 0, "description": "Last message ordinal of the range, inclusive, not a tag number." },
-            "verbose": { "type": "boolean", "description": "With start/end: one entry per message with ordinal and per-part preview instead of the transcript." },
-            "message": { "type": "integer", "minimum": 0, "description": "Message ordinal from a <session-history> heading or a ctx_search hit, not a tag number. Returns that one message in full. Use alone." },
-        }
-    })
-}
-
-fn ctx_note_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": true,
-        "properties": {
-            "action": { "type": "string", "enum": ["write", "read", "update", "dismiss"], "description": "write | read | update | dismiss. Defaults to write when content is given, else read." },
-            "content": { "type": "string", "maxLength": 65536, "description": "Note text for write/update: first line is the title (under 80 chars), then the detail." },
-            "note_ids": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 }, "description": "Note ids: one for update, 1–50 for dismiss or read (read returns full bodies). Ignored by write." },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Rows per read (default 25)." },
-            "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest rows (default 0)." },
-            "filter": { "type": "string", "enum": ["all", "active", "pending", "ready", "dismissed"], "description": "Read filter: all, active, pending (unsurfaced smart notes), ready, dismissed. Omitted, it shows active session notes plus every current smart note (pending included); active shows only notes whose stored status is active." },
-            "surface_condition": { "type": "string", "maxLength": 4096, "description": "Makes this a smart note: a condition an outside checker can verify on its own, periodically — repository state, releases, web pages, anything it can look up — never something only this conversation knows. The note is parked until the condition holds." },
-            "memory_project": { "type": "string", "description": "Resolved MC project identity supplied by the host transport." },
-        }
-    })
 }
 
 /// Supported schema ceilings baked into this build, without opening either database.
@@ -30117,7 +29920,12 @@ mod tests {
 
     #[test]
     fn ctx_note_schema_declares_one_id_field() {
-        let properties = ctx_note_schema()["properties"].clone();
+        let properties = prompt_surface::session_tools(&PromptSurfaceSelection::default())
+            .into_iter()
+            .find(|tool| tool.name == "ctx_note")
+            .unwrap()
+            .schema["properties"]
+            .clone();
         // A second scalar id field is what made required-all tool surfaces fail
         // every call with filler in both (issue 460).
         assert!(properties.get("note_id").is_none());
@@ -42356,9 +42164,14 @@ mod tests {
         assert!(!tool_text(by_range).contains("non-negative integers"));
         let negative = call_facade(&handler, "ctx_expand", json!({"message": -1})).await;
         assert!(tool_is_error(negative));
-        let schema = ctx_expand_schema();
+        let schema = prompt_surface::session_tools(&PromptSurfaceSelection::default())
+            .into_iter()
+            .find(|tool| tool.name == "ctx_expand")
+            .unwrap()
+            .schema;
         for property in ["message", "start", "end"] {
-            assert_eq!(schema["properties"][property]["minimum"], json!(0));
+            assert_eq!(schema["properties"][property]["type"], json!("number"));
+            assert!(schema["properties"][property].get("minimum").is_none());
         }
     }
 
