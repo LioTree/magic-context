@@ -8572,8 +8572,8 @@ impl McHandler {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        match store.authorize_historian_report(&project_path, &run_id, &token) {
-            Ok(mc_store::HistorianReportOutcome::Authorized(_)) => {}
+        let authorization = match store.authorize_historian_report(&project_path, &run_id, &token) {
+            Ok(mc_store::HistorianReportOutcome::Authorized(authorization)) => authorization,
             Ok(mc_store::HistorianReportOutcome::Refused(refusal)) => {
                 return respond(json!({ "ok": false, "refusal": refusal.as_wire_str() }));
             }
@@ -8583,13 +8583,14 @@ impl McHandler {
                     message: error.to_string(),
                 };
             }
-        }
+        };
 
         let report = match parse_historian_report(request) {
             Ok(report) => report,
             Err(outcome) => return outcome,
         };
         let durable = durable_report(&report);
+        let deferred_telemetry = report.clone();
         match self.host_runs.deliver(&run_id, report) {
             Ok(()) => respond(json!({ "ok": true, "accepted": true, "publish": "immediate" })),
             Err(
@@ -8612,6 +8613,11 @@ impl McHandler {
                     now_ms(),
                 ) {
                     Ok(mc_store::HistorianRecordOutcome::Recorded) => {
+                        deferred_telemetry.record_invocations(
+                            store,
+                            &authorization.session_id,
+                            &binding.harness,
+                        );
                         eprintln!(
                             "mc-module: historian report for {run_id} stored for the next pass (no firing task in this process is waiting on it)"
                         );
@@ -10732,6 +10738,8 @@ impl McHandler {
                 crate::transform::TransformError::ProtectedToolResultsOverLimit
             ) {
                 crate::transform::PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE
+            } else if matches!(e, crate::transform::TransformError::SignedTurnOverLimit) {
+                crate::transform::SIGNED_TURN_OVER_LIMIT_CODE
             } else {
                 "transform_failed"
             };
@@ -15013,6 +15021,7 @@ fn optional_run_string(request: &Value, field: &str) -> Result<Option<String>, H
 /// the report it is handed.
 fn durable_report(report: &HostRunReport) -> mc_store::HistorianRunReport {
     match report {
+        HostRunReport::WithInvocations { report, .. } => durable_report(report),
         HostRunReport::Output(output) => mc_store::HistorianRunReport::Output {
             text: output.text.clone(),
             length_capped: output.length_capped,
@@ -15025,6 +15034,34 @@ fn durable_report(report: &HostRunReport) -> mc_store::HistorianRunReport {
 }
 
 fn parse_historian_report(request: &Value) -> Result<HostRunReport, HandlerOutcome> {
+    let report = parse_historian_report_body(request)?;
+    let Some(attempts) = request.get("invocations") else {
+        return Ok(report);
+    };
+    // Accounting is optional: a malformed telemetry extension must not discard paid output.
+    match serde_json::from_value::<Vec<mc_store::HistorianInvocation>>(attempts.clone()) {
+        Ok(invocations)
+            if invocations.len() <= 64
+                && invocations.iter().all(|attempt| {
+                    matches!(
+                        attempt.status.as_str(),
+                        "completed" | "failed" | "aborted" | "timed_out" | "empty"
+                    )
+                }) =>
+        {
+            Ok(HostRunReport::WithInvocations {
+                report: Box::new(report),
+                invocations,
+            })
+        }
+        _ => {
+            eprintln!("mc-module: ignoring invalid historian invocation telemetry");
+            Ok(report)
+        }
+    }
+}
+
+fn parse_historian_report_body(request: &Value) -> Result<HostRunReport, HandlerOutcome> {
     let output = request.get("output").filter(|value| !value.is_null());
     let error = request.get("error").filter(|value| !value.is_null());
     match (output, error) {
@@ -27658,6 +27695,21 @@ mod tests {
             json!({"info":{"id":"a0","role":"assistant"},"parts":[{"type":"text","text":"first answer"}]}),
         ];
         for pass in 0..5 {
+            if pass >= 3 {
+                // From pass 3 on, mark a pending bootstrap-seed fold in both stores. The
+                // fixture is one open Anthropic turn with signed thinking on a prefix-bound
+                // model, so the render-identity change below would wait for the turn to end
+                // (the m0/m1 head is frozen while that thinking is kept). A pending seed fold
+                // makes the pass a HARD (a full m0/m1 rebuild) whatever else is queued, so it
+                // gives these passes their rewrite instead.
+                for store in [&store, &reference_store] {
+                    let mut loaded = store.load("ses").unwrap();
+                    loaded.meta.bootstrap_seed_fold_pending = true;
+                    store
+                        .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                        .unwrap();
+                }
+            }
             if pass == 4 {
                 for (store, project) in [(&store, &project), (&reference_store, &reference_project)]
                 {
@@ -27884,6 +27936,15 @@ mod tests {
             .any(|unit| unit.key == "strip:native_reasoning_keep:step-0"));
         let mut priced_request = make_request(&native);
         priced_request["render_config"] = json!("independent-priced-config-change");
+        // Mark a pending bootstrap-seed fold. A render-identity change inside the open signed
+        // turn would wait for the turn to end, but a pending seed fold makes the pass a
+        // HARD (a full m0/m1 rebuild) whatever else is queued (the HARD asserted below). It re-renders the same head, so
+        // the turn's signed thinking stays valid.
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.bootstrap_seed_fold_pending = true;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
         let priced = call_transform_request(&handler, priced_request).await;
         assert_eq!(priced["action"], "HARD");
         // step-0 belongs to the active Anthropic turn (no real user message follows
@@ -27985,6 +28046,15 @@ mod tests {
         }
         let mut priced_request = make_request(&native, "claude-fable-5-1");
         priced_request["render_config"] = json!("independent-priced-config-change");
+        // Mark a pending bootstrap-seed fold. A render-identity change inside the open signed
+        // turn would wait for the turn to end, but a pending seed fold makes the pass a
+        // HARD (a full m0/m1 rebuild) whatever else is queued (the HARD asserted below). It re-renders the same head, so
+        // the turn's signed thinking stays valid.
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.bootstrap_seed_fold_pending = true;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
         let priced = call_transform_request(&handler, priced_request).await;
         assert_eq!(priced["action"], "HARD");
         let target = priced["native_messages"]
@@ -42445,7 +42515,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn the_historian_claim_lane_answers_the_wire_a2_codes_against() {
         let golden = claim_wire_golden();
-        let (handler, store, _dir, project) =
+        let (handler, store, dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         let project_path = project.to_string_lossy().to_string();
         let queued_at_ms = now_ms();
@@ -42580,15 +42650,39 @@ mod tests {
         // and its token is still current, but nothing in this process is waiting for
         // the answer. The report is stored on the queue row rather than refused.
         assert_eq!(handler.host_runs.waiting_count(), 0);
-        drive_claim_wire_case(
-            &handler,
-            claim_wire_case(
-                &golden,
-                "a-report-with-no-firing-waiting-is-stored-for-the-next-pass",
-            ),
-            Some(&token),
-        )
-        .await;
+        let invocations = json!([
+            { "provider_id": "prov", "model_id": "broken", "started_at": queued_at_ms,
+              "ended_at": queued_at_ms + 1, "status": "failed", "error": "provider unavailable" },
+            { "provider_id": "other", "model_id": "good", "started_at": queued_at_ms + 1,
+              "ended_at": queued_at_ms + 2, "status": "completed", "input_tokens": 120,
+              "output_tokens": 40, "cache_read_tokens": 80, "cache_write_tokens": 10, "error": null }
+        ]);
+        let case = claim_wire_case(
+            &golden,
+            "a-report-with-no-firing-waiting-is-stored-for-the-next-pass",
+        );
+        let mut deferred = case.request.clone();
+        deferred["token"] = json!(token);
+        deferred["invocations"] = invocations.clone();
+        let observed = call_dispatch_request(&handler, deferred).await;
+        assert_eq!(observed, case.response);
+        let descriptor = dev_descriptor_at(dir.path().join("data").to_str().unwrap());
+        let context_path = match descriptor.backend {
+            StorageBackend::Sqlite { path } => {
+                PathBuf::from(path).parent().unwrap().join("context.db")
+            }
+            _ => panic!("test store is SQLite"),
+        };
+        let conn = rusqlite::Connection::open(context_path).unwrap();
+        let rows: Vec<(i64,String,Option<i64>,Option<String>)> = conn.prepare(
+            "SELECT id,status,parent_invocation_id,error FROM subagent_invocations WHERE session_id='ses' ORDER BY id"
+        ).unwrap().query_map([], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
+            .collect::<Result<_,_>>().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, "failed");
+        assert_eq!(rows[0].3.as_deref(), Some("provider unavailable"));
+        assert_eq!(rows[1].1, "completed");
+        assert_eq!(rows[1].2, Some(rows[0].0));
         let parked = store
             .load_parked_historian_run("ses")
             .unwrap()
@@ -42611,12 +42705,24 @@ mod tests {
                 "run_id": CLAIM_RUN_ID,
                 "token": token,
                 "output": { "text": "<compartments/>", "length_capped": false },
+                "invocations": invocations,
             }),
         )
         .await;
         assert_eq!(
             duplicate,
             json!({ "ok": false, "refusal": "already_reported" })
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subagent_invocations WHERE session_id='ses'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "a refused duplicate cannot record the attempts again"
         );
     }
 
