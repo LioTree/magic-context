@@ -1230,6 +1230,12 @@ export class PiSubagentRunner implements SubagentRunner {
 					`subagent accounting failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
+			if (
+				options.runIdentity !== undefined &&
+				!/^[a-f0-9-]{36}$/.test(options.runIdentity)
+			) {
+				throw new Error("Invalid score subprocess identity");
+			}
 			return result;
 		}
 
@@ -1313,7 +1319,14 @@ export class PiSubagentRunner implements SubagentRunner {
 		};
 		if (options.systemPrompt.length > 0) {
 			try {
-				systemPromptTempDir = mkdtempSync(join(tmpdir(), "mc-pi-prompt-"));
+				systemPromptTempDir = mkdtempSync(
+					join(
+						tmpdir(),
+						options.runIdentity
+							? `mc-pi-subagent-${options.runIdentity}-`
+							: "mc-pi-prompt-",
+					),
+				);
 				systemPromptPath = join(systemPromptTempDir, "system-prompt.txt");
 				writeFileSync(systemPromptPath, options.systemPrompt, "utf8");
 			} catch (error) {
@@ -1372,8 +1385,31 @@ export class PiSubagentRunner implements SubagentRunner {
 			// during normal completion race" from "timeout actually decided
 			// the outcome."
 			let settled = false;
+			let childCreated = false;
+			let exitAcknowledged = false;
+			let pendingSettlement: SubagentRunResult | undefined;
+			let resultHandedOff = false;
+			const handoffResult = (result: SubagentRunResult) => {
+				if (!options.onResult || resultHandedOff) return;
+				resultHandedOff = true;
+				options.onResult(result);
+			};
 			const settle = (result: SubagentRunResult) => {
 				if (settled) return;
+				if (options.waitForExit && childCreated && !exitAcknowledged) {
+					pendingSettlement ??= result;
+					return;
+				}
+				try {
+					handoffResult(result);
+				} catch {
+					result = {
+						ok: false,
+						reason: "parse_failed",
+						error: "Score result handoff failed",
+						durationMs: Date.now() - startTime,
+					};
+				}
 				settled = true;
 				if (
 					accountingMessages.length > 0 &&
@@ -1465,6 +1501,7 @@ export class PiSubagentRunner implements SubagentRunner {
 							MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
 							MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE: budgetGuardFile,
 							MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
+								options.agent === "rescore" ||
 								/^(magic-context-)?historian(?:-recomp|-editor)?$/.test(
 									options.agent,
 								)
@@ -1497,6 +1534,7 @@ export class PiSubagentRunner implements SubagentRunner {
 						],
 					},
 				);
+				childCreated = true;
 			} catch (error) {
 				cleanupSystemPromptFile();
 				settle({
@@ -1516,7 +1554,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					error: "pi subagent aborted by caller",
 					durationMs: Date.now() - startTime,
 				});
-				return;
+				if (!options.waitForExit) return;
 			}
 
 			emitProgress({ type: "spawned", argv: args, pid: child.pid });
@@ -2033,6 +2071,46 @@ export class PiSubagentRunner implements SubagentRunner {
 					}
 				}
 
+				if (
+					options.onResult &&
+					sawAgentEnd &&
+					finalStopReason === "stop" &&
+					finalAssistantText?.trim()
+				) {
+					const messages = agentEndMessages ?? accumulatedMessages;
+					const assistant = [...messages]
+						.reverse()
+						.find(
+							(message) =>
+								message &&
+								typeof message === "object" &&
+								(message as { role?: string }).role === "assistant",
+						) as { content?: unknown[] } | undefined;
+					const hasToolCall = assistant?.content?.some(
+						(part) =>
+							part &&
+							typeof part === "object" &&
+							(part as { type?: string }).type === "toolCall",
+					);
+					if (!hasToolCall) {
+						try {
+							handoffResult({
+								ok: true,
+								assistantText: finalAssistantText.trim(),
+								durationMs: Date.now() - startTime,
+							});
+						} catch {
+							terminateChild(child);
+							settle({
+								ok: false,
+								reason: "parse_failed",
+								error: "Score result handoff failed",
+								durationMs: Date.now() - startTime,
+							});
+						}
+					}
+				}
+
 				// Pi's print mode finishes the agent loop but does NOT always
 				// exit the child process cleanly afterwards — observed
 				// pattern: assistant message_end with stopReason="stop"
@@ -2120,8 +2198,10 @@ export class PiSubagentRunner implements SubagentRunner {
 				});
 			};
 			options.signal?.addEventListener("abort", onAbort, { once: true });
+			if (options.signal?.aborted) queueMicrotask(onAbort);
 
 			child.on("error", (error) => {
+				if (child.pid === undefined) exitAcknowledged = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (drainTimerHandle) clearTimeout(drainTimerHandle);
 				options.signal?.removeEventListener("abort", onAbort);
@@ -2141,6 +2221,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			) => {
 				if (childExitHandled) return;
 				childExitHandled = true;
+				exitAcknowledged = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (drainTimerHandle) clearTimeout(drainTimerHandle);
 				if (exitGraceHandle) clearTimeout(exitGraceHandle);
@@ -2152,6 +2233,10 @@ export class PiSubagentRunner implements SubagentRunner {
 					ms: Date.now() - startTime,
 				});
 				if (settled) return;
+				if (pendingSettlement) {
+					settle(pendingSettlement);
+					return;
+				}
 
 				const settleCompletedToolOnlyDreamer = (
 					messages: unknown[],

@@ -1,15 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import { inspectCurateMemoryOperations } from "../features/magic-context/dreamer/task-executor";
+import { RescoreService } from "../features/magic-context/rescore-service";
+import { initializeDatabase } from "../features/magic-context/storage-db";
 import {
     HiddenCompletionRefusal,
     type HiddenRunIdentity,
 } from "../hooks/magic-context/compartment-runner-types";
+import { createOpenCodeRescoreCarrier } from "../hooks/magic-context/rescore-driver";
 import {
     getPromptFailureDetail,
     promptSyncWithValidatedOutputRetry,
 } from "../shared/model-suggestion-retry";
 import { Database } from "../shared/sqlite";
 import {
+    createLateHiddenExecutor,
     createV2HiddenCompletionExecutor,
     type HiddenChildHost,
     toolLoopMessages,
@@ -972,6 +976,7 @@ describe("OpenCode 2 hidden child completion", () => {
         });
         expect([...agents.keys()]).toEqual([
             HIDDEN_HISTORIAN_AGENT,
+            "rescore",
             HIDDEN_DREAMER_AGENT,
             HIDDEN_CURATE_AGENT,
             "dreamer-memory-mapper",
@@ -1459,4 +1464,198 @@ describe("hidden completion temperature capabilities", () => {
             state.db.close();
         }
     });
+});
+
+/** Catalog rows stating that the mock model accepts a temperature parameter. */
+const temperatureRows = [{ id: "cheap", providerID: "mock", capabilities: { temperature: true } }];
+
+describe("score-only hidden completions", () => {
+    test("rescore has a separate tool-less role and does not queue the live historian", async () => {
+        // Subagent temperature is sent only when model metadata accepts it; the rescore's
+        // frozen temperature goes through the same per-model decision.
+        const f = await setup("host-generation-1", { modelCatalog: async () => temperatureRows });
+        const score = await f.executor.open({
+            ...run,
+            kind: "rescore",
+            agent: "rescore",
+            maxOutputTokens: 1000,
+        });
+        expect(f.creates[0].metadata.role).toBe("rescore");
+        expect(f.creates[0].agent).toBe("rescore");
+        expect(f.creates[0].permissions).toEqual([{ action: "*", resource: "*", effect: "deny" }]);
+        const historian = await f.executor.open(run);
+        expect(f.creates).toHaveLength(2);
+        await f.executor.attempt(score, request("cheap", { temperature: 0, system: "score-only" }));
+        expect(f.requests[0].tools).toEqual({});
+        expect(f.requests[0].options).toEqual({
+            temperature: 0,
+            maxOutputTokens: 1000,
+            maxTokens: 1000,
+        });
+        expect(f.requests[0].system).toEqual([{ type: "text", text: "score-only" }]);
+        await close(f.executor, historian, false);
+        await close(f.executor, score, true);
+        f.db.close();
+    });
+    test("rescore refuses unsupported frozen variant instead of silently dropping it", async () => {
+        const f = await setup("generation", {
+            modelCatalog: async () => [{ providerID: "mock", id: "cheap", variants: {} }],
+        });
+        await expect(
+            f.executor.open({
+                ...run,
+                kind: "rescore",
+                agent: "rescore",
+                model: { model: "mock/cheap", qualifier: "unsupported" },
+                configuredModels: [{ model: "mock/cheap", qualifier: "unsupported" }],
+            }),
+        ).rejects.toThrow("Frozen score variant");
+        expect(f.creates).toHaveLength(0);
+        f.db.close();
+    });
+    test("durable score recovery reads a finished child without prompting after restart", async () => {
+        const f = await setup("generation", { keepSubagents: true });
+        const score = await f.executor.open({ ...run, kind: "rescore", agent: "rescore" });
+        await f.executor.attempt(score, request());
+        f.rows.appendIdle(score.id, "succeeded");
+        await close(f.executor, score, true);
+        const restarted = await f.create("next-generation");
+        const prompts = f.requests.length;
+        const creates = f.creates.length;
+        expect((await restarted.recover?.(score.id))?.text).toBe("editor completion");
+        expect(f.requests).toHaveLength(prompts);
+        expect(f.creates).toHaveLength(creates);
+        await restarted.interrupt?.(score.id);
+        expect(f.interrupts).toContain(score.id);
+        f.db.close();
+    });
+});
+
+test("OpenCode 2 score batch records rescore accounting and publishes only scores", async () => {
+    const f = await setup("host-generation-1", { modelCatalog: async () => temperatureRows });
+    initializeDatabase(f.db);
+    f.db
+        .prepare(
+            "INSERT INTO session_projects(session_id,harness,project_path,updated_at) VALUES ('session','opencode','/project',0)",
+        )
+        .run();
+    f.db
+        .prepare(`INSERT INTO compartments(session_id,sequence,start_message,end_message,start_message_id,end_message_id,title,content,p1,importance,legacy,created_at)
+        VALUES ('session',1,1,2,'m1','m2','Title','','P1',50,0,1)`)
+        .run();
+    const service = new RescoreService({
+        db: f.db,
+        projectPath: "/project",
+        sessionId: "session",
+        harness: "opencode2",
+        profile: { model: "mock/cheap", temperature: 0, maxOutputTokens: 1234 },
+        admissionFailure: () => null,
+    });
+    const authority = service.confirm(service.preview().snapshotId);
+    const admission = service.admit(authority)!;
+    f.setCompletion(
+        JSON.stringify(
+            Object.keys(JSON.parse(admission.attempt.handle_map)).map((handle) => ({
+                handle,
+                importance: 90,
+                reason: "durable invariant",
+            })),
+        ),
+    );
+    const carrier = createOpenCodeRescoreCarrier({
+        db: f.db,
+        executor: f.executor,
+        sessionId: "session",
+        directory: "/project",
+        harness: "opencode2",
+        timeoutMs: 1000,
+    });
+    const text = await carrier.complete(admission, new AbortController().signal, (id) =>
+        service.recordCarrier(authority, admission.attempt.id, id),
+    );
+    service.persistPayload(authority, admission.attempt.id, text);
+    service.publish(authority, admission.attempt.id);
+    expect(service.status(authority.jobId).job.state).toBe("complete");
+    expect(f.db.prepare("SELECT subagent, model_id FROM subagent_invocations").all()).toEqual([
+        { subagent: "rescore", model_id: "cheap" },
+    ]);
+    expect(f.db.prepare("SELECT importance FROM compartments").get()).toEqual({ importance: 50 });
+    expect(f.requests[0].tools).toEqual({});
+    expect(f.requests[0].options).toEqual({
+        temperature: 0,
+        maxTokens: 1234,
+        maxOutputTokens: 1234,
+    });
+    f.db.close();
+});
+
+test("OpenCode 2 recovery preserves actual model and length/error termination metadata", async () => {
+    const f = await setup();
+    f.rows.append("length-child", "[]", { modelID: "answering-model", finish: "length" });
+    f.rows.appendIdle("length-child", "succeeded");
+    expect(await f.executor.recover?.("length-child")).toMatchObject({
+        text: "[]",
+        providerId: "mock",
+        modelId: "answering-model",
+        lengthCapped: true,
+    });
+    f.rows.append("error-child", "[]", { error: { message: "provider failed" } });
+    f.rows.appendIdle("error-child", "failed");
+    expect(await f.executor.recover?.("error-child")).toMatchObject({
+        text: "[]",
+        providerId: "mock",
+        modelId: "cheap",
+        failed: true,
+    });
+    f.db.close();
+});
+
+test("rescore and memory-check slots coexist with retained historian turns through the late executor", async () => {
+    const f = await setup("merged-host", { keepSubagents: true });
+    const executor = createLateHiddenExecutor(() => f.executor);
+    const historian = await executor.open({ ...run, kind: "historian", agent: "historian" });
+    const scorePromise = executor.open({ ...run, kind: "rescore", agent: "rescore" });
+    const checkPromise = executor.open({
+        ...run,
+        kind: "historian",
+        metadata: { memoryCheck: true },
+    });
+    let nextHistorian: Promise<Awaited<ReturnType<typeof executor.open>>> | undefined;
+    try {
+        await eventually(() => f.creates.length === 3);
+        const [score, check] = await Promise.all([scorePromise, checkPromise]);
+        expect(f.creates[1].agent).toBe("rescore");
+        expect(f.creates[1].metadata.role).toBe("rescore");
+        expect(f.creates[1].permissions).toEqual([{ action: "*", resource: "*", effect: "deny" }]);
+        await executor.attempt(historian, request());
+        executor.detach?.(historian);
+        nextHistorian = executor.open({ ...run, kind: "historian", agent: "historian" });
+        await eventually(() => f.creates.length === 4);
+        await nextHistorian;
+        await executor.attempt(historian, {
+            ...request("cheap", { parts: [{ type: "text", text: "turn two" }] }),
+            // Detach frees the queue; a retained child's next request must opt into conversation replay.
+            continueConversation: true,
+        });
+        expect(f.requests[1].messages).toEqual([
+            { role: "user", content: [{ type: "text", text: "calibrated chunk" }] },
+            { role: "assistant", content: [{ type: "text", text: "editor completion" }] },
+            { role: "user", content: [{ type: "text", text: "turn two" }] },
+        ]);
+        await executor.attempt(score, request());
+        f.rows.appendIdle(score.id, "succeeded");
+        expect(await executor.recoveryState?.(score.id)).toBe("terminal");
+        expect((await executor.recover?.(score.id))?.modelId).toBe("cheap");
+        await executor.interrupt?.(score.id);
+        expect(f.interrupts).toContain(score.id);
+        expect(f.requests[2].tools).toEqual({});
+        expect(check.id).not.toBe(historian.id);
+        expect(f.removed).not.toContain(historian.id);
+    } finally {
+        await close(f.executor, historian, true);
+        await close(f.executor, await scorePromise, true);
+        await close(f.executor, await checkPromise, false);
+        if (nextHistorian) await close(f.executor, await nextHistorian, false);
+        f.db.close();
+    }
 });

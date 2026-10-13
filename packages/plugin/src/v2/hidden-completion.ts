@@ -17,7 +17,7 @@ import { parseProviderModel, toModelEntry } from "../shared/resolve-fallbacks";
 import { runTokenLog } from "../shared/run-token-log";
 import type { Database } from "../shared/sqlite";
 import { subagentTemperature } from "../shared/subagent-temperature";
-import { createNativeHiddenChildren } from "./hidden-child-native";
+import { createNativeHiddenChildren, isSessionNotFound } from "./hidden-child-native";
 import {
     assistantOutcome,
     errorText,
@@ -117,6 +117,7 @@ function slotFor(identity: HiddenRunIdentity, role: HiddenChildRole): string {
 }
 
 function roleFor(identity: HiddenRunIdentity): HiddenChildRole {
+    if (identity.kind === "rescore") return "rescore";
     if (identity.kind !== "dreamer-task") return "historian";
     return identity.agent === HIDDEN_CURATE_AGENT ? "dreamer-curate" : "dreamer";
 }
@@ -391,6 +392,9 @@ export function createLateHiddenExecutor(
         open: (run) => wired().open(run),
         attempt: (handle, request) => wired().attempt(handle, request),
         collect: (handle, limit) => wired().collect(handle, limit),
+        recover: (id) => wired().recover?.(id) ?? Promise.resolve(null),
+        recoveryState: (id) => wired().recoveryState?.(id) ?? Promise.resolve("unknown"),
+        interrupt: (id) => wired().interrupt?.(id) ?? Promise.resolve(),
         detach: (handle) => current()?.detach?.(handle),
         close: (handle, settlement) => wired().close(handle, settlement),
     };
@@ -441,7 +445,7 @@ export async function createV2HiddenCompletionExecutor(
     };
 
     const warnedVariants = new Set<string>();
-    const validateVariant = async (model: Model): Promise<Model> => {
+    const validateVariant = async (model: Model, strict = false): Promise<Model> => {
         if (!model.variant || !options.modelCatalog) return model;
         try {
             const listed = await options.modelCatalog();
@@ -467,6 +471,7 @@ export async function createV2HiddenCompletionExecutor(
             )
                 return model;
             const key = `${model.providerID}/${model.modelID}:${model.variant}`;
+            if (strict) throw new Error(`Frozen score variant is unsupported: ${key}`);
             if (!warnedVariants.has(key)) {
                 warnedVariants.add(key);
                 note(
@@ -474,14 +479,15 @@ export async function createV2HiddenCompletionExecutor(
                 );
             }
             return { providerID: model.providerID, modelID: model.modelID };
-        } catch {
+        } catch (error) {
+            if (strict) throw error;
             return model;
         }
     };
 
     const resolveHead = async (identity: HiddenRunIdentity): Promise<Model> => {
         const configured = configuredHead(identity);
-        if (configured) return validateVariant(configured);
+        if (configured) return validateVariant(configured, identity.kind === "rescore");
         if (!identity.parentSessionId) {
             throw new HiddenCompletionRefusal(
                 "hidden_model_unsupported",
@@ -526,6 +532,7 @@ export async function createV2HiddenCompletionExecutor(
     const interruptAndRetire = async (run: RunState, reason: string): Promise<void> => {
         try {
             await host.interrupt({ sessionID: run.child.id });
+            if (run.identity.kind === "rescore") await host.wait({ sessionID: run.child.id });
         } finally {
             retire(run, reason);
         }
@@ -574,8 +581,17 @@ export async function createV2HiddenCompletionExecutor(
                 throw new Error("Hidden completion prompt aborted");
             }
 
-            const requested = await validateVariant(requestModel(request, run.child.model));
-            if (run.identity.kind !== "dreamer-task" && request.body.temperature === undefined) {
+            const requested = await validateVariant(
+                requestModel(request, run.child.model),
+                run.identity.kind === "rescore",
+            );
+            // A rescore runs on its frozen sampling profile, so a configured historian
+            // temperature is not added to it.
+            if (
+                run.identity.kind !== "dreamer-task" &&
+                run.identity.kind !== "rescore" &&
+                request.body.temperature === undefined
+            ) {
                 const configured = options.historianTemperature?.();
                 if (typeof configured === "number" && Number.isFinite(configured))
                     request = { ...request, body: { ...request.body, temperature: configured } };
@@ -848,11 +864,74 @@ export async function createV2HiddenCompletionExecutor(
             if (!completion) throw new Error("Hidden completion has no settled output");
             return completion;
         },
+        async recover(id) {
+            return withReader(options.openReader, (reader) => {
+                const row = reader.latestAssistant(id);
+                const idle = reader.latestIdle(id);
+                if (!row || !idle || idle.seq < row.seq || (!row.data.finish && !row.data.outcome))
+                    return null;
+                const tokens = row.data.tokens;
+                return {
+                    text: assistantText(row),
+                    usage: {
+                        input: tokens?.input ?? 0,
+                        output: tokens?.output ?? 0,
+                        cacheRead: tokens?.cache?.read ?? 0,
+                        cacheWrite: tokens?.cache?.write ?? 0,
+                    },
+                    lengthCapped: ["length", "max_tokens"].includes(row.data.finish ?? ""),
+                    failed:
+                        row.data.error !== undefined ||
+                        idle.data.outcome === "failed" ||
+                        idle.data.outcome === "interrupted" ||
+                        row.data.outcome === "failed" ||
+                        row.data.outcome === "interrupted" ||
+                        row.data.finish === "error" ||
+                        row.data.finish === "aborted",
+                    providerId: row.data.model?.providerID,
+                    modelId: row.data.model?.id,
+                };
+            });
+        },
+        async recoveryState(id) {
+            const state = withReader(options.openReader, (reader) => {
+                const idle = reader.latestIdle(id);
+                return idle && idle.seq >= reader.latestSequence(id)
+                    ? ("terminal" as const)
+                    : undefined;
+            });
+            if (state) return state;
+            try {
+                await host.get({ sessionID: id });
+                return "active";
+            } catch (error) {
+                return isSessionNotFound(error) ? "unavailable" : "unknown";
+            }
+        },
+        async interrupt(id) {
+            await host.interrupt({ sessionID: id });
+            await host.wait({ sessionID: id });
+        },
         async close(handle, settlement) {
             if (!handle) return;
             const run = runs.get(handle);
-            if (!run) return;
+            if (!run) {
+                if (
+                    settlement.context === "rescore" &&
+                    !settlement.retainForRecovery &&
+                    !options.keepSubagents
+                ) {
+                    try {
+                        await removeSession.call(host, { sessionID: handle.id });
+                    } catch (error) {
+                        if (!isSessionNotFound(error))
+                            note("Could not remove recovered score child");
+                    }
+                }
+                return;
+            }
             try {
+                if (settlement.retainForRecovery) return;
                 // Settled provider failures are retired in attempt() before the marker is released.
                 // Keep this guard for callers that close an unsuccessful run without an attempt
                 // error, but never make a retired child reusable through close().
@@ -873,7 +952,7 @@ export async function createV2HiddenCompletionExecutor(
                 runs.delete(handle);
                 run.releaseRole();
             }
-            await lifecycle.finish(run.child, run.retired);
+            if (!settlement.retainForRecovery) await lifecycle.finish(run.child, run.retired);
         },
     };
 }
