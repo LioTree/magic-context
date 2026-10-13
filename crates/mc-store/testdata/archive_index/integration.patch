@@ -1,0 +1,9 @@
+*** Begin Patch
+*** Update File: crates/mc-store/src/archive_index/mod.rs
+@@
+ //! Raw archive extension. The archive owner registers store, FTS and ordinal modules here.
++
++pub mod store;
++pub mod fts;
++pub mod ordinals;
+*** End Patch

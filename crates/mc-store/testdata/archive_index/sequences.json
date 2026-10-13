@@ -1,0 +1,37 @@
+{
+  "session": "archive-parity",
+  "steps": [
+    {"mode":"page","revision":"r1","messages":[
+      {"id":"u1","ordinal":1,"role":"user","parts":[{"type":"text","text":"  Fix running archive_index::store   café \n paths/a.rs "}],"createdAt":100,"completedAt":101,"version":1},
+      {"id":"a1","ordinal":2,"role":"assistant","parts":[{"type":"text","text":"Indexed runners and CAFÉ paths/a.rs"},{"type":"tool","state":{"input":{"secret":"expand only"},"output":"tool output"}},{"type":"reasoning","text":"private reasoning"}],"createdAt":200,"completedAt":201,"version":"v1"}
+    ]},
+    {"mode":"live","revision":"r2","messages":[
+      {"id":"a1","ordinal":2,"role":"assistant","parts":[{"type":"text","text":"Indexed runners and CAFÉ paths/a.rs"},{"type":"tool","state":{"input":{"secret":"expand only"},"output":"tool output"}},{"type":"reasoning","text":"private reasoning"}],"createdAt":200,"completedAt":201,"version":"v1"}
+    ]},
+    {"mode":"page","revision":"r3","messages":[
+      {"id":"u2","ordinal":3,"role":"user","parts":[{"type":"text","text":"<system-reminder>not searchable</system-reminder> needle_identity"}],"createdAt":300,"completedAt":301,"version":1},
+      {"id":"u2","ordinal":3,"role":"user","parts":[{"type":"text","text":"<system-reminder>not searchable</system-reminder> needle_identity"}],"createdAt":300,"completedAt":301,"version":1},
+      {"id":"s1","ordinal":4,"role":"system","parts":[{"type":"text","text":"system is not indexed"}],"createdAt":400,"completedAt":null,"version":null}
+    ]},
+    {"mode":"live","revision":"r4","messages":[
+      {"id":"a1","ordinal":2,"role":"assistant","parts":[{"type":"text","text":"Revised archive_index::store and café"},{"type":"tool","state":{"input":{"secret":"revised expand only"},"output":"new tool output"}}],"createdAt":220,"completedAt":221,"version":"v2"}
+    ]},
+    {"mode":"live","revision":"r5","messages":[
+      {"id":"u1","ordinal":1,"role":"user","parts":[{"type":"text","text":"[SYSTEM DIRECTIVE: MAGIC-CONTEXT internal]"}],"createdAt":100,"completedAt":101,"version":2}
+    ]},
+    {"mode":"revert","revision":"r6","revertFrom":3,"messages":[]},
+    {"mode":"page","revision":"r7","messages":[
+      {"id":"u3","ordinal":3,"role":"user","parts":[{"type":"text","text":"new tail after positive revert"}],"createdAt":500,"completedAt":501,"version":1},
+      {"id":"a3","ordinal":4,"role":"assistant","parts":[{"type":"text","text":""},{"type":"tool","state":{"input":"full original input","output":"full original output"}}],"createdAt":600,"completedAt":601,"version":1}
+    ]}
+  ],
+  "normalizations": [
+    {"id":"clean1","ordinal":1,"role":"user","parts":[{"type":"text","text":"<!-- OMO_INTERNAL_INITIATOR -->  Hello\tworld\n<system-reminder>gone</system-reminder>"}],"createdAt":null,"completedAt":null},
+    {"id":"clean2","ordinal":2,"role":"assistant","parts":[{"type":"text","text":"a<SYSTEM-REMINDER>multi\nline</SYSTEM-REMINDER>b"},{"type":"text","text":"x <system-reminder>unclosed"},{"type":"text","text":"\ufeffbom\ufeffspace\u0085kept"}],"createdAt":null,"completedAt":null},
+    {"id":"clean3","ordinal":3,"role":"user","parts":[{"type":"text","text":"ignored only","ignored":true}],"createdAt":null,"completedAt":null},
+    {"id":"clean4","ordinal":4,"role":"user","parts":[{"type":"text","text":"ignored but selected","ignored":true},{"type":"text","text":"meaningful"},{"type":"reasoning","text":"not selected"}],"createdAt":null,"completedAt":null},
+    {"id":"clean5","ordinal":5,"role":"user","parts":[{"type":"text","text":"outside <system-reminder>\nThe user sent the following message:\nsteered words\n\nPlease address this message and continue with your tasks.\n</system-reminder> tail"}],"createdAt":null,"completedAt":null},
+    {"id":"clean6","ordinal":6,"role":"user","parts":[{"type":"text","text":"<system-reminder>\nThe user sent the following message:\nonly wrapper\n\nPlease address this message and continue with your tasks.\n</system-reminder>"}],"createdAt":null,"completedAt":null},
+    {"id":"clean7","ordinal":7,"role":"tool","parts":[{"type":"text","text":"not indexed"}],"createdAt":null,"completedAt":null}
+  ]
+}
