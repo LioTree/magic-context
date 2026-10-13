@@ -13,7 +13,7 @@ import { postRebuildProfile, type StageProfile } from "./provider-post-rebuild-p
 import { encodeOpenCodeMessagesToCk } from "../../plugin/src/hooks/magic-context/module-wire";
 
 /** Directly awaiting the real handler records misses; it does not enlarge the production host fence. */
-export async function preparationTiming(samples = 100, diagnostic?: { driver: Driver; output: string; stores: string }) {
+export async function preparationTiming(samples = 100, diagnostic?: { driver: Driver; output: string; stores: string }, realistic = false) {
     assert.ok(samples >= 5);
     process.env.MC_POLICY_SUMMARY_SKIP_FULL_CHECK = "1";
     const root = join(tmpdir(), "magic-context", "provider-preparation-timing");
@@ -22,25 +22,43 @@ export async function preparationTiming(samples = 100, diagnostic?: { driver: Dr
     if (!diagnostic) mkdirSync(join(work, "stores"));
     const driver = diagnostic?.driver ?? new Driver(buildDriver(join(work, "build")), join(work, "stores"));
     const fullRows: {host: string; sample: number; module_ms: number; wall_ms: number; before: ReturnType<typeof systemSample>; after: ReturnType<typeof systemSample>; psi: ReturnType<typeof psiDelta>}[] = [];
-    const rows: { host: string; setting: boolean; sample: number; request_id: string; rebuild_id: string; rebuild_before: ReturnType<typeof systemSample>; before: ReturnType<typeof systemSample>; after: ReturnType<typeof systemSample>; rebuild_psi: ReturnType<typeof psiDelta>; psi: ReturnType<typeof psiDelta>; wall_ms: number; rebuild_wall_ms: number }[] = [];
+    const fixtureShapes: unknown[] = [];
+    const rows: { host: string; setting: boolean; sample: number; request_id: string; rebuild_id: string; rebuild_before: ReturnType<typeof systemSample>; before: ReturnType<typeof systemSample>; after: ReturnType<typeof systemSample>; rebuild_psi: ReturnType<typeof psiDelta>; psi: ReturnType<typeof psiDelta>; wall_ms: number; rebuild_wall_ms: number; ordinary_module_ms: number; ordinary_wall_ms: number; ordinary_before: ReturnType<typeof systemSample>; ordinary_after: ReturnType<typeof systemSample>; ordinary_psi: ReturnType<typeof psiDelta> }[] = [];
     try {
         for (const host of ["OpenCode1", "OpenCode2"] as const) {
             const directory = join(work, "stores", host);
-            const f = await fixture(driver, host, directory);
+            const f = await fixture(driver, host, directory, false, realistic);
             try {
                 updateSessionMeta(f.db, "session", { lastUsageContextLimit: 4_000_000 });
                 const history = Array.from({ length: 17_000 }, (_, i) => i % 5 === 0 ? message(`synthetic-${i}`, "user", `Inspect fixture ${i}: café 🦀`)
                     : i % 5 === 4 ? message(`synthetic-${i}`, "assistant", `Fixture ${i} complete`) : tools(`synthetic-${i}`));
+                if (realistic) history.forEach((entry, i) => { (entry.info as any).absolute_ordinal = i + 1; });
                 for (let warm = 0; warm < 3; warm++) await f.full(history);
                 await f.pass(history);
                 assert.equal(f.fallbacks.length, 0);
+                if (realistic) {
+                    await f.event("realistic_seed", {covered: 16_500, compartments: 2_300, memories: 1_000});
+                    await f.full(history);
+                    await f.pass(history);
+                }
+                const inspected = await driver.send({op: "inspect", rig: f.rig});
+                const tail = realistic ? history.slice(-500) : history;
+                const trim = realistic ? { flat_boundary_id: inspected.boundary_id,
+                    boundary_bare_message_id: inspected.boundary_id.split("#")[0],
+                    boundary_absolute_ordinal: inspected.coverage, next_absolute_ordinal: 16_501 } : undefined;
+                if (realistic) assert.equal(inspected.coverage, 16_500, "the tail must start immediately after the folded history");
+                fixtureShapes.push({host, stored_messages: history.length, raw_tail_messages: tail.length,
+                    frozen_units: inspected.units.length, compartment_count: inspected.compartment_count,
+                    memories: realistic ? 1_000 : 0, coverage: inspected.coverage,
+                    policy_parts: await f.sql("SELECT COUNT(*) FROM mc_provider_policy_parts_v1")});
                 const state = f.stored()!;
                 const plan = JSON.parse(state.state.plan_json!);
                 const base = f.wires.filter(w => w.method === "compaction.step").at(-1)!.params;
                 const applied = { compaction_id: state.views.at(-1)!.compaction_id, version: state.views.at(-1)!.version };
                 const newest = { ordinal: state.state.next_ordinal - 1, mid: history.at(-1)!.info.id };
                 for (let sample = 0; sample < samples; sample++) {
-                    await f.event("publish", { start: sample * 5 + 1, end: (sample + 1) * 5, mid: `synthetic-${(sample + 1) * 5 - 1}` });
+                    if (realistic) await f.event("realistic_delta", {sample});
+                    else await f.event("publish", { start: sample * 5 + 1, end: (sample + 1) * 5, mid: `synthetic-${(sample + 1) * 5 - 1}` });
                     await f.event("flush");
                     await driver.send({ op: "settle", rig: f.rig });
                     const model = `openai/gpt-5.6-preparation-timing-${sample}`;
@@ -71,16 +89,16 @@ export async function preparationTiming(samples = 100, diagnostic?: { driver: Dr
                         const context = new Database(join(directory, "context.db"));
                         try { context.exec(`VACUUM INTO '${join(branch, "context.db").replaceAll("'", "''")}'`); }
                         finally { context.close(); }
-                        const rig = `${host}-${sample}-${setting}`;
-                        await driver.send({ op: "create", rig, directory: branch, project_root: join(directory, "project"), harness: request.harness });
+                        const rig = `timing-${host}-${sample}-${setting}`;
+                        await driver.send({ op: "create", rig, directory: branch, project_root: join(directory, "project"), harness: request.harness, memory_enabled: realistic });
                         try {
                             driver.proveIsolation();
                             if (setting === "full") {
                                 const before = systemSample();
                                 const start = performance.now();
-                                const full = await driver.send({ op: "full", rig, timing: true, messages: history,
-                                    ingress: encodeOpenCodeMessagesToCk(history), now: status.now, model, window: 4_000_000,
-                                    extra: { request_id: rebuildId } });
+                                const full = await driver.send({ op: "full", rig, timing: true, messages: tail,
+                                    ingress: encodeOpenCodeMessagesToCk(tail), now: status.now, model, window: 4_000_000,
+                                    extra: { request_id: rebuildId, ...(trim ? { declared_trim: trim } : {}) } });
                                 const wall_ms = performance.now() - start;
                                 const after = systemSample();
                                 assert.ok(!full.error, JSON.stringify(full.error));
@@ -103,8 +121,21 @@ export async function preparationTiming(samples = 100, diagnostic?: { driver: Dr
                             assert.equal(answered.ok.answer, "ops");
                             assert.equal(typeof rebuilt.raw, "string");
                             assert.equal(typeof answered.raw, "string");
-                            answers.push([rebuilt.raw, answered.raw]);
-                            const row = { host, setting, sample, request_id: id, rebuild_id: rebuildId, rebuild_before, before, after, rebuild_psi: psiDelta(rebuild_before, before), psi: psiDelta(before, after), wall_ms, rebuild_wall_ms };
+                            const ordinaryEntry = message(`${id}-ordinary`, "assistant", "ordinary next message");
+                            (ordinaryEntry.info as {model: {modelID: string}}).model.modelID = model.slice("openai/".length);
+                            const ordinary_before = systemSample();
+                            const ordinaryStart = performance.now();
+                            const ordinary = await driver.send({op: "call", rig, timing: true, body: {method: "transform.hook", params: {
+                                ...request, ...providerSubjects(ordinaryEntry)[0], request_id: `${id}-ordinary`, message: ordinaryEntry,
+                                subject_mid: `${id}-ordinary`, subject_ordinal: newest.ordinal + 2, consume_prepared_policy: false,
+                            }}});
+                            const ordinary_wall_ms = performance.now() - ordinaryStart;
+                            const ordinary_after = systemSample();
+                            assert.ok(!ordinary.error, JSON.stringify(ordinary.error));
+                            assert.equal(ordinary.ok.answer, "ops");
+                            answers.push([rebuilt.raw, answered.raw, ordinary.raw]);
+                            const row = { host, setting, sample, request_id: id, rebuild_id: rebuildId, rebuild_before, before, after, rebuild_psi: psiDelta(rebuild_before, before), psi: psiDelta(before, after), wall_ms, rebuild_wall_ms,
+                                ordinary_module_ms: ordinary.module_ms, ordinary_wall_ms, ordinary_before, ordinary_after, ordinary_psi: psiDelta(ordinary_before, ordinary_after)};
                             rows.push(row);
                             console.log(`PREPARATION_TIMING_SAMPLE=${JSON.stringify(row)}`);
                         } finally {
@@ -149,6 +180,7 @@ export async function preparationTiming(samples = 100, diagnostic?: { driver: Dr
         const values = complete.filter(row => row.host === host && row.setting === setting);
         return { host, setting, samples: values.length, consumed: values.filter(row => row.consumed).length,
             module_p50_ms: percentile(values.map(row => row.module_ms), .5), module_p99_ms: percentile(values.map(row => row.module_ms), .99),
+            ordinary_module_p50_ms: percentile(values.map(row => row.ordinary_module_ms), .5), ordinary_module_p99_ms: percentile(values.map(row => row.ordinary_module_ms), .99),
             wall_p50_ms: percentile(values.map(row => row.wall_ms), .5), wall_p99_ms: percentile(values.map(row => row.wall_ms), .99),
             rebuild_module_p50_ms: percentile(values.map(row => row.rebuild_module_ms), .5), rebuild_module_p99_ms: percentile(values.map(row => row.rebuild_module_ms), .99),
             preparation_p50_ms: percentile(values.map(row => row.preparation_ms), .5), preparation_p99_ms: percentile(values.map(row => row.preparation_ms), .99),
@@ -162,7 +194,8 @@ export async function preparationTiming(samples = 100, diagnostic?: { driver: Dr
             over_product_fence: values.filter(row => row.over_product_fence).length };
     }));
     assert.ok(lanes.filter(lane => lane.setting).every(lane => lane.consumed > 0), "timing must reach real consumption, not only cold fallback");
-    const result = { schema: 2, samples: complete, full_samples: fullRows, lanes, base_messages: 17_000, cpu_request: "linux,4c", work, bun: Bun.version,
+    const result = { schema: 2, samples: complete, full_samples: fullRows, lanes, fixture_shapes: fixtureShapes, realistic,
+        base_messages: 17_000, cpu_request: "linux,4c", work, bun: Bun.version,
         setting: "rust_provider_preparation=false/true via real request control; same pre-rebuild snapshot", product_hook_fence_ms: 1500,
         measurement_kind: "synthetic_real_handler_first_post_rebuild", quantile: "nearest-rank; report misses, do not exclude them" };
     console.log(`PREPARATION_TIMING_RESULT=${JSON.stringify(result)}`);
@@ -171,7 +204,7 @@ export async function preparationTiming(samples = 100, diagnostic?: { driver: Dr
 if (import.meta.main) {
     const samples = Number(Bun.argv[2] ?? 100);
     const result = Bun.argv.includes("--profile")
-        ? await postRebuildProfile((driver, output, stores) => preparationTiming(samples, {driver, output, stores}))
-        : await preparationTiming(samples);
+        ? await postRebuildProfile((driver, output, stores) => preparationTiming(samples, {driver, output, stores}, Bun.argv.includes("--realistic")))
+        : await preparationTiming(samples, undefined, Bun.argv.includes("--realistic"));
     if (process.env.MC_TIMING_RESULT_OUT) writeFileSync(process.env.MC_TIMING_RESULT_OUT, JSON.stringify(result, null, 2) + "\n");
 }

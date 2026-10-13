@@ -106,7 +106,7 @@ fn provider_pipeline_driver() {
                 json!({"armed":true})
             } else if op == "create" {
                 let config = McModuleConfig {
-                    inject_docs: false, memory_enabled: false, temporal_awareness: false,
+                    inject_docs: false, memory_enabled: cmd["memory_enabled"] == true, temporal_awareness: false,
                     protected_tokens_user: Some(0), protected_tools: if cmd["protect_bash"] == true {BTreeMap::from([("bash".into(),2)])} else {BTreeMap::new()},
                     execute_threshold_percentage: 90.0, cache_ttl: "never".into(),
                     ..default_test_config()
@@ -151,6 +151,33 @@ fn provider_pipeline_driver() {
                         },
                         "delete" => { rig.store.replace_compartments(namespace, &[]).unwrap(); },
                         "flush" => { rig.store.arm_soft_refresh(namespace).unwrap(); },
+                        "realistic_seed" => {
+                            let covered = cmd["covered"].as_i64().unwrap();
+                            let count = cmd["compartments"].as_i64().unwrap();
+                            let rows = (0..count).map(|i| {
+                                let start = i * covered / count + 1;
+                                let end = (i + 1) * covered / count;
+                                StoredCompartment { sequence: i + 1, start_message: start, end_message: end,
+                                    end_message_id: format!("synthetic-{}#0", end - 1),
+                                    title: format!("Fixture compartment {i}"),
+                                    content: format!("Completed investigation {i}: preserve the exact compartment ordering."),
+                                    p1: Some(format!("Investigation {i} complete.")), importance: 50,
+                                    ..Default::default() }
+                            }).collect::<Vec<_>>();
+                            rig.store.replace_compartments(namespace, &rows).unwrap();
+                            for i in 1..=cmd["memories"].as_i64().unwrap() {
+                                rig.store.seed_memory(i, rig.binding.project_root.to_str().unwrap(), "project",
+                                    &format!("Fixture memory {i}: independently preserve memory ordering."), 50).unwrap();
+                            }
+                        },
+                        "realistic_delta" => {
+                            let mut rows = rig.store.load_compartments(namespace).unwrap();
+                            let sample = cmd["sample"].as_u64().unwrap();
+                            let at = sample as usize % rows.len();
+                            rows[at].content.push_str(&format!(" Delta {sample}."));
+                            if let Some(p1) = &mut rows[at].p1 { p1.push_str(&format!(" Delta {sample}.")); }
+                            rig.store.replace_compartments(namespace, &rows).unwrap();
+                        },
                         "historian_start" | "historian_idle" => {
                             let mut loaded = rig.store.load(namespace).unwrap();
                             loaded.meta.historian.state = if cmd["event"] == "historian_start" {
@@ -178,7 +205,8 @@ fn provider_pipeline_driver() {
                     json!({"pending":rig.store.load_pending_agent_drops("session").unwrap().into_iter().map(|d|d.target_id).collect::<Vec<_>>(),"queue":queued,"version":state.core.version,
                         "model":state.meta.last_model_key,"floor":state.meta.protected_tokens_effective,
                         "coverage":state.meta.coverage_ordinal,"protected_tools":state.meta.protected_tool_block_ids,
-                        "units":state.core.frozen_units})
+                        "units":state.core.frozen_units,"boundary_id":state.core.boundary_id,
+                        "compartment_count":rig.store.load_compartments("session").unwrap().len()})
                 } else if op == "restart" {
                     let mut h = McHandler::with_producer_factory_config_resolver(
                         Arc::new(TestProducerFactory {state: Arc::new(ProducerState::default())}),
@@ -537,16 +565,17 @@ function prefix(before: string[], after: string[]) {
 }
 
 let serial = 0;
-export async function fixture(driver: Driver, host: Host, directory?: string, protectBash = false) {
+export async function fixture(driver: Driver, host: Host, directory?: string, protectBash = false, memoryEnabled = false) {
     const rig = `${host}-${++serial}`;
     const harness = host === "OpenCode1" ? "opencode" : "opencode2";
-    await driver.send({ op: "create", rig, harness, directory, protect_bash: protectBash });
+    await driver.send({ op: "create", rig, harness, directory, protect_bash: protectBash, memory_enabled: memoryEnabled });
     const oracleRig = `${rig}-full`;
     await driver.send({
         op: "create",
         rig: oracleRig,
         harness,
         protect_bash: protectBash,
+        memory_enabled: memoryEnabled,
         directory: directory ? join(directory, "oracle") : undefined,
     });
     driver.proveIsolation();

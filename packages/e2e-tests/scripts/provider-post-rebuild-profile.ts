@@ -94,6 +94,16 @@ pub fn diagnostic_field(name: &str, value: usize) {
         if let Some(profile) = profile.borrow_mut().as_mut() { *profile.fields.entry(name.into()).or_default() += value; }
     });
 }
+pub fn diagnostic_timings(prefix: &str, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => for (name, value) in fields {
+            diagnostic_timings(&format!("{prefix}_{name}"), value);
+        },
+        serde_json::Value::Number(number) if number.is_f64() => diagnostic_record(prefix, number.as_f64().unwrap()),
+        serde_json::Value::Number(number) if number.is_u64() => diagnostic_field(prefix, number.as_u64().unwrap() as usize),
+        _ => {},
+    }
+}
 pub fn diagnostic_measure<T>(name: &str, action: impl FnOnce() -> T) -> T {
     let start = std::time::Instant::now();
     let value = action();
@@ -234,7 +244,7 @@ impl Drop for DiagnosticProfileGuard {
 		'    mc_store::provider_meters::diagnostic_record("rebuild_prepare_drops", diagnostic_drops.elapsed().as_secs_f64()*1000.0);\n    mc_store::provider_meters::diagnostic_record("rebuild_preparation_total", diagnostic_prepare.elapsed().as_secs_f64()*1000.0);\n    let prepare_ms = started.elapsed().as_secs_f64() * 1000.0 - replay_ms;',
 	);
 	patch(compact, "    let engine_ms = engine_started.elapsed().as_secs_f64() * 1000.0;",
-		'    let engine_ms = engine_started.elapsed().as_secs_f64() * 1000.0;\n    mc_store::provider_meters::diagnostic_record("engine", engine_ms);');
+		'    let engine_ms = engine_started.elapsed().as_secs_f64() * 1000.0;\n    mc_store::provider_meters::diagnostic_record("engine", engine_ms);\n    if let Some(timings) = &output.engine.response.timings { mc_store::provider_meters::diagnostic_timings("engine", &serde_json::to_value(timings).unwrap()); }');
 	patch(compact, "        let wire = Codec::OpencodeAiSdk.encode_view(\n            &engine,\n            &template,\n            &super::codec_opencode::NativeRenderContext::from(&output.engine),\n        )?;",
 		'        let wire = mc_store::provider_meters::diagnostic_measure("view_build", || Codec::OpencodeAiSdk.encode_view(\n            &engine,\n            &template,\n            &super::codec_opencode::NativeRenderContext::from(&output.engine),\n        ))?;');
 	patch(compact, '                    save_host_view(store, &work.key, &view, "produced")?;',
