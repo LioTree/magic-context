@@ -46,6 +46,12 @@ export function stripPiProcessedImages(args: {
 	messageIdToMaxTag: ReadonlyMap<string, number>;
 	stableId: (message: unknown, index: number) => string | undefined;
 	addIds?: typeof addProcessedImageStrippedIds;
+	/** Check the first image coordinate before persisting or replacing any part. */
+	admitFirstApplication?: (
+		message: unknown,
+		messageIndex: number,
+		partIndex: number,
+	) => boolean;
 	onFirstApplication?: (
 		message: unknown,
 		messageIndex: number,
@@ -76,7 +82,17 @@ export function stripPiProcessedImages(args: {
 			const id = args.stableId(raw, i);
 			if (!id || frozenIds.has(id)) continue;
 			const maxTag = args.messageIdToMaxTag.get(id) ?? 0;
-			if (maxTag <= args.watermark) newlyStrippedIds.push(id);
+			if (maxTag > args.watermark) continue;
+			if (
+				args.admitFirstApplication?.(
+					raw,
+					i,
+					message.content.findIndex(isLargeImagePart),
+				) === false
+			) {
+				continue;
+			}
+			newlyStrippedIds.push(id);
 		}
 	}
 

@@ -1035,6 +1035,8 @@ export function stripProcessedImages(
         messageTagNumbers: Map<MessageLike, number>;
         /** Commit new replay IDs before changing bytes; false leaves new images intact. */
         persistNewIds?: (ids: readonly string[]) => boolean;
+        /** Admit the first image coordinate before changing bytes or freezing the message id. */
+        admitFirstApplication?: (message: MessageLike, partIndex: number) => boolean;
         /** Reports only first strips, never restoring an already frozen image. */
         onFirstApplication?: (message: MessageLike, partIndex: number) => void;
     },
@@ -1081,6 +1083,13 @@ export function stripProcessedImages(
                 part.url.startsWith("data:") &&
                 part.url.length > 200
             ) {
+                if (
+                    isNewDetection &&
+                    !touchedThisMsg &&
+                    options.admitFirstApplication?.(msg, j) === false
+                ) {
+                    break;
+                }
                 planned.push({ message: msg, partIndex: j, firstApplication: isNewDetection });
                 touchedThisMsg = true;
             }

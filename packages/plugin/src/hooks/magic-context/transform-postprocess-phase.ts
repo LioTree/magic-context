@@ -3397,13 +3397,29 @@ export async function runPostTransformPhase(
         try {
             const tImg = performance.now();
             const frozenImageIds = replaySnapshot.processedImageStrippedIds;
+            const heldImageCoords: string[] = [];
             stripProcessedImages(args.messages, frozenImageIds, {
-                detect: canEditWholePrefix && args.watermark > 0,
+                detect:
+                    (holdEnabled ? isCacheBustingPass : canEditWholePrefix) && args.watermark > 0,
                 watermark: args.watermark,
                 messageTagNumbers: args.messageTagNumbers,
                 persistNewIds: (ids) => addProcessedImageStrippedIds(args.db, args.sessionId, ids),
+                admitFirstApplication: holdEnabled
+                    ? (message, block) => {
+                          if (editAdmission.admit({ kind: "message", id: message.info.id, block }))
+                              return true;
+                          heldImageCoords.push(`${message.info.id ?? "<no id>"}:${block}`);
+                          return false;
+                      }
+                    : undefined,
                 onFirstApplication: recordFirstApplicationAt,
             });
+            if (heldImageCoords.length > 0 && editAdmission.frame.kind === "boundary") {
+                sessionLog(
+                    args.sessionId,
+                    `edit admission: held lane=processed_image coords=${heldImageCoords.join(",")} boundary=${editAdmission.frame.messageId ?? "<unresolved>"} held_edits=${heldImageCoords.length}`,
+                );
+            }
             logTransformTiming(args.sessionId, "stripProcessedImages", tImg);
         } catch (error) {
             failPass("image-strip-exception", error);

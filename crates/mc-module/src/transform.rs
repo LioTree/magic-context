@@ -15868,6 +15868,12 @@ fn new_frozen_strip_units(
         {
             let marker = strip_unit("processed_image", &message.mid, &sentinel);
             if !existing_keys.contains(marker.key.as_str()) {
+                let first = blocks.iter().position(image_block_is_large).unwrap();
+                let target = ck_wire::block_id(&message.mid, first);
+                if !admit_block_id(admission, &target) {
+                    held_blocks.push(format!("processed_image:{target}"));
+                    continue;
+                }
                 units.insert(marker.key.clone(), marker);
             }
             for (block_index, block) in blocks.iter().enumerate() {
@@ -15897,7 +15903,7 @@ fn new_frozen_strip_units(
             held_whole_messages = ?held_whole,
             held_blocks = ?held_blocks,
             held_edits = held_whole.len() + held_blocks.len(),
-            "mc-module: held placeholder, system-injected and stale-reduce strips before kept current-turn thinking"
+            "mc-module: held placeholder, system-injected, stale-reduce and processed-image strips before kept current-turn thinking"
         );
     }
     units.into_values().collect()
@@ -32621,6 +32627,7 @@ pub(crate) mod tests {
     include!("transform/reasoning_clear_tests.rs");
     include!("transform/reasoning_clear_gate_tests.rs");
     include!("transform/stale_reduce_tests.rs");
+    include!("transform/image_admission_tests.rs");
     include!("tests/signed_prefix_hold.rs");
     include!("tests/signed_prefix_hold_review.rs");
     include!("tests/signed_prefix_hold_review_r2.rs");

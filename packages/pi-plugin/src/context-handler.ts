@@ -9733,16 +9733,35 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.canUseEmptySentinels) {
 		const tProcessedImages = performance.now();
 		try {
+			const heldImageCoords: string[] = [];
 			const imageResult = stripPiProcessedImages({
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
-				detect: isCacheBustingPass && !protectedSignedPrefix,
+				detect: isCacheBustingPass && (holdEnabled || !protectedSignedPrefix),
 				watermark: getMaxDroppedTagNumber(args.db, args.sessionId),
 				messageIdToMaxTag,
 				stableId: stableIdResolver,
+				admitFirstApplication: holdEnabled
+					? (message, index, block) => {
+							const id = stableIdResolver(message, index);
+							if (editAdmission.admit({ kind: "message", id, block }))
+								return true;
+							heldImageCoords.push(`${id ?? "<no id>"}:${block}`);
+							return false;
+						}
+					: undefined,
 				onFirstApplication: recordFirstApplicationAt,
 			});
+			if (
+				heldImageCoords.length > 0 &&
+				editAdmission.frame.kind === "boundary"
+			) {
+				sessionLog(
+					args.sessionId,
+					`edit admission: held lane=processed_image coords=${heldImageCoords.join(",")} boundary=${editAdmission.frame.messageId ?? "<unresolved>"} held_edits=${heldImageCoords.length}`,
+				);
+			}
 			if (imageResult.newlyStrippedIds.length > 0) {
 				droppedCount += imageResult.stripped;
 			}

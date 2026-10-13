@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { getProcessedImageStrippedIds } from "@magic-context/core/features/magic-context/storage";
+import {
+	createEditAdmission,
+	isAdmissionUser,
+	thinkingAnchor,
+} from "@magic-context/core/hooks/magic-context/edit-admission";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import { assistantMessage, createTestDb } from "./test-utils.test";
@@ -31,6 +36,85 @@ function idByTimestamp(message: unknown): string | undefined {
 }
 
 describe("stripPiProcessedImages", () => {
+	it("admits only tail images before persistence and replays held bytes until a later permitted bust", () => {
+		const db = createTestDb();
+		try {
+			const raw = [
+				imageMessage("user", 1),
+				{
+					...assistantMessage("kept", 2),
+					content: [
+						{ type: "thinking", thinking: "kept", signature: "signed" },
+					],
+				},
+				imageMessage("toolResult", 3),
+				assistantMessage("processed", 4),
+			];
+			raw[0].content.push({
+				type: "image",
+				data: IMAGE_DATA,
+				mimeType: "image/png",
+			});
+			const applied: string[] = [];
+			const pass = (detect: boolean) => {
+				const messages = structuredClone(raw);
+				const admission = createEditAdmission({
+					messages,
+					stableId: idByTimestamp,
+					partsOf: (m) => m.content,
+					isRealUser: isAdmissionUser,
+					prefixBound: true,
+					isRetainedThinking: (_m, p) =>
+						(p as { type?: string }).type === "thinking",
+					anchorOf: thinkingAnchor,
+				});
+				const coords: string[] = [];
+				const result = stripPiProcessedImages({
+					db,
+					sessionId: "ses-admission",
+					messages,
+					detect,
+					watermark: 5,
+					messageIdToMaxTag: new Map(),
+					stableId: idByTimestamp,
+					admitFirstApplication: (m, _index, block) => {
+						const id = idByTimestamp(m);
+						coords.push(`${id}:${block}`);
+						return admission.admit({ kind: "message", id, block });
+					},
+					onFirstApplication: (m, _index, block) => {
+						applied.push(`${idByTimestamp(m)}:${block}`);
+					},
+				});
+				return { messages, result, coords };
+			};
+			const held = pass(true);
+			expect(held.coords).toEqual(["entry-3:1", "entry-1:1"]);
+			expect(held.result).toEqual({
+				stripped: 1,
+				newlyStrippedIds: ["entry-3"],
+			});
+			expect(held.messages[0]).toEqual(raw[0]);
+			expect(pass(false).messages).toEqual(held.messages);
+			expect([...getProcessedImageStrippedIds(db, "ses-admission")]).toEqual([
+				"entry-3",
+			]);
+			expect(applied).toEqual(["entry-3:1"]);
+			expect(pass(false).coords).toEqual([]);
+			expect(pass(true).messages).toEqual(held.messages);
+			raw.push({
+				role: "user",
+				timestamp: 5,
+				content: [{ type: "text", text: "next task" }],
+			});
+			expect(pass(false).result.newlyStrippedIds).toEqual([]);
+			const release = pass(true);
+			expect(release.result.newlyStrippedIds).toEqual(["entry-1"]);
+			expect(pass(false).messages).toEqual(release.messages);
+		} finally {
+			closeQuietly(db);
+		}
+	});
 	it("freezes old processed user/tool-result images and replays identical bytes on defer", () => {
 		const db = createTestDb();
 		try {
