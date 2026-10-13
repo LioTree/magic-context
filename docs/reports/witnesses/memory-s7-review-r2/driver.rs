@@ -133,6 +133,16 @@ async fn s7_r2_default_fence_survives_reopen_and_releases_once() {
 
 #[tokio::test]
 async fn s7_r2_late_typed_error_must_not_abandon_fresh_attempt() {
+    #[derive(Clone)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Capture(logs.clone());
+    let _trace = tracing::subscriber::set_default(tracing_subscriber::fmt().with_ansi(false)
+        .with_writer(move || writer.clone()).finish());
     let dir = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(s7_store(dir.path(), false));
     let chunk = historian_chunk();
@@ -174,4 +184,32 @@ async fn s7_r2_late_typed_error_must_not_abandon_fresh_attempt() {
     assert_eq!(current.firing_seq, 2);
     assert_eq!(current.state, HistorianPhase::AwaitingProducer, "late error from attempt 1 abandoned attempt 2");
     assert_eq!(current.producer_run_id.as_deref(), Some("fresh-run"));
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(logs.matches("discarded stale historian observation").count(), 1);
+    assert!(logs.contains("late_error"));
+}
+
+#[tokio::test]
+async fn s7_r2_enabled_rust_writes_turn_one_stage() {
+    let _lane = crate::historian_stage::enabled_test_lane();
+    let dir = tempfile::tempdir().unwrap();
+    let store = s7_store(dir.path(), false);
+    let chunk = historian_chunk();
+    let prior = prior_ranges();
+    let models = vec!["test/first".into()];
+    let mut request = fire_request(&store, "enabled stage fixture", &models, &chunk, &prior);
+    request.validate_options.memory_enabled = false;
+    let mut producer = ScriptedProducer::default().with_start(Ok(run_handle("enabled-run")))
+        .with_output(Ok(producer_output(s7_xml("enabled stage fixture", false))));
+    run_historian_firing(&mut producer, request).await.unwrap();
+    assert_eq!(s7_counts(&store), vec![1,1,1,0,0,0]);
+    store.with_context_conn_for_test(|conn| {
+        let stage: (String,String,i64,String) = conn.query_row(
+            "SELECT stage,state,run_attempt,request_json FROM memory_stage_attempts", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        assert_eq!((&*stage.0,&*stage.1,stage.2), ("turn_one","committed",1));
+        let request: serde_json::Value = serde_json::from_str(&stage.3).unwrap();
+        assert_eq!(request["prompt"], "enabled stage fixture");
+        Ok(())
+    }).unwrap();
 }

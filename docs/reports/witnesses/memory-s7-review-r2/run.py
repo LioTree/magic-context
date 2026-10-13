@@ -88,12 +88,16 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory(prefix="mc-s7-r2-", dir=os.environ.get("TMPDIR")) as tmp:
             dest = snapshot(Path(tmp), "head")
             result = original.cargo(dest, "mc-module", "s7_r2", True, "r2-witnesses")
-            failed = set(re.findall(r"^    (historian::tests::s7_r2_\S+)$", result.stdout, re.M))
-            expected = {"historian::tests::s7_r2_late_typed_error_must_not_abandon_fresh_attempt"}
-            assert result.returncode == 101 and failed == expected
-            assert "late error from attempt 1 abandoned attempt 2" in result.stdout
-            assert "2 passed; 1 failed" in result.stdout
-            print("S7_R2_EXPECTED_RED late_typed_error; other 2 independent witnesses passed")
+            expected = {
+                "historian::tests::s7_r2_dormant_rust_all_tables",
+                "historian::tests::s7_r2_default_fence_survives_reopen_and_releases_once",
+                "historian::tests::s7_r2_late_typed_error_must_not_abandon_fresh_attempt",
+                "historian::tests::s7_r2_enabled_rust_writes_turn_one_stage",
+            }
+            seen = set(re.findall(r"^test (historian::tests::s7_r2_\S+) \.\.\.", result.stdout, re.M))
+            summary = re.search(r"test result: ok\. (\d+) passed; 0 failed; 0 ignored", result.stdout)
+            assert result.returncode == 0 and seen == expected and summary is not None and int(summary.group(1)) == len(expected), (result.returncode, seen, expected)
+            print(f"S7_R2_WITNESSES_GREEN {len(expected)} named witnesses passed")
     else:
         original.main()
         if len(sys.argv) > 1 and sys.argv[1] == "differential":

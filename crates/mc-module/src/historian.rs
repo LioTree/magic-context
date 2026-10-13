@@ -751,7 +751,7 @@ pub fn persist_historian_state(
     session_id: &str,
     next_state: HistorianDurableState,
 ) -> Result<u64, HistorianStateError> {
-    persist_historian_state_inner(store, session_id, next_state, 0)
+    persist_historian_state_inner(store, session_id, next_state, 0, None)
 }
 
 // Report transitions may race metadata syncs or no-fire audit observations.
@@ -761,9 +761,77 @@ pub fn persist_historian_state(
 fn persist_historian_report_state(
     store: &McStore,
     session_id: &str,
+    previous: &HistorianDurableState,
     next_state: HistorianDurableState,
 ) -> Result<u64, HistorianStateError> {
-    persist_historian_state_inner(store, session_id, next_state, 2)
+    persist_historian_state_inner(
+        store,
+        session_id,
+        next_state,
+        2,
+        Some((previous, "late_reply")),
+    )
+}
+
+fn persist_historian_error_state(
+    store: &McStore,
+    session_id: &str,
+    previous: &HistorianDurableState,
+    next_state: HistorianDurableState,
+) -> Result<u64, HistorianStateError> {
+    persist_historian_state_inner(
+        store,
+        session_id,
+        next_state,
+        2,
+        Some((previous, "late_error")),
+    )
+}
+
+/// An awaited reply or error belongs to the firing/claim that requested it.
+/// Compare its phase, firing sequence, claim attempt, child and producer handle
+/// before using it; a delayed failure must never release a replacement's slot.
+fn check_attempt_identity(
+    session_id: &str,
+    previous: &HistorianDurableState,
+    current: &HistorianDurableState,
+    event: &'static str,
+) -> Result<(), HistorianStateError> {
+    if current.state != previous.state
+        || current.firing_seq != previous.firing_seq
+        || current.producer_attempt != previous.producer_attempt
+        || current.producer_session_id != previous.producer_session_id
+        || current.producer_run_id != previous.producer_run_id
+    {
+        tracing::warn!(
+            session_id,
+            event,
+            expected_firing_seq = previous.firing_seq,
+            current_firing_seq = current.firing_seq,
+            expected_attempt = previous.producer_attempt,
+            current_attempt = current.producer_attempt,
+            "discarded stale historian observation"
+        );
+        return Err(HistorianStateError::InvalidTransition {
+            from: current.state.clone(),
+            event,
+        });
+    }
+    Ok(())
+}
+
+fn check_current_attempt(
+    store: &McStore,
+    session_id: &str,
+    previous: &HistorianDurableState,
+    event: &'static str,
+) -> Result<(), HistorianStateError> {
+    check_attempt_identity(
+        session_id,
+        previous,
+        &store.load_meta(session_id)?.meta.historian,
+        event,
+    )
 }
 
 #[cfg(test)]
@@ -780,21 +848,13 @@ fn persist_historian_state_inner(
     session_id: &str,
     mut next_state: HistorianDurableState,
     mut metadata_retries: usize,
+    owner: Option<(&HistorianDurableState, &'static str)>,
 ) -> Result<u64, HistorianStateError> {
     let preserve_report_audit = metadata_retries > 0;
     let mut loaded = store.load_meta(session_id)?;
     loop {
-        if preserve_report_audit
-            && (loaded.meta.historian.state == HistorianPhase::Idle
-                || loaded.meta.historian.firing_seq != next_state.firing_seq
-                || (next_state.state != HistorianPhase::Idle
-                    && (loaded.meta.historian.producer_run_id != next_state.producer_run_id
-                        || loaded.meta.historian.producer_attempt != next_state.producer_attempt)))
-        {
-            return Err(HistorianStateError::InvalidTransition {
-                from: loaded.meta.historian.state.clone(),
-                event: "late_report",
-            });
+        if let Some((previous, event)) = owner {
+            check_attempt_identity(session_id, previous, &loaded.meta.historian, event)?;
         }
         if preserve_report_audit {
             next_state.recent_decisions = loaded.meta.historian.recent_decisions.clone();
@@ -827,6 +887,13 @@ fn persist_historian_state_inner(
             }
             Err(error @ McStoreError::CasConflict { .. }) if metadata_retries > 0 => {
                 let fresh = store.load_meta(session_id)?;
+                if let Some((previous, event)) = owner {
+                    if check_attempt_identity(session_id, previous, &fresh.meta.historian, event)
+                        .is_err()
+                    {
+                        return Err(error.into());
+                    }
+                }
                 let mut expected = loaded.meta.historian.clone();
                 // Recovery preparation can record a no-fire observation after
                 // adoption starts. Only these audit fields may change while
@@ -2318,6 +2385,19 @@ where
                 )
                 .await
         };
+        if let Err(error) = check_current_attempt(
+            request.store,
+            request.session_id,
+            &fired,
+            if started.is_err() {
+                "late_error"
+            } else {
+                "late_reply"
+            },
+        ) {
+            producer.close().await;
+            return Err(error.into());
+        }
         let mut handle = match started {
             Ok(handle) => {
                 if let Some(cache) = runner_refusal_cache {
@@ -2364,9 +2444,10 @@ where
                     } else {
                         None
                     };
-                    persist_historian_state(
+                    persist_historian_error_state(
                         request.store,
                         request.session_id,
+                        &fired,
                         abandon_runner_refusal(
                             &fired,
                             runner_refusal_detail(&runner_refusal_failures, exhausted),
@@ -2413,9 +2494,10 @@ where
                         decision.failure_backoff_at_ms = reset;
                     }
                 }
-                persist_historian_state(
+                persist_historian_error_state(
                     request.store,
                     request.session_id,
+                    &fired,
                     abandon_chain_failure(
                         &fired,
                         &err,
@@ -2438,7 +2520,12 @@ where
 
         let awaiting =
             producer_started(&fired, producer_session_id.clone(), handle.run_id.clone())?;
-        persist_historian_state(request.store, request.session_id, awaiting.clone())?;
+        persist_historian_report_state(
+            request.store,
+            request.session_id,
+            &fired,
+            awaiting.clone(),
+        )?;
         let awaiting = if crate::historian_recovery::is_unknown_handle(&awaiting) {
             let reserved = crate::historian_recovery::reserve_probe(
                 request.store,
@@ -2454,7 +2541,7 @@ where
             awaiting
         };
 
-        let output = match producer
+        let observed_output = producer
             .await_output_with_timeout(
                 &handle.run_id,
                 crate::historian_recovery::probe_wait_budget(
@@ -2463,8 +2550,21 @@ where
                     request.await_timeout,
                 ),
             )
-            .await
-        {
+            .await;
+        if let Err(error) = check_current_attempt(
+            request.store,
+            request.session_id,
+            &awaiting,
+            if observed_output.is_err() {
+                "late_error"
+            } else {
+                "late_reply"
+            },
+        ) {
+            producer.close().await;
+            return Err(error.into());
+        }
+        let output = match observed_output {
             Ok(output) => output,
             Err(HistorianProducerError::TimedOut)
                 if crate::historian_producer::is_stage_submission(&handle.run_id) =>
@@ -2496,7 +2596,21 @@ where
                 // the await gave up. If the re-drain reports the run's own terminal
                 // failure (a classified error, an abort, or a context overflow), that
                 // outcome decides the chain instead, so abort and overflow still stop it.
-                match producer.redrain_output(&handle.run_id).await {
+                let observed_redrain = producer.redrain_output(&handle.run_id).await;
+                if let Err(error) = check_current_attempt(
+                    request.store,
+                    request.session_id,
+                    &awaiting,
+                    if observed_redrain.is_err() {
+                        "late_error"
+                    } else {
+                        "late_reply"
+                    },
+                ) {
+                    producer.close().await;
+                    return Err(error.into());
+                }
+                match observed_redrain {
                     Ok(output) => output,
                     Err(recovery_err) => {
                         let _ = producer.cancel(&handle.run_id).await;
@@ -2539,9 +2653,10 @@ where
                                 decision.failure_backoff_at_ms = reset;
                             }
                         }
-                        persist_historian_state(
+                        persist_historian_error_state(
                             request.store,
                             request.session_id,
+                            &awaiting,
                             abandon_chain_failure(
                                 &awaiting,
                                 deciding_err,
@@ -2619,9 +2734,10 @@ where
                         decision.failure_backoff_at_ms = reset;
                     }
                 }
-                persist_historian_state(
+                persist_historian_error_state(
                     request.store,
                     request.session_id,
+                    &awaiting,
                     abandon_chain_failure(
                         &awaiting,
                         &err,
@@ -3179,23 +3295,47 @@ where
         });
     };
 
+    let mut awaiting = request.store.load_meta(request.session_id)?.meta.historian;
+    let expected = HistorianDurableState {
+        state: HistorianPhase::AwaitingProducer,
+        firing_seq,
+        producer_session_id: Some(producer_session_id.clone()),
+        producer_run_id: Some(producer_run_id.clone()),
+        producer_attempt: initial.producer_attempt,
+        ..awaiting.clone()
+    };
+    check_attempt_identity(request.session_id, &expected, &awaiting, "late_error")?;
     if crate::historian_producer::is_stage_submission(&producer_run_id) {
-        let current = request.store.load_meta(request.session_id)?.meta.historian;
         let now = request.now_ms;
         let backoff =
             completion_failure_backoff_at_ms(request.now_ms, request.failure_backoff_at_ms, now);
         let reserved = crate::historian_recovery::reserve_probe(
             request.store,
             request.session_id,
-            &current,
+            &awaiting,
             now,
             request.await_timeout,
             backoff,
         )?;
-        producer_run_id = reserved.producer_run_id.unwrap();
+        producer_run_id = reserved.producer_run_id.clone().unwrap();
+        awaiting = reserved;
     }
     producer.bind_session(&producer_session_id).await?;
-    let state = match producer.status(&producer_run_id).await {
+    let observed_status = producer.status(&producer_run_id).await;
+    if let Err(error) = check_current_attempt(
+        request.store,
+        request.session_id,
+        &awaiting,
+        if observed_status.is_err() {
+            "late_error"
+        } else {
+            "late_reply"
+        },
+    ) {
+        producer.close().await;
+        return Err(error.into());
+    }
+    let state = match observed_status {
         Ok(state) => state,
         Err(error) if crate::historian_producer::is_stage_submission(&producer_run_id) => {
             let now = (request.completion_now_ms)().max(request.now_ms);
@@ -3204,11 +3344,10 @@ where
                 request.failure_backoff_at_ms,
                 now,
             );
-            let current = request.store.load_meta(request.session_id)?.meta.historian;
             let resolution = crate::historian_recovery::probe_failed(
                 request.store,
                 request.session_id,
-                &current,
+                &awaiting,
                 now,
                 backoff,
             );
@@ -3222,8 +3361,14 @@ where
                 request.failure_backoff_at_ms,
                 (request.completion_now_ms)(),
             );
-            abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
+            let resolution = persist_historian_error_state(
+                request.store,
+                request.session_id,
+                &awaiting,
+                abandon(&awaiting, failure_backoff_at_ms),
+            );
             producer.close().await;
+            resolution?;
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
     };
@@ -3236,15 +3381,19 @@ where
                 request.failure_backoff_at_ms,
                 (request.completion_now_ms)(),
             );
-            abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
+            let resolution = persist_historian_error_state(
+                request.store,
+                request.session_id,
+                &awaiting,
+                abandon(&awaiting, failure_backoff_at_ms),
+            );
             producer.close().await;
+            resolution?;
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
     }
 
-    let loaded = request.store.load_meta(request.session_id)?;
-    let awaiting = loaded.meta.historian.clone();
-    let output = match producer
+    let observed_output = producer
         .await_output_with_timeout(
             &producer_run_id,
             crate::historian_recovery::probe_wait_budget(
@@ -3253,8 +3402,21 @@ where
                 request.await_timeout,
             ),
         )
-        .await
-    {
+        .await;
+    if let Err(error) = check_current_attempt(
+        request.store,
+        request.session_id,
+        &awaiting,
+        if observed_output.is_err() {
+            "late_error"
+        } else {
+            "late_reply"
+        },
+    ) {
+        producer.close().await;
+        return Err(error.into());
+    }
+    let output = match observed_output {
         Ok(output) => output,
         Err(err)
             if crate::historian_producer::is_stage_submission(&producer_run_id)
@@ -3308,16 +3470,21 @@ where
                             failure_backoff_at_ms
                         }
                     });
-            abandon_current_state_with_detail(
+            let resolution = persist_historian_error_state(
                 request.store,
                 request.session_id,
-                backoff_at_ms,
-                Some(prefixed_detail(
-                    detail_prefix,
-                    format!("producer reattach output ({producer_run_id}): {err:?}"),
-                )),
-            )?;
+                &awaiting,
+                abandon_with_detail(
+                    &awaiting,
+                    backoff_at_ms,
+                    Some(prefixed_detail(
+                        detail_prefix,
+                        format!("producer reattach output ({producer_run_id}): {err:?}"),
+                    )),
+                ),
+            );
             producer.close().await;
+            resolution?;
             return Err(HistorianDriveError::Producer(err));
         }
     };
@@ -3414,7 +3581,7 @@ fn publish_output_from_awaiting(
         "historian response received"
     );
     let validating = output_received(&awaiting, &output.text)?;
-    persist_historian_report_state(store, session_id, validating.clone())?;
+    persist_historian_report_state(store, session_id, &awaiting, validating.clone())?;
 
     let validation_result = if output.length_capped {
         Err(HistorianValidationError {
@@ -3445,6 +3612,7 @@ fn publish_output_from_awaiting(
             persist_historian_report_state(
                 store,
                 session_id,
+                &validating,
                 abandon_with_detail(
                     &validating,
                     failure_backoff_at_ms,
@@ -3457,7 +3625,7 @@ fn publish_output_from_awaiting(
 
     let publishing = validation_ok(&validating)?;
     let publishing_row_version =
-        persist_historian_report_state(store, session_id, publishing.clone())?;
+        persist_historian_report_state(store, session_id, &validating, publishing.clone())?;
     let predicate = publish_predicate(&publishing)?;
     // Commit-point freshness checks live INSIDE publish_validated_chunk, which abandons
     // the matching firing before returning a rejection. A separate pre-check could return
@@ -3489,14 +3657,6 @@ fn publish_output_from_awaiting(
         },
     )?;
     Ok(published.row_version)
-}
-
-fn abandon_current_state(
-    store: &McStore,
-    session_id: &str,
-    failure_backoff_at_ms: i64,
-) -> Result<(), HistorianStateError> {
-    abandon_current_state_with_detail(store, session_id, failure_backoff_at_ms, None)
 }
 
 fn abandon_current_state_with_detail(

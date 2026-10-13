@@ -392,3 +392,59 @@ blocks and reproduction instructions; unclear runner/generator/interleaving
 references were clarified. Binary snapshots and comment-free JSON were not part
 of that comment review. Full-workspace lint/build and optional provider-dependent
 tests are intentionally not substituted for these focused report-only gates.
+
+## Accepted round-two follow-up
+
+The round-two report and witnesses were cherry-picked from
+`cb42e8be93593da6083e5163b223f9af518b8f15`. The witness that delivers a typed
+error from attempt 1 after replacement attempt 2 has started is now a
+required-green regression. A reply, status observation, or typed error
+from the Broca driver is checked against the phase, firing sequence, claim
+attempt, provider child and producer handle that requested it. State transitions
+repeat that identity check inside the metadata CAS path. Stale observations are
+discarded and logged rather than releasing or altering replacement work. This
+fences the demonstrated component-API interleaving without claiming it was
+reachable through the current production scheduler.
+
+The release accepts this difference in the pre-dispatch attempt ledger:
+**dormant Rust writes no turn-one stage; dormant TypeScript writes one minimal
+stage per firing**. Keeping Rust's existing behavior is intentional because no
+dormant Rust code reads a stage record. The TypeScript record contains the lane
+and chunk bounds, not a full prompt or system message. Rust remains on its
+legacy dormant send/wire path. Both write ordinary publication/activity metadata.
+Explicit enabled-lane component fixtures now prove that both runtimes write a
+turn-one stage; they do not enable production inference or claim broader
+cross-runtime row-byte parity.
+
+`fold-13` and `fold-15` are promotion-off raw-outbox fixtures that deliberately
+carry facts while bypassing the historian's memory-enabled and auto-promotion
+collection filters. Their retained candidate rows are not live historian
+regressions: the live caller empties facts before making such a fold. These
+low-level replay fixtures and persisted facts are therefore documented without
+changing replay, collection or promotion behavior.
+
+### Round-two correction verification
+
+The four required Rust round-two witnesses pass on Linux with four vCPUs,
+including the late typed-error interleaving, reopen/release fence, dormant
+all-table inventory, and new enabled-stage fixture. The late-error witness also
+captures exactly one stale-observation log and leaves attempt 2 awaiting
+`fresh-run`, with no failure annotation. Disabling the shared identity comparison
+made only that witness fail; the other three remained green. The mutation used
+the staged live source, changed one file by 3 insertions and 2 deletions, and was
+restored to an empty unstaged diff.
+
+The real TypeScript runner passes its 16 dormant footprint cases plus one
+explicit enabled-stage case; the witness TypeScript configuration typechecks.
+The stage payload assertions confirm the minimal TypeScript lane/chunk-bound
+record. Rust's enabled component fixture commits one stage, while its dormant
+fixture retains the accepted zero-stage behavior.
+
+The affected Rust run passed 112 of 113 historian tests before exposing an
+outward-error compatibility difference in the existing replacement-preservation
+CAS test. The code was adjusted to keep the original CAS-conflict return while
+logging/discarding the stale observation; that exact unchanged test then passed.
+The stage suite (2 tests), host suite (7 tests), and strict package clippy pass.
+Repository build, typecheck and lint pass. The full plugin suite still reports
+8407 passed, 19 skipped and the unrelated temporary WASM-bundle
+`onnxruntime-web/webgpu` resolution failure.

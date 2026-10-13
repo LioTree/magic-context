@@ -102,6 +102,9 @@ for (const appendedCount of [1, 2]) for (const memoryEnabled of [false, true]) f
         expect(after.memory_activity_ledger).toHaveLength(appendedCount);
         const stage = db.prepare("SELECT state, stage FROM memory_stage_attempts").get();
         expect(stage).toEqual({ state: "published", stage: "turn_one" });
+        const request = JSON.parse((db.prepare("SELECT request_json FROM memory_stage_attempts").get() as { request_json: string }).request_json) as Record<string, unknown>;
+        expect(request.lane).toBe("dormant");
+        expect(Object.keys(request).sort()).toEqual(["chunkEnd", "chunkStart", "lane"]);
         expect(after.memory_pending_facts).toHaveLength(memoryEnabled && autoPromote && moduleAuthority ? 1 : 0);
         expect(after.memories).toHaveLength(memoryEnabled && autoPromote && !moduleAuthority ? 1 : 0);
         expect(after.memory_fact_blocks).toHaveLength(0);
@@ -112,3 +115,34 @@ for (const appendedCount of [1, 2]) for (const memoryEnabled of [false, true]) f
         console.log("S7_R2_TS " + JSON.stringify({ label, tableCount: Object.keys(after).length, changes: changes(before, after), stage, lifecycle: { publications: after.memory_publications, stages: stage, activity: after.memory_activity_ledger, facts: after.memory_pending_facts } }));
     });
 }
+
+test.skipIf(process.env.MC_S7_REVIEW !== "1")("s7_r2_ts_enabled_writes_turn_one_stage", async () => {
+    const sessionId = "s7-r2-ts-enabled";
+    const directory = join(home, "project");
+    mkdirSync(directory);
+    seedOpenCode(sessionId, 1);
+    const db = openDatabase();
+    if (!db) throw new Error("temporary context database could not be opened");
+    replaceAllCompartments(db, sessionId, [{ sequence: 0, startMessage: 1, endMessage: 2, startMessageId: "m-1", endMessageId: "m-2", title: "Earlier", content: "Old summary" }]);
+    const client = { session: {
+        get: mock(async () => ({ data: { directory } })),
+        create: mock(async () => ({ data: { id: "s7-r2-enabled-child" } })),
+        prompt: mock(async () => ({})),
+        messages: mock(async () => ({ data: [{ info: { role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: reply(1) }] }] })),
+        delete: mock(async () => ({})),
+    } } as unknown as PluginContext["client"];
+    expect(acquireCompartmentLease(db, sessionId, "r2-enabled-holder")).not.toBeNull();
+    try {
+        await runCompartmentAgent(await prepareProducerFixture({ model: "test/fixture-historian", client, db, sessionId, directory,
+            historianChunkTokens: 10_000, compartmentLeaseHolderId: "r2-enabled-holder", memoryEnabled: false,
+            autoPromote: false, memoryLifecycleLane: "enabled" }));
+    } finally { releaseCompartmentLease(db, sessionId, "r2-enabled-holder"); }
+    await settleHistorianTurnTwoRuns();
+    const stages = db.prepare("SELECT stage,state,run_attempt,request_json FROM memory_stage_attempts").all() as Array<{ stage: string; state: string; run_attempt: number; request_json: string }>;
+    expect(stages).toHaveLength(1);
+    expect(stages[0]).toMatchObject({ stage: "turn_one", state: "published", run_attempt: 1 });
+    const request = JSON.parse(stages[0]!.request_json) as Record<string, unknown>;
+    expect(request.lane).toBe("enabled");
+    expect(Object.keys(request).sort()).toEqual(["chunkEnd", "chunkStart", "lane"]);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM memory_publications WHERE commit_order IS NOT NULL").get()).toEqual({ n: 1 });
+});

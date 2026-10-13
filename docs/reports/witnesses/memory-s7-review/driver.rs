@@ -204,7 +204,7 @@ async fn s7_review_witness_dormant_publish_has_no_new_rows() {
     assert_eq!(
         s7_counts(&store),
         vec![1, 0, 1, 0, 0, 0],
-        "dormant publish must match TypeScript: one publication/activity row, no stage/fact/proposal rows"
+        "dormant Rust keeps publication/activity bookkeeping and its accepted no-stage divergence from TypeScript"
     );
 }
 

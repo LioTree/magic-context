@@ -385,14 +385,19 @@ witness `tsconfig` typecheck are the authoritative diagnostics instead.
 
 The release ruling distinguishes the inactive lifecycle lane from ordinary
 historian publication. TypeScript's current compartment runner unconditionally
-calls `commitTurnOnePublication`: one publication row commits and one activity
-row is inserted per newly appended compartment. Accordingly, the dormant witness
-now expects `[1, 0, 1, 0, 0, 0]`, not the original all-zero oracle. Stage, fact,
-memory and proposal rows remain absent in that ordinary no-fact fixture. The
-byte-identity witness uses an independently specified TypeScript-compatible
-publication/activity oracle and compares all remaining row bytes without masking
-any differences. The witness runner now requires green regressions instead of
-accepting the historical expected-red set.
+allocates one minimal turn-one stage per firing and calls
+`commitTurnOnePublication`: one publication row commits and one activity row is
+inserted per newly appended compartment. Dormant Rust deliberately does not
+allocate that stage. This is an accepted divergence: TypeScript writes one stage,
+Rust writes none, and nothing in dormant Rust reads a stage record. The Rust
+witness therefore expects `[1, 0, 1, 0, 0, 0]` for its ordinary no-fact fixture;
+it is not a complete TypeScript row oracle. The byte witness independently
+specifies only the common publication/activity metadata and compares the other
+Rust production row bytes without masking differences. The actual TypeScript
+footprint is exercised by the round-two real-runner matrix, which expects one
+minimal stage with `{lane, chunkStart, chunkEnd}` and no prompt/system text.
+Witness modes now require green regressions instead of accepting expected-red
+counterexamples.
 
 Production stage writes, stage-aware host metadata, changed Broca send identities,
 and the new queued/lost-ack/crash-replay send path are gated by the inactive lane.
