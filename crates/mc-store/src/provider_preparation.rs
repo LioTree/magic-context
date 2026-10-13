@@ -37,7 +37,7 @@ impl ProviderStoredPreparation {
             ));
         }
         if self.prepared_blob.len() < 32
-            || &Sha256::digest(&self.prepared_blob[32..])[..] != &self.prepared_blob[..32]
+            || Sha256::digest(&self.prepared_blob[32..])[..] != self.prepared_blob[..32]
         {
             return Err(ProviderError::Transient(
                 "prepared policy checksum changed".into(),
@@ -312,6 +312,29 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn preparation_refuses_unaccounted_changes_without_clearing_frontier() {
+        let (_dir, store, key) = rig();
+        write(
+            &store,
+            &key,
+            "INSERT INTO mc_provider_policy_changes_v1 VALUES (?1,'L','m#0',NULL,0,'session')",
+        );
+        let before = store.provider_policy_revision("engine").unwrap();
+        assert!(!store
+            .prepare_provider_policy(&key, |_, _| {
+                panic!("unaccounted changes must prevent preparation before the builder runs")
+            })
+            .unwrap());
+        assert_eq!(store.provider_policy_revision("engine").unwrap(), before);
+        store.inner.with_conn(|conn| {
+            let held: (String, String, i64) = conn.query_row("SELECT lineage_id,block_id,previous_consumed FROM mc_provider_policy_changes_v1 WHERE conv_key=?1", [key.conversation_key()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+            assert_eq!(held, ("L".into(), "m#0".into(), 0));
+            assert!(matching_preparation_tx(conn, &key, "engine")?.is_none());
+            Ok(())
+        }).unwrap();
     }
     #[test]
     fn exhausted_revision_aborts_an_or_ignore_writer() {

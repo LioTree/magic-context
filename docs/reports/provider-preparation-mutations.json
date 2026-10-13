@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "toolchain": "cargo 1.99.0 (5f94df478 2026-08-27); rustc 1.99.0 (b940084d7 2026-09-28)",
+  "runner": "linux,4c",
+  "procedure": "Stage each live file before mutation, confirm empty working diff, mutate one control, capture nonempty diff, run one named test, restore from the index and touch the path, confirm empty working diff. Each focused run had exactly one failed test; no other test was selected. The restored 19-test hookcost_review set and 345-test store suite passed.",
+  "mutation_evidence": [
+    {
+      "control": "Freeze the retained original baseline at the preparation cut before actual admission",
+      "expected_red": "providers::step_transform::parity_tests::hookcost_review_witnesses::prepared_refreeze_finalizes_the_exact_r1_admitted_cut",
+      "captured_output": "prepared_refreeze_finalizes_the_exact_r1_admitted_cut ... FAILED; assertion left == right failed: left 1, right 9. 0 passed; 1 failed; 1993 filtered out. No other selected tests.",
+      "applied_evidence": "crates/mc-module/src/providers/policy_summary_preparation.rs: during mutation 1 file changed, 6 insertions(+); after git checkout -- <path> && touch <path>, git diff --stat empty",
+      "outcome": "reddened"
+    },
+    {
+      "control": "Clear the replayed newest admitted measurements before finalization",
+      "expected_red": "providers::step_transform::parity_tests::hookcost_review_witnesses::prepared_refreeze_finalizes_the_exact_r1_admitted_cut",
+      "captured_output": "prepared_refreeze_finalizes_the_exact_r1_admitted_cut ... FAILED; match: valid R1 preparation must actually be consumed; left false, right true. 0 passed; 1 failed; 1993 filtered out. No other selected tests.",
+      "applied_evidence": "crates/mc-module/src/providers/policy_summary_preparation.rs: during mutation 1 file changed, 1 insertion(+); after git checkout -- <path> && touch <path>, git diff --stat empty",
+      "outcome": "reddened"
+    },
+    {
+      "control": "Remove revision equality from the stored preparation join",
+      "expected_red": "providers::step_transform::parity_tests::hookcost_review_witnesses::prepared_policy_sibling_revision_mismatch_uses_cold_bytes",
+      "captured_output": "prepared_policy_sibling_revision_mismatch_uses_cold_bytes ... FAILED; sibling: mismatch must use the cold path; left true, right false. 0 passed; 1 failed; 1993 filtered out. No other selected tests.",
+      "applied_evidence": "crates/mc-store/src/provider_preparation.rs: during mutation 1 file changed, 1 insertion(+), 1 deletion(-); after git checkout -- <path> && touch <path>, git diff --stat empty",
+      "outcome": "reddened"
+    },
+    {
+      "control": "Delete unaccounted change-log rows instead of refusing preparation",
+      "expected_red": "provider_preparation::tests::preparation_refuses_unaccounted_changes_without_clearing_frontier",
+      "captured_output": "preparation_refuses_unaccounted_changes_without_clearing_frontier ... FAILED; unaccounted changes must prevent preparation before the builder runs. 0 passed; 1 failed; 349 filtered out. No other selected tests.",
+      "applied_evidence": "crates/mc-store/src/provider_preparation.rs: during mutation 1 file changed, 1 insertion(+), 1 deletion(-); after git checkout -- <path> && touch <path>, git diff --stat empty",
+      "outcome": "reddened"
+    },
+    {
+      "control": "Bypass preparation settings-key validation",
+      "expected_red": "providers::step_transform::parity_tests::hookcost_review_witnesses::prepared_policy_invalid_key_uses_cold_bytes",
+      "captured_output": "prepared_policy_invalid_key_uses_cold_bytes ... FAILED; key: mismatch must use the cold path; left true, right false. 0 passed; 1 failed; 1993 filtered out. No other selected tests.",
+      "applied_evidence": "crates/mc-module/src/providers/policy_summary_preparation.rs: during mutation 1 file changed, 2 insertions(+), 1 deletion(-); after git checkout -- <path> && touch <path>, git diff --stat empty",
+      "outcome": "reddened"
+    }
+  ]
+}

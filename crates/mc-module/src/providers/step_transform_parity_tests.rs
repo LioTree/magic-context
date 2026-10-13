@@ -1448,11 +1448,15 @@ mod hookcost_review_witnesses {
 
     #[test]
     fn prepared_refreeze_finalizes_the_exact_r1_admitted_cut() {
+        prepared_cut_case("match");
+    }
+
+    fn prepared_cut_case(change: &str) {
         let (_, parts, settings) = covered_fixture();
         let root = std::env::temp_dir().join("magic-context/prepared-r1");
         std::fs::create_dir_all(&root).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
-        let store =
+        let mut store =
             mc_store::McStore::open_for_test(&crate::test_support::descriptor(dir.path())).unwrap();
         let key = mc_store::ProviderSessionKey {
             project_root: "/fixture".into(),
@@ -1507,6 +1511,95 @@ mod hookcost_review_witnesses {
             before,
             "preparation must not publish the earlier baseline"
         );
+        match change {
+            "sibling" => {
+                let sibling = mc_store::ProviderSessionKey {
+                    harness: "opencode2".into(),
+                    ..key.clone()
+                };
+                store
+                    .save_provider_conversation(
+                        &sibling,
+                        &mc_store::provider_records::ProviderConversation {
+                            engine_namespace: "engine".into(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            "shared_tag" => {
+                sql.execute(
+                    "INSERT INTO mc_provider_consumed_tags_v1 VALUES ('engine',2,'session')",
+                    [],
+                )
+                .unwrap();
+            }
+            "covered_tag" => {
+                sql.execute("UPDATE mc_provider_policy_parts_v1 SET policy_json=json_set(policy_json,'$.tag_number',77) WHERE block_id='covered#0'", []).unwrap();
+            }
+            "settings" => {
+                sql.execute("UPDATE mc_provider_conversations_v2 SET hook_counters_json=json_set(hook_counters_json,'$.engine_policy.prose_ratio',2.0)", []).unwrap();
+            }
+            "key" => {
+                sql.execute(
+                    "UPDATE mc_provider_policy_preparations_v1 SET settings_key='unsupported'",
+                    [],
+                )
+                .unwrap();
+            }
+            "baseline" => {
+                sql.execute(
+                    "UPDATE mc_provider_policy_preparations_v1 SET original_baseline_json='null'",
+                    [],
+                )
+                .unwrap();
+            }
+            "cut" => {
+                sql.execute(
+                    "UPDATE mc_provider_policy_preparations_v1 SET newest_ordinal=99",
+                    [],
+                )
+                .unwrap();
+            }
+            "cap" => {
+                sql.execute(
+                    "UPDATE mc_provider_policy_preparations_v1 SET uncompressed_bytes=?1",
+                    [mc_store::MAX_PROVIDER_PREPARATION_BYTES as u64 + 1],
+                )
+                .unwrap();
+            }
+            "checksum" => {
+                sql.execute(
+                    "UPDATE mc_provider_policy_preparations_v1 SET prepared_blob=x'00'",
+                    [],
+                )
+                .unwrap();
+            }
+            "evicted" => {
+                sql.execute("DELETE FROM mc_provider_policy_preparations_v1", [])
+                    .unwrap();
+            }
+            "restart" => {
+                drop(store);
+                store =
+                    mc_store::McStore::open_for_test(&crate::test_support::descriptor(dir.path()))
+                        .unwrap();
+            }
+            "ancestry" => {
+                sql.execute(
+                    "INSERT INTO mc_provider_lineages_v1 VALUES (?1,'child',3,'L',1,'session')",
+                    [key.conversation_key()],
+                )
+                .unwrap();
+                sql.execute(
+                    "UPDATE mc_provider_conversations_v2 SET lineage_id='child'",
+                    [],
+                )
+                .unwrap();
+            }
+            "match" | "off" | "cache_bust" | "same_cut" => {}
+            _ => panic!("unknown preparation case {change}"),
+        }
         let mut next_req = request(
             &[message(
                 "next",
@@ -1527,7 +1620,7 @@ mod hookcost_review_witnesses {
         }
         let mut cold_parts = parts.clone();
         cold_parts.extend(next.clone());
-        let cold = transform::channel1_inputs_from_parts(
+        let cold_r1 = transform::channel1_inputs_from_parts(
             &cold_parts,
             &settings,
             0,
@@ -1537,29 +1630,40 @@ mod hookcost_review_witnesses {
             None,
         );
         let lineage = mc_store::provider_records::ProviderLineage {
-            lineage_id: "L".into(),
-            first_ordinal: 1,
-            descends_from: None,
-            through_ordinal: None,
+            lineage_id: if change == "ancestry" { "child" } else { "L" }.into(),
+            first_ordinal: if change == "ancestry" { 3 } else { 1 },
+            descends_from: (change == "ancestry").then(|| "L".into()),
+            through_ordinal: (change == "ancestry").then_some(1),
         };
         let incoming = mc_store::provider_records::ProviderMessage {
-            ordinal: 3,
+            ordinal: if change == "same_cut" { 2 } else { 3 },
             mid: "next".into(),
             message_bytes: b"{}".to_vec(),
         };
-        let warm = store.commit_provider_hook_with_preparation(&key, mc_store::provider_records::ProviderHookRequest { lineage:&lineage,message:Some(&incoming),served_through_ordinal:Some(2),unserved_subjects:&[],repeat_subject:None }, &next,true,|ctx| {
-            assert!(ctx.policy_index.preparation().is_some());
-            let (inputs,summary) = super::super::super::policy_summary::channel1_inputs(&ctx.policy_index,&ctx.counters["engine_policy"],0,&Default::default(),true,false,None)?;
-            assert!(ctx.policy_index.preparation_was_consumed(), "R1 acceptance must execute preparation, not fall back to the cold oracle");
+        if change == "same_cut" {
+            for part in &mut next {
+                part.ordinal = 2;
+            }
+        }
+        let (warm, cold) = store.commit_provider_hook_with_preparation(&key, mc_store::provider_records::ProviderHookRequest { lineage:&lineage,message:Some(&incoming),served_through_ordinal:Some(2),unserved_subjects:&[],repeat_subject:None }, &next,change != "off",|ctx| {
+            let cold = transform::channel1_inputs_from_parts(&ctx.policy_index.all_parts()?, &ctx.counters["engine_policy"], 0, &Default::default(), true, change == "cache_bust", None);
+            let (inputs,summary) = super::super::super::policy_summary::channel1_inputs(&ctx.policy_index,&ctx.counters["engine_policy"],0,&Default::default(),true,change == "cache_bust",None)?;
+            assert_eq!(ctx.policy_index.preparation_was_consumed(), matches!(change, "match" | "restart"), "{change}: mismatch must use the cold path; a valid R1 preparation must actually be consumed");
             let mut counters = ctx.counters.clone();
             counters["policy_baseline_updates"] = json!(inputs.baseline.baseline_parts.iter().map(|measurement| json!({"block_id":measurement.key.split('\0').next().unwrap(),"measurement":measurement})).collect::<Vec<_>>());
             let mut baseline=inputs.baseline.clone();baseline.baseline_parts.clear();
             counters["engine_policy"]["baseline"]=serde_json::to_value(baseline).unwrap();
             counters["engine_policy"]["baseline_len"]=json!(inputs.baseline.baseline_parts.len());
-            Ok((mc_store::provider_records::ProviderHookWrite { answer:None,counters,policy_summary:summary },inputs))
+            Ok((mc_store::provider_records::ProviderHookWrite { answer:None,counters,policy_summary:summary },(inputs,cold)))
         }).unwrap();
-        assert_eq!(warm.baseline.baseline_parts.len(), 9);
-        assert_eq!(warm.tool_outputs, 1);
+        if matches!(change, "match" | "restart") {
+            assert_eq!(warm.baseline.baseline_parts.len(), 9);
+            assert_eq!(warm.tool_outputs, 1);
+            assert_eq!(
+                serde_json::to_vec(&warm.baseline).unwrap(),
+                serde_json::to_vec(&cold_r1.baseline).unwrap()
+            );
+        }
         assert_eq!(
             serde_json::to_vec(&warm.baseline).unwrap(),
             serde_json::to_vec(&cold.baseline).unwrap()
@@ -1568,5 +1672,72 @@ mod hookcost_review_witnesses {
             serde_json::to_vec(&host_channel1(&warm, &json!({})).0).unwrap(),
             serde_json::to_vec(&host_channel1(&cold, &json!({})).0).unwrap()
         );
+        assert_eq!(warm.users, cold.users);
+        assert_eq!(warm.tool_outputs, cold.tool_outputs);
+        assert_eq!(
+            serde_json::to_vec(&warm.hint).unwrap(),
+            serde_json::to_vec(&cold.hint).unwrap()
+        );
+    }
+
+    #[test]
+    fn prepared_policy_sibling_revision_mismatch_uses_cold_bytes() {
+        prepared_cut_case("sibling");
+    }
+    #[test]
+    fn prepared_policy_shared_consumed_tag_uses_cold_bytes() {
+        prepared_cut_case("shared_tag");
+    }
+    #[test]
+    fn prepared_policy_covered_tag_change_uses_cold_bytes() {
+        prepared_cut_case("covered_tag");
+    }
+    #[test]
+    fn prepared_policy_settings_revision_mismatch_uses_cold_bytes() {
+        prepared_cut_case("settings");
+    }
+    #[test]
+    fn prepared_policy_invalid_key_uses_cold_bytes() {
+        prepared_cut_case("key");
+    }
+    #[test]
+    fn prepared_policy_original_baseline_mismatch_uses_cold_bytes() {
+        prepared_cut_case("baseline");
+    }
+    #[test]
+    fn prepared_policy_cut_mismatch_uses_cold_bytes() {
+        prepared_cut_case("cut");
+    }
+    #[test]
+    fn prepared_policy_byte_cap_uses_cold_bytes() {
+        prepared_cut_case("cap");
+    }
+    #[test]
+    fn prepared_policy_corrupt_checksum_uses_cold_bytes() {
+        prepared_cut_case("checksum");
+    }
+    #[test]
+    fn prepared_policy_evicted_uses_cold_bytes() {
+        prepared_cut_case("evicted");
+    }
+    #[test]
+    fn prepared_policy_restart_retains_revision_checked_bytes() {
+        prepared_cut_case("restart");
+    }
+    #[test]
+    fn prepared_policy_disabled_uses_cold_bytes() {
+        prepared_cut_case("off");
+    }
+    #[test]
+    fn prepared_policy_cache_bust_uses_cold_bytes() {
+        prepared_cut_case("cache_bust");
+    }
+    #[test]
+    fn prepared_policy_ancestry_change_uses_cold_bytes() {
+        prepared_cut_case("ancestry");
+    }
+    #[test]
+    fn prepared_policy_unadvanced_cut_uses_cold_bytes() {
+        prepared_cut_case("same_cut");
     }
 }

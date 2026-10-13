@@ -88,7 +88,12 @@ export async function preparationDifferential(samples = 48) {
                     const warmView = await call(arms[1]!, { method: "compaction.step", params: { ...status, consume_prepared_policy: true } });
                     assert.equal(warmView.raw, coldView.raw, "preparation must not change exact rebuilt answer bytes");
                     assert.equal(warmView.answer.answer, "compaction_message");
-                    const probe = tools(nextId, sample % 7 === 0);
+                    assert.deepEqual(await sql(arms[0]!, "SELECT count(*) FROM mc_provider_policy_preparations_v1"), [[0]], "setting off must not write preparation");
+                    assert.deepEqual(await sql(arms[1]!, "SELECT count(*) FROM mc_provider_policy_preparations_v1"), [[1]], "setting on must reach preparation before admission");
+                    for (const statement of ["SELECT policy_json FROM mc_provider_policy_parts_v1 ORDER BY ordinal,block_id", "SELECT summary_json FROM mc_provider_policy_summaries_v1"]) {
+                        assert.deepEqual(await sql(arms[1]!, statement), await sql(arms[0]!, statement), "preparation must not publish policy before real admission");
+                    }
+                    const probe = tools(nextId);
                     // Use one result as the actual post_tool subject. Other parts
                     // still join the admitted message and its newest cut.
                     (probe.info as { model: { modelID: string } }).model.modelID = model.slice("openai/".length);
@@ -112,6 +117,19 @@ export async function preparationDifferential(samples = 48) {
                     const policyCounters = (rows: string[][]) => rows.map(([encoded]) =>
                         Object.fromEntries(Object.entries(JSON.parse(encoded!)).filter(([name]) => !name.startsWith("historian_"))));
                     assert.deepEqual(policyCounters(await sql(arms[1]!, "SELECT hook_counters_json FROM mc_provider_conversations_v2")), policyCounters(await sql(arms[0]!, "SELECT hook_counters_json FROM mc_provider_conversations_v2")), "durable baseline/settings/grace differ");
+                    const applied = { compaction_id: warmView.answer.compaction.compaction_id, version: warmView.answer.compaction.version };
+                    const ack = { ...status, request_id: `ack-${nextId}`, step_id: `ack-${nextId}`, prefix_rebuilding: undefined,
+                        newest: { ordinal: state.state.next_ordinal, mid: nextId }, served_through_ordinal: state.state.next_ordinal, last_applied: applied };
+                    const coldAck = await call(arms[0]!, { method: "compaction.step", params: ack });
+                    const warmAck = await call(arms[1]!, { method: "compaction.step", params: { ...ack, consume_prepared_policy: true } });
+                    assert.equal(warmAck.raw, coldAck.raw, "acknowledgement and next step bytes differ");
+                    for (const statement of ["SELECT answer_seq,lineage_id,subject_mid,hook,subject_part,ops_json,state FROM mc_provider_hook_answers_v1 ORDER BY answer_seq", "SELECT last_answer_json FROM mc_provider_conversations_v2"]) {
+                        assert.deepEqual(await sql(arms[1]!, statement), await sql(arms[0]!, statement), "durable answers and receipts differ after acknowledgement");
+                    }
+                    // Tag allocation uses each arm's wall clock. Compare every
+                    // functional field while excluding only that timestamp.
+                    const tags = (rows: string[][]) => rows.map(([encoded]) => JSON.parse(encoded!).map(({ created_at_ms: _clock, ...fields }: Record<string, unknown>) => fields));
+                    assert.deepEqual(tags(await sql(arms[1]!, "SELECT tags_json FROM mc_provider_hook_answers_v1 ORDER BY answer_seq")), tags(await sql(arms[0]!, "SELECT tags_json FROM mc_provider_hook_answers_v1 ORDER BY answer_seq")));
                     const row = { host, sample, request_id: nextId, answers_identical: true, measurements_identical: true, summary_identical: true, append_bytes: Buffer.byteLength(appends(warm.answer)) };
                     results.push(row);
                     console.log(`PREPARATION_DIFFERENTIAL_SAMPLE=${JSON.stringify(row)}`);

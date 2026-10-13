@@ -358,6 +358,7 @@ export class Driver {
     private killed = false;
     readonly faults: string[] = [];
     readonly preparationOutcomes: { request_id: string; consumed: boolean }[] = [];
+    readonly preparationCompletions: { request_id: string; prepared: boolean; preparation_ms: number }[] = [];
     readonly moduleCompletions: { request_id: string; method: string; module_ms: number }[] = [];
     get wasKilled() {
         return this.killed;
@@ -431,6 +432,12 @@ export class Driver {
                         const method = /method="([^"]+)"/.exec(line)?.[1];
                         const ms = /module_ms=([0-9.eE+-]+)/.exec(line)?.[1];
                         if (request && method && ms) this.moduleCompletions.push({ request_id: request, method, module_ms: Number(ms) });
+                    }
+                    if (line.includes("provider policy preparation complete")) {
+                        const request = /request_id=([^ }]+)/.exec(line)?.[1];
+                        const prepared = /prepared=(true|false)/.exec(line)?.[1];
+                        const ms = /preparation_ms=([0-9.eE+-]+)/.exec(line)?.[1];
+                        if (request && prepared && ms) this.preparationCompletions.push({ request_id: request, prepared: prepared === "true", preparation_ms: Number(ms) });
                     }
                     process.stderr.write(`${line}\n`);
                 }
