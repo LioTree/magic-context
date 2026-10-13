@@ -500,10 +500,10 @@ fn has_file_extension(word: &[u16]) -> bool {
     (1..=5).contains(&run) && word.len() > run && word[word.len() - run - 1] == u16::from(b'.')
 }
 
-/// The TypeScript regex `^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)+$`.
+/// Lowercase dotted keys and bare identifiers with underscores, matching the TypeScript scanner.
 fn is_config_key(word: &[u16]) -> bool {
     let segments: Vec<&[u16]> = word.split(|&unit| unit == u16::from(b'.')).collect();
-    segments.len() >= 2
+    (segments.len() >= 2 || word.contains(&u16::from(b'_')))
         && segments.iter().all(|segment| {
             let lower_or_underscore =
                 |unit: u16| (0x61..=0x7a).contains(&unit) || unit == u16::from(b'_');

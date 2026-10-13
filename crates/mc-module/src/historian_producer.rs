@@ -31,6 +31,7 @@ use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
 /// legitimately needs five figures. The provider clamps to its own per-model limit, so a
 /// generous request costs nothing unless the model actually generates that much.
 pub(crate) const HISTORIAN_MAX_OUTPUT_TOKENS: u32 = 32_000;
+const HISTORIAN_SESSION_RETENTION_SECONDS: u64 = 86_400;
 
 #[derive(Serialize)]
 struct GenerationRequest {
@@ -52,15 +53,16 @@ struct SendModel<'a> {
     variant: Option<&'a str>,
 }
 
-/// `session.send` params, in Broca's golden field order (`prompt`, `send_id`, `model`)
-/// followed by the fields only this client adds. Magic Context never sends `delivery`,
-/// so every send is Broca's default queued delivery, which must name its variant
-/// explicitly: a queued send does not inherit one from the session.
+/// Serialize `prompt`, `send_id`, and nested `model` first, followed by optional
+/// retention seconds, then this client's `tools`, `generation`, and `system` fields.
+/// Omitting `delivery` selects queued mode; put any requested variant in `model`.
 #[derive(Serialize)]
 struct SendParams<'a> {
     prompt: &'a str,
     send_id: &'a str,
     model: SendModel<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention: Option<u64>,
     tools: &'a [Value],
     generation: GenerationRequest,
     #[serde(skip_serializing_if = "str::is_empty")]
@@ -68,14 +70,15 @@ struct SendParams<'a> {
 }
 
 #[derive(Serialize)]
-struct SendRequest<'a> {
+pub(crate) struct SendRequest<'a> {
     method: &'static str,
     params: SendParams<'a>,
 }
 
 /// Build one `session.send` request. `model` is the canonical `provider/model` string,
 /// split at the FIRST slash so multi-slash model names keep their remainder intact.
-fn session_send_request<'a>(
+#[allow(clippy::too_many_arguments)] // Each argument corresponds to a separate wire value.
+pub(crate) fn session_send_request<'a>(
     send_id: &'a str,
     system: &'a str,
     prompt: &'a str,
@@ -83,6 +86,7 @@ fn session_send_request<'a>(
     variant: Option<&'a str>,
     max_output_tokens: u32,
     temperature: Option<f64>,
+    retention: Option<u64>,
 ) -> Result<SendRequest<'a>, HistorianProducerError> {
     let (provider, model_name) = model.split_once('/').ok_or_else(|| {
         HistorianProducerError::Subc(ProducerErrorBody::untagged(
@@ -100,6 +104,7 @@ fn session_send_request<'a>(
                 model: model_name,
                 variant: variant.filter(|variant| !variant.is_empty()),
             },
+            retention,
             tools: &[],
             generation: GenerationRequest {
                 max_output_tokens,
@@ -359,6 +364,33 @@ pub struct RunHandle {
     pub run_id: String,
 }
 
+const STAGE_SUBMISSION_PREFIX: &str = "mc-broca-stage:";
+
+/// Store this opaque handle in HistorianDurableState.producer_run_id. It includes
+/// the exact request so restart can reattach even if the Broca model runner's
+/// acknowledgement was lost. Broca deduplicates requests with the same send_id,
+/// so replay returns the original submission rather than a second provider call.
+pub(crate) fn stage_submission_handle(session_id: &str, request: &Value) -> RunHandle {
+    RunHandle {
+        run_id: format!(
+            "{STAGE_SUBMISSION_PREFIX}{}",
+            json!({"session_id": session_id, "request": request})
+        ),
+    }
+}
+
+pub(crate) fn is_stage_submission(handle: &str) -> bool {
+    handle.starts_with(STAGE_SUBMISSION_PREFIX)
+}
+
+fn stage_submission(handle: &str) -> Result<Option<Value>, HistorianProducerError> {
+    handle
+        .strip_prefix(STAGE_SUBMISSION_PREFIX)
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(Into::into)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProducerOutput {
     pub text: String,
@@ -512,7 +544,17 @@ pub enum HistorianProducerError {
 }
 
 impl HistorianProducerError {
+    pub(crate) fn unknown_send_outcome(&self) -> bool {
+        matches!(
+            self,
+            Self::FrameIo(_) | Self::UnexpectedStreamEnd | Self::TimedOut
+        )
+    }
     /// Provider reset metadata is a retry hint, never an error-class override.
+    pub(crate) fn unknown_run_outcome(&self) -> bool {
+        !matches!(self, Self::RunFailed { .. })
+    }
+
     pub(crate) fn provider_retry_at_ms(&self, now_ms: i64) -> Option<i64> {
         let (metadata, text) = match self {
             Self::Subc(body) => (body.retry_metadata.as_ref(), body.message.as_str()),
@@ -623,6 +665,10 @@ impl HistorianProducerError {
             self,
             HistorianProducerError::Subc(body) if body.code == "unknown_module"
         )
+    }
+
+    pub(crate) fn is_expired(&self) -> bool {
+        matches!(self, HistorianProducerError::Subc(body) if body.code == "expired")
     }
 
     /// Parse a route-open refusal while preserving the runner's code and message verbatim.
@@ -819,9 +865,131 @@ pub struct HistorianProducer {
     session_id: Option<String>,
     command_route: Option<OpenedRoute>,
     subscribe_route: Option<OpenedRoute>,
+    /// `None` means this route has not been queried; `Some(None)` means it declared no
+    /// usable retention group. This cache belongs to a route and is cleared on close.
+    route_retention: Option<Option<u64>>,
+    /// Freeze the first send's policy for this session. In particular, a session that
+    /// began without retention must not opt in on a later send.
+    session_retention: Option<Option<u64>>,
 }
 
 impl HistorianProducer {
+    /// Dormant calls keep session_id as send_id, as the original producer did.
+    /// Enabled historian turns share one provider session, with send keys that
+    /// distinguish project, publication, run attempt and turn. Clause checks use
+    /// separate sessions so they cannot inherit earlier historian messages.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_stage_with_generation(
+        &mut self,
+        session_id: &str,
+        stage_key: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        variant: Option<&str>,
+        max_output_tokens: u32,
+        temperature: Option<f64>,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        if !crate::historian_stage::lifecycle_enabled() {
+            return self
+                .start_with_generation(
+                    session_id,
+                    system,
+                    prompt,
+                    model,
+                    variant,
+                    max_output_tokens,
+                    temperature,
+                )
+                .await;
+        }
+        if self.session_id.as_deref() != Some(session_id) {
+            self.close().await;
+        }
+        self.bind_session(session_id.to_string());
+        let route = self.ensure_command_route().await?;
+        // Stage sends carry no retention: recovery rebuilds this exact body from the
+        // persisted stage request to derive the same submission handle, and that request
+        // does not record a retention. Giving stage sessions a retention would first require
+        // persisting it in that stage request. Stage sends happen only while
+        // `historian_stage::RUST_LIFECYCLE_ENABLED` is on, which it is not in production.
+        let request = serde_json::to_value(session_send_request(
+            stage_key,
+            system,
+            prompt,
+            model,
+            variant,
+            max_output_tokens,
+            temperature,
+            None,
+        )?)?;
+        match self.unary_json(route, &request).await {
+            Ok(response) => match send_outcome(&response) {
+                SendOutcome::Active(run_id) => Ok(RunHandle { run_id }),
+                SendOutcome::Queued(_) => Ok(stage_submission_handle(session_id, &request)),
+                SendOutcome::Unrecognized => Err(HistorianProducerError::MissingRunId),
+            },
+            // The write may have reached Broca. Keep the original key and request
+            // rather than starting a fallback attempt with an unknown outcome.
+            Err(error) if error.unknown_send_outcome() => {
+                Ok(stage_submission_handle(session_id, &request))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_check_with_generation(
+        &mut self,
+        check_key: &str,
+        system: &str,
+        operands_and_input: &str,
+        model: &str,
+        variant: Option<&str>,
+        max_output_tokens: u32,
+        temperature: Option<f64>,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        if !crate::historian_stage::lifecycle_enabled() {
+            return Err(HistorianProducerError::Subc(ProducerErrorBody::untagged(
+                "historian_lane_dormant",
+                "clause checks require an enabled historian lane",
+            )));
+        }
+        let session = crate::historian_stage::check_session_id(check_key);
+        self.start_stage_with_generation(
+            &session,
+            check_key,
+            system,
+            operands_and_input,
+            model,
+            variant,
+            max_output_tokens,
+            temperature,
+        )
+        .await
+    }
+
+    async fn reattach_submission(
+        &mut self,
+        submission: &Value,
+    ) -> Result<String, HistorianProducerError> {
+        let session = submission["session_id"]
+            .as_str()
+            .ok_or(HistorianProducerError::MissingRunId)?;
+        if self.session_id.as_deref() != Some(session) {
+            self.close().await;
+        }
+        self.bind_session(session.to_string());
+        loop {
+            let route = self.ensure_command_route().await?;
+            let response = self.unary_json(route, &submission["request"]).await?;
+            match send_outcome(&response) {
+                SendOutcome::Active(run_id) => return Ok(run_id),
+                SendOutcome::Queued(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                SendOutcome::Unrecognized => return Err(HistorianProducerError::MissingRunId),
+            }
+        }
+    }
     pub async fn connect(config: HistorianProducerConfig) -> Result<Self, HistorianProducerError> {
         let conn = connection_file::read(&config.connection_file).map_err(|source| {
             HistorianProducerError::ConnectionFile {
@@ -852,13 +1020,19 @@ impl HistorianProducer {
             session_id: None,
             command_route: None,
             subscribe_route: None,
+            route_retention: None,
+            session_retention: None,
         })
     }
 
     /// Bind subsequent status/subscribe/cancel calls to an existing session. Reattach
     /// probes open the route with the persisted session id and must not call send again.
     pub fn bind_session(&mut self, session_id: impl Into<String>) {
-        self.session_id = Some(session_id.into());
+        let session_id = session_id.into();
+        if self.session_id.as_deref() != Some(session_id.as_str()) {
+            self.session_retention = None;
+        }
+        self.session_id = Some(session_id);
     }
 
     pub async fn start(
@@ -916,6 +1090,11 @@ impl HistorianProducer {
     ) -> Result<RunHandle, HistorianProducerError> {
         self.bind_session(session_id.to_string());
         let route = self.ensure_command_route().await?;
+        // Check `role.describe` before building this send; include retention only when
+        // the runner advertises support. Its first accepted send fixes the session's
+        // lifetime, so repeat sends must keep that initial policy.
+        let declared_retention = self.retention_for_route(route).await;
+        let retention = select_session_retention(&mut self.session_retention, declared_retention);
         // The route identity is the session. Keeping `session` out of this body avoids
         // a second, diverging source of truth for the run lineage.
         //
@@ -943,6 +1122,7 @@ impl HistorianProducer {
             variant,
             max_output_tokens,
             temperature,
+            retention,
         )?;
         let response = self.unary_json(route, body).await?;
         match send_outcome(&response) {
@@ -1014,6 +1194,9 @@ impl HistorianProducer {
     }
 
     pub async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError> {
+        if is_stage_submission(run_id) {
+            return Ok(RunState::Active);
+        }
         let route = self.ensure_command_route().await?;
         let response = self
             .unary_json(
@@ -1025,6 +1208,12 @@ impl HistorianProducer {
     }
 
     pub async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError> {
+        // This handle may name a queued send or a send whose acknowledgement was
+        // lost. Its eventual run is not yet known. Preserve it for recovery rather
+        // than retracting the send or using this local handle as a provider run id.
+        if is_stage_submission(run_id) {
+            return Ok(());
+        }
         let route = self.ensure_command_route().await?;
         let _ = self
             .unary_json(
@@ -1056,6 +1245,29 @@ impl HistorianProducer {
         if let Some(route) = self.command_route.take() {
             let _ = self.send_goodbye(route).await;
         }
+        self.route_retention = None;
+    }
+
+    async fn retention_for_route(&mut self, route: OpenedRoute) -> Option<u64> {
+        if let Some(retention) = self.route_retention {
+            return retention;
+        }
+
+        let described = self
+            .unary_json(route, json!({ "method": "role.describe", "params": {} }))
+            .await;
+        let retention = match described {
+            Ok(answer) => retention_from_role_describe(&answer),
+            Err(_) => None,
+        };
+        if retention.is_none() {
+            static RETENTION_UNAVAILABLE_WARNING: std::sync::Once = std::sync::Once::new();
+            RETENTION_UNAVAILABLE_WARNING.call_once(|| {
+                tracing::warn!("[mc-module] Broca does not declare a usable retention capability; historian and dreamer sessions will use the runner's default lifetime");
+            });
+        }
+        self.route_retention = Some(retention);
+        retention
     }
 
     async fn subscribe_from_start(
@@ -1063,6 +1275,20 @@ impl HistorianProducer {
         run_id: &str,
         timeout: Duration,
     ) -> Result<ProducerOutput, HistorianProducerError> {
+        if let Some(submission) = stage_submission(run_id)? {
+            return match tokio::time::timeout(timeout, async {
+                let resolved_run = self.reattach_submission(&submission).await?;
+                let route = self.ensure_subscribe_route().await?;
+                let body = json!({ "method": "session.subscribe", "params": { "from": "start" } });
+                let corr = self.send_request(route, body).await?;
+                self.drain_subscribe(route, corr, &resolved_run).await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(HistorianProducerError::TimedOut),
+            };
+        }
         let route = self.ensure_subscribe_route().await?;
         // Subscribe from "start" instead of a cursor. Replay after a cursor is
         // exclusive, so persisting an advancing cursor can drop units at or before
@@ -1347,6 +1573,50 @@ impl HistorianProducer {
         self.next_corr = self.next_corr.saturating_add(1).max(1);
         corr
     }
+}
+
+/// Return a policy only when `role.describe` names `retention` and provides positive
+/// limits. Older runners may not support the field, so omitting it when the group is
+/// absent keeps their `session.send` requests valid.
+fn retention_from_role_describe(answer: &Value) -> Option<u64> {
+    let answer = answer.get("result").unwrap_or(answer);
+    let declares_retention = answer
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups
+                .iter()
+                .any(|group| group.as_str() == Some("retention"))
+        });
+    if !declares_retention {
+        return None;
+    }
+    let max_seconds = answer
+        .get("retention")
+        .and_then(|retention| retention.get("max_seconds"))
+        .and_then(Value::as_u64)
+        .filter(|max_seconds| *max_seconds > 0)?;
+    let delete_within_ms = answer
+        .get("retention")
+        .and_then(|retention| retention.get("delete_within_ms"))
+        .and_then(Value::as_u64)?;
+    if delete_within_ms == 0 {
+        return None;
+    }
+    Some(HISTORIAN_SESSION_RETENTION_SECONDS.min(max_seconds))
+}
+
+fn select_session_retention(
+    frozen: &mut Option<Option<u64>>,
+    declared: Option<u64>,
+) -> Option<u64> {
+    let original = *frozen.get_or_insert(declared);
+    let (Some(maximum), Some(original)) = (declared, original) else {
+        return None;
+    };
+    let selected = original.min(maximum);
+    *frozen = Some(Some(selected));
+    Some(selected)
 }
 
 impl Drop for HistorianProducer {
@@ -2030,9 +2300,182 @@ mod tests {
         assert_eq!(send_outcome(&Value::Null), SendOutcome::Unrecognized);
     }
 
+    #[tokio::test]
+    async fn dormant_stage_api_preserves_legacy_send_and_refuses_checks() {
+        assert!(!crate::historian_stage::lifecycle_enabled());
+        let server = fake_server(json!({"run_id":"run-1"}), vec![]).await;
+        let mut producer = client(&server).await;
+        producer
+            .start_stage_with_generation(
+                "legacy-child",
+                "different-stage-key",
+                "system",
+                "prompt",
+                "prov/model",
+                None,
+                100,
+                None,
+            )
+            .await
+            .unwrap();
+        let check = producer
+            .start_check_with_generation(
+                "check-key",
+                "check-system",
+                "input",
+                "prov/model",
+                None,
+                100,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(check, Err(HistorianProducerError::Subc(ref error)) if error.code == "historian_lane_dormant")
+        );
+        producer.close().await;
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 1);
+        assert_eq!(log.sends[0]["send_id"], "legacy-child");
+        assert_eq!(log.route_sessions, vec!["legacy-child"]);
+    }
+
+    #[tokio::test]
+    async fn queued_stage_reattaches_after_restart_without_retract_or_new_identity() {
+        let _lane = crate::historian_stage::enabled_test_lane();
+        let events = vec![
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
+            json!({"kind":"control","unit":{"type":"assistant_message","message":{"content":[{"type":"text","text":"stage reply"}]}}}),
+            json!({"kind":"control","unit":{"type":"run_finished"}}),
+        ];
+        let server = fake_server(
+            json!([
+                {"result":{"state":"pending","submission_id":"queued-1"}},
+                {"result":{"state":"active","run_id":"run-1"}}
+            ]),
+            events,
+        )
+        .await;
+        let key = crate::historian_stage::stage_key("/p", "pub", 7, "turn_two");
+        let mut first = client(&server).await;
+        let handle = first
+            .start_stage_with_generation(
+                "retained-child",
+                &key,
+                "system",
+                "prompt",
+                "prov/model",
+                None,
+                32_000,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(is_stage_submission(&handle.run_id));
+        first.close().await;
+        drop(first);
+        let mut recovered = client(&server).await;
+        assert_eq!(
+            recovered.status(&handle.run_id).await.unwrap(),
+            RunState::Active
+        );
+        let output = recovered
+            .await_output_with_timeout(&handle.run_id, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(output.text, "stage reply");
+        recovered.close().await;
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 2);
+        assert_eq!(log.sends[0], log.sends[1]);
+        assert_eq!(log.sends[0]["send_id"], key);
+        assert!(log.sends[0].get("schema").is_none());
+        assert!(log.retracts.is_empty());
+        assert!(log
+            .route_sessions
+            .iter()
+            .all(|session| session == "retained-child"));
+    }
+
+    #[tokio::test]
+    async fn checks_bind_distinct_fresh_sessions_and_never_historian_lineage() {
+        let _lane = crate::historian_stage::enabled_test_lane();
+        let server = fake_server(json!({"run_id":"run-1"}), vec![]).await;
+        let mut producer = client(&server).await;
+        let keys = [
+            "decision:revision=1:support:c1:hash=a:profile=p",
+            "decision:revision=1:support:c2:hash=a:profile=p",
+        ];
+        producer
+            .start_stage_with_generation(
+                "retained-historian",
+                "historian-key",
+                "historian-system",
+                "past-historian-context",
+                "prov/model",
+                None,
+                100,
+                None,
+            )
+            .await
+            .unwrap();
+        for key in keys {
+            producer
+                .start_check_with_generation(
+                    key,
+                    "check-system",
+                    "only-operands-and-window",
+                    "prov/model",
+                    None,
+                    100,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.route_sessions,
+            std::iter::once("retained-historian".to_string())
+                .chain(keys.map(crate::historian_stage::check_session_id))
+                .collect::<Vec<_>>()
+        );
+        for (send, key) in log.sends.iter().skip(1).zip(keys) {
+            assert_eq!(send["send_id"], key);
+            assert_eq!(send["system"], "check-system");
+            assert_eq!(send["prompt"], "only-operands-and-window");
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_lost_ack_keeps_original_request_for_recovery() {
+        let _lane = crate::historian_stage::enabled_test_lane();
+        let server =
+            fake_server_with_lost_send_reply(json!({"run_id":"run-1"}), vec![], true).await;
+        let key = crate::historian_stage::stage_key("/p", "pub", 3, "turn_one");
+        let mut producer = client(&server).await;
+        let handle = producer
+            .start_stage_with_generation("child", &key, "s", "p", "prov/model", None, 100, None)
+            .await
+            .unwrap();
+        let record = stage_submission(&handle.run_id).unwrap().unwrap();
+        assert_eq!(record["request"]["params"]["send_id"], key);
+        producer.close().await;
+        drop(producer);
+        let mut recovered = client(&server).await;
+        assert_eq!(
+            recovered.reattach_submission(&record).await.unwrap(),
+            "run-1"
+        );
+        recovered.close().await;
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 2);
+        assert_eq!(log.sends[0], log.sends[1]);
+    }
+
     #[derive(Debug, Default)]
     struct ServerLog {
         route_sessions: Vec<String>,
+        role_describes: Vec<Value>,
         sends: Vec<Value>,
         subscribes: Vec<Value>,
         retracts: Vec<Value>,
@@ -2052,6 +2495,21 @@ mod tests {
     async fn fake_server_with_lost_send_reply(
         send_response: Value,
         stream_events: Vec<Value>,
+        lose_first_reply: bool,
+    ) -> FakeServer {
+        fake_server_with_role_describe(
+            send_response,
+            stream_events,
+            json!({"capabilities": [], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}}),
+            lose_first_reply,
+        )
+        .await
+    }
+
+    async fn fake_server_with_role_describe(
+        send_response: Value,
+        stream_events: Vec<Value>,
+        role_describe_response: Value,
         mut lose_first_reply: bool,
     ) -> FakeServer {
         let temp = tempfile::tempdir().unwrap();
@@ -2080,6 +2538,11 @@ mod tests {
         let log_task = Arc::clone(&log);
         tokio::spawn(async move {
             let mut stream_events: VecDeque<Value> = stream_events.into();
+            let mut responses: VecDeque<Value> = send_response
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| vec![send_response])
+                .into();
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 authenticate_server(
@@ -2126,18 +2589,34 @@ mod tests {
                         FrameType::Request => {
                             let req: Value = serde_json::from_slice(&frame.body).unwrap();
                             match req.get("method").and_then(Value::as_str) {
+                                Some("role.describe") => {
+                                    log_task.lock().await.role_describes.push(req.clone());
+                                    send_response_frame(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        serde_json::to_vec(&role_describe_response).unwrap(),
+                                    )
+                                    .await;
+                                }
                                 Some("session.send") => {
                                     log_task.lock().await.sends.push(req["params"].clone());
                                     if lose_first_reply {
                                         lose_first_reply = false;
                                         continue;
                                     }
+                                    let response = if responses.len() > 1 {
+                                        responses.pop_front().unwrap()
+                                    } else {
+                                        responses.front().unwrap().clone()
+                                    };
                                     send_response_frame(
                                         &mut stream,
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&send_response).unwrap(),
+                                        serde_json::to_vec(&response).unwrap(),
                                     )
                                     .await;
                                 }
@@ -2280,9 +2759,10 @@ mod tests {
 
     #[tokio::test]
     async fn lost_send_reply_retry_reuses_attempt_send_id_after_reconnect() {
-        let server = fake_server_with_lost_send_reply(
+        let server = fake_server_with_role_describe(
             json!({"state":"active","run_id":"run-1"}),
             Vec::new(),
+            json!({"capabilities":["retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
             true,
         )
         .await;
@@ -2309,6 +2789,72 @@ mod tests {
         assert_eq!(log.sends.len(), 2);
         assert_eq!(log.sends[0]["send_id"], json!(session));
         assert_eq!(log.sends[1]["send_id"], json!(session));
+        assert_eq!(log.sends[0]["retention"], json!(86_400));
+        assert_eq!(log.sends[1]["retention"], json!(86_400));
+        assert_eq!(
+            log.role_describes.len(),
+            2,
+            "each new route is queried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_send_includes_one_day_retention_when_role_declares_group() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            false,
+        )
+        .await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:1", "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        client.close().await;
+
+        let log = server.log.lock().await;
+        assert_eq!(log.role_describes.len(), 1);
+        assert_eq!(
+            log.role_describes[0],
+            json!({"method":"role.describe","params":{}})
+        );
+        assert_eq!(log.sends[0]["retention"], json!(86_400));
+    }
+
+    #[tokio::test]
+    async fn first_send_omits_retention_when_role_does_not_declare_group() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:1", "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        client.close().await;
+
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 1);
+        assert!(log.sends[0].get("retention").is_none());
+    }
+
+    #[tokio::test]
+    async fn first_send_clamps_retention_to_role_maximum() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention"],"retention":{"max_seconds":43_200,"delete_within_ms":3_600_000}}),
+            false,
+        )
+        .await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:1", "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        client.close().await;
+
+        assert_eq!(server.log.lock().await.sends[0]["retention"], json!(43_200));
     }
 
     #[tokio::test]
@@ -2543,8 +3089,14 @@ mod tests {
         include_str!("../testdata/broca/send_request.model_variant_queue.json");
     const BROCA_SEND_MODEL_VARIANT_STEER: &str =
         include_str!("../testdata/broca/send_request.model_variant_steer.json");
+    const SEND_WITH_RETENTION: &str =
+        include_str!("../testdata/broca/send_request.model_variant_retention.json");
 
     fn golden_send_params(variant: Option<&str>) -> String {
+        golden_send_params_with_retention(variant, None)
+    }
+
+    fn golden_send_params_with_retention(variant: Option<&str>, retention: Option<u64>) -> String {
         let request = session_send_request(
             "s-1",
             "",
@@ -2553,6 +3105,7 @@ mod tests {
             variant,
             HISTORIAN_MAX_OUTPUT_TOKENS,
             None,
+            retention,
         )
         .unwrap();
         assert_eq!(request.method, "session.send");
@@ -2572,6 +3125,73 @@ mod tests {
             format!(
                 "{golden_body},\"tools\":[],\"generation\":{{\"max_output_tokens\":{HISTORIAN_MAX_OUTPUT_TOKENS}}}}}"
             )
+        );
+    }
+
+    /// The retention fixture keeps the runner fields first: `prompt`, `send_id`, nested
+    /// `model`, and integer retention seconds. This producer appends `tools` and
+    /// `generation` afterward.
+    #[test]
+    fn session_send_retention_matches_runner_contract_field_order() {
+        let golden_body = SEND_WITH_RETENTION
+            .strip_suffix('}')
+            .expect("retention golden is one JSON object");
+        assert_eq!(
+            golden_send_params_with_retention(Some("high"), Some(86_400)),
+            format!(
+                "{golden_body},\"tools\":[],\"generation\":{{\"max_output_tokens\":{HISTORIAN_MAX_OUTPUT_TOKENS}}}}}"
+            )
+        );
+    }
+
+    #[test]
+    fn retention_requires_a_declared_group_and_clamps_to_its_maximum() {
+        assert_eq!(
+            retention_from_role_describe(
+                &json!({"capabilities": ["retention"], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}})
+            ),
+            Some(86_400)
+        );
+        assert_eq!(
+            retention_from_role_describe(
+                &json!({"capabilities": [], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}})
+            ),
+            None
+        );
+        assert_eq!(
+            retention_from_role_describe(
+                &json!({"capabilities": ["retention"], "retention": {"max_seconds": 43_200, "delete_within_ms": 3_600_000}})
+            ),
+            Some(43_200)
+        );
+    }
+
+    #[test]
+    fn a_session_without_first_send_retention_cannot_opt_in_later() {
+        let mut frozen = None;
+        assert_eq!(select_session_retention(&mut frozen, None), None);
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(86_400)),
+            None,
+            "a later route cannot opt a session into retention"
+        );
+        assert_eq!(frozen, Some(None));
+    }
+
+    #[test]
+    fn a_reconnected_session_can_only_shorten_its_frozen_retention() {
+        let mut frozen = None;
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(86_400)),
+            Some(86_400)
+        );
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(43_200)),
+            Some(43_200)
+        );
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(172_800)),
+            Some(43_200)
         );
     }
 

@@ -1271,6 +1271,7 @@ export interface ModuleStateSyncClient {
             | "agent_drops.append"
             | "ctx_note"
             | "ctx_memory"
+            | "memory.curate"
             | "note.evaluate"
             | "historian.pending"
             | "historian.claim"

@@ -187,9 +187,37 @@ function requiredState(db: Database, key: HostRunnerKey): HostRunnerState {
     return state;
 }
 
+const commitBatches = new WeakSet<Database>();
+
+/** Publish a cancellable bridge pass atomically; nested record writes share this transaction. */
+export function commitHostRunnerBatch(
+    db: Database,
+    writes: readonly (() => void)[],
+    check: () => void,
+): void {
+    check();
+    db.transaction(() => {
+        commitBatches.add(db);
+        try {
+            for (const write of writes) {
+                check();
+                write();
+            }
+            // Synchronous SQLite can outlast the timer; check the clock before COMMIT.
+            check();
+        } finally {
+            commitBatches.delete(db);
+        }
+    }).immediate();
+}
+
 function writeTransaction(db: Database, site: string, write: () => void): void {
     // Do not catch a failed write as unavailability: entries must be durable before serving.
     try {
+        if (commitBatches.has(db)) {
+            write();
+            return;
+        }
         db.exec("BEGIN IMMEDIATE");
         const startedAt = performance.now();
         let committed = false;

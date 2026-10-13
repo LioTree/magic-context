@@ -95,6 +95,7 @@ pub const DOMAIN_TABLES: &[&str] = &[
     "compartment_history_versions",
     "compartment_events",
     "compartments",
+    "historian_runs",
     "memories",
     "memory_agent_fragments",
     "memory_classification_items",
@@ -105,10 +106,14 @@ pub const DOMAIN_TABLES: &[&str] = &[
     "memory_journal",
     "memory_mutation_log",
     "memory_pending_facts",
+    "memory_publications",
+    "memory_stage_attempts",
+    "memory_activity_ledger",
     "memory_verifications",
     "notes",
     "primer_candidates",
     "session_facts",
+    "subagent_invocations",
     "user_memories",
     "user_memory_candidates",
 ];
@@ -341,6 +346,10 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
         "ffe1e5a4d218c3a16cacc0a4c716eb227fa1bba59f203f035226d73ee0f88751",
     ),
     (
+        "historian_runs",
+        "4fdc0eabcd26ec85f2ad536402f2dbcc3d097a29644ab9f95683a40e38fa5643",
+    ),
+    (
         "memories",
         "58c79f0e321c82007bebfe3fb250e318786c920ac36320e6883d44013d051fd5",
     ),
@@ -377,6 +386,18 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
         "3df65a4de3a311e953e06adbe65c53f168c51e9847322130b5adff823ff6bb91",
     ),
     (
+        "memory_publications",
+        "366cf8bd34848e91be75433186cac20f902d40edf826ecbd24249ab28702fd43",
+    ),
+    (
+        "memory_stage_attempts",
+        "dbc66bedb9f92ff24ca83cb734892c2f2fea6c8d195912e869f68cfa26fabaa6",
+    ),
+    (
+        "memory_activity_ledger",
+        "7f73fa2ad2d786d34b29998e0d5250608c7c1fb9a22b9001c537928804feaa58",
+    ),
+    (
         "memory_pending_facts",
         "aea2c0879d21921958b5d4266604d658fb8ac5a1256b004b76a0567735cdea27",
     ),
@@ -399,6 +420,10 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     (
         "user_memories",
         "db3e60857602228326096491485382054f65432421e673b669b5a91f7dc8c865",
+    ),
+    (
+        "subagent_invocations",
+        "e99ff3c619f1905c7cd4ef83b6ef82bed73c2fffb5c12ff35d01fb6756718c58",
     ),
     (
         "user_memory_candidates",
@@ -1073,6 +1098,22 @@ impl HostStore {
             writes(tx).map_err(HostStoreError::from)
         })
         .map(|_| ())
+    }
+
+    /// Check telemetry tables against the pinned schema without waiting up to five seconds
+    /// for SQLite's writer lock; that wait budget belongs to compartment publication.
+    pub fn try_domain_transaction(
+        &mut self,
+        tables: &[&str],
+        writes: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
+    ) -> Result<(), HostStoreError> {
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let outcome = self.with_domain_transaction(tables, writes);
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(u64::from(
+                CONTEXT_BUSY_TIMEOUT_MS,
+            )))?;
+        outcome
     }
 
     /// The health block the status surface reports.

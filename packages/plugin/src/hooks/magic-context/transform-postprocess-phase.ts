@@ -117,6 +117,7 @@ import {
     type DroppedTokenReduction,
     estimateDroppedTokensFromTagReductions,
 } from "./dropped-token-estimate";
+import { createEditAdmission, isAdmissionUser, thinkingAnchor } from "./edit-admission";
 import {
     contextRefusalError,
     EmergencyFailClosedError,
@@ -995,6 +996,9 @@ export function clearRustModeBoundaryRecord(db: ContextDatabase, sessionId: stri
  * Rust-mode host thinking strips for prefix-bound models: replay the persisted
  * binding-mismatch set, apply an armed reactive recovery, and on a busting pass
  * freeze and remove every remaining signed block past the pass's first change.
+ * A module signed-thinking reset (bytes before the active turn's kept thinking
+ * changed) removes every signed block, the active turn's included, and skips the
+ * reactive restore of the turn's originals, which are bound to the old bytes.
  */
 function applyRustModeThinkingStrips(
     args: Parameters<typeof runRustModePostprocess>[0],
@@ -1006,6 +1010,11 @@ function applyRustModeThinkingStrips(
     const recoveryMessageIds = new Set<string>();
     let thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null = null;
     let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
+    // A module signed-thinking reset invalidates every signed block served before this
+    // pass, the active turn's included, so no thinking is protected from it.
+    const signedThinkingReset =
+        args.cacheBustingPass === true && args.moduleSignedThinkingReset === true;
+    const stripProtection = signedThinkingReset ? undefined : args.protectedThinkingMessages;
     {
         try {
             for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
@@ -1043,7 +1052,7 @@ function applyRustModeThinkingStrips(
             args.messages,
             args.resolvedProviderID,
             recoveryMessageIds,
-            args.protectedThinkingMessages,
+            stripProtection,
         );
         // On a busting pass of a prefix-bound model, every remaining assistant
         // with reasoning past the pass's first changed byte is persisted into the
@@ -1055,34 +1064,45 @@ function applyRustModeThinkingStrips(
         // is no permission to strip them, unless this host edited earlier
         // bytes itself on the same pass.
         const moduleBustStrips =
-            !args.activeThinkingTurn &&
-            args.cacheBustingPass === true &&
-            (args.moduleReasoningTrimOnly !== true || hostEditBeforeNewestThinking);
+            signedThinkingReset ||
+            (!args.activeThinkingTurn &&
+                args.cacheBustingPass === true &&
+                (args.moduleReasoningTrimOnly !== true || hostEditBeforeNewestThinking));
         const stripFrom =
-            args.thinkingBindingRecoveryEnabledForModel === true
+            args.thinkingBindingRecoveryEnabledForModel === true || signedThinkingReset
                 ? proactiveStripStartIndex({ ...args, cacheBustingPass: moduleBustStrips })
                 : null;
         if (stripFrom !== null) {
+            const stripped = args.messages.slice(stripFrom);
             const outcome = freezeReasoningOnBustingPass({
                 db: args.db,
                 sessionId: args.sessionId,
-                messages: args.messages.slice(stripFrom),
-                protectedMessages: args.protectedThinkingMessages,
+                messages: stripped,
+                protectedMessages: stripProtection,
                 alreadyFrozen: recoveryMessageIds,
             });
             if (outcome.strip) {
                 proactiveThinkingStrip = outcome.strip;
                 for (const id of outcome.strip.messageIds) recoveryMessageIds.add(id);
+            }
+            // The module already persisted the reset, so its removal is served even when
+            // this host's own record of it could not be written.
+            const removed = signedThinkingReset
+                ? new Set(findReasoningBearingAssistantIds(stripped))
+                : new Set(outcome.strip?.messageIds ?? []);
+            if (removed.size > 0) {
                 stripReasoningFromAssistantIds(
                     args.messages,
                     args.resolvedProviderID,
-                    new Set(outcome.strip.messageIds),
-                    args.protectedThinkingMessages,
+                    removed,
+                    stripProtection,
                 );
             }
         }
     }
-    args.restoreLatestTurnOriginals?.();
+    // The turn's originals are bound to the bytes the reset changed: restoring them would
+    // put back exactly the thinking the reset removed.
+    if (!signedThinkingReset) args.restoreLatestTurnOriginals?.();
     return { thinkingBindingRecovery, proactiveThinkingStrip };
 }
 
@@ -1120,6 +1140,14 @@ export function runRustModePostprocess(args: {
      * blocks on a prefix-bound model.
      */
     moduleReasoningTrimOnly?: boolean;
+    /**
+     * The module removed every signed thinking block it serves on this busting pass
+     * (`signed_thinking_reset` in its response): bytes before the active turn's kept
+     * thinking changed, so no signed block from before this pass is valid any more.
+     * The host strips and freezes all of them, the active turn's included, and skips
+     * the reactive restore of the turn's originals.
+     */
+    moduleSignedThinkingReset?: boolean;
     /**
      * Set when the module deferred but this pass stops serving a frozen
      * last-known-good replay. The frozen replay served the messages that arrived
@@ -2048,6 +2076,45 @@ export async function runPostTransformPhase(
     const protectedThinkingMessages = new Set(
         args.messages.filter((message) => message.parts.some((part) => retainedThinking.has(part))),
     );
+    // Edit admission. On prefix-bound models a signed thinking block is valid only while
+    // every byte before it is unchanged, so an edit before the last current-turn thinking
+    // block still sent is held: not applied and not persisted. Built once, before any edit
+    // of this pass, over the same messages and `info.id` values the strips below use.
+    const editAdmission = createEditAdmission({
+        messages: args.messages,
+        stableId: (message) => message.info.id,
+        partsOf: (message) => message.parts,
+        isRealUser: isAdmissionUser,
+        prefixBound: args.thinkingBindingRecoveryEnabledForModel === true,
+        isRetainedThinking: (_message, part) => retainedThinking.has(part),
+        anchorOf: thinkingAnchor,
+        onUnresolved: (reason) =>
+            sessionLog(
+                args.sessionId,
+                `edit admission: unresolved thinking boundary (${reason}); holding every edit not provably after it`,
+            ),
+    });
+    const heldWholeMessages = new Map<string, string[]>();
+    const admitWholeMessage =
+        (lane: string) =>
+        (message: MessageLike): boolean => {
+            if (editAdmission.admit({ kind: "message", id: message.info.id, block: "whole" }))
+                return true;
+            const held = heldWholeMessages.get(lane) ?? [];
+            held.push(message.info.id ?? "<no id>");
+            heldWholeMessages.set(lane, held);
+            return false;
+        };
+    const logHeldWholeMessages = (): void => {
+        if (editAdmission.frame.kind !== "boundary") return;
+        for (const [lane, ids] of heldWholeMessages) {
+            sessionLog(
+                args.sessionId,
+                `edit admission: held lane=${lane} coords=${ids.map((id) => `${id}:whole`).join(",")} boundary=${editAdmission.frame.messageId ?? "<unresolved>"} held_edits=${ids.length}`,
+            );
+        }
+        heldWholeMessages.clear();
+    };
     const newTargets = protectNewTagMutations(
         args.messages,
         args.targets,
@@ -3428,6 +3495,7 @@ export async function runPostTransformPhase(
                 args.messages,
                 args.resolvedProviderID,
                 recordFirstApplicationAt,
+                admitWholeMessage("placeholder"),
             );
             const protectedTailStart = Math.max(
                 0,
@@ -3438,7 +3506,11 @@ export async function runPostTransformPhase(
                 protectedTailStart,
                 args.resolvedProviderID,
                 recordFirstApplicationAt,
+                admitWholeMessage("system-injected"),
             );
+            logHeldWholeMessages();
+            // Messages hidden behind the compaction marker are not in the request this
+            // pass sends, so storing a decision for them changes nothing sent now.
             const hiddenMessages = args.hiddenMessagesAtCompactionSeam ?? [];
             const hiddenDroppedResult = stripDroppedPlaceholderMessages(
                 hiddenMessages,

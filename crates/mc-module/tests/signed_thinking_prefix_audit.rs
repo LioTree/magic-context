@@ -269,6 +269,8 @@ enum Lane {
     Caveman,
     Image,
     Placeholder,
+    /// An older assistant message holding only a host notification.
+    SystemInjected,
 }
 
 const SUMMARY_TEXT: &str = "I have finished reading the parser and the lexer. The parser consumes tokens from the lexer, and the error recovery path is incomplete because it never resynchronises after an unexpected token.";
@@ -553,6 +555,29 @@ impl Fixture {
             );
             self.served = self.pass();
         }
+        if self.lane == Lane::SystemInjected {
+            self.push(
+                "system-injected",
+                "assistant",
+                vec![json!({"type":"text","text":"<system-reminder>Background task bg-7 completed; its output is ready.</system-reminder>"})],
+            );
+            // The strip spares the newest 40 messages, which may still be actionable, so the
+            // notification needs that many later messages before it is eligible.
+            for i in 0..20 {
+                let id = format!("filler-read-{i}");
+                self.push(
+                    &format!("filler-{i}"),
+                    "assistant",
+                    vec![read_call(&id, &format!("/project/notes/{i}.md"))],
+                );
+                self.push(
+                    &format!("filler-{i}-result-0"),
+                    "tool",
+                    vec![result(&id, "read", &format!("note {i}\n"))],
+                );
+            }
+            self.served = self.pass();
+        }
         if !subagent {
             audit_assert_eq!(self.mock.check(&self.wire()), None);
             self.user_turn(
@@ -701,14 +726,18 @@ impl Fixture {
             Lane::Caveman => !text.contains(SUMMARY_TEXT),
             Lane::Image => !text.contains("\"media\""),
             Lane::Placeholder => !text.contains("[dropped §998§]"),
+            Lane::SystemInjected => !text.contains("Background task bg-7"),
         }
     }
 }
 
 /// Lanes whose mid-loop bust changes the request before a signed thinking block the request
-/// still carries, which a strict-binding provider rejects.
+/// still carries, which a strict-binding provider rejects. Only a primary's Todo lane is
+/// exposed. A primary's HardFold is not: the signed-prefix head freeze replays m0/m1
+/// unchanged for the whole open signed turn, so the fold is held (no edit, no error) and
+/// lands at the next user turn.
 fn exposed(subagent: bool, lane: Lane) -> bool {
-    !subagent && matches!(lane, Lane::HardFold | Lane::Todo | Lane::Placeholder)
+    !subagent && matches!(lane, Lane::Todo)
 }
 
 fn mid_loop(profile: &str, subagent: bool, lane: Lane) {
@@ -890,7 +919,7 @@ fn control(profile: &str, lane: Lane) {
 // supersession, the 85% force band, reasoning clearing and the stale ctx_reduce strip
 // did not price a bust or select work here even at a new user turn, so a held result
 // for them would be vacuous; the report covers them from the code.
-const PRIMARY_LANES: [Lane; 9] = [
+const PRIMARY_LANES: [Lane; 10] = [
     Lane::DropFull,
     Lane::Wall95,
     Lane::Flush,
@@ -900,11 +929,25 @@ const PRIMARY_LANES: [Lane; 9] = [
     Lane::Caveman,
     Lane::Image,
     Lane::Placeholder,
+    Lane::SystemInjected,
 ];
 // A subagent pass at the execute threshold is already allowed to change the request
 // (the module reports a SOFT `m1_delta` pass), so a held result here is the thinking
 // guard declining the edit, not a missing permission.
-const SUBAGENT_LANES: [Lane; 3] = [Lane::DropFull, Lane::Wall95, Lane::Placeholder];
+const SUBAGENT_LANES: [Lane; 4] = [
+    Lane::DropFull,
+    Lane::Wall95,
+    Lane::Placeholder,
+    Lane::SystemInjected,
+];
+
+/// Lanes added after the Claude Code lane list was frozen run only on the OpenCode profile.
+/// Claude Code keeps earlier turns' signed thinking on a bust, so its new-user-turn release
+/// fails until the module strips that completed-turn thinking; lanes join its list together
+/// with that strip (rollout step 8 in docs/designs/signed-thinking-hold.md).
+fn on_profile(profile: &str, lane: Lane) -> bool {
+    profile != "claude-code-anthropic" || lane != Lane::SystemInjected
+}
 
 /// `MC_AUDIT_LANE=<Lane>` restricts a diagnostic run to one lane.
 fn selected(lane: Lane) -> bool {
@@ -917,19 +960,28 @@ macro_rules! audit {
             use super::*;
             #[test]
             fn primary_mid_loop() {
-                for lane in PRIMARY_LANES.into_iter().filter(|l| selected(*l)) {
+                for lane in PRIMARY_LANES
+                    .into_iter()
+                    .filter(|l| selected(*l) && on_profile($profile, *l))
+                {
                     mid_loop($profile, false, lane);
                 }
             }
             #[test]
             fn subagent_run() {
-                for lane in SUBAGENT_LANES.into_iter().filter(|l| selected(*l)) {
+                for lane in SUBAGENT_LANES
+                    .into_iter()
+                    .filter(|l| selected(*l) && on_profile($profile, *l))
+                {
                     mid_loop($profile, true, lane);
                 }
             }
             #[test]
             fn control_at_new_user_turn() {
-                for lane in PRIMARY_LANES.into_iter().filter(|l| selected(*l)) {
+                for lane in PRIMARY_LANES
+                    .into_iter()
+                    .filter(|l| selected(*l) && on_profile($profile, *l))
+                {
                     control($profile, lane);
                 }
             }
@@ -1133,6 +1185,34 @@ fn parked_force_and_flush_are_not_standing_permissions() {
     }
 }
 
+/// Claude Code with an armed `/ctx-flush` inside an open signed turn: the signed-prefix head
+/// freeze holds the flush. The pass permits no prefix bust, the refresh stays armed, and
+/// nothing is parked in `held_release` (Claude Code does not park triggers).
+fn assert_claude_code_flush_held_mid_turn(f: &Fixture) {
+    audit_assert!(!f.served.prefix_bust_permitted);
+    let meta = f.store.load_meta(&f.req.session_id).unwrap().meta;
+    audit_assert!(meta.soft_refresh_pending);
+    audit_assert!(meta.held_release.is_none());
+}
+
+/// Ends the turn and serves the first pass of the next one, where the held flush lands.
+/// Unlike `next_user_turn`, this does not require the provider mock to accept the release:
+/// Claude Code keeps thinking blocks from older turns, so the provider mock rejects every
+/// prefix rewrite at a new user turn on that profile (the `control` audit records this).
+fn claude_code_flush_release(f: &mut Fixture, mid: &str) {
+    let text = format!(
+        "Step {}: this part of the work is done and verified.",
+        f.step + 1
+    );
+    f.respond(vec![json!({"type":"text","text":text})], vec![], true);
+    f.user_turn(
+        mid,
+        "Continue with the next part of the parser work; keep using tools until done.",
+        vec![],
+    );
+    f.served = f.pass();
+}
+
 #[test]
 fn claude_code_held_flush_retains_legacy_profile_gate() {
     let mut f = Fixture::new(
@@ -1144,6 +1224,8 @@ fn claude_code_held_flush_retains_legacy_profile_gate() {
     f.tool_loop(4);
     f.arm_and_bust(false);
     f.served = f.pass();
+    assert_claude_code_flush_held_mid_turn(&f);
+    claude_code_flush_release(&mut f, "flush-profile-gate-release");
     audit_assert!(f.served.prefix_bust_permitted);
     let meta = f.store.load_meta(&f.req.session_id).unwrap().meta;
     audit_assert!(!meta.soft_refresh_pending);
@@ -1162,6 +1244,8 @@ fn step2_review_claude_code_gate_preserves_guidance_adoption() {
     f.arm_and_bust(false);
     f.ctx.guidance_date = Some("2026-09-02".into());
     f.served = f.pass();
+    assert_claude_code_flush_held_mid_turn(&f);
+    claude_code_flush_release(&mut f, "review-guidance-gate-release");
     let meta = f.store.load_meta(&f.req.session_id).unwrap().meta;
     assert!(f.served.prefix_bust_permitted);
     assert!(!meta.soft_refresh_pending);
@@ -1202,6 +1286,8 @@ fn step2_review_claude_code_gate_preserves_pending_overlay_drain() {
         .unwrap();
     f.req.auto_search_enabled = true;
     f.served = f.pass();
+    assert_claude_code_flush_held_mid_turn(&f);
+    claude_code_flush_release(&mut f, "review-overlay-gate-release");
     let meta = f.store.load_meta(&f.req.session_id).unwrap().meta;
     assert!(f.served.prefix_bust_permitted);
     assert!(!meta.soft_refresh_pending);

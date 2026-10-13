@@ -204,6 +204,15 @@ export function planMemoryRevision(decision: RevisionDecision, context: GateCont
     const spans: EvidenceSpan[] = [];
     const checks: PlannedCheck[] = [];
     const finalTokens = scanConcreteTokens(decision.finalText);
+    // Consolidation must keep each source's concrete facts in the surviving memory.
+    // Mentioning an identifier or number in evidence does not preserve it in the result.
+    if (
+        decision.action === "merge" &&
+        context.sources.some((source) =>
+            scanConcreteTokens(source.content).some((token) => !finalTokens.includes(token)),
+        )
+    )
+        return refused("dropped_token");
     for (const { operand, change } of removed) {
         const span = matchFactEvidence(
             context.blocks,

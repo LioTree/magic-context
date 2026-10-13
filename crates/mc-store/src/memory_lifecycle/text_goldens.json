@@ -306,6 +306,7 @@
         "config.json",
         "a.b.c",
         "A_B",
+        "_x",
         "9_9"
       ]
     },
@@ -335,6 +336,17 @@
         "3",
         "NARROW_CHECK_WINDOW_MAX",
         "1200"
+      ]
+    },
+    {
+      "input": "retry_limit is 17; _private_limit = 3; retry_limit17 is an identifier, not 17",
+      "expected": [
+        "retry_limit",
+        "17",
+        "_private_limit",
+        "3",
+        "retry_limit17",
+        "17"
       ]
     }
   ],

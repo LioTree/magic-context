@@ -1,4 +1,6 @@
+import { registerNoProposalReviewWitnesses } from "@magic-context/core/shared/memory-no-proposals-review.test";
 import {
+	type ProjectionDriver,
 	type ProjectionFixture,
 	type ProjectionOptions,
 	registerMemoryProjectionRegressions,
@@ -40,7 +42,7 @@ function textOf(message: unknown): string {
 		.join("");
 }
 
-registerMemoryProjectionRegressions({
+const driver: ProjectionDriver = {
 	host: "Pi",
 	open: createTestDb,
 	hard: (f, sessionId, render) => {
@@ -61,4 +63,7 @@ registerMemoryProjectionRegressions({
 			materialized: result.m0Materialized,
 		};
 	},
-});
+};
+
+registerMemoryProjectionRegressions(driver);
+registerNoProposalReviewWitnesses(driver);

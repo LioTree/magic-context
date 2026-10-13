@@ -329,7 +329,9 @@ describe("memory revision deterministic gates", () => {
     test("compatible two-source merge plans disproof kept and cross-source checks", async () => {
         const f = fixture();
         f.decision.action = "merge";
-        f.decision.added = [];
+        f.decision.added = [
+            { text: "Limit remains 32 KiB. ", evidence: f.decision.changes[0]!.evidence },
+        ];
         f.context.sources[0]!.content = "Limit is 32 KiB. Keep the rule. ";
         f.context.sources.push({
             id: 2,
@@ -339,11 +341,12 @@ describe("memory revision deterministic gates", () => {
             content: "Other rule.",
         });
         f.decision.expectedSources.push({ id: 2, revision: 1 });
-        f.decision.finalText = "Keep the rule. Other rule.";
-        f.decision.changes[0]!.replacement = false;
+        f.decision.finalText = "Limit remains 32 KiB. Keep the rule. Other rule.";
         expect((await assess(f)).calls.map((request) => request.kind)).toEqual([
             "disproof",
+            "support",
             "kept-clause",
+            "compatibility",
             "compatibility",
         ]);
         expect((await assess(f, (request) => request.kind === "compatibility")).reason).toBe(
@@ -396,3 +399,36 @@ describe("memory revision deterministic gates", () => {
         expect(result).toMatchObject({ ok: false, reason: "malformed_check", retryable: false });
     });
 });
+
+for (const [name, text, preserved] of [
+    ["keeps each source identifier and number in the survivor", "retry_limit remains 17. ", true],
+    ["refuses a lost identifier even if evidence repeats it", "The limit remains 17. ", false],
+    ["refuses a lost number even if evidence repeats it", "retry_limit remains bounded. ", false],
+] as const) {
+    test(`merge ${name}`, async () => {
+        const f = fixture();
+        const evidence = { blockStartOrdinal: 42, excerpt: "retry_limit was 17 and remains 17." };
+        f.decision.action = "merge";
+        f.context.sources[0]!.content = "retry_limit was 17. Keep the rule. ";
+        f.context.sources.push({
+            id: 2,
+            revision: 1,
+            projectPath: "project",
+            status: "active",
+            content: "Other rule.",
+        });
+        f.decision.expectedSources.push({ id: 2, revision: 1 });
+        f.decision.changes[0]!.evidence = evidence;
+        f.decision.added = [{ text, evidence }];
+        f.decision.finalText = `${text}Keep the rule. Other rule.`;
+        f.context.blocks[0]!.parts = [evidence.excerpt];
+        f.context.blocks[0]!.joinedText = evidence.excerpt;
+        const result = await assess(f);
+        expect(result.ok).toBe(preserved);
+        if (preserved) expect(result.calls.length).toBeGreaterThan(0);
+        else {
+            expect(result.reason).toBe("dropped_token");
+            expect(result.calls).toHaveLength(0);
+        }
+    });
+}

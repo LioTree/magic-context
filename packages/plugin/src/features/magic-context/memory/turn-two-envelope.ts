@@ -11,7 +11,7 @@
  */
 import { splitMemoryClauses } from "./lifecycle-text";
 
-/** Actions a turn-two decision may name. */
+/** Known reply actions, including unsupported actions that are dropped rather than retried. */
 export const TURN_TWO_ACTIONS = [
     "new",
     "covered",
@@ -20,8 +20,8 @@ export const TURN_TWO_ACTIONS = [
     "merge",
     "replaces",
     "abstain",
-    // Operations that need a human approval: they become proposals in the review
-    // inbox (`memory_tool_proposals`) and are never applied automatically.
+    // Recognized so a model's unsupported retirement or rule promotion can be
+    // dropped and logged without retrying the entire envelope.
     "retire",
     "promote_rule",
 ] as const;
@@ -320,8 +320,8 @@ export function buildTurnTwoPrompt(input: {
     const lines: string[] = [
         "Turn two: reconcile each candidate fact with existing project memory.",
         'Reply with exactly one JSON object: {"decisions":[...],"scores":[...]}.',
-        "One decision per fact_id. Actions: new, covered, conflict, edit, merge, replaces, abstain, retire, promote_rule.",
-        "covered needs target_id, revision and clauses; conflict, retire and promote_rule need target_id; edit and replaces need target_id, revision, removed, replaced, kept, added and final_text; merge needs sources, survivor_id, removed, replaced, kept, added and final_text.",
+        "One decision per fact_id. Actions: new, covered, conflict, edit, merge, replaces, abstain.",
+        "covered needs target_id, revision and clauses; conflict needs target_id; edit and replaces need target_id, revision, removed, replaced, kept, added and final_text; merge needs sources, survivor_id, removed, replaced, kept, added and final_text.",
         "Every removed, replaced and added clause cites a block start ordinal of that fact's own blocks and an exact excerpt.",
     ];
     if (input.lexicalOnly) lines.push(LEXICAL_ONLY_NOTICE);

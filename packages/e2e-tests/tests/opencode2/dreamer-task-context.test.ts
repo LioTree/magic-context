@@ -147,19 +147,16 @@ test("OpenCode 2 shapes all six dream routes and keeps timer work in its owning 
             console.log(`manual dream task=${task} recorded result=${JSON.stringify(result)}`);
             expect(result.status).toBe("completed");
             if (task === "curate") {
-                expect(result.progress).toContain("1 memory operation proposed (update)");
-                expect(result.progress).not.toContain("applied");
+                expect(result.progress).toContain("1 memory operation applied (update)");
+                expect(result.progress).not.toContain("proposed");
                 expect(JSON.stringify(db.prepare("SELECT * FROM memories WHERE id = ?").get(ids[0]!)))
-                    .toBe(memoryBefore!);
+                    .not.toBe(memoryBefore!);
+                expect(db.prepare("SELECT content FROM memories WHERE id = ?").get(ids[0]!)).toEqual({ content: "Fixture claim is recorded in fact.txt. Clarification 1 preserves the fixture fact." });
+                expect(db.prepare("SELECT previous_text FROM memory_history WHERE memory_id = ?").all(ids[0]!)).toEqual([{ previous_text: "Fixture claim 0 is recorded in fact.txt." }]);
                 const proposals = db.prepare(
                     "SELECT target_ids_json, proposal_json, reason FROM memory_tool_proposals WHERE project_path = ? AND writer = 'curate' AND operation = 'update'",
                 ).all(project) as { target_ids_json: string; proposal_json: string; reason: string }[];
-                expect(proposals).toHaveLength(1);
-                expect(JSON.parse(proposals[0]!.target_ids_json)).toEqual([ids[0]!]);
-                expect(proposals[0]!.reason).toBe("MEMORY_PENDING_PROPOSAL");
-                expect(JSON.parse(proposals[0]!.proposal_json)).toMatchObject({
-                    content: "Fixture claim is recorded in fact.txt. Clarification 1 preserves the fixture fact.",
-                });
+                expect(proposals).toHaveLength(0);
             }
         }
         expect(searchCalls).toBe(1);

@@ -53,8 +53,22 @@ impl FacadeMutationTxn<'_> {
                 |row| row.get(0),
             )
             .map_err(crate::FacadeMemoryMutationError::storage)?;
-        let key = crate::memory_lifecycle::applier::fresh_decision_key("agent-history", now_ms);
-        self.tx.execute("INSERT INTO memory_history(memory_id,revision,previous_text,after_text,applied_at,reason,evidence_json,source_ids_json,decision_key) VALUES(?1,?2,?3,?4,?5,?6,'[]','[]',?7)",params![memory.id,revision,memory.content,after,now_ms,operation,key]).map_err(crate::FacadeMemoryMutationError::storage)?;
+        let operation = if self.automated {
+            operation.replace("agent_", "curate_")
+        } else {
+            operation.to_string()
+        };
+        let key = crate::memory_lifecycle::applier::fresh_decision_key(
+            if self.automated {
+                "curate-history"
+            } else {
+                "agent-history"
+            },
+            now_ms,
+        );
+        let before = serde_json::to_string(memory)
+            .map_err(|error| crate::FacadeMemoryMutationError::Storage(error.to_string()))?;
+        self.tx.execute("INSERT INTO memory_history(memory_id,revision,previous_text,after_text,applied_at,reason,before_json,evidence_json,source_ids_json,decision_key) VALUES(?1,?2,?3,?4,?5,?6,?8,'[]','[]',?7)",params![memory.id,revision,memory.content,after,now_ms,operation,key,before]).map_err(crate::FacadeMemoryMutationError::storage)?;
         self.tx
             .execute(
                 "UPDATE memories SET revision=revision+1 WHERE id=?1",
@@ -77,7 +91,7 @@ impl FacadeMutationTxn<'_> {
         visible_texts: &[VisibleText],
         now_ms: i64,
     ) -> Result<(), String> {
-        if lines.is_empty() {
+        if self.automated || lines.is_empty() {
             return Ok(());
         }
         self.tx.execute("INSERT OR IGNORE INTO memory_agent_fragments(session_id,harness,project_path,operation_key,memory_ids_json,current_id,lines,visible_texts_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![session,FRAGMENT_HARNESS,project,key,serde_json::to_string(ids).map_err(|e| e.to_string())?,current_id,lines.join("\n"),serde_json::to_string(visible_texts).map_err(|e| e.to_string())?,now_ms]).map_err(|e| e.to_string())?;

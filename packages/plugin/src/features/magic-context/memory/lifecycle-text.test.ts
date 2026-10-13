@@ -74,6 +74,11 @@ describe("memory lifecycle text goldens", () => {
             "OTHER_REFUSAL_CODE",
         ]);
         expect(scanConcreteTokens("164 KiB")).not.toContain("64 KiB");
+        expect(
+            scanConcreteTokens(
+                "retry_limit is 17; _private_limit = 3; retry_limit17 is an identifier, not 17",
+            ),
+        ).toEqual(["retry_limit", "17", "_private_limit", "3", "retry_limit17", "17"]);
     });
     test("marker list includes renderer constants and literal user markers are rejected", () => {
         expect(EVIDENCE_MARKERS).toEqual([

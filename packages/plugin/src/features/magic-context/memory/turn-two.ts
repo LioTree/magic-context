@@ -24,12 +24,14 @@
  * `authority_elsewhere` (the Rust module, not this process, owns the project's
  * memory), and backlog facts beyond `RETRY_BACKLOG_PER_RUN`.
  */
+
+import { sessionLog } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import {
     type ApplierReceipt,
     applyHistorianRevision,
     applyMemoryAdmission,
-    MEMORY_PENDING_PROPOSAL,
+    assertMemoryFactReservation,
     resolveFactDecision,
     tsOwnsMemory,
 } from "./lifecycle-applier";
@@ -193,6 +195,10 @@ export type TurnTwoRecoveryResolver = (record: TurnTwoStageRecord) =>
           reattach(): Promise<TurnTwoReattach>;
           /** Close the stage's hidden child session once none of its facts is in flight. */
           close?(): Promise<void>;
+          /** Called under the give-up write lock; a renewed ownership lease can veto release. */
+          canRelease?(): boolean;
+          /** Called only after the give-up transaction commits, for carrier-specific release logging. */
+          onRelease?(): void;
       })
     | "busy"
     | null;
@@ -252,6 +258,7 @@ interface FactRow {
     content: string;
     anchor_known: number;
     fact_attempts: number;
+    stageKey?: string;
 }
 
 const PLACEHOLDER_PROFILE: ReportedProfile = {
@@ -354,27 +361,44 @@ export function turnTwoDecisionKey(
 }
 
 /** Consume one attempt of every fact still reserved by `stageKey`. */
-function consumeStageAttempts(db: Database, stageKey: string, reason: string, state: string): void {
-    db.transaction(() => {
-        const facts = db
-            .prepare(
-                "SELECT id,project_path FROM memory_pending_facts WHERE state='in_flight' AND reserved_stage_key=?",
+function consumeStageAttempts(
+    db: Database,
+    stageKey: string,
+    reason: string,
+    state: string,
+    canRelease?: () => boolean,
+): boolean {
+    return db
+        .transaction(() => {
+            if (
+                !db
+                    .prepare(
+                        "SELECT 1 FROM memory_stage_attempts WHERE stage_key=? AND state IN ('reserved','sending','replied')",
+                    )
+                    .get(stageKey)
             )
-            .all(stageKey) as Array<{ id: number; project_path: string }>;
-        for (const fact of facts)
-            resolveFactDecision(db, {
-                key: JSON.stringify([stageKey, fact.id, reason]),
-                projectPath: fact.project_path,
-                factId: fact.id,
-                operation: "turn_two",
-                state: "retryable",
-                reason,
-            });
-        db.prepare("UPDATE memory_stage_attempts SET state=? WHERE stage_key=?").run(
-            state,
-            stageKey,
-        );
-    }).immediate();
+                return false;
+            if (canRelease && !canRelease()) return false;
+            const facts = db
+                .prepare(
+                    "SELECT id,project_path FROM memory_pending_facts WHERE state='in_flight' AND reserved_stage_key=?",
+                )
+                .all(stageKey) as Array<{ id: number; project_path: string }>;
+            for (const fact of facts)
+                resolveFactDecision(db, {
+                    key: JSON.stringify([stageKey, fact.id, reason]),
+                    projectPath: fact.project_path,
+                    factId: fact.id,
+                    operation: "turn_two",
+                    state: "retryable",
+                    reason,
+                });
+            db.prepare(
+                "UPDATE memory_stage_attempts SET state=? WHERE stage_key=? AND state IN ('reserved','sending','replied')",
+            ).run(state, stageKey);
+            return true;
+        })
+        .immediate();
 }
 
 function readStageRequest(db: Database, stageKey: string): StageRequest | null {
@@ -525,7 +549,7 @@ function reserveTurnTwo(
 
 function recordStageReply(db: Database, stageKey: string, reply: TurnTwoStageReply): void {
     db.prepare(
-        "UPDATE memory_stage_attempts SET reply_json=?,reported_profile_json=?,usage_json=?,state='replied' WHERE stage_key=?",
+        "UPDATE memory_stage_attempts SET reply_json=?,reported_profile_json=?,usage_json=?,state='replied' WHERE stage_key=? AND state IN ('reserved','sending')",
     ).run(
         JSON.stringify({ text: reply.text, lengthCapped: reply.lengthCapped }),
         JSON.stringify(reply.profile),
@@ -535,6 +559,7 @@ function recordStageReply(db: Database, stageKey: string, reply: TurnTwoStageRep
 }
 
 interface ResolveContext {
+    log?: (message: string) => void;
     memoryEnabled: boolean;
     autoPromote: boolean;
     enforcedJson: boolean;
@@ -565,7 +590,7 @@ async function resolveStage(
 ): Promise<boolean> {
     const row = db
         .prepare(
-            "SELECT reply_json,reported_profile_json FROM memory_stage_attempts WHERE stage_key=?",
+            "SELECT reply_json,reported_profile_json FROM memory_stage_attempts WHERE stage_key=? AND state='replied'",
         )
         .get(stageKey) as {
         reply_json: string | null;
@@ -585,25 +610,52 @@ async function resolveStage(
     }
     const facts = db
         .prepare(
-            "SELECT id,project_path,publication_id,category,content,anchor_known,fact_attempts FROM memory_pending_facts WHERE state='in_flight' AND reserved_stage_key=? ORDER BY id",
+            "SELECT id,project_path,publication_id,category,content,anchor_known,fact_attempts,reserved_stage_key AS stageKey FROM memory_pending_facts WHERE state='in_flight' AND reserved_stage_key=? ORDER BY id",
         )
         .all(stageKey) as FactRow[];
     for (const fact of facts) {
         const attempts = request.factAttempts[String(fact.id)] ?? fact.fact_attempts;
         const decision = envelope.decisions.get(fact.id);
         try {
+            assertMemoryFactReservation(db, {
+                stageKey,
+                factId: fact.id,
+                projectPath: fact.project_path,
+                factAttempts: attempts,
+            });
             await resolveFact(db, fact, attempts, decision, profile, context, stageKey);
         } catch (error) {
             if (error instanceof CheckOutcomeUnknownError) return false;
             throw error;
         }
     }
-    recordItemScores(db, request.items, envelope.scores);
-    if (stillReserved(db, stageKey) === 0)
-        db.prepare("UPDATE memory_stage_attempts SET state='resolved' WHERE stage_key=?").run(
-            stageKey,
-        );
+    db.transaction(() => {
+        if (
+            !db
+                .prepare(
+                    "SELECT 1 FROM memory_stage_attempts WHERE stage_key=? AND state='replied'",
+                )
+                .get(stageKey)
+        )
+            return;
+        recordItemScores(db, request.items, envelope.scores);
+        if (stillReserved(db, stageKey) === 0)
+            db.prepare(
+                "UPDATE memory_stage_attempts SET state='resolved' WHERE stage_key=? AND state='replied'",
+            ).run(stageKey);
+    }).immediate();
     return true;
+}
+
+function factReservation(fact: FactRow) {
+    return fact.stageKey
+        ? {
+              stageKey: fact.stageKey,
+              factId: fact.id,
+              projectPath: fact.project_path,
+              factAttempts: fact.fact_attempts,
+          }
+        : undefined;
 }
 
 function pending(
@@ -620,6 +672,7 @@ function pending(
         factId: fact.id,
         operation: "turn_two",
         state: "decided_pending",
+        reservation: factReservation(fact),
         reason,
         memoryId,
         mapping,
@@ -665,25 +718,12 @@ async function resolveFact(
             return pending(db, fact, key, "abstain");
         case "retire":
         case "promote_rule": {
-            // Retirement and standing-rule promotion need a human approval: they go to
-            // the review inbox as proposals, and nothing is retired automatically.
-            const target = liveTarget(db, fact.project_path, decision.targetId);
-            if (!target) return pending(db, fact, key, "proposal_target");
-            return resolveFactDecision(db, {
-                key,
-                projectPath: fact.project_path,
-                factId: fact.id,
-                operation: "turn_two",
-                state: "decided_pending",
-                reason: MEMORY_PENDING_PROPOSAL,
-                memoryId: target.memory.id,
-                proposal: {
-                    sourceSessionId,
-                    operation: decision.action === "retire" ? "archive" : "promote_rule",
-                    targetIds: [target.memory.id],
-                    proposal: { factId: fact.id, action: decision.action },
-                },
-            });
+            // Turn two may patch grounded clauses, but cannot retire memories or
+            // promote standing rules. Record the dropped decision, not a proposal.
+            const message = `[memory] turn two dropped ${decision.action} for fact ${fact.id}`;
+            if (context.log) context.log(message);
+            else sessionLog(context.owner.sessionId, message);
+            return pending(db, fact, key, `${decision.action}_dropped`);
         }
         case "new":
             return applyMemoryAdmission(db, {
@@ -693,6 +733,7 @@ async function resolveFact(
                 memoryEnabled: context.memoryEnabled,
                 autoPromote: context.autoPromote,
                 factId: fact.id,
+                reservation: factReservation(fact),
             });
         case "conflict": {
             if (!context.autoPromote) {
@@ -712,6 +753,7 @@ async function resolveFact(
                 autoPromote: context.autoPromote,
                 conflictTargetId: decision.targetId,
                 factId: fact.id,
+                reservation: factReservation(fact),
             });
         }
         case "covered":
@@ -719,7 +761,7 @@ async function resolveFact(
         case "edit":
         case "replaces":
         case "merge":
-            return resolveRevision(db, fact, key, decision, profile, context);
+            return resolveRevision(db, fact, key, decision, profile, context, stageKey);
     }
 }
 
@@ -746,6 +788,7 @@ function resolveCovered(
             operation: "turn_two",
             state: "retryable",
             reason: "cas_loss",
+            reservation: factReservation(fact),
         });
     const clauses = splitMemoryClauses(target.memory.content);
     const ordinals = decision.clauses ?? [];
@@ -769,6 +812,7 @@ function resolveCovered(
         factId: fact.id,
         operation: "covered",
         state: "covered",
+        reservation: factReservation(fact),
         reason: "covered",
         memoryId: target.memory.id,
         mapping: { memoryId: target.memory.id, revision: target.revision, clauses: ordinals },
@@ -782,6 +826,7 @@ async function resolveRevision(
     decision: TurnTwoDecision,
     profile: ReportedProfile,
     context: ResolveContext,
+    stageKey: string,
 ): Promise<ApplierReceipt> {
     const expectedSources =
         decision.action === "merge"
@@ -864,6 +909,12 @@ async function resolveRevision(
             return context.checks.reattachCheck(request);
         },
         fact.id,
+        {
+            stageKey,
+            factId: fact.id,
+            projectPath: fact.project_path,
+            factAttempts: fact.fact_attempts,
+        },
     );
 }
 
@@ -932,7 +983,17 @@ export async function recoverTurnTwoStages(
     for (const record of stageRecords(db, input.projectPath)) {
         let carrier: Exclude<ReturnType<TurnTwoRecoveryResolver>, "busy"> = null;
         const giveUp = async (reason: string, state: string) => {
-            consumeStageAttempts(db, record.stageKey, reason, state);
+            if (
+                !consumeStageAttempts(
+                    db,
+                    record.stageKey,
+                    reason,
+                    state,
+                    () => carrier?.canRelease?.() ?? true,
+                )
+            )
+                return;
+            carrier?.onRelease?.();
             input.log?.(`turn two: gave up stage ${record.stageKey} (${reason})`);
             await carrier?.close?.().catch(() => undefined);
         };
@@ -980,6 +1041,7 @@ export async function recoverTurnTwoStages(
                     check: () => Promise.reject(new CheckOutcomeUnknownError("no carrier")),
                 },
                 owner: { sessionId: record.sessionId, harness: record.harness },
+                log: input.log,
             });
             input.log?.(
                 `turn two: recovered stage ${record.stageKey} (${done ? "resolved" : "still in flight"})`,
@@ -1089,6 +1151,7 @@ export async function runTurnTwo(db: Database, input: TurnTwoRunInput): Promise<
         validatedProfiles: input.validatedProfiles,
         checks: input.carrier,
         owner: { sessionId: input.sessionId, harness: input.carrier.harness },
+        log: input.log,
     });
     const inFlight = !done || stillReserved(db, reserved.stageKey) > 0;
     return {

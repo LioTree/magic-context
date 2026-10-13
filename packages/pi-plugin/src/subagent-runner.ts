@@ -1,4 +1,5 @@
 import * as childProcess from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdtempSync,
@@ -858,22 +859,14 @@ type ExtensionRetryResult = {
 /**
  * Pi-side implementation of `SubagentRunner`.
  *
- * Spawns `pi --print --mode json` as a child process and consumes its
- * NDJSON event stream over stdout until the `agent_end` event delivers
- * the full final message array. We extract the last assistant message's
- * concatenated text content and return it as the run result.
+ * Ordinary calls use print mode, or RPC when a token budget and tool guard
+ * are available. Both expose NDJSON events. A retained historian uses RPC,
+ * returns each completed agent turn without the terminal drain, and keeps
+ * the same process open for a continuation until its owner closes it.
  *
- * Why subprocess instead of in-process?
- * - Pi's @earendil-works/pi-coding-agent has no in-process child-session
- *   API equivalent to OpenCode's `client.session.create() / .prompt()`.
- *   Sessions are tied to a SessionManager that runs the interactive UI
- *   loop, and the agent loop expects to own stdout/stderr.
- * - The print-mode subprocess path is the *only* officially supported
- *   single-shot invocation in Pi today, and it's stable: it emits a
- *   well-typed NDJSON event stream regardless of which provider/model
- *   is targeted. Spawning is more expensive (cold-start ~500ms) but
- *   subagent invocations already amortize that against many seconds of
- *   model latency, so the overhead is in the noise.
+ * A subprocess isolates the child's agent loop, stdout/stderr, prompt file
+ * and tool restrictions from the host extension. Cancellation can terminate
+ * that process without ending the host's interactive session.
  *
  * Output protocol (each stdout line is one JSON object):
  *
@@ -904,13 +897,35 @@ type ExtensionRetryResult = {
  *   their own narrowed tool sets; if a model emits tool calls during a
  *   subagent run, those tools execute inside Pi's child process just
  *   fine — we just don't surface intermediate state to the caller.
- * - Per-turn token usage. Pi reports usage in each `message_end`, but
- *   the runner contract only returns the final assistant text. If the
- *   historian/dreamer ever needs token accounting, we'll add
- *   a `usage` field to `SubagentRunResult.meta` rather than changing
- *   the core contract.
+ * Retained RPC replies carry the reported provider/model and final turn's
+ * usage in `SubagentRunResult.meta`; ordinary callers keep their existing
+ * single-shot result contract.
  */
-export class PiSubagentRunner implements SubagentRunner {
+export interface PiRpcHistorianChild {
+	readonly id: string;
+	readonly alive: boolean;
+	send(message: string, stageKey: string): Promise<SubagentRunResult>;
+	close(): Promise<void>;
+}
+
+export interface PiRpcHistorianRunner extends SubagentRunner {
+	readonly canRetainHistorian: boolean;
+	runRetainedHistorian(
+		options: SubagentRunOptions,
+		stageKey?: string,
+	): Promise<{
+		result: SubagentRunResult;
+		child: PiRpcHistorianChild | null;
+	}>;
+}
+
+interface RetainedRpcCallbacks {
+	stageKey?: string;
+	ready(child: PiRpcHistorianChild): void;
+	turn(result: SubagentRunResult): void;
+}
+
+export class PiSubagentRunner implements PiRpcHistorianRunner {
 	readonly harness = resolvePiHarnessKind();
 
 	/**
@@ -924,6 +939,7 @@ export class PiSubagentRunner implements SubagentRunner {
 	private readonly spawnImpl: typeof childProcess.spawn;
 	private readonly platform: NodeJS.Platform;
 	private readonly extraArgs: readonly string[];
+	private readonly budgetGuardOverride: boolean | undefined;
 	/** `undefined` means preserve Pi's normal extension discovery behavior. */
 	private readonly subagentExtensions: readonly string[] | undefined;
 	private readonly getHostToolNames:
@@ -943,6 +959,8 @@ export class PiSubagentRunner implements SubagentRunner {
 			getHostToolNames?: () => readonly string[] | undefined;
 			/** Test seam for subprocess lifecycle tests. Production uses child_process.spawn. */
 			spawnImpl?: typeof childProcess.spawn;
+			/** Test override for an installation missing subagent-entry.js, which rejects child tool calls after its token budget. */
+			budgetGuardAvailable?: boolean;
 		} = {},
 	) {
 		this.invocation =
@@ -959,6 +977,7 @@ export class PiSubagentRunner implements SubagentRunner {
 		this.spawnImpl = options.spawnImpl ?? childProcess.spawn;
 		this.platform = options.platform ?? process.platform;
 		this.extraArgs = options.extraArgs ?? [];
+		this.budgetGuardOverride = options.budgetGuardAvailable;
 		this.subagentExtensions =
 			options.subagentExtensions ?? configuredSubagentExtensions;
 		this.getHostToolNames = options.getHostToolNames;
@@ -1015,6 +1034,86 @@ export class PiSubagentRunner implements SubagentRunner {
 			);
 		}
 		return fallbackRun.result;
+	}
+
+	get canRetainHistorian(): boolean {
+		return (
+			this.invocation.targetHarness === "pi" && this.budgetToolGuardAvailable
+		);
+	}
+
+	private get budgetToolGuardAvailable(): boolean {
+		return (
+			this.budgetGuardOverride ??
+			(SUBAGENT_ENTRY_PATH !== undefined ||
+				this.subagentExtensions?.some(
+					(extension) => basename(extension) === "subagent-entry.js",
+				) === true)
+		);
+	}
+
+	/** Retain an RPC child after turn one; subsequent prompts never spawn a replacement. */
+	async runRetainedHistorian(
+		options: SubagentRunOptions,
+		stageKey?: string,
+	): Promise<{
+		result: SubagentRunResult;
+		child: PiRpcHistorianChild | null;
+	}> {
+		if (!this.canRetainHistorian || options.tokenBudget === undefined) {
+			return { result: await this.run(options), child: null };
+		}
+		let child: PiRpcHistorianChild | null = null;
+		let first = true;
+		let receive: (result: SubagentRunResult) => void = () => {};
+		const initial = new Promise<SubagentRunResult>((resolve) => {
+			receive = resolve;
+		});
+		const provider = resolveProviderModelAttempt(
+			options.model,
+			this.invocation.targetHarness,
+		);
+		const lifetime = this.runOnce(
+			options,
+			{ disableDiscoveredExtensions: false },
+			provider?.modelRef,
+			{
+				stageKey,
+				ready: (handle) => {
+					child = handle;
+				},
+				turn: (result) => {
+					if (!first) return;
+					first = false;
+					receive(
+						result.ok && result.meta?.lengthCapped === true
+							? {
+									ok: false,
+									reason: "truncated",
+									error: "Pi RPC turn one was length capped",
+									durationMs: result.durationMs,
+									meta: result.meta,
+								}
+							: result,
+					);
+				},
+			},
+		);
+		void lifetime.then(
+			(result) => {
+				if (first) receive(result);
+			},
+			(error) => {
+				if (first)
+					receive({
+						ok: false,
+						reason: "spawn_failed",
+						error: String(error),
+						durationMs: 0,
+					});
+			},
+		);
+		return { result: await initial, child };
 	}
 
 	private async runWithExtensionRetry(
@@ -1154,6 +1253,7 @@ export class PiSubagentRunner implements SubagentRunner {
 		options: SubagentRunOptions,
 		runMode: PiRunMode,
 		modelRefOverride?: string,
+		retainedRpc?: RetainedRpcCallbacks,
 	): Promise<SubagentRunResult> {
 		const startTime = Date.now();
 		let recordedAccounting = false;
@@ -1230,6 +1330,12 @@ export class PiSubagentRunner implements SubagentRunner {
 					`subagent accounting failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
+			if (
+				options.runIdentity !== undefined &&
+				!/^[a-f0-9-]{36}$/.test(options.runIdentity)
+			) {
+				throw new Error("Invalid score subprocess identity");
+			}
 			return result;
 		}
 
@@ -1286,11 +1392,7 @@ export class PiSubagentRunner implements SubagentRunner {
 		// Pi's print mode concatenates stdin into the initial message, so when we
 		// pipe the prompt we must omit the positional argv to avoid duplication.
 		const promptBytes = Buffer.byteLength(options.userMessage, "utf8");
-		const budgetToolGuardAvailable =
-			SUBAGENT_ENTRY_PATH !== undefined ||
-			this.subagentExtensions?.some(
-				(extension) => basename(extension) === "subagent-entry.js",
-			) === true;
+		const budgetToolGuardAvailable = this.budgetToolGuardAvailable;
 		const rpcBudget =
 			options.tokenBudget !== undefined &&
 			this.invocation.targetHarness === "pi" &&
@@ -1313,7 +1415,14 @@ export class PiSubagentRunner implements SubagentRunner {
 		};
 		if (options.systemPrompt.length > 0) {
 			try {
-				systemPromptTempDir = mkdtempSync(join(tmpdir(), "mc-pi-prompt-"));
+				systemPromptTempDir = mkdtempSync(
+					join(
+						tmpdir(),
+						options.runIdentity
+							? `mc-pi-subagent-${options.runIdentity}-`
+							: "mc-pi-prompt-",
+					),
+				);
 				systemPromptPath = join(systemPromptTempDir, "system-prompt.txt");
 				writeFileSync(systemPromptPath, options.systemPrompt, "utf8");
 			} catch (error) {
@@ -1365,6 +1474,12 @@ export class PiSubagentRunner implements SubagentRunner {
 		// fallback chain is configured, `buildArgs` emits Pi's `--models a,b,c`.
 
 		return new Promise<SubagentRunResult>((resolve) => {
+			let pendingTurn: ((result: SubagentRunResult) => void) | undefined;
+			let rpcAlive = true;
+			let reaped: () => void = () => {};
+			const childReaped = new Promise<void>((done) => {
+				reaped = done;
+			});
 			let accountingMessages: unknown[] = [];
 			// Track whether we've already resolved so timeout/abort/exit don't
 			// double-resolve. JS promises tolerate double-resolve silently but
@@ -1372,9 +1487,44 @@ export class PiSubagentRunner implements SubagentRunner {
 			// during normal completion race" from "timeout actually decided
 			// the outcome."
 			let settled = false;
+			let childCreated = false;
+			let exitAcknowledged = false;
+			let pendingSettlement: SubagentRunResult | undefined;
+			let resultHandedOff = false;
+			const handoffResult = (result: SubagentRunResult) => {
+				if (!options.onResult || resultHandedOff) return;
+				resultHandedOff = true;
+				options.onResult(result);
+			};
 			const settle = (result: SubagentRunResult) => {
 				if (settled) return;
+				if (options.waitForExit && childCreated && !exitAcknowledged) {
+					pendingSettlement ??= result;
+					return;
+				}
+				try {
+					handoffResult(result);
+				} catch {
+					result = {
+						ok: false,
+						reason: "parse_failed",
+						error: "Score result handoff failed",
+						durationMs: Date.now() - startTime,
+					};
+				}
 				settled = true;
+				rpcAlive = false;
+				pendingTurn?.(
+					result.ok
+						? {
+								ok: false,
+								reason: "non_zero_exit",
+								error: "Pi RPC child closed",
+								durationMs: result.durationMs,
+							}
+						: result,
+				);
+				pendingTurn = undefined;
 				if (
 					accountingMessages.length > 0 &&
 					/historian|dreamer|classify/i.test(options.agent)
@@ -1465,6 +1615,7 @@ export class PiSubagentRunner implements SubagentRunner {
 							MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
 							MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE: budgetGuardFile,
 							MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
+								options.agent === "rescore" ||
 								/^(magic-context-)?historian(?:-recomp|-editor)?$/.test(
 									options.agent,
 								)
@@ -1497,6 +1648,7 @@ export class PiSubagentRunner implements SubagentRunner {
 						],
 					},
 				);
+				childCreated = true;
 			} catch (error) {
 				cleanupSystemPromptFile();
 				settle({
@@ -1516,7 +1668,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					error: "pi subagent aborted by caller",
 					durationMs: Date.now() - startTime,
 				});
-				return;
+				if (!options.waitForExit) return;
 			}
 
 			emitProgress({ type: "spawned", argv: args, pid: child.pid });
@@ -1540,7 +1692,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					`${JSON.stringify({
 						type: "prompt",
 						message: options.userMessage,
-						id: "dreamer-initial",
+						id: retainedRpc?.stageKey ?? "dreamer-initial",
 					})}\n`,
 				);
 			} else if (deliverViaStdin && child.stdin) {
@@ -1714,6 +1866,60 @@ export class PiSubagentRunner implements SubagentRunner {
 			// + no toolCall content), then drain until natural child exit.
 			const accumulatedMessages: unknown[] = [];
 			accountingMessages = accumulatedMessages;
+			let rpcTurnDelivered = false;
+			if (retainedRpc && rpcBudget) {
+				retainedRpc.ready({
+					id: `pi-rpc:${process.pid}:${child.pid ?? 0}:${randomUUID()}`,
+					get alive() {
+						return rpcAlive;
+					},
+					send: (message, stageKey) => {
+						if (!rpcAlive || pendingTurn || !rpcTurnDelivered)
+							return Promise.reject(
+								new Error("Pi RPC child unavailable or busy"),
+							);
+						rpcTurnDelivered = false;
+						sawAgentEnd = false;
+						preserveDrainedResult = false;
+						finalAssistantText = null;
+						finalStopReason = null;
+						finalErrorMessage = null;
+						agentEndMessages = null;
+						accumulatedMessages.length = 0;
+						hardDeadline =
+							typeof options.timeoutMs === "number" && options.timeoutMs > 0
+								? Date.now() + options.timeoutMs
+								: undefined;
+						armHardTimeout();
+						return new Promise((receive) => {
+							pendingTurn = receive;
+							try {
+								child.stdin?.write(
+									`${JSON.stringify({ type: "prompt", message, id: stageKey })}\n`,
+								);
+							} catch (error) {
+								terminateChild(child);
+								settle({
+									ok: false,
+									reason: "model_failed",
+									error: String(error),
+									durationMs: Date.now() - startTime,
+								});
+							}
+						});
+					},
+					close: async () => {
+						terminateChild(child);
+						settle({
+							ok: false,
+							reason: "abort",
+							error: "Pi RPC child closed by owner",
+							durationMs: Date.now() - startTime,
+						});
+						await childReaped;
+					},
+				});
+			}
 			const captureFinalAssistant = (messages: unknown[]) => {
 				const result = extractFinalAssistant(messages);
 				finalAssistantText = result.text;
@@ -2033,6 +2239,46 @@ export class PiSubagentRunner implements SubagentRunner {
 					}
 				}
 
+				if (
+					options.onResult &&
+					sawAgentEnd &&
+					finalStopReason === "stop" &&
+					finalAssistantText?.trim()
+				) {
+					const messages = agentEndMessages ?? accumulatedMessages;
+					const assistant = [...messages]
+						.reverse()
+						.find(
+							(message) =>
+								message &&
+								typeof message === "object" &&
+								(message as { role?: string }).role === "assistant",
+						) as { content?: unknown[] } | undefined;
+					const hasToolCall = assistant?.content?.some(
+						(part) =>
+							part &&
+							typeof part === "object" &&
+							(part as { type?: string }).type === "toolCall",
+					);
+					if (!hasToolCall) {
+						try {
+							handoffResult({
+								ok: true,
+								assistantText: finalAssistantText.trim(),
+								durationMs: Date.now() - startTime,
+							});
+						} catch {
+							terminateChild(child);
+							settle({
+								ok: false,
+								reason: "parse_failed",
+								error: "Score result handoff failed",
+								durationMs: Date.now() - startTime,
+							});
+						}
+					}
+				}
+
 				// Pi's print mode finishes the agent loop but does NOT always
 				// exit the child process cleanly afterwards — observed
 				// pattern: assistant message_end with stopReason="stop"
@@ -2046,7 +2292,67 @@ export class PiSubagentRunner implements SubagentRunner {
 				// grace to flush + exit naturally; if it's still alive,
 				// SIGTERM it. This matches the upstream pi-subagents
 				// drain-after-stop pattern.
-				if (sawAgentEnd && !drainTimerStarted) {
+				if (
+					retainedRpc &&
+					rpcBudget &&
+					e.type === "agent_end" &&
+					sawAgentEnd &&
+					!rpcTurnDelivered
+				) {
+					rpcTurnDelivered = true;
+					if (timeoutHandle) {
+						clearTimeout(timeoutHandle);
+						timeoutHandle = undefined;
+					}
+					const last = [...(agentEndMessages ?? accumulatedMessages)]
+						.reverse()
+						.find(
+							(message) => (message as { role?: string })?.role === "assistant",
+						) as
+						| { provider?: string; model?: string; usage?: unknown }
+						| undefined;
+					const meta = {
+						reportedProvider: last?.provider,
+						reportedModel: last?.model,
+						usage: last?.usage,
+					};
+					const result: SubagentRunResult =
+						finalAssistantText?.trim() &&
+						(finalStopReason === "stop" || finalStopReason === "length")
+							? {
+									ok: true,
+									assistantText: finalAssistantText.trim(),
+									durationMs: Date.now() - startTime,
+									meta: { ...meta, lengthCapped: finalStopReason === "length" },
+								}
+							: {
+									ok: false,
+									reason: "model_failed",
+									error:
+										finalErrorMessage ??
+										"Pi RPC turn has no usable assistant reply",
+									durationMs: Date.now() - startTime,
+									meta,
+								};
+					if (pendingTurn) {
+						const receive = pendingTurn;
+						pendingTurn = undefined;
+						receive(result);
+					} else {
+						// Record turn one's token usage at its reply; closing the retained
+						// process later is not a failure of that completed turn.
+						try {
+							recordAccounting(result, agentEndMessages ?? accumulatedMessages);
+						} catch (error) {
+							sessionLog(
+								options.accountingSessionId ?? "subagent",
+								`subagent accounting failed: ${String(error)}`,
+							);
+						}
+						retainedRpc.turn(result);
+					}
+				}
+				if (sawAgentEnd && !drainTimerStarted && !retainedRpc) {
 					drainTimerStarted = true;
 					if (timeoutHandle) {
 						clearTimeout(timeoutHandle);
@@ -2064,11 +2370,12 @@ export class PiSubagentRunner implements SubagentRunner {
 
 			// Hard timeout. We use SIGTERM first so the child can flush
 			// stdout cleanly, with SIGKILL as a backstop in case it hangs.
-			// The deadline is fixed at spawn: the drain timer replaces it once a
-			// terminal turn arrives, and a Pi auto-retry re-arms it for whatever
-			// time is left, so a retrying child stays bounded by timeoutMs.
+			// Single-shot calls keep a deadline fixed at spawn. Retained RPC gives
+			// each prompt its own deadline and pauses it at agent_end, so the child
+			// can stay open while separate memory checks run. Auto-retries still
+			// use only the time left in the current prompt's deadline.
 			let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-			const hardDeadline =
+			let hardDeadline =
 				typeof options.timeoutMs === "number" && options.timeoutMs > 0
 					? Date.now() + options.timeoutMs
 					: undefined;
@@ -2120,8 +2427,11 @@ export class PiSubagentRunner implements SubagentRunner {
 				});
 			};
 			options.signal?.addEventListener("abort", onAbort, { once: true });
+			if (options.signal?.aborted) queueMicrotask(onAbort);
 
 			child.on("error", (error) => {
+				if (child.pid === undefined) exitAcknowledged = true;
+				reaped();
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (drainTimerHandle) clearTimeout(drainTimerHandle);
 				options.signal?.removeEventListener("abort", onAbort);
@@ -2141,6 +2451,8 @@ export class PiSubagentRunner implements SubagentRunner {
 			) => {
 				if (childExitHandled) return;
 				childExitHandled = true;
+				exitAcknowledged = true;
+				reaped();
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (drainTimerHandle) clearTimeout(drainTimerHandle);
 				if (exitGraceHandle) clearTimeout(exitGraceHandle);
@@ -2152,6 +2464,10 @@ export class PiSubagentRunner implements SubagentRunner {
 					ms: Date.now() - startTime,
 				});
 				if (settled) return;
+				if (pendingSettlement) {
+					settle(pendingSettlement);
+					return;
+				}
 
 				const settleCompletedToolOnlyDreamer = (
 					messages: unknown[],

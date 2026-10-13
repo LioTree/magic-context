@@ -1,9 +1,9 @@
 import {
 	cortexKitProjectConfigBasePath,
-	cortexKitUserConfigBasePath,
 	type LegacyConfigSource,
 	resolveLegacyConfigSources,
 	resolveLegacyConfigSourcesForHarness,
+	resolveMagicContextUserConfig,
 } from "@magic-context/core/config/migrate-config-location";
 import "@magic-context/core/config/prune-config-leaf";
 import { existsSync } from "node:fs";
@@ -96,11 +96,6 @@ interface LoadedConfigFile {
 // still detect a pre-existing .json at the target for resilience.
 function getProjectConfigPaths(cwd: string): string[] {
 	const basePath = cortexKitProjectConfigBasePath(cwd);
-	return [`${basePath}.jsonc`, `${basePath}.json`];
-}
-
-function getUserConfigPaths(): string[] {
-	const basePath = cortexKitUserConfigBasePath();
 	return [`${basePath}.jsonc`, `${basePath}.json`];
 }
 
@@ -573,16 +568,21 @@ export function loadPiConfigDetailed(
 		!projectLegacyFallback &&
 		legacySources.project.some((source) => existsSync(source.path));
 
-	const userPath = resolveFirstExisting(getUserConfigPaths());
-	const userLegacyFallback = userPath
-		? null
-		: resolvePiLegacyFallback(harnessLegacy.user);
+	const userDetected = resolveMagicContextUserConfig();
+	if (userDetected.warning) warnings.push(userDetected.warning);
+	const userPath =
+		userDetected.format === "none" ? undefined : userDetected.path;
+	const userLegacyFallback =
+		userPath || userDetected.overridden
+			? null
+			: resolvePiLegacyFallback(harnessLegacy.user);
 	const userReadPath = userPath ?? userLegacyFallback?.path;
 	if (userReadPath) {
 		const loaded = loadConfigFile(userReadPath, "user");
 		if (loaded) loadedFiles.push(loaded);
 	}
 	const legacyUserUnmigrated =
+		!userDetected.overridden &&
 		!userPath &&
 		!userLegacyFallback &&
 		legacySources.user.some((source) => existsSync(source.path));

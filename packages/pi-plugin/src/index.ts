@@ -203,6 +203,7 @@ import {
 	type PiHarnessKind,
 	resolvePiHarnessDetection,
 } from "./pi-harness-kind";
+import { recoverLostPiRpcStages } from "./pi-historian-turn-two";
 import { notePiLkgProviderUsage } from "./pi-lkg";
 import {
 	computePiPressure,
@@ -1876,6 +1877,7 @@ async function startPiMagicContextRuntime(
 	// project with a different value, users need `/reload` or a Pi restart for the
 	// tool/command/overlay surface to change, matching Pi's registration lifecycle.
 	registerMagicContextTools(pi, {
+		rerankConnectionFile: config.subc?.connection_file,
 		expandTools: config.historian?.expand_tools,
 		db,
 		ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
@@ -1950,6 +1952,7 @@ async function startPiMagicContextRuntime(
 
 		const sessionId = resolveSessionId(ctx);
 		const model = ctx.model;
+		recoverLostPiRpcStages(db);
 		if (sessionId && model?.provider && model.id) {
 			seedSessionCacheTtlIfUnsynced({
 				db,

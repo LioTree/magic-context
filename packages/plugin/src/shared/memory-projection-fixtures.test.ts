@@ -2,6 +2,10 @@ import { expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DREAMER_AGENT } from "../agents/dreamer";
+import { archiveExpiredMemories } from "../features/magic-context/dreamer/expire-memories";
+import { acquireLeaseWithAcquisition } from "../features/magic-context/dreamer/lease";
+import { applyVerifyManifest } from "../features/magic-context/dreamer/verify";
 import {
     applyAgentMemoryMutation,
     applyMemoryAdmission,
@@ -24,6 +28,7 @@ import { getOrCreateSessionMeta, queueMemoryMutation } from "../features/magic-c
 import { initializeDatabase } from "../features/magic-context/storage-db";
 import { bumpProjectMemoryEpoch } from "../features/magic-context/storage-project-state";
 import { getVisibleMemoryIds } from "../hooks/magic-context/inject-compartments";
+import { createCtxMemoryTools } from "../tools/ctx-memory/tools";
 import { Database } from "./sqlite";
 import { createTestTempDirFromPath } from "./test-temp-dir";
 
@@ -310,6 +315,148 @@ function updateLines(m1: string): string[] {
 }
 
 export function registerMemoryProjectionRegressions(driver: ProjectionDriver): void {
+    for (const operation of [
+        "curate-update",
+        "curate-merge",
+        "curate-archive",
+        "verify-archive",
+        "verify-update",
+        "expiry-archive",
+    ] as const) {
+        test(`${driver.host} ${operation} applies directly with undo history and waits for natural HARD`, async () => {
+            const f = createProjectionFixture(`${driver.host}-${operation}`, driver.open);
+            try {
+                const [session] = f.sessions;
+                const target = memory(f, "cache_ttl is 5 minutes in config.ts.");
+                const second =
+                    operation === "curate-merge"
+                        ? memory(f, "config.ts declares a 5 minute cache_ttl.")
+                        : null;
+                const successor =
+                    operation === "curate-archive"
+                        ? memory(f, "config.ts now declares a longer cache_ttl.")
+                        : null;
+                const expiry = Date.now() + 60_000;
+                if (operation === "expiry-archive")
+                    f.db
+                        .prepare("UPDATE memories SET expires_at=? WHERE id=?")
+                        .run(expiry, target.id);
+                driver.hard(f, session);
+                const before = driver.pass(f, session, false);
+                expect(before.m0 + before.m1).toContain(target.content);
+                const leaseKey = `${operation}:${f.projectPath}`;
+                const holderId = "automated-holder";
+                const leaseAcquisition = acquireLeaseWithAcquisition(f.db, holderId, leaseKey)!;
+                const corrected = "cache_ttl is 10 minutes in config.ts.";
+                if (operation.startsWith("curate-")) {
+                    const action = operation.slice(7) as "update" | "merge" | "archive";
+                    const tools = createCtxMemoryTools({
+                        db: f.db,
+                        resolveProjectPath: () => f.projectPath,
+                        memoryEnabled: true,
+                        embeddingEnabled: false,
+                    });
+                    const result = await tools.ctx_memory!.execute(
+                        {
+                            action,
+                            ids: second ? [target.id, second.id] : [target.id],
+                            content: action === "archive" ? undefined : corrected,
+                            superseded_by: successor?.id,
+                            reason: "obsolete code fact",
+                        },
+                        {
+                            sessionID: session,
+                            agent: DREAMER_AGENT,
+                            directory: f.directory,
+                            worktree: f.directory,
+                            abort: new AbortController().signal,
+                            metadata: () => {},
+                            ask: async () => {},
+                        },
+                    );
+                    expect(result).toMatch(/^(Updated memory|Merged memories|Archived memor)/);
+                } else if (operation.startsWith("verify-")) {
+                    const verdict =
+                        operation === "verify-archive"
+                            ? `<archive id="${target.id}" reason="obsolete code fact"/>`
+                            : `<update id="${target.id}" files="config.ts">${corrected}</update>`;
+                    const result = await applyVerifyManifest(
+                        {
+                            db: f.db,
+                            projectIdentity: f.projectPath,
+                            parentSessionId: undefined,
+                            sessionDirectory: f.directory,
+                            holderId,
+                            leaseKey,
+                            leaseAcquisition,
+                            deadline: Date.now() + 10_000,
+                            normalizeFiles: async (files) => [...files],
+                        },
+                        [
+                            {
+                                id: target.id,
+                                category: target.category,
+                                content: target.content,
+                                mappedFiles: ["config.ts"],
+                            },
+                        ],
+                        `<verify>${verdict}</verify>`,
+                    );
+                    expect(operation === "verify-archive" ? result.archived : result.updated).toBe(
+                        1,
+                    );
+                } else {
+                    expect(
+                        await archiveExpiredMemories({
+                            db: f.db,
+                            projectIdentity: f.projectPath,
+                            holderId,
+                            leaseKey,
+                            leaseAcquisition,
+                            now: expiry + 1,
+                        }),
+                    ).toBe(1);
+                }
+                const history = f.db
+                    .prepare(
+                        "SELECT previous_text,before_json FROM memory_history WHERE memory_id=?",
+                    )
+                    .all(target.id) as { previous_text: string; before_json: string }[];
+                expect(history).toHaveLength(1);
+                expect(history[0]!.previous_text).toBe(target.content);
+                expect(JSON.parse(history[0]!.before_json).status).toBe("active");
+                if (second)
+                    expect(
+                        f.db
+                            .prepare("SELECT previous_text FROM memory_history WHERE memory_id=?")
+                            .get(second.id),
+                    ).toEqual({ previous_text: second.content });
+                for (const table of [
+                    "memory_mutation_log",
+                    "memory_agent_fragments",
+                    "memory_tool_proposals",
+                ])
+                    expect(f.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({
+                        n: 0,
+                    });
+                const current = getMemoryById(f.db, target.id)!;
+                if (operation.endsWith("archive") || second)
+                    expect(current.status).toBe("archived");
+                else expect(current.content).toBe(corrected);
+                expect(driver.pass(f, session, false)).toEqual(before);
+                const soft = driver.pass(f, session, true);
+                expect(soft.materialized).toBe(false);
+                expect(soft.m0).toBe(before.m0);
+                expect(soft.m1).toBe(before.m1);
+                const hard = driver.pass(f, session, true, { cacheExpired: true });
+                expect(hard.materialized).toBe(true);
+                expect(hard.m0 + hard.m1).not.toContain(target.content);
+                if (!operation.endsWith("archive")) expect(hard.m0 + hard.m1).toContain(corrected);
+            } finally {
+                f.close();
+            }
+        });
+    }
     const create = (label: string) =>
         createProjectionFixture(`${driver.host}-${label}`, driver.open);
 

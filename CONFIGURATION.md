@@ -13,6 +13,23 @@ Magic Context reads config from one shared CortexKit location across OpenCode, P
 
 Project config always merges on top of user config. The unified setup wizard (`npx @cortexkit/magic-context@latest setup`) writes the user-level file with sensible defaults.
 
+Environment overrides shared by OpenCode, Pi and Oh My Pi (OMP):
+
+| Variable | Purpose |
+|---|---|
+| `MAGIC_CONTEXT_STORAGE_DIR` | Absolute directory for Magic Context's data store, before `XDG_DATA_HOME`/platform defaults. |
+| `MAGIC_CONTEXT_CONFIG_PATH` | Absolute path to the **exact user-level config file**, before `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` (or `~/.config/...`). |
+
+`MAGIC_CONTEXT_CONFIG_PATH` is useful when a harness isolates its own XDG config
+root. Relative or blank values are errors. If it is set but the file is missing,
+Magic Context emits one user-config warning and uses no user config; it does **not**
+fall back to XDG or legacy user files or migrate them into the selected file.
+Defaults and project settings still apply. Project config remains
+`<project>/.cortexkit/magic-context.jsonc`, merges on top, and still cannot set
+user-only keys. Live reload watches the overridden file (including later creation);
+live keys keep their normal next-run semantics. Changing the environment variable
+of an already running host requires restarting that host.
+
 > **Migrating from an earlier version?** Config used to live in per-harness paths (`~/.config/opencode/`, `~/.pi/agent/`, `<project>/.opencode/`, `<project>/.pi/`, or the project root). On first run after upgrading, Magic Context moves your existing config to the CortexKit location automatically and leaves a `<old-name>.MOVED_READPLEASE` breadcrumb (preserving your original settings) at each old path. If two old locations held *different* settings it won't guess — it leaves both in place and warns you to consolidate by hand.
 
 ### Changing config without a restart

@@ -46,6 +46,8 @@ export async function resolveDreamerModuleRoute(args: {
     if (projectNeedsSingleStoreMigration(args.db, args.projectIdentity)) {
         throw new SingleStoreMigrationRequiredError();
     }
+    if (args.transformMode === "rust" && !args.moduleClient)
+        throw new DreamerModuleFailureError("memory route", new Error("module client unavailable"));
     if (args.transformMode === "ts" || !args.moduleClient) return undefined;
     return {
         moduleClient: args.moduleClient,

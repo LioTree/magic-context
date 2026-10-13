@@ -342,6 +342,7 @@ describe("H1 review: passing controls and record-only coverage", () => {
             JSON.stringify({
                 ...state,
                 ids: [...state.ids],
+                source_digests: [...state.source_digests],
                 elided: [...state.elided],
                 hole_ids: [...state.hole_ids],
             }),
@@ -349,6 +350,7 @@ describe("H1 review: passing controls and record-only coverage", () => {
         const restarted: RunnerRecord<Message> = {
             ...durable,
             ids: new Map(durable.ids),
+            source_digests: new Map(durable.source_digests),
             elided: new Set(durable.elided),
             hole_ids: new Set(durable.hole_ids),
         };

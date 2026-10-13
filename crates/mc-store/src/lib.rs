@@ -19,17 +19,25 @@ pub use cache_codec::{
 };
 pub mod context_boundaries;
 pub use context_boundaries::ResolvedContextBoundary;
+pub mod archive_index;
+pub mod context_schema;
 pub mod context_writes;
+pub mod dream_scheduler;
+pub mod git_archive;
 mod historian_claim;
+mod historian_telemetry;
+pub use historian_telemetry::{HistorianInvocation, HistorianRunTelemetry};
 pub mod memory_lifecycle;
 pub mod memory_projection;
 pub mod move_inventory;
 pub mod move_snapshot;
 pub mod move_store;
+pub mod parity_schema_manifest;
 pub mod private_permissions;
 mod provider_legacy;
 mod provider_log;
 pub mod provider_records;
+pub mod retrieval_vectors;
 pub use provider_records::ProviderSessionKey;
 pub mod score_projection;
 pub mod single_store_domain;
@@ -4204,6 +4212,9 @@ pub struct TruncateOutcome {
 }
 
 pub struct HistorianPublishRequest<'a> {
+    /// Optional durable publication identity for the historian lifecycle lane. With
+    /// no identity, publication preserves the legacy writes exactly.
+    pub lifecycle_publication_id: Option<&'a str>,
     pub session_id: &'a str,
     /// The harness label the session's `context.db` rows carry. `None` takes the label the
     /// host recorded for the session in `session_projects`, or `opencode`.
@@ -5548,7 +5559,7 @@ pub struct StoredMemory {
 /// A complete `memories` row for tool-side guards and lossless mutations. The render
 /// path intentionally reads a smaller projection; mutation ports use this shape so they
 /// can preserve status, ownership, merge metadata, and cache-invalidation columns.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct StoredMemoryFull {
     pub id: i64,
     pub project_path: String,
@@ -6720,9 +6731,74 @@ const FACADE_COMMAND_TABLES: &[&str] = &[
 /// together.
 pub struct FacadeMutationTxn<'a> {
     tx: &'a rusqlite::Connection,
+    automated: bool,
 }
 
 impl<'a> FacadeMutationTxn<'a> {
+    /// Automated curation validates targets and saves their prior versions for undo,
+    /// but does not enqueue a prompt update or record an agent fragment.
+    pub fn automated(&self) -> FacadeMutationTxn<'_> {
+        FacadeMutationTxn {
+            tx: self.tx,
+            automated: true,
+        }
+    }
+
+    fn append_memory_mutation(&self, mutation: MemoryMutationAppend<'_>) -> rusqlite::Result<()> {
+        if self.automated {
+            return Ok(());
+        }
+        append_memory_mutation_tx(self.tx, mutation)
+    }
+
+    fn can_edit_memory_project(&self, requested: &str, stored: &str) -> bool {
+        requested == stored
+            || (self.automated
+                && memory_lifecycle::authority::module_owns_memory(self.tx, stored)
+                    .unwrap_or(false))
+    }
+
+    pub fn check_memory_revisions(&self, targets: &[(i64, i64)]) -> Result<(), String> {
+        for &(id, revision) in targets {
+            let current: i64 = self
+                .tx
+                .query_row("SELECT revision FROM memories WHERE id=?1", [id], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())?;
+            if current != revision {
+                return Err(format!("stale_revision: memory {id}"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_curate_successor(&self, ids: &[i64], successor_id: i64) -> Result<(), String> {
+        let successor = self.memory_for_fragment(successor_id)?;
+        if !self.automated
+            || !matches!(successor.status.as_str(), "active" | "permanent")
+            || successor.superseded_by_memory_id.is_some()
+        {
+            return Err("invalid curate successor".to_string());
+        }
+        for &id in ids {
+            let source = self.memory_for_fragment(id)?;
+            if id == successor_id
+                || source.category != successor.category
+                || source.project_path != successor.project_path
+            {
+                return Err("invalid curate successor".to_string());
+            }
+            self.tx
+                .execute(
+                    "UPDATE memories SET superseded_by_memory_id=?1 WHERE id=?2",
+                    params![successor_id, id],
+                )
+                .map_err(|error| error.to_string())?;
+            self.tx.execute("INSERT OR IGNORE INTO memory_successor_links(source_id,successor_id,decision_key) VALUES(?1,?2,?3)", params![id,successor_id,format!("curate-archive:{id}:{successor_id}")]).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
     /// Insert a memory through the memory applier, under a fresh decision key. Returns the
     /// row's id when the admission applied (an insert or a live same-category match).
     /// Any other outcome is an error, which rolls back the enclosing facade transaction;
@@ -6757,9 +6833,10 @@ impl<'a> FacadeMutationTxn<'a> {
         else {
             return Err(FacadeMemoryMutationError::Unavailable { id });
         };
-        if memory.project_path != project_path
-            || memory.superseded_by_memory_id.is_some()
-            || !matches!(memory.status.as_str(), "active" | "permanent")
+        if !self.can_edit_memory_project(project_path, &memory.project_path)
+            || (!self.automated
+                && (memory.superseded_by_memory_id.is_some()
+                    || !matches!(memory.status.as_str(), "active" | "permanent")))
         {
             return Err(FacadeMemoryMutationError::Unavailable { id });
         }
@@ -6797,18 +6874,15 @@ impl<'a> FacadeMutationTxn<'a> {
                 params![content, target_category, normalized_hash, now_ms, id],
             )
             .map_err(FacadeMemoryMutationError::storage)?;
-        append_memory_mutation_tx(
-            self.tx,
-            MemoryMutationAppend {
-                project_path: &memory.project_path,
-                mutation_type: "update",
-                target_memory_id: id,
-                superseded_by_id: None,
-                category: Some(target_category),
-                new_content: Some(content),
-                queued_at: now_ms,
-            },
-        )
+        self.append_memory_mutation(MemoryMutationAppend {
+            project_path: &memory.project_path,
+            mutation_type: "update",
+            target_memory_id: id,
+            superseded_by_id: None,
+            category: Some(target_category),
+            new_content: Some(content),
+            queued_at: now_ms,
+        })
         .map_err(FacadeMemoryMutationError::storage)?;
         load_memory_full_tx(self.tx, id)
             .map_err(FacadeMemoryMutationError::storage)?
@@ -6829,8 +6903,8 @@ impl<'a> FacadeMutationTxn<'a> {
             else {
                 return Err(FacadeMemoryMutationError::Unavailable { id: *id });
             };
-            if memory.project_path != project_path
-                || memory.superseded_by_memory_id.is_some()
+            if !self.can_edit_memory_project(project_path, &memory.project_path)
+                || (!self.automated && memory.superseded_by_memory_id.is_some())
                 || !matches!(memory.status.as_str(), "active" | "permanent" | "archived")
             {
                 return Err(FacadeMemoryMutationError::Unavailable { id: *id });
@@ -6862,18 +6936,15 @@ impl<'a> FacadeMutationTxn<'a> {
                     )
                     .map_err(FacadeMemoryMutationError::storage)?;
             }
-            append_memory_mutation_tx(
-                self.tx,
-                MemoryMutationAppend {
-                    project_path: &memory.project_path,
-                    mutation_type: "archive",
-                    target_memory_id: memory.id,
-                    superseded_by_id: None,
-                    category: None,
-                    new_content: None,
-                    queued_at: now_ms,
-                },
-            )
+            self.append_memory_mutation(MemoryMutationAppend {
+                project_path: &memory.project_path,
+                mutation_type: "archive",
+                target_memory_id: memory.id,
+                superseded_by_id: None,
+                category: None,
+                new_content: None,
+                queued_at: now_ms,
+            })
             .map_err(FacadeMemoryMutationError::storage)?;
             archived.push(memory.id);
         }
@@ -6898,9 +6969,10 @@ impl<'a> FacadeMutationTxn<'a> {
             else {
                 return Err(FacadeMemoryMutationError::Unavailable { id: *id });
             };
-            if row.project_path != project_path
-                || row.superseded_by_memory_id.is_some()
-                || !matches!(row.status.as_str(), "active" | "permanent")
+            if !self.can_edit_memory_project(project_path, &row.project_path)
+                || (!self.automated
+                    && (row.superseded_by_memory_id.is_some()
+                        || !matches!(row.status.as_str(), "active" | "permanent")))
                 || rows
                     .first()
                     .is_some_and(|first: &StoredMemoryFull| first.category != row.category)
@@ -6937,7 +7009,7 @@ impl<'a> FacadeMutationTxn<'a> {
                 category: &category,
                 content: merged_content,
                 source_session_id,
-                source_type: Some("agent"),
+                source_type: Some(if self.automated { "dreamer" } else { "agent" }),
                 importance: Some(50),
                 expires_at: None,
                 metadata_json: None,
@@ -6971,17 +7043,19 @@ impl<'a> FacadeMutationTxn<'a> {
                     params![seen_count, retrieval_count, merged_from, target_id],
                 )
                 .map_err(FacadeMemoryMutationError::storage)?;
-            self.tx
-                .execute(
-                    "DELETE FROM memory_mutation_log
+            if !self.automated {
+                self.tx
+                    .execute(
+                        "DELETE FROM memory_mutation_log
                       WHERE id = (
                           SELECT MAX(id) FROM memory_mutation_log
                            WHERE project_path = ?1 AND mutation_type = 'update'
                              AND target_memory_id = ?2 AND queued_at = ?3
                       )",
-                    params![project_path, target_id, now_ms],
-                )
-                .map_err(FacadeMemoryMutationError::storage)?;
+                        params![project_path, target_id, now_ms],
+                    )
+                    .map_err(FacadeMemoryMutationError::storage)?;
+            }
             merged = load_memory_full_tx(self.tx, target_id)
                 .map_err(FacadeMemoryMutationError::storage)?
                 .ok_or(FacadeMemoryMutationError::Unavailable { id: target_id })?;
@@ -7002,9 +7076,10 @@ impl<'a> FacadeMutationTxn<'a> {
         else {
             return Err(FacadeMemoryMutationError::Unavailable { id: target_id });
         };
-        if target.project_path != project_path
-            || target.superseded_by_memory_id.is_some()
-            || !matches!(target.status.as_str(), "active" | "permanent")
+        if !self.can_edit_memory_project(project_path, &target.project_path)
+            || (!self.automated
+                && (target.superseded_by_memory_id.is_some()
+                    || !matches!(target.status.as_str(), "active" | "permanent")))
         {
             return Err(FacadeMemoryMutationError::Unavailable { id: target_id });
         }
@@ -7024,10 +7099,11 @@ impl<'a> FacadeMutationTxn<'a> {
             else {
                 return Err(FacadeMemoryMutationError::Unavailable { id: source_id });
             };
-            if source.project_path != project_path
+            if !self.can_edit_memory_project(project_path, &source.project_path)
                 || source.category != target.category
-                || source.superseded_by_memory_id.is_some()
-                || !matches!(source.status.as_str(), "active" | "permanent")
+                || (!self.automated
+                    && (source.superseded_by_memory_id.is_some()
+                        || !matches!(source.status.as_str(), "active" | "permanent")))
             {
                 return Err(FacadeMemoryMutationError::Unavailable { id: source_id });
             }
@@ -7074,21 +7150,18 @@ impl<'a> FacadeMutationTxn<'a> {
                     params![target_id, now_ms, source.id],
                 )
                 .map_err(FacadeMemoryMutationError::storage)?;
-            append_memory_mutation_tx(
-                self.tx,
-                MemoryMutationAppend {
-                    project_path: &source.project_path,
-                    mutation_type: "superseded",
-                    target_memory_id: source.id,
-                    superseded_by_id: Some(target_id),
-                    category: None,
-                    new_content: None,
-                    queued_at: now_ms,
-                },
-            )
+            self.append_memory_mutation(MemoryMutationAppend {
+                project_path: &source.project_path,
+                mutation_type: "superseded",
+                target_memory_id: source.id,
+                superseded_by_id: Some(target_id),
+                category: None,
+                new_content: None,
+                queued_at: now_ms,
+            })
             .map_err(FacadeMemoryMutationError::storage)?;
         }
-        if target.content != merged_content {
+        if self.automated || target.content != merged_content {
             self.record_agent_history(&target, merged_content, "agent_merge_target", now_ms)?;
         }
         self.tx
@@ -7116,18 +7189,15 @@ impl<'a> FacadeMutationTxn<'a> {
                 ],
             )
             .map_err(FacadeMemoryMutationError::storage)?;
-        append_memory_mutation_tx(
-            self.tx,
-            MemoryMutationAppend {
-                project_path: &target.project_path,
-                mutation_type: "update",
-                target_memory_id: target_id,
-                superseded_by_id: None,
-                category: Some(&target.category),
-                new_content: Some(merged_content),
-                queued_at: now_ms,
-            },
-        )
+        self.append_memory_mutation(MemoryMutationAppend {
+            project_path: &target.project_path,
+            mutation_type: "update",
+            target_memory_id: target_id,
+            superseded_by_id: None,
+            category: Some(&target.category),
+            new_content: Some(merged_content),
+            queued_at: now_ms,
+        })
         .map_err(FacadeMemoryMutationError::storage)?;
         load_memory_full_tx(self.tx, target_id)
             .map_err(FacadeMemoryMutationError::storage)?
@@ -8355,7 +8425,11 @@ impl McStore {
         }
 
         let response = self.context_write(FACADE_COMMAND_TABLES, |tx| {
-            mutation(&FacadeMutationTxn { tx }).map_err(|error| {
+            mutation(&FacadeMutationTxn {
+                tx,
+                automated: false,
+            })
+            .map_err(|error| {
                 rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
             })
         })?;
@@ -13797,6 +13871,7 @@ impl McStore {
         // Side channels are best effort: a test can make one fail, and the fold's
         // compartments must still land.
         let fold = context_writes::FoldWrite {
+            lifecycle_publication_id: request.lifecycle_publication_id.map(str::to_owned),
             project_path: request.project_path.to_string(),
             harness: request.harness.map(str::to_string),
             compartments: numbered.clone(),
@@ -17451,37 +17526,31 @@ fn set_memory_verification_tx(
                 record_automated_memory_edit_tx(
                     tx,
                     update.memory_id,
-                    &memory.content,
+                    &memory,
                     content,
                     "verify_update",
                     now_ms,
                 )?;
             }
             "archive" => {
-                // "The files refute this memory" is a model-judged retirement: it waits as
-                // a pending proposal and the row stays live, as the TypeScript verify does.
-                let revision: i64 = tx.query_row(
-                    "SELECT revision FROM memories WHERE id = ?1",
-                    params![update.memory_id],
-                    |row| row.get(0),
-                )?;
+                let metadata = merge_archive_reason(
+                    memory.metadata_json.as_deref(),
+                    update
+                        .archive_reason
+                        .as_deref()
+                        .unwrap_or("verified archive"),
+                );
                 tx.execute(
-                    "INSERT OR IGNORE INTO memory_tool_proposals
-                        (project_path, source_session_id, proposal_key, writer, operation,
-                         target_ids_json, expected_revisions_json, proposal_json, reason, created_at)
-                     VALUES (?1, NULL, ?2, 'verify', 'archive', ?3, ?4, ?5, 'MEMORY_PENDING_PROPOSAL', ?6)",
-                    params![
-                        project,
-                        format!("verify-archive:{}:{}", update.memory_id, memory.normalized_hash),
-                        serde_json::json!([update.memory_id]).to_string(),
-                        serde_json::json!([{ "id": update.memory_id, "revision": revision }])
-                            .to_string(),
-                        serde_json::json!({
-                            "reason": update.archive_reason.as_deref().unwrap_or("verified archive")
-                        })
-                        .to_string(),
-                        now_ms,
-                    ],
+                    "UPDATE memories SET status='archived', metadata_json=?1, updated_at=?2 WHERE id=?3",
+                    params![metadata, now_ms, update.memory_id],
+                )?;
+                record_automated_memory_edit_tx(
+                    tx,
+                    update.memory_id,
+                    &memory,
+                    &memory.content,
+                    "verify_archive",
+                    now_ms,
                 )?;
             }
             _ => {
@@ -17547,7 +17616,7 @@ fn expire_memories_tx(
         record_automated_memory_edit_tx(
             tx,
             memory_id,
-            &memory.content,
+            &memory,
             &memory.content,
             "expired",
             now_ms,
@@ -17562,7 +17631,7 @@ fn expire_memories_tx(
 fn record_automated_memory_edit_tx(
     tx: &rusqlite::Connection,
     memory_id: i64,
-    previous_text: &str,
+    before: &StoredMemoryFull,
     after_text: &str,
     reason: &str,
     now_ms: i64,
@@ -17574,18 +17643,20 @@ fn record_automated_memory_edit_tx(
     )?;
     tx.execute(
         "INSERT OR IGNORE INTO memory_history
-            (memory_id, revision, previous_text, after_text, applied_at, reason,
+            (memory_id, revision, previous_text, after_text, applied_at, reason, before_json,
              evidence_json, source_ids_json, decision_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', ?7, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?9, '[]', ?7, ?8)",
         params![
             memory_id,
             revision,
-            previous_text,
+            before.content,
             after_text,
             now_ms,
             reason,
             serde_json::json!([memory_id]).to_string(),
             format!("{reason}:{memory_id}:{revision}"),
+            serde_json::to_string(before)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
         ],
     )?;
     tx.execute(
@@ -24251,6 +24322,7 @@ mod tests {
 
         let first = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24284,6 +24356,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24340,6 +24413,7 @@ mod tests {
 
         let error = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24408,6 +24482,7 @@ mod tests {
 
             store
                 .publish_historian_chunk(HistorianPublishRequest {
+                    lifecycle_publication_id: None,
                     harness: None,
                     session_id: "ses",
                     expected_row_version: expected,
@@ -24487,6 +24562,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24535,6 +24611,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24575,6 +24652,7 @@ mod tests {
         };
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: Some(99),
@@ -24624,6 +24702,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24667,6 +24746,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -24721,6 +24801,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -25059,6 +25140,7 @@ mod tests {
 
         let error = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -25111,6 +25193,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -25152,6 +25235,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -25272,6 +25356,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
@@ -25323,6 +25408,7 @@ mod tests {
     ) -> Result<HistorianPublishResult, HistorianPublishError> {
         let expected = store.load(session_id).unwrap().row_version;
         store.publish_historian_chunk(HistorianPublishRequest {
+            lifecycle_publication_id: None,
             harness: None,
             session_id,
             expected_row_version: expected,

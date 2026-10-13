@@ -3,7 +3,7 @@
   "provenance": {
     "surface": "crates/mc-module/src/lib.rs — historian.pending / claim / heartbeat / complete",
     "slice": "rust standalone A1",
-    "note": "Values listed in `volatile` are replaced with the string \"<volatile>\" on both sides before comparison, because they are minted secrets or wall-clock deadlines. The test asserts them separately against computed expectations."
+    "note": "Values listed in `volatile` are replaced with the string \"<volatile>\" on both sides before comparison, because they are minted secrets, wall-clock deadlines, or publication identities containing the fixture's temporary project path. The test asserts them separately against computed expectations."
   },
   "cases": [
     {
@@ -61,6 +61,7 @@
         "run_id": "mc-historian:project:a1a1a1a1a1a1a1a1:1",
         "session_id": "ses",
         "attempt": 1,
+
         "token": "<volatile>",
         "prompt": {
           "system": "historian-system-prompt",

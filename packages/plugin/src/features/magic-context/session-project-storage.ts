@@ -1,4 +1,4 @@
-import { getHarness } from "../../shared/harness";
+import { getHarness, type HarnessId } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { isUserHomeDirectory } from "./memory/project-identity";
 
@@ -94,6 +94,7 @@ export function recordSessionProjectIdentity(
     db: Database,
     sessionId: string,
     projectPath: string | undefined,
+    harness: HarnessId = getHarness(),
 ): SessionProjectIdentityChange | undefined {
     if (!sessionId || !projectPath) return undefined;
     // A session started exactly at the user's home directory is not a project.
@@ -105,7 +106,6 @@ export function recordSessionProjectIdentity(
         isUserHomeDirectory(projectPath)
     )
         return;
-    const harness = getHarness();
     const now = Date.now();
     let previousProjectPath: string | undefined;
     db.transaction(() => {

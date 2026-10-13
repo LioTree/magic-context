@@ -234,6 +234,144 @@ function fixture(host: "v1" | "v2", options: OpenCodeProviderOptions = {}) {
 }
 for (const host of ["v1", "v2"] as const)
     describe(`OpenCode ${host} provider adapter`, () => {
+        test("adapter methods keep usage durable and admit the exact last served view plus raw tail", async () => {
+            const f = fixture(host);
+            const first = message("first");
+            await f.pass([first]);
+            const second = message("second");
+            const served = await f.pass([first, second]);
+            expect(served[1].parts[0]).toMatchObject({ text: "§2§ second" });
+            f.adapter.recordProviderUsage("session", {
+                messages: served,
+                inputTokens: 123,
+                model: "openai/gpt-5.6",
+                envelope: "system+tools",
+            });
+            expect(JSON.parse(f.stored()!.state.setup_json!).measuredUsage.input_tokens).toBe(123);
+            f.restart();
+            const tail = message("tail");
+            const admitted = f.adapter.isFallbackAdmissible("session", {
+                messages: [first, second, tail],
+                model: "openai/gpt-5.6",
+                envelope: "system+tools",
+                contextWindow: 100_000,
+            });
+            expect(admitted).toEqual({ admissible: true, view: [...served, tail] });
+            const recovered = { messages: [] as unknown[] };
+            expect(f.adapter.recoverOutput("session", recovered)).toBe(true);
+            expect(recovered.messages).toEqual(served);
+            expect(
+                f.adapter.isFallbackAdmissible("missing", {
+                    messages: [],
+                    model: "openai/gpt-5.6",
+                    envelope: "system+tools",
+                }).admissible,
+            ).toBe(false);
+            expect(() =>
+                f.adapter.recordProviderUsage("missing", {
+                    messages: served,
+                    inputTokens: 123,
+                    model: "openai/gpt-5.6",
+                    envelope: "system+tools",
+                }),
+            ).toThrow("No active provider record");
+        });
+
+        test("identity fallback retains frozen hook ops before any compaction", async () => {
+            const f = fixture(host);
+            f.setReply((w) =>
+                w.method === "compaction.step"
+                    ? {
+                          answer: "compaction_message",
+                          request_id: w.params.request_id,
+                          compaction: {
+                              compaction_id: "identity",
+                              version: 2,
+                              range: { from: 0, to: 0 },
+                              replacement: [],
+                          },
+                      }
+                    : undefined,
+            );
+            const first = message("first");
+            await f.pass([first]);
+            const second = message("second");
+            const served = await f.pass([first, second]);
+            expect(served[1].parts[0]).toMatchObject({ text: "§2§ second" });
+            const tail = message("tail");
+            expect(
+                f.adapter.isFallbackAdmissible("session", {
+                    messages: [first, second, tail],
+                    model: "openai/gpt-5.6",
+                    envelope: "system+tools",
+                    contextWindow: 100_000,
+                    systemPromptTokens: 10,
+                    toolDefinitionTokens: 0,
+                }),
+            ).toEqual({ admissible: true, view: [...served, tail] });
+        });
+
+        test("outcome observer runs after durable commit and is awaited before publication", async () => {
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => {
+                release = resolve;
+            });
+            let observed!: () => void;
+            const observation = new Promise<void>((resolve) => {
+                observed = resolve;
+            });
+            const f = fixture(host, {
+                onOutcome: async (id, subject, outcome) => {
+                    const stored = f.stored()!.entries.find((entry) => entry.message_id === id)!;
+                    expect(JSON.parse(stored.hook_json).outcomes).toEqual([outcome]);
+                    expect(subject).toEqual(outcome.subject);
+                    observed();
+                    await gate;
+                },
+            });
+            const first = message("first");
+            await f.pass([first]);
+            const second = message("second");
+            const output = { messages: [first, second] as unknown[] };
+            let returned = false;
+            const pass = f.adapter.run("session", [first, second], output, f.meta).then(() => {
+                returned = true;
+            });
+            await Promise.race([observation, pass]);
+            expect(returned).toBe(false);
+            expect(output.messages[1]).toBe(second);
+            release();
+            await pass;
+            expect((output.messages[1] as MessageLike).parts[0]).toMatchObject({
+                text: "§2§ second",
+            });
+        });
+
+        test("observer failure leaves committed outcomes frozen for restart without re-hooking", async () => {
+            let calls = 0;
+            const f = fixture(host, {
+                onOutcome: async () => {
+                    calls++;
+                    throw new Error("mirror down");
+                },
+            });
+            const first = message("first");
+            const second = message("second");
+            await f.pass([first]);
+            await expect(f.pass([first, second])).rejects.toThrow(
+                "Provider record cannot safely serve",
+            );
+            expect(f.stored()!.entries.some((entry) => entry.message_id === "second")).toBe(true);
+            f.restart();
+            f.setReply((w) => {
+                if (w.method === "transform.hook") throw new Error("must not re-hook");
+                return undefined;
+            });
+            const served = await f.pass([first, second]);
+            expect(served[1].parts[0]).toMatchObject({ text: "§2§ second" });
+            expect(calls).toBe(1);
+        });
+
         test("bootstrap adopts canonical ordinals once, omits head rows and syncs before pages", async () => {
             const f = fixture(host);
             const head = {

@@ -26,17 +26,22 @@ import {
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
 import {
+    type AgentMemoryMutation,
     type ApplierReceipt,
     applyAgentMemoryMutation,
+    applyCurateMemoryMutation,
     applyMemoryAdmission,
     getMemoryRevision,
     MemoryContentDuplicateError,
-    proposeMemoryMutation,
+    tsOwnsMemory,
 } from "../../features/magic-context/memory/lifecycle-applier";
 import { createMemoryVisibilityPolicy } from "../../features/magic-context/memory/memory-visibility";
 import { computeNormalizedHash } from "../../features/magic-context/memory/normalize-hash";
 import { describeUnresolvedProjectIdentity } from "../../features/magic-context/memory/project-identity";
-import { getMemoriesForList } from "../../features/magic-context/memory/storage-memory";
+import {
+    getMemoriesForList,
+    ModuleMemoryAuthorityError,
+} from "../../features/magic-context/memory/storage-memory";
 import { normalizeStoredProjectPath } from "../../features/magic-context/storage";
 import {
     projectNeedsSingleStoreMigration,
@@ -248,6 +253,27 @@ function requestRustMemorySync(deps: CtxMemoryToolDeps, sessionId: string): void
     } catch (error) {
         sessionLog(sessionId, "rust memory sync trigger failed (ignored):", error);
     }
+}
+
+async function applyCurateMutation(
+    deps: CtxMemoryToolDeps,
+    directory: string,
+    request: AgentMemoryMutation,
+): Promise<ApplierReceipt> {
+    // Moving both writers into context.db removes the old authority_managed markers,
+    // but Rust-mode automated edits still belong to the module. A failed module call
+    // never grants permission to write through the local TypeScript path.
+    if (deps.rustToolBackends?.curateMemory)
+        return deps.rustToolBackends.curateMemory({ ...request, projectRoot: directory });
+    if (deps.memoryAuthority === "module")
+        throw new ModuleMemoryAuthorityError(request.projectPath);
+    const projects = new Set([
+        request.projectPath,
+        ...request.targets.map((target) => getMemoryById(deps.db, target.id)!.projectPath),
+    ]);
+    if (![...projects].every((project) => tsOwnsMemory(deps.db, project)))
+        throw new ModuleMemoryAuthorityError(request.projectPath);
+    return applyCurateMemoryMutation(deps.db, request);
 }
 
 interface MemoryProjectPathRow {
@@ -657,15 +683,27 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     requestRustMemorySync(deps, toolContext.sessionID);
                     return `Updated memory [ID: ${memory.id}] in ${category}.`;
                 }
-                const receipt = proposeMemoryMutation(deps.db, {
+                const receipt = await applyCurateMutation(deps, toolContext.directory, {
+                    key: randomUUID(),
                     projectPath: targetIdentityForStoredPath(rawProjectPath),
                     sourceSessionId: toolContext.sessionID,
-                    writer: "curate",
                     operation: "update",
-                    targetIds: [memory.id],
-                    proposal: { content, category: args.category, reason: args.reason },
+                    targets: [{ id: memory.id, revision: getMemoryRevision(deps.db, memory.id)! }],
+                    content,
+                    category: getValidatedCategory(args.category) ?? memory.category,
+                    reason: args.reason,
                 });
-                return `${receipt.reason}: update retained as a pending proposal; memory [ID: ${memory.id}] is unchanged.`;
+                if (receipt.state !== "applied")
+                    return `Error: ${receipt.reason}; memory [ID: ${memory.id}] is unchanged.`;
+                if (!deps.rustToolBackends?.curateMemory)
+                    queueMemoryEmbedding({
+                        deps,
+                        sessionId: toolContext.sessionID,
+                        projectPath,
+                        memoryId: memory.id,
+                        content,
+                    });
+                return `Updated memory [ID: ${memory.id}] in ${getValidatedCategory(args.category) ?? memory.category}.`;
             }
 
             if (args.action === "merge") {
@@ -689,7 +727,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     return "Error: One or more source memories were not found.";
                 }
                 // Primary agents may apply changes only to their own project's memories.
-                // The dreamer may propose cross-project consolidation, but workspace sharing
+                // The dreamer may apply cross-project consolidation, but workspace sharing
                 // still controls which source rows it is allowed to read.
                 if (toolContext.agent !== DREAMER_AGENT) {
                     const foreign = sourceMemories.find((memory) => !memoryOwnedByTool(memory));
@@ -766,15 +804,30 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     requestRustMemorySync(deps, toolContext.sessionID);
                     return `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${receipt.memoryId}] in ${category}; superseded [${receipt.supersededIds?.join(", ")}].`;
                 }
-                const receipt = proposeMemoryMutation(deps.db, {
+                const receipt = await applyCurateMutation(deps, toolContext.directory, {
+                    key: randomUUID(),
                     projectPath,
                     sourceSessionId: toolContext.sessionID,
-                    writer: "curate",
                     operation: "merge",
-                    targetIds: ids,
-                    proposal: { content, category, reason: args.reason },
+                    targets: sourceMemories.map((memory) => ({
+                        id: memory.id,
+                        revision: getMemoryRevision(deps.db, memory.id)!,
+                    })),
+                    content,
+                    category,
+                    reason: args.reason,
                 });
-                return `${receipt.reason}: merge retained as a pending proposal; memories [${ids.join(", ")}] are unchanged.`;
+                if (receipt.state !== "applied")
+                    return `Error: ${receipt.reason}; memories [${ids.join(", ")}] are unchanged.`;
+                if (!deps.rustToolBackends?.curateMemory)
+                    queueMemoryEmbedding({
+                        deps,
+                        sessionId: toolContext.sessionID,
+                        projectPath,
+                        memoryId: receipt.memoryId!,
+                        content,
+                    });
+                return `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${receipt.memoryId}] in ${category}; superseded [${receipt.supersededIds?.join(", ")}].`;
             }
 
             if (args.action === "archive") {
@@ -834,15 +887,24 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         ? `Archived ${plural} [ID: ${archiveIds.join(", ")}] (${args.reason.trim()}).`
                         : `Archived ${plural} [ID: ${archiveIds.join(", ")}].`;
                 }
-                const receipt = proposeMemoryMutation(deps.db, {
+                const receipt = await applyCurateMutation(deps, toolContext.directory, {
+                    key: randomUUID(),
                     projectPath,
                     sourceSessionId: toolContext.sessionID,
-                    writer: "curate",
                     operation: "archive",
-                    targetIds: archiveIds,
-                    proposal: { reason: args.reason, supersededBy: args.superseded_by },
+                    targets: targets.map((target) => ({
+                        id: target.memoryId,
+                        revision: getMemoryRevision(deps.db, target.memoryId)!,
+                    })),
+                    reason: args.reason,
+                    supersededById: curatePreflight.successor?.id,
                 });
-                return `${receipt.reason}: archive retained as a pending proposal; memories [${archiveIds.join(", ")}] are unchanged.`;
+                if (receipt.state !== "applied")
+                    return `Error: ${receipt.reason}; memories [${archiveIds.join(", ")}] are unchanged.`;
+                const plural = archiveIds.length > 1 ? "memories" : "memory";
+                return args.reason?.trim()
+                    ? `Archived ${plural} [ID: ${archiveIds.join(", ")}] (${args.reason.trim()}).`
+                    : `Archived ${plural} [ID: ${archiveIds.join(", ")}].`;
             }
 
             return "Error: Unknown action.";

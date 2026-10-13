@@ -60,6 +60,40 @@ export interface ApplierReceipt {
      */
     reportedProfile?: ReportedProfile;
 }
+
+export interface MemoryFactReservation {
+    stageKey: string;
+    factId: number;
+    projectPath: string;
+    factAttempts: number;
+}
+
+export class MemoryStageOwnershipLostError extends Error {
+    constructor() {
+        super("memory stage no longer owns the fact reservation");
+        this.name = "MemoryStageOwnershipLostError";
+    }
+}
+
+/** Recheck the send's reservation under the resolving write lock; memory revision CAS does not revoke a released send. */
+export function assertMemoryFactReservation(
+    db: Database,
+    reservation: MemoryFactReservation,
+): void {
+    const owned = db
+        .prepare(
+            `SELECT 1 FROM memory_pending_facts f JOIN memory_stage_attempts s ON s.stage_key=f.reserved_stage_key
+         WHERE f.id=? AND f.project_path=? AND f.state='in_flight' AND f.fact_attempts=?
+           AND s.stage_key=? AND s.project_path=f.project_path AND s.stage='turn_two' AND s.state='replied'`,
+        )
+        .get(
+            reservation.factId,
+            reservation.projectPath,
+            reservation.factAttempts,
+            reservation.stageKey,
+        );
+    if (!owned) throw new MemoryStageOwnershipLostError();
+}
 export interface AdmissionRequest {
     key: string;
     operation: "new" | "conflict" | "agent_save";
@@ -68,6 +102,7 @@ export interface AdmissionRequest {
     autoPromote?: boolean;
     conflictTargetId?: number;
     factId?: number;
+    reservation?: MemoryFactReservation;
     classificationAnchor?: { toolCallPartId: string; saveOrdinal: number };
     /** Harness of `input.sourceSessionId`, for an agent save's m[1] fragment. */
     sourceHarness?: string;
@@ -129,6 +164,7 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
         .transaction(() => {
             const existingReceipt = readReceipt(db, request.key);
             if (existingReceipt) return existingReceipt;
+            if (request.reservation) assertMemoryFactReservation(db, request.reservation);
             const record = (receipt: ApplierReceipt) =>
                 recordReceipt(
                     db,
@@ -276,7 +312,7 @@ export function applyMemoryAdmission(db: Database, request: AdmissionRequest): A
 /**
  * Resolve a candidate fact without touching any memory row: `covered` (the mapping
  * is recorded on the fact only), and every `decided_pending` outcome that needs no
- * applier write (abstain, a malformed decision, an approval-gated operation, a
+ * applier write (abstain, a malformed decision, an unsupported operation, a
  * recitation). One transaction writes the receipt keyed by the decision key and the
  * fact's new state; a receipt already recorded under the key wins.
  */
@@ -286,6 +322,7 @@ export function resolveFactDecision(
         key: string;
         projectPath: string;
         factId: number;
+        reservation?: MemoryFactReservation;
         operation: string;
         /**
          * `retryable` consumes one of the fact's attempts: the fact becomes
@@ -296,17 +333,13 @@ export function resolveFactDecision(
         reason: string;
         memoryId?: number;
         mapping?: unknown;
-        /** An approval-gated operation, recorded in the review inbox in the same transaction. */
-        proposal?: Pick<
-            ProposalRequest,
-            "sourceSessionId" | "operation" | "targetIds" | "proposal"
-        >;
     },
 ): ApplierReceipt {
     return db
         .transaction(() => {
             const existing = readReceipt(db, request.key);
             if (existing) return existing;
+            if (request.reservation) assertMemoryFactReservation(db, request.reservation);
             if (request.state === "retryable")
                 return resolveRevisionFailure(db, request, request.reason, true);
             const receipt = recordReceipt(db, request, {
@@ -320,54 +353,8 @@ export function resolveFactDecision(
                     JSON.stringify(request.mapping),
                     request.factId,
                 );
-            if (request.proposal)
-                proposeMemoryMutation(db, {
-                    ...request.proposal,
-                    projectPath: request.projectPath,
-                    key: request.key,
-                    writer: "historian",
-                });
-            return receipt;
-        })
-        .immediate();
-}
 
-export interface ProposalRequest {
-    projectPath: string;
-    sourceSessionId?: string;
-    key?: string;
-    /** Automated writers whose retirements and ungrounded edits wait for review. */
-    writer: "curate" | "verify" | "historian";
-    operation: "update" | "archive" | "merge" | "promote_rule";
-    targetIds: number[];
-    proposal: unknown;
-}
-export const MEMORY_PENDING_PROPOSAL = "MEMORY_PENDING_PROPOSAL";
-export function proposeMemoryMutation(db: Database, request: ProposalRequest): ApplierReceipt {
-    return db
-        .transaction(() => {
-            const sources = request.targetIds.map((id) =>
-                db.prepare("SELECT id,revision FROM memories WHERE id=?").get(id),
-            );
-            db.prepare(
-                "INSERT OR IGNORE INTO memory_tool_proposals(project_path,source_session_id,proposal_key,writer,operation,target_ids_json,expected_revisions_json,proposal_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            ).run(
-                request.projectPath,
-                request.sourceSessionId ?? null,
-                request.key ?? null,
-                request.writer,
-                request.operation,
-                JSON.stringify(request.targetIds),
-                JSON.stringify(sources),
-                JSON.stringify(request.proposal),
-                MEMORY_PENDING_PROPOSAL,
-                Date.now(),
-            );
-            return {
-                state: "decided_pending" as const,
-                reason: MEMORY_PENDING_PROPOSAL,
-                adoptionClass: memoryAdoptionClass(request.operation),
-            };
+            return receipt;
         })
         .immediate();
 }
@@ -416,6 +403,7 @@ export interface AgentMemoryMutation {
     content?: string;
     category?: MemoryInput["category"];
     reason?: string;
+    supersededById?: number;
     sourceSessionId: string;
     /** The harness of that session; defaults to this process's harness. */
     sourceHarness?: string;
@@ -513,11 +501,32 @@ function agentMutationFragment(
     };
 }
 
-/** Agent tool calls authorize immediate changes; automated curation remains a proposal. */
+/** Agent edits also publish prompt-update lines; automated edits wait for a full memory rebuild. */
 export function applyAgentMemoryMutation(
     db: Database,
     request: AgentMemoryMutation,
 ): ApplierReceipt {
+    return applyMemoryMutation(db, request, false);
+}
+
+/** Curate checks which memories it may read and edit; this transaction rechecks ownership and stored revisions. */
+export function applyCurateMemoryMutation(
+    db: Database,
+    request: AgentMemoryMutation,
+): ApplierReceipt {
+    return applyMemoryMutation(db, request, true);
+}
+
+function applyMemoryMutation(
+    db: Database,
+    request: AgentMemoryMutation,
+    automated: boolean,
+): ApplierReceipt {
+    const writer = automated ? "curate" : "ctx_memory";
+    const adoptionClass = automated ? "deferred" : "live";
+    const queue = (mutation: Parameters<typeof queueMemoryMutation>[1]) => {
+        if (!automated) queueMemoryMutation(db, mutation);
+    };
     return db
         .transaction(() => {
             const recovered = readReceipt(db, request.key);
@@ -528,12 +537,12 @@ export function applyAgentMemoryMutation(
                     {
                         key: request.key,
                         projectPath: request.projectPath,
-                        operation: `ctx_memory_${request.operation}`,
+                        operation: `${writer}_${request.operation}`,
                     },
                     receipt,
                 );
             const refuse = (reason: string) =>
-                record({ state: "decided_pending", reason, adoptionClass: "live" });
+                record({ state: "decided_pending", reason, adoptionClass });
             if (
                 request.targets.length === 0 ||
                 new Set(request.targets.map((target) => target.id)).size !==
@@ -547,16 +556,17 @@ export function applyAgentMemoryMutation(
                 const memory = getMemoryById(db, target.id);
                 if (
                     !memory ||
-                    normalizeStoredProjectPath(memory.projectPath) !==
-                        normalizeStoredProjectPath(request.projectPath)
+                    (!automated &&
+                        normalizeStoredProjectPath(memory.projectPath) !==
+                            normalizeStoredProjectPath(request.projectPath))
                 )
                     return refuse("target_not_owned");
                 if (!tsOwnsMemory(db, memory.projectPath))
                     throw new ModuleMemoryAuthorityError(memory.projectPath);
                 if (
                     getMemoryRevision(db, target.id) !== target.revision ||
-                    memory.status === "archived" ||
-                    memory.supersededByMemoryId !== null
+                    (!automated &&
+                        (memory.status === "archived" || memory.supersededByMemoryId !== null))
                 )
                     return refuse("stale_revision");
                 sources.push(memory);
@@ -586,7 +596,9 @@ export function applyAgentMemoryMutation(
             // Take every revision before changing any row. A failed source CAS rolls the whole operation back.
             for (const target of request.targets) {
                 db.prepare(
-                    "UPDATE memories SET revision=revision+1 WHERE id=? AND revision=? AND status!='archived' AND superseded_by_memory_id IS NULL",
+                    automated
+                        ? "UPDATE memories SET revision=revision+1 WHERE id=? AND revision=?"
+                        : "UPDATE memories SET revision=revision+1 WHERE id=? AND revision=? AND status!='archived' AND superseded_by_memory_id IS NULL",
                 ).run(target.id, target.revision);
                 const result = db.prepare("SELECT changes() AS n").get() as { n: number };
                 if (result.n !== 1) throw new Error("Memory revision changed during apply");
@@ -596,7 +608,7 @@ export function applyAgentMemoryMutation(
             if (request.operation === "update") {
                 updateMemoryContent(db, first.id, content!, hash!);
                 db.prepare("UPDATE memories SET category=? WHERE id=?").run(category, first.id);
-                queueMemoryMutation(db, {
+                queue({
                     projectPath: normalizeStoredProjectPath(first.projectPath),
                     mutationType: "update",
                     targetMemoryId: first.id,
@@ -607,8 +619,14 @@ export function applyAgentMemoryMutation(
             } else if (request.operation === "archive") {
                 for (const source of sources) {
                     archiveMemory(db, source.id, request.reason);
+                    if (automated && request.supersededById !== undefined) {
+                        supersededMemory(db, source.id, request.supersededById);
+                        db.prepare(
+                            "INSERT OR IGNORE INTO memory_successor_links(source_id,successor_id,decision_key) VALUES(?,?,?)",
+                        ).run(source.id, request.supersededById, request.key);
+                    }
                     clearAgentMutationDerivedData(db, source);
-                    queueMemoryMutation(db, {
+                    queue({
                         projectPath: normalizeStoredProjectPath(source.projectPath),
                         mutationType: "archive",
                         targetMemoryId: source.id,
@@ -623,13 +641,13 @@ export function applyAgentMemoryMutation(
                         category,
                         content: content!,
                         sourceSessionId: request.sourceSessionId,
-                        sourceType: "agent",
+                        sourceType: automated ? "dreamer" : "agent",
                     });
                 if (!duplicate) before.push(null);
                 const changed = canonical.content !== content || canonical.normalizedHash !== hash;
                 if (changed) {
                     updateMemoryContent(db, canonical.id, content!, hash!);
-                    queueMemoryMutation(db, {
+                    queue({
                         projectPath: normalizeStoredProjectPath(canonical.projectPath),
                         mutationType: "update",
                         targetMemoryId: canonical.id,
@@ -653,7 +671,7 @@ export function applyAgentMemoryMutation(
                         db.prepare(
                             "INSERT OR IGNORE INTO memory_successor_links(source_id,successor_id,decision_key) VALUES(?,?,?)",
                         ).run(source.id, canonical.id, request.key);
-                        queueMemoryMutation(db, {
+                        queue({
                             projectPath: normalizeStoredProjectPath(source.projectPath),
                             mutationType: "superseded",
                             targetMemoryId: source.id,
@@ -690,34 +708,40 @@ export function applyAgentMemoryMutation(
                     JSON.stringify(before[index]),
                     JSON.stringify(after[index]),
                     Date.now(),
-                    request.reason ?? `ctx_memory_${request.operation}`,
+                    request.reason ?? `${writer}_${request.operation}`,
                     "[]",
                     JSON.stringify(sources.map((memory) => memory.id)),
                     request.key,
                 );
             }
-            recordAgentFragment(db, {
-                sessionId: request.sourceSessionId,
-                harness: request.sourceHarness,
-                projectPath: normalizeStoredProjectPath(request.projectPath),
-                operationKey: request.key,
-                ...agentMutationFragment(
-                    request.operation,
-                    sources,
-                    canonical,
-                    duplicate !== null,
-                    category,
-                    content,
-                    canonical !== null &&
-                        content !== undefined &&
-                        sessionShowsMemoryText(db, request.sourceSessionId, canonical.id, content),
-                ),
-            });
+            if (!automated)
+                recordAgentFragment(db, {
+                    sessionId: request.sourceSessionId,
+                    harness: request.sourceHarness,
+                    projectPath: normalizeStoredProjectPath(request.projectPath),
+                    operationKey: request.key,
+                    ...agentMutationFragment(
+                        request.operation,
+                        sources,
+                        canonical,
+                        duplicate !== null,
+                        category,
+                        content,
+                        canonical !== null &&
+                            content !== undefined &&
+                            sessionShowsMemoryText(
+                                db,
+                                request.sourceSessionId,
+                                canonical.id,
+                                content,
+                            ),
+                    ),
+                });
             const receipt = record({
                 state: "applied",
                 reason: request.operation,
                 memoryId: canonical?.id ?? first.id,
-                adoptionClass: "live",
+                adoptionClass,
                 supersededIds,
             });
             db.prepare(
@@ -745,6 +769,7 @@ export async function applyHistorianRevision(
     owner: { sessionId: string; harness: string },
     reattachOrSend: (request: CheckRequest, options: { reattach: boolean }) => Promise<CheckReply>,
     factId?: number,
+    reservation?: MemoryFactReservation,
 ): Promise<ApplierReceipt> {
     const existing = readReceipt(db, decision.key);
     if (existing) return existing;
@@ -767,15 +792,16 @@ export async function applyHistorianRevision(
     };
     if (!tsOwnsMemory(db, decision.projectPath))
         return db
-            .transaction(
-                () =>
-                    readReceipt(db, decision.key) ??
-                    recordReceipt(db, request, {
-                        state: "retryable",
-                        reason: "authority_elsewhere",
-                        adoptionClass: memoryAdoptionClass(decision.action),
-                    }),
-            )
+            .transaction(() => {
+                const recovered = readReceipt(db, decision.key);
+                if (recovered) return recovered;
+                if (reservation) assertMemoryFactReservation(db, reservation);
+                return recordReceipt(db, request, {
+                    state: "retryable",
+                    reason: "authority_elsewhere",
+                    adoptionClass: memoryAdoptionClass(decision.action),
+                });
+            })
             .immediate();
     // A target or source of this project that was archived or revised after the
     // decision read it: the decision is stale, not wrong, so it is retried.
@@ -791,30 +817,33 @@ export async function applyHistorianRevision(
         })
     )
         return db
-            .transaction(
-                () =>
-                    readReceipt(db, decision.key) ??
-                    resolveRevisionFailure(db, request, "cas_loss", true),
-            )
+            .transaction(() => {
+                const recovered = readReceipt(db, decision.key);
+                if (recovered) return recovered;
+                if (reservation) assertMemoryFactReservation(db, reservation);
+                return resolveRevisionFailure(db, request, "cas_loss", true);
+            })
             .immediate();
     const plan = planMemoryRevision(decision, context);
     if (!plan.ok)
         return db
-            .transaction(
-                () =>
-                    readReceipt(db, decision.key) ??
-                    recordReceipt(db, request, {
-                        state: "decided_pending",
-                        reason: plan.reason,
-                        adoptionClass: memoryAdoptionClass(decision.action),
-                    }),
-            )
+            .transaction(() => {
+                const recovered = readReceipt(db, decision.key);
+                if (recovered) return recovered;
+                if (reservation) assertMemoryFactReservation(db, reservation);
+                return recordReceipt(db, request, {
+                    state: "decided_pending",
+                    reason: plan.reason,
+                    adoptionClass: memoryAdoptionClass(decision.action),
+                });
+            })
             .immediate();
     const outcome = await checkMemoryRevision(db, owner, decision, context, reattachOrSend);
     const receipt = db
         .transaction(() => {
             const recovered = readReceipt(db, decision.key);
             if (recovered) return recovered;
+            if (reservation) assertMemoryFactReservation(db, reservation);
             if (!outcome.ok)
                 return resolveRevisionFailure(
                     db,

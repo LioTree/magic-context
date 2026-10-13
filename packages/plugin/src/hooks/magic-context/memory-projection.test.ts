@@ -1,5 +1,7 @@
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
+import { registerNoProposalReviewWitnesses } from "../../shared/memory-no-proposals-review.test";
 import {
+    type ProjectionDriver,
     type ProjectionFixture,
     type ProjectionOptions,
     registerMemoryProjectionRegressions,
@@ -26,7 +28,7 @@ function options(f: ProjectionFixture, sessionId: string, render: ProjectionOpti
     };
 }
 
-registerMemoryProjectionRegressions({
+const driver: ProjectionDriver = {
     host: "OpenCode",
     hard: (f, sessionId, render) => {
         materializeM0(options(f, sessionId, render));
@@ -42,4 +44,7 @@ registerMemoryProjectionRegressions({
             materialized: result.m0RematerializedThisPass,
         };
     },
-});
+};
+
+registerMemoryProjectionRegressions(driver);
+registerNoProposalReviewWitnesses(driver);

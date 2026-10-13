@@ -58,6 +58,7 @@ const tokenInputs = [
     "2026-09-17x 12:10:30 ``a ` b`` `unclosed 7 µs 7µs 5 secs 5 sec.",
     "(see docs/designs/memory-lifecycle.md). Ends with KEY_CODE.",
     "MAX_STAGE2_ATTEMPTS = 3 and NARROW_CHECK_WINDOW_MAX = 1200 units",
+    "retry_limit is 17; _private_limit = 3; retry_limit17 is an identifier, not 17",
 ];
 
 const markerInputs = [

@@ -43,6 +43,7 @@ pub mod classify;
 pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
+pub mod config_parity;
 mod content_language;
 pub mod decay_render;
 pub mod decision_calibration;
@@ -54,7 +55,9 @@ pub mod historian_chunk;
 pub mod historian_host;
 pub mod historian_producer;
 pub mod historian_prompt;
+pub mod historian_recovery;
 pub mod historian_runner;
+pub mod historian_stage;
 pub mod historian_tool_template;
 pub mod historian_validate;
 pub mod host_store;
@@ -64,6 +67,7 @@ pub mod m0_compose;
 pub mod m1_compose;
 pub mod memory_render;
 pub mod memory_tool;
+pub mod parity_contract;
 pub mod project_docs;
 pub mod project_identity;
 pub mod prompt_surface;
@@ -71,6 +75,7 @@ pub mod protection_window;
 mod providers;
 mod reply_pages;
 mod retained_size;
+pub mod retrieval;
 mod transport_handler;
 pub use transport_handler::McTransportHandler;
 pub mod edit_admission;
@@ -8459,6 +8464,38 @@ impl McHandler {
         };
         match store.claim_historian_run(&project_path, &run_id, &claimant, now_ms()) {
             Ok(mc_store::HistorianClaimOutcome::Claimed(claim)) => {
+                let lifecycle = if historian_stage::lifecycle_enabled() {
+                    let state = match store.load_meta(&claim.session_id) {
+                        Ok(loaded) => loaded.meta.historian,
+                        Err(error) => {
+                            return HandlerOutcome::Error {
+                                code: "store_load_failed".into(),
+                                message: error.to_string(),
+                            }
+                        }
+                    };
+                    let stage = historian_stage::HistorianStage::turn_one(
+                        &project_path,
+                        &claim.session_id,
+                        &state,
+                    );
+                    if let Err(error) = stage.persist(store, &claim.session_id, &binding.harness, "rust_host", None,
+                    &json!({"system": claim.system_prompt, "prompt": claim.user_prompt, "model_chain": claim.model_chain}), now_ms()) {
+                    return HandlerOutcome::Error { code: error.code().into(), message: error.to_string() };
+                }
+                    let child = match stage.child(store) {
+                        Ok(child) => child,
+                        Err(error) => {
+                            return HandlerOutcome::Error {
+                                code: error.code().into(),
+                                message: error.to_string(),
+                            }
+                        }
+                    };
+                    Some(stage.wire(child.as_deref()))
+                } else {
+                    None
+                };
                 let mut body = json!({
                 "ok": true,
                 "run_id": claim.run_id,
@@ -8477,6 +8514,9 @@ impl McHandler {
                 // The queuing request's per-attempt timeout. A claimant times each model
                 // with it instead of its own configuration; one that predates the field
                 // ignores it and keeps its own.
+                if let Some(lifecycle) = lifecycle {
+                    body["lifecycle"] = lifecycle;
+                }
                 if let Some(timeout) = claim.historian_timeout_ms {
                     body["historian_timeout_ms"] = json!(timeout);
                 }
@@ -8574,8 +8614,8 @@ impl McHandler {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        match store.authorize_historian_report(&project_path, &run_id, &token) {
-            Ok(mc_store::HistorianReportOutcome::Authorized(_)) => {}
+        let authorization = match store.authorize_historian_report(&project_path, &run_id, &token) {
+            Ok(mc_store::HistorianReportOutcome::Authorized(authorization)) => authorization,
             Ok(mc_store::HistorianReportOutcome::Refused(refusal)) => {
                 return respond(json!({ "ok": false, "refusal": refusal.as_wire_str() }));
             }
@@ -8585,13 +8625,51 @@ impl McHandler {
                     message: error.to_string(),
                 };
             }
-        }
+        };
 
         let report = match parse_historian_report(request) {
             Ok(report) => report,
             Err(outcome) => return outcome,
         };
+        // Use lifecycle metadata only when the schema/profile-gated historian
+        // workflow is enabled. Otherwise preserve the legacy report contract,
+        // without writing stage or child-session records.
+        if historian_stage::lifecycle_enabled() {
+            if let Some(lifecycle) = request.get("lifecycle") {
+                let state = match store.load_meta(&authorization.session_id) {
+                    Ok(loaded) => loaded.meta.historian,
+                    Err(error) => {
+                        return HandlerOutcome::Error {
+                            code: "store_load_failed".into(),
+                            message: error.to_string(),
+                        }
+                    }
+                };
+                let stage = historian_stage::HistorianStage::turn_one(
+                    &project_path,
+                    &authorization.session_id,
+                    &state,
+                );
+                let child = lifecycle
+                    .get("child_session_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty());
+                if lifecycle.get("stage_key").and_then(Value::as_str)
+                    != Some(stage.stage_key.as_str())
+                    || child.is_none()
+                {
+                    return respond(json!({"ok": false, "refusal": "stage_identity_mismatch"}));
+                }
+                if let Err(error) = stage.record_host_child(store, child.unwrap(), lifecycle) {
+                    return HandlerOutcome::Error {
+                        code: error.code().into(),
+                        message: error.to_string(),
+                    };
+                }
+            }
+        }
         let durable = durable_report(&report);
+        let deferred_telemetry = report.clone();
         match self.host_runs.deliver(&run_id, report) {
             Ok(()) => respond(json!({ "ok": true, "accepted": true, "publish": "immediate" })),
             Err(
@@ -8614,6 +8692,11 @@ impl McHandler {
                     now_ms(),
                 ) {
                     Ok(mc_store::HistorianRecordOutcome::Recorded) => {
+                        deferred_telemetry.record_invocations(
+                            store,
+                            &authorization.session_id,
+                            &binding.harness,
+                        );
                         eprintln!(
                             "mc-module: historian report for {run_id} stored for the next pass (no firing task in this process is waiting on it)"
                         );
@@ -10734,6 +10817,8 @@ impl McHandler {
                 crate::transform::TransformError::ProtectedToolResultsOverLimit
             ) {
                 crate::transform::PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE
+            } else if matches!(e, crate::transform::TransformError::SignedTurnOverLimit) {
+                crate::transform::SIGNED_TURN_OVER_LIMIT_CODE
             } else {
                 "transform_failed"
             };
@@ -13083,7 +13168,11 @@ impl McHandler {
                 self.handle_memory_set_verification(channel, &request).await
             }
             "memory.set_mapping" => self.handle_memory_set_mapping(channel, &request).await,
-            "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
+            "ctx_memory" => {
+                self.handle_ctx_memory_facade(channel, &request, false)
+                    .await
+            }
+            "memory.curate" => self.handle_memory_curate_facade(channel, &request).await,
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
             "ctx_reduce" => self.handle_ctx_reduce_facade(channel, &request).await,
@@ -13564,7 +13653,39 @@ impl McHandler {
         mcp_text_result(reply, false)
     }
 
-    async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_memory_curate_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let outcome = self.handle_ctx_memory_facade(channel, request, true).await;
+        let HandlerOutcome::Response(bytes) = &outcome else {
+            return outcome;
+        };
+        let Ok(Value::Object(mut body)) = serde_json::from_slice::<Value>(bytes) else {
+            return outcome;
+        };
+        if body.contains_key("structuredContent") {
+            return outcome;
+        }
+        // Existing scope and transaction refusals keep their human explanation, but
+        // must also report failure through the machine-readable curation contract.
+        let code = if body.get("isError") == Some(&Value::Bool(true)) {
+            "mutation_refused"
+        } else {
+            "invalid_receipt"
+        };
+        body.insert("isError".into(), Value::Bool(true));
+        body.insert(
+            "structuredContent".into(),
+            serde_json::to_value(MemoryCurateResult::refused(code))
+                .expect("curate receipt is serializable"),
+        );
+        respond(Value::Object(body))
+    }
+
+    async fn handle_ctx_memory_facade(
+        &self,
+        channel: u16,
+        request: &Value,
+        automated: bool,
+    ) -> HandlerOutcome {
         let Some(args) = facade_arguments(request, &["action"]) else {
             return invalid_params_error("ctx_memory arguments must be an object");
         };
@@ -13579,6 +13700,32 @@ impl McHandler {
             return tool_error_result(format!("Error: {error}."));
         }
         let is_mutation = matches!(action, "write" | "update" | "archive" | "merge");
+        if automated && !matches!(action, "update" | "archive" | "merge") {
+            return invalid_params_error("memory.curate requires update, archive or merge");
+        }
+        let expected_revisions: Vec<(i64, i64)> = if automated {
+            let Some(targets) = args.get("expected_revisions").and_then(Value::as_array) else {
+                return invalid_params_error("memory.curate requires expected_revisions");
+            };
+            let Some(targets) = targets
+                .iter()
+                .map(|target| {
+                    Some((
+                        target.get("id")?.as_i64()?,
+                        target.get("revision")?.as_i64()?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return invalid_params_error("invalid expected_revisions");
+            };
+            if targets.iter().map(|(id, _)| *id).collect::<Vec<_>>() != memory_ids(args, action) {
+                return invalid_params_error("expected_revisions must name every target");
+            }
+            targets
+        } else {
+            Vec::new()
+        };
         let facade_scope = match self
             .resolve_facade_scope(channel, Some(args), "memories", is_mutation)
             .await
@@ -13655,7 +13802,11 @@ impl McHandler {
                     memory_project,
                     "memories",
                     conversation_key,
-                    "ctx_memory",
+                    if automated {
+                        "memory.curate"
+                    } else {
+                        "ctx_memory"
+                    },
                     action,
                     command_id.as_deref(),
                     |tx| {
@@ -13755,10 +13906,19 @@ impl McHandler {
                     memory_project,
                     "memories",
                     conversation_key,
-                    "ctx_memory",
+                    if automated {
+                        "memory.curate"
+                    } else {
+                        "ctx_memory"
+                    },
                     action,
                     command_id.as_deref(),
-                    |tx| {
+                    |agent_tx| {
+                        let automated_tx = agent_tx.automated();
+                        let tx = if automated { &automated_tx } else { agent_tx };
+                        if automated {
+                            tx.check_memory_revisions(&expected_revisions)?;
+                        }
                         let memory = tx
                             .update_memory_content(memory_project, id, content, category, now_ms())
                             .map_err(|error| request_context.render_mutation_error(error))?;
@@ -13781,10 +13941,16 @@ impl McHandler {
                             }],
                             now_ms(),
                         )?;
-                        facade_text_response(
-                            format!("Updated memory [ID: {rendered_id}] in {}.", memory.category),
-                            false,
-                        )
+                        let text =
+                            format!("Updated memory [ID: {rendered_id}] in {}.", memory.category);
+                        if automated {
+                            mcp_curate_result(
+                                text,
+                                MemoryCurateResult::applied(rendered_id, vec![]),
+                            )
+                        } else {
+                            facade_text_response(text, false)
+                        }
                     },
                 ))
             }
@@ -13801,18 +13967,36 @@ impl McHandler {
                     memory_project,
                     "memories",
                     conversation_key,
-                    "ctx_memory",
+                    if automated {
+                        "memory.curate"
+                    } else {
+                        "ctx_memory"
+                    },
                     action,
                     command_id.as_deref(),
-                    |tx| {
+                    |agent_tx| {
+                        let automated_tx = agent_tx.automated();
+                        let tx = if automated { &automated_tx } else { agent_tx };
+                        if automated {
+                            tx.check_memory_revisions(&expected_revisions)?;
+                        }
                         let archived = tx
                             .archive_memories(memory_project, &ids, reason, now_ms())
                             .map_err(|error| request_context.render_mutation_error(error))?;
+                        if automated {
+                            if let Some(successor_id) =
+                                args.get("superseded_by").and_then(Value::as_i64)
+                            {
+                                tx.set_curate_successor(&archived, successor_id)?;
+                            }
+                        }
                         if archived.is_empty() {
-                            facade_text_response(
-                                "No active memories needed archiving.".to_string(),
-                                false,
-                            )
+                            let text = "No active memories needed archiving.".to_string();
+                            if automated {
+                                mcp_curate_result(text, MemoryCurateResult::refused("not_active"))
+                            } else {
+                                facade_text_response(text, false)
+                            }
                         } else {
                             tx.record_agent_fragment(
                                 conversation_key,
@@ -13828,10 +14012,16 @@ impl McHandler {
                                 now_ms(),
                             )?;
                             let rendered_ids = archived;
-                            facade_text_response(
-                                format!("Archived memory IDs [{}].", join_i64s(&rendered_ids)),
-                                false,
-                            )
+                            let text =
+                                format!("Archived memory IDs [{}].", join_i64s(&rendered_ids));
+                            if automated {
+                                mcp_curate_result(
+                                    text,
+                                    MemoryCurateResult::applied(rendered_ids[0], vec![]),
+                                )
+                            } else {
+                                facade_text_response(text, false)
+                            }
                         }
                     },
                 ))
@@ -13859,10 +14049,13 @@ impl McHandler {
                         memory_project,
                         "memories",
                         conversation_key,
-                        "ctx_memory",
+                        if automated { "memory.curate" } else { "ctx_memory" },
                         action,
                         command_id.as_deref(),
-                        |tx| {
+                        |agent_tx| {
+                            let automated_tx = agent_tx.automated();
+                            let tx = if automated { &automated_tx } else { agent_tx };
+                            if automated { tx.check_memory_revisions(&expected_revisions)?; }
                             let (mut memory, superseded_ids) = tx
                                 .merge_memories_canonical(
                                     memory_project,
@@ -13902,6 +14095,7 @@ impl McHandler {
                                     join_i64s(&rendered_superseded)
                                 )
                             };
+                            if automated { return mcp_curate_result(text, MemoryCurateResult::applied(memory.id, superseded_ids)); }
                             mcp_memory_result(
                                 text,
                                 false,
@@ -15028,6 +15222,7 @@ fn optional_run_string(request: &Value, field: &str) -> Result<Option<String>, H
 /// the report it is handed.
 fn durable_report(report: &HostRunReport) -> mc_store::HistorianRunReport {
     match report {
+        HostRunReport::WithInvocations { report, .. } => durable_report(report),
         HostRunReport::Output(output) => mc_store::HistorianRunReport::Output {
             text: output.text.clone(),
             length_capped: output.length_capped,
@@ -15040,6 +15235,34 @@ fn durable_report(report: &HostRunReport) -> mc_store::HistorianRunReport {
 }
 
 fn parse_historian_report(request: &Value) -> Result<HostRunReport, HandlerOutcome> {
+    let report = parse_historian_report_body(request)?;
+    let Some(attempts) = request.get("invocations") else {
+        return Ok(report);
+    };
+    // Accounting is optional: a malformed telemetry extension must not discard paid output.
+    match serde_json::from_value::<Vec<mc_store::HistorianInvocation>>(attempts.clone()) {
+        Ok(invocations)
+            if invocations.len() <= 64
+                && invocations.iter().all(|attempt| {
+                    matches!(
+                        attempt.status.as_str(),
+                        "completed" | "failed" | "aborted" | "timed_out" | "empty"
+                    )
+                }) =>
+        {
+            Ok(HostRunReport::WithInvocations {
+                report: Box::new(report),
+                invocations,
+            })
+        }
+        _ => {
+            eprintln!("mc-module: ignoring invalid historian invocation telemetry");
+            Ok(report)
+        }
+    }
+}
+
+fn parse_historian_report_body(request: &Value) -> Result<HostRunReport, HandlerOutcome> {
     let output = request.get("output").filter(|value| !value.is_null());
     let error = request.get("error").filter(|value| !value.is_null());
     match (output, error) {
@@ -16900,6 +17123,49 @@ fn mcp_text_result(text: String, is_error: bool) -> HandlerOutcome {
         "content": [{ "type": "text", "text": text }],
         "isError": is_error,
     }))
+}
+
+#[derive(serde::Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum MemoryCurateState {
+    Applied,
+    Refused,
+}
+
+#[derive(serde::Serialize)]
+struct MemoryCurateResult {
+    state: MemoryCurateState,
+    memory_id: Option<i64>,
+    superseded_ids: Vec<i64>,
+    error_code: Option<String>,
+}
+
+impl MemoryCurateResult {
+    fn applied(memory_id: i64, superseded_ids: Vec<i64>) -> Self {
+        Self {
+            state: MemoryCurateState::Applied,
+            memory_id: Some(memory_id),
+            superseded_ids,
+            error_code: None,
+        }
+    }
+    fn refused(code: &str) -> Self {
+        Self {
+            state: MemoryCurateState::Refused,
+            memory_id: None,
+            superseded_ids: vec![],
+            error_code: Some(code.into()),
+        }
+    }
+}
+
+fn mcp_curate_result(text: String, receipt: MemoryCurateResult) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": receipt.state == MemoryCurateState::Refused,
+        "structuredContent": receipt,
+    }))
+    .map_err(|error| error.to_string())
 }
 
 fn mcp_memory_result(text: String, is_error: bool, operation: Value) -> Result<Vec<u8>, String> {
@@ -27674,6 +27940,21 @@ mod tests {
             json!({"info":{"id":"a0","role":"assistant"},"parts":[{"type":"text","text":"first answer"}]}),
         ];
         for pass in 0..5 {
+            if pass >= 3 {
+                // From pass 3 on, mark a pending bootstrap-seed fold in both stores. The
+                // fixture is one open Anthropic turn with signed thinking on a prefix-bound
+                // model, so the render-identity change below would wait for the turn to end
+                // (the m0/m1 head is frozen while that thinking is kept). A pending seed fold
+                // makes the pass a HARD (a full m0/m1 rebuild) whatever else is queued, so it
+                // gives these passes their rewrite instead.
+                for store in [&store, &reference_store] {
+                    let mut loaded = store.load("ses").unwrap();
+                    loaded.meta.bootstrap_seed_fold_pending = true;
+                    store
+                        .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                        .unwrap();
+                }
+            }
             if pass == 4 {
                 for (store, project) in [(&store, &project), (&reference_store, &reference_project)]
                 {
@@ -27713,6 +27994,7 @@ mod tests {
                     let loaded = store.load("ses").unwrap();
                     store
                         .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                            lifecycle_publication_id: None,
                             harness: None,
                             session_id: "ses",
                             expected_row_version: loaded.row_version,
@@ -27900,6 +28182,15 @@ mod tests {
             .any(|unit| unit.key == "strip:native_reasoning_keep:step-0"));
         let mut priced_request = make_request(&native);
         priced_request["render_config"] = json!("independent-priced-config-change");
+        // Mark a pending bootstrap-seed fold. A render-identity change inside the open signed
+        // turn would wait for the turn to end, but a pending seed fold makes the pass a
+        // HARD (a full m0/m1 rebuild) whatever else is queued (the HARD asserted below). It re-renders the same head, so
+        // the turn's signed thinking stays valid.
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.bootstrap_seed_fold_pending = true;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
         let priced = call_transform_request(&handler, priced_request).await;
         assert_eq!(priced["action"], "HARD");
         // step-0 belongs to the active Anthropic turn (no real user message follows
@@ -28001,6 +28292,15 @@ mod tests {
         }
         let mut priced_request = make_request(&native, "claude-fable-5-1");
         priced_request["render_config"] = json!("independent-priced-config-change");
+        // Mark a pending bootstrap-seed fold. A render-identity change inside the open signed
+        // turn would wait for the turn to end, but a pending seed fold makes the pass a
+        // HARD (a full m0/m1 rebuild) whatever else is queued (the HARD asserted below). It re-renders the same head, so
+        // the turn's signed thinking stays valid.
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.bootstrap_seed_fold_pending = true;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
         let priced = call_transform_request(&handler, priced_request).await;
         assert_eq!(priced["action"], "HARD");
         let target = priced["native_messages"]
@@ -29880,6 +30180,7 @@ mod tests {
             .unwrap();
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: Some(1),
@@ -32737,6 +33038,196 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn module_curate_facade_applies_update_merge_archive_without_agent_fragments() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_root = project.to_str().unwrap();
+        let identity = "git:curate-direct";
+        handler.bind_route(7, binding(route_root, "token"));
+        activate_module_authority(&store, "context", identity, route_root, "memories");
+        let first = insert_memory(&store, identity, "CONSTRAINTS", "cache_ttl=5m", 1);
+        let second = insert_memory(&store, identity, "CONSTRAINTS", "cache_ttl=10m", 1);
+        let update = json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-update", "action": "update", "ids": [first], "expected_revisions": [{"id": first, "revision": 1}], "content": "cache_ttl=15m" });
+        let applied = tool_body(call_facade(&handler, "memory.curate", update.clone()).await);
+        assert!(applied["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Updated memory"));
+        assert_eq!(
+            applied["structuredContent"],
+            json!({"state": "applied", "memory_id": first, "superseded_ids": [], "error_code": null})
+        );
+        let replay = tool_body(call_facade(&handler, "memory.curate", update).await);
+        assert_eq!(replay["structuredContent"], applied["structuredContent"]);
+        assert_eq!(
+            store.get_memory_full(first).unwrap().unwrap().content,
+            "cache_ttl=15m"
+        );
+        let merged = tool_body(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-merge", "action": "merge", "ids": [first, second], "expected_revisions": [{"id": first, "revision": 2}, {"id": second, "revision": 1}], "content": "cache_ttl=20m" })).await);
+        assert!(
+            merged["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Merged memories"),
+            "{merged}"
+        );
+        assert_eq!(
+            store.get_memory_full(first).unwrap().unwrap().status,
+            "archived"
+        );
+        let canonical: (i64, i64) = store
+            .with_context_conn_for_test(|conn| {
+                conn.query_row(
+                    "SELECT id,revision FROM memories WHERE content='cache_ttl=20m'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            merged["structuredContent"],
+            json!({"state": "applied", "memory_id": canonical.0, "superseded_ids": [first, second], "error_code": null})
+        );
+        let archive = tool_body(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-archive", "action": "archive", "ids": [canonical.0], "expected_revisions": [{"id": canonical.0, "revision": canonical.1}], "reason": "obsolete" })).await);
+        assert!(
+            archive["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Archived memory"),
+            "{archive}"
+        );
+        assert_eq!(
+            archive["structuredContent"],
+            json!({"state": "applied", "memory_id": canonical.0, "superseded_ids": [], "error_code": null})
+        );
+        assert_eq!(
+            store.get_memory_full(canonical.0).unwrap().unwrap().status,
+            "archived"
+        );
+        let inactive = tool_body(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-inactive", "action": "archive", "ids": [canonical.0], "expected_revisions": [{"id": canonical.0, "revision": canonical.1 + 1}] })).await);
+        assert_eq!(
+            inactive["structuredContent"],
+            json!({"state": "refused", "memory_id": null, "superseded_ids": [], "error_code": "not_active"})
+        );
+        store
+            .with_context_conn_for_test(|conn| {
+                for table in [
+                    "memory_mutation_log",
+                    "memory_agent_fragments",
+                    "memory_tool_proposals",
+                ] {
+                    assert_eq!(
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                            .get::<_, i64>(0))?,
+                        0,
+                        "{table}"
+                    );
+                }
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM memory_history WHERE memory_id=?1",
+                        [first],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn noprop_curate_stale_cas_refuses_each_action_and_changes_nothing() {
+        if std::env::var("MC_NOPROP_REVIEW").as_deref() != Ok("1") {
+            return;
+        }
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let root = project.to_str().unwrap();
+        let identity = "git:noprop-cas";
+        handler.bind_route(7, binding(root, "token"));
+        activate_module_authority(&store, "context", identity, root, "memories");
+        let first = insert_memory(&store, identity, "CONSTRAINTS", "Original first.", 1);
+        let second = insert_memory(&store, identity, "CONSTRAINTS", "Original second.", 1);
+        for action in ["update", "archive", "merge"] {
+            let ids = if action == "merge" {
+                vec![first, second]
+            } else {
+                vec![first]
+            };
+            let expected: Vec<Value> = ids
+                .iter()
+                .map(|id| json!({"id": id, "revision": if *id == first { 0 } else { 1 }}))
+                .collect();
+            let body = tool_body(call_facade(&handler, "memory.curate", json!({
+                "memory_project": identity, "command_id": format!("stale-{action}"),
+                "action": action, "ids": ids, "expected_revisions": expected, "content": "Replacement.",
+            })).await);
+            assert_eq!(body["isError"], true, "{action}: {body}");
+            assert_eq!(
+                body["structuredContent"],
+                json!({"state": "refused", "memory_id": null, "superseded_ids": [], "error_code": "mutation_refused"}),
+                "{action}: {body}"
+            );
+            assert!(
+                body["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("stale_revision"),
+                "{action}: {body}"
+            );
+        }
+        let foreign = insert_memory(&store, "git:foreign", "CONSTRAINTS", "Foreign source.", 1);
+        store.with_context_conn_for_test(|conn| {
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS authority_managed(project_path TEXT PRIMARY KEY, context_store_uuid TEXT NOT NULL, marked_at INTEGER NOT NULL)")?;
+            conn.execute("INSERT INTO authority_managed(project_path,context_store_uuid,marked_at) VALUES(?1,'review',1)", [identity])?;
+            Ok(())
+        }).unwrap();
+        let refused = tool_body(call_facade(&handler, "memory.curate", json!({
+            "memory_project": identity, "command_id": "mixed-authority", "action": "merge",
+            "ids": [first, foreign], "expected_revisions": [{"id": first, "revision": 1}, {"id": foreign, "revision": 1}],
+            "content": "Merged foreign source.",
+        })).await);
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(
+            store.get_memory_full(foreign).unwrap().unwrap().status,
+            "active"
+        );
+        assert_eq!(
+            store.get_memory_full(first).unwrap().unwrap().content,
+            "Original first."
+        );
+        assert_eq!(
+            store.get_memory_full(second).unwrap().unwrap().status,
+            "active"
+        );
+        store
+            .with_context_conn_for_test(|conn| {
+                for table in [
+                    "memory_history",
+                    "memory_mutation_log",
+                    "memory_agent_fragments",
+                    "memory_tool_proposals",
+                ] {
+                    assert_eq!(
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                            .get::<_, i64>(0))?,
+                        0,
+                        "{table}"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn verification_and_mapping_facades_are_fenced_hash_guarded_and_idempotent() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
@@ -32860,15 +33351,14 @@ mod tests {
         assert!(matches!(archive, HandlerOutcome::Response(_)));
         let after_archive =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        // A verify archive is a model-judged retirement: a pending proposal, the row
-        // stays live, and nothing moves the prompt.
+        // Archiving changes the stored memory's status but leaves the m1 revision signal unchanged.
         assert_eq!(
             after_archive, before_archive,
             "a verify archive must not move the m1 mutation signal"
         );
         assert_eq!(
             store.get_memory_full(archived_id).unwrap().unwrap().status,
-            "active"
+            "archived"
         );
         let proposals: Vec<(String, String, String)> = store
             .with_context_conn_for_test(|tx| {
@@ -32881,14 +33371,7 @@ mod tests {
                 rows
             })
             .unwrap();
-        assert_eq!(
-            proposals,
-            vec![(
-                "verify".to_string(),
-                "archive".to_string(),
-                format!("[{archived_id}]")
-            )]
-        );
+        assert_eq!(proposals, vec![]);
 
         let mapping = call_facade(&handler, "memory.set_mapping", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
@@ -39299,6 +39782,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
                 expected_row_version: loaded.row_version,
@@ -41549,6 +42033,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                lifecycle_publication_id: None,
                 harness: None,
                 session_id,
                 expected_row_version: store.load(session_id).unwrap().row_version,
@@ -42461,7 +42946,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn the_historian_claim_lane_answers_the_wire_a2_codes_against() {
         let golden = claim_wire_golden();
-        let (handler, store, _dir, project) =
+        let (handler, store, dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         let project_path = project.to_string_lossy().to_string();
         let queued_at_ms = now_ms();
@@ -42499,6 +42984,7 @@ mod tests {
             None,
         )
         .await;
+
         let token = claimed["token"]
             .as_str()
             .expect("a claim mints a token")
@@ -42596,15 +43082,39 @@ mod tests {
         // and its token is still current, but nothing in this process is waiting for
         // the answer. The report is stored on the queue row rather than refused.
         assert_eq!(handler.host_runs.waiting_count(), 0);
-        drive_claim_wire_case(
-            &handler,
-            claim_wire_case(
-                &golden,
-                "a-report-with-no-firing-waiting-is-stored-for-the-next-pass",
-            ),
-            Some(&token),
-        )
-        .await;
+        let invocations = json!([
+            { "provider_id": "prov", "model_id": "broken", "started_at": queued_at_ms,
+              "ended_at": queued_at_ms + 1, "status": "failed", "error": "provider unavailable" },
+            { "provider_id": "other", "model_id": "good", "started_at": queued_at_ms + 1,
+              "ended_at": queued_at_ms + 2, "status": "completed", "input_tokens": 120,
+              "output_tokens": 40, "cache_read_tokens": 80, "cache_write_tokens": 10, "error": null }
+        ]);
+        let case = claim_wire_case(
+            &golden,
+            "a-report-with-no-firing-waiting-is-stored-for-the-next-pass",
+        );
+        let mut deferred = case.request.clone();
+        deferred["token"] = json!(token);
+        deferred["invocations"] = invocations.clone();
+        let observed = call_dispatch_request(&handler, deferred).await;
+        assert_eq!(observed, case.response);
+        let descriptor = dev_descriptor_at(dir.path().join("data").to_str().unwrap());
+        let context_path = match descriptor.backend {
+            StorageBackend::Sqlite { path } => {
+                PathBuf::from(path).parent().unwrap().join("context.db")
+            }
+            _ => panic!("test store is SQLite"),
+        };
+        let conn = rusqlite::Connection::open(context_path).unwrap();
+        let rows: Vec<(i64,String,Option<i64>,Option<String>)> = conn.prepare(
+            "SELECT id,status,parent_invocation_id,error FROM subagent_invocations WHERE session_id='ses' ORDER BY id"
+        ).unwrap().query_map([], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
+            .collect::<Result<_,_>>().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, "failed");
+        assert_eq!(rows[0].3.as_deref(), Some("provider unavailable"));
+        assert_eq!(rows[1].1, "completed");
+        assert_eq!(rows[1].2, Some(rows[0].0));
         let parked = store
             .load_parked_historian_run("ses")
             .unwrap()
@@ -42627,12 +43137,24 @@ mod tests {
                 "run_id": CLAIM_RUN_ID,
                 "token": token,
                 "output": { "text": "<compartments/>", "length_capped": false },
+                "invocations": invocations,
             }),
         )
         .await;
         assert_eq!(
             duplicate,
             json!({ "ok": false, "refusal": "already_reported" })
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subagent_invocations WHERE session_id='ses'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "a refused duplicate cannot record the attempts again"
         );
     }
 
