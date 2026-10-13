@@ -10,7 +10,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const repository = resolve(import.meta.dir, "..");
-const base = "9d26c87081a9925217fa09698ce08e7a092e1f4d";
+// Master 62f20c02 has no experimental hold, but does record which Pi tag numbers
+// have been served. Keep that safety metadata in the exact comparison instead
+// of deleting it to match the older 9d26c87081 schema.
+const base =
+	process.env.MC_HOLD_ORACLE_BASE ?? "62f20c02ff99d132dd67d4ad727330f5de855e14";
 
 function run(command: string[], cwd: string, env?: Record<string, string>) {
 	const result = Bun.spawnSync(command, {
@@ -58,15 +62,18 @@ test("signed-thinking hold off matches pre-hold served bytes and stored decision
 		join(oracle, "scripts/signed-thinking-hold-corpus.ts"),
 	);
 	const capture = (source: string, label: string, harness: string) => {
-		const home = join(root, harness);
+		const home = join(root, label);
 		mkdirSync(home, { recursive: true });
+		// Both sources use the same project path, but independent HOME/XDG roots.
+		// Sharing session ledgers would let the candidate inherit the oracle's state.
+		const projectRoot = join(root, "projects", harness);
 		const output = join(root, `${label}.json`);
 		console.log(
 			run(["bun", "scripts/signed-thinking-hold-corpus.ts"], source, {
 				HOME: home,
 				XDG_CONFIG_HOME: join(home, "config"),
 				XDG_DATA_HOME: join(home, "data"),
-				MC_HOLD_CORPUS_ROOT: home,
+				MC_HOLD_CORPUS_ROOT: projectRoot,
 				MC_HOLD_CORPUS_OUTPUT: output,
 				MC_HOLD_SETTING: "off",
 				MC_HOLD_HARNESS: harness,

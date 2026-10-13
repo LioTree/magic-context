@@ -1,6 +1,7 @@
 //! Capture served bytes and stored decisions from randomized signed-thinking passes.
 //! scripts/signed-thinking-hold-differential.test.ts compiles this same corpus against
-//! master merge base 9d26c87081 to check the default-off runtime against an independent source oracle.
+//! master 62f20c02 (without experimental admission) as an independent source oracle
+//! for requests with signed_thinking_hold set to off.
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 use mc_module::config::CacheTtlProvenance;
 use mc_module::transform::{transform, ProducerContext, TransformRequest};

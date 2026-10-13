@@ -32,7 +32,12 @@
  * source_contents remain intact for expansion.
  */
 
-import { freezePiContentDecision } from "@magic-context/core/features/magic-context/pi-content-decisions";
+import {
+	encodePiContentDecision,
+	freezePiContentDecision,
+	getPiContentDecisions,
+	withdrawPiContentDecision,
+} from "@magic-context/core/features/magic-context/pi-content-decisions";
 import {
 	CTX_REDUCE_KEEP,
 	protectedToolTagNumbers,
@@ -99,6 +104,7 @@ const DEDUP_SAFE_TOOLS = new Set([
 ]);
 
 export interface PiHeuristicCleanupConfig {
+	signedThinkingHold?: "off" | "on";
 	/** Bulk-freeze native removal decisions before measuring the active wire tools. */
 	prepareToolRemovalMeasurements?: (callIds: readonly string[]) => void;
 	protectedTools?: Readonly<Record<string, number>>;
@@ -557,6 +563,7 @@ export function applyPiHeuristicCleanup(
 
 	// ── Pass 2: strip system injections from message tags ─────────────
 	if (routine) {
+		let existingDecisions: Set<string> | undefined;
 		db.transaction(() => {
 			for (const tag of tags) {
 				if (tag.status !== "active") continue;
@@ -592,6 +599,22 @@ export function applyPiHeuristicCleanup(
 						}
 					}
 				} else {
+					// A replay decision may exist only for an edit that was applied: replay
+					// strips the reminder on every later pass, so a decision left behind by
+					// a refused edit would change text that was sent unstripped. With the
+					// hold on, skip protected targets early. Regardless of the setting,
+					// target.setContent can refuse; only a newly added decision is withdrawn.
+					if (
+						config.signedThinkingHold === "on" &&
+						target.thinkingRewriteProtected
+					)
+						continue;
+					existingDecisions ??= getPiContentDecisions(db, sessionId);
+					const alreadyDecided = existingDecisions.has(
+						encodePiContentDecision("reminder-strip", tag.messageId),
+					);
+					// The decision is stored before the edit so that bytes never ship
+					// without a durable replay record.
 					if (
 						freezePiContentDecision(
 							db,
@@ -610,6 +633,14 @@ export function applyPiHeuristicCleanup(
 									content.length - stripped.length,
 								),
 							});
+						} else if (!alreadyDecided) {
+							// Undo this call's refused edit, never an earlier applied decision.
+							withdrawPiContentDecision(
+								db,
+								sessionId,
+								"reminder-strip",
+								tag.messageId,
+							);
 						}
 					}
 				}

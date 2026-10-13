@@ -117,6 +117,7 @@ import {
     type DroppedTokenReduction,
     estimateDroppedTokensFromTagReductions,
 } from "./dropped-token-estimate";
+import { createEditAdmission, isAdmissionUser, thinkingAnchor } from "./edit-admission";
 import {
     contextRefusalError,
     EmergencyFailClosedError,
@@ -2049,6 +2050,51 @@ export async function runPostTransformPhase(
     const protectedThinkingMessages = new Set(
         args.messages.filter((message) => message.parts.some((part) => retainedThinking.has(part))),
     );
+    const holdEnabled = args.signedThinkingHold === "on";
+    // Edit admission. On prefix-bound models a signed thinking block is valid only while
+    // every byte before it is unchanged, so an edit before the last current-turn thinking
+    // block still sent is held: not applied and not persisted. Built once, before any edit
+    // of this pass, over the same messages and `info.id` values the strips below use.
+    const editAdmission = holdEnabled
+        ? createEditAdmission({
+              messages: args.messages,
+              stableId: (message) => message.info.id,
+              partsOf: (message) => message.parts,
+              isRealUser: isAdmissionUser,
+              prefixBound: args.thinkingBindingRecoveryEnabledForModel === true,
+              isRetainedThinking: (_message, part) => retainedThinking.has(part),
+              anchorOf: thinkingAnchor,
+              onUnresolved: (reason) =>
+                  sessionLog(
+                      args.sessionId,
+                      `edit admission: unresolved thinking boundary (${reason}); holding every edit not provably after it`,
+                  ),
+          })
+        : undefined;
+    const heldWholeMessages = new Map<string, string[]>();
+    const admitWholeMessage =
+        (lane: string) =>
+        (message: MessageLike): boolean => {
+            if (
+                !editAdmission ||
+                editAdmission.admit({ kind: "message", id: message.info.id, block: "whole" })
+            )
+                return true;
+            const held = heldWholeMessages.get(lane) ?? [];
+            held.push(message.info.id ?? "<no id>");
+            heldWholeMessages.set(lane, held);
+            return false;
+        };
+    const logHeldWholeMessages = (): void => {
+        if (editAdmission?.frame.kind !== "boundary") return;
+        for (const [lane, ids] of heldWholeMessages) {
+            sessionLog(
+                args.sessionId,
+                `edit admission: held lane=${lane} coords=${ids.map((id) => `${id}:whole`).join(",")} boundary=${editAdmission.frame.messageId ?? "<unresolved>"} held_edits=${ids.length}`,
+            );
+        }
+        heldWholeMessages.clear();
+    };
     const newTargets = protectNewTagMutations(
         args.messages,
         args.targets,
@@ -2068,7 +2114,6 @@ export async function runPostTransformPhase(
         (activeThinkingTurn && args.thinkingBindingRecoveryEnabledForModel === true);
     // Cached-head and tag-target protection is always enabled. Only the experimental
     // trigger parking changes which independent bust permissions remain available.
-    const holdEnabled = args.signedThinkingHold === "on";
     if (!holdEnabled) parkedBustTriggersBySession.delete(args.sessionId);
     const parkedTriggers = holdEnabled
         ? (parkedBustTriggersBySession.get(args.sessionId) ?? new ParkedBustTriggers())
@@ -3435,6 +3480,7 @@ export async function runPostTransformPhase(
                 args.messages,
                 args.resolvedProviderID,
                 recordFirstApplicationAt,
+                admitWholeMessage("placeholder"),
             );
             const protectedTailStart = Math.max(
                 0,
@@ -3445,7 +3491,11 @@ export async function runPostTransformPhase(
                 protectedTailStart,
                 args.resolvedProviderID,
                 recordFirstApplicationAt,
+                admitWholeMessage("system-injected"),
             );
+            logHeldWholeMessages();
+            // Persist strip results for messages already hidden by the compaction marker.
+            // These messages are not sent, so the record changes no current request bytes.
             const hiddenMessages = args.hiddenMessagesAtCompactionSeam ?? [];
             const hiddenDroppedResult = stripDroppedPlaceholderMessages(
                 hiddenMessages,

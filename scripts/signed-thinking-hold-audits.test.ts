@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 
 const repository = resolve(import.meta.dir, "..");
 const baseline =
-	process.env.MC_HOLD_AUDIT_BASE ?? "3549c4340ef37066f6690fb466824ac752ba0cbb";
+	process.env.MC_HOLD_AUDIT_BASE ?? "2d19947cb6bd3724dad74f05073e1db08323f621";
 const files = [
 	"packages/plugin/src/hooks/magic-context/signed-thinking-prefix-audit.test.ts",
 	"packages/pi-plugin/src/signed-thinking-prefix-audit.test.ts",
@@ -28,7 +28,7 @@ test("hold on retains the train's default audit and exact strict failure set", (
 		],
 		{ cwd: repository },
 	);
-	expect(archive.exitCode).toBe(0);
+	expect(archive.exitCode, archive.stderr.toString()).toBe(0);
 	for (const name of ["plugin", "pi-plugin", "retina-local-fs"])
 		symlinkSync(
 			join(repository, "packages", name, "node_modules"),
