@@ -1,8 +1,0 @@
-   Compiling mc-module v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_3fe238420bb412f9/crates/mc-module)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.85s
-     Running unittests src/lib.rs (/run/motor/target/debug/deps/mc_module-5ca59ececab7f8a0)
-
-thread 'providers::cc_step_lane_review::marker_transport_positions_are_exhaustively_refused' (362) panicked at crates/mc-module/src/providers/../../../../docs/reports/cc-step-lane-witnesses.rs:97:13:
-top-level text
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-error: test failed, to rerun pass `-p mc-module --lib`

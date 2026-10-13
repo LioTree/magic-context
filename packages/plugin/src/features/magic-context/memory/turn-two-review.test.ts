@@ -1,6 +1,6 @@
 /**
  * Independent review of memory slice S6 (historian turn two), commit dafaede1.
- * Report: docs/reports/memory-s6-review.md.
+ * Report: .cortexkit/internal-docs/investigations/reports/memory-s6-review.md.
  *
  * Part of the normal suite:
  * - `review witness: …` tests assert behaviour the spec or the rulings require. They
@@ -460,7 +460,7 @@ describe("S6 review witnesses (failed at dafaede1)", () => {
     }, 30_000);
 });
 
-// Memory #17639 from the v6 merge trial (docs/reports/historian-merge-turn-trial-v6-sonnet.md:71).
+// Memory #17639 from the v6 merge trial (.cortexkit/internal-docs/investigations/reports/historian-merge-turn-trial-v6-sonnet.md:71).
 // It splits into four clauses; the fourth ("that is the gap to close with a host-runner
 // default.") is stale, because the passage below says the host default already exists.
 const GAP_MEMORY =

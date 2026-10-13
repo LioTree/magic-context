@@ -556,11 +556,10 @@ mod tests {
 
     #[test]
     fn disposition_covers_inventory_and_names_host_inputs() {
-        let inventory = include_str!("../../../docs/designs/rust-parity-inventory.md");
-        let manifest: Value = serde_json::from_str(include_str!(
-            "../../../docs/designs/rust-parity-disposition.json"
-        ))
-        .unwrap();
+        let inventory = include_str!("tests/fixtures/rust-parity-inventory.md");
+        let manifest: Value =
+            serde_json::from_str(include_str!("tests/fixtures/rust-parity-disposition.json"))
+                .unwrap();
         let inventory_ids: Vec<&str> = inventory
             .lines()
             .filter_map(|line| {

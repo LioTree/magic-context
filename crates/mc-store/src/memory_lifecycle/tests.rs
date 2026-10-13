@@ -14,7 +14,7 @@ use crate::single_store_domain::CONTEXT_SCHEMA_SNAPSHOT;
 
 const GOLDENS: &str = include_str!("text_goldens.json");
 
-// A real memory from the historian merge trial (docs/reports/historian-merge-turn-trial-v6-sonnet.md:71,
+// A real memory from the historian merge trial (.cortexkit/internal-docs/investigations/reports/historian-merge-turn-trial-v6-sonnet.md:71,
 // issue #17639). The trial numbered its clauses with the outdated "gap" statement as clause
 // four, and edits cite clauses by number, so the splitter must produce exactly that numbering
 // and must not split after the abbreviation "e.g.".

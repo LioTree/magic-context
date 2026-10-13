@@ -8,7 +8,7 @@
  * subagent run), and each primary lane has a control at a new user turn that
  * must land the lane's own edit validly.
  *
- * Findings: docs/reports/signed-thinking-prefix-edits-audit.md. Run with
+ * Findings: .cortexkit/internal-docs/investigations/reports/signed-thinking-prefix-edits-audit.md. Run with
  * MC_AUDIT_STRICT=1 to make every exposed lane fail on its strict-binding 400.
  */
 import { describe, it } from "bun:test";
@@ -734,7 +734,7 @@ for (const subagent of [false, true]) {
 						`AUDIT Pi/OMP | ${scope} | ${lane}: ${error ?? "accepted"}; laneLanded=${edit}; nonThinkingEdit=${nonThinkingEdit}; pendingOps=${getPendingOps(f.db, f.sessionId).length}`,
 					);
 					// Under MC_AUDIT_STRICT=1 every lane must behave as held, which is
-					// the acceptance bar of docs/designs/signed-thinking-hold.md.
+					// the acceptance bar of .cortexkit/internal-docs/designs/designs/signed-thinking-hold.md.
 					if (!GOLDEN && !STRICT_AUDIT && EXPOSED.has(lane)) {
 						expect(edit).toBe(true);
 						expect(error).toBe(PREFIX_ERROR);

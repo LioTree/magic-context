@@ -398,7 +398,7 @@ async fn post_assistant_addresses_text_blocks_and_never_nontext_parts() {
 #[test]
 fn broca_real_messages_round_trip_byte_exactly() {
     let entries: Vec<compact::status::StatusMessage> = serde_json::from_str(include_str!(
-        "../../../../docs/designs/mc-tool-catalog-v1/broca-session-read-messages.json"
+        "../tests/fixtures/tool-catalog/broca-session-read-messages.json"
     ))
     .unwrap();
     assert_eq!(entries.len(), 3);
@@ -744,7 +744,7 @@ async fn catalog_and_hook_high_water_survive_a_fresh_handler() {
     {
         let handler = handler(dir.path(), runner.clone());
         let request: Value = serde_json::from_str(include_str!(
-            "../../../../docs/designs/mc-tool-catalog-v1/worker.request.json"
+            "../tests/fixtures/tool-catalog/worker.request.json"
         ))
         .unwrap();
         let catalog = response(

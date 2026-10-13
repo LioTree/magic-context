@@ -1,6 +1,6 @@
 /**
  * Independent review of memory slice S6 (historian turn two), commit dafaede1:
- * the OpenCode 2 carrier. Report: docs/reports/memory-s6-review.md.
+ * the OpenCode 2 carrier. Report: .cortexkit/internal-docs/investigations/reports/memory-s6-review.md.
  *
  * Part of the normal suite. Both tests drive the production OpenCode 2
  * hidden-completion executor and hidden-child context hook over a fake host whose

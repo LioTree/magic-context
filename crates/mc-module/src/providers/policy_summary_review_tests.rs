@@ -943,8 +943,9 @@ fn production_writes_replay_equals_full_computation_over_600_sequences() {
 }
 
 /// The same differential including writes no shipped writer performs today:
-/// each must be logged, drop the summary or take a replay fallback (F1-F3 in
-/// docs/reports/provider-policy-summary-review.md were the gaps).
+/// each must be logged, invalidate the summary or take a replay fallback.
+/// The investigation records the cases in
+/// .cortexkit/internal-docs/investigations/reports/provider-policy-summary-review.md.
 #[test]
 fn out_of_band_writes_replay_equals_full_computation_over_600_sequences() {
     let found = report("out-of-band", 1_000..1_600, true);

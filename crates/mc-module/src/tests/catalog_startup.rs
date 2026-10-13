@@ -229,17 +229,16 @@ impl LiveRoute {
     }
 
     async fn catalog(&self) -> Vec<u8> {
-        let request: Value = serde_json::from_str(include_str!(
-            "../../../../docs/designs/mc-tool-catalog-v1/head-full.request.json"
-        ))
-        .unwrap();
+        let request: Value =
+            serde_json::from_str(include_str!("fixtures/tool-catalog/head-full.request.json"))
+                .unwrap();
         let bytes = self
             .call(json!({"name":"tool.catalog","arguments":request}))
             .await
             .unwrap();
         assert_eq!(
             bytes,
-            include_bytes!("../../../../docs/designs/mc-tool-catalog-v1/head-full.answer.jcs")
+            include_bytes!("fixtures/tool-catalog/head-full.answer.jcs")
         );
         bytes
     }

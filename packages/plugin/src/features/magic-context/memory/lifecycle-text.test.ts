@@ -15,7 +15,7 @@ import {
 
 // In this host-versus-Broca routing memory, the trailing gap statement must be clause four.
 // The abbreviation e.g. in the host-default statement must not create another boundary.
-// Source: docs/reports/historian-merge-turn-trial-v6-sonnet.md:71 (#17639), db0582e9c6.
+// Source: .cortexkit/internal-docs/investigations/reports/historian-merge-turn-trial-v6-sonnet.md:71 (#17639), db0582e9c6.
 const GAP_MEMORY =
     "Rust transform mode must not require Broca (or any other CK module) to be running: every module under CK/subc stays decoupled unless coupling is necessary. Historian and dreamer completions in rust mode run by default in the same harness as the parent session (the host runs the prompt, e.g. OpenCode/Pi child session or the v2 child carrier), and route to the Broca runner only when the user configures it (Ufuk ruling, 2026-09-17). Today `crates/mc-module/src/historian_producer.rs` opens a route straight to `broca` (DEFAULT_RUNNER_MODULE_ID) — that is the gap to close with a host-runner default.";
 

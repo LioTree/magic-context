@@ -2,6 +2,7 @@ import {
     estimateImageTokensFromDataUrl,
     estimateToolAttachmentImageTokens,
 } from "./image-token-estimate";
+import { opaqueThinkingCost } from "./opaque-thinking";
 import type { MessageLike } from "./transform-operations";
 
 export interface MessageTokenEstimate {
@@ -14,7 +15,15 @@ export function serializedWireText(value: unknown): string {
     return (typeof value === "string" ? value : JSON.stringify(value)) ?? "";
 }
 
-/** Walk only provider-visible fields, for both token estimates and byte budgets. */
+/**
+ * Visit every field of a message that reaches the provider request: `text` with
+ * the field's value (a string, or a value the request carries serialized), and
+ * `image` with the token count of an image the request carries. Fields OpenCode
+ * keeps only for itself, such as tool metadata, are not visited. Token estimates
+ * and fit byte bounds both walk this. Encrypted thinking signatures and redacted
+ * payloads remain in exact request identity for authentication and replay, but
+ * their ciphertext is not conversation text to tokenize.
+ */
 export function visitWireContent(
     message: MessageLike,
     visit: {
@@ -22,6 +31,17 @@ export function visitWireContent(
         image: (bucket: keyof MessageTokenEstimate, tokens: number) => void;
     },
 ): void {
+    let opaqueCounted = false;
+    const opaque = () => {
+        if (opaqueCounted) return;
+        opaqueCounted = true;
+        const usage = (
+            message.info as unknown as
+                | { tokens?: { reasoning?: number; output?: number } }
+                | undefined
+        )?.tokens;
+        visit.image("conversation", opaqueThinkingCost(usage?.reasoning, usage?.output).tokens);
+    };
     for (const part of message.parts) {
         if (!part || typeof part !== "object") continue;
         const p = part as {
@@ -31,6 +51,7 @@ export function visitWireContent(
             signature?: string;
             data?: string;
             ignored?: boolean;
+            redacted?: boolean;
             state?: { input?: unknown; output?: unknown; content?: unknown; error?: unknown };
             args?: unknown;
             input?: unknown;
@@ -39,7 +60,7 @@ export function visitWireContent(
             result?: unknown;
             mime?: string;
             url?: unknown;
-            metadata?: { anthropic?: { signature?: string } };
+            metadata?: { anthropic?: { signature?: string; redactedData?: string } };
         };
         if (p.ignored) continue;
         const text = (value: unknown) => {
@@ -51,15 +72,23 @@ export function visitWireContent(
                 text(p.text);
                 break;
             case "reasoning":
-                text(p.text);
-                text(p.metadata?.anthropic?.signature);
+                if (p.redacted || p.metadata?.anthropic?.redactedData) opaque();
+                else {
+                    text(p.text);
+                    if (!p.text && p.metadata?.anthropic?.signature) opaque();
+                }
                 break;
             case "thinking":
-                text(p.thinking);
-                text(p.signature);
+                if (p.redacted) opaque();
+                else {
+                    text(p.thinking);
+                    if (!p.thinking && p.signature) opaque();
+                }
                 break;
             case "redacted_thinking":
-                text(p.data);
+                // Encrypted thinking/signatures are not input prose. Preserve
+                // their bytes for replay and prefix matching, not tokenization.
+                opaque();
                 break;
             case "file":
                 if (typeof p.mime === "string" && p.mime.startsWith("image/")) {
@@ -75,6 +104,8 @@ export function visitWireContent(
                 tool(p.state?.input ?? p.input ?? p.args);
                 tool(p.state?.output ?? p.state?.content ?? p.output ?? p.result ?? p.content);
                 tool(p.state?.error);
+                // Legacy skeletons may still carry media. Count what the wire
+                // actually contains, not what its output marker implies.
                 visit.image("toolCall", estimateToolAttachmentImageTokens(p.state));
                 break;
             case "tool-call":

@@ -12,6 +12,7 @@ import {
 import { resolveModelConfigValue } from "../../shared/prompt-surface";
 import { isRecord } from "../../shared/record-type-guard";
 import { hasAnthropicReasoning, isInActiveAnthropicTurn } from "./active-anthropic-turn";
+import { UNKNOWN_REASONING_STEP_TOKENS } from "./opaque-thinking";
 import { estimateTokens } from "./read-session-formatting";
 import { neutralizedReasoningSource } from "./sentinel";
 import {
@@ -61,7 +62,7 @@ export function projectOpencodeReasoningBudgetCutoff(
 }
 
 export const DEFAULT_KEEP_REASONING_TOKENS = 10_000;
-export const UNKNOWN_REASONING_STEP_TOKENS = 1_000;
+export { UNKNOWN_REASONING_STEP_TOKENS } from "./opaque-thinking";
 export type KeepReasoningTokens = number | Record<string, number>;
 
 export function resolveKeepReasoningTokens(

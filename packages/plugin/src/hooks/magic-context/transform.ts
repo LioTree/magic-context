@@ -146,6 +146,7 @@ import {
     type PassDegradationKind,
     type PassDegradationSite,
 } from "./pass-outcome";
+import { requestPendingMaterialization } from "./pending-materialization";
 import {
     createDefaultBoundarySnapshotForTests,
     hasRunnableCompartmentWindow,
@@ -707,6 +708,7 @@ export function resolveTransformHostSeams(
 }
 
 export function createTransform(deps: TransformDeps) {
+    registerSystemDateRefresh(deps.historyRefreshSessions);
     const finalWireUsage = createFinalWireUsageTracker();
     const host = resolveTransformHostSeams(deps);
     const loadedSessions = new Set<string>();
@@ -798,6 +800,16 @@ export function createTransform(deps: TransformDeps) {
             return;
         }
         deps.onMessagesPassStarted?.(sessionId, messages);
+        const dateRequest =
+            systemDateRequestForOutput(deps.historyRefreshSessions, output) ??
+            beginSystemDateRequest(
+                deps.historyRefreshSessions,
+                sessionId,
+                "messages",
+                systemDateTurnId(messages),
+                systemDateRequestIdentity(output),
+            );
+        bindSystemDateRequest(output, dateRequest);
         if (
             providerTransform &&
             deps.rustPipeline === "provider" &&
@@ -1854,9 +1866,11 @@ export function createTransform(deps: TransformDeps) {
             !freezeM0M1 && deps.historyRefreshSessions.has(sessionId);
         const deferredHistoryWasPendingAtPassStart =
             !freezeM0M1 && deferredHistoryRefreshSessions.has(sessionId);
-        const prefixTrimSourceOrder = deferredHistoryWasPendingAtPassStart
-            ? capturePrefixTrimSourceOrder(messages)
-            : undefined;
+        // Signed-thinking protection can end after history preparation, and
+        // reducers can remove the assistant that marks the summarized boundary.
+        // Retain the input message order so delivery and the next request both
+        // remove the same summary-covered messages even if that row disappears.
+        const prefixTrimSourceOrder = capturePrefixTrimSourceOrder(messages);
         const earlyActiveRunBlocksMaterialization =
             (getActiveCompartmentRun(sessionId) !== undefined ||
                 sessionMeta.compartmentInProgress) &&
@@ -2652,7 +2666,11 @@ export function createTransform(deps: TransformDeps) {
         // Queue a fresh materialization so the baseline is re-cut on the next
         // bust instead of the session silently looping in degraded mode.
         if (pendingCompartmentInjection?.needsFreshMaterialization) {
-            deps.pendingMaterializationSessions.add(sessionId);
+            requestPendingMaterialization(
+                deps.pendingMaterializationSessions,
+                sessionId,
+                "boundary_repair",
+            );
             deferredMaterializationSessions.add(sessionId);
         }
 
@@ -2961,6 +2979,7 @@ export function createTransform(deps: TransformDeps) {
             },
         });
         passOutcome.markFinalized();
+
         // Compaction-off: the emergency/overflow machinery is fully disarmed
         // (derived force-band tiered drop, absolute 95% fail-closed block, overflow-recovery latch).
         // A persisted latch is cleared by the off-transition, never consumed
@@ -3036,7 +3055,11 @@ export function createTransform(deps: TransformDeps) {
                     )
                 ) {
                     thinkingFitRetries.add(sessionId);
-                    deps.pendingMaterializationSessions.add(sessionId);
+                    requestPendingMaterialization(
+                        deps.pendingMaterializationSessions,
+                        sessionId,
+                        "fit_retry",
+                    );
                     messages.splice(0, messages.length, ...originalForThinkingFit);
                     try {
                         await transform({}, output);
@@ -3282,6 +3305,12 @@ export function createTransform(deps: TransformDeps) {
             );
         }
 
+        finishSystemDateRefresh(
+            deps.historyRefreshSessions,
+            dateRequest,
+            (postTransformResult.bustedThisPass && !activeThinkingPrefixHold) ||
+                postTransformResult.thinkingReleasedForFit === true,
+        );
         if (passOutcome.captureEligible) {
             const keys = resolveLkgModelKeys(messages);
             const modelKey = modelForBudget
@@ -3623,3 +3652,12 @@ export function resolveHistoryBudgetTokens(
 
 import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
 import { resolveDecisionCalibration } from "./decision-calibration";
+import {
+    beginSystemDateRequest,
+    bindSystemDateRequest,
+    finishSystemDateRefresh,
+    registerSystemDateRefresh,
+    systemDateRequestForOutput,
+    systemDateRequestIdentity,
+    systemDateTurnId,
+} from "./system-date-refresh";

@@ -4,7 +4,7 @@
  * If a paused owner cannot renew, another process may take over, but the owner's
  * late reply must not apply a second edit. Processes on one machine share wall
  * time; deliberately offsetting only one process's clock is outside that contract.
- * docs/reports/memory-s8-review-r2.md records the accepted takeover cost and rulings.
+ * .cortexkit/internal-docs/investigations/reports/memory-s8-review-r2.md records the accepted takeover cost and rulings.
  * The long-send and starvation cases use real timers and take about 130 seconds.
  */
 import { describe, expect, it, spyOn } from "bun:test";

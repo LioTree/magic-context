@@ -12,7 +12,7 @@
 //! only when a rebuild that is already happening for another reason commits, and
 //! never requests a rebuild itself. That commit stores the selection sequence it
 //! rendered (the score watermark) with the bytes in `ModuleMeta`. See
-//! `docs/designs/compartment-rescore.md`.
+//! `.cortexkit/internal-docs/designs/designs/compartment-rescore.md`.
 
 use std::collections::HashMap;
 

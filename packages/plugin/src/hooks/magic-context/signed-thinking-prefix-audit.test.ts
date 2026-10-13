@@ -14,7 +14,7 @@
  * land the lane's own edit, which proves a held mid-loop result comes from the
  * thinking guard and not from an idle lane.
  *
- * Findings: docs/reports/signed-thinking-prefix-edits-audit.md. Run with
+ * Findings: .cortexkit/internal-docs/investigations/reports/signed-thinking-prefix-edits-audit.md. Run with
  * MC_AUDIT_STRICT=1 to make every exposed lane fail on its strict-binding 400.
  */
 import { describe, it, spyOn } from "bun:test";
@@ -739,7 +739,7 @@ for (const generation of ["v1", "v2"] as const) {
                             `AUDIT ${host} | ${scope} | ${lane}: ${error ?? "accepted"}; laneLanded=${edit}; nonThinkingEdit=${nonThinkingEdit}; pendingOps=${getPendingOps(f.db, f.sessionId).length}`,
                         );
                         // Under MC_AUDIT_STRICT=1 every lane must behave as held,
-                        // which is the acceptance bar of docs/designs/signed-thinking-hold.md.
+                        // which is the acceptance bar of .cortexkit/internal-docs/designs/designs/signed-thinking-hold.md.
                         if (!GOLDEN && !STRICT_AUDIT && EXPOSED.has(lane)) {
                             expect(edit).toBe(true);
                             expect(error).toBe(PREFIX_ERROR);
@@ -1012,7 +1012,7 @@ for (const generation of ["v1", "v2"] as const) {
             // busting pass retires it (reconcileMarkerRepresentation). Removing it then edits
             // the request before every kept thinking block. The fix records the served summary
             // with the head and holds its retirement until the turn keeps no signed thinking
-            // (docs/designs/signed-thinking-hold.md, section 7).
+            // (.cortexkit/internal-docs/designs/designs/signed-thinking-hold.md, section 7).
             const MARKER_LANE: Lane = "compaction-marker summary retired by a bust";
             it(
                 `${MARKER_LANE}: mid tool loop`,

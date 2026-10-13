@@ -5,7 +5,7 @@
  * named "review witness" reproduces one fixed defect, named in the test, so it cannot
  * return: a send left `dispatched` after a later attempt published, and an
  * uncommitted publication left behind by session deletion
- * (docs/reports/memory-s5-review.md).
+ * (.cortexkit/internal-docs/investigations/reports/memory-s5-review.md).
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";

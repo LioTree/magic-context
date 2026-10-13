@@ -23,7 +23,7 @@ import {
     splitMemoryClauses,
 } from "../../../../packages/plugin/src/features/magic-context/memory/lifecycle-text";
 
-// A real memory from the historian merge trial (docs/reports/historian-merge-turn-trial-v6-sonnet.md:71,
+// A real memory from the historian merge trial (.cortexkit/internal-docs/investigations/reports/historian-merge-turn-trial-v6-sonnet.md:71,
 // issue #17639). It exercises an abbreviation ("e.g."), backtick spans, a date and a spaced
 // em dash, and the trial numbered its outdated final statement as clause four.
 const GAP_MEMORY =

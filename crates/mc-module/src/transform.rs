@@ -5485,7 +5485,7 @@ fn apply_once(
     };
     // Signed-prefix hold. An unfinished Anthropic thinking turn on a prefix-bound model signs
     // its thinking against the request prefix: a signed thinking block stays valid only while
-    // everything sent before it is unchanged (docs/reports/anthropic-thinking-binding.md),
+    // everything sent before it is unchanged, because its signature binds to that prefix,
     // and re-rendering the synthetic m0/m1 head invalidates every signed block after it
     // (HTTP 400 on strict-binding accounts). The provider also caches that prefix between the
     // turn's tool steps, and the next real user message pays for a rewrite anyway. So inside
@@ -5652,7 +5652,7 @@ fn apply_once(
     // For models whose signatures bind thinking to preceding bytes, Anthropic rejects
     // changes before a resent block. The Claude Code serializer keeps completed-turn
     // blocks, so releasing a parked /ctx-flush at the next user turn would be rejected.
-    // Rollout step 8 in docs/designs/signed-thinking-hold.md removes completed-turn
+    // Rollout step 8 in .cortexkit/internal-docs/designs/designs/signed-thinking-hold.md removes completed-turn
     // thinking before parking withheld flushes. Until then, consume flushes without parking.
     let trigger_holds_enabled =
         hold_enabled && serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic);
@@ -6468,7 +6468,7 @@ fn apply_once(
     if !prefix_replay_must_be_preserved {
         // These block IDs suppress tag/hint rendering; clearing them allows those
         // additions to be rendered. Claude Code keeps this legacy drain behavior until
-        // rollout step 8 in docs/designs/signed-thinking-hold.md removes thinking from
+        // rollout step 8 in .cortexkit/internal-docs/designs/designs/signed-thinking-hold.md removes thinking from
         // completed turns. A deferred prefix rewrite can then proceed without resending
         // signatures bound to old bytes.
         meta.pending_tag_block_ids

@@ -491,7 +491,7 @@ mod dispatch_tests {
             assert_eq!(codec, Codec::OwnedBroca);
             assert_eq!(codec.serializer_profile(), SerializerProfile::OwnedBroca);
             let entries: Vec<compact::status::StatusMessage> = serde_json::from_str(include_str!(
-                "../../../../docs/designs/mc-tool-catalog-v1/broca-session-read-messages.json"
+                "../tests/fixtures/tool-catalog/broca-session-read-messages.json"
             ))
             .unwrap();
             for entry in entries {

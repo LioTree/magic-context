@@ -1,5 +1,6 @@
-//! Schema-pinned move inventory, generated from fresh context/store migration heads.
+//! Schema objects included in move manifests, pinned to fresh context/store migration heads.
 //!
+//! Inventory checks must precede writes so a refused move leaves both stores unchanged.
 //! New schema objects must be reviewed here before any exporter reads row data.
 
 use rusqlite::Connection;

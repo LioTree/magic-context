@@ -1,6 +1,6 @@
 /**
  * Independent review of memory slice S6 (historian turn two), commit dafaede1: Pi
- * projection. Report: docs/reports/memory-s6-review.md.
+ * projection. Report: .cortexkit/internal-docs/investigations/reports/memory-s6-review.md.
  *
  * Part of the normal suite. The `review probe` passed when the review was written and
  * stays as a permanent regression test: it is evidence that an edit applied by turn two

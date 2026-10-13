@@ -11,7 +11,7 @@
 //! each primary lane has a control at a new user turn that must land the lane's own
 //! edit validly.
 //!
-//! Findings: docs/reports/signed-thinking-prefix-edits-audit.md. Run with
+//! Findings: .cortexkit/internal-docs/investigations/reports/signed-thinking-prefix-edits-audit.md. Run with
 //! `MC_AUDIT_STRICT=1` to make every exposed lane fail on its strict-binding 400.
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 use mc_module::config::CacheTtlProvenance;
@@ -772,7 +772,7 @@ fn mid_loop(profile: &str, subagent: bool, lane: Lane) {
     }
     println!("AUDIT {profile} | subagent={subagent} | {lane:?}: {error:?}; laneLanded={landed}; nonThinkingEdit={non_thinking_edit}");
     // Under MC_AUDIT_STRICT=1 every lane must behave as held, which is the acceptance bar of
-    // docs/designs/signed-thinking-hold.md.
+    // .cortexkit/internal-docs/designs/designs/signed-thinking-hold.md.
     let strict = std::env::var("MC_AUDIT_STRICT").as_deref() == Ok("1");
     if !golden() && !strict && exposed(subagent, lane) {
         audit_assert!(
@@ -945,7 +945,7 @@ const SUBAGENT_LANES: [Lane; 4] = [
 /// Lanes added after the Claude Code lane list was frozen run only on the OpenCode profile.
 /// Claude Code keeps earlier turns' signed thinking on a bust, so its new-user-turn release
 /// fails until the module strips that completed-turn thinking; lanes join its list together
-/// with that strip (rollout step 8 in docs/designs/signed-thinking-hold.md).
+/// with that strip (rollout step 8 in .cortexkit/internal-docs/designs/designs/signed-thinking-hold.md).
 fn on_profile(profile: &str, lane: Lane) -> bool {
     profile != "claude-code-anthropic" || lane != Lane::SystemInjected
 }
@@ -1253,7 +1253,7 @@ fn step2_review_claude_code_gate_preserves_guidance_adoption() {
     assert!(meta.held_release.is_none());
     // Planned Claude Code behavior keeps a blocked flush pending until a pass can
     // rewrite the prefix without current-turn thinking. Rollout step 8 in
-    // docs/designs/signed-thinking-hold.md also removes completed-turn thinking so
+    // .cortexkit/internal-docs/designs/designs/signed-thinking-hold.md also removes completed-turn thinking so
     // that release does not resend invalidated old signatures. Until then, preserve
     // the existing flush: adopt the next system-prompt date and consume the refresh
     // flag without parking it.
@@ -1295,7 +1295,7 @@ fn step2_review_claude_code_gate_preserves_pending_overlay_drain() {
     assert!(meta.held_release.is_none());
     // Planned behavior keeps pending tag/hint IDs while their blocks cannot safely
     // change under kept current-turn thinking. Rollout step 8 in
-    // docs/designs/signed-thinking-hold.md adds that delay for Claude Code and removes
+    // .cortexkit/internal-docs/designs/designs/signed-thinking-hold.md adds that delay for Claude Code and removes
     // completed-turn thinking before release. Until then, preserve the existing
     // behavior: clear pending_tag_block_ids and pending_user_hint_block_ids on
     // mutation passes so tags/hints can render, while a flush consumes its refresh flag.

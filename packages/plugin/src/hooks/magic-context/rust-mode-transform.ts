@@ -2602,6 +2602,16 @@ export function createRustModeTransform(
         sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
     ): Promise<void> => {
         const passStartedAt = performance.now();
+        const dateRequest =
+            systemDateRequestForOutput(deps.historyRefreshSessions, output) ??
+            beginSystemDateRequest(
+                deps.historyRefreshSessions,
+                sessionId,
+                "messages",
+                systemDateTurnId(messages),
+                systemDateRequestIdentity(output),
+            );
+        bindSystemDateRequest(output, dateRequest);
         const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
         let markerApplyAttempted = false;
@@ -4731,6 +4741,7 @@ export function createRustModeTransform(
                 throw error;
             }
             const bookkeepingStartedAt = performance.now();
+            finishSystemDateRefresh(deps.historyRefreshSessions, dateRequest, moduleDecisionBusts);
             if (shouldAdoptModuleAfterFreeze(moduleDecisionBusts, frozenReplayReleased)) {
                 if (frozenReleaseReason) {
                     sessionLog(
@@ -5271,3 +5282,11 @@ import {
     protectedToolRefusal,
     signedTurnContextRefusal,
 } from "./emergency-fail-closed";
+import {
+    beginSystemDateRequest,
+    bindSystemDateRequest,
+    finishSystemDateRefresh,
+    systemDateRequestForOutput,
+    systemDateRequestIdentity,
+    systemDateTurnId,
+} from "./system-date-refresh";

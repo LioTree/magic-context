@@ -5,7 +5,7 @@
  * out-of-order compartments, ranges outside or across compartments, and facts of a
  * reply whose last compartment is discarded. The "review witness" test reproduces a
  * fixed defect (a discarded-tail fact recorded twice once the tail was re-derived;
- * docs/reports/memory-s5-review.md) so it cannot return.
+ * .cortexkit/internal-docs/investigations/reports/memory-s5-review.md) so it cannot return.
  */
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";

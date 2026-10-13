@@ -1,5 +1,5 @@
 // Transform-level tests for rescored compartment importance (see
-// `docs/designs/compartment-rescore.md`).
+// `.cortexkit/internal-docs/designs/designs/compartment-rescore.md`).
 //
 // Terms used below:
 // - m0 is the frozen history head of the cached prompt; see "m[0]/m[1] cache

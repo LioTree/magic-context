@@ -3317,7 +3317,7 @@ pub const LATEST_MIGRATION_VERSION: u32 = {
 /// (`StoreAheadOfBinary`) before it reads or rewrites any cache row. So an older
 /// build can never rewrite the metadata and drop the watermark. Every build at or
 /// above this version must keep the watermark when it rewrites metadata. See
-/// "Rust applied-score rollback fence" in `docs/designs/compartment-rescore.md`.
+/// "Rust applied-score rollback fence" in `.cortexkit/internal-docs/designs/designs/compartment-rescore.md`.
 pub const SCORE_SELECTION_WATERMARK_STORE_FENCE: u32 = 67;
 
 /// The first bundled migration whose SQL creates `table`, or `None` when no

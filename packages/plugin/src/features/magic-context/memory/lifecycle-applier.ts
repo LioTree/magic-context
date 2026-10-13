@@ -923,7 +923,7 @@ function applyMemoryMutation(
  * Apply one gated historian edit, merge or replacement (turn two). It is an
  * automated edit: it changes canonical rows and writes history, but no mutation-log
  * row and no agent fragment, so it reaches a prompt only at that session's next
- * natural HARD fold (docs/designs/memory-s3-projection.md, "Automated writers").
+ * natural HARD fold (.cortexkit/internal-docs/designs/designs/memory-s3-projection.md, "Automated writers").
  *
  * Order: a recorded receipt answers at once; a project whose memory the module owns
  * is `authority_elsewhere`; a source that moved since the decision read it is a CAS

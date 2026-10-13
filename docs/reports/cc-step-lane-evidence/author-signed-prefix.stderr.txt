@@ -1,4 +1,0 @@
-   Compiling mc-module v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_3fe238420bb412f9/crates/mc-module)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.81s
-     Running unittests src/lib.rs (/run/motor/target/debug/deps/mc_module-5ca59ececab7f8a0)
-error: test failed, to rerun pass `-p mc-module --lib`
