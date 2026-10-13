@@ -22,7 +22,7 @@
     "execution_mode": "mutating",
     "name": "ctx_memory",
     "schema": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "action": {
           "description": "write | update | archive | merge | get",
@@ -37,49 +37,29 @@
         },
         "category": {
           "description": "Kind of fact (required for write; optional on update/merge).",
+          "enum": [
+            "PROJECT_RULES",
+            "ARCHITECTURE",
+            "CONSTRAINTS",
+            "CONFIG_VALUES",
+            "NAMING"
+          ],
           "type": "string"
         },
         "content": {
           "description": "One standalone fact (write, update, merge).",
-          "maxLength": 65536,
           "type": "string"
-        },
-        "id": {
-          "description": "Single memory id for update or archive.",
-          "minimum": 1,
-          "type": "integer"
         },
         "ids": {
           "description": "Ids from <project-memory>: one for update, 1+ for archive, 2+ for merge, 1–20 for get.",
           "items": {
-            "minimum": 1,
-            "type": "integer"
+            "type": "number"
           },
-          "maxItems": 100,
           "type": "array"
-        },
-        "memory_project": {
-          "description": "Resolved MC project identity supplied by the host transport.",
-          "type": "string"
         },
         "reason": {
           "description": "Why it is archived (optional).",
-          "maxLength": 4096,
           "type": "string"
-        },
-        "source_ids": {
-          "description": "Merge form: memory ids to supersede into target_id.",
-          "items": {
-            "minimum": 1,
-            "type": "integer"
-          },
-          "maxItems": 100,
-          "type": "array"
-        },
-        "target_id": {
-          "description": "Merge form: memory id to keep and update.",
-          "minimum": 1,
-          "type": "integer"
         }
       },
       "type": "object"
@@ -90,22 +70,19 @@
     "execution_mode": "pure",
     "name": "ctx_expand",
     "schema": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "end": {
           "description": "Last message ordinal of the range, inclusive, not a tag number.",
-          "minimum": 0,
-          "type": "integer"
+          "type": "number"
         },
         "message": {
           "description": "Message ordinal from a <session-history> heading or a ctx_search hit, not a tag number. Returns that one message in full. Use alone.",
-          "minimum": 0,
-          "type": "integer"
+          "type": "number"
         },
         "start": {
           "description": "First message ordinal of the range (a <session-history> heading's start, or a ctx_search hit), not a tag number.",
-          "minimum": 0,
-          "type": "integer"
+          "type": "number"
         },
         "tag": {
           "anyOf": [
@@ -131,23 +108,33 @@
     "execution_mode": "pure",
     "name": "ctx_search",
     "schema": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "from": {
           "description": "Earliest date, YYYY-MM-DD (inclusive).",
           "type": "string"
         },
         "limit": {
-          "default": 8,
           "description": "Maximum results (default 10).",
-          "maximum": 25,
-          "minimum": 1,
-          "type": "integer"
+          "type": "number"
         },
         "query": {
           "description": "A natural-language question carrying the exact terms you expect in the answer.",
-          "maxLength": 1024,
           "type": "string"
+        },
+        "sources": {
+          "description": "Restrict to these sources; omit or [] for all.",
+          "items": {
+            "enum": [
+              "memory",
+              "message",
+              "git_commit",
+              "primer",
+              "note"
+            ],
+            "type": "string"
+          },
+          "type": "array"
         },
         "to": {
           "description": "Latest date, YYYY-MM-DD (inclusive; default open).",
@@ -162,21 +149,20 @@
     "execution_mode": "mutating",
     "name": "ctx_note",
     "schema": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "action": {
           "description": "write | read | update | dismiss (default: write with content, else read).",
           "enum": [
             "write",
             "read",
-            "update",
-            "dismiss"
+            "dismiss",
+            "update"
           ],
           "type": "string"
         },
         "content": {
           "description": "Note text: first line title (<80 chars), then detail.",
-          "maxLength": 65536,
           "type": "string"
         },
         "filter": {
@@ -191,15 +177,8 @@
           "type": "string"
         },
         "limit": {
-          "default": 25,
           "description": "Rows per read (default 25).",
-          "maximum": 100,
-          "minimum": 1,
-          "type": "integer"
-        },
-        "memory_project": {
-          "description": "Resolved MC project identity supplied by the host transport.",
-          "type": "string"
+          "type": "number"
         },
         "note_ids": {
           "description": "One id for update, 1–50 for dismiss or read (full bodies). Ignored by write.",
@@ -213,14 +192,11 @@
           "type": "array"
         },
         "offset": {
-          "default": 0,
           "description": "Skip newest rows (default 0).",
-          "minimum": 0,
-          "type": "integer"
+          "type": "number"
         },
         "surface_condition": {
           "description": "A condition an outside checker can verify on its own, periodically (repository, releases, web — anything it can look up); never something only this conversation knows.",
-          "maxLength": 4096,
           "type": "string"
         }
       },

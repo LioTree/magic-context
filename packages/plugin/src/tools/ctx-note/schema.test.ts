@@ -12,25 +12,38 @@ const piSchemaSource = readFileSync(
     resolve(import.meta.dir, "../../../../pi-plugin/src/tools/ctx-note.ts"),
     "utf8",
 );
-const rustSchemaSource = readFileSync(
-    resolve(import.meta.dir, "../../../../../crates/mc-module/src/lib.rs"),
-    "utf8",
-);
+const rustCatalog = JSON.parse(
+    readFileSync(
+        resolve(import.meta.dir, "../../../../../crates/mc-module/assets/tool_catalog_v1.json"),
+        "utf8",
+    ),
+) as {
+    tools: { name: string; structure: { properties: Record<string, unknown> } }[];
+    parameter_descriptions: { full: { ctx_note: { note_ids: string } } };
+};
+const rustNoteSchema = rustCatalog.tools.find((tool) => tool.name === "ctx_note")?.structure;
 
 describe("ctx_note note_ids schema parity", () => {
     it("keeps the single id field byte-identical across TS, Pi, and Rust", () => {
-        for (const source of [pluginSchemaSource, piSchemaSource, rustSchemaSource]) {
+        for (const source of [pluginSchemaSource, piSchemaSource]) {
             expect(source).toContain(NOTE_IDS_DESCRIPTION);
         }
+        expect(rustCatalog.parameter_descriptions.full.ctx_note.note_ids).toBe(
+            NOTE_IDS_DESCRIPTION,
+        );
         expect(pluginSchemaSource).toContain(".array(tool.schema.number().int().min(1))");
         expect(pluginSchemaSource).toContain(".max(50)");
         expect(piSchemaSource).toContain(
             "Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })",
         );
         expect(piSchemaSource).toContain("maxItems: 50");
-        expect(rustSchemaSource).toContain(
-            '"minItems": 1, "maxItems": 50, "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 }',
-        );
+        expect(rustNoteSchema).toBeDefined();
+        expect(rustNoteSchema?.properties.note_ids).toEqual({
+            minItems: 1,
+            maxItems: 50,
+            type: "array",
+            items: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+        });
     });
 
     it("declares no note_id scalar on any lane", () => {
@@ -39,7 +52,7 @@ describe("ctx_note note_ids schema parity", () => {
         for (const source of [pluginSchemaSource, piSchemaSource]) {
             expect(source).not.toMatch(/note_id\??:\s/);
         }
-        expect(rustSchemaSource).not.toContain('"note_id": {');
+        expect(rustNoteSchema?.properties).not.toHaveProperty("note_id");
     });
 
     it("mentions the id field in each description preset", () => {

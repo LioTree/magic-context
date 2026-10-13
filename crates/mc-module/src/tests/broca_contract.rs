@@ -441,15 +441,15 @@ async fn owned_broca_guidance_variant_follows_ctx_reduce_presence() {
         )
         .await;
         assert_eq!(response["ok"], json!(true), "{response}");
-        let expected = crate::prompt_surface::guidance_asset(
-            crate::prompt_surface::PromptSurfacePreset::Full,
-            variant,
+        let expected = typescript_legacy_guidance(
+            if matches!(variant, crate::prompt_surface::GuidanceVariant::Full) {
+                "full"
+            } else {
+                "no_reduce"
+            },
         );
         assert!(
-            response["bytes"]
-                .as_str()
-                .unwrap()
-                .starts_with(expected.bytes),
+            response["bytes"].as_str().unwrap().starts_with(&expected),
             "tool_present={tool_present} served the wrong guidance variant"
         );
     }

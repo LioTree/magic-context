@@ -8756,7 +8756,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// qualify. Strips that run after later splices look messages up by the same ids.
 	const makeEditAdmission = () =>
 		createEditAdmission({
-			messages: workingMessages as unknown[],
+			messages:
+				holdEnabled || args.stableIdSchemeCutover === true
+					? (workingMessages as unknown[])
+					: [],
 			stableId: stableIdResolver,
 			partsOf: (message) => {
 				const content = (message as { content?: unknown })?.content;

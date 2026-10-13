@@ -1,7 +1,10 @@
 //! Retrieval extension. Provider clients implement EmbeddingProvider; lanes implement RetrievalLane.
 //!
-//! These adapters describe future parity services only. They are not substituted for the
-//! existing literal-search backend, which remains on its original path.
+//! The HTTP provider requires an injected transport. The memory_tool literal
+//! search backend does not call this extension; UnavailableLane below continues
+//! to report that semantic retrieval lanes have not been implemented.
+
+pub mod embedding_provider;
 
 use crate::parity_contract::*;
 

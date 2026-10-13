@@ -7,6 +7,7 @@
  * does not duplicate megabytes of identical guidance. No stores are opened.
  */
 import { readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { buildMagicContextSection } from "../../../../packages/plugin/src/agents/magic-context-prompt";
 import {
@@ -587,4 +588,82 @@ if (reviewBaseline) {
 	console.log(
 		`Recorded ${deltas.length} exact schema/description deltas, ${languageDeltas.length} language deltas, and two noncompacting-head guidance deltas for THALAMUS review.`,
 	);
+}
+
+// Capture Magic Context's own tool manifests and guidance replies from TypeScript.
+// Separate shared Broca/commons fixtures capture whole transport conversations and
+// are not generated here. Rust is not run to calculate expected schemas or text.
+if (process.argv.includes("--refresh-legacy-facades")) {
+	const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+	const orderedLegacy = (value: unknown): unknown => {
+		if (Array.isArray(value)) return value.map(orderedLegacy);
+		if (value && typeof value === "object") {
+			const object = value as Record<string, unknown>;
+			return Object.fromEntries(Object.keys(object).sort().map((key) => [key, orderedLegacy(object[key])]));
+		}
+		return value;
+	};
+	const legacyOrder = ["ctx_reduce", "ctx_memory", "ctx_expand", "ctx_search", "ctx_note"];
+	const executionModes: Record<string, string> = { ctx_reduce: "pure", ctx_memory: "mutating", ctx_search: "pure", ctx_expand: "pure", ctx_note: "mutating" };
+	const facadeTools = (preset: "full" | "light", searchOverride?: string) => {
+		const captured = tools.find((row) => row.preset === preset && row.smart)!;
+		return legacyOrder.map((name) => {
+			const tool = captured.tools.find((row) => row.name === name)!;
+			const schema = structuredClone(tool.input_schema) as Record<string, unknown>;
+			// Claude Code's gateway requires drop to authorize reduction; TS advertises it as optional.
+			if (name === "ctx_reduce") schema.required = ["drop"];
+			return { name, execution_mode: executionModes[name], description: name === "ctx_search" && searchOverride ? searchOverride : tool.description, schema };
+		});
+	};
+	const epoch = (preset: "full" | "light", searchOverride?: string) => {
+		if (preset === "full" && !searchOverride) return "";
+		const hasher = createHash("sha256");
+		const part = (label: string, value: string) => hasher.update(`${Buffer.byteLength(label)}:${label}=${Buffer.byteLength(value)}:${value};`);
+		part("preset", preset);
+		for (const tool of facadeTools(preset, searchOverride)) {
+			part("tool", tool.name);
+			part("description", tool.description);
+		}
+		return `pm${hasher.digest("hex")}`;
+	};
+	for (const preset of surfaces) {
+		const path = resolve(import.meta.dir, `../broca-facade-tools-${preset}.json`);
+		const before = readFileSync(path, "utf8");
+		const after = `${JSON.stringify(orderedLegacy(facadeTools(preset)), null, 2)}\n`;
+		writeFileSync(path, after);
+		console.log(`${path}: before=${hash(before)} after=${hash(after)}`);
+	}
+	// The test config enables memory, temporal markers and smart notes, but not the
+	// background Dreamer agent. Use those flags rather than text enabling every feature.
+	const configuredMask = 1 | 4 | 16;
+	const date = "Today's date: Thu Jan 01 2026";
+	const contentHash = (text: string, preset: "full" | "light") => hash(text + (preset === "light" ? "\n\0magic-context-prompt-surface:light" : ""));
+	const path = resolve(import.meta.dir, "../guidance-get-golden.json");
+	const captured = JSON.parse(readFileSync(path, "utf8")) as Record<string, string>;
+	for (const key of Object.keys(captured)) {
+		const preset = key.includes("/light") ? "light" : "full";
+		const reply = JSON.parse(captured[key]) as Record<string, unknown>;
+		if (key.startsWith("guidance.get/")) {
+			const reduce = !key.includes("/no-reduce");
+			const override = key.endsWith("/override") ? "A user's own guidance section." : undefined;
+			const text = guidance(configuredMask | (reduce ? 64 : 0), preset, key.endsWith("/language-fr") ? "fr" : "", false, override);
+			reply.bytes = `${text}\n${date}`;
+			reply.hash = hash(reply.bytes as string);
+			reply.content_hash = contentHash(text, preset);
+			reply.manifest_content_epoch = epoch(preset);
+			reply.tool_manifest = facadeTools(preset);
+		} else {
+			const override = key.endsWith("/description-override") ? "Search this project's archive." : undefined;
+			reply.tools = facadeTools(preset, override);
+			reply.content_epoch = epoch(preset, override);
+		}
+		captured[key] = JSON.stringify(orderedLegacy(reply));
+	}
+	writeFileSync(path, `${JSON.stringify(orderedLegacy(captured), null, 2)}\n`);
+	writeFileSync(resolve(import.meta.dir, "legacy-guidance-reference.json"), `${JSON.stringify({
+		full: guidance(configuredMask | 64, "full", ""),
+		no_reduce: guidance(configuredMask, "full", ""),
+		user_path_override: guidance(configuredMask | 64, "full", "", false, "## Magic Context\n\nTrusted route guidance."),
+	}, null, 2)}\n`);
+	console.log("Refreshed 2 MC-only tool arrays, 13 legacy reply pins and 3 independent guidance references.");
 }

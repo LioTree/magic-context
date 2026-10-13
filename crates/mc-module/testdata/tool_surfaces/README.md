@@ -29,6 +29,7 @@ bun crates/mc-module/testdata/tool_surfaces/generate.ts
 bun crates/mc-module/testdata/tool_surfaces/generate.ts --check
 bun crates/mc-module/testdata/tool_surfaces/generate.ts --check --report-icu-drift
 bun crates/mc-module/testdata/tool_surfaces/generate.ts --refresh-assets
+bun crates/mc-module/testdata/tool_surfaces/generate.ts --refresh-legacy-facades
 bun crates/mc-module/testdata/tool_surfaces/generate.ts --review-baseline=b62632c1a49f4fc248120147aafc0520ef462178
 ```
 
@@ -45,6 +46,16 @@ authorization digest:
 `69c7dd3393dc8af19386eb80f849df7a1943126bfe1a14769bfff1182b88abf6`.
 The delta manifest records the known divergence separately, not as a changed
 Rust advertisement.
+
+`--refresh-legacy-facades` writes the two MC-only `broca-facade-tools-*.json`
+arrays, the legacy `guidance.get`/`manifest.get` reply pins, and three guidance
+references from the real TypeScript factories and prompt builder. It preserves MC's
+transport order, execution modes, date/hash envelope and the required-drop exception.
+It never runs Rust to produce expected text or schemas and never changes the joint
+Broca/commons transcripts or exchanges. Its flags match the legacy test configuration:
+memory, temporal markers and smart notes on, no configured Dreamer. Before/after
+advertised JSON fields and file hashes are recorded in
+`docs/reports/train-stack3-advertised-deltas.json`.
 
 The golden captures 20 tool schemas (five tools × full/light × smart on/off),
 48,896 guidance cases (all seven boolean switches × full/light × unset language

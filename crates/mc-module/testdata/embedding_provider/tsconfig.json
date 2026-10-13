@@ -1,0 +1,16 @@
+{
+    "extends": "../../../../packages/plugin/tsconfig.json",
+    "compilerOptions": {
+        "rootDir": "../../../..",
+        "noEmit": true,
+        "emitDeclarationOnly": false,
+        "declaration": false,
+        "declarationMap": false,
+        "typeRoots": [
+            "../../../../packages/plugin/node_modules/@types",
+            "../../../../packages/plugin/node_modules"
+        ]
+    },
+    "include": ["capture.ts"],
+    "references": []
+}

@@ -22,7 +22,7 @@
     "execution_mode": "mutating",
     "name": "ctx_memory",
     "schema": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "action": {
           "description": "write | update | archive | merge | get",
@@ -37,49 +37,29 @@
         },
         "category": {
           "description": "Kind of fact (required for write; on update/merge optional, omitted keeps the current category).",
+          "enum": [
+            "PROJECT_RULES",
+            "ARCHITECTURE",
+            "CONSTRAINTS",
+            "CONFIG_VALUES",
+            "NAMING"
+          ],
           "type": "string"
         },
         "content": {
           "description": "The memory text — one standalone fact (write, update, merge).",
-          "maxLength": 65536,
           "type": "string"
-        },
-        "id": {
-          "description": "Single memory id for update or archive.",
-          "minimum": 1,
-          "type": "integer"
         },
         "ids": {
           "description": "Memory ids from <project-memory>: one for update, one or more for archive, two or more for merge, 1–20 for get.",
           "items": {
-            "minimum": 1,
-            "type": "integer"
+            "type": "number"
           },
-          "maxItems": 100,
           "type": "array"
-        },
-        "memory_project": {
-          "description": "Resolved MC project identity supplied by the host transport.",
-          "type": "string"
         },
         "reason": {
           "description": "Why it is being archived (optional).",
-          "maxLength": 4096,
           "type": "string"
-        },
-        "source_ids": {
-          "description": "Merge form: memory ids to supersede into target_id.",
-          "items": {
-            "minimum": 1,
-            "type": "integer"
-          },
-          "maxItems": 100,
-          "type": "array"
-        },
-        "target_id": {
-          "description": "Merge form: memory id to keep and update.",
-          "minimum": 1,
-          "type": "integer"
         }
       },
       "type": "object"
@@ -90,22 +70,19 @@
     "execution_mode": "pure",
     "name": "ctx_expand",
     "schema": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "end": {
           "description": "Last message ordinal of the range, inclusive, not a tag number.",
-          "minimum": 0,
-          "type": "integer"
+          "type": "number"
         },
         "message": {
           "description": "Message ordinal from a <session-history> heading or a ctx_search hit, not a tag number. Returns that one message in full. Use alone.",
-          "minimum": 0,
-          "type": "integer"
+          "type": "number"
         },
         "start": {
           "description": "First message ordinal of the range (a <session-history> heading's start, or a ctx_search hit), not a tag number.",
-          "minimum": 0,
-          "type": "integer"
+          "type": "number"
         },
         "tag": {
           "anyOf": [
@@ -127,27 +104,37 @@
     }
   },
   {
-    "description": "Search the archive — everything that ever happened in this project, not just what is on your desk.\n\nRetrieval matches meaning and exact words and fuses them, so phrase `query` as a natural-language question that still carries the exact terms you expect in the answer (paths, symbols, config keys, error strings); a bare keyword stack finds less.\n- \"where is the opencode source code path?\"  (a location you once knew)\n- \"why did we choose SQLite over postgres?\"  (a decision and its reasons)\n- \"how does the dreamer lease work?\"  (a mechanism discussed or implemented earlier)\n- Not: \"upload client retry backoff config\"\n\nResults only contain what you CANNOT currently see — memories already in <project-memory> and the live tail are filtered out. A query that is just memory ids (`#7234`, `12, 34`) resolves them directly.\n\nSources (omit for all):\n- memory — rules, constraints, conventions; \"what's our convention for X\"\n- message — the raw conversation behind compacted history; \"did we discuss this\"; hits carry ordinals for ctx_expand(start=N-10, end=N+5)\n- git_commit — commit history; \"when did this change\" (pair with message for regression hunts)\n- note — parked follow-ups with their recorded text; \"did we leave a follow-up\"\nUse from/to to restrict every source to an inclusive UTC date range.",
+    "description": "Search the archive — everything that ever happened in this project, not just what is on your desk.\n\nRetrieval matches meaning and exact words and fuses them, so phrase `query` as a natural-language question that still carries the exact terms you expect in the answer (paths, symbols, config keys, error strings); a bare keyword stack finds less.\n- \"where is the opencode source code path?\"  (a location you once knew)\n- \"why did we choose SQLite over postgres?\"  (a decision and its reasons)\n- \"how does the dreamer lease work?\"  (a mechanism discussed or implemented earlier)\n- Not: \"upload client retry backoff config\"\n\nResults only contain what you CANNOT currently see — memories already in <project-memory> and the live tail are filtered out. A query that is just memory ids (`#7234`, `12, 34`) resolves them directly.\n\nSources (omit for all):\n- memory — rules, constraints, conventions; \"what's our convention for X\"\n- message — the raw conversation behind compacted history; \"did we discuss this\"; hits carry ordinals for ctx_expand(start=N-10, end=N+5)\n- git_commit — commit history; \"when did this change\" (pair with message for regression hunts)\n- primer — reusable project Q&A the dreamer distils from recurring questions; \"have we answered this before\"\n- note — parked follow-ups with their recorded text; \"did we leave a follow-up\"\nUse from/to to restrict every source to an inclusive UTC date range.",
     "execution_mode": "pure",
     "name": "ctx_search",
     "schema": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "from": {
           "description": "Earliest date, YYYY-MM-DD (inclusive).",
           "type": "string"
         },
         "limit": {
-          "default": 8,
           "description": "Maximum results (default 10).",
-          "maximum": 25,
-          "minimum": 1,
-          "type": "integer"
+          "type": "number"
         },
         "query": {
           "description": "A natural-language question carrying the exact terms you expect in the answer.",
-          "maxLength": 1024,
           "type": "string"
+        },
+        "sources": {
+          "description": "Restrict to these sources; omitting it or passing [] searches every source.",
+          "items": {
+            "enum": [
+              "memory",
+              "message",
+              "git_commit",
+              "primer",
+              "note"
+            ],
+            "type": "string"
+          },
+          "type": "array"
         },
         "to": {
           "description": "Latest date, YYYY-MM-DD (inclusive; default open).",
@@ -162,21 +149,20 @@
     "execution_mode": "mutating",
     "name": "ctx_note",
     "schema": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "action": {
           "description": "write | read | update | dismiss. Defaults to write when content is given, else read.",
           "enum": [
             "write",
             "read",
-            "update",
-            "dismiss"
+            "dismiss",
+            "update"
           ],
           "type": "string"
         },
         "content": {
           "description": "Note text for write/update: first line is the title (under 80 chars), then the detail.",
-          "maxLength": 65536,
           "type": "string"
         },
         "filter": {
@@ -191,15 +177,8 @@
           "type": "string"
         },
         "limit": {
-          "default": 25,
           "description": "Rows per read (default 25).",
-          "maximum": 100,
-          "minimum": 1,
-          "type": "integer"
-        },
-        "memory_project": {
-          "description": "Resolved MC project identity supplied by the host transport.",
-          "type": "string"
+          "type": "number"
         },
         "note_ids": {
           "description": "Note ids: one for update, 1–50 for dismiss or read (read returns full bodies). Ignored by write.",
@@ -213,14 +192,11 @@
           "type": "array"
         },
         "offset": {
-          "default": 0,
           "description": "Skip this many newest rows (default 0).",
-          "minimum": 0,
-          "type": "integer"
+          "type": "number"
         },
         "surface_condition": {
           "description": "Makes this a smart note: a condition an outside checker can verify on its own, periodically — repository state, releases, web pages, anything it can look up — never something only this conversation knows. The note is parked until the condition holds.",
-          "maxLength": 4096,
           "type": "string"
         }
       },

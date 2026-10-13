@@ -799,7 +799,8 @@ fn signed_prefix_hold_reconcile_hard_waits_for_the_turn() {
 fn signed_prefix_hold_subagent_tag_surface_transition_waits() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path());
-    let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    ctx.signed_thinking_hold = crate::config::SignedThinkingHold::On;
     let session = "signed-hold-subagent-surface";
     signed_hold_compartments(&s, session);
     let subagent = |used: u64, tools: bool| {

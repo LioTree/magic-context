@@ -2087,7 +2087,7 @@ export async function runPostTransformPhase(
     // have been omitted for a prefix rewrite, when no signed boundary remains to protect.
     const makeEditAdmission = () =>
         createEditAdmission({
-            messages: args.messages,
+            messages: holdEnabled ? args.messages : [],
             stableId: (message) => message.info.id,
             partsOf: (message) => message.parts,
             isRealUser: isAdmissionUser,

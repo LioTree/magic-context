@@ -1452,8 +1452,6 @@ pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
 
 /// Storage namespace for the cache-state domain.
 const STORAGE_NAMESPACE: &str = "mc_cache";
-#[cfg(test)]
-const GUIDANCE_TEXT: &str = prompt_surface::GUIDANCE_FULL_PRIMARY;
 /// Matches the default OpenCode protected tag window. The Claude Code facade has no
 /// request-local transform config, so acknowledgement validation uses the durable tag
 /// ordering with the same default recency window as an omitted transform field.
@@ -22634,6 +22632,17 @@ mod tests {
         assert_eq!(decision(None, 50.0), scheduler::BaseDecision::Execute);
     }
 
+    fn typescript_legacy_guidance(key: &str) -> String {
+        let reference: Value = serde_json::from_str(include_str!(
+            "../testdata/tool_surfaces/legacy-guidance-reference.json"
+        ))
+        .unwrap();
+        reference[key]
+            .as_str()
+            .expect("TypeScript guidance reference")
+            .to_string()
+    }
+
     fn default_test_config() -> McModuleConfig {
         McModuleConfig {
             cache_ttl_by_model: std::collections::BTreeMap::new(),
@@ -29262,16 +29271,14 @@ mod tests {
         )
         .await;
 
+        let reference = typescript_legacy_guidance("user_path_override");
         assert_eq!(
             guidance["bytes"],
-            json!("## Magic Context\n\nTrusted route guidance.\nToday's date: Fri Jan 01 2016")
+            json!(format!("{reference}\nToday's date: Fri Jan 01 2016"))
         );
         assert_eq!(
             guidance["content_hash"],
-            json!(prompt_surface::guidance_content_hash(
-                "## Magic Context\n\nTrusted route guidance.",
-                PromptSurfacePreset::Full,
-            ))
+            json!(sha256_hex(reference.as_bytes()))
         );
     }
 
@@ -29698,7 +29705,7 @@ mod tests {
         assert!(first_bytes.ends_with("Today's date: Fri Jan 01 2016"));
         assert_eq!(
             first["content_hash"],
-            json!(sha256_hex(GUIDANCE_TEXT.as_bytes()))
+            json!(sha256_hex(typescript_legacy_guidance("full").as_bytes()))
         );
         assert_eq!(
             first["hash"],
@@ -32093,7 +32100,10 @@ mod tests {
     }
 
     #[test]
-    fn ctx_manifest_schemas_accept_unknown_args_without_advertising_reduced_fields() {
+    // Advertised schemas now byte-match TypeScript's closed objects
+    // (additionalProperties: false). Execution remains tolerant of unrelated keys;
+    // the dispatch regression below protects that separate compatibility contract.
+    fn ctx_manifest_matches_closed_typescript_fields_without_reduction_placeholders() {
         let manifest = manifest("magic-context");
         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
             panic!("tool provider manifest entry");
@@ -32106,19 +32116,12 @@ mod tests {
             ("ctx_reduce", vec!["drop"]),
             (
                 "ctx_memory",
-                vec![
-                    "action",
-                    "category",
-                    "content",
-                    "id",
-                    "ids",
-                    "target_id",
-                    "source_ids",
-                    "reason",
-                    "memory_project",
-                ],
+                vec!["action", "category", "content", "ids", "reason"],
             ),
-            ("ctx_search", vec!["query", "limit", "from", "to"]),
+            (
+                "ctx_search",
+                vec!["query", "limit", "from", "to", "sources"],
+            ),
             (
                 "ctx_expand",
                 vec!["start", "end", "verbose", "message", "tag"],
@@ -32133,16 +32136,14 @@ mod tests {
                     "offset",
                     "filter",
                     "surface_condition",
-                    "memory_project",
                 ],
             ),
         ];
 
-        // ctx_reduce is the one AUTHORIZER-PINNED schema: Thalamus exact-matches
-        // the canonical closed shape and fails closed on any deviation, silently
-        // disabling the tagging surface. Its imitated-args tolerance lives in the
-        // execution unwrap, not the advertised schema. Every other ctx_ tool keeps
-        // the open accept-unknown-args posture.
+        // The Claude Code gateway authorizes ctx_reduce by exact schema match;
+        // changing this canonical closed shape disables tagging there. Compatibility
+        // with imitated call arguments lives in the execution unwrap. Advertised
+        // objects remain closed independently of that runtime tolerance.
         assert_eq!(
             by_name["ctx_reduce"].schema,
             json!({
@@ -32169,13 +32170,11 @@ mod tests {
             let tool = by_name
                 .get(name)
                 .unwrap_or_else(|| panic!("missing {name} manifest entry"));
-            if name != "ctx_reduce" {
-                assert_ne!(
-                    tool.schema.get("additionalProperties"),
-                    Some(&json!(false)),
-                    "{name} must preserve compatibility arguments"
-                );
-            }
+            assert_eq!(
+                tool.schema.get("additionalProperties"),
+                Some(&json!(false)),
+                "{name} advertised schema must match TypeScript"
+            );
             let properties = tool.schema["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{name} schema properties"));
@@ -32186,6 +32185,59 @@ mod tests {
             assert_eq!(actual, expected, "{name} advertised fields changed");
             assert!(!properties.contains_key("reduced"));
             assert!(!properties.contains_key("summary"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_advertisement_keeps_execution_tolerant_and_required_refusals_unchanged() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let valid = tool_body(call_facade(&handler, "ctx_note", json!({"action":"read"})).await);
+        assert_eq!(valid["isError"], json!(false));
+        let with_extra = tool_body(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action":"read", "stray":{"ignored":true}}),
+            )
+            .await,
+        );
+        assert_eq!(
+            with_extra, valid,
+            "closed advertisement does not add runtime key validation"
+        );
+        for (name, arguments, refusal) in [
+            ("ctx_reduce", json!({}), "Error: 'drop' must be provided."),
+            (
+                "ctx_reduce",
+                json!({"drop":false}),
+                "Error: 'drop' must be provided.",
+            ),
+            (
+                "ctx_search",
+                json!({}),
+                "Error: 'query' is required for ctx_search.",
+            ),
+            (
+                "ctx_search",
+                json!({"query":false}),
+                "Error: 'query' is required for ctx_search.",
+            ),
+        ] {
+            let rejected = tool_body(call_facade(&handler, name, arguments.clone()).await);
+            assert_eq!(rejected["isError"], json!(true));
+            assert_eq!(rejected["content"][0]["text"], json!(refusal));
+            let mut extra = arguments;
+            extra["stray"] = json!({"ignored":true});
+            let extra_rejected = tool_body(call_facade(&handler, name, extra).await);
+            assert_eq!(
+                extra_rejected, rejected,
+                "{name} required-field refusal changed with an extra key"
+            );
         }
     }
 
