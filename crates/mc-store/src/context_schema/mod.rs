@@ -1,4 +1,9 @@
-//! Context bootstrap extension. The schema owner registers bootstrap and fingerprints here.
+//! Injectable fresh context.db bootstrap; legacy migrations are not installed by this provider.
+
+pub mod bootstrap;
+pub mod fingerprints;
+
+pub use bootstrap::{BootstrapContextSchema, BOOTSTRAP, BOOTSTRAP_VERSION};
 
 use crate::parity_schema_manifest::*;
 
