@@ -5,7 +5,7 @@ use ck_wire::{
 };
 use std::ops::Range;
 
-const EXTRAS: &str = "mc-claude-code";
+pub(super) const EXTRAS: &str = "mc-claude-code";
 
 // Revisions of the native codec and raw JSON envelope formats, frozen internally
 // with each admitted native route/session plan. Discovery is still held.

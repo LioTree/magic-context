@@ -94,6 +94,8 @@ pub(super) struct HostView {
     pub(super) raw_replacement: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) head_slots: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cut_replacement: Option<super::native_cut::CutReplacement>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct HostCoverage {
@@ -800,13 +802,18 @@ fn execute_host(
                 .ok_or_else(|| invalid_field("raw_view"))?,
         )?;
     }
-    Ok(Some(HostView {
+    let mut view = HostView {
         engine,
         wire,
         coverage,
         raw_replacement,
         head_slots,
-    }))
+        cut_replacement: None,
+    };
+    if codec == Codec::ClaudeCodeAnthropic && view.wire.raw_view.is_some() {
+        super::native_cut::attach(&work.key, &mut view, &template)?;
+    }
+    Ok(Some(view))
 }
 
 fn status(
@@ -1134,9 +1141,15 @@ impl McHandler {
                 coverage: None,
                 raw_replacement: (codec == Codec::ClaudeCodeAnthropic).then(Vec::new),
                 head_slots: (codec == Codec::ClaudeCodeAnthropic).then(Vec::new),
+                cut_replacement: None,
             }
         };
         if codec == Codec::ClaudeCodeAnthropic && view.wire.raw_view.is_some() {
+            let retained = view
+                .wire
+                .raw_view
+                .as_ref()
+                .and_then(|frozen| frozen.retained_tail.clone());
             view.wire.raw_view = Some(Box::new(super::native_view::freeze(
                 key,
                 &view.engine,
@@ -1147,6 +1160,7 @@ impl McHandler {
                     .as_deref()
                     .ok_or_else(|| invalid_field("raw_view"))?,
             )?));
+            super::native_cut::refresh(key, &mut view, retained)?;
         }
         save_host_view(store, key, &view, "applied")?;
         setup.setup.state.version_high_water = high;
@@ -1535,6 +1549,7 @@ impl McHandler {
                                 code.as_str(),
                                 "signed_prefix_edit"
                                     | "native_endpoint_missing"
+                                    | "native_hook_cut_unrepresentable"
                                     | "invalid_signed_tool_boundary"
                                     | "native_endpoint_unrepresentable"
                             ) =>

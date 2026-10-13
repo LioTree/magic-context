@@ -17,6 +17,7 @@ mod codec_claude_code;
 mod codec_opencode;
 mod compaction;
 mod historian;
+mod native_cut;
 mod native_plan;
 mod native_view;
 mod policy_summary;

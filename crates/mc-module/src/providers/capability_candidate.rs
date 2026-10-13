@@ -1,5 +1,5 @@
 //! Compiled native format pins, used internally without advertising the capability.
-//! Discovery/declaration publication remains held until scoped raw views and cuts ship.
+//! Discovery/declaration publication remains held pending coordinated activation.
 use super::*;
 use hooks::claude_code::{ClaudeCodeCapabilities, PayloadCaps};
 use std::sync::LazyLock;
@@ -56,6 +56,7 @@ fn build_candidate() -> ClaudeCodeCapabilities {
                 "identity":sha256_hex(include_bytes!("records.rs")),
                 "plan":sha256_hex(include_bytes!("native_plan.rs")),
                 "view":sha256_hex(include_bytes!("native_view.rs")),
+                "cut":sha256_hex(include_bytes!("native_cut.rs")),
             }))
             .expect("native format fingerprints")
         )

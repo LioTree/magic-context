@@ -153,6 +153,7 @@ pub(super) fn validate(key: &Key, host: &compaction::HostView) -> Result<(), Han
         return Err(invalid_view());
     }
     frozen.validate().map_err(|_| invalid_view())?;
+    super::native_cut::validate(key, host)?;
     let RawPayload::Inline { bytes } = &frozen.payload else {
         return Err(invalid_view());
     };
@@ -274,6 +275,16 @@ impl McHandler {
             let RawPayload::Inline { bytes } = &frozen.payload else {
                 return Err(ViewReadRefusal::InvalidView);
             };
+            if let Some(cut) = &host.cut_replacement {
+                if request.view_id == cut.reference.view_id {
+                    return page(
+                        &request,
+                        &cut.reference,
+                        &cut.bytes,
+                        pins.caps.view_page_bytes,
+                    );
+                }
+            }
             page(&request, &frozen.view, bytes, pins.caps.view_page_bytes)
         })();
         bytes(&result.unwrap_or_else(|code| ViewReadAnswer::Refuse {
@@ -355,6 +366,7 @@ mod tests {
                 }),
                 raw_replacement: Some(raw),
                 head_slots: None,
+                cut_replacement: None,
             },
         )
     }

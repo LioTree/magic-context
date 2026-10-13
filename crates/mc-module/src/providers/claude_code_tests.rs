@@ -356,6 +356,53 @@ async fn cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes
     read["sha256"] = json!("0".repeat(64));
     let rejected = response(call(&h, "compaction.view.read", read).await);
     assert_eq!(rejected["code"], "digest_mismatch");
+    let cut = frozen
+        .cut_replacement_ref
+        .as_ref()
+        .expect("native hook head reference");
+    let cut_read = json!({"request_id":"head","view_id":cut.view_id,"version":cut.version,"sha256":cut.sha256,"byte_cursor":0});
+    let head = response(call(&h, "compaction.view.read", cut_read.clone()).await);
+    assert_eq!(head["answer"], "page");
+    let prefix: Vec<Value> = serde_json::from_str(head["bytes"].as_str().unwrap()).unwrap();
+    assert_eq!(prefix.len(), 2);
+    assert!(!head["bytes"].as_str().unwrap().contains("live tail"));
+    assert_eq!(
+        frozen.retained_tail.as_ref().unwrap(),
+        &vec![compact::view::RetainedPart {
+            endpoint: compact::view::NativeEndpoint {
+                message_id: "tail".into(),
+                part_index: 0
+            },
+            engine_handle: "tail#0".into()
+        }]
+    );
+    let mut applied = step(r#"{ "content":"unsigned live text", "role":"user" }"#);
+    applied["newest"] = json!({"mid":"tail","ordinal":1});
+    applied["last_applied"] = json!({"compaction_id":answer["compaction"]["compaction_id"],"version":answer["compaction"]["version"]});
+    response(call(&h, "compaction.step", applied).await);
+    h.bind_route(7, b.clone());
+    setup(&h).await;
+    let replay = response(call(&h, "compaction.view.read", cut_read.clone()).await);
+    assert_eq!(replay["bytes"], head["bytes"]);
+    drop(h);
+    let h = handler(dir.path(), thalamus());
+    h.bind_route(7, b.clone());
+    setup(&h).await;
+    let replay = response(call(&h, "compaction.view.read", cut_read.clone()).await);
+    assert_eq!(replay["bytes"], head["bytes"]);
+    let mut sibling = b.clone();
+    sibling.session = "subagent".into();
+    h.bind_route(7, sibling);
+    response(
+        call(
+            &h,
+            "transform.declare",
+            json!({"session":"subagent","harness":"claude-code","preset":"head","params":plan()}),
+        )
+        .await,
+    );
+    let borrowed = response(call(&h, "compaction.view.read", cut_read).await);
+    assert_eq!(borrowed["code"], "unknown_version");
     for slot in answer["head_slots"].as_array().unwrap() {
         let index = slot["index"].as_u64().unwrap() as usize;
         assert_eq!(slot["bytes_sha256"], sha256_hex(raw[index].as_bytes()));
