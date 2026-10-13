@@ -1148,3 +1148,42 @@ async fn r3_randomized_host_full_engine_240_passes() {
     );
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
+
+#[tokio::test]
+async fn hookcost_review_durable_wire_fragment_is_not_response_wire_fragment() {
+    if std::env::var("MC_HOOKCOST_REVIEW").as_deref() != Ok("1") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (h, binding, store, key, _) = fixture(dir.path());
+    response(h.provider_setup(binding.clone(), &setup_request()).await);
+    let mut boot = step("boot", vec![message(1), message(2)], 2);
+    boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+    let answer_bytes = h.provider_step(binding, &boot).await.unwrap();
+    let answer: Value = serde_json::from_slice(&answer_bytes).unwrap();
+    assert_eq!(answer["answer"], "compaction_message");
+    let version = answer["compaction"]["version"].as_u64().unwrap();
+    let row = store
+        .load_provider_view(&key.store_key(), version)
+        .unwrap()
+        .unwrap();
+    let view: HostView = serde_json::from_str(&row.replacement_json).unwrap();
+    let durable_fragment = serde_json::to_string(&view.wire).unwrap();
+    let response_fragment = serde_json::to_string(&answer["compaction"]).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&durable_fragment).unwrap(),
+        answer["compaction"]
+    );
+    assert_ne!(durable_fragment.as_bytes(), response_fragment.as_bytes());
+    let raw_assembled = String::from_utf8(answer_bytes.clone()).unwrap().replacen(
+        &response_fragment,
+        &durable_fragment,
+        1,
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&raw_assembled).unwrap(),
+        answer
+    );
+    assert_ne!(raw_assembled.as_bytes(), answer_bytes.as_slice());
+    println!("typed durable CompactionMessage and Value response compaction are JSON-equal but byte-unequal; substituting the durable fragment changes the encoded answer");
+}
