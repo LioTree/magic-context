@@ -1,0 +1,5 @@
+{
+  "extends": "../context_schema/tsconfig.json",
+  "include": ["generate.ts"],
+  "exclude": ["node_modules", "dist"]
+}

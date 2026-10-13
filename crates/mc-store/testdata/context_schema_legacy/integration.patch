@@ -1,0 +1,9 @@
+diff --git a/crates/mc-store/src/context_schema/mod.rs b/crates/mc-store/src/context_schema/mod.rs
+--- a/crates/mc-store/src/context_schema/mod.rs
++++ b/crates/mc-store/src/context_schema/mod.rs
+@@ -3,4 +3,5 @@
+ pub mod bootstrap;
+ pub mod fingerprints;
++pub mod migrations_legacy;
+
+ pub use bootstrap::{BootstrapContextSchema, BOOTSTRAP, BOOTSTRAP_VERSION};
