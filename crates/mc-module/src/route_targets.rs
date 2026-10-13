@@ -223,6 +223,15 @@ pub(crate) fn catalog_provider_target_for_test() -> RouteTarget {
 }
 
 #[cfg(test)]
+pub(crate) fn expected_routes_for_tests(runner: &str) -> Vec<String> {
+    #[cfg(feature = "agent-data")]
+    let routes = vec!["thalamus", runner, "engram", "entorhinal"];
+    #[cfg(not(feature = "agent-data"))]
+    let routes = vec!["thalamus", runner];
+    routes.into_iter().map(str::to_owned).collect()
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::Path;
@@ -234,15 +243,15 @@ mod tests {
     fn route_targets_follow_the_resolved_runner() {
         assert_eq!(
             route_targets(&RouteTargetConfig::default()),
-            vec!["thalamus".to_string(), "broca".to_string()]
+            expected_routes_for_tests("broca")
         );
         assert_eq!(
             route_targets(&RouteTargetConfig::runner_module("custom-runner")),
-            vec!["thalamus".to_string(), "custom-runner".to_string()]
+            expected_routes_for_tests("custom-runner")
         );
         assert_eq!(
             route_targets(&RouteTargetConfig::host_runner()),
-            vec!["thalamus".to_string(), "broca".to_string()]
+            expected_routes_for_tests("broca")
         );
     }
 
@@ -270,7 +279,10 @@ mod tests {
             assert!(RegisteredRoute::ProviderRunner.self_signals().is_empty());
         }
         let host = RouteTargetConfig::host_runner().with_provider_runner_module("scripted-runner");
-        assert_eq!(route_targets(&host), vec!["thalamus", "scripted-runner"]);
+        assert_eq!(
+            route_targets(&host),
+            expected_routes_for_tests("scripted-runner")
+        );
         assert!(host.target(RegisteredRoute::HistorianRunner).is_none());
         assert!(self_signals(&host).is_empty());
     }
@@ -336,7 +348,7 @@ mod tests {
             );
             assert_eq!(
                 route_targets(&config),
-                vec!["thalamus".to_string(), "broca".to_string()],
+                expected_routes_for_tests("broca"),
                 "{label}: provider runner remains an optional target"
             );
             assert_eq!(
@@ -363,10 +375,7 @@ mod tests {
             "no config: Claude Code still needs Broca"
         );
         fs::write(&path, r#"{ "historian": { "runner": "host" } }"#).expect("write");
-        assert_eq!(
-            edges(&path),
-            vec!["thalamus".to_string(), "broca".to_string()]
-        );
+        assert_eq!(edges(&path), expected_routes_for_tests("broca"));
         let hosted = RouteTargetConfig::for_configured_runners(
             crate::config::user_configured_runners_at(&path),
         );

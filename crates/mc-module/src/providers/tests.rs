@@ -170,6 +170,16 @@ async fn describe_envelopes_are_identical_and_manifest_methods_are_not_tools() {
     assert_eq!(answer["majors"].as_array().unwrap().len(), 3);
     let manifest = manifest(DEFAULT_MODULE_ID);
     let caps = manifest.capabilities.as_ref().unwrap();
+    #[cfg(feature = "agent-data")]
+    assert_eq!(
+        caps.provides,
+        [
+            compact::PROVIDES,
+            hooks::PROVIDES,
+            cortexkit_role_agent_data::PROVIDES
+        ]
+    );
+    #[cfg(not(feature = "agent-data"))]
     assert_eq!(caps.provides, [compact::PROVIDES, hooks::PROVIDES]);
     assert!(caps.requires.is_empty());
     let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {

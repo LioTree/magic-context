@@ -76,10 +76,14 @@ pub trait SessionLookup: Send + Sync {
 
 pub struct SubcMoveIo {
     connection_file: Option<PathBuf>,
+    module_id: String,
 }
 impl SubcMoveIo {
-    pub fn new(connection_file: Option<PathBuf>) -> Self {
-        Self { connection_file }
+    pub fn new(connection_file: Option<PathBuf>, module_id: String) -> Self {
+        Self {
+            connection_file,
+            module_id,
+        }
     }
     async fn call(
         &self,
@@ -101,7 +105,7 @@ impl SubcMoveIo {
             .flatten()
             .ok_or_else(DoorError::unavailable)?;
         let consumer_identity = subc_control::ConsumerIdentity {
-            module_id: crate::DEFAULT_MODULE_ID.into(),
+            module_id: self.module_id.clone(),
             launch_nonce: nonce.value().to_owned(),
         };
         let consumer = SubcConsumer::connect(path, ConsumerOptions::default())

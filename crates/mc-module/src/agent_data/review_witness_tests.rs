@@ -179,12 +179,13 @@ fn review_feature_off_manifest_bytes_services_and_routes_match_old_builder() {
 
 #[cfg(not(feature = "agent-data"))]
 #[tokio::test]
-async fn review_feature_off_registry_failure_refuses_an_ordinary_bind() {
+async fn review_feature_off_ignores_registry_failure_on_an_ordinary_bind() {
     let dir = tempfile::tempdir().unwrap();
-    let h = make(dir.path(), Arc::new(FakeDoor::default())).await;
-    let path = h.agent_data.root().unwrap().join("bindings.json");
-    std::fs::remove_file(&path).unwrap();
-    std::fs::create_dir(&path).unwrap();
+    let root = dir.path().join("agent-data");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(root.join("bindings.json")).unwrap();
+    let h = production_make(dir.path()).await;
+    assert!(h.agent_data.is_none());
     let request = RouteBindRequest::new(
         RouteHandle::detached(1, 1),
         RouteTarget::ManagementSurface {
@@ -194,12 +195,9 @@ async fn review_feature_off_registry_failure_refuses_an_ordinary_bind() {
     )
     .with_principal(Principal::Direct);
     let decision = h.on_bind(&request).await;
-    assert!(format!("{decision:?}").contains("Reject"), "{decision:?}");
-    assert!(
-        format!("{decision:?}").contains("unavailable"),
-        "{decision:?}"
-    );
-    assert!(!h.bindings.lock().unwrap().contains_key(&1));
+    assert!(format!("{decision:?}").contains("Accept"), "{decision:?}");
+    assert!(h.bindings.lock().unwrap().contains_key(&1));
+    assert!(root.join("bindings.json").is_dir());
 }
 
 // Make a genuine move back: A still has its released preimage, while B has
@@ -233,7 +231,7 @@ async fn staged_move_back(a: &McHandler, b: &McHandler, door: &FakeDoor) -> Vec<
 }
 
 #[tokio::test]
-async fn review_status_reads_released_copy_while_transform_refuses() {
+async fn review_session_diagnostics_refuse_released_data() {
     let dir = tempfile::tempdir().unwrap();
     let door = Arc::new(FakeDoor::default());
     let h = make(dir.path(), door.clone()).await;
@@ -244,22 +242,22 @@ async fn review_status_reads_released_copy_while_transform_refuses() {
     let mut p = params(&refs);
     p["holder"] = json!("other-Mac");
     reply(call(&h, role::ops::RELEASE, p).await);
-    assert_eq!(
-        refusal(
-            h.dispatch_value(1, json!({"method":"transform","session_id":SESSION}))
-                .await
-        ),
-        "session_moved"
-    );
-    let status = reply(
-        h.dispatch_value(1, json!({"method":"status","session_id":SESSION}))
-            .await,
-    );
-    assert_eq!(status["session_id"], SESSION);
-    assert!(
-        status["row_version"].is_number(),
-        "released data is still visible: {status}"
-    );
+    for method in ["transform", "status", "health", "diagnostics"] {
+        assert_eq!(
+            refusal(
+                h.dispatch_value(1, json!({"method":method,"session_id":SESSION}))
+                    .await
+            ),
+            "session_moved",
+            "{method}"
+        );
+    }
+    for method in ["status", "health", "diagnostics"] {
+        assert_eq!(
+            reply(h.dispatch_value(1, json!({"method":method})).await)["ok"],
+            true
+        );
+    }
 }
 
 #[tokio::test]
@@ -278,90 +276,125 @@ async fn review_overlapping_refs_refusal_rolls_back_the_temporary_gate() {
         refusal(call(&h, role::ops::PREPARE, params(&refs)).await),
         "not_exportable"
     );
-    let journal: Journal = load(&h.agent_data.root().unwrap().join("journal.json")).unwrap();
+    let journal: Journal = load(
+        &h.agent_data
+            .as_ref()
+            .expect("test coordinator")
+            .root()
+            .unwrap()
+            .join("journal.json"),
+    )
+    .unwrap();
     assert!(!journal.cuts.contains_key(CUT));
     assert!(h
         .agent_data
+        .as_ref()
+        .expect("test coordinator")
         .enter(vec![SESSION.into()], "turn_in_flight")
         .is_ok());
     reply(call(&h, role::ops::ABORT, params(&refs)).await);
     assert!(h
         .agent_data
+        .as_ref()
+        .expect("test coordinator")
         .enter(vec![SESSION.into()], "turn_in_flight")
         .is_ok());
 }
 
 #[cfg(not(feature = "agent-data"))]
 #[tokio::test]
-async fn review_feature_off_writes_bind_registry_and_retains_stale_prepare_gate() {
-    assert!(!ENABLED);
-    let dir = tempfile::tempdir().unwrap();
-    let door = Arc::new(FakeDoor::default());
-    let h = make(dir.path(), door.clone()).await;
+async fn review_feature_off_does_not_write_bind_registry_and_preserves_stranded_gates() {
+    let clean = tempfile::tempdir().unwrap();
+    let h = production_make(clean.path()).await;
+    assert!(h.agent_data.is_none());
     observe(&h, SESSION).await;
-    let root = h.agent_data.root().unwrap();
-    let tuples: Vec<BindTuple> = load(&root.join("bindings.json")).unwrap();
-    assert!(tuples
-        .iter()
-        .any(|t| t.session == SESSION && t.project_root == ROOT));
-    seed(&h, SESSION);
-    reply(call(&h, role::ops::PREPARE, params(&[reference(SESSION)])).await);
+    assert!(!clean.path().join("agent-data").exists());
     drop(h);
-    let h = make(dir.path(), door).await;
-    observe(&h, SESSION).await;
-    assert_eq!(
-        refusal(
-            h.dispatch_value(1, json!({"method":"transform","session_id":SESSION}))
-                .await
-        ),
-        "session_moving"
-    );
-    assert!(RouteTargetConfig::default()
-        .target(RegisteredRoute::EngramDoor)
-        .is_none());
+    for step in [
+        Step::Prepared,
+        Step::Exported,
+        Step::Released,
+        Step::Imported,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agent-data");
+        std::fs::create_dir(&root).unwrap();
+        let identity = Identity {
+            harness: "opencode".into(),
+            project_root: ROOT.into(),
+            session: SESSION.into(),
+            namespaces: vec![],
+        };
+        let mut cut = Cut {
+            step,
+            sessions: vec![identity],
+            ..Cut::default()
+        };
+        if step == Step::Imported {
+            cut.intent = Some(role::ops::ACTIVATE.into());
+        }
+        let mut journal = Journal::default();
+        journal.cuts.insert(CUT.into(), cut);
+        save(&root.join("journal.json"), &journal).unwrap();
+        let before = std::fs::read(root.join("journal.json")).unwrap();
+        let h = production_make(dir.path()).await;
+        observe(&h, SESSION).await;
+        assert_eq!(
+            refusal(
+                h.dispatch_value(1, json!({"method":"status","session_id":SESSION}))
+                    .await
+            ),
+            if step == Step::Released {
+                "session_moved"
+            } else {
+                "session_moving"
+            }
+        );
+        assert!(!root.join("bindings.json").exists());
+        assert_eq!(std::fs::read(root.join("journal.json")).unwrap(), before);
+        h.move_visibility
+            .configure_readonly(&dir.path().join("store.db"))
+            .unwrap();
+        assert_eq!(
+            h.move_visibility.stranded_sessions.lock().unwrap().len(),
+            if matches!(step, Step::Prepared | Step::Exported) {
+                1
+            } else {
+                0
+            }
+        );
+    }
 }
 
 #[cfg(not(feature = "agent-data"))]
 #[tokio::test]
-async fn review_feature_off_callback_accepts_prepare_and_production_io_leaves_intent() {
+async fn review_feature_off_refuses_internal_service_without_an_intent() {
     let dir = tempfile::tempdir().unwrap();
-    let mut h = make(dir.path(), Arc::new(FakeDoor::default())).await;
-    h.agent_data = AgentDataService::new(None);
-    h.agent_data
-        .configure(&dir.path().join("store.db"))
-        .unwrap();
-    bind(
-        &h,
-        CHANNEL,
-        "agent-data",
-        "driver",
-        Principal::Reserved {
-            module_id: "entorhinal".into(),
+    let h = production_make(dir.path()).await;
+    assert!(h.agent_data.is_none());
+    let request = RouteBindRequest::new(
+        RouteHandle::detached(CHANNEL, 1),
+        RouteTarget::InternalService {
+            module_id: DEFAULT_MODULE_ID.into(),
+            service_id: role::SERVICE_ID.into(),
         },
+        BindIdentity::new(PathBuf::from(ROOT), "agent-data", "driver"),
     )
-    .await;
-    seed(&h, SESSION);
-    observe(&h, SESSION).await;
+    .with_principal(Principal::Reserved {
+        module_id: "entorhinal".into(),
+    });
+    let decision = h.on_bind(&request).await;
+    assert!(format!("{decision:?}").contains("Reject"));
     assert_eq!(
         refusal(call(&h, role::ops::PREPARE, params(&[reference(SESSION)])).await),
         "unavailable"
     );
-    let journal: Journal = load(&h.agent_data.root().unwrap().join("journal.json")).unwrap();
-    assert_eq!(
-        journal.cuts[CUT].intent.as_deref(),
-        Some(role::ops::PREPARE)
-    );
-    assert_eq!(
-        refusal(
-            h.dispatch_value(1, json!({"method":"transform","session_id":SESSION}))
-                .await
-        ),
-        "session_moving"
-    );
+    assert!(!dir.path().join("agent-data").exists());
+    assert!(!h.bindings.lock().unwrap().contains_key(&CHANNEL));
 }
 
 #[tokio::test]
-async fn review_partial_activate_abort_restores_session_rows_but_divergence_advances() {
+async fn review_partial_activate_abort_restores_rows_and_does_not_fork() {
     let mut reached = false;
     // Inject after context.db's replacement commits but before store.db's
     // installation. The fault hook counts journal checkpoints from zero; the
@@ -386,9 +419,22 @@ async fn review_partial_activate_abort_restores_session_rows_but_divergence_adva
         let before_context = context.fingerprint(SESSION).unwrap();
         let before_module = mover.fingerprint(SESSION).unwrap();
         let before_rows = module_shipped_rows(&a);
-        *a.agent_data.crash_after.lock().unwrap() = Some(point);
+        *a.agent_data
+            .as_ref()
+            .expect("test coordinator")
+            .crash_after
+            .lock()
+            .unwrap() = Some(point);
         let outcome = call(&a, role::ops::ACTIVATE, back_params(&refs)).await;
-        let journal: Journal = load(&a.agent_data.root().unwrap().join("journal.json")).unwrap();
+        let journal: Journal = load(
+            &a.agent_data
+                .as_ref()
+                .expect("test coordinator")
+                .root()
+                .unwrap()
+                .join("journal.json"),
+        )
+        .unwrap();
         if note(&a) != "returned note" || journal.cuts[BACK].step == Step::Activated {
             assert!(
                 matches!(
@@ -408,16 +454,19 @@ async fn review_partial_activate_abort_restores_session_rows_but_divergence_adva
         assert_eq!(note(&a), "returned note");
         assert_ne!(context.fingerprint(SESSION).unwrap(), before_context);
         assert_ne!(mover.fingerprint(SESSION).unwrap(), before_module);
-        let half_status = reply(
-            a.dispatch_value(1, json!({"method":"status","session_id":SESSION}))
-                .await,
-        );
-        assert!(
-            half_status["row_version"].is_null(),
-            "normal status can see the discarded module half: {half_status}"
-        );
+        for method in ["status", "health", "diagnostics"] {
+            assert_eq!(
+                refusal(
+                    a.dispatch_value(1, json!({"method":method,"session_id":SESSION}))
+                        .await
+                ),
+                "session_moving"
+            );
+        }
         assert!(a
             .agent_data
+            .as_ref()
+            .expect("test coordinator")
             .enter(vec![SESSION.into()], "turn_in_flight")
             .is_err());
         drop(mover);
@@ -451,8 +500,8 @@ async fn review_partial_activate_abort_restores_session_rows_but_divergence_adva
         assert_ne!(restored.fingerprint(SESSION).unwrap(), before_module);
         assert_eq!(
             reply(call(&a, role::ops::DIVERGED, back_params(&refs)).await)["refs"][0]["state"],
-            "advanced",
-            "the restored cache epoch is mistaken for newly gained session data"
+            "at_cut",
+            "restored installation bookkeeping must not create a fork"
         );
         assert_eq!(project_rows(&a), vec!["A project data"; 3]);
         assert_eq!(project_rows(&b), vec!["B project data"; 3]);
@@ -492,6 +541,8 @@ async fn review_move_back_replaces_released_copy_and_serves_again() {
     assert_eq!(note(&a), "returned note");
     assert!(a
         .agent_data
+        .as_ref()
+        .expect("test coordinator")
         .enter(vec![SESSION.into()], "turn_in_flight")
         .is_ok());
     assert_eq!(
@@ -548,12 +599,14 @@ async fn review_concurrent_imports_do_not_overwrite_a_newly_activated_copy() {
     assert_eq!(note(&d), "portable note");
     assert!(d
         .agent_data
+        .as_ref()
+        .expect("test coordinator")
         .enter(vec![SESSION.into()], "turn_in_flight")
         .is_ok());
 }
 
 #[tokio::test]
-async fn review_staging_corruption_is_installed_without_digest_recheck() {
+async fn review_staging_corruption_is_refused_without_replacing_rows() {
     let sdir = tempfile::tempdir().unwrap();
     let ddir = tempfile::tempdir().unwrap();
     let door = Arc::new(FakeDoor::default());
@@ -564,20 +617,51 @@ async fn review_staging_corruption_is_installed_without_digest_recheck() {
     let refs = vec![reference(SESSION)];
     prepared(&s, &door, &refs).await;
     reply(call(&d, role::ops::IMPORT, params(&refs)).await);
-    let root = d.agent_data.root().unwrap();
+    let root = d.agent_data.as_ref().unwrap().root().unwrap();
     let path = directory(&root, CUT, &refs[0].r#ref).join("context-0.bin");
-    let journal: Journal = load(&root.join("journal.json")).unwrap();
-    let expected = journal.cuts[CUT].snapshots[0].header.halves[0]
-        .context_digest
-        .clone();
-    let mut bytes = std::fs::read(&path).unwrap();
+    let before_module = module_shipped_rows(&d);
+    let before_notes = context_conn(&d)
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE session_id=?1",
+            [SESSION],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+    let before_journal = std::fs::read(root.join("journal.json")).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let mut bytes = original.clone();
     let old = b"portable note";
     let offset = bytes.windows(old.len()).position(|w| w == old).unwrap();
     bytes[offset..offset + old.len()].copy_from_slice(b"CORRUPT! note");
-    std::fs::write(&path, bytes).unwrap();
-    assert_ne!(snapshot::file_digest(&path).unwrap(), expected);
+    std::fs::write(&path, &bytes).unwrap();
+    let refused = call(&d, role::ops::ACTIVATE, params(&refs)).await;
+    assert_eq!(refusal(refused.clone()), "unavailable");
+    match refused {
+        HandlerOutcome::ErrorWithDetail { detail, .. } => {
+            assert_eq!(detail["reason"], "staging_digest_mismatch")
+        }
+        _ => panic!("corruption must be named"),
+    }
+    assert_eq!(module_shipped_rows(&d), before_module);
+    assert_eq!(
+        context_conn(&d)
+            .query_row(
+                "SELECT COUNT(*) FROM notes WHERE session_id=?1",
+                [SESSION],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        before_notes
+    );
+    assert_eq!(
+        std::fs::read(root.join("journal.json")).unwrap(),
+        before_journal
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(!directory(&root, CUT, &refs[0].r#ref).join("undo").exists());
+    std::fs::write(path, original).unwrap();
     reply(call(&d, role::ops::ACTIVATE, params(&refs)).await);
-    assert_eq!(note(&d), "CORRUPT! note");
+    assert_eq!(note(&d), "portable note");
 }
 
 #[cfg(not(feature = "agent-data"))]
@@ -714,4 +798,137 @@ async fn review_feature_off_normal_dispatch_preserves_business_write_footprints(
     );
     assert_eq!(row_counts(&old, false), row_counts(&new, false));
     eprintln!("direct unchanged business handlers vs feature-off dispatch: identical transform ck_messages and SQL row footprints after transform, historian claim and ctx_memory write");
+}
+
+#[cfg(not(feature = "agent-data"))]
+async fn production_make(dir: &Path) -> McHandler {
+    let store = Arc::new(McHandler::open_store_once(&descriptor(dir)).await.unwrap());
+    let mut h = McHandler::new();
+    h.fixed_config = Some(McModuleConfig {
+        inject_docs: false,
+        temporal_awareness: false,
+        memory_enabled: false,
+        execute_threshold_percentage: 100.0,
+        ..McModuleConfig::default()
+    });
+    h.store.set(store).ok().unwrap();
+    h.move_visibility
+        .configure_readonly(&dir.join("store.db"))
+        .unwrap();
+    h
+}
+
+#[tokio::test]
+async fn review_abort_restore_rebaselines_but_a_real_turn_still_advances() {
+    let sdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let door = Arc::new(FakeDoor::default());
+    let s = make(sdir.path(), door.clone()).await;
+    let d = make(ddir.path(), door.clone()).await;
+    seed(&s, SESSION);
+    seed(&d, SESSION);
+    observe(&s, SESSION).await;
+    observe(&d, SESSION).await;
+    let refs = vec![reference(SESSION)];
+    let local = json!({"refs":refs,"cutId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"});
+    reply(call(&d, role::ops::PREPARE, local.clone()).await);
+    reply(call(&d, role::ops::ABORT, local).await);
+    context_conn(&s)
+        .execute(
+            "UPDATE notes SET content='incoming note' WHERE session_id=?1",
+            [SESSION],
+        )
+        .unwrap();
+    prepared(&s, &door, &refs).await;
+    assert_eq!(
+        reply(call(&d, role::ops::DIVERGED, params(&refs)).await)["refs"][0]["state"],
+        "at_cut"
+    );
+    reply(call(&d, role::ops::IMPORT, params(&refs)).await);
+    *d.agent_data.as_ref().unwrap().crash_after.lock().unwrap() = Some(1);
+    assert_eq!(
+        refusal(call(&d, role::ops::ACTIVATE, params(&refs)).await),
+        "unavailable"
+    );
+    reply(call(&d, role::ops::ABORT, params(&refs)).await);
+    assert_eq!(note(&d), "portable note");
+    assert_eq!(
+        reply(call(&d, role::ops::DIVERGED, params(&refs)).await)["refs"][0]["state"],
+        "at_cut"
+    );
+    let mut turn = FixtureBuilder::frozen_reductions();
+    turn.session_id = SESSION.into();
+    assert!(reply(d.dispatch_value(1, turn.call_transform()).await)["ck_messages"].is_array());
+    assert_eq!(
+        reply(call(&d, role::ops::DIVERGED, params(&refs)).await)["refs"][0]["state"],
+        "advanced"
+    );
+}
+#[tokio::test]
+async fn review_undo_corruption_refuses_activation_and_abort_without_new_writes() {
+    let sdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let door = Arc::new(FakeDoor::default());
+    let s = make(sdir.path(), door.clone()).await;
+    let d = make(ddir.path(), door.clone()).await;
+    seed(&s, SESSION);
+    observe(&s, SESSION).await;
+    let refs = vec![reference(SESSION)];
+    prepared(&s, &door, &refs).await;
+    reply(call(&d, role::ops::IMPORT, params(&refs)).await);
+    *d.agent_data.as_ref().unwrap().crash_after.lock().unwrap() = Some(1);
+    assert_eq!(
+        refusal(call(&d, role::ops::ACTIVATE, params(&refs)).await),
+        "unavailable"
+    );
+    let root = d.agent_data.as_ref().unwrap().root().unwrap();
+    let path = directory(&root, CUT, &refs[0].r#ref).join("undo/context-0.bin");
+    let original = std::fs::read(&path).unwrap();
+    let mut corrupt = original.clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    std::fs::write(&path, &corrupt).unwrap();
+    let before = std::fs::read(root.join("journal.json")).unwrap();
+    let rows = module_shipped_rows(&d);
+    for op in [role::ops::ACTIVATE, role::ops::ABORT] {
+        let error = call(&d, op, params(&refs)).await;
+        assert_eq!(refusal(error.clone()), "unavailable");
+        match error {
+            HandlerOutcome::ErrorWithDetail { detail, .. } => {
+                assert_eq!(detail["reason"], "undo_digest_mismatch")
+            }
+            _ => panic!("undo corruption must be named"),
+        }
+        assert_eq!(module_shipped_rows(&d), rows);
+        assert_eq!(std::fs::read(root.join("journal.json")).unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+    }
+    std::fs::write(path, original).unwrap();
+    reply(call(&d, role::ops::ABORT, params(&refs)).await);
+}
+#[tokio::test]
+async fn review_effective_registration_id_controls_bind_and_item_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let door = Arc::new(FakeDoor::default());
+    let mut h = make(dir.path(), door).await;
+    h.registered_module_id = "override-magic-context".into();
+    h.agent_data.as_mut().unwrap().module_id = h.registered_module_id.clone();
+    let request = RouteBindRequest::new(
+        RouteHandle::detached(CHANNEL, 2),
+        RouteTarget::InternalService {
+            module_id: h.registered_module_id.clone(),
+            service_id: role::SERVICE_ID.into(),
+        },
+        BindIdentity::new(PathBuf::from(ROOT), "agent-data", "driver"),
+    )
+    .with_principal(Principal::Reserved {
+        module_id: "entorhinal".into(),
+    });
+    assert!(format!("{:?}", h.on_bind(&request).await).contains("Accept"));
+    seed(&h, SESSION);
+    observe(&h, SESSION).await;
+    let prepare = reply(call(&h, role::ops::PREPARE, params(&[reference(SESSION)])).await);
+    assert_eq!(
+        prepare["items"][0]["stream"],
+        "reserved:override-magic-context"
+    );
 }

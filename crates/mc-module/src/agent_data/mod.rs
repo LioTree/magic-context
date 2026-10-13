@@ -3,11 +3,13 @@
 //! while the other half (or another ref in the move) is still being recovered.
 pub mod door;
 mod snapshot;
+mod visibility;
+pub(crate) use visibility::MoveVisibility;
 #[cfg(test)]
 #[path = "adapter_tests.rs"]
 mod tests;
 
-use crate::{McHandler, SessionBinding, DEFAULT_MODULE_ID};
+use crate::{McHandler, SessionBinding};
 use cortexkit_role_agent_data as role;
 use door::{EngramDoor, SessionLookup, SubcMoveIo};
 use mc_store::{
@@ -43,8 +45,8 @@ use subc_protocol::Principal;
 
 pub const REF_KINDS: [&str; 3] = ["opencode-session", "pi-session", "claude-code-session"];
 pub const ENABLED: bool = cfg!(feature = "agent-data");
-pub fn stream() -> String {
-    format!("reserved:{DEFAULT_MODULE_ID}")
+pub fn stream(module_id: &str) -> String {
+    format!("reserved:{module_id}")
 }
 fn kind(harness: &str) -> Option<&'static str> {
     match harness {
@@ -139,33 +141,44 @@ impl Drop for PassGuard {
         a.active.retain(|_, r| !r.is_empty());
     }
 }
-pub struct AgentDataService {
-    root: Mutex<Option<PathBuf>>,
+pub(crate) struct AgentDataService {
+    visibility: Arc<MoveVisibility>,
+    module_id: String,
     tuples: Mutex<Vec<BindTuple>>,
     pub(crate) channels: Mutex<BTreeSet<u16>>,
-    activity: Arc<Mutex<Activity>>,
     serial: tokio::sync::Mutex<()>,
     door: Arc<dyn EngramDoor>,
     lookup: Arc<dyn SessionLookup>,
     lookup_warned: AtomicBool,
+    corruption_warned: Mutex<BTreeSet<String>>,
     #[cfg(test)]
     crash_after: Mutex<Option<usize>>,
 }
 impl AgentDataService {
-    pub fn new(connection_file: Option<PathBuf>) -> Self {
-        let io = Arc::new(SubcMoveIo::new(connection_file));
-        Self::with_io(io.clone(), io)
+    pub(crate) fn new(
+        connection_file: Option<PathBuf>,
+        module_id: String,
+        visibility: Arc<MoveVisibility>,
+    ) -> Self {
+        let io = Arc::new(SubcMoveIo::new(connection_file, module_id.clone()));
+        Self::with_io_and_visibility(io.clone(), io, module_id, visibility)
     }
-    fn with_io(door: Arc<dyn EngramDoor>, lookup: Arc<dyn SessionLookup>) -> Self {
+    fn with_io_and_visibility(
+        door: Arc<dyn EngramDoor>,
+        lookup: Arc<dyn SessionLookup>,
+        module_id: String,
+        visibility: Arc<MoveVisibility>,
+    ) -> Self {
         Self {
-            root: Mutex::new(None),
+            visibility,
+            module_id,
             tuples: Mutex::new(vec![]),
             channels: Mutex::new(BTreeSet::new()),
-            activity: Arc::new(Mutex::new(Activity::default())),
             serial: tokio::sync::Mutex::new(()),
             door,
             lookup,
             lookup_warned: AtomicBool::new(false),
+            corruption_warned: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             crash_after: Mutex::new(None),
         }
@@ -221,66 +234,6 @@ impl AgentDataService {
             save(&root.join("bindings.json"), &*tuples)?;
         }
         Ok(())
-    }
-    fn refresh_gates(&self, journal: &Journal) {
-        let mut activity = self.activity.lock().expect("move activity");
-        activity.gates.clear();
-        for (cut_id, cut) in &journal.cuts {
-            let blocked = cut.intent.is_some()
-                || matches!(cut.step, Step::Prepared | Step::Exported | Step::Released);
-            if !blocked {
-                continue;
-            }
-            let code = if cut.step == Step::Released {
-                "session_moved"
-            } else {
-                "session_moving"
-            };
-            for id in &cut.sessions {
-                for session in std::iter::once(&id.session).chain(id.namespaces.iter()) {
-                    if journal
-                        .current
-                        .get(session)
-                        .is_some_and(|current| current != cut_id)
-                        && cut.intent.is_none()
-                    {
-                        continue;
-                    }
-                    activity
-                        .gates
-                        .insert(session.clone(), (code.into(), cut.holder.clone()));
-                }
-            }
-        }
-    }
-    pub(crate) fn enter(
-        &self,
-        sessions: Vec<String>,
-        reason: &str,
-    ) -> Result<PassGuard, HandlerOutcome> {
-        let mut activity = self.activity.lock().expect("move activity");
-        for s in &sessions {
-            if let Some((code, holder)) = activity.gates.get(s) {
-                return Err(HandlerOutcome::ErrorWithDetail {
-                    code: code.clone(),
-                    message: format!("session {s} is not served on this Mac"),
-                    detail: json!({"holder":holder}),
-                });
-            }
-        }
-        for s in &sessions {
-            *activity
-                .active
-                .entry(s.clone())
-                .or_default()
-                .entry(reason.into())
-                .or_default() += 1;
-        }
-        Ok(PassGuard {
-            activity: self.activity.clone(),
-            sessions,
-            reason: reason.into(),
-        })
     }
     fn checkpoint(&self, root: &Path, journal: &Journal) -> Result<(), ErrorBody> {
         save(&root.join("journal.json"), journal)?;
@@ -979,7 +932,7 @@ impl AgentDataService {
                 });
             self.checkpoint(root, journal)?;
         }
-        let items=journal.cuts[cut_id].snapshots.iter().map(|s|json!({"ref_kind":s.header.ref_kind,"ref":s.header.session_ref,"sessionRef":s.header.session_ref,"stream":stream(),"endOffset":s.end,"digest":s.digest,"format":s.header.format(),"frozen":true})).collect::<Vec<_>>();
+        let items=journal.cuts[cut_id].snapshots.iter().map(|s|json!({"ref_kind":s.header.ref_kind,"ref":s.header.session_ref,"sessionRef":s.header.session_ref,"stream":stream(&self.module_id),"endOffset":s.end,"digest":s.digest,"format":s.header.format(),"frozen":true})).collect::<Vec<_>>();
         Ok(json!({"items":items,"external":[]}))
     }
     #[allow(clippy::too_many_arguments)] // Two SQLite handles share one persisted move record; explicit arguments make both writes auditable.
@@ -1014,7 +967,8 @@ impl AgentDataService {
                 File::open(directory(root, cut_id, r).join("wire.bin")).map_err(storage)?;
             file.seek(SeekFrom::Start(offset - snapshot.start))
                 .map_err(storage)?;
-            let cap = mc_store::move_snapshot::MAX_RECORD_LENGTH - 17 - stream().len();
+            let cap =
+                mc_store::move_snapshot::MAX_RECORD_LENGTH - 17 - stream(&self.module_id).len();
             let mut bytes = vec![0; snapshot::PAGE.min(cap)];
             while offset < snapshot.end {
                 let count = file.read(&mut bytes).map_err(storage)?;
@@ -1274,6 +1228,28 @@ impl AgentDataService {
         context: &ContextMoveStore,
     ) -> Result<Value, ErrorBody> {
         let cut = journal.cuts[cut_id].clone();
+        for snapshot in &cut.snapshots {
+            self.validate_images(
+                &cut,
+                cut_id,
+                &snapshot.header,
+                &directory(root, cut_id, &snapshot.header.session_ref),
+                "activate",
+                mover,
+                "staging_digest_mismatch",
+            )?;
+        }
+        for header in &cut.undo {
+            self.validate_images(
+                &cut,
+                cut_id,
+                header,
+                &directory(root, cut_id, &header.session_ref).join("undo"),
+                "abort",
+                mover,
+                "undo_digest_mismatch",
+            )?;
+        }
         if cut.intent.is_none() {
             self.refuse_busy(handler, mover, refs, &cut.sessions)?;
             self.gate(refs, &cut.sessions)?;
@@ -1327,6 +1303,17 @@ impl AgentDataService {
         }
         for snapshot in &snapshots {
             let dir = directory(root, cut_id, &snapshot.header.session_ref);
+            for header in &journal.cuts[cut_id].undo {
+                self.validate_images(
+                    &journal.cuts[cut_id],
+                    cut_id,
+                    header,
+                    &directory(root, cut_id, &header.session_ref).join("undo"),
+                    "abort",
+                    mover,
+                    "undo_digest_mismatch",
+                )?;
+            }
             self.replace_halves(
                 root,
                 journal,
@@ -1384,6 +1371,19 @@ impl AgentDataService {
         mover: &mut MoveStore,
         context: &ContextMoveStore,
     ) -> Result<(), ErrorBody> {
+        self.validate_images(
+            &journal.cuts[cut_id],
+            cut_id,
+            header,
+            dir,
+            phase,
+            mover,
+            if phase == "abort" {
+                "undo_digest_mismatch"
+            } else {
+                "staging_digest_mismatch"
+            },
+        )?;
         for (i, half) in header.halves.iter().enumerate() {
             let install = binding(
                 cut_id,
@@ -1486,6 +1486,17 @@ impl AgentDataService {
         context: &ContextMoveStore,
     ) -> Result<Value, ErrorBody> {
         let original = journal.cuts.get(cut_id).cloned().unwrap_or_default();
+        for header in &original.undo {
+            self.validate_images(
+                &original,
+                cut_id,
+                header,
+                &directory(root, cut_id, &header.session_ref).join("undo"),
+                "abort",
+                mover,
+                "undo_digest_mismatch",
+            )?;
+        }
         let cut = journal.cuts.entry(cut_id.into()).or_default();
         cut.intent = Some(Op::Abort.method().into());
         self.checkpoint(root, journal)?;
@@ -1499,6 +1510,13 @@ impl AgentDataService {
                         .map_err(storage)?;
                     self.checkpoint(root, journal)?;
                 }
+                // Restoring cache generations changes storage bookkeeping, not
+                // session history. Record the restored row-store cut so only
+                // a subsequent local write can be reported as divergence.
+                journal.baselines.insert(
+                    header.session_ref.clone(),
+                    fingerprint(mover, context, &header.identity)?,
+                );
             }
         } else {
             for id in &original.sessions {
@@ -1579,56 +1597,7 @@ impl AgentDataService {
     }
 }
 
-impl AgentDataService {
-    pub(crate) fn request_pass(
-        &self,
-        handler: &McHandler,
-        channel: u16,
-        request: &Value,
-        method: Option<&str>,
-    ) -> Result<Option<PassGuard>, HandlerOutcome> {
-        if matches!(
-            method,
-            Some("echo" | "health" | "diagnostics" | "status" | "role.describe")
-        ) {
-            return Ok(None);
-        }
-        let mut sessions = BTreeSet::new();
-        if let Some(binding) = handler
-            .bindings
-            .lock()
-            .expect("route bindings")
-            .get(&channel)
-        {
-            if !binding.session.is_empty() {
-                sessions.insert(binding.session.clone());
-            }
-        }
-        for pointer in [
-            "/session_id",
-            "/session",
-            "/params/session",
-            "/params/session_id",
-            "/arguments/session_id",
-        ] {
-            if let Some(session) = request.pointer(pointer).and_then(Value::as_str) {
-                if !session.is_empty() {
-                    sessions.insert(session.into());
-                }
-            }
-        }
-        if sessions.is_empty() {
-            return Ok(None);
-        }
-        let reason = match method {
-            Some("transform" | "compaction.step" | "transform.hook") => "turn_in_flight",
-            Some("dreamer.run_task") => "dreamer_running",
-            Some(method) if method.starts_with("historian.") => "historian_running",
-            _ => "run_active",
-        };
-        self.enter(sessions.into_iter().collect(), reason).map(Some)
-    }
-}
+impl AgentDataService {}
 
 impl AgentDataService {
     async fn execute(&self, handler: &McHandler, request: &Request) -> Result<Value, ErrorBody> {
@@ -1642,5 +1611,62 @@ impl AgentDataService {
             }
         }
         result
+    }
+}
+
+impl std::ops::Deref for AgentDataService {
+    type Target = MoveVisibility;
+    fn deref(&self) -> &Self::Target {
+        &self.visibility
+    }
+}
+
+impl AgentDataService {
+    #[allow(clippy::too_many_arguments)]
+    fn validate_images(
+        &self,
+        cut: &Cut,
+        cut_id: &str,
+        header: &Header,
+        dir: &Path,
+        phase: &str,
+        mover: &MoveStore,
+        reason: &str,
+    ) -> Result<(), ErrorBody> {
+        for (i, half) in header.halves.iter().enumerate() {
+            let install = internal_cut(cut_id, &half.session, &format!("{phase}-install"));
+            let complete = cut.installed.contains(&install)
+                || matches!(
+                    mover.cut_state(&install).map_err(storage)?.as_deref(),
+                    Some("installed" | "activated")
+                );
+            if complete {
+                continue;
+            }
+            for (side, expected) in [
+                ("context", &half.context_digest),
+                ("module", &half.module_digest),
+            ] {
+                let path = dir.join(format!("{side}-{i}.bin"));
+                if snapshot::file_digest(&path).as_ref() != Ok(expected) {
+                    let key = format!("{cut_id}:{reason}");
+                    if self
+                        .corruption_warned
+                        .lock()
+                        .expect("move corruption warnings")
+                        .insert(key)
+                    {
+                        tracing::error!(cut_id,reason,session=%half.session,store=side,"move image is corrupt; preserve the preimages and repair or abort the move");
+                    }
+                    let mut error = storage(format!(
+                        "{reason}: {side} image does not match its saved digest"
+                    ));
+                    error.detail =
+                        Some(json!({"reason":reason,"session_id":half.session,"store":side}));
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 }

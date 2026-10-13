@@ -1,4 +1,5 @@
 use super::*;
+use crate::DEFAULT_MODULE_ID;
 use crate::{
     config::McModuleConfig,
     test_support::{descriptor, FixtureBuilder},
@@ -45,7 +46,7 @@ impl FakeDoor {
         }
     }
     fn cap() -> usize {
-        mc_store::move_snapshot::MAX_RECORD_LENGTH - 17 - stream().len()
+        mc_store::move_snapshot::MAX_RECORD_LENGTH - 17 - stream(DEFAULT_MODULE_ID).len()
     }
 }
 #[async_trait]
@@ -193,7 +194,12 @@ async fn bind(h: &McHandler, channel: u16, harness: &str, session: &str, princip
 async fn make(dir: &Path, door: Arc<FakeDoor>) -> McHandler {
     let store = Arc::new(McHandler::open_store_once(&descriptor(dir)).await.unwrap());
     let mut handler = McHandler::new();
-    handler.agent_data = AgentDataService::with_io(door.clone(), door);
+    handler.agent_data = Some(AgentDataService::with_io_and_visibility(
+        door.clone(),
+        door,
+        DEFAULT_MODULE_ID.into(),
+        Arc::clone(&handler.move_visibility),
+    ));
     let config = McModuleConfig {
         inject_docs: false,
         temporal_awareness: false,
@@ -203,7 +209,12 @@ async fn make(dir: &Path, door: Arc<FakeDoor>) -> McHandler {
     };
     handler.fixed_config = Some(config);
     handler.store.set(store).ok().unwrap();
-    handler.agent_data.configure(&dir.join("store.db")).unwrap();
+    handler
+        .agent_data
+        .as_ref()
+        .expect("test coordinator")
+        .configure(&dir.join("store.db"))
+        .unwrap();
     bind(
         &handler,
         CHANNEL,
@@ -397,7 +408,7 @@ async fn round_trip_serves_identical_turn_and_released_source_refuses_by_name() 
     let before = reply(s.dispatch_value(1, fixture.call_transform()).await);
     let refs = vec![reference(SESSION)];
     let prepare = prepared(&s, &door, &refs).await;
-    assert_eq!(prepare["items"][0]["stream"], stream());
+    assert_eq!(prepare["items"][0]["stream"], stream(DEFAULT_MODULE_ID));
     assert_eq!(
         reply(call(&d, role::ops::DIVERGED, params(&refs)).await)["refs"][0]["state"],
         "at_cut"
@@ -437,7 +448,12 @@ async fn busy_covers_transform_historian_and_dreamer_and_import_races() {
     observe(&s, SESSION).await;
     let refs = vec![reference(SESSION)];
     for reason in ["turn_in_flight", "historian_running", "dreamer_running"] {
-        let pass = s.agent_data.enter(vec![SESSION.into()], reason).unwrap();
+        let pass = s
+            .agent_data
+            .as_ref()
+            .expect("test coordinator")
+            .enter(vec![SESSION.into()], reason)
+            .unwrap();
         let busy = reply(call(&s, role::ops::BUSY, json!({"refs":refs})).await);
         assert_eq!(busy["refs"][0]["state"], "busy");
         assert_eq!(busy["refs"][0]["reason_code"], reason);
@@ -451,6 +467,8 @@ async fn busy_covers_transform_historian_and_dreamer_and_import_races() {
     reply(call(&d, role::ops::DIVERGED, params(&refs)).await);
     let pass = d
         .agent_data
+        .as_ref()
+        .expect("test coordinator")
         .enter(vec![SESSION.into()], "dreamer_running")
         .unwrap();
     assert_eq!(
@@ -461,6 +479,8 @@ async fn busy_covers_transform_historian_and_dreamer_and_import_races() {
     reply(call(&d, role::ops::IMPORT, params(&refs)).await);
     let pass = d
         .agent_data
+        .as_ref()
+        .expect("test coordinator")
         .enter(vec![SESSION.into()], "turn_in_flight")
         .unwrap();
     assert_eq!(
@@ -544,6 +564,8 @@ async fn abort_after_import_leaves_both_live_halves_untouched() {
     reply(call(&s, role::ops::ABORT, params(&refs)).await);
     assert!(s
         .agent_data
+        .as_ref()
+        .expect("test coordinator")
         .enter(vec![SESSION.into()], "turn_in_flight")
         .is_ok());
     assert!(s
@@ -609,7 +631,12 @@ async fn incompatible_version_and_cut_not_ready_precede_all_staging_writes() {
             "incompatible_version"
         );
     }
-    let root = d.agent_data.root().unwrap();
+    let root = d
+        .agent_data
+        .as_ref()
+        .expect("test coordinator")
+        .root()
+        .unwrap();
     assert!(!root.join(CUT).exists());
     assert_eq!(
         reply(call(&d, role::ops::STATUS, params(&refs)).await)["step"],
@@ -650,7 +677,10 @@ async fn local_advanced_before_import_keeps_local_data_and_records_no_reply() {
 async fn daemon_target_and_manifest_stream_cannot_drift() {
     let dir = tempfile::tempdir().unwrap();
     let h = make(dir.path(), Arc::new(FakeDoor::default())).await;
-    assert_eq!(stream(), format!("reserved:{DEFAULT_MODULE_ID}"));
+    assert_eq!(
+        stream(DEFAULT_MODULE_ID),
+        format!("reserved:{DEFAULT_MODULE_ID}")
+    );
     let request = RouteBindRequest::new(
         RouteHandle::detached(88, 1),
         RouteTarget::InternalService {
@@ -664,7 +694,14 @@ async fn daemon_target_and_manifest_stream_cannot_drift() {
     });
     let decision = h.on_bind(&request).await;
     assert!(format!("{decision:?}").contains("agent_data_target_mismatch"));
-    assert!(!h.agent_data.channels.lock().unwrap().contains(&88));
+    assert!(!h
+        .agent_data
+        .as_ref()
+        .expect("test coordinator")
+        .channels
+        .lock()
+        .unwrap()
+        .contains(&88));
     let manifest = crate::manifest(DEFAULT_MODULE_ID);
     let value = serde_json::to_value(manifest).unwrap();
     assert_eq!(
@@ -761,7 +798,12 @@ async fn every_durable_write_boundary_recovers_after_restart_and_retry() {
                 p["holder"] = json!("receiver");
             }
             let h = if receiver { &d } else { &s };
-            *h.agent_data.crash_after.lock().unwrap() = Some(point);
+            *h.agent_data
+                .as_ref()
+                .expect("test coordinator")
+                .crash_after
+                .lock()
+                .unwrap() = Some(point);
             let result = call(h, op, p.clone()).await;
             if matches!(result, HandlerOutcome::Response(_)) {
                 assert!(reached > 0, "{op} had no injected write boundary");
@@ -778,11 +820,20 @@ async fn every_durable_write_boundary_recovers_after_restart_and_retry() {
             }
             let h = if receiver { &d } else { &s };
             let _status = reply(call(h, role::ops::STATUS, params(&refs)).await);
-            let durable: Journal =
-                load(&h.agent_data.root().unwrap().join("journal.json")).unwrap();
+            let durable: Journal = load(
+                &h.agent_data
+                    .as_ref()
+                    .expect("test coordinator")
+                    .root()
+                    .unwrap()
+                    .join("journal.json"),
+            )
+            .unwrap();
             if durable.cuts[CUT].intent.is_some() {
                 assert!(
                     h.agent_data
+                        .as_ref()
+                        .expect("test coordinator")
                         .enter(vec![SESSION.into()], "turn_in_flight")
                         .is_err(),
                     "{op} boundary {point}: partial write was served"
@@ -885,8 +936,20 @@ async fn project_memories_remain_machine_owned_and_snapshot_files_are_private() 
             }
         }
     }
-    private(&s.agent_data.root().unwrap());
-    private(&d.agent_data.root().unwrap());
+    private(
+        &s.agent_data
+            .as_ref()
+            .expect("test coordinator")
+            .root()
+            .unwrap(),
+    );
+    private(
+        &d.agent_data
+            .as_ref()
+            .expect("test coordinator")
+            .root()
+            .unwrap(),
+    );
 }
 
 #[tokio::test]
@@ -938,7 +1001,14 @@ async fn missing_sealed_digest_is_recorded_and_a_wrong_seal_is_refused() {
         refusal(call(&d, role::ops::IMPORT, params(&refs)).await),
         "digest_mismatch"
     );
-    assert!(!d.agent_data.root().unwrap().join(CUT).exists());
+    assert!(!d
+        .agent_data
+        .as_ref()
+        .expect("test coordinator")
+        .root()
+        .unwrap()
+        .join(CUT)
+        .exists());
     door.state
         .lock()
         .unwrap()
@@ -948,6 +1018,14 @@ async fn missing_sealed_digest_is_recorded_and_a_wrong_seal_is_refused() {
         .1 = None;
     reply(call(&d, role::ops::DIVERGED, params(&refs)).await);
     reply(call(&d, role::ops::IMPORT, params(&refs)).await);
-    let journal: Journal = load(&d.agent_data.root().unwrap().join("journal.json")).unwrap();
+    let journal: Journal = load(
+        &d.agent_data
+            .as_ref()
+            .expect("test coordinator")
+            .root()
+            .unwrap()
+            .join("journal.json"),
+    )
+    .unwrap();
     assert!(journal.cuts[CUT].seal_unverified_logged);
 }
