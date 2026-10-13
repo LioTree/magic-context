@@ -1,0 +1,282 @@
+{
+  "mode": "offline-recorded-audit",
+  "validatedProfiles": [],
+  "requiredModels": {
+    "gemini": "google/antigravity-gemini-3.8-flash",
+    "deepseek": null
+  },
+  "controls": [
+    {
+      "control": "12:10",
+      "gate": "append_only",
+      "plannedChecks": 0,
+      "reportedProfile": {
+        "provider": "anthropic",
+        "modelId": "claude-sonnet-5-5",
+        "variant": null,
+        "temperature": null,
+        "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978"
+      },
+      "capturedRequestHash": "d20c775ba6269c3024cd592cadab30ea56a6b4a6466e9ccd4f1913cd8e576be8",
+      "inputRecordHash": "a436f41d86a7f50025eb1c4b2b870ee9a7b2a3ef5ab2e40cffd035b10bbdc1bd",
+      "recordedOutputHash": "89d56e8ea4071d818b34505551fbb3bdeed619d0a8cb1b31383142ab7cc51acf",
+      "historianSystemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "historicalEffectiveGrade": "wrong",
+      "historicalProposedGrade": "wrong",
+      "historicalGradeFileHash": "7988e02b08aec41fa15f369c71b91c8bd31da631691abdc5b4c498959930f22d"
+    },
+    {
+      "control": "27:13",
+      "gate": "non_revision",
+      "plannedChecks": 0,
+      "reportedProfile": {
+        "provider": "anthropic",
+        "modelId": "claude-sonnet-5-5",
+        "variant": null,
+        "temperature": null,
+        "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978"
+      },
+      "capturedRequestHash": "0b6068bae7a18addfeaba7ece91161b4fae24de18d816bdecf254e25427c55de",
+      "inputRecordHash": "8ba53a40b66ce735015aa9ef0cf361d811b2653d73788a05977e3fb086df233a",
+      "recordedOutputHash": "c8aa02280da13acee7c7018b9fd0b3412ba44b5d0af449a47b1fb3dc21d523a0",
+      "historianSystemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "historicalEffectiveGrade": "correct",
+      "historicalProposedGrade": "correct",
+      "historicalGradeFileHash": "af4096867a5c5c1c32175534d97e51fe1adef00325662c954513fbe9b05f98d4"
+    },
+    {
+      "control": "35:3",
+      "gate": "dropped_token",
+      "plannedChecks": 0,
+      "reportedProfile": {
+        "provider": "anthropic",
+        "modelId": "claude-sonnet-5-5",
+        "variant": null,
+        "temperature": null,
+        "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978"
+      },
+      "capturedRequestHash": "922565f66be192aeaa2078ef12956433848941c32cea7eb01f10936882e742f4",
+      "inputRecordHash": "aefa60ecd39aa5d0b88c5e2f0c025a1b5a32ff4ded587503905d71b64da97954",
+      "recordedOutputHash": "23317d4f4d4638047c6d6176e2c116409983abc5a019e0ed4b852ab188038415",
+      "historianSystemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "historicalEffectiveGrade": "correct",
+      "historicalProposedGrade": "wrong",
+      "historicalGradeFileHash": "6e74ef7003807552b73cfe5c3a54cc5fba63bc08f9cf73fce83433e200621aa0"
+    },
+    {
+      "control": "2:4",
+      "gate": "append_only",
+      "plannedChecks": 0,
+      "reportedProfile": {
+        "provider": "anthropic",
+        "modelId": "claude-sonnet-5-5",
+        "variant": null,
+        "temperature": null,
+        "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978"
+      },
+      "capturedRequestHash": "57be7a2d70a5b037289cd7f2e84ab0f3e226c0ccf8f8f93618703f371fba1071",
+      "inputRecordHash": "a144b69982b2612664bf6c5a3225f80ce0f228f5a64dc3ebd1a4fa42f8303d4f",
+      "recordedOutputHash": "a6cc60510119a491dbb8b4ce9af9336d5dd8bd18ab3205f862e2912e3d0b0565",
+      "historianSystemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "historicalEffectiveGrade": "wrong",
+      "historicalProposedGrade": "wrong",
+      "historicalGradeFileHash": "81eed98d8b9bbd99039e295106c0cb452868b078d1559d0bc4a025a00bfa6e20"
+    }
+  ],
+  "recordedProfileInventory": [
+    {
+      "path": "merge-turn-v8/deepseek-case-12-run-1-second.json",
+      "inputRecordHash": "535f53149bd7496e5fb8001cbe635780ec1e5fcf217a6efa52adb499e56fc203",
+      "capturedRequestHash": "9f39d94d9dec1ccec0ad8162ed94979984256c068cb5a54f6eb88ad692ed0998",
+      "outputHash": "3acb9e0cfd533d9d960345bfaf67df77a26f5d3c3d392a0db6c60f65d201651f",
+      "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "reportedModelId": "deepseek-flash",
+      "requestModelId": "deepseek-flash",
+      "requestVariant": "high",
+      "requestTemperature": null,
+      "status": "recorded-only-not-validated"
+    },
+    {
+      "path": "merge-turn-v8/deepseek-case-2-run-1-second.json",
+      "inputRecordHash": "ced861201fe34bb6b990c0ea98c02f25ae69fea85d793feb0f7aae8d2d2ec3f4",
+      "capturedRequestHash": "14e37c8cb3e1e7b8dfbce6a09507393187babb196dafcb1d870aa963719fe03b",
+      "outputHash": "a94325e523680cb88fa865c46eedf3f0a6d8acaaba92a8ab3d3b8e3e7d8c55c9",
+      "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "reportedModelId": "deepseek-flash",
+      "requestModelId": "deepseek-flash",
+      "requestVariant": "high",
+      "requestTemperature": null,
+      "status": "recorded-only-not-validated"
+    },
+    {
+      "path": "merge-turn-v8/deepseek-case-27-run-1-second.json",
+      "inputRecordHash": "02ad27700007e2b014e28b2bf9f2b2d8065bb70d81a2ecf258cf84385d381de5",
+      "capturedRequestHash": "0dcc625f494ef05eca7bb79c06062eb97d5cadf00d930689ae2df4a33466a68b",
+      "outputHash": "48d6b5ee1d09771f2175ba794403289849ca5d5d6df2d3c311d8827a8b8410f3",
+      "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "reportedModelId": "deepseek-flash",
+      "requestModelId": "deepseek-flash",
+      "requestVariant": "high",
+      "requestTemperature": null,
+      "status": "recorded-only-not-validated"
+    },
+    {
+      "path": "merge-turn-v8/deepseek-case-35-run-1-second.json",
+      "inputRecordHash": "15dff9257722ae817952a7a362d8c33ab844384468f3954274b8947112783020",
+      "capturedRequestHash": "be86512b6dcf6e303ad357deb91af57367ab0360bb7903ab193e3ddd20c5aa44",
+      "outputHash": "9c3338426c502cc260b5bc4c2fd789b3e481cc7033560c83a0de41189c7af68a",
+      "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "reportedModelId": "deepseek-flash",
+      "requestModelId": "deepseek-flash",
+      "requestVariant": "high",
+      "requestTemperature": null,
+      "status": "recorded-only-not-validated"
+    },
+    {
+      "path": "merge-turn-v8/gemini-case-12-run-1-second.json",
+      "inputRecordHash": "fd5ca473bd39a33c3c5c02e30f848b3cf9c4896bfca53df23cc62d462cd13a78",
+      "capturedRequestHash": "ae1e0b3e699dbd0dfb69425fa04d8b8b634311505f8d8fcc9f933b9c844438fe",
+      "outputHash": "760e8ad76c81fdd8a5a265ebf26f6a71bd3150d91b692bca61164d1e2d58857b",
+      "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "reportedModelId": "gemini-3.8-flash",
+      "requestModelId": null,
+      "requestVariant": null,
+      "requestTemperature": null,
+      "status": "recorded-only-not-validated"
+    },
+    {
+      "path": "merge-turn-v8/gemini-case-2-run-1-second.json",
+      "inputRecordHash": "e1d226f2e01e90040f17d27c05814a4212bc3b45e9861b0cedaa76d02c524fa6",
+      "capturedRequestHash": "8ae6faa19b2dcea213776d5235b5fab4d0b96e2673a59ce69451e5f897398f77",
+      "outputHash": "c336178e3ee739ec2089b0312c55043f0d3473f9554c1e3dd2da8640cc83340d",
+      "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "reportedModelId": "gemini-3.8-flash",
+      "requestModelId": null,
+      "requestVariant": null,
+      "requestTemperature": null,
+      "status": "recorded-only-not-validated"
+    },
+    {
+      "path": "merge-turn-v8/gemini-case-2-run-2-second.json",
+      "inputRecordHash": "a233ef09327f82c6a590a888aeea7fc52524a6a4f46ff0e664926bd501e3f7df",
+      "capturedRequestHash": "8ae6faa19b2dcea213776d5235b5fab4d0b96e2673a59ce69451e5f897398f77",
+      "outputHash": "5f528e19689ec5bddff28f3872af8fd81f3930f81a730f1817bee7a4354281a9",
+      "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "reportedModelId": "gemini-3.8-flash",
+      "requestModelId": null,
+      "requestVariant": null,
+      "requestTemperature": null,
+      "status": "recorded-only-not-validated"
+    },
+    {
+      "path": "merge-turn-v8/gemini-case-2-run-3-second.json",
+      "inputRecordHash": "cec60563be2092e80a9f659f99fcfa0e41e2f85d0b336220eab5d769447c9b20",
+      "capturedRequestHash": "8ae6faa19b2dcea213776d5235b5fab4d0b96e2673a59ce69451e5f897398f77",
+      "outputHash": "abb3501468fe1e44b3e39d703212de981a09e6d3a3c06a0193390fbaa586f1e4",
+      "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "reportedModelId": "gemini-3.8-flash",
+      "requestModelId": null,
+      "requestVariant": null,
+      "requestTemperature": null,
+      "status": "recorded-only-not-validated"
+    },
+    {
+      "path": "merge-turn-v8/gemini-case-27-run-1-second.json",
+      "inputRecordHash": "33215abe7d7abd2d160f4fbc51d3255bd9687831fdcfb40b3d3645c04a41bfea",
+      "capturedRequestHash": "1a047fc4bb60ed63e62b6794f3aa0f662a19f3986b4f5b8807af5ec162c61c39",
+      "outputHash": "6452313502286d26d3054ae06af025a9fbb4ede2404f784100eb1d0af37fa786",
+      "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "reportedModelId": "gemini-3.8-flash",
+      "requestModelId": null,
+      "requestVariant": null,
+      "requestTemperature": null,
+      "status": "recorded-only-not-validated"
+    },
+    {
+      "path": "merge-turn-v8/gemini-case-35-run-1-second.json",
+      "inputRecordHash": "d1234f3286eaa87c15806b74695dc6f416c172ab1a3f3a8fbcd4b2d8cbd0907d",
+      "capturedRequestHash": "314b71f75d9b3e73e56e98ea660fb063cf65549ba96d37cae849e84d81dc2ec8",
+      "outputHash": "ceed5994aed5a4444d3ef1b9b6933819bf180886542ce1f0b926ad5163355885",
+      "systemHash": "f6a5a6dac2c8e29f0c4c54d3eb3c482b6159b9bfce76831cca01928de5ddc978",
+      "reportedModelId": "gemini-3.8-flash",
+      "requestModelId": null,
+      "requestVariant": null,
+      "requestTemperature": null,
+      "status": "recorded-only-not-validated"
+    }
+  ],
+  "cases": 4,
+  "facts": 39,
+  "missingAnchors": 38,
+  "bounds": [
+    {
+      "caseId": 2,
+      "units": 31684,
+      "withinLimit": true
+    },
+    {
+      "caseId": 12,
+      "units": 34805,
+      "withinLimit": true
+    },
+    {
+      "caseId": 27,
+      "units": 21568,
+      "withinLimit": true
+    },
+    {
+      "caseId": 35,
+      "units": 16881,
+      "withinLimit": true
+    }
+  ],
+  "startFailures": [
+    "durable_private_corpus_unconfirmed",
+    "owner_literal_deepseek_model_missing",
+    "historical_corpus_must_contain_cases_0_through_39_once",
+    "2:1: recorded_source_block_anchor_missing",
+    "2:2: recorded_source_block_anchor_missing",
+    "2:3: recorded_source_block_anchor_missing",
+    "2:4: recorded_source_block_anchor_missing",
+    "2:5: recorded_source_block_anchor_missing",
+    "2:6: recorded_source_block_anchor_missing",
+    "2:7: recorded_source_block_anchor_missing",
+    "2:8: recorded_source_block_anchor_missing",
+    "2:9: recorded_source_block_anchor_missing",
+    "2:10: recorded_source_block_anchor_missing",
+    "2:11: recorded_source_block_anchor_missing",
+    "2:12: recorded_source_block_anchor_missing",
+    "2:13: recorded_source_block_anchor_missing",
+    "12:1: recorded_source_block_anchor_missing",
+    "12:2: recorded_source_block_anchor_missing",
+    "12:3: recorded_source_block_anchor_missing",
+    "12:4: recorded_source_block_anchor_missing",
+    "12:5: recorded_source_block_anchor_missing",
+    "12:6: recorded_source_block_anchor_missing",
+    "12:7: recorded_source_block_anchor_missing",
+    "12:8: recorded_source_block_anchor_missing",
+    "12:9: recorded_source_block_anchor_missing",
+    "12:10: recorded_source_block_anchor_missing",
+    "27:1: recorded_source_block_anchor_missing",
+    "27:2: recorded_source_block_anchor_missing",
+    "27:3: recorded_source_block_anchor_missing",
+    "27:4: recorded_source_block_anchor_missing",
+    "27:5: recorded_source_block_anchor_missing",
+    "27:6: recorded_source_block_anchor_missing",
+    "27:7: recorded_source_block_anchor_missing",
+    "27:8: recorded_source_block_anchor_missing",
+    "27:9: recorded_source_block_anchor_missing",
+    "27:10: recorded_source_block_anchor_missing",
+    "27:11: recorded_source_block_anchor_missing",
+    "27:12: recorded_source_block_anchor_missing",
+    "27:13: recorded_source_block_anchor_missing",
+    "35:1: recorded_source_block_anchor_missing",
+    "35:2: recorded_source_block_anchor_missing"
+  ],
+  "omissionsFailures": [
+    "omissions_ledger_missing_or_malformed"
+  ],
+  "acceptanceFailures": [
+    "independent_v6_grades_missing_or_malformed"
+  ]
+}

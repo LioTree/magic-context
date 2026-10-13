@@ -1,0 +1,32 @@
+[
+    {
+        "control": "Neutralized the missing owner literal DeepSeek model start fence in core.ts.",
+        "expected_red": "replay start fence > complete private corpus starts; missing owner model never starts",
+        "captured_output": "(fail) replay start fence > complete private corpus starts; missing owner model never starts; Expected substring: owner_literal_deepseek_model_missing; Received function did not throw. 6 pass, 1 fail; Bun 1.4.2.",
+        "applied_evidence": "packages/plugin/scripts/memory-lifecycle-replay/core.ts: before mutation git diff --stat empty; during mutation 1 file changed, 2 insertions(+), 1 deletion(-); after git checkout -- <path> && touch <path>, git diff --stat empty.",
+        "outcome": "reddened",
+        "surviving_tests": [
+            "replay start fence > private corpus hashes are checked against actual bytes and paths cannot escape",
+            "replay start fence > every named start condition fails closed",
+            "production turn one > prompt uses production anchor instruction without project memory",
+            "production turn one > only reply-local printed ranges or explicit unknown anchors pass",
+            "independent omissions ledger > complete paired grades pass and missing either arm fails closed",
+            "independent omissions ledger > safety loss, per-case loss excess and non-independent or incomplete inventory fail"
+        ]
+    },
+    {
+        "control": "Neutralized the missing new/S paired omissions-grade fence in core.ts.",
+        "expected_red": "independent omissions ledger > complete paired grades pass and missing either arm fails closed",
+        "captured_output": "(fail) independent omissions ledger > complete paired grades pass and missing either arm fails closed; Expected to contain: 1:refusal code: both_arm_grades_required; Received: []. 6 pass, 1 fail; Bun 1.4.2.",
+        "applied_evidence": "packages/plugin/scripts/memory-lifecycle-replay/core.ts: before mutation git diff --stat empty; during mutation 1 file changed, 2 insertions(+), 1 deletion(-); after git checkout -- <path> && touch <path>, git diff --stat empty.",
+        "outcome": "reddened",
+        "surviving_tests": [
+            "replay start fence > private corpus hashes are checked against actual bytes and paths cannot escape",
+            "replay start fence > complete private corpus starts; missing owner model never starts",
+            "replay start fence > every named start condition fails closed",
+            "production turn one > prompt uses production anchor instruction without project memory",
+            "production turn one > only reply-local printed ranges or explicit unknown anchors pass",
+            "independent omissions ledger > safety loss, per-case loss excess and non-independent or incomplete inventory fail"
+        ]
+    }
+]
