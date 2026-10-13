@@ -4,6 +4,8 @@
 //! search backend does not call this extension; UnavailableLane below continues
 //! to report that semantic retrieval lanes have not been implemented.
 
+pub use crate::memory_tool::{compartments, hybrid};
+
 pub mod embedding_provider;
 
 use crate::parity_contract::*;
