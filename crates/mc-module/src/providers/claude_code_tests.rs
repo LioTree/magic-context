@@ -685,3 +685,256 @@ async fn cc_raw_history_size_does_not_silently_replace_the_supplied_pressure_est
         .unwrap();
     assert!((pressure.0 - 0.002).abs() < 0.000001);
 }
+
+pub(super) fn validate_native_answer(
+    answer: &Value,
+    pins: &hooks::claude_code::ClaudeCodeCapabilities,
+) {
+    let principal = hooks::claude_code::PRINCIPAL;
+    let lane =
+        hooks::claude_code::ClaudeCodeLane::admit(principal, "first-step", Some(pins.clone()))
+            .unwrap();
+    let typed: compact::answer::StepAnswer = serde_json::from_value(answer.clone()).unwrap();
+    typed
+        .validate_claude_code(&lane, principal, "first-step")
+        .unwrap();
+}
+
+async fn native_read(h: &McHandler, reference: &compact::view::ViewRef) -> String {
+    let params = json!({"request_id":"read","view_id":reference.view_id,"version":reference.version,"sha256":reference.sha256,"byte_cursor":0});
+    let bytes = h
+        .provider_native_view_read(h.facade_binding(7).unwrap(), &params)
+        .await
+        .unwrap();
+    let answer: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(answer["answer"], "page");
+    assert!(answer.get("next_byte_cursor").is_none());
+    answer["bytes"].as_str().unwrap().into()
+}
+
+#[tokio::test]
+async fn cc_first_head_scalar_is_verbatim_stable_then_folded() {
+    first_head_sequence(
+        r#"{ "content":"caf\u00e9 first user", "role":"user" }"#,
+        0,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cc_first_head_blocks_are_verbatim_stable_then_folded() {
+    first_head_sequence(r#"{ "role":"user", "content":[ {"type":"text", "text":"caf\u00e9 first user"}, {"type":"text","text":"second part"} ] }"#, 1, false).await;
+}
+
+async fn first_head_sequence(first_raw: &str, last_part: u64, cut_unfolded: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    // Project docs exist only in this throwaway fixture, never in a live store.
+    std::fs::write(
+        dir.path().join("ARCHITECTURE.md"),
+        "# Fixture\nfirst-step-doc-evidence\n",
+    )
+    .unwrap();
+    let h = handler(dir.path(), thalamus());
+    let mut b = binding(dir.path(), thalamus());
+    b.config.memory_enabled = true;
+    b.config.inject_docs = true;
+    h.bind_route(7, b);
+    let project = dir.path().to_string_lossy();
+    h.store
+        .get()
+        .unwrap()
+        .insert_memory(mc_store::InsertMemoryInput {
+            project_path: &project,
+            route_project_root: None,
+            category: "knowledge",
+            content: "first-step-memory-evidence",
+            source_session_id: None,
+            source_type: Some("tool"),
+            importance: Some(70),
+            expires_at: None,
+            metadata_json: None,
+            now_ms: 1,
+        })
+        .unwrap();
+    let pins = h.native_pins();
+    let declare = json!({"preset":"head","params":plan(),"composition":{},"claude_code":pins});
+    h.admit_native_plan(
+        7,
+        &h.facade_binding(7).unwrap(),
+        "transform.declare",
+        &declare,
+    )
+    .await
+    .unwrap();
+    let setup = json!({"session":"cc","harness":"claude-code","request_id":"setup","preset":"head","params":plan(),"composition":{},"claude_code":pins,"model":"fixture","context_window":100000,"lineage_id":"L","now":1});
+    let bytes = h
+        .provider_setup(h.facade_binding(7).unwrap(), &setup)
+        .await
+        .unwrap();
+    let ready: Value = serde_json::from_slice(&bytes).unwrap();
+    let typed: compact::setup::SetupAnswer = serde_json::from_value(ready.clone()).unwrap();
+    assert!(matches!(typed, compact::setup::SetupAnswer::Ready { .. }));
+    assert_eq!(ready["initial"]["range"], json!({"from":0,"to":0}));
+    assert_eq!(ready["initial"]["replacement"], json!([]));
+    assert!(ready["initial"].get("raw_view").is_none());
+    validate_native_answer(
+        &json!({"answer":"compaction_message","request_id":"setup","compaction":ready["initial"]}),
+        &pins,
+    );
+
+    let mut status = step(first_raw);
+    let tail_raw = r#"{ "role":"user", "content":"retained live tail" }"#;
+    status["messages"].as_array_mut().unwrap().push(json!({"mid":"tail","ordinal":1,"message":serde_json::from_str::<Value>(tail_raw).unwrap(),"raw_message":tail_raw}));
+    status["newest"] = json!({"mid":"tail","ordinal":1});
+    let bytes = h
+        .provider_step(h.facade_binding(7).unwrap(), &status)
+        .await
+        .unwrap();
+    let first: Value = serde_json::from_slice(&bytes).unwrap();
+    validate_native_answer(&first, &pins);
+    assert_eq!(first["answer"], "compaction_message");
+    assert_eq!(first["compaction"]["range"], json!({"from":0,"to":1}));
+    assert_eq!(
+        first["coverage"],
+        json!({"end_mid":"m","ordinal":0,"endpoint":{"message_id":"m","part_index":last_part}})
+    );
+    let frozen: compact::view::FrozenView =
+        serde_json::from_value(first["compaction"]["raw_view"].clone()).unwrap();
+    assert_eq!(frozen.lineage_id, "L");
+    assert_eq!(frozen.profile, pins.profile);
+    assert_eq!(frozen.profile_generation, pins.profile_generation);
+    assert_eq!(frozen.provider_generation, pins.provider_generation);
+    assert_eq!(
+        frozen.view.version,
+        first["compaction"]["version"].as_u64().unwrap()
+    );
+    let prefix = native_read(&h, &frozen.view).await;
+    assert!(prefix.ends_with(&format!(",{first_raw}]")));
+    assert!(String::from_utf8(bytes)
+        .unwrap()
+        .contains(&format!(",{first_raw}]")));
+    assert!(prefix.contains("first-step-memory-evidence"));
+    assert!(prefix.contains("first-step-doc-evidence"));
+    assert!(!prefix.contains("retained live tail"));
+    assert_eq!(frozen.retained_tail, Some(vec![]));
+    assert_eq!(
+        native_read(&h, frozen.cut_replacement_ref.as_ref().unwrap()).await,
+        prefix
+    );
+    status["last_applied"] = json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
+    if cut_unfolded {
+        // The covered original can leave the host transcript: the cut prefix
+        // already carries that same message verbatim until a summary supersedes it.
+        status["messages"].as_array_mut().unwrap().remove(0);
+        status["after_ordinal"] = json!(1);
+    }
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    let store = h.store.get().unwrap();
+    assert_eq!(
+        store
+            .load_meta(&key.engine_key())
+            .unwrap()
+            .meta
+            .coverage_ordinal,
+        None
+    );
+    for ordinal in 2..=3 {
+        let raw = format!(r#"{{ "role":"user", "content":"later turn {ordinal}" }}"#);
+        status["messages"].as_array_mut().unwrap().push(json!({"mid":format!("later-{ordinal}"),"ordinal":ordinal,"message":serde_json::from_str::<Value>(&raw).unwrap(),"raw_message":raw}));
+        status["newest"] = json!({"mid":format!("later-{ordinal}"),"ordinal":ordinal});
+        status["request_id"] = json!(format!("no-fold-{ordinal}"));
+        let bytes = h
+            .provider_step(h.facade_binding(7).unwrap(), &status)
+            .await
+            .unwrap();
+        let answer: Value = serde_json::from_slice(&bytes).unwrap();
+        validate_native_answer(&answer, &pins);
+        assert_eq!(answer["answer"], "noop");
+        assert_eq!(native_read(&h, &frozen.view).await, prefix);
+        assert_eq!(
+            store
+                .load_meta(&key.engine_key())
+                .unwrap()
+                .meta
+                .coverage_ordinal,
+            None
+        );
+    }
+    store
+        .replace_compartments(
+            &key.engine_key(),
+            &[mc_store::StoredCompartment {
+                sequence: 1,
+                start_message: 0,
+                end_message: 0,
+                end_message_id: format!("m#{last_part}"),
+                title: "first user fold".into(),
+                content: "real-fold-evidence".into(),
+                p1: Some("real-fold-evidence".into()),
+                importance: 50,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    status["request_id"] = json!("fold");
+    status["prefix_rebuilding"] = json!({"reason":"expired_cache"});
+    status["estimate"]["request_tokens"] = json!(80000);
+    let bytes = h
+        .provider_step(h.facade_binding(7).unwrap(), &status)
+        .await
+        .unwrap();
+    let folded: Value = serde_json::from_slice(&bytes).unwrap();
+    validate_native_answer(&folded, &pins);
+    assert_eq!(folded["answer"], "compaction_message");
+    assert_eq!(folded["compaction"]["range"], json!({"from":0,"to":4}));
+    assert!(folded.to_string().contains("real-fold-evidence"));
+    let folded_view: compact::view::FrozenView =
+        serde_json::from_value(folded["compaction"]["raw_view"].clone()).unwrap();
+    let folded_raw = native_read(&h, &folded_view.view).await;
+    assert!(!folded_raw.contains(first_raw));
+    assert!(folded_raw.contains(tail_raw));
+    let cut = native_read(&h, folded_view.cut_replacement_ref.as_ref().unwrap()).await;
+    assert!(cut.contains("real-fold-evidence"));
+    assert!(!cut.contains("retained live tail"));
+    let retained = folded_view.retained_tail.as_ref().unwrap();
+    assert_eq!(
+        retained
+            .iter()
+            .map(|part| part.engine_handle.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tail#0", "later-2#0", "later-3#0"]
+    );
+    assert_eq!(
+        store
+            .load_meta(&key.engine_key())
+            .unwrap()
+            .meta
+            .coverage_ordinal,
+        Some(0)
+    );
+
+    // Emulate the native hook removing message zero through its final part.
+    // Its replacement is the frozen cut prefix; the remaining originals stay raw.
+    status["messages"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|message| message["ordinal"] != 0);
+    status["after_ordinal"] = json!(1);
+    status["last_applied"] = json!({"compaction_id":folded["compaction"]["compaction_id"],"version":folded["compaction"]["version"]});
+    status.as_object_mut().unwrap().remove("prefix_rebuilding");
+    status["estimate"]["request_tokens"] = json!(1);
+    status["request_id"] = json!("after-hook-cut");
+    let bytes = h
+        .provider_step(h.facade_binding(7).unwrap(), &status)
+        .await
+        .unwrap();
+    let after_cut: Value = serde_json::from_slice(&bytes).unwrap();
+    validate_native_answer(&after_cut, &pins);
+    assert_eq!(after_cut["answer"], "noop");
+    assert_eq!(
+        native_read(&h, folded_view.cut_replacement_ref.as_ref().unwrap()).await,
+        cut
+    );
+    assert_eq!(native_read(&h, &frozen.view).await, prefix);
+}

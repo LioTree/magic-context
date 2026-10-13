@@ -709,7 +709,7 @@ fn execute_host(
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
     setup.setup.state.rebuild_epoch = state.rebuild_epoch;
-    let transform::compaction::Answer::Replacement(engine) = output.answer else {
+    let transform::compaction::Answer::Replacement(mut engine) = output.answer else {
         return Ok(None);
     };
     let (mut wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) = previous
@@ -734,13 +734,20 @@ fn execute_host(
             previous.head_slots,
         )
     } else {
-        let (wire, raw_replacement) = if codec == Codec::ClaudeCodeAnthropic {
-            let (wire, raw) = super::codec_claude_code::encode_view(
+        let (wire, raw_replacement, initial_coverage) = if codec == Codec::ClaudeCodeAnthropic {
+            let (mut wire, mut raw) = super::codec_claude_code::encode_view(
                 &engine,
                 &template,
                 output.engine.response.coverage_ordinal,
             )?;
-            (wire, Some(raw))
+            let coverage = if output.engine.response.coverage_ordinal.is_none()
+                && super::native_view::has_selected_bundle(conversation)?
+            {
+                native_uncovered_prefix(&mut engine, &mut wire, &mut raw, &template, &messages)?
+            } else {
+                None
+            };
+            (wire, Some(raw), coverage)
         } else {
             (
                 codec.encode_view(
@@ -749,17 +756,20 @@ fn execute_host(
                     &super::codec_opencode::NativeRenderContext::from(&output.engine),
                 )?,
                 None,
+                None,
             )
         };
-        let coverage = output.engine.response.coverage_ordinal.and_then(|ordinal| {
-            messages
-                .iter()
-                .find(|m| m.ordinal == ordinal)
-                .map(|m| HostCoverage {
-                    end_mid: m.mid.clone(),
-                    ordinal,
-                    endpoint: None,
-                })
+        let coverage = initial_coverage.or_else(|| {
+            output.engine.response.coverage_ordinal.and_then(|ordinal| {
+                messages
+                    .iter()
+                    .find(|m| m.ordinal == ordinal)
+                    .map(|m| HostCoverage {
+                        end_mid: m.mid.clone(),
+                        ordinal,
+                        endpoint: None,
+                    })
+            })
         });
         let head_slots = raw_replacement
             .as_ref()
@@ -773,7 +783,10 @@ fn execute_host(
                 "covered native message is missing",
             ));
         }
-        if let Some(coverage) = &mut coverage {
+        if let Some(coverage) = coverage
+            .as_mut()
+            .filter(|coverage| coverage.endpoint.is_none())
+        {
             let message = messages
                 .iter()
                 .find(|m| m.mid == coverage.end_mid && m.ordinal == coverage.ordinal)
@@ -816,6 +829,71 @@ fn execute_host(
         super::native_cut::attach(&work.key, &mut view, &template)?;
     }
     Ok(Some(view))
+}
+
+fn native_uncovered_prefix(
+    engine: &mut transform::compaction::View,
+    wire: &mut compact::answer::CompactionMessage,
+    raw: &mut Vec<String>,
+    request: &TransformRequest,
+    messages: &[compact::status::StatusMessage],
+) -> Result<Option<HostCoverage>, HandlerOutcome> {
+    if raw.is_empty() {
+        engine.range.to = engine.range.from;
+        wire.range.to = wire.range.from;
+        return Ok(None);
+    }
+    let invalid = || {
+        error(
+            "native_hook_cut_unrepresentable",
+            "unfolded native head requires verbatim original user content",
+        )
+    };
+    let first = request.messages.first().ok_or_else(invalid)?;
+    let head_count = engine
+        .replacement
+        .iter()
+        .take_while(|message| message.meta.synthetic)
+        .count();
+    // Before the first fold the engine returns the head and the entire original
+    // transcript. Publish only the head and first user message, covering that
+    // message without consuming or editing the remaining original transcript.
+    if first.ck.role != "user"
+        || first.ck.content.iter().any(|block| {
+            matches!(
+                block.kind,
+                ck_wire::CkKind::ToolCall { .. } | ck_wire::CkKind::ToolResult { .. }
+            )
+        })
+        || engine.replacement.len() != head_count + request.messages.len()
+    {
+        return Err(invalid());
+    }
+    for (bytes, source) in raw[head_count..].iter().zip(&request.messages) {
+        if bytes != &super::codec_claude_code::render(&source.ck)? {
+            return Err(invalid());
+        }
+    }
+    let message = messages
+        .iter()
+        .find(|message| message.mid == first.mid && message.ordinal == first.ordinal)
+        .ok_or_else(invalid)?;
+    let part = first.ck.content.len().checked_sub(1).ok_or_else(invalid)?;
+    let endpoint = super::codec_claude_code::whole_message_endpoint(
+        message,
+        &format!("{}#{part}", first.mid),
+    )?;
+    let to = first.ordinal.checked_add(1).ok_or_else(invalid)?;
+    engine.range.to = to;
+    wire.range.to = to;
+    engine.replacement.truncate(head_count + 1);
+    wire.replacement.truncate(head_count + 1);
+    raw.truncate(head_count + 1);
+    Ok(Some(HostCoverage {
+        end_mid: first.mid.clone(),
+        ordinal: first.ordinal,
+        endpoint: Some(endpoint),
+    }))
 }
 
 fn status(
@@ -3870,5 +3948,41 @@ mod native_replay_tests {
             None
         ));
         assert!(coverage_replay_matches(Codec::OpencodeAiSdk, Some(2), None));
+    }
+}
+
+#[cfg(test)]
+mod native_empty_tests {
+    use super::*;
+
+    #[test]
+    fn native_empty_replacement_is_identity_even_with_a_working_range() {
+        let mut engine = transform::compaction::View {
+            compaction_id: "identity".into(),
+            version: 1,
+            range: transform::compaction::Range {
+                lineage_id: "L".into(),
+                from: 0,
+                to: 1,
+            },
+            replacement: vec![],
+        };
+        let mut wire = compact::answer::CompactionMessage::new(
+            "identity",
+            1,
+            compact::answer::Range::new(0, 1),
+            vec![],
+        );
+        let template: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step","session_id":"cc","messages":[],"render_config":"","tool_present":false,"auto_search_enabled":false})).unwrap();
+        let coverage =
+            native_uncovered_prefix(&mut engine, &mut wire, &mut vec![], &template, &[]).unwrap();
+        assert!(coverage.is_none());
+        assert_eq!(engine.range.to, engine.range.from);
+        assert_eq!(wire.range.to, wire.range.from);
+        assert!(wire.replacement.is_empty());
+        assert!(wire.raw_view.is_none());
+        let answer = json!({"answer":"compaction_message","request_id":"empty","compaction":wire});
+        let pins = McHandler::new().native_pins();
+        super::super::claude_code_tests::validate_native_answer(&answer, &pins);
     }
 }

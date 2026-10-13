@@ -62,17 +62,29 @@ pub(super) fn attach(
     {
         return Err(unrepresentable());
     }
+    // An unfolded head covers the first user message by carrying it verbatim.
+    // That copy belongs to the installed cut prefix, not the retained tail.
+    let mut cut_count = head_count;
+    if let Some(message) = host.engine.replacement.get(cut_count) {
+        if native_identity(message) == Some((endpoint.message_id.as_str(), coverage.ordinal)) {
+            if message.role != "user" || raw[cut_count] != codec_claude_code::render(&boundary.ck)?
+            {
+                return Err(unrepresentable());
+            }
+            cut_count += 1;
+        }
+    }
     let originals = request
         .messages
         .iter()
-        .filter(|entry| entry.ordinal > coverage.ordinal)
+        .filter(|entry| entry.ordinal > coverage.ordinal && entry.ordinal < host.engine.range.to)
         .collect::<Vec<_>>();
-    let tail = &host.engine.replacement[head_count..];
+    let tail = &host.engine.replacement[cut_count..];
     if tail.len() != originals.len() {
         return Err(unrepresentable());
     }
     let mut retained = Vec::new();
-    for ((message, source), bytes) in tail.iter().zip(originals).zip(&raw[head_count..]) {
+    for ((message, source), bytes) in tail.iter().zip(originals).zip(&raw[cut_count..]) {
         if native_identity(message) != Some((source.mid.as_str(), source.ordinal))
             || message.content.len() != source.ck.content.len()
             || bytes != &codec_claude_code::render(&source.ck)?
@@ -89,7 +101,7 @@ pub(super) fn attach(
             });
         }
     }
-    let bytes = format!("[{}]", raw[..head_count].join(","));
+    let bytes = format!("[{}]", raw[..cut_count].join(","));
     host.cut_replacement = Some(CutReplacement {
         reference: super::native_view::identity(key, &host.engine, "cut", &bytes),
         bytes,
@@ -141,7 +153,20 @@ pub(super) fn validate(key: &Key, host: &compaction::HostView) -> Result<(), Han
     if host.engine.replacement.len() != raw.len()
         || host.engine.replacement[..count]
             .iter()
-            .any(|message| native_identity(message).is_some() || !message.meta.synthetic)
+            .enumerate()
+            .any(|(index, message)| match native_identity(message) {
+                None => !message.meta.synthetic,
+                Some((mid, ordinal)) => {
+                    index + 1 != count
+                        || message.role != "user"
+                        || host.coverage.as_ref().is_none_or(|coverage| {
+                            coverage.ordinal != ordinal || coverage.end_mid != mid
+                        })
+                        || frozen.endpoint.message_id != mid
+                        || message.content.len().checked_sub(1).map(|part| part as u64)
+                            != Some(frozen.endpoint.part_index)
+                }
+            })
     {
         return Err(unrepresentable());
     }

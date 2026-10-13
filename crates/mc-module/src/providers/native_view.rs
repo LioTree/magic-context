@@ -13,13 +13,9 @@ fn invalid_view() -> HandlerOutcome {
     )
 }
 
-pub(super) fn frozen_for_plan(
-    key: &Key,
-    engine: &transform::compaction::View,
+pub(super) fn has_selected_bundle(
     conversation: &mc_store::provider_records::ProviderConversation,
-    endpoint: Option<&NativeEndpoint>,
-    raw: &[String],
-) -> Result<Option<Box<FrozenView>>, HandlerOutcome> {
+) -> Result<bool, HandlerOutcome> {
     let plan: hooks::subscription::DeclareRequest = serde_json::from_str(
         conversation
             .native_plan_json
@@ -27,7 +23,21 @@ pub(super) fn frozen_for_plan(
             .ok_or_else(invalid_view)?,
     )
     .map_err(|_| invalid_view())?;
-    if endpoint.is_none() && plan.claude_code.is_none() {
+    Ok(plan.claude_code.is_some())
+}
+
+pub(super) fn frozen_for_plan(
+    key: &Key,
+    engine: &transform::compaction::View,
+    conversation: &mc_store::provider_records::ProviderConversation,
+    endpoint: Option<&NativeEndpoint>,
+    raw: &[String],
+) -> Result<Option<Box<FrozenView>>, HandlerOutcome> {
+    // An empty insertion covers no original part and has no bytes to freeze.
+    if endpoint.is_none() && raw.is_empty() {
+        return Ok(None);
+    }
+    if endpoint.is_none() && !has_selected_bundle(conversation)? {
         return Ok(None);
     }
     freeze(key, engine, endpoint, raw).map(|view| Some(Box::new(view)))
@@ -303,7 +313,7 @@ mod tests {
     const RAW: &str = r#"{ "content":[{"type":"thinking","thinking":"caf\u00e9","signature":"sig\\x"},{"type":"redacted_thinking","data":"opaque=="}], "role":"assistant" }"#;
 
     #[tokio::test]
-    async fn negotiated_native_publication_requires_original_endpoint() {
+    async fn negotiated_native_empty_identity_needs_no_endpoint() {
         use crate::providers::claude_code_tests as cc;
         let dir = tempfile::tempdir().unwrap();
         let h = cc::handler(dir.path(), cc::thalamus());
@@ -314,14 +324,22 @@ mod tests {
             .unwrap();
         let binding = h.facade_binding(7).unwrap();
         let setup = json!({"session":"cc","harness":"claude-code","request_id":"setup","preset":"head","params":declare["params"],"composition":{},"claude_code":declare["claude_code"],"model":"fixture","context_window":100000,"lineage_id":"L","now":1});
-        h.provider_setup(binding.clone(), &setup).await.unwrap();
-        let mut status = cc::step(r#"{ "role":"user","content":"not folded" }"#);
-        status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let response = h.provider_step(binding, &status).await.unwrap();
+        let response = h.provider_setup(binding.clone(), &setup).await.unwrap();
         let answer: Value = serde_json::from_slice(&response).unwrap();
-        assert_eq!(answer["answer"], "refuse");
-        assert_eq!(answer["provider_code"], "native_endpoint_missing");
-        assert!(answer.get("compaction").is_none());
+        assert_eq!(answer["initial"]["replacement"], json!([]));
+        let key = Key::new(&binding, "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        let conversation = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        let (_, mut host) = fixture();
+        host.engine.range.to = 0;
+        assert!(
+            frozen_for_plan(&key, &host.engine, &conversation, None, &[])
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn fixture() -> (Key, compaction::HostView) {
