@@ -5101,10 +5101,6 @@ impl McHandler {
             .native_connection_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        self.native_route_plans
-            .lock()
-            .expect("native route plans mutex")
-            .remove(&channel);
         DISPATCH_HEALTH.route_open(channel);
         self.threshold_logged_routes
             .lock()
@@ -5116,6 +5112,10 @@ impl McHandler {
             .remove(&channel);
         let replacement = {
             let mut bindings = self.bindings.lock().expect("bindings mutex");
+            self.native_route_plans
+                .lock()
+                .expect("native route plans mutex")
+                .remove(&channel);
             let previous = bindings.insert(channel, binding);
             previous.and_then(|previous| {
                 let still_bound = bindings
@@ -5534,10 +5534,6 @@ impl McHandler {
 
     /// Remove a route and evict process-local session state after its final binding closes.
     fn unbind_route(&self, channel: u16) {
-        self.native_route_plans
-            .lock()
-            .expect("native route plans mutex")
-            .remove(&channel);
         self.threshold_logged_routes
             .lock()
             .expect("threshold log mutex")
@@ -5553,6 +5549,10 @@ impl McHandler {
             .remove(&channel);
         let (removed_root, last_session_route) = {
             let mut bindings = self.bindings.lock().expect("bindings mutex");
+            self.native_route_plans
+                .lock()
+                .expect("native route plans mutex")
+                .remove(&channel);
             let removed = bindings.remove(&channel);
             let last_session_route = removed.as_ref().and_then(|binding| {
                 let still_bound = bindings

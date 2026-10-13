@@ -1636,6 +1636,11 @@ impl McHandler {
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
         if host {
+            let _route = if attested_claude_code(&binding) {
+                Some(self.native_publication_fence(&binding)?)
+            } else {
+                None
+            };
             return self.host_setup(&store, binding, &key, request, chosen);
         }
         let mut record = self.provider_store.load(&key)?;
@@ -1786,6 +1791,25 @@ impl McHandler {
             .await
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
+        if attested_claude_code(&binding) {
+            let _route = self.native_publication_fence(&binding)?;
+            let conversation = store
+                .load_provider_conversation(&key.store_key())
+                .map_err(transient)?
+                .ok_or_else(|| {
+                    error(
+                        "setup_missing",
+                        "native step requires its frozen conversation",
+                    )
+                })?;
+            let frozen: Value =
+                serde_json::from_str(&conversation.params_json).map_err(transient)?;
+            if !host_plan(&binding, &request.session, &request.harness, &frozen)? {
+                return Err(invalid_field("params"));
+            }
+            let work = self.provider_work(&store, binding, key)?;
+            return self.host_step(&store, &work, conversation, params, request);
+        }
         if let Some(conversation) = store
             .load_provider_conversation(&key.store_key())
             .map_err(transient)?

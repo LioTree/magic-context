@@ -10,6 +10,34 @@ pub(crate) struct NativeConnectionPlan {
 }
 
 impl McHandler {
+    /// Keep the route table locked from the post-await identity check through
+    /// synchronous native writes and response construction. Bind and unbind
+    /// take this same lock, so neither can replace a checked route mid-commit.
+    pub(super) fn native_publication_fence(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<u16, SessionBinding>>, HandlerOutcome> {
+        let bindings = self.bindings.lock().expect("bindings mutex");
+        if !attested_claude_code(binding)
+            || binding.connection_incarnation == 0
+            || binding.native_generation.is_none()
+            || !bindings.values().any(|current| {
+                current.connection_incarnation == binding.connection_incarnation
+                    && current.native_generation == binding.native_generation
+                    && current.principal == binding.principal
+                    && current.project_root == binding.project_root
+                    && current.session == binding.session
+                    && current.harness == binding.harness
+            })
+        {
+            return Err(error(
+                "native_route_stale",
+                "native route incarnation or generation changed before publication",
+            ));
+        }
+        Ok(bindings)
+    }
+
     pub(super) fn native_pins(&self) -> ClaudeCodeCapabilities {
         #[cfg(test)]
         if let Some(pins) = self

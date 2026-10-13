@@ -203,25 +203,47 @@ fn key(h: &McHandler) -> Key {
     Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap()
 }
 
-#[tokio::test]
-async fn review_witness_old_generation_step_commits_after_rebind() {
+fn snapshot(h: &McHandler, key: &Key) -> Value {
+    let store = h.store.get().unwrap();
+    json!({
+        "conversation":store.load_provider_conversation(&key.store_key()).unwrap(),
+        "messages":store.load_provider_messages(&key.store_key(),"L").unwrap().iter().map(|message|json!([message.mid,message.ordinal,message.message_bytes])).collect::<Vec<_>>(),
+        "lineage":format!("{:?}",store.load_provider_lineage(&key.store_key(),"L").unwrap()),
+        "views":format!("{:?}",store.load_provider_views(&key.store_key()).unwrap()),
+        "hooks":format!("{:?}",store.load_provider_hook_answers(&key.store_key()).unwrap()),
+        "engine":format!("{:?}",store.load(&key.engine_key()).unwrap()),
+    })
+}
+
+fn assert_stale(outcome: HandlerOutcome) {
+    let description = match &outcome {
+        HandlerOutcome::Response(bytes) => format!(
+            "Response answer={}",
+            serde_json::from_slice::<Value>(bytes).unwrap()["answer"]
+        ),
+        other => format!("{other:?}"),
+    };
+    assert!(
+        matches!(&outcome,HandlerOutcome::Error {code,..} if code=="native_route_stale"),
+        "stale operation published instead of refusing: {description}"
+    );
+}
+
+async fn queued_call_after_rebind(
+    h: &McHandler,
+    old_key: &Key,
+    method: &str,
+    params: Value,
+) -> HandlerOutcome {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
-
-    let dir = tempfile::tempdir().unwrap();
-    let h = cc::handler(dir.path(), cc::thalamus());
-    *h.native_bundle_override.lock().unwrap() = Some(pins("generation-a"));
-    cc::setup(&h).await;
-    let old_key = key(&h);
-    let params = cc::step(r#"{"role":"user","content":"late old generation"}"#);
-    let serial = h.provider_serial.lock_for(&old_key).await;
-    let mut pending = Box::pin(cc::call(&h, "compaction.step", params));
+    let serial = h.provider_serial.lock_for(old_key).await;
+    let mut pending = Box::pin(cc::call(h, method, params));
     let mut cx = Context::from_waker(Waker::noop());
     assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));
-    // The dispatch first locks to validate its plan, then locks again to write.
-    // Queue another lock holder between those phases so the connection can be
-    // rebound after validation but before the old request writes or responds.
-    let mut competing = Box::pin(h.provider_serial.lock_for(&old_key));
+    // Queue between the admission and effect locks. The request has already
+    // validated its old plan when it waits for the competing holder below.
+    let mut competing = Box::pin(h.provider_serial.lock_for(old_key));
     assert!(matches!(competing.as_mut().poll(&mut cx), Poll::Pending));
     drop(serial);
     assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));
@@ -229,47 +251,159 @@ async fn review_witness_old_generation_step_commits_after_rebind() {
         Poll::Ready(serial) => serial,
         Poll::Pending => panic!("competing operation should own the serial lock"),
     };
-    assert!(matches!(
-        pending
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Pending
-    ));
-    assert!(h
-        .store
-        .get()
-        .unwrap()
-        .load_provider_messages(&old_key.store_key(), "L")
-        .unwrap()
-        .is_empty());
-
-    h.bind_route(7, cc::binding(dir.path(), cc::thalamus()));
+    assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));
+    h.bind_route(7, cc::binding(&old_key.project, cc::thalamus()));
     *h.native_bundle_override.lock().unwrap() = Some(pins("generation-b"));
+    cc::setup(h).await;
+    drop(serial);
+    pending.await
+}
+
+#[tokio::test]
+async fn review_witness_old_generation_step_commits_after_rebind() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = cc::handler(dir.path(), cc::thalamus());
+    *h.native_bundle_override.lock().unwrap() = Some(pins("generation-a"));
     cc::setup(&h).await;
+    let old_key = key(&h);
+    let params = cc::step(r#"{"role":"user","content":"late old generation"}"#);
+    let before = snapshot(&h, &old_key);
+    // Reject the queued step after rebind and keep its old generation unchanged.
+    assert_stale(queued_call_after_rebind(&h, &old_key, "compaction.step", params).await);
     let new_key = key(&h);
     assert_ne!(
         old_key.store_key().conversation_key(),
         new_key.store_key().conversation_key()
     );
-    drop(serial);
-
-    // The queued request belongs to the replaced connection and generation;
-    // accepting its write and response after the new Setup demonstrates the defect.
-    let HandlerOutcome::Response(bytes) = pending.await else {
-        panic!("old admitted step no longer publishes a response")
-    };
-    let answer: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(answer["answer"], "compaction_message");
+    assert_eq!(snapshot(&h, &old_key), before);
     let store = h.store.get().unwrap();
-    assert_eq!(
-        store
-            .load_provider_messages(&old_key.store_key(), "L")
-            .unwrap()
-            .len(),
-        1
-    );
+    assert!(store
+        .load_provider_messages(&old_key.store_key(), "L")
+        .unwrap()
+        .is_empty());
     assert!(store
         .load_provider_messages(&new_key.store_key(), "L")
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn review_witness_old_generation_hook_refuses_after_rebind() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = cc::handler(dir.path(), cc::thalamus());
+    *h.native_bundle_override.lock().unwrap() = Some(pins("generation-a"));
+    cc::setup(&h).await;
+    let old_key = key(&h);
+    let before = snapshot(&h, &old_key);
+    let raw = r#"{"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"s"},{"type":"text","text":"answer"}]}"#;
+    let params = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"hook","params":{"serializer_profile":"claude-code-anthropic","observation":"answer"},"subject_mid":"m","subject_ordinal":0,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw,"hook":"post_assistant","blocks":["answer"]});
+    assert_stale(queued_call_after_rebind(&h, &old_key, "transform.hook", params).await);
+    assert_eq!(snapshot(&h, &old_key), before);
+    assert!(h
+        .store
+        .get()
+        .unwrap()
+        .load_provider_messages(&key(&h).store_key(), "L")
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn review_witness_old_generation_view_read_refuses_after_rebind() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = cc::handler(dir.path(), cc::thalamus());
+    *h.native_bundle_override.lock().unwrap() = Some(pins("generation-a"));
+    cc::setup(&h).await;
+    let old_key = key(&h);
+    let request = review_request(&[
+        ("covered", r#"{"role":"user","content":"history"}"#),
+        ("tail", r#"{ "role":"user", "content":"retained" }"#),
+    ]);
+    let (_, mut host) = review_host(&request, review_engine(&request));
+    host.wire.raw_view = Some(Box::new(
+        native_view::freeze(
+            &old_key,
+            &host.engine,
+            host.coverage.as_ref().unwrap().endpoint.as_ref(),
+            host.raw_replacement.as_deref().unwrap(),
+        )
+        .unwrap(),
+    ));
+    attach(&old_key, &mut host, &request).unwrap();
+    let store = h.store.get().unwrap();
+    let mut conversation = store
+        .load_provider_conversation(&old_key.store_key())
+        .unwrap()
+        .unwrap();
+    conversation.lineage_id = "L".into();
+    store
+        .save_provider_conversation(&old_key.store_key(), &conversation)
+        .unwrap();
+    store
+        .save_provider_view(
+            &old_key.store_key(),
+            &mc_store::provider_records::ProviderView {
+                version: host.engine.version,
+                lineage_id: "L".into(),
+                range_from: host.engine.range.from,
+                range_to: host.engine.range.to,
+                replacement_json: serde_json::to_string(&host).unwrap(),
+                state: "produced".into(),
+            },
+        )
+        .unwrap();
+    let frozen = host.wire.raw_view.as_ref().unwrap();
+    let params = json!({"request_id":"read","view_id":frozen.view.view_id,"version":frozen.view.version,"sha256":frozen.view.sha256,"byte_cursor":0});
+    let HandlerOutcome::Response(bytes) =
+        cc::call(&h, "compaction.view.read", params.clone()).await
+    else {
+        panic!("current route must read the seeded view")
+    };
+    let answer: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(answer["answer"], "page");
+    assert_eq!(
+        answer["bytes"],
+        format!("[{}]", host.raw_replacement.as_ref().unwrap().join(","))
+    );
+    let before = snapshot(&h, &old_key);
+    assert_stale(queued_call_after_rebind(&h, &old_key, "compaction.view.read", params).await);
+    assert_eq!(snapshot(&h, &old_key), before);
+}
+
+#[tokio::test]
+async fn review_native_publication_fence_holds_lifecycle_lock_and_checks_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = cc::handler(dir.path(), cc::thalamus());
+    cc::setup(&h).await;
+    let binding = h.facade_binding(7).unwrap();
+    let guard = h.native_publication_fence(&binding).unwrap();
+    assert!(h.bindings.try_lock().is_err());
+    drop(guard);
+    h.bindings
+        .lock()
+        .unwrap()
+        .get_mut(&7)
+        .unwrap()
+        .connection_incarnation += 1;
+    assert!(
+        matches!(h.native_publication_fence(&binding),Err(HandlerOutcome::Error {code,..}) if code=="native_route_stale")
+    );
+    h.bindings
+        .lock()
+        .unwrap()
+        .get_mut(&7)
+        .unwrap()
+        .connection_incarnation = binding.connection_incarnation;
+    h.bindings
+        .lock()
+        .unwrap()
+        .get_mut(&7)
+        .unwrap()
+        .native_generation
+        .as_mut()
+        .unwrap()
+        .provider = "different".into();
+    assert!(
+        matches!(h.native_publication_fence(&binding),Err(HandlerOutcome::Error {code,..}) if code=="native_route_stale")
+    );
 }
