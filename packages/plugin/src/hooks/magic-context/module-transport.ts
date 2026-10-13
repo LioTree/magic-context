@@ -468,6 +468,7 @@ export class SubcModuleTransport {
             | "agent_drops.append"
             | "ctx_note"
             | "ctx_memory"
+            | "memory.curate"
             | "note.evaluate"
             | "dreamer.run_task"
             | "memory.set_classification"

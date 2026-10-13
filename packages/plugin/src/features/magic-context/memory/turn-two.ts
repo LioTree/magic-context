@@ -24,13 +24,14 @@
  * `authority_elsewhere` (the Rust module, not this process, owns the project's
  * memory), and backlog facts beyond `RETRY_BACKLOG_PER_RUN`.
  */
+
+import { sessionLog } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import {
     type ApplierReceipt,
     applyHistorianRevision,
     applyMemoryAdmission,
     assertMemoryFactReservation,
-    MEMORY_PENDING_PROPOSAL,
     resolveFactDecision,
     tsOwnsMemory,
 } from "./lifecycle-applier";
@@ -558,6 +559,7 @@ function recordStageReply(db: Database, stageKey: string, reply: TurnTwoStageRep
 }
 
 interface ResolveContext {
+    log?: (message: string) => void;
     memoryEnabled: boolean;
     autoPromote: boolean;
     enforcedJson: boolean;
@@ -716,25 +718,12 @@ async function resolveFact(
             return pending(db, fact, key, "abstain");
         case "retire":
         case "promote_rule": {
-            // Retirement and standing-rule promotion need a human approval: they go to
-            // the review inbox as proposals, and nothing is retired automatically.
-            const target = liveTarget(db, fact.project_path, decision.targetId);
-            if (!target) return pending(db, fact, key, "proposal_target");
-            return resolveFactDecision(db, {
-                key,
-                projectPath: fact.project_path,
-                factId: fact.id,
-                operation: "turn_two",
-                state: "decided_pending",
-                reason: MEMORY_PENDING_PROPOSAL,
-                memoryId: target.memory.id,
-                proposal: {
-                    sourceSessionId,
-                    operation: decision.action === "retire" ? "archive" : "promote_rule",
-                    targetIds: [target.memory.id],
-                    proposal: { factId: fact.id, action: decision.action },
-                },
-            });
+            // Turn two may patch grounded clauses, but cannot retire memories or
+            // promote standing rules. Record the dropped decision, not a proposal.
+            const message = `[memory] turn two dropped ${decision.action} for fact ${fact.id}`;
+            if (context.log) context.log(message);
+            else sessionLog(context.owner.sessionId, message);
+            return pending(db, fact, key, `${decision.action}_dropped`);
         }
         case "new":
             return applyMemoryAdmission(db, {
@@ -1052,6 +1041,7 @@ export async function recoverTurnTwoStages(
                     check: () => Promise.reject(new CheckOutcomeUnknownError("no carrier")),
                 },
                 owner: { sessionId: record.sessionId, harness: record.harness },
+                log: input.log,
             });
             input.log?.(
                 `turn two: recovered stage ${record.stageKey} (${done ? "resolved" : "still in flight"})`,
@@ -1161,6 +1151,7 @@ export async function runTurnTwo(db: Database, input: TurnTwoRunInput): Promise<
         validatedProfiles: input.validatedProfiles,
         checks: input.carrier,
         owner: { sessionId: input.sessionId, harness: input.carrier.harness },
+        log: input.log,
     });
     const inFlight = !done || stillReserved(db, reserved.stageKey) > 0;
     return {

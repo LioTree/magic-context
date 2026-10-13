@@ -2,10 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { initializeDatabase } from "../storage-db";
 import {
+    applyCurateMemoryMutation,
     applyHistorianRevision,
     applyMemoryAdmission,
     memoryAdoptionClass,
-    proposeMemoryMutation,
 } from "./lifecycle-applier";
 import { checkMemoryRevision } from "./lifecycle-check-ledger";
 import { CHECK_SYSTEM_PROMPTS, type GateContext, type RevisionDecision } from "./lifecycle-gates";
@@ -141,35 +141,29 @@ describe("memory lifecycle applier", () => {
             db.close();
         }
     });
-    test("curate proposals preserve canonical rows rendering history links and embeddings", () => {
+    test("curate update applies directly with undo history and no prompt signals", () => {
         const db = store();
         try {
             const memory = insertMemory(db, input);
-            const rows = db.prepare("SELECT * FROM memories").all();
             const before = renderingState(db);
-            for (const writer of ["curate"] as const)
-                for (const operation of ["archive", "merge", "update"] as const) {
-                    expect(
-                        proposeMemoryMutation(db, {
-                            projectPath: "p",
-                            sourceSessionId: "s",
-                            key: `${writer}:${operation}`,
-                            writer,
-                            operation,
-                            targetIds: [memory.id],
-                            proposal: { content: "replacement" },
-                        }),
-                    ).toMatchObject({
-                        state: "decided_pending",
-                        reason: "MEMORY_PENDING_PROPOSAL",
-                    });
-                }
-            expect(db.prepare("SELECT * FROM memories").all()).toEqual(rows);
+            expect(
+                applyCurateMemoryMutation(db, {
+                    key: "curate-update",
+                    projectPath: "p",
+                    sourceSessionId: "s",
+                    operation: "update",
+                    targets: [{ id: memory.id, revision: 1 }],
+                    content: "Use stable descriptive names",
+                }),
+            ).toMatchObject({ state: "applied", adoptionClass: "deferred" });
+            expect(getMemoryById(db, memory.id)?.content).toBe("Use stable descriptive names");
+            expect(db.prepare("SELECT previous_text FROM memory_history").all()).toEqual([
+                { previous_text: input.content },
+            ]);
             expect(renderingState(db)).toEqual(before);
             expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual({
-                n: 3,
+                n: 0,
             });
-            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({ n: 0 });
         } finally {
             db.close();
         }

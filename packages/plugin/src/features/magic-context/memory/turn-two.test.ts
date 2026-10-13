@@ -584,7 +584,7 @@ describe("turn two decision matrix", () => {
         }
     });
 
-    test("retirement and standing-rule promotion become inbox proposals and retire nothing", async () => {
+    test("retirement and standing-rule promotion are dropped and logged without proposals", async () => {
         const db = store();
         try {
             const target = insertMemory(db, {
@@ -598,23 +598,24 @@ describe("turn two decision matrix", () => {
                 { content: "Promote" },
                 { content: "Retire nothing" },
             ]);
-            await run(
-                db,
-                publicationId,
-                stubCarrier(() =>
-                    reply([
-                        { fact_id: factIds[0], action: "retire", target_id: target.id },
-                        { fact_id: factIds[1], action: "promote_rule", target_id: target.id },
-                        { fact_id: factIds[2], action: "retire" },
-                    ]),
-                ).carrier,
+            const logs: string[] = [];
+            const carrier = stubCarrier(() =>
+                reply([
+                    { fact_id: factIds[0], action: "retire", target_id: target.id },
+                    { fact_id: factIds[1], action: "promote_rule", target_id: target.id },
+                    { fact_id: factIds[2], action: "retire" },
+                ]),
             );
-            for (const id of factIds.slice(0, 2))
+            await run(db, publicationId, carrier.carrier, { log: (message) => logs.push(message) });
+            expect(carrier.prompts[0]).not.toContain("abstain, retire");
+            expect(carrier.prompts[0]).not.toContain("promote_rule");
+            for (const [index, id] of factIds.slice(0, 2).entries())
                 expect(fact(db, id)).toMatchObject({
                     state: "decided_pending",
-                    reason: "MEMORY_PENDING_PROPOSAL",
-                    matched_memory_id: target.id,
+                    reason: index === 0 ? "retire_dropped" : "promote_rule_dropped",
                 });
+            expect(logs.some((line) => line.includes("dropped retire"))).toBe(true);
+            expect(logs.some((line) => line.includes("dropped promote_rule"))).toBe(true);
             expect(fact(db, factIds[2]!)).toMatchObject({
                 state: "decided_pending",
                 reason: "malformed_decision",
@@ -625,14 +626,7 @@ describe("turn two decision matrix", () => {
                         "SELECT writer,operation,target_ids_json FROM memory_tool_proposals ORDER BY id",
                     )
                     .all(),
-            ).toEqual([
-                { writer: "historian", operation: "archive", target_ids_json: `[${target.id}]` },
-                {
-                    writer: "historian",
-                    operation: "promote_rule",
-                    target_ids_json: `[${target.id}]`,
-                },
-            ]);
+            ).toEqual([]);
             expect(db.prepare("SELECT * FROM memories").all()).toEqual(before);
             expect(count(db, "SELECT COUNT(*) AS n FROM memory_history")).toBe(0);
         } finally {
@@ -642,6 +636,130 @@ describe("turn two decision matrix", () => {
 });
 
 describe("turn two gated edits", () => {
+    test("a merge that loses a source identifier or number is refused before any check or write", async () => {
+        const db = store();
+        try {
+            const survivor = insertMemory(db, {
+                projectPath: PROJECT,
+                category: "CONSTRAINTS",
+                content: "Keep rule. ",
+            });
+            const source = insertMemory(db, {
+                projectPath: PROJECT,
+                category: "CONSTRAINTS",
+                content: "retry_limit is 17.",
+            });
+            const before = db.prepare("SELECT * FROM memories ORDER BY id").all();
+            const published = publish(db, [
+                {
+                    content: "Use bounded retries.",
+                    block: { ordinal: 42, parts: ["Use bounded retries."] },
+                },
+            ]);
+            const stub = stubCarrier(() =>
+                reply([
+                    {
+                        fact_id: published.factIds[0],
+                        action: "merge",
+                        sources: [
+                            { id: survivor.id, revision: 1 },
+                            { id: source.id, revision: 1 },
+                        ],
+                        survivor_id: survivor.id,
+                        removed: [],
+                        replaced: [
+                            {
+                                memory_id: source.id,
+                                clause: 1,
+                                block: 42,
+                                excerpt: "Use bounded retries.",
+                            },
+                        ],
+                        kept: [{ memory_id: survivor.id, clause: 1 }],
+                        added: [
+                            {
+                                text: "Use bounded retries.",
+                                block: 42,
+                                excerpt: "Use bounded retries.",
+                            },
+                        ],
+                        final_text: "Keep rule. Use bounded retries.",
+                    },
+                ]),
+            );
+            await run(db, published.publicationId, stub.carrier);
+            expect(fact(db, published.factIds[0]!)).toMatchObject({
+                state: "decided_pending",
+                reason: "dropped_token",
+            });
+            expect(stub.checks).toHaveLength(0);
+            expect(db.prepare("SELECT * FROM memories ORDER BY id").all()).toEqual(before);
+            for (const table of [
+                "memory_history",
+                "memory_successor_links",
+                "memory_tool_proposals",
+            ])
+                expect(count(db, `SELECT COUNT(*) AS n FROM ${table}`)).toBe(0);
+        } finally {
+            db.close();
+        }
+    });
+    if (process.env.MC_NOPROP_REVIEW === "1") {
+        test("noprop merge refuses source-token loss even when the evidence repeats them", async () => {
+            const db = store();
+            try {
+                const survivor = insertMemory(db, {
+                    projectPath: PROJECT,
+                    category: "CONSTRAINTS",
+                    content: "Keep rule. ",
+                });
+                const source = insertMemory(db, {
+                    projectPath: PROJECT,
+                    category: "CONSTRAINTS",
+                    content: "retry_limit is 17.",
+                });
+                const excerpt = "retry_limit was 17; now use bounded retries.";
+                const before = db.prepare("SELECT * FROM memories ORDER BY id").all();
+                const published = publish(db, [
+                    { content: "Use bounded retries.", block: { ordinal: 42, parts: [excerpt] } },
+                ]);
+                const stub = stubCarrier(() =>
+                    reply([
+                        {
+                            fact_id: published.factIds[0],
+                            action: "merge",
+                            sources: [
+                                { id: survivor.id, revision: 1 },
+                                { id: source.id, revision: 1 },
+                            ],
+                            survivor_id: survivor.id,
+                            removed: [],
+                            replaced: [{ memory_id: source.id, clause: 1, block: 42, excerpt }],
+                            kept: [{ memory_id: survivor.id, clause: 1 }],
+                            added: [{ text: "Use bounded retries.", block: 42, excerpt }],
+                            final_text: "Keep rule. Use bounded retries.",
+                        },
+                    ]),
+                );
+                await run(db, published.publicationId, stub.carrier);
+                expect(fact(db, published.factIds[0]!)).toMatchObject({
+                    state: "decided_pending",
+                    reason: "dropped_token",
+                });
+                expect(db.prepare("SELECT * FROM memories ORDER BY id").all()).toEqual(before);
+                expect(stub.checks).toHaveLength(0);
+                for (const table of [
+                    "memory_history",
+                    "memory_successor_links",
+                    "memory_tool_proposals",
+                ])
+                    expect(count(db, `SELECT COUNT(*) AS n FROM ${table}`)).toBe(0);
+            } finally {
+                db.close();
+            }
+        });
+    }
+
     test("a green edit makes exactly 4 checks and applies once with history, no mutation-log row and fresh FTS", async () => {
         const db = store();
         try {

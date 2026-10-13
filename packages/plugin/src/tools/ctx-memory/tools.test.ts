@@ -232,16 +232,23 @@ function createTestDb(dbPath = ":memory:"): Database {
     return db;
 }
 
-function expectPendingProposal(
+function expectAutomatedEdit(
     db: Database,
     result: unknown,
     memories: Array<NonNullable<ReturnType<typeof getMemoryById>>>,
 ): void {
-    expect(String(result)).toContain("MEMORY_PENDING_PROPOSAL");
-    for (const memory of memories) expect(getMemoryById(db, memory.id)).toEqual(memory);
-    expect(
-        (db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get() as { n: number }).n,
-    ).toBeGreaterThan(0);
+    expect(String(result)).toMatch(/^(Updated memory|Merged memories|Archived memor)/);
+    const history = db.prepare("SELECT memory_id,previous_text FROM memory_history").all() as {
+        memory_id: number;
+        previous_text: string;
+    }[];
+    expect(history.length).toBeGreaterThan(0);
+    for (const entry of history) {
+        const before = memories.find((memory) => memory.id === entry.memory_id);
+        if (before) expect(entry.previous_text).toBe(before.content);
+    }
+    expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual({ n: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM memory_agent_fragments").get()).toEqual({ n: 0 });
     expect(db.prepare("SELECT COUNT(*) AS n FROM memory_mutation_log").get()).toEqual({ n: 0 });
 }
 
@@ -1224,7 +1231,7 @@ describe("createCtxMemoryTools", () => {
             toolContext("ses-dreamer", DREAMER_AGENT),
         );
 
-        expectPendingProposal(db, result, [own, { ...foreignShared, shareable: 1 }]);
+        expectAutomatedEdit(db, result, [own, { ...foreignShared, shareable: 1 }]);
     });
 
     describe("#given curate safety gates", () => {
@@ -1277,7 +1284,7 @@ describe("createCtxMemoryTools", () => {
                 dreamerToolContext("/repo/project"),
             );
 
-            expectPendingProposal(db, result, [source, successor]);
+            expectAutomatedEdit(db, result, [source, successor]);
         });
 
         it("allows a user-profile reason for a legacy user category when consolidation is valid", async () => {
@@ -1302,7 +1309,7 @@ describe("createCtxMemoryTools", () => {
                 dreamerToolContext("/repo/project"),
             );
 
-            expectPendingProposal(db, result, [source, successor]);
+            expectAutomatedEdit(db, result, [source, successor]);
         });
 
         it("REFUSES a user-profile archive reason for a project-scoped category", async () => {
@@ -1397,7 +1404,7 @@ describe("createCtxMemoryTools", () => {
                 dreamerToolContext("/repo/project"),
             );
 
-            expectPendingProposal(db, result, [source, successor]);
+            expectAutomatedEdit(db, result, [source, successor]);
         });
     });
 
@@ -1484,7 +1491,7 @@ describe("createCtxMemoryTools", () => {
             );
         });
 
-        it("pending update preserves content verification and derived data", async () => {
+        it("direct dreamer update invalidates content verification and derived data", async () => {
             const memory = insertMemory(db, {
                 projectPath: "/repo/project",
                 category: "CONFIG_DEFAULTS",
@@ -1501,11 +1508,11 @@ describe("createCtxMemoryTools", () => {
                 toolContext("ses-dreamer", DREAMER_AGENT),
             );
 
-            expectPendingProposal(db, result, [memory]);
-            expect(getMemoryVerifications(db, [memory.id]).has(memory.id)).toBe(true);
+            expectAutomatedEdit(db, result, [memory]);
+            expect(getMemoryVerifications(db, [memory.id]).has(memory.id)).toBe(false);
         });
 
-        it("pending dreamer update never starts an embedding request", async () => {
+        it("direct dreamer update starts a fresh embedding request", async () => {
             registerMemoryEmbeddingsForProject(db);
             let calls = 0;
             installTestEmbeddingProvider(async () => {
@@ -1521,9 +1528,9 @@ describe("createCtxMemoryTools", () => {
                 { action: "update", ids: [memory.id], content: "cache_ttl=10m" },
                 toolContext("ses-dreamer", DREAMER_AGENT),
             );
-            expectPendingProposal(db, result, [memory]);
+            expectAutomatedEdit(db, result, [memory]);
             await wait();
-            expect(calls).toBe(0);
+            expect(calls).toBe(1);
         });
         it("agent update drops an embedding result when a later revision changes the content", async () => {
             registerMemoryEmbeddingsForProject(db);
@@ -1585,7 +1592,7 @@ describe("createCtxMemoryTools", () => {
             expect(getProjectState(db, rawProjectPath)).toBeNull();
         });
 
-        it("normalizes legacy raw project paths before recording a proposal", async () => {
+        it("normalizes legacy raw project paths before auditing a direct update", async () => {
             const rawProjectPath = "/legacy/raw-project";
             const projectIdentity = normalizeStoredProjectPath(rawProjectPath);
             const legacyTools = createCtxMemoryTools({
@@ -1609,8 +1616,8 @@ describe("createCtxMemoryTools", () => {
                 toolContext("ses-dreamer", DREAMER_AGENT),
             );
 
-            expectPendingProposal(db, result, [memory]);
-            expect(db.prepare("SELECT project_path FROM memory_tool_proposals").get()).toEqual({
+            expectAutomatedEdit(db, result, [memory]);
+            expect(db.prepare("SELECT project_path FROM memory_journal").get()).toEqual({
                 project_path: projectIdentity,
             });
         });
@@ -2059,13 +2066,13 @@ describe("createCtxMemoryTools", () => {
             });
         });
 
-        it("proposal persistence failure leaves canonical content unchanged", async () => {
+        it("undo history persistence failure leaves canonical content unchanged", async () => {
             const memory = insertMemory(db, {
                 projectPath: "/repo/project",
                 category: "CONFIG_DEFAULTS",
                 content: "cache_ttl=5m",
             });
-            db.exec("DROP TABLE memory_tool_proposals");
+            db.exec("DROP TABLE memory_history");
 
             let thrown: unknown;
             try {
@@ -2081,7 +2088,7 @@ describe("createCtxMemoryTools", () => {
                 thrown = error;
             }
 
-            expect(String(thrown)).toContain("memory_tool_proposals");
+            expect(String(thrown)).toContain("memory_history");
             expect(getMemoryById(db, memory.id)?.content).toBe("cache_ttl=5m");
         });
     });
@@ -2181,7 +2188,7 @@ describe("createCtxMemoryTools", () => {
                 ]),
             );
         });
-        it("retains a merge proposal without creating a canonical row or archiving sources", async () => {
+        it("applies a dreamer merge with a canonical row and audited source archives", async () => {
             const first = insertMemory(db, {
                 projectPath: "/repo/project",
                 category: "CONSTRAINTS",
@@ -2202,11 +2209,11 @@ describe("createCtxMemoryTools", () => {
                 toolContext("ses-dreamer", DREAMER_AGENT),
             );
 
-            expectPendingProposal(db, result, [first, second]);
-            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(2);
+            expectAutomatedEdit(db, result, [first, second]);
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(1);
         });
 
-        it("retains a merge proposal matching a canonical hash without changing its bytes", async () => {
+        it("applies a merge matching a canonical hash and updates its bytes", async () => {
             const canonical = insertMemory(db, {
                 projectPath: "/repo/project",
                 category: "CONSTRAINTS",
@@ -2227,7 +2234,7 @@ describe("createCtxMemoryTools", () => {
                 toolContext("ses-dreamer", DREAMER_AGENT),
             );
 
-            expectPendingProposal(db, result, [canonical, duplicate]);
+            expectAutomatedEdit(db, result, [canonical, duplicate]);
         });
 
         it("rejects a PRIMARY-agent merge that includes another project's memory", async () => {
@@ -2289,7 +2296,7 @@ describe("createCtxMemoryTools", () => {
             expect(getMemoryById(db, active.id)?.status).toBe("active");
         });
 
-        it("retains a dreamer merge proposal for archived memories without restoring them", async () => {
+        it("applies a dreamer merge that restores its archived canonical memory", async () => {
             const archived = insertMemory(db, {
                 projectPath: "/repo/project",
                 category: "CONSTRAINTS",
@@ -2311,8 +2318,8 @@ describe("createCtxMemoryTools", () => {
                 toolContext("ses-dreamer", DREAMER_AGENT),
             );
 
-            expectPendingProposal(db, result, [getMemoryById(db, archived.id)!, active]);
-            expect(getMemoryById(db, archived.id)?.status).toBe("archived");
+            expectAutomatedEdit(db, result, [getMemoryById(db, archived.id)!, active]);
+            expect(getMemoryById(db, archived.id)?.status).toBe("active");
         });
 
         it("rejects malformed or duplicate merge ids", async () => {
@@ -2350,7 +2357,7 @@ describe("createCtxMemoryTools", () => {
             expect(getMemoryById(db, second.id)?.status).toBe("active");
         });
 
-        it("retains a cross-project dreamer merge proposal without touching either identity", async () => {
+        it("applies a cross-project dreamer merge without bumping either identity's epoch", async () => {
             const first = insertMemory(db, {
                 projectPath: "/repo/project-a",
                 category: "CONSTRAINTS",
@@ -2376,7 +2383,7 @@ describe("createCtxMemoryTools", () => {
                 toolContext("ses-dreamer", DREAMER_AGENT),
             );
 
-            expectPendingProposal(db, result, [first, second, third]);
+            expectAutomatedEdit(db, result, [first, second, third]);
             expect(getProjectMemoryEpoch(db, "/repo/project-a")).toBe(0);
             expect(getProjectMemoryEpoch(db, "/repo/project-b")).toBe(0);
         });
@@ -3112,3 +3119,60 @@ describe("createCtxMemoryTools", () => {
         });
     });
 });
+
+for (const operation of ["update", "merge", "archive"] as const) {
+    it(`module-owned curate ${operation} refuses an unavailable backend without a TypeScript fallback`, async () => {
+        const db = createTestDb();
+        try {
+            const first = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The registry owns startup ordering.",
+            });
+            const second = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The loader checks the registry.",
+            });
+            db.prepare("INSERT INTO authority_repair_pending(project_path) VALUES(?)").run(
+                "/repo/project",
+            );
+            const before = db.prepare("SELECT * FROM memories ORDER BY id").all();
+            let calls = 0;
+            const tools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    curateMemory: async () => {
+                        calls++;
+                        throw new Error("module unavailable");
+                    },
+                },
+            });
+            await expect(
+                tools.ctx_memory.execute(
+                    {
+                        action: operation,
+                        ids: operation === "merge" ? [first.id, second.id] : [first.id],
+                        content: "The registry owns deterministic startup ordering.",
+                        superseded_by: operation === "archive" ? second.id : undefined,
+                    },
+                    dreamerToolContext("/repo/project"),
+                ),
+            ).rejects.toThrow("module unavailable");
+            expect(calls).toBe(1);
+            expect(db.prepare("SELECT * FROM memories ORDER BY id").all()).toEqual(before);
+            for (const table of [
+                "memory_history",
+                "memory_tool_proposals",
+                "memory_agent_fragments",
+                "memory_mutation_log",
+            ])
+                expect(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
+        } finally {
+            db.close();
+        }
+    });
+}

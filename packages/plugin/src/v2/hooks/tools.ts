@@ -67,6 +67,7 @@ export async function registerTools(
             ? {
                   ...createCtxMemoryTools({
                       ...project,
+                      memoryAuthority: config.transform_mode === "rust" ? "module" : "ts",
                       ...(rustToolBackends ? { rustToolBackends } : {}),
                       agentSaveClassificationAnchor: (location) =>
                           agentSaveClassificationAnchor(location),

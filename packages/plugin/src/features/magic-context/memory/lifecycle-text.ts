@@ -245,6 +245,7 @@ export function scanConcreteTokens(input: string): string[] {
             word.includes("/") ||
             /\.[A-Za-z0-9]{1,5}$/.test(word) ||
             /^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)+$/.test(word) ||
+            (/^[a-z_][a-z0-9_]*$/.test(word) && word.includes("_")) ||
             /^[A-Z0-9]+(?:_[A-Z0-9]+)+$/.test(word)
         ) {
             tokens.push(word);

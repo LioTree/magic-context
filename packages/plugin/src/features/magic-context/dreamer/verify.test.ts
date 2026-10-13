@@ -434,23 +434,18 @@ describe("runVerify disposition", () => {
                 remaining: 0,
                 complete: true,
             });
-            // A verify archive is a model-judged retirement: it waits as a pending
-            // proposal and the rows stay live until someone approves it.
-            expect(getMemoryById(db, constraint.id)?.status).toBe("active");
-            expect(getMemoryById(db, projectRuleCodeFact.id)?.status).toBe("active");
+            expect(getMemoryById(db, constraint.id)?.status).toBe("archived");
+            expect(getMemoryById(db, projectRuleCodeFact.id)?.status).toBe("archived");
             expect(
-                db
-                    .prepare(
-                        "SELECT writer, operation, target_ids_json FROM memory_tool_proposals ORDER BY id",
-                    )
-                    .all(),
+                db.prepare("SELECT previous_text FROM memory_history ORDER BY id").all(),
             ).toEqual(
-                [constraint.id, projectRuleCodeFact.id].map((id) => ({
-                    writer: "verify",
-                    operation: "archive",
-                    target_ids_json: JSON.stringify([id]),
+                [constraint, projectRuleCodeFact].map((memory) => ({
+                    previous_text: memory.content,
                 })),
             );
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual({
+                n: 0,
+            });
         } finally {
             closeQuietly(db);
         }
@@ -1028,11 +1023,13 @@ describe("applyVerifyManifest", () => {
                 skipped: 0,
                 refused: 0,
             });
-            // The archive verdict becomes a pending proposal; the row stays live.
-            expect(getMemoryById(db, archived.id)?.status).toBe("active");
-            expect(db.prepare("SELECT target_ids_json FROM memory_tool_proposals").all()).toEqual([
-                { target_ids_json: JSON.stringify([archived.id]) },
+            expect(getMemoryById(db, archived.id)?.status).toBe("archived");
+            expect(db.prepare("SELECT previous_text FROM memory_history").all()).toEqual([
+                { previous_text: archived.content },
             ]);
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual({
+                n: 0,
+            });
             expect(getMemoryById(db, silent.id)?.status).toBe("active");
             const silentState = getMemoryVerifications(db, [silent.id]).get(silent.id);
             expect(silentState?.files).toEqual(["src/old.ts"]);

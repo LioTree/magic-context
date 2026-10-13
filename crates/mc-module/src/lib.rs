@@ -13089,7 +13089,11 @@ impl McHandler {
                 self.handle_memory_set_verification(channel, &request).await
             }
             "memory.set_mapping" => self.handle_memory_set_mapping(channel, &request).await,
-            "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
+            "ctx_memory" => {
+                self.handle_ctx_memory_facade(channel, &request, false)
+                    .await
+            }
+            "memory.curate" => self.handle_memory_curate_facade(channel, &request).await,
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
             "ctx_reduce" => self.handle_ctx_reduce_facade(channel, &request).await,
@@ -13570,7 +13574,39 @@ impl McHandler {
         mcp_text_result(reply, false)
     }
 
-    async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_memory_curate_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let outcome = self.handle_ctx_memory_facade(channel, request, true).await;
+        let HandlerOutcome::Response(bytes) = &outcome else {
+            return outcome;
+        };
+        let Ok(Value::Object(mut body)) = serde_json::from_slice::<Value>(bytes) else {
+            return outcome;
+        };
+        if body.contains_key("structuredContent") {
+            return outcome;
+        }
+        // Existing scope and transaction refusals keep their human explanation, but
+        // must also report failure through the machine-readable curation contract.
+        let code = if body.get("isError") == Some(&Value::Bool(true)) {
+            "mutation_refused"
+        } else {
+            "invalid_receipt"
+        };
+        body.insert("isError".into(), Value::Bool(true));
+        body.insert(
+            "structuredContent".into(),
+            serde_json::to_value(MemoryCurateResult::refused(code))
+                .expect("curate receipt is serializable"),
+        );
+        respond(Value::Object(body))
+    }
+
+    async fn handle_ctx_memory_facade(
+        &self,
+        channel: u16,
+        request: &Value,
+        automated: bool,
+    ) -> HandlerOutcome {
         let Some(args) = facade_arguments(request, &["action"]) else {
             return invalid_params_error("ctx_memory arguments must be an object");
         };
@@ -13585,6 +13621,32 @@ impl McHandler {
             return tool_error_result(format!("Error: {error}."));
         }
         let is_mutation = matches!(action, "write" | "update" | "archive" | "merge");
+        if automated && !matches!(action, "update" | "archive" | "merge") {
+            return invalid_params_error("memory.curate requires update, archive or merge");
+        }
+        let expected_revisions: Vec<(i64, i64)> = if automated {
+            let Some(targets) = args.get("expected_revisions").and_then(Value::as_array) else {
+                return invalid_params_error("memory.curate requires expected_revisions");
+            };
+            let Some(targets) = targets
+                .iter()
+                .map(|target| {
+                    Some((
+                        target.get("id")?.as_i64()?,
+                        target.get("revision")?.as_i64()?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return invalid_params_error("invalid expected_revisions");
+            };
+            if targets.iter().map(|(id, _)| *id).collect::<Vec<_>>() != memory_ids(args, action) {
+                return invalid_params_error("expected_revisions must name every target");
+            }
+            targets
+        } else {
+            Vec::new()
+        };
         let facade_scope = match self
             .resolve_facade_scope(channel, Some(args), "memories", is_mutation)
             .await
@@ -13661,7 +13723,11 @@ impl McHandler {
                     memory_project,
                     "memories",
                     conversation_key,
-                    "ctx_memory",
+                    if automated {
+                        "memory.curate"
+                    } else {
+                        "ctx_memory"
+                    },
                     action,
                     command_id.as_deref(),
                     |tx| {
@@ -13761,10 +13827,19 @@ impl McHandler {
                     memory_project,
                     "memories",
                     conversation_key,
-                    "ctx_memory",
+                    if automated {
+                        "memory.curate"
+                    } else {
+                        "ctx_memory"
+                    },
                     action,
                     command_id.as_deref(),
-                    |tx| {
+                    |agent_tx| {
+                        let automated_tx = agent_tx.automated();
+                        let tx = if automated { &automated_tx } else { agent_tx };
+                        if automated {
+                            tx.check_memory_revisions(&expected_revisions)?;
+                        }
                         let memory = tx
                             .update_memory_content(memory_project, id, content, category, now_ms())
                             .map_err(|error| request_context.render_mutation_error(error))?;
@@ -13787,10 +13862,16 @@ impl McHandler {
                             }],
                             now_ms(),
                         )?;
-                        facade_text_response(
-                            format!("Updated memory [ID: {rendered_id}] in {}.", memory.category),
-                            false,
-                        )
+                        let text =
+                            format!("Updated memory [ID: {rendered_id}] in {}.", memory.category);
+                        if automated {
+                            mcp_curate_result(
+                                text,
+                                MemoryCurateResult::applied(rendered_id, vec![]),
+                            )
+                        } else {
+                            facade_text_response(text, false)
+                        }
                     },
                 ))
             }
@@ -13807,18 +13888,36 @@ impl McHandler {
                     memory_project,
                     "memories",
                     conversation_key,
-                    "ctx_memory",
+                    if automated {
+                        "memory.curate"
+                    } else {
+                        "ctx_memory"
+                    },
                     action,
                     command_id.as_deref(),
-                    |tx| {
+                    |agent_tx| {
+                        let automated_tx = agent_tx.automated();
+                        let tx = if automated { &automated_tx } else { agent_tx };
+                        if automated {
+                            tx.check_memory_revisions(&expected_revisions)?;
+                        }
                         let archived = tx
                             .archive_memories(memory_project, &ids, reason, now_ms())
                             .map_err(|error| request_context.render_mutation_error(error))?;
+                        if automated {
+                            if let Some(successor_id) =
+                                args.get("superseded_by").and_then(Value::as_i64)
+                            {
+                                tx.set_curate_successor(&archived, successor_id)?;
+                            }
+                        }
                         if archived.is_empty() {
-                            facade_text_response(
-                                "No active memories needed archiving.".to_string(),
-                                false,
-                            )
+                            let text = "No active memories needed archiving.".to_string();
+                            if automated {
+                                mcp_curate_result(text, MemoryCurateResult::refused("not_active"))
+                            } else {
+                                facade_text_response(text, false)
+                            }
                         } else {
                             tx.record_agent_fragment(
                                 conversation_key,
@@ -13834,10 +13933,16 @@ impl McHandler {
                                 now_ms(),
                             )?;
                             let rendered_ids = archived;
-                            facade_text_response(
-                                format!("Archived memory IDs [{}].", join_i64s(&rendered_ids)),
-                                false,
-                            )
+                            let text =
+                                format!("Archived memory IDs [{}].", join_i64s(&rendered_ids));
+                            if automated {
+                                mcp_curate_result(
+                                    text,
+                                    MemoryCurateResult::applied(rendered_ids[0], vec![]),
+                                )
+                            } else {
+                                facade_text_response(text, false)
+                            }
                         }
                     },
                 ))
@@ -13865,10 +13970,13 @@ impl McHandler {
                         memory_project,
                         "memories",
                         conversation_key,
-                        "ctx_memory",
+                        if automated { "memory.curate" } else { "ctx_memory" },
                         action,
                         command_id.as_deref(),
-                        |tx| {
+                        |agent_tx| {
+                            let automated_tx = agent_tx.automated();
+                            let tx = if automated { &automated_tx } else { agent_tx };
+                            if automated { tx.check_memory_revisions(&expected_revisions)?; }
                             let (mut memory, superseded_ids) = tx
                                 .merge_memories_canonical(
                                     memory_project,
@@ -13908,6 +14016,7 @@ impl McHandler {
                                     join_i64s(&rendered_superseded)
                                 )
                             };
+                            if automated { return mcp_curate_result(text, MemoryCurateResult::applied(memory.id, superseded_ids)); }
                             mcp_memory_result(
                                 text,
                                 false,
@@ -16922,6 +17031,49 @@ fn mcp_text_result(text: String, is_error: bool) -> HandlerOutcome {
         "content": [{ "type": "text", "text": text }],
         "isError": is_error,
     }))
+}
+
+#[derive(serde::Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum MemoryCurateState {
+    Applied,
+    Refused,
+}
+
+#[derive(serde::Serialize)]
+struct MemoryCurateResult {
+    state: MemoryCurateState,
+    memory_id: Option<i64>,
+    superseded_ids: Vec<i64>,
+    error_code: Option<String>,
+}
+
+impl MemoryCurateResult {
+    fn applied(memory_id: i64, superseded_ids: Vec<i64>) -> Self {
+        Self {
+            state: MemoryCurateState::Applied,
+            memory_id: Some(memory_id),
+            superseded_ids,
+            error_code: None,
+        }
+    }
+    fn refused(code: &str) -> Self {
+        Self {
+            state: MemoryCurateState::Refused,
+            memory_id: None,
+            superseded_ids: vec![],
+            error_code: Some(code.into()),
+        }
+    }
+}
+
+fn mcp_curate_result(text: String, receipt: MemoryCurateResult) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": receipt.state == MemoryCurateState::Refused,
+        "structuredContent": receipt,
+    }))
+    .map_err(|error| error.to_string())
 }
 
 fn mcp_memory_result(text: String, is_error: bool, operation: Value) -> Result<Vec<u8>, String> {
@@ -32791,6 +32943,196 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn module_curate_facade_applies_update_merge_archive_without_agent_fragments() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_root = project.to_str().unwrap();
+        let identity = "git:curate-direct";
+        handler.bind_route(7, binding(route_root, "token"));
+        activate_module_authority(&store, "context", identity, route_root, "memories");
+        let first = insert_memory(&store, identity, "CONSTRAINTS", "cache_ttl=5m", 1);
+        let second = insert_memory(&store, identity, "CONSTRAINTS", "cache_ttl=10m", 1);
+        let update = json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-update", "action": "update", "ids": [first], "expected_revisions": [{"id": first, "revision": 1}], "content": "cache_ttl=15m" });
+        let applied = tool_body(call_facade(&handler, "memory.curate", update.clone()).await);
+        assert!(applied["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Updated memory"));
+        assert_eq!(
+            applied["structuredContent"],
+            json!({"state": "applied", "memory_id": first, "superseded_ids": [], "error_code": null})
+        );
+        let replay = tool_body(call_facade(&handler, "memory.curate", update).await);
+        assert_eq!(replay["structuredContent"], applied["structuredContent"]);
+        assert_eq!(
+            store.get_memory_full(first).unwrap().unwrap().content,
+            "cache_ttl=15m"
+        );
+        let merged = tool_body(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-merge", "action": "merge", "ids": [first, second], "expected_revisions": [{"id": first, "revision": 2}, {"id": second, "revision": 1}], "content": "cache_ttl=20m" })).await);
+        assert!(
+            merged["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Merged memories"),
+            "{merged}"
+        );
+        assert_eq!(
+            store.get_memory_full(first).unwrap().unwrap().status,
+            "archived"
+        );
+        let canonical: (i64, i64) = store
+            .with_context_conn_for_test(|conn| {
+                conn.query_row(
+                    "SELECT id,revision FROM memories WHERE content='cache_ttl=20m'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            merged["structuredContent"],
+            json!({"state": "applied", "memory_id": canonical.0, "superseded_ids": [first, second], "error_code": null})
+        );
+        let archive = tool_body(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-archive", "action": "archive", "ids": [canonical.0], "expected_revisions": [{"id": canonical.0, "revision": canonical.1}], "reason": "obsolete" })).await);
+        assert!(
+            archive["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Archived memory"),
+            "{archive}"
+        );
+        assert_eq!(
+            archive["structuredContent"],
+            json!({"state": "applied", "memory_id": canonical.0, "superseded_ids": [], "error_code": null})
+        );
+        assert_eq!(
+            store.get_memory_full(canonical.0).unwrap().unwrap().status,
+            "archived"
+        );
+        let inactive = tool_body(call_facade(&handler, "memory.curate", json!({ "memory_project": identity, "context_store_uuid": "context", "authority_generation": 1, "command_id": "curate-inactive", "action": "archive", "ids": [canonical.0], "expected_revisions": [{"id": canonical.0, "revision": canonical.1 + 1}] })).await);
+        assert_eq!(
+            inactive["structuredContent"],
+            json!({"state": "refused", "memory_id": null, "superseded_ids": [], "error_code": "not_active"})
+        );
+        store
+            .with_context_conn_for_test(|conn| {
+                for table in [
+                    "memory_mutation_log",
+                    "memory_agent_fragments",
+                    "memory_tool_proposals",
+                ] {
+                    assert_eq!(
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                            .get::<_, i64>(0))?,
+                        0,
+                        "{table}"
+                    );
+                }
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM memory_history WHERE memory_id=?1",
+                        [first],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn noprop_curate_stale_cas_refuses_each_action_and_changes_nothing() {
+        if std::env::var("MC_NOPROP_REVIEW").as_deref() != Ok("1") {
+            return;
+        }
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let root = project.to_str().unwrap();
+        let identity = "git:noprop-cas";
+        handler.bind_route(7, binding(root, "token"));
+        activate_module_authority(&store, "context", identity, root, "memories");
+        let first = insert_memory(&store, identity, "CONSTRAINTS", "Original first.", 1);
+        let second = insert_memory(&store, identity, "CONSTRAINTS", "Original second.", 1);
+        for action in ["update", "archive", "merge"] {
+            let ids = if action == "merge" {
+                vec![first, second]
+            } else {
+                vec![first]
+            };
+            let expected: Vec<Value> = ids
+                .iter()
+                .map(|id| json!({"id": id, "revision": if *id == first { 0 } else { 1 }}))
+                .collect();
+            let body = tool_body(call_facade(&handler, "memory.curate", json!({
+                "memory_project": identity, "command_id": format!("stale-{action}"),
+                "action": action, "ids": ids, "expected_revisions": expected, "content": "Replacement.",
+            })).await);
+            assert_eq!(body["isError"], true, "{action}: {body}");
+            assert_eq!(
+                body["structuredContent"],
+                json!({"state": "refused", "memory_id": null, "superseded_ids": [], "error_code": "mutation_refused"}),
+                "{action}: {body}"
+            );
+            assert!(
+                body["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("stale_revision"),
+                "{action}: {body}"
+            );
+        }
+        let foreign = insert_memory(&store, "git:foreign", "CONSTRAINTS", "Foreign source.", 1);
+        store.with_context_conn_for_test(|conn| {
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS authority_managed(project_path TEXT PRIMARY KEY, context_store_uuid TEXT NOT NULL, marked_at INTEGER NOT NULL)")?;
+            conn.execute("INSERT INTO authority_managed(project_path,context_store_uuid,marked_at) VALUES(?1,'review',1)", [identity])?;
+            Ok(())
+        }).unwrap();
+        let refused = tool_body(call_facade(&handler, "memory.curate", json!({
+            "memory_project": identity, "command_id": "mixed-authority", "action": "merge",
+            "ids": [first, foreign], "expected_revisions": [{"id": first, "revision": 1}, {"id": foreign, "revision": 1}],
+            "content": "Merged foreign source.",
+        })).await);
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(
+            store.get_memory_full(foreign).unwrap().unwrap().status,
+            "active"
+        );
+        assert_eq!(
+            store.get_memory_full(first).unwrap().unwrap().content,
+            "Original first."
+        );
+        assert_eq!(
+            store.get_memory_full(second).unwrap().unwrap().status,
+            "active"
+        );
+        store
+            .with_context_conn_for_test(|conn| {
+                for table in [
+                    "memory_history",
+                    "memory_mutation_log",
+                    "memory_agent_fragments",
+                    "memory_tool_proposals",
+                ] {
+                    assert_eq!(
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                            .get::<_, i64>(0))?,
+                        0,
+                        "{table}"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn verification_and_mapping_facades_are_fenced_hash_guarded_and_idempotent() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
@@ -32914,15 +33256,14 @@ mod tests {
         assert!(matches!(archive, HandlerOutcome::Response(_)));
         let after_archive =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        // A verify archive is a model-judged retirement: a pending proposal, the row
-        // stays live, and nothing moves the prompt.
+        // Archiving changes the stored memory's status but leaves the m1 revision signal unchanged.
         assert_eq!(
             after_archive, before_archive,
             "a verify archive must not move the m1 mutation signal"
         );
         assert_eq!(
             store.get_memory_full(archived_id).unwrap().unwrap().status,
-            "active"
+            "archived"
         );
         let proposals: Vec<(String, String, String)> = store
             .with_context_conn_for_test(|tx| {
@@ -32935,14 +33276,7 @@ mod tests {
                 rows
             })
             .unwrap();
-        assert_eq!(
-            proposals,
-            vec![(
-                "verify".to_string(),
-                "archive".to_string(),
-                format!("[{archived_id}]")
-            )]
-        );
+        assert_eq!(proposals, vec![]);
 
         let mapping = call_facade(&handler, "memory.set_mapping", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,

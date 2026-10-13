@@ -46,7 +46,7 @@ import {
     getMemoryVerifications,
     type Memory,
 } from "../memory";
-import { MEMORY_PENDING_PROPOSAL } from "../memory/lifecycle-applier";
+
 import { runCompressCues } from "../mural/compress-cues";
 import { detectOverflow } from "../overflow-detection";
 import { recordChildInvocation } from "../subagent-token-capture";
@@ -333,7 +333,6 @@ function validateCurateAssistantText(text: string): string {
 interface CurateMemoryOperationSummary {
     totalCalls: number;
     completedActions: string[];
-    proposedActions: string[];
 }
 
 interface CurateValidatedOutput {
@@ -345,7 +344,6 @@ export function inspectCurateMemoryOperations(messages: unknown): CurateMemoryOp
     const summary: CurateMemoryOperationSummary = {
         totalCalls: 0,
         completedActions: [],
-        proposedActions: [],
     };
     if (!Array.isArray(messages)) return summary;
 
@@ -363,15 +361,7 @@ export function inspectCurateMemoryOperations(messages: unknown): CurateMemoryOp
             const input = isRecord(part.state.input) ? part.state.input : null;
             const action = input?.action;
             const output = typeof part.state.output === "string" ? part.state.output : "";
-            // A successful automated edit records a proposal without changing the memory.
-            // Keep that receipt separate from applied edits and from tool refusals.
-            if (
-                (action === "merge" || action === "archive" || action === "update") &&
-                output.startsWith(`${MEMORY_PENDING_PROPOSAL}:`)
-            ) {
-                summary.proposedActions.push(action);
-                continue;
-            }
+
             if (
                 (output === "completed" &&
                     (action === "merge" || action === "archive" || action === "update")) ||
@@ -390,17 +380,14 @@ function formatExpiredArchiveProgress(count: number): string {
     return `curate: archived ${count} expired ${count === 1 ? "memory" : "memories"}`;
 }
 
-function formatCurateMemoryOperations(
-    actions: readonly string[],
-    outcome: "applied" | "proposed" = "applied",
-): string {
+function formatCurateMemoryOperations(actions: readonly string[]): string {
     const actionCounts = new Map<string, number>();
     for (const action of actions) actionCounts.set(action, (actionCounts.get(action) ?? 0) + 1);
     const actionDetail = [...actionCounts]
         .map(([action, count]) => (count === 1 ? action : `${action} ×${count}`))
         .join(", ");
     const noun = actions.length === 1 ? "operation" : "operations";
-    return `curate: ${actions.length} memory ${noun} ${outcome}${actionDetail ? ` (${actionDetail})` : ""}`;
+    return `curate: ${actions.length} memory ${noun} applied${actionDetail ? ` (${actionDetail})` : ""}`;
 }
 
 function requireDreamClient(client: PluginContext["client"] | undefined): PluginContext["client"] {
@@ -1979,7 +1966,7 @@ async function runAgenticTask(
                 ? curateChunks
                 : [{ memories: [] as CuratePromptMemory[], crossChunkCandidates: [] as string[] }];
         const completedActions: string[] = [];
-        const proposedActions: string[] = [];
+
         let curateRefused = 0;
         let run: { output: unknown[]; validated: string | CurateValidatedOutput } = {
             output: [],
@@ -2044,15 +2031,10 @@ async function runAgenticTask(
                         if (text) validateCurateAssistantText(text);
                         if (
                             memoryOperations.totalCalls > 0 &&
-                            memoryOperations.completedActions.length === 0 &&
-                            memoryOperations.proposedActions.length === 0
+                            memoryOperations.completedActions.length === 0
                         )
                             throw new Error("Curate returned no completed ctx_memory tool result.");
-                        if (
-                            !text &&
-                            memoryOperations.completedActions.length === 0 &&
-                            memoryOperations.proposedActions.length === 0
-                        )
+                        if (!text && memoryOperations.completedActions.length === 0)
                             throw new Error("Dreamer returned no assistant output.");
                         return { text: text || null, memoryOperations };
                     },
@@ -2137,10 +2119,7 @@ async function runAgenticTask(
 
                             const memoryOperations = inspectCurateMemoryOperations(messages);
                             if (text) validateCurateAssistantText(text);
-                            if (
-                                memoryOperations.completedActions.length > 0 ||
-                                memoryOperations.proposedActions.length > 0
-                            ) {
+                            if (memoryOperations.completedActions.length > 0) {
                                 return { text, memoryOperations };
                             }
                             if (!text) throw new Error("Dreamer returned no assistant output.");
@@ -2159,9 +2138,7 @@ async function runAgenticTask(
                 completedActions.push(
                     ...(run.validated as CurateValidatedOutput).memoryOperations.completedActions,
                 );
-                proposedActions.push(
-                    ...(run.validated as CurateValidatedOutput).memoryOperations.proposedActions,
-                );
+
                 curateRefused += takeCurateSafetyRefusalCount(childSessionId ?? "");
             }
             if (childSessionId && !deps.hiddenCompletionExecutor) {
@@ -2181,9 +2158,8 @@ async function runAgenticTask(
             run.validated = {
                 text: null,
                 memoryOperations: {
-                    totalCalls: completedActions.length + proposedActions.length,
+                    totalCalls: completedActions.length,
                     completedActions,
-                    proposedActions,
                 },
             };
 
@@ -2250,12 +2226,7 @@ async function runAgenticTask(
             curateOutput && curateOutput.memoryOperations.completedActions.length > 0
                 ? formatCurateMemoryOperations(curateOutput.memoryOperations.completedActions)
                 : null,
-            curateOutput && curateOutput.memoryOperations.proposedActions.length > 0
-                ? formatCurateMemoryOperations(
-                      curateOutput.memoryOperations.proposedActions,
-                      "proposed",
-                  )
-                : null,
+
             curateRefused > 0 ? `curate: refused ${curateRefused} unsafe mutation(s)` : null,
         ]
             .filter((value): value is string => Boolean(value))
