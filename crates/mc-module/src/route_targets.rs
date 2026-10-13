@@ -89,6 +89,12 @@ impl RouteTargetConfig {
     }
 
     pub(crate) fn target(&self, route: RegisteredRoute) -> Option<RouteTarget> {
+        if route == RegisteredRoute::EngramDoor {
+            return crate::agent_data::ENABLED.then(|| RouteTarget::InternalService {
+                module_id: "engram".into(),
+                service_id: "session-door".into(),
+            });
+        }
         route
             .module_id(self)
             .map(|module_id| RouteTarget::ManagementSurface {
@@ -101,20 +107,26 @@ impl RouteTargetConfig {
 /// constructing a `RouteTarget` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegisteredRoute {
+    EngramDoor,
+    EntorhinalSessionRef,
     SessionResolve,
     HistorianRunner,
     ProviderRunner,
 }
 
 impl RegisteredRoute {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 5] = [
         Self::SessionResolve,
         Self::HistorianRunner,
         Self::ProviderRunner,
+        Self::EngramDoor,
+        Self::EntorhinalSessionRef,
     ];
 
     fn module_id(self, config: &RouteTargetConfig) -> Option<&str> {
         match self {
+            Self::EngramDoor => crate::agent_data::ENABLED.then_some("engram"),
+            Self::EntorhinalSessionRef => crate::agent_data::ENABLED.then_some("entorhinal"),
             Self::SessionResolve => Some(DEFAULT_THALAMUS_MODULE_ID),
             Self::HistorianRunner => config.runner_module_id(),
             Self::ProviderRunner => Some(config.provider_runner_module_id()),
@@ -126,6 +138,7 @@ impl RegisteredRoute {
     /// exhaustive so a new route has to state its own behaviors here.
     fn self_signals(self) -> Vec<SelfSignalDeclaration> {
         match self {
+            Self::EngramDoor | Self::EntorhinalSessionRef => Vec::new(),
             // A lookup on the session registry: it spends nothing and shapes no surface.
             Self::SessionResolve => Vec::new(),
             // Callbacks and transcript reads spend no provider quota. Declaring this target
@@ -413,8 +426,17 @@ mod tests {
                 let Some(target) = config.target(route) else {
                     continue;
                 };
-                let RouteTarget::ManagementSurface { module_id } = target else {
-                    panic!("registered module routes must use the management surface");
+                let module_id = match target {
+                    RouteTarget::ManagementSurface { module_id } => module_id,
+                    RouteTarget::InternalService {
+                        module_id,
+                        service_id,
+                    } => {
+                        assert_eq!(route, RegisteredRoute::EngramDoor);
+                        assert_eq!(service_id, "session-door");
+                        module_id
+                    }
+                    _ => panic!("registered route has an unexpected target kind"),
                 };
                 assert!(
                     consumed.contains(&module_id),
@@ -756,7 +778,28 @@ mod tests {
                     continue;
                 }
                 let source = fs::read_to_string(&path).expect("read Rust source");
-                if source.contains("RouteTarget::") {
+                // Matching an existing RouteTarget does not open a route. Check
+                // expressions that construct new targets, not match patterns.
+                struct Constructors(bool);
+                impl<'ast> syn::visit::Visit<'ast> for Constructors {
+                    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+                        if node.path.segments.iter().any(|s| s.ident == "RouteTarget") {
+                            self.0 = true;
+                        }
+                        syn::visit::visit_expr_struct(self, node);
+                    }
+                }
+                if path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
+                {
+                    continue;
+                }
+                let parsed = syn::parse_file(&source).expect("parse Rust route constructors");
+                let mut constructors = Constructors(false);
+                syn::visit::Visit::visit_file(&mut constructors, &parsed);
+                if constructors.0 {
                     offenders.push(
                         path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
                             .unwrap_or(&path)

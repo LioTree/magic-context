@@ -87,6 +87,49 @@ pub enum SourceMode {
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+
+pub fn fingerprint_half(
+    conn: &mut Connection,
+    store: Store,
+    session: &str,
+) -> Result<String, SnapshotError> {
+    struct HashWriter(Sha256);
+    impl Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = HashWriter(Sha256::new());
+    capture_half(conn, store, session, &mut out)?;
+    Ok(format!("{:x}", out.0.finalize()))
+}
+
+pub fn has_session_data(
+    conn: &Connection,
+    store: Store,
+    session: &str,
+) -> Result<bool, SnapshotError> {
+    for table in ship_tables(store) {
+        let RowSelector::Predicate(predicate) = table.rows else {
+            return Err(SnapshotError::Invalid("inventory_mismatch"));
+        };
+        if conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {} WHERE {predicate})",
+                quoted(table.table)
+            ),
+            [session],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 pub(crate) fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

@@ -234,6 +234,22 @@ pub(crate) fn check_writer(conn: &Connection, session: &str) -> rusqlite::Result
 }
 
 impl McStore {
+    pub fn move_storage_path(&self) -> Option<&Path> {
+        self.move_path.as_deref()
+    }
+
+    /// Return the persisted harness, original project root, native session id,
+    /// and engine namespace. The registrar hashes the literal first three fields
+    /// into sessionRef; substituting a resolved git identity would change it.
+    pub fn move_provider_identities(
+        &self,
+    ) -> Result<Vec<(String, String, String, String)>, McStoreError> {
+        self.inner.with_conn(|conn| {
+            conn.prepare("SELECT harness,project_root,session,engine_namespace FROM mc_provider_conversations_v2 ORDER BY conv_key")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect()
+        }).map_err(Into::into)
+    }
     /// Used by the method layer for read/serve gating; table triggers independently
     /// protect every write in its own transaction.
     pub fn session_move_phase(&self, session: &str) -> Result<Option<String>, McStoreError> {
@@ -271,6 +287,155 @@ pub struct MoveStore {
     transaction_probe: Option<tests::TransactionProbe>,
 }
 impl MoveStore {
+    pub fn schema_version(&self) -> Result<u32, MoveError> {
+        Ok(crate::single_store_schema::recorded_store_version(
+            &self.writer,
+        )?)
+    }
+    pub fn cut_state(&self, cut: &str) -> Result<Option<String>, MoveError> {
+        Ok(self
+            .writer
+            .query_row(
+                "SELECT state FROM mc_move_cuts WHERE cut_id=?1",
+                [cut],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    pub fn session_fence_cut(&self, session: &str) -> Result<Option<String>, MoveError> {
+        Ok(self
+            .writer
+            .query_row(
+                "SELECT cut_id FROM mc_move_fences WHERE session_id=?1",
+                [session],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    pub fn restore_source_fence(&mut self, cut: &str) -> Result<(), MoveError> {
+        self.write(cut, |tx| {
+            let (session,state): (String,String)=tx.query_row("SELECT session_id,state FROM mc_move_cuts WHERE cut_id=?1", [cut], |r| Ok((r.get(0)?,r.get(1)?)))?;
+            if state != "sealed" {return Err(MoveError::refusal("cut_conflict"));}
+            tx.execute("INSERT OR IGNORE INTO mc_move_fences(session_id,cut_id,phase) VALUES(?1,?2,'frozen')",params![session,cut])?;
+            Ok(())
+        })
+    }
+    /// Copy the session's store.db rows before replacement, so an interrupted
+    /// activation can restore them. The coordinator has already blocked requests
+    /// for every moving session; encoding and schema checks match source capture.
+    pub fn capture_undo(&self, session: &str, path: &Path) -> Result<u64, MoveError> {
+        let mut reader = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut out = BufWriter::new(crate::private_permissions::create_file(path, true)?);
+        codec::capture_half_checked(&mut reader, Store::Module, session, &mut out, |conn| {
+            if crate::single_store_schema::recorded_store_version(conn)?
+                != move_inventory::STORE_SCHEMA_VERSION
+            {
+                return Err(SnapshotError::Invalid("schema_mismatch"));
+            }
+            Ok(())
+        })?;
+        out.flush()?;
+        out.get_ref().sync_all()?;
+        Ok(out.get_ref().metadata()?.len())
+    }
+    pub fn busy_reason(&self, session: &str) -> Result<Option<&'static str>, MoveError> {
+        let provider: bool = self.writer.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_conversations_v2 WHERE (session=?1 OR engine_namespace=?1) AND (json_type(hook_counters_json,'$.historian_launch_pending')='object' OR json_extract(hook_counters_json,'$.historian_evaluation_due')=1))", [session], |r|r.get(0))?;
+        if provider {
+            return Ok(Some("historian_running"));
+        }
+        let historian: bool = self.writer.query_row("SELECT EXISTS(SELECT 1 FROM mc_historian_pending_run WHERE session_id=?1) OR EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id=?1 AND json_extract(meta,'$.historian.state') NOT IN ('Idle','idle','Cancelled','cancelled','Completed','completed'))", [session], |r| r.get(0))?;
+        if historian {
+            return Ok(Some("historian_running"));
+        }
+        let pending: bool = self.writer.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mc_single_store_pending_publish WHERE session_id=?1)",
+            [session],
+            |r| r.get(0),
+        )?;
+        Ok(pending.then_some("turn_in_flight"))
+    }
+    pub fn fingerprint(&self, session: &str) -> Result<String, MoveError> {
+        let mut reader = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(codec::fingerprint_half(
+            &mut reader,
+            Store::Module,
+            session,
+        )?)
+    }
+    pub fn has_session_data(&self, session: &str) -> Result<bool, MoveError> {
+        Ok(codec::has_session_data(
+            &self.writer,
+            Store::Module,
+            session,
+        )?)
+    }
+    /// Validate an incoming staged file without reserving or installing database
+    /// rows. Replacing this session can reuse its primary keys, but a key owned
+    /// by another session is always refused.
+    pub fn validate_import(&self, session: &str, path: &Path) -> Result<(), MoveError> {
+        preflight_for(&self.writer, Store::Module, session, path, true)
+    }
+
+    /// Mark this session's store.db rows unavailable before bounded removal.
+    /// The coordinator is already durably blocking every moving session. An
+    /// existing frozen marker is replaced only when prior_cut names its owner,
+    /// preventing one move from clearing another move's write protection.
+    pub fn reserve_discard(
+        &mut self,
+        binding: &CutBinding,
+        prior_cut: Option<&str>,
+    ) -> Result<(), MoveError> {
+        let json =
+            serde_json::to_string(binding).map_err(|_| MoveError::refusal("cut_conflict"))?;
+        self.write(&binding.cut_id, |tx| {
+            let existing: Option<String> = tx.query_row("SELECT binding FROM mc_move_cuts WHERE cut_id=?1", [&binding.cut_id], |r| r.get(0)).optional()?;
+            if let Some(old) = existing {
+                return if old == json { Ok(()) } else { Err(MoveError::refusal("cut_conflict")) };
+            }
+            let fence: Option<String> = tx.query_row("SELECT cut_id FROM mc_move_fences WHERE session_id=?1", [&binding.host_session_id], |r| r.get(0)).optional()?;
+            if let Some(fence) = fence {
+                if prior_cut != Some(fence.as_str()) { return Err(MoveError::refusal("move_in_progress")); }
+                tx.execute("DELETE FROM mc_move_fences WHERE cut_id=?1", [&fence])?;
+                tx.execute("DELETE FROM mc_move_installs WHERE cut_id=?1", [&fence])?;
+            }
+            tx.execute("INSERT INTO mc_move_cuts(cut_id,session_id,binding,manifest_digest,state) VALUES(?1,?2,?3,'','staged')", params![binding.cut_id,binding.host_session_id,json])?;
+            tx.execute("INSERT INTO mc_move_fences VALUES(?1,?2,'staged')", params![binding.host_session_id,binding.cut_id])?;
+            tx.execute("INSERT INTO mc_move_installs(cut_id,session_id,manifest_digest) VALUES(?1,?2,'')", params![binding.cut_id,binding.host_session_id])?;
+            Ok(())
+        })
+    }
+
+    /// Publish a completed module half only while the two-store coordinator still
+    /// gates the entire ref set. Replays after a lost reply are harmless.
+    pub fn activate(&mut self, cut: &str) -> Result<(), MoveError> {
+        self.write(cut, |tx| {
+            let (session, state): (String, String) = tx.query_row(
+                "SELECT session_id,state FROM mc_move_cuts WHERE cut_id=?1",
+                [cut],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if state == "activated" {
+                return Ok(());
+            }
+            if state != "installed" {
+                return Err(MoveError::refusal("cut_conflict"));
+            }
+            require_owner(tx, cut, &session, "staged")?;
+            tx.execute(
+                "UPDATE mc_move_cuts SET state='activated' WHERE cut_id=?1",
+                [cut],
+            )?;
+            tx.execute("DELETE FROM mc_move_fences WHERE cut_id=?1", [cut])?;
+            tx.execute("DELETE FROM mc_move_installs WHERE cut_id=?1", [cut])?;
+            Ok(())
+        })
+    }
     fn open(
         path: &Path,
         namespace: Arc<AtomicU64>,
@@ -397,6 +562,8 @@ impl MoveStore {
     pub fn freeze(&mut self, cut: &str) -> Result<(), MoveError> {
         self.write(cut, |tx| {
             let session = source_session(tx, cut)?;
+            let provider: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_conversations_v2 WHERE (session=?1 OR engine_namespace=?1) AND (json_type(hook_counters_json,'$.historian_launch_pending')='object' OR json_extract(hook_counters_json,'$.historian_evaluation_due')=1))", [&session], |r|r.get(0))?;
+            if provider {return Err(MoveError::refusal("session_busy"));}
             for table in ["mc_single_store_pending_publish", "mc_historian_pending_run"] {
                 if tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE session_id = ?1)"), [&session], |r| r.get::<_, bool>(0))? {
                     return Err(MoveError::refusal(if table == "mc_single_store_pending_publish" { "pending_context_write" } else { "session_busy" }));
@@ -954,8 +1121,18 @@ fn validate_row_owner(
     Ok(())
 }
 fn preflight(conn: &Connection, session: &str, path: &Path) -> Result<(), MoveError> {
+    preflight_for(conn, Store::Module, session, path, false)
+}
+
+pub(crate) fn preflight_for(
+    conn: &Connection,
+    store: Store,
+    session: &str,
+    path: &Path,
+    replacing: bool,
+) -> Result<(), MoveError> {
     let mut input = BufReader::new(File::open(path)?);
-    for table in codec::ship_tables(Store::Module) {
+    for table in codec::ship_tables(store) {
         let count = codec::read_section(&mut input, table)?;
         // A temporary, throwaway DB checks source PK uniqueness without holding
         // the destination handle or retaining all keys in a process-sized set.
@@ -964,11 +1141,33 @@ fn preflight(conn: &Connection, session: &str, path: &Path) -> Result<(), MoveEr
         for _ in 0..count {
             let row = codec::read_row(&mut input, table)?;
             validate_row_owner(table, &row, session)?;
+            let RowSelector::Predicate(selector) = table.rows else {
+                return Err(MoveError::refusal("inventory_mismatch"));
+            };
+            let columns = table.shipped_columns();
+            let projection = columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("?{} AS {}", i + 2, codec::quoted(c)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let values = std::iter::once(Value::Text(session.into())).chain(row.iter().cloned());
+            if !conn.query_row(
+                &format!("SELECT ({selector}) FROM (SELECT {projection})"),
+                rusqlite::params_from_iter(values),
+                |r| r.get::<_, bool>(0),
+            )? {
+                return Err(MoveError::refusal("identity_mismatch"));
+            }
             let key = codec::source_key(table, &row)?;
             if keys.execute("INSERT INTO keys VALUES(?1)", [key]).is_err() {
                 return Err(MoveError::table("key_collision", table.table));
             }
-            refuse_inventory_key_collision(conn, table, &row)?;
+            if replacing {
+                refuse_foreign_key_collision(conn, table, &row, session)?;
+            } else {
+                refuse_inventory_key_collision(conn, table, &row)?;
+            }
         }
     }
     let mut tail = [0];
@@ -976,6 +1175,44 @@ fn preflight(conn: &Connection, session: &str, path: &Path) -> Result<(), MoveEr
         return Err(MoveError::refusal("manifest_mismatch"));
     }
     Ok(())
+}
+
+fn refuse_foreign_key_collision(
+    conn: &Connection,
+    table: &move_inventory::TableInventory,
+    row: &[Value],
+    session: &str,
+) -> Result<(), MoveError> {
+    let columns = table.shipped_columns();
+    let RowSelector::Predicate(selector) = table.rows else {
+        return Err(MoveError::refusal("inventory_mismatch"));
+    };
+    let predicate = table
+        .primary_key
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{} IS ?{}", codec::quoted(c), i + 2))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let values = std::iter::once(Value::Text(session.into())).chain(
+        table
+            .primary_key
+            .iter()
+            .map(|c| row[columns.iter().position(|col| col == c).unwrap()].clone()),
+    );
+    let collision: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE {predicate} AND NOT ({selector}))",
+            codec::quoted(table.table)
+        ),
+        rusqlite::params_from_iter(values),
+        |r| r.get(0),
+    )?;
+    if collision {
+        Err(MoveError::table("key_collision", table.table))
+    } else {
+        Ok(())
+    }
 }
 
 /// Check the inventory-declared primary key against a destination table without

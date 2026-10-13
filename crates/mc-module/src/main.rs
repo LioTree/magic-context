@@ -48,10 +48,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let args: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(mc_module::single_store_repair::cli_main(&args));
     }
-    let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
+    let module_id = DEFAULT_MODULE_ID;
 
     let logger = match cortexkit_log::init_from_env() {
         Ok(logger) => logger,
@@ -84,11 +81,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let smart_notes_enabled = mc_module::config::user_smart_notes_enabled();
     subc_client_rs::serve_with(
         &connection_file,
-        manifest_with_route_targets_and_smart_notes(
-            &module_id,
-            &route_targets,
-            smart_notes_enabled,
-        ),
+        manifest_with_route_targets_and_smart_notes(module_id, &route_targets, smart_notes_enabled),
         McTransportHandler::new(
             McHandler::new_with_connection_file_and_route_targets(
                 Some(connection_file.clone()),
