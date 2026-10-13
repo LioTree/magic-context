@@ -1,0 +1,4808 @@
+{
+  "config": {
+    "type": "object",
+    "shape": {
+      "enabled": {
+        "type": "default",
+        "inner": {
+          "type": "boolean"
+        },
+        "value": true
+      },
+      "allow_home_project": {
+        "type": "default",
+        "inner": {
+          "type": "boolean"
+        },
+        "value": false
+      },
+      "mural": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "enabled": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": false
+            },
+            "model": {
+              "type": "optional",
+              "inner": {
+                "type": "unknown"
+              }
+            }
+          }
+        },
+        "value": {
+          "enabled": false
+        }
+      },
+      "transform_mode": {
+        "type": "default",
+        "inner": {
+          "type": "enum",
+          "values": [
+            "ts",
+            "rust"
+          ]
+        },
+        "value": "ts"
+      },
+      "rust_pipeline": {
+        "type": "default",
+        "inner": {
+          "type": "enum",
+          "values": [
+            "full_request",
+            "provider"
+          ]
+        },
+        "value": "full_request"
+      },
+      "signed_thinking_hold": {
+        "type": "default",
+        "inner": {
+          "type": "enum",
+          "values": [
+            "off",
+            "on"
+          ]
+        },
+        "value": "off"
+      },
+      "auto_update": {
+        "type": "optional",
+        "inner": {
+          "type": "boolean"
+        }
+      },
+      "language": {
+        "type": "optional",
+        "inner": {
+          "type": "string",
+          "checks": [
+            {
+              "check": "trim"
+            },
+            {
+              "check": "lowercase"
+            },
+            {
+              "check": "custom",
+              "rule": "language"
+            }
+          ]
+        }
+      },
+      "profile": {
+        "type": "optional",
+        "inner": {
+          "type": "string",
+          "checks": [
+            {
+              "check": "trim"
+            },
+            {
+              "check": "min_length",
+              "minimum": 1
+            }
+          ]
+        }
+      },
+      "profiles": {
+        "type": "optional",
+        "inner": {
+          "type": "record",
+          "key": {
+            "type": "string",
+            "checks": [
+              {
+                "check": "trim"
+              },
+              {
+                "check": "min_length",
+                "minimum": 1
+              }
+            ]
+          },
+          "value": {
+            "type": "object",
+            "shape": {
+              "historian": {
+                "type": "optional",
+                "inner": {
+                  "type": "object",
+                  "shape": {
+                    "opencode": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "object",
+                        "shape": {
+                          "model": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "union",
+                              "options": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "object",
+                                  "shape": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "variant": {
+                                      "type": "optional",
+                                      "inner": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  },
+                                  "catchall": {
+                                    "type": "never"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "fallback_models": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "array",
+                              "element": {
+                                "type": "union",
+                                "options": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "shape": {
+                                      "model": {
+                                        "type": "string"
+                                      },
+                                      "variant": {
+                                        "type": "optional",
+                                        "inner": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    },
+                                    "catchall": {
+                                      "type": "never"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "variant": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "catchall": {
+                          "type": "never"
+                        }
+                      }
+                    },
+                    "pi": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "object",
+                        "shape": {
+                          "model": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "union",
+                              "options": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "object",
+                                  "shape": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "thinking_level": {
+                                      "type": "optional",
+                                      "inner": {
+                                        "type": "enum",
+                                        "values": [
+                                          "off",
+                                          "minimal",
+                                          "low",
+                                          "medium",
+                                          "high",
+                                          "xhigh",
+                                          "max"
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  "catchall": {
+                                    "type": "never"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "fallback_models": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "array",
+                              "element": {
+                                "type": "union",
+                                "options": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "shape": {
+                                      "model": {
+                                        "type": "string"
+                                      },
+                                      "thinking_level": {
+                                        "type": "optional",
+                                        "inner": {
+                                          "type": "enum",
+                                          "values": [
+                                            "off",
+                                            "minimal",
+                                            "low",
+                                            "medium",
+                                            "high",
+                                            "xhigh",
+                                            "max"
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    "catchall": {
+                                      "type": "never"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "thinking_level": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "enum",
+                              "values": [
+                                "off",
+                                "minimal",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                                "max"
+                              ]
+                            }
+                          }
+                        },
+                        "catchall": {
+                          "type": "never"
+                        }
+                      }
+                    },
+                    "omp": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "object",
+                        "shape": {
+                          "model": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "union",
+                              "options": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "object",
+                                  "shape": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "thinking_level": {
+                                      "type": "optional",
+                                      "inner": {
+                                        "type": "enum",
+                                        "values": [
+                                          "off",
+                                          "minimal",
+                                          "low",
+                                          "medium",
+                                          "high",
+                                          "xhigh",
+                                          "max",
+                                          "inherit",
+                                          "auto"
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  "catchall": {
+                                    "type": "never"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "fallback_models": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "array",
+                              "element": {
+                                "type": "union",
+                                "options": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "shape": {
+                                      "model": {
+                                        "type": "string"
+                                      },
+                                      "thinking_level": {
+                                        "type": "optional",
+                                        "inner": {
+                                          "type": "enum",
+                                          "values": [
+                                            "off",
+                                            "minimal",
+                                            "low",
+                                            "medium",
+                                            "high",
+                                            "xhigh",
+                                            "max",
+                                            "inherit",
+                                            "auto"
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    "catchall": {
+                                      "type": "never"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "thinking_level": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "enum",
+                              "values": [
+                                "off",
+                                "minimal",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                                "max",
+                                "inherit",
+                                "auto"
+                              ]
+                            }
+                          }
+                        },
+                        "catchall": {
+                          "type": "never"
+                        }
+                      }
+                    }
+                  },
+                  "catchall": {
+                    "type": "never"
+                  }
+                }
+              },
+              "dreamer": {
+                "type": "optional",
+                "inner": {
+                  "type": "object",
+                  "shape": {
+                    "opencode": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "object",
+                        "shape": {
+                          "model": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "union",
+                              "options": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "object",
+                                  "shape": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "variant": {
+                                      "type": "optional",
+                                      "inner": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  },
+                                  "catchall": {
+                                    "type": "never"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "fallback_models": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "array",
+                              "element": {
+                                "type": "union",
+                                "options": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "shape": {
+                                      "model": {
+                                        "type": "string"
+                                      },
+                                      "variant": {
+                                        "type": "optional",
+                                        "inner": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    },
+                                    "catchall": {
+                                      "type": "never"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "variant": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "catchall": {
+                          "type": "never"
+                        }
+                      }
+                    },
+                    "pi": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "object",
+                        "shape": {
+                          "model": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "union",
+                              "options": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "object",
+                                  "shape": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "thinking_level": {
+                                      "type": "optional",
+                                      "inner": {
+                                        "type": "enum",
+                                        "values": [
+                                          "off",
+                                          "minimal",
+                                          "low",
+                                          "medium",
+                                          "high",
+                                          "xhigh",
+                                          "max"
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  "catchall": {
+                                    "type": "never"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "fallback_models": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "array",
+                              "element": {
+                                "type": "union",
+                                "options": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "shape": {
+                                      "model": {
+                                        "type": "string"
+                                      },
+                                      "thinking_level": {
+                                        "type": "optional",
+                                        "inner": {
+                                          "type": "enum",
+                                          "values": [
+                                            "off",
+                                            "minimal",
+                                            "low",
+                                            "medium",
+                                            "high",
+                                            "xhigh",
+                                            "max"
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    "catchall": {
+                                      "type": "never"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "thinking_level": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "enum",
+                              "values": [
+                                "off",
+                                "minimal",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                                "max"
+                              ]
+                            }
+                          }
+                        },
+                        "catchall": {
+                          "type": "never"
+                        }
+                      }
+                    },
+                    "omp": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "object",
+                        "shape": {
+                          "model": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "union",
+                              "options": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "object",
+                                  "shape": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "thinking_level": {
+                                      "type": "optional",
+                                      "inner": {
+                                        "type": "enum",
+                                        "values": [
+                                          "off",
+                                          "minimal",
+                                          "low",
+                                          "medium",
+                                          "high",
+                                          "xhigh",
+                                          "max",
+                                          "inherit",
+                                          "auto"
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  "catchall": {
+                                    "type": "never"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "fallback_models": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "array",
+                              "element": {
+                                "type": "union",
+                                "options": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "shape": {
+                                      "model": {
+                                        "type": "string"
+                                      },
+                                      "thinking_level": {
+                                        "type": "optional",
+                                        "inner": {
+                                          "type": "enum",
+                                          "values": [
+                                            "off",
+                                            "minimal",
+                                            "low",
+                                            "medium",
+                                            "high",
+                                            "xhigh",
+                                            "max",
+                                            "inherit",
+                                            "auto"
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    "catchall": {
+                                      "type": "never"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "thinking_level": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "enum",
+                              "values": [
+                                "off",
+                                "minimal",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                                "max",
+                                "inherit",
+                                "auto"
+                              ]
+                            }
+                          }
+                        },
+                        "catchall": {
+                          "type": "never"
+                        }
+                      }
+                    }
+                  },
+                  "catchall": {
+                    "type": "never"
+                  }
+                }
+              }
+            },
+            "catchall": {
+              "type": "never"
+            }
+          }
+        }
+      },
+      "historian": {
+        "type": "optional",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "temperature": {
+              "type": "optional",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 0,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 2,
+                    "inclusive": true
+                  }
+                ]
+              }
+            },
+            "top_p": {
+              "type": "optional",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 0,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 1,
+                    "inclusive": true
+                  }
+                ]
+              }
+            },
+            "prompt": {
+              "type": "optional",
+              "inner": {
+                "type": "string"
+              }
+            },
+            "tools": {
+              "type": "optional",
+              "inner": {
+                "type": "record",
+                "key": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "disable": {
+              "type": "optional",
+              "inner": {
+                "type": "boolean"
+              }
+            },
+            "description": {
+              "type": "optional",
+              "inner": {
+                "type": "string"
+              }
+            },
+            "mode": {
+              "type": "optional",
+              "inner": {
+                "type": "enum",
+                "values": [
+                  "subagent",
+                  "primary",
+                  "all"
+                ]
+              }
+            },
+            "color": {
+              "type": "optional",
+              "inner": {
+                "type": "string",
+                "checks": [
+                  {
+                    "check": "string_format",
+                    "format": "regex",
+                    "pattern": "^#[0-9A-Fa-f]{6}$"
+                  }
+                ]
+              }
+            },
+            "maxSteps": {
+              "type": "optional",
+              "inner": {
+                "type": "number"
+              }
+            },
+            "permission": {
+              "type": "optional",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "edit": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "ask",
+                        "allow",
+                        "deny"
+                      ]
+                    }
+                  },
+                  "bash": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "union",
+                      "options": [
+                        {
+                          "type": "enum",
+                          "values": [
+                            "ask",
+                            "allow",
+                            "deny"
+                          ]
+                        },
+                        {
+                          "type": "record",
+                          "key": {
+                            "type": "string"
+                          },
+                          "value": {
+                            "type": "enum",
+                            "values": [
+                              "ask",
+                              "allow",
+                              "deny"
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "webfetch": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "ask",
+                        "allow",
+                        "deny"
+                      ]
+                    }
+                  },
+                  "doom_loop": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "ask",
+                        "allow",
+                        "deny"
+                      ]
+                    }
+                  },
+                  "external_directory": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "ask",
+                        "allow",
+                        "deny"
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "maxTokens": {
+              "type": "optional",
+              "inner": {
+                "type": "number"
+              }
+            },
+            "expand_tools": {
+              "type": "optional",
+              "inner": {
+                "type": "record",
+                "key": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "union",
+                  "options": [
+                    {
+                      "type": "string",
+                      "checks": [
+                        {
+                          "check": "custom",
+                          "rule": "historian.expand_tools.*"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "literal",
+                      "values": [
+                        false
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            "opencode": {
+              "type": "optional",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "model": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "union",
+                      "options": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "shape": {
+                            "model": {
+                              "type": "string"
+                            },
+                            "variant": {
+                              "type": "optional",
+                              "inner": {
+                                "type": "string"
+                              }
+                            }
+                          },
+                          "catchall": {
+                            "type": "never"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "fallback_models": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "array",
+                      "element": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "variant": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "catchall": {
+                  "type": "never"
+                }
+              }
+            },
+            "pi": {
+              "type": "optional",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "model": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "union",
+                      "options": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "shape": {
+                            "model": {
+                              "type": "string"
+                            },
+                            "thinking_level": {
+                              "type": "optional",
+                              "inner": {
+                                "type": "enum",
+                                "values": [
+                                  "off",
+                                  "minimal",
+                                  "low",
+                                  "medium",
+                                  "high",
+                                  "xhigh",
+                                  "max"
+                                ]
+                              }
+                            }
+                          },
+                          "catchall": {
+                            "type": "never"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "fallback_models": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "array",
+                      "element": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "thinking_level": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "enum",
+                                  "values": [
+                                    "off",
+                                    "minimal",
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max"
+                                  ]
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "thinking_level": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "off",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max"
+                      ]
+                    }
+                  }
+                },
+                "catchall": {
+                  "type": "never"
+                }
+              }
+            },
+            "omp": {
+              "type": "optional",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "model": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "union",
+                      "options": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "shape": {
+                            "model": {
+                              "type": "string"
+                            },
+                            "thinking_level": {
+                              "type": "optional",
+                              "inner": {
+                                "type": "enum",
+                                "values": [
+                                  "off",
+                                  "minimal",
+                                  "low",
+                                  "medium",
+                                  "high",
+                                  "xhigh",
+                                  "max",
+                                  "inherit",
+                                  "auto"
+                                ]
+                              }
+                            }
+                          },
+                          "catchall": {
+                            "type": "never"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "fallback_models": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "array",
+                      "element": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "thinking_level": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "enum",
+                                  "values": [
+                                    "off",
+                                    "minimal",
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max",
+                                    "inherit",
+                                    "auto"
+                                  ]
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "thinking_level": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "off",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max",
+                        "inherit",
+                        "auto"
+                      ]
+                    }
+                  }
+                },
+                "catchall": {
+                  "type": "never"
+                }
+              }
+            },
+            "runner": {
+              "type": "optional",
+              "inner": {
+                "type": "enum",
+                "values": [
+                  "broca",
+                  "host"
+                ]
+              }
+            },
+            "host_runner": {
+              "type": "optional",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "enabled": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            },
+            "two_pass": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": false
+            },
+            "disallowed_tools": {
+              "type": "default",
+              "inner": {
+                "type": "array",
+                "element": {
+                  "type": "enum",
+                  "values": [
+                    "*",
+                    "read",
+                    "aft_outline",
+                    "aft_zoom",
+                    "aft_search"
+                  ]
+                }
+              },
+              "value": []
+            }
+          }
+        }
+      },
+      "dreamer": {
+        "type": "optional",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "temperature": {
+              "type": "optional",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 0,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 2,
+                    "inclusive": true
+                  }
+                ]
+              }
+            },
+            "top_p": {
+              "type": "optional",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 0,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 1,
+                    "inclusive": true
+                  }
+                ]
+              }
+            },
+            "prompt": {
+              "type": "optional",
+              "inner": {
+                "type": "string"
+              }
+            },
+            "tools": {
+              "type": "optional",
+              "inner": {
+                "type": "record",
+                "key": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "disable": {
+              "type": "optional",
+              "inner": {
+                "type": "boolean"
+              }
+            },
+            "description": {
+              "type": "optional",
+              "inner": {
+                "type": "string"
+              }
+            },
+            "mode": {
+              "type": "optional",
+              "inner": {
+                "type": "enum",
+                "values": [
+                  "subagent",
+                  "primary",
+                  "all"
+                ]
+              }
+            },
+            "color": {
+              "type": "optional",
+              "inner": {
+                "type": "string",
+                "checks": [
+                  {
+                    "check": "string_format",
+                    "format": "regex",
+                    "pattern": "^#[0-9A-Fa-f]{6}$"
+                  }
+                ]
+              }
+            },
+            "maxSteps": {
+              "type": "optional",
+              "inner": {
+                "type": "number"
+              }
+            },
+            "permission": {
+              "type": "optional",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "edit": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "ask",
+                        "allow",
+                        "deny"
+                      ]
+                    }
+                  },
+                  "bash": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "union",
+                      "options": [
+                        {
+                          "type": "enum",
+                          "values": [
+                            "ask",
+                            "allow",
+                            "deny"
+                          ]
+                        },
+                        {
+                          "type": "record",
+                          "key": {
+                            "type": "string"
+                          },
+                          "value": {
+                            "type": "enum",
+                            "values": [
+                              "ask",
+                              "allow",
+                              "deny"
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "webfetch": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "ask",
+                        "allow",
+                        "deny"
+                      ]
+                    }
+                  },
+                  "doom_loop": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "ask",
+                        "allow",
+                        "deny"
+                      ]
+                    }
+                  },
+                  "external_directory": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "ask",
+                        "allow",
+                        "deny"
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "maxTokens": {
+              "type": "optional",
+              "inner": {
+                "type": "number"
+              }
+            },
+            "runner": {
+              "type": "optional",
+              "inner": {
+                "type": "enum",
+                "values": [
+                  "broca",
+                  "host"
+                ]
+              }
+            },
+            "opencode": {
+              "type": "optional",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "model": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "union",
+                      "options": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "shape": {
+                            "model": {
+                              "type": "string"
+                            },
+                            "variant": {
+                              "type": "optional",
+                              "inner": {
+                                "type": "string"
+                              }
+                            }
+                          },
+                          "catchall": {
+                            "type": "never"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "fallback_models": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "array",
+                      "element": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "variant": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "string"
+                    }
+                  },
+                  "tasks": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "record",
+                      "key": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "object",
+                        "shape": {
+                          "model": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "union",
+                              "options": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "object",
+                                  "shape": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "variant": {
+                                      "type": "optional",
+                                      "inner": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  },
+                                  "catchall": {
+                                    "type": "never"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "fallback_models": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "array",
+                              "element": {
+                                "type": "union",
+                                "options": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "shape": {
+                                      "model": {
+                                        "type": "string"
+                                      },
+                                      "variant": {
+                                        "type": "optional",
+                                        "inner": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    },
+                                    "catchall": {
+                                      "type": "never"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "variant": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "string"
+                            }
+                          },
+                          "timeout_minutes": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "number",
+                              "checks": [
+                                {
+                                  "check": "greater_than",
+                                  "value": 5,
+                                  "inclusive": true
+                                }
+                              ]
+                            }
+                          }
+                        },
+                        "catchall": {
+                          "type": "never"
+                        }
+                      }
+                    }
+                  }
+                },
+                "catchall": {
+                  "type": "never"
+                }
+              }
+            },
+            "pi": {
+              "type": "optional",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "model": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "union",
+                      "options": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "shape": {
+                            "model": {
+                              "type": "string"
+                            },
+                            "thinking_level": {
+                              "type": "optional",
+                              "inner": {
+                                "type": "enum",
+                                "values": [
+                                  "off",
+                                  "minimal",
+                                  "low",
+                                  "medium",
+                                  "high",
+                                  "xhigh",
+                                  "max"
+                                ]
+                              }
+                            }
+                          },
+                          "catchall": {
+                            "type": "never"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "fallback_models": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "array",
+                      "element": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "thinking_level": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "enum",
+                                  "values": [
+                                    "off",
+                                    "minimal",
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max"
+                                  ]
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "thinking_level": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "off",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max"
+                      ]
+                    }
+                  },
+                  "tasks": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "record",
+                      "key": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "object",
+                        "shape": {
+                          "model": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "union",
+                              "options": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "object",
+                                  "shape": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "thinking_level": {
+                                      "type": "optional",
+                                      "inner": {
+                                        "type": "enum",
+                                        "values": [
+                                          "off",
+                                          "minimal",
+                                          "low",
+                                          "medium",
+                                          "high",
+                                          "xhigh",
+                                          "max"
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  "catchall": {
+                                    "type": "never"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "fallback_models": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "array",
+                              "element": {
+                                "type": "union",
+                                "options": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "shape": {
+                                      "model": {
+                                        "type": "string"
+                                      },
+                                      "thinking_level": {
+                                        "type": "optional",
+                                        "inner": {
+                                          "type": "enum",
+                                          "values": [
+                                            "off",
+                                            "minimal",
+                                            "low",
+                                            "medium",
+                                            "high",
+                                            "xhigh",
+                                            "max"
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    "catchall": {
+                                      "type": "never"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "thinking_level": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "enum",
+                              "values": [
+                                "off",
+                                "minimal",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                                "max"
+                              ]
+                            }
+                          },
+                          "timeout_minutes": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "number",
+                              "checks": [
+                                {
+                                  "check": "greater_than",
+                                  "value": 5,
+                                  "inclusive": true
+                                }
+                              ]
+                            }
+                          }
+                        },
+                        "catchall": {
+                          "type": "never"
+                        }
+                      }
+                    }
+                  }
+                },
+                "catchall": {
+                  "type": "never"
+                }
+              }
+            },
+            "omp": {
+              "type": "optional",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "model": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "union",
+                      "options": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "shape": {
+                            "model": {
+                              "type": "string"
+                            },
+                            "thinking_level": {
+                              "type": "optional",
+                              "inner": {
+                                "type": "enum",
+                                "values": [
+                                  "off",
+                                  "minimal",
+                                  "low",
+                                  "medium",
+                                  "high",
+                                  "xhigh",
+                                  "max",
+                                  "inherit",
+                                  "auto"
+                                ]
+                              }
+                            }
+                          },
+                          "catchall": {
+                            "type": "never"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "fallback_models": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "array",
+                      "element": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "thinking_level": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "enum",
+                                  "values": [
+                                    "off",
+                                    "minimal",
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max",
+                                    "inherit",
+                                    "auto"
+                                  ]
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "thinking_level": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "enum",
+                      "values": [
+                        "off",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max",
+                        "inherit",
+                        "auto"
+                      ]
+                    }
+                  },
+                  "tasks": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "record",
+                      "key": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "object",
+                        "shape": {
+                          "model": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "union",
+                              "options": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "object",
+                                  "shape": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "thinking_level": {
+                                      "type": "optional",
+                                      "inner": {
+                                        "type": "enum",
+                                        "values": [
+                                          "off",
+                                          "minimal",
+                                          "low",
+                                          "medium",
+                                          "high",
+                                          "xhigh",
+                                          "max",
+                                          "inherit",
+                                          "auto"
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  "catchall": {
+                                    "type": "never"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "fallback_models": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "array",
+                              "element": {
+                                "type": "union",
+                                "options": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "shape": {
+                                      "model": {
+                                        "type": "string"
+                                      },
+                                      "thinking_level": {
+                                        "type": "optional",
+                                        "inner": {
+                                          "type": "enum",
+                                          "values": [
+                                            "off",
+                                            "minimal",
+                                            "low",
+                                            "medium",
+                                            "high",
+                                            "xhigh",
+                                            "max",
+                                            "inherit",
+                                            "auto"
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    "catchall": {
+                                      "type": "never"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "thinking_level": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "enum",
+                              "values": [
+                                "off",
+                                "minimal",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                                "max",
+                                "inherit",
+                                "auto"
+                              ]
+                            }
+                          },
+                          "timeout_minutes": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "number",
+                              "checks": [
+                                {
+                                  "check": "greater_than",
+                                  "value": 5,
+                                  "inclusive": true
+                                }
+                              ]
+                            }
+                          }
+                        },
+                        "catchall": {
+                          "type": "never"
+                        }
+                      }
+                    }
+                  }
+                },
+                "catchall": {
+                  "type": "never"
+                }
+              }
+            },
+            "tasks": {
+              "type": "default",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "map-memories": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.map-memories.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 2 * * *"
+                    }
+                  },
+                  "verify": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.verify.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 3 * * *"
+                    }
+                  },
+                  "verify-broad": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.verify-broad.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 4 * * 0"
+                    }
+                  },
+                  "curate": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.curate.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 4 * * 0"
+                    }
+                  },
+                  "compress-cues": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.compress-cues.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 4 * * *"
+                    }
+                  },
+                  "classify-memories": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.classify-memories.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 6 * * *"
+                    }
+                  },
+                  "retrospective": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.retrospective.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        },
+                        "recency_days": {
+                          "type": "default",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 1,
+                                "inclusive": true
+                              },
+                              {
+                                "check": "less_than",
+                                "value": 3650,
+                                "inclusive": true
+                              }
+                            ]
+                          },
+                          "value": 30
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 5 * * *",
+                      "recency_days": 30
+                    }
+                  },
+                  "maintain-docs": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.maintain-docs.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        },
+                        "max_tokens": {
+                          "type": "default",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          },
+                          "value": 12000
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "",
+                      "max_tokens": 12000
+                    }
+                  },
+                  "evaluate-smart-notes": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.evaluate-smart-notes.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 3 * * *"
+                    }
+                  },
+                  "review-user-memories": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.review-user-memories.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        },
+                        "promotion_threshold": {
+                          "type": "default",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "check": "greater_than",
+                                "value": 2,
+                                "inclusive": true
+                              },
+                              {
+                                "check": "less_than",
+                                "value": 20,
+                                "inclusive": true
+                              }
+                            ]
+                          },
+                          "value": 3
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 3 * * *",
+                      "promotion_threshold": 3
+                    }
+                  },
+                  "promote-primers": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.promote-primers.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        },
+                        "promotion_threshold": {
+                          "type": "default",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "check": "greater_than",
+                                "value": 2,
+                                "inclusive": true
+                              },
+                              {
+                                "check": "less_than",
+                                "value": 20,
+                                "inclusive": true
+                              }
+                            ]
+                          },
+                          "value": 2
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 3 * * *",
+                      "promotion_threshold": 2
+                    }
+                  },
+                  "refresh-primers": {
+                    "type": "default",
+                    "inner": {
+                      "type": "object",
+                      "shape": {
+                        "schedule": {
+                          "type": "default",
+                          "inner": {
+                            "type": "string",
+                            "checks": [
+                              {
+                                "check": "custom",
+                                "rule": "dreamer.tasks.refresh-primers.schedule"
+                              }
+                            ]
+                          },
+                          "value": ""
+                        },
+                        "token_budget": {
+                          "type": "optional",
+                          "inner": {
+                            "type": "number",
+                            "checks": [
+                              {
+                                "type": "number",
+                                "check": "number_format",
+                                "abort": false,
+                                "format": "safeint"
+                              },
+                              {
+                                "check": "greater_than",
+                                "value": 0,
+                                "inclusive": false
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "catchall": {
+                        "type": "never"
+                      }
+                    },
+                    "value": {
+                      "schedule": "0 3 * * *"
+                    }
+                  }
+                }
+              },
+              "value": {
+                "map-memories": {
+                  "schedule": "0 2 * * *"
+                },
+                "verify": {
+                  "schedule": "0 3 * * *"
+                },
+                "verify-broad": {
+                  "schedule": "0 4 * * 0"
+                },
+                "curate": {
+                  "schedule": "0 4 * * 0"
+                },
+                "compress-cues": {
+                  "schedule": "0 4 * * *"
+                },
+                "classify-memories": {
+                  "schedule": "0 6 * * *"
+                },
+                "retrospective": {
+                  "schedule": "0 5 * * *",
+                  "recency_days": 30
+                },
+                "maintain-docs": {
+                  "schedule": "",
+                  "max_tokens": 12000
+                },
+                "evaluate-smart-notes": {
+                  "schedule": "0 3 * * *"
+                },
+                "review-user-memories": {
+                  "schedule": "0 3 * * *",
+                  "promotion_threshold": 3
+                },
+                "promote-primers": {
+                  "schedule": "0 3 * * *",
+                  "promotion_threshold": 2
+                },
+                "refresh-primers": {
+                  "schedule": "0 3 * * *"
+                }
+              }
+            },
+            "inject_docs": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": true
+            }
+          }
+        }
+      },
+      "smart_notes": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "enabled": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": true
+            },
+            "retina_handoff": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": false
+            }
+          }
+        },
+        "value": {
+          "enabled": true,
+          "retina_handoff": false
+        }
+      },
+      "cache_ttl": {
+        "type": "default",
+        "inner": {
+          "type": "union",
+          "options": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "shape": {
+                "default": {
+                  "type": "string"
+                }
+              },
+              "catchall": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "value": "5m"
+      },
+      "prompt_surface": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "default": {
+              "type": "default",
+              "inner": {
+                "type": "enum",
+                "values": [
+                  "full",
+                  "light"
+                ]
+              },
+              "value": "full"
+            },
+            "models": {
+              "type": "optional",
+              "inner": {
+                "type": "record",
+                "key": {
+                  "type": "string",
+                  "checks": [
+                    {
+                      "check": "custom",
+                      "rule": "prompt_surface.models#key"
+                    }
+                  ]
+                },
+                "value": {
+                  "type": "enum",
+                  "values": [
+                    "full",
+                    "light"
+                  ]
+                }
+              }
+            },
+            "guidance_override_path": {
+              "type": "optional",
+              "inner": {
+                "type": "string",
+                "checks": [
+                  {
+                    "check": "custom",
+                    "rule": "prompt_surface.guidance_override_path"
+                  }
+                ]
+              }
+            },
+            "tool_descriptions": {
+              "type": "optional",
+              "inner": {
+                "type": "record",
+                "key": {
+                  "type": "string",
+                  "checks": [
+                    {
+                      "check": "custom",
+                      "rule": "prompt_surface.tool_descriptions#key"
+                    }
+                  ]
+                },
+                "value": {
+                  "type": "string",
+                  "checks": [
+                    {
+                      "check": "custom",
+                      "rule": "prompt_surface.tool_descriptions.*"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "value": {
+          "default": "full"
+        }
+      },
+      "output_reserve": {
+        "type": "optional",
+        "inner": {
+          "type": "union",
+          "options": [
+            {
+              "type": "number",
+              "checks": [
+                {
+                  "check": "greater_than",
+                  "value": 0,
+                  "inclusive": true
+                }
+              ]
+            },
+            {
+              "type": "object",
+              "shape": {
+                "default": {
+                  "type": "number",
+                  "checks": [
+                    {
+                      "check": "greater_than",
+                      "value": 0,
+                      "inclusive": true
+                    }
+                  ]
+                }
+              },
+              "catchall": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 0,
+                    "inclusive": true
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "models": {
+        "type": "optional",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "window_overlay_path": {
+              "type": "optional",
+              "inner": {
+                "type": "string",
+                "checks": [
+                  {
+                    "check": "trim"
+                  },
+                  {
+                    "check": "min_length",
+                    "minimum": 1
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "toast_duration_ms": {
+        "type": "default",
+        "inner": {
+          "type": "number",
+          "checks": [
+            {
+              "check": "greater_than",
+              "value": 0,
+              "inclusive": true
+            },
+            {
+              "check": "less_than",
+              "value": 60000,
+              "inclusive": true
+            }
+          ]
+        },
+        "value": 5000
+      },
+      "execute_threshold_percentage": {
+        "type": "default",
+        "inner": {
+          "type": "union",
+          "options": [
+            {
+              "type": "number",
+              "checks": [
+                {
+                  "check": "greater_than",
+                  "value": 20,
+                  "inclusive": true
+                },
+                {
+                  "check": "less_than",
+                  "value": 90,
+                  "inclusive": true
+                }
+              ]
+            },
+            {
+              "type": "object",
+              "shape": {
+                "default": {
+                  "type": "number",
+                  "checks": [
+                    {
+                      "check": "greater_than",
+                      "value": 20,
+                      "inclusive": true
+                    },
+                    {
+                      "check": "less_than",
+                      "value": 90,
+                      "inclusive": true
+                    }
+                  ]
+                }
+              },
+              "catchall": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 20,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 90,
+                    "inclusive": true
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "value": 65
+      },
+      "execute_threshold_tokens": {
+        "type": "optional",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "default": {
+              "type": "optional",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 5000,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 2000000,
+                    "inclusive": true
+                  }
+                ]
+              }
+            }
+          },
+          "catchall": {
+            "type": "number",
+            "checks": [
+              {
+                "check": "greater_than",
+                "value": 5000,
+                "inclusive": true
+              },
+              {
+                "check": "less_than",
+                "value": 2000000,
+                "inclusive": true
+              }
+            ]
+          }
+        }
+      },
+      "protected_tokens": {
+        "type": "optional",
+        "inner": {
+          "type": "number",
+          "checks": [
+            {
+              "type": "number",
+              "check": "number_format",
+              "abort": false,
+              "format": "safeint"
+            },
+            {
+              "check": "greater_than",
+              "value": 4000,
+              "inclusive": true
+            },
+            {
+              "check": "less_than",
+              "value": 1000000,
+              "inclusive": true
+            }
+          ]
+        }
+      },
+      "protected_tags": {
+        "type": "optional",
+        "inner": {
+          "type": "unknown"
+        }
+      },
+      "clear_reasoning_age": {
+        "type": "optional",
+        "inner": {
+          "type": "unknown"
+        }
+      },
+      "keep_reasoning_tokens": {
+        "type": "optional",
+        "inner": {
+          "type": "union",
+          "options": [
+            {
+              "type": "number",
+              "checks": [
+                {
+                  "type": "number",
+                  "check": "number_format",
+                  "abort": false,
+                  "format": "safeint"
+                },
+                {
+                  "check": "greater_than",
+                  "value": 0,
+                  "inclusive": true
+                },
+                {
+                  "check": "less_than",
+                  "value": 1000000,
+                  "inclusive": true
+                }
+              ]
+            },
+            {
+              "type": "object",
+              "shape": {
+                "default": {
+                  "type": "optional",
+                  "inner": {
+                    "type": "number",
+                    "checks": [
+                      {
+                        "type": "number",
+                        "check": "number_format",
+                        "abort": false,
+                        "format": "safeint"
+                      },
+                      {
+                        "check": "greater_than",
+                        "value": 0,
+                        "inclusive": true
+                      },
+                      {
+                        "check": "less_than",
+                        "value": 1000000,
+                        "inclusive": true
+                      }
+                    ]
+                  }
+                }
+              },
+              "catchall": {
+                "type": "number",
+                "checks": [
+                  {
+                    "type": "number",
+                    "check": "number_format",
+                    "abort": false,
+                    "format": "safeint"
+                  },
+                  {
+                    "check": "greater_than",
+                    "value": 0,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 1000000,
+                    "inclusive": true
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "history_budget_percentage": {
+        "type": "default",
+        "inner": {
+          "type": "number",
+          "checks": [
+            {
+              "check": "greater_than",
+              "value": 0.05,
+              "inclusive": true
+            },
+            {
+              "check": "less_than",
+              "value": 0.5,
+              "inclusive": true
+            }
+          ]
+        },
+        "value": 0.15
+      },
+      "historian_timeout_ms": {
+        "type": "default",
+        "inner": {
+          "type": "number",
+          "checks": [
+            {
+              "check": "greater_than",
+              "value": 60000,
+              "inclusive": true
+            }
+          ]
+        },
+        "value": 600000
+      },
+      "commit_cluster_trigger": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "enabled": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": true
+            },
+            "min_clusters": {
+              "type": "default",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 1,
+                    "inclusive": true
+                  }
+                ]
+              },
+              "value": 3
+            }
+          }
+        },
+        "value": {
+          "enabled": true,
+          "min_clusters": 3
+        }
+      },
+      "system_prompt_injection": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "enabled": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": true
+            },
+            "skip_signatures": {
+              "type": "default",
+              "inner": {
+                "type": "array",
+                "element": {
+                  "type": "string"
+                }
+              },
+              "value": [
+                "<!-- magic-context: skip -->"
+              ]
+            }
+          }
+        },
+        "value": {
+          "enabled": true,
+          "skip_signatures": [
+            "<!-- magic-context: skip -->"
+          ]
+        }
+      },
+      "sqlite": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "cache_size_mb": {
+              "type": "default",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 2,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 2048,
+                    "inclusive": true
+                  }
+                ]
+              },
+              "value": 64
+            },
+            "mmap_size_mb": {
+              "type": "default",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 0,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 8192,
+                    "inclusive": true
+                  }
+                ]
+              },
+              "value": 0
+            }
+          }
+        },
+        "value": {
+          "cache_size_mb": 64,
+          "mmap_size_mb": 0
+        }
+      },
+      "storage": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "enforce_private_permissions": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": true
+            }
+          }
+        },
+        "value": {
+          "enforce_private_permissions": true
+        }
+      },
+      "embedding": {
+        "type": "default",
+        "inner": {
+          "type": "transform",
+          "rule": "embedding",
+          "inner": {
+            "type": "object",
+            "shape": {
+              "provider": {
+                "type": "default",
+                "inner": {
+                  "type": "enum",
+                  "values": [
+                    "local",
+                    "openai-compatible",
+                    "off",
+                    "synapse"
+                  ]
+                },
+                "value": "local"
+              },
+              "fallback_provider": {
+                "type": "optional",
+                "inner": {
+                  "type": "enum",
+                  "values": [
+                    "local",
+                    "openai-compatible",
+                    "off"
+                  ]
+                }
+              },
+              "model": {
+                "type": "optional",
+                "inner": {
+                  "type": "string"
+                }
+              },
+              "endpoint": {
+                "type": "optional",
+                "inner": {
+                  "type": "string"
+                }
+              },
+              "api_key": {
+                "type": "optional",
+                "inner": {
+                  "type": "string"
+                }
+              },
+              "input_type": {
+                "type": "optional",
+                "inner": {
+                  "type": "string"
+                }
+              },
+              "query_input_type": {
+                "type": "optional",
+                "inner": {
+                  "type": "string"
+                }
+              },
+              "query_instruction": {
+                "type": "optional",
+                "inner": {
+                  "type": "union",
+                  "options": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "literal",
+                      "values": [
+                        false
+                      ]
+                    }
+                  ]
+                }
+              },
+              "document_prefix": {
+                "type": "optional",
+                "inner": {
+                  "type": "string"
+                }
+              },
+              "truncate": {
+                "type": "optional",
+                "inner": {
+                  "type": "string"
+                }
+              },
+              "max_input_tokens": {
+                "type": "optional",
+                "inner": {
+                  "type": "number",
+                  "checks": [
+                    {
+                      "type": "number",
+                      "check": "number_format",
+                      "abort": false,
+                      "format": "safeint"
+                    },
+                    {
+                      "check": "greater_than",
+                      "value": 0,
+                      "inclusive": false
+                    }
+                  ]
+                }
+              },
+              "local_runtime": {
+                "type": "default",
+                "inner": {
+                  "type": "enum",
+                  "values": [
+                    "auto",
+                    "native",
+                    "wasm"
+                  ]
+                },
+                "value": "auto"
+              },
+              "local_dtype": {
+                "type": "optional",
+                "inner": {
+                  "type": "enum",
+                  "values": [
+                    "auto",
+                    "fp32",
+                    "fp16",
+                    "q8",
+                    "int8",
+                    "uint8",
+                    "q4",
+                    "bnb4",
+                    "q4f16",
+                    "q2",
+                    "q2f16",
+                    "q1",
+                    "q1f16"
+                  ]
+                }
+              }
+            },
+            "checks": [
+              {
+                "check": "custom",
+                "rule": "embedding"
+              }
+            ]
+          }
+        },
+        "value": {
+          "provider": "local",
+          "model": "Xenova/all-MiniLM-L6-v2",
+          "local_runtime": "auto"
+        }
+      },
+      "subc": {
+        "type": "optional",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "connection_file": {
+              "type": "transform",
+              "rule": "subc.connection_file",
+              "inner": {
+                "type": "string",
+                "checks": [
+                  {
+                    "check": "trim"
+                  },
+                  {
+                    "check": "min_length",
+                    "minimum": 1
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "shadow_embedding": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "enabled": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": false
+            }
+          }
+        },
+        "value": {
+          "enabled": false
+        }
+      },
+      "temporal_awareness": {
+        "type": "default",
+        "inner": {
+          "type": "boolean"
+        },
+        "value": true
+      },
+      "keep_subagents": {
+        "type": "default",
+        "inner": {
+          "type": "boolean"
+        },
+        "value": false
+      },
+      "debug_rpc": {
+        "type": "default",
+        "inner": {
+          "type": "boolean"
+        },
+        "value": false
+      },
+      "fail_closed_blocking": {
+        "type": "default",
+        "inner": {
+          "type": "boolean"
+        },
+        "value": true
+      },
+      "compaction": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "enabled": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": true
+            }
+          }
+        },
+        "value": {
+          "enabled": true
+        }
+      },
+      "todowrite": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "enabled": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": false
+            },
+            "overlay": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": true
+            }
+          }
+        },
+        "value": {
+          "enabled": false,
+          "overlay": true
+        }
+      },
+      "pi": {
+        "type": "optional",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "subagent_extensions": {
+              "type": "optional",
+              "inner": {
+                "type": "array",
+                "element": {
+                  "type": "string",
+                  "checks": [
+                    {
+                      "check": "trim"
+                    },
+                    {
+                      "check": "min_length",
+                      "minimum": 1
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "smart_drops": {
+        "type": "optional",
+        "inner": {
+          "type": "unknown"
+        }
+      },
+      "protected_tools": {
+        "type": "transform",
+        "rule": "protected_tools",
+        "inner": {
+          "type": "default",
+          "inner": {
+            "type": "record",
+            "key": {
+              "type": "string"
+            },
+            "value": {
+              "type": "number",
+              "checks": [
+                {
+                  "type": "number",
+                  "check": "number_format",
+                  "abort": false,
+                  "format": "safeint"
+                },
+                {
+                  "check": "greater_than",
+                  "value": 0,
+                  "inclusive": true
+                }
+              ]
+            }
+          },
+          "value": {
+            "todowrite": 1,
+            "ctx_reduce": 3
+          }
+        }
+      },
+      "caveman_text_compression": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "enabled": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": false
+            },
+            "min_chars": {
+              "type": "default",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 100,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 10000,
+                    "inclusive": true
+                  }
+                ]
+              },
+              "value": 500
+            }
+          }
+        },
+        "value": {
+          "enabled": false,
+          "min_chars": 500
+        }
+      },
+      "memory": {
+        "type": "default",
+        "inner": {
+          "type": "object",
+          "shape": {
+            "enabled": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": true
+            },
+            "injection_budget_tokens": {
+              "type": "default",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 500,
+                    "inclusive": true
+                  },
+                  {
+                    "check": "less_than",
+                    "value": 20000,
+                    "inclusive": true
+                  }
+                ]
+              },
+              "value": 4000
+            },
+            "auto_promote": {
+              "type": "default",
+              "inner": {
+                "type": "boolean"
+              },
+              "value": true
+            },
+            "retrieval_count_promotion_threshold": {
+              "type": "default",
+              "inner": {
+                "type": "number",
+                "checks": [
+                  {
+                    "check": "greater_than",
+                    "value": 1,
+                    "inclusive": true
+                  }
+                ]
+              },
+              "value": 3
+            },
+            "auto_search": {
+              "type": "default",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "enabled": {
+                    "type": "default",
+                    "inner": {
+                      "type": "boolean"
+                    },
+                    "value": true
+                  },
+                  "score_threshold": {
+                    "type": "default",
+                    "inner": {
+                      "type": "number",
+                      "checks": [
+                        {
+                          "check": "greater_than",
+                          "value": 0.3,
+                          "inclusive": true
+                        },
+                        {
+                          "check": "less_than",
+                          "value": 0.95,
+                          "inclusive": true
+                        }
+                      ]
+                    },
+                    "value": 0.6
+                  },
+                  "min_prompt_chars": {
+                    "type": "default",
+                    "inner": {
+                      "type": "number",
+                      "checks": [
+                        {
+                          "check": "greater_than",
+                          "value": 5,
+                          "inclusive": true
+                        },
+                        {
+                          "check": "less_than",
+                          "value": 500,
+                          "inclusive": true
+                        }
+                      ]
+                    },
+                    "value": 20
+                  }
+                }
+              },
+              "value": {
+                "enabled": true,
+                "score_threshold": 0.6,
+                "min_prompt_chars": 20
+              }
+            },
+            "git_commit_indexing": {
+              "type": "default",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "enabled": {
+                    "type": "default",
+                    "inner": {
+                      "type": "boolean"
+                    },
+                    "value": false
+                  },
+                  "since_days": {
+                    "type": "default",
+                    "inner": {
+                      "type": "number",
+                      "checks": [
+                        {
+                          "check": "greater_than",
+                          "value": 7,
+                          "inclusive": true
+                        },
+                        {
+                          "check": "less_than",
+                          "value": 3650,
+                          "inclusive": true
+                        }
+                      ]
+                    },
+                    "value": 365
+                  },
+                  "max_commits": {
+                    "type": "default",
+                    "inner": {
+                      "type": "number",
+                      "checks": [
+                        {
+                          "check": "greater_than",
+                          "value": 100,
+                          "inclusive": true
+                        },
+                        {
+                          "check": "less_than",
+                          "value": 20000,
+                          "inclusive": true
+                        }
+                      ]
+                    },
+                    "value": 2000
+                  }
+                }
+              },
+              "value": {
+                "enabled": false,
+                "since_days": 365,
+                "max_commits": 2000
+              }
+            }
+          }
+        },
+        "value": {
+          "enabled": true,
+          "injection_budget_tokens": 4000,
+          "auto_promote": true,
+          "retrieval_count_promotion_threshold": 3,
+          "auto_search": {
+            "enabled": true,
+            "score_threshold": 0.6,
+            "min_prompt_chars": 20
+          },
+          "git_commit_indexing": {
+            "enabled": false,
+            "since_days": 365,
+            "max_commits": 2000
+          }
+        }
+      }
+    }
+  },
+  "profiles": {
+    "type": "record",
+    "key": {
+      "type": "string",
+      "checks": [
+        {
+          "check": "trim"
+        },
+        {
+          "check": "min_length",
+          "minimum": 1
+        }
+      ]
+    },
+    "value": {
+      "type": "object",
+      "shape": {
+        "historian": {
+          "type": "optional",
+          "inner": {
+            "type": "object",
+            "shape": {
+              "opencode": {
+                "type": "optional",
+                "inner": {
+                  "type": "object",
+                  "shape": {
+                    "model": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "fallback_models": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "array",
+                        "element": {
+                          "type": "union",
+                          "options": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "object",
+                              "shape": {
+                                "model": {
+                                  "type": "string"
+                                },
+                                "variant": {
+                                  "type": "optional",
+                                  "inner": {
+                                    "type": "string"
+                                  }
+                                }
+                              },
+                              "catchall": {
+                                "type": "never"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "variant": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "catchall": {
+                    "type": "never"
+                  }
+                }
+              },
+              "pi": {
+                "type": "optional",
+                "inner": {
+                  "type": "object",
+                  "shape": {
+                    "model": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "thinking_level": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "enum",
+                                  "values": [
+                                    "off",
+                                    "minimal",
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max"
+                                  ]
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "fallback_models": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "array",
+                        "element": {
+                          "type": "union",
+                          "options": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "object",
+                              "shape": {
+                                "model": {
+                                  "type": "string"
+                                },
+                                "thinking_level": {
+                                  "type": "optional",
+                                  "inner": {
+                                    "type": "enum",
+                                    "values": [
+                                      "off",
+                                      "minimal",
+                                      "low",
+                                      "medium",
+                                      "high",
+                                      "xhigh",
+                                      "max"
+                                    ]
+                                  }
+                                }
+                              },
+                              "catchall": {
+                                "type": "never"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "thinking_level": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "enum",
+                        "values": [
+                          "off",
+                          "minimal",
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max"
+                        ]
+                      }
+                    }
+                  },
+                  "catchall": {
+                    "type": "never"
+                  }
+                }
+              },
+              "omp": {
+                "type": "optional",
+                "inner": {
+                  "type": "object",
+                  "shape": {
+                    "model": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "thinking_level": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "enum",
+                                  "values": [
+                                    "off",
+                                    "minimal",
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max",
+                                    "inherit",
+                                    "auto"
+                                  ]
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "fallback_models": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "array",
+                        "element": {
+                          "type": "union",
+                          "options": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "object",
+                              "shape": {
+                                "model": {
+                                  "type": "string"
+                                },
+                                "thinking_level": {
+                                  "type": "optional",
+                                  "inner": {
+                                    "type": "enum",
+                                    "values": [
+                                      "off",
+                                      "minimal",
+                                      "low",
+                                      "medium",
+                                      "high",
+                                      "xhigh",
+                                      "max",
+                                      "inherit",
+                                      "auto"
+                                    ]
+                                  }
+                                }
+                              },
+                              "catchall": {
+                                "type": "never"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "thinking_level": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "enum",
+                        "values": [
+                          "off",
+                          "minimal",
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max",
+                          "inherit",
+                          "auto"
+                        ]
+                      }
+                    }
+                  },
+                  "catchall": {
+                    "type": "never"
+                  }
+                }
+              }
+            },
+            "catchall": {
+              "type": "never"
+            }
+          }
+        },
+        "dreamer": {
+          "type": "optional",
+          "inner": {
+            "type": "object",
+            "shape": {
+              "opencode": {
+                "type": "optional",
+                "inner": {
+                  "type": "object",
+                  "shape": {
+                    "model": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "fallback_models": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "array",
+                        "element": {
+                          "type": "union",
+                          "options": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "object",
+                              "shape": {
+                                "model": {
+                                  "type": "string"
+                                },
+                                "variant": {
+                                  "type": "optional",
+                                  "inner": {
+                                    "type": "string"
+                                  }
+                                }
+                              },
+                              "catchall": {
+                                "type": "never"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "variant": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "catchall": {
+                    "type": "never"
+                  }
+                }
+              },
+              "pi": {
+                "type": "optional",
+                "inner": {
+                  "type": "object",
+                  "shape": {
+                    "model": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "thinking_level": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "enum",
+                                  "values": [
+                                    "off",
+                                    "minimal",
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max"
+                                  ]
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "fallback_models": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "array",
+                        "element": {
+                          "type": "union",
+                          "options": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "object",
+                              "shape": {
+                                "model": {
+                                  "type": "string"
+                                },
+                                "thinking_level": {
+                                  "type": "optional",
+                                  "inner": {
+                                    "type": "enum",
+                                    "values": [
+                                      "off",
+                                      "minimal",
+                                      "low",
+                                      "medium",
+                                      "high",
+                                      "xhigh",
+                                      "max"
+                                    ]
+                                  }
+                                }
+                              },
+                              "catchall": {
+                                "type": "never"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "thinking_level": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "enum",
+                        "values": [
+                          "off",
+                          "minimal",
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max"
+                        ]
+                      }
+                    }
+                  },
+                  "catchall": {
+                    "type": "never"
+                  }
+                }
+              },
+              "omp": {
+                "type": "optional",
+                "inner": {
+                  "type": "object",
+                  "shape": {
+                    "model": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "thinking_level": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "enum",
+                                  "values": [
+                                    "off",
+                                    "minimal",
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max",
+                                    "inherit",
+                                    "auto"
+                                  ]
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "fallback_models": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "array",
+                        "element": {
+                          "type": "union",
+                          "options": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "object",
+                              "shape": {
+                                "model": {
+                                  "type": "string"
+                                },
+                                "thinking_level": {
+                                  "type": "optional",
+                                  "inner": {
+                                    "type": "enum",
+                                    "values": [
+                                      "off",
+                                      "minimal",
+                                      "low",
+                                      "medium",
+                                      "high",
+                                      "xhigh",
+                                      "max",
+                                      "inherit",
+                                      "auto"
+                                    ]
+                                  }
+                                }
+                              },
+                              "catchall": {
+                                "type": "never"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "thinking_level": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "enum",
+                        "values": [
+                          "off",
+                          "minimal",
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max",
+                          "inherit",
+                          "auto"
+                        ]
+                      }
+                    }
+                  },
+                  "catchall": {
+                    "type": "never"
+                  }
+                }
+              }
+            },
+            "catchall": {
+              "type": "never"
+            }
+          }
+        }
+      },
+      "catchall": {
+        "type": "never"
+      }
+    }
+  },
+  "languages": [
+    "aa",
+    "ab",
+    "ae",
+    "af",
+    "ak",
+    "am",
+    "an",
+    "ar",
+    "as",
+    "av",
+    "ay",
+    "az",
+    "ba",
+    "be",
+    "bg",
+    "bh",
+    "bi",
+    "bm",
+    "bn",
+    "bo",
+    "br",
+    "bs",
+    "ca",
+    "ce",
+    "ch",
+    "co",
+    "cr",
+    "cs",
+    "cu",
+    "cv",
+    "cy",
+    "da",
+    "de",
+    "dv",
+    "dz",
+    "ee",
+    "el",
+    "en",
+    "eo",
+    "es",
+    "et",
+    "eu",
+    "fa",
+    "ff",
+    "fi",
+    "fj",
+    "fo",
+    "fr",
+    "fy",
+    "ga",
+    "gd",
+    "gl",
+    "gn",
+    "gu",
+    "gv",
+    "ha",
+    "he",
+    "hi",
+    "ho",
+    "hr",
+    "ht",
+    "hu",
+    "hy",
+    "hz",
+    "ia",
+    "id",
+    "ie",
+    "ig",
+    "ii",
+    "ik",
+    "in",
+    "io",
+    "is",
+    "it",
+    "iu",
+    "iw",
+    "ja",
+    "ji",
+    "jv",
+    "jw",
+    "ka",
+    "kg",
+    "ki",
+    "kj",
+    "kk",
+    "kl",
+    "km",
+    "kn",
+    "ko",
+    "kr",
+    "ks",
+    "ku",
+    "kv",
+    "kw",
+    "ky",
+    "la",
+    "lb",
+    "lg",
+    "li",
+    "ln",
+    "lo",
+    "lt",
+    "lu",
+    "lv",
+    "mg",
+    "mh",
+    "mi",
+    "mk",
+    "ml",
+    "mn",
+    "mo",
+    "mr",
+    "ms",
+    "mt",
+    "my",
+    "na",
+    "nb",
+    "nd",
+    "ne",
+    "ng",
+    "nl",
+    "nn",
+    "no",
+    "nr",
+    "nv",
+    "ny",
+    "oc",
+    "oj",
+    "om",
+    "or",
+    "os",
+    "pa",
+    "pi",
+    "pl",
+    "ps",
+    "pt",
+    "qu",
+    "rm",
+    "rn",
+    "ro",
+    "ru",
+    "rw",
+    "sa",
+    "sc",
+    "sd",
+    "se",
+    "sg",
+    "sh",
+    "si",
+    "sk",
+    "sl",
+    "sm",
+    "sn",
+    "so",
+    "sq",
+    "sr",
+    "ss",
+    "st",
+    "su",
+    "sv",
+    "sw",
+    "ta",
+    "te",
+    "tg",
+    "th",
+    "ti",
+    "tk",
+    "tl",
+    "tn",
+    "to",
+    "tr",
+    "ts",
+    "tt",
+    "tw",
+    "ty",
+    "ug",
+    "uk",
+    "ur",
+    "uz",
+    "ve",
+    "vi",
+    "vo",
+    "wa",
+    "wo",
+    "xh",
+    "yi",
+    "yo",
+    "za",
+    "zh",
+    "zu"
+  ],
+  "commands": [
+    "ctx-status",
+    "ctx-recomp",
+    "ctx-wrapup",
+    "ctx-flush",
+    "ctx-dream",
+    "ctx-embed"
+  ]
+}
