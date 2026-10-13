@@ -1,0 +1,23 @@
+--- a/crates/mc-module/src/lib.rs
++++ b/crates/mc-module/src/lib.rs
+@@ -14530,8 +14530,18 @@
+                         false,
+                     );
+                 }
+-                let limit = usize_arg(args, "limit").unwrap_or(25).clamp(1, 100);
+-                let offset = usize_arg(args, "offset").unwrap_or(0);
++                let limit = args
++                    .get("limit")
++                    .and_then(Value::as_f64)
++                    .filter(|value| *value > 0.0)
++                    .map(|value| value.floor() as usize)
++                    .unwrap_or(25);
++                let offset = args
++                    .get("offset")
++                    .and_then(Value::as_f64)
++                    .filter(|value| *value > 0.0)
++                    .map(|value| value.floor() as usize)
++                    .unwrap_or(0);
+                 // The default view is the tray: active session notes plus the
+                 // smart notes that are ready or still parked. An explicit filter
+                 // applies the same statuses to both types.

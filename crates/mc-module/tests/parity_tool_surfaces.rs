@@ -1,0 +1,304 @@
+//! Byte parity with real TypeScript builders, independently of Rust's assets.
+use std::sync::OnceLock;
+
+use mc_module::config::McModuleConfig;
+use mc_module::prompt_surface::{
+    catalog_for_config, compose_guidance, guidance_asset, primary_language_directive,
+    session_tools_for_config, GuidanceVariant, PromptSurfacePreset, PromptSurfaceSelection,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+#[derive(Deserialize)]
+struct ToolCase {
+    preset: PromptSurfacePreset,
+    smart: bool,
+    tools: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct Language {
+    code: String,
+    directive: String,
+}
+
+#[derive(Deserialize)]
+struct Extra {
+    mask: usize,
+    preset: PromptSurfacePreset,
+    language: String,
+    denied: bool,
+    #[serde(rename = "override")]
+    primary_override: Option<String>,
+    text: [usize; 2],
+}
+
+#[derive(Deserialize)]
+struct Golden {
+    tools: Vec<ToolCase>,
+    languages: Vec<Language>,
+    rejected: Vec<String>,
+    strings: Vec<String>,
+    guidance_cases: Vec<[usize; 5]>,
+    extras: Vec<Extra>,
+}
+
+fn golden() -> &'static Golden {
+    static GOLDEN: OnceLock<Golden> = OnceLock::new();
+    GOLDEN.get_or_init(|| {
+        serde_json::from_str(include_str!("../testdata/tool_surfaces/golden.json")).unwrap()
+    })
+}
+
+fn config(mask: usize, language: &str, preset: PromptSurfacePreset) -> McModuleConfig {
+    let on = |bit: u32| mask & (1usize << bit) != 0;
+    let mut config = McModuleConfig {
+        memory_enabled: on(0),
+        temporal_awareness: on(2),
+        smart_notes_enabled: on(4),
+        compaction_enabled: on(6),
+        language: (!language.is_empty()).then(|| language.to_string()),
+        ..Default::default()
+    };
+    config.caveman.enabled = on(3);
+    config.catalog.dreamer_runnable = on(1);
+    config.catalog.prompt_surface_default = Some(preset.as_str().to_string());
+    config
+}
+
+fn catalog_request(config: &McModuleConfig, subagent: bool, denied: bool) -> Value {
+    let compacting = config.compaction_enabled;
+    let role = if subagent { "worker" } else { "head" };
+    let mut names = if subagent && !compacting {
+        Vec::new()
+    } else if subagent {
+        vec!["ctx_reduce", "ctx_expand", "ctx_search"]
+    } else if compacting {
+        vec![
+            "ctx_reduce",
+            "ctx_expand",
+            "ctx_note",
+            "ctx_memory",
+            "ctx_search",
+        ]
+    } else {
+        vec!["ctx_search", "ctx_memory", "ctx_note"]
+    };
+    names.retain(|name| {
+        !(*name == "ctx_reduce" && denied || *name == "ctx_memory" && !config.memory_enabled)
+    });
+    let mut composition = json!({
+        "providers": [{"provider": "magic-context", "tools": names.iter().map(|name| json!({"name": name})).collect::<Vec<_>>()}]
+    });
+    if compacting {
+        composition["compaction"] = json!({"provider": "magic-context"});
+    }
+    json!({
+        "preset": role,
+        "params": {"exclude": if denied {vec!["ctx_reduce"]} else {vec![]}},
+        "composition": composition,
+        "system_text": {"preset": role, "params": {}}
+    })
+}
+
+fn expected_text(pair: [usize; 2]) -> String {
+    let golden = golden();
+    format!("{}{}", golden.strings[pair[0]], golden.strings[pair[1]])
+}
+
+fn assert_tool(actual: &Value, expected: &Value, context: &str) {
+    assert_eq!(actual["name"], expected["name"], "{context}");
+    assert_eq!(
+        actual["description"].as_str().unwrap().as_bytes(),
+        expected["description"].as_str().unwrap().as_bytes(),
+        "{context}: description"
+    );
+    // Canonicalize object key order only: bounds, unions, enum/required order,
+    // defaults and every parameter-description byte remain part of the check.
+    assert_eq!(
+        serde_jcs::to_vec(&actual["input_schema"]).unwrap(),
+        serde_jcs::to_vec(&expected["input_schema"]).unwrap(),
+        "{context}: schema"
+    );
+}
+
+#[test]
+fn typescript_tool_builders_match_legacy_and_catalog_bytes() {
+    for case in &golden().tools {
+        let mask = 1 | 64 | if case.smart { 16 } else { 0 };
+        let config = config(mask, "", case.preset);
+        let selection = PromptSurfaceSelection {
+            preset: case.preset,
+            ..Default::default()
+        };
+        let legacy = session_tools_for_config(&selection, &config);
+        let catalog = catalog_for_config(&catalog_request(&config, false, false), &config).unwrap();
+        assert_eq!(legacy.len(), 5);
+        assert_eq!(catalog["tools"].as_array().unwrap().len(), 5);
+        for expected in &case.tools {
+            let name = expected["name"].as_str().unwrap();
+            let tool = legacy.iter().find(|tool| tool.name == name).unwrap();
+            let actual = json!({"name": tool.name, "description": tool.description, "input_schema": tool.schema});
+            assert_tool(
+                &actual,
+                expected,
+                &format!("legacy {name} {:?} smart={}", case.preset, case.smart),
+            );
+            let actual = catalog["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert_tool(
+                actual,
+                expected,
+                &format!("catalog {name} {:?} smart={}", case.preset, case.smart),
+            );
+        }
+    }
+    println!("Compared 20 builder-derived tool schemas/descriptions through both legacy and catalog surfaces");
+}
+
+fn assert_guidance(
+    mask: usize,
+    preset: PromptSurfacePreset,
+    language: &str,
+    denied: bool,
+    primary_override: Option<&str>,
+    expected: &str,
+) {
+    let subagent = mask & 32 != 0;
+    let mut config = config(mask, language, preset);
+    config.prompt_surface_guidance_override = primary_override.map(str::to_string);
+    let selection = PromptSurfaceSelection {
+        preset,
+        guidance_override: config.prompt_surface_guidance_override.clone(),
+        ..Default::default()
+    };
+    let composed = compose_guidance(
+        &selection,
+        &config,
+        subagent,
+        config.compaction_enabled && !denied,
+    );
+    assert_eq!(
+        composed.as_bytes(),
+        expected.as_bytes(),
+        "composer mask={mask} preset={preset:?} language={language:?} denied={denied}"
+    );
+    let answer = catalog_for_config(&catalog_request(&config, subagent, denied), &config).unwrap();
+    assert_eq!(
+        answer["system_text"]["text"].as_str().unwrap().as_bytes(),
+        expected.as_bytes(),
+        "catalog mask={mask} preset={preset:?} language={language:?} denied={denied}"
+    );
+    let case = golden()
+        .tools
+        .iter()
+        .find(|case| case.preset == preset && case.smart == config.smart_notes_enabled)
+        .unwrap();
+    for actual in answer["tools"].as_array().unwrap() {
+        let expected = case
+            .tools
+            .iter()
+            .find(|tool| tool["name"] == actual["name"])
+            .unwrap();
+        assert_tool(actual, expected, &format!("matrix mask={mask} {language}"));
+    }
+}
+
+#[test]
+fn typescript_guidance_matrix_matches_every_config_and_language() {
+    let golden = golden();
+    assert_eq!(golden.languages.len(), 191);
+    assert_eq!(
+        golden.guidance_cases.len(),
+        128 * 2 * golden.languages.len()
+    );
+    let mut seen = vec![false; golden.guidance_cases.len()];
+    for &[mask, surface, language, prefix, suffix] in &golden.guidance_cases {
+        let index = (mask * 2 + surface) * golden.languages.len() + language;
+        assert!(!seen[index], "duplicate config case");
+        seen[index] = true;
+        let preset = if surface == 0 {
+            PromptSurfacePreset::Full
+        } else {
+            PromptSurfacePreset::Light
+        };
+        assert_guidance(
+            mask,
+            preset,
+            &golden.languages[language].code,
+            false,
+            None,
+            &expected_text([prefix, suffix]),
+        );
+    }
+    assert!(seen.iter().all(|seen| *seen));
+    for case in &golden.extras {
+        assert_guidance(
+            case.mask,
+            case.preset,
+            &case.language,
+            case.denied,
+            case.primary_override.as_deref(),
+            &expected_text(case.text),
+        );
+    }
+    println!("Compared {} exhaustive guidance cases and {} override/permission cases on both Rust serving composers", golden.guidance_cases.len(), golden.extras.len());
+}
+
+#[test]
+fn all_icu_languages_and_rejected_codes_match_typescript() {
+    let golden = golden();
+    for language in &golden.languages {
+        assert_eq!(
+            primary_language_directive(Some(&language.code)).as_bytes(),
+            language.directive.as_bytes(),
+            "{}",
+            language.code
+        );
+        let padded = format!(" {} ", language.code.to_ascii_uppercase());
+        assert_eq!(
+            primary_language_directive(Some(&padded)),
+            language.directive
+        );
+    }
+    for code in golden
+        .rejected
+        .iter()
+        .map(String::as_str)
+        .chain(["english", "en-US", "123", "éé"])
+    {
+        assert_eq!(primary_language_directive(Some(code)), "", "{code}");
+    }
+    assert_eq!(golden.languages.len() - 1 + golden.rejected.len(), 26 * 26);
+    println!(
+        "Compared 190 ICU names/directives and {} rejected two-letter codes",
+        golden.rejected.len()
+    );
+}
+
+#[test]
+fn legacy_guidance_assets_are_the_generated_enabled_baseline() {
+    for preset in [PromptSurfacePreset::Full, PromptSurfacePreset::Light] {
+        for (variant, reduce) in [
+            (GuidanceVariant::Full, true),
+            (GuidanceVariant::NoReduce, false),
+        ] {
+            let mask = 1 | 2 | 4 | 16 | if reduce { 64 } else { 0 };
+            let surface = usize::from(preset == PromptSurfacePreset::Light);
+            let row = golden()
+                .guidance_cases
+                .iter()
+                .find(|row| row[0] == mask && row[1] == surface && row[2] == 0)
+                .unwrap();
+            let expected = expected_text([row[3], row[4]]);
+            assert_eq!(
+                guidance_asset(preset, variant).bytes.as_bytes(),
+                expected.as_bytes()
+            );
+        }
+    }
+}

@@ -1,0 +1,35 @@
+--- a/crates/mc-module/src/tests/tool_catalog.rs
++++ b/crates/mc-module/src/tests/tool_catalog.rs
+@@ -252,7 +252,7 @@
+                 let text = answer["system_text"]["text"].as_str().unwrap();
+                 let variant = match (preset, compacting) {
+                     ("head", true) => Some(format!("primary/reduce/{surface}")),
+-                    ("head", false) => Some(format!("tools_only/{surface}")),
++                    ("head", false) => Some(format!("primary/no_reduce/{surface}")),
+                     (_, true) => Some(format!("subagent/{surface}")),
+                     (_, false) => None,
+                 };
+@@ -586,7 +586,7 @@
+ }
+ 
+ #[test]
+-fn a_user_override_replaces_only_the_compacting_head_text() {
++fn a_user_override_replaces_head_text_with_or_without_compaction() {
+     let mut config = example_catalog_config();
+     config.guidance_override = Some("My own section.".to_string());
+     let text_for = |preset: &str, compacting: bool, config: &CatalogConfig| {
+@@ -613,12 +613,9 @@
+     // The config-driven clauses (here the temporal-marker line) still follow
+     // the user's section.
+     assert!(primary.contains("<!-- +Xm -->"), "{primary}");
+-    // The non-compacting head and helper texts never use a head override.
++    // Primary prose is user-owned with or without compaction; bounded children ignore it.
+     let plain = example_catalog_config();
+-    assert_eq!(
+-        text_for("head", false, &config),
+-        text_for("head", false, &plain)
+-    );
++    assert!(text_for("head", false, &config).starts_with("My own section."));
+     assert_eq!(
+         text_for("worker", true, &config),
+         text_for("worker", true, &plain)

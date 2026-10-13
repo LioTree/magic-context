@@ -6,7 +6,7 @@
 //! and the tests compare against them byte for byte.
 //!
 //! Everything the answer says comes from one shared definition,
-//! `assets/tool_catalog_v1.json` plus the two tools-only texts beside it: the
+//! `assets/tool_catalog_v1.json`: the
 //! tools, their argument-schema structures, descriptions and parameter
 //! descriptions, and the guidance templates. The documentation generator
 //! (`docs/designs/mc-tool-catalog-v1/generate.ts`) reads the same files and
@@ -88,6 +88,8 @@ pub(crate) struct Definition {
     parameter_descriptions: Value,
     /// Guidance templates and the fragments they include, by name.
     texts: BTreeMap<String, String>,
+    /// English-plus-endonym names captured from the TypeScript ICU runtime.
+    pub language_names: BTreeMap<String, String>,
 }
 
 /// The shared definition, parsed once. The files are compiled in, so a
@@ -114,11 +116,11 @@ pub(crate) fn definition() -> &'static Definition {
 }
 
 impl Definition {
-    fn tool(&self, name: &str) -> Option<&ToolDefinition> {
+    pub(crate) fn tool(&self, name: &str) -> Option<&ToolDefinition> {
         self.tools.iter().find(|tool| tool.name == name)
     }
 
-    fn description(&self, surface: Surface, tool: &str) -> Option<&str> {
+    pub(crate) fn description(&self, surface: Surface, tool: &str) -> Option<&str> {
         self.descriptions
             .get(surface.as_str())
             .and_then(|table| table.get(tool))
@@ -707,7 +709,7 @@ fn guidance_text(
         return Ok(String::new());
     }
     let required: &[&str] = if !compacting {
-        &["ctx_search", "ctx_memory", "ctx_note"]
+        &["ctx_search", "ctx_note"]
     } else if preset != Preset::Head {
         &["ctx_expand", "ctx_search"]
     } else {
@@ -720,24 +722,18 @@ fn guidance_text(
         ));
     }
     let surface = text_surface(&item.params, config).as_str();
-    let directive = config
-        .language
-        .as_deref()
-        .and_then(crate::primary_language_directive);
+    let directive = crate::prompt_surface::primary_language_directive(config.language.as_deref());
     let flags = TextFlags {
         memory: config.memory_enabled && own.contains("ctx_memory"),
         dreamer: config.dreamer_runnable && config.smart_notes_enabled,
         temporal: config.temporal_awareness,
         caveman: config.caveman_text_compression,
-        language: directive.is_some(),
+        language: !directive.is_empty(),
     };
     let mut values = BTreeMap::new();
-    values.insert("language_directive", directive.unwrap_or_default());
+    values.insert("language_directive", directive);
     let reduce = own.contains("ctx_reduce");
     let name = match preset {
-        // Magic Context puts nothing into a tools-only session (no history,
-        // tags or markings), so its text describes only the tools.
-        Preset::Head if !compacting => format!("tools_only/{surface}"),
         // A subagent without ctx_reduce has no tagged messages, so it gets no
         // guidance at all; the runner skips an empty text.
         Preset::Worker | Preset::Reader if !reduce => return Ok(String::new()),
@@ -775,16 +771,17 @@ fn preflight_digest(item: &SystemTextItem, config: &CatalogConfig) -> Result<Str
 }
 
 /// A digest of every model-facing string the build ships: every guidance
-/// template and fragment (the tools-only texts included), every description
-/// and every parameter description. It sits inside `preflight_digest`, so a
-/// deploy that only rewords text still changes the digest a session's owner
-/// compares to notice new wording.
+/// template and fragment (the tools-only texts included), every description,
+/// every parameter description, and the generated ICU language names. It sits
+/// inside `preflight_digest`, so a deploy that only rewords text still changes
+/// the digest a session's owner compares to notice new wording.
 pub(crate) fn text_revision() -> Result<String, CatalogError> {
     let definition = definition();
     let value = json!({
         "texts": definition.texts,
         "descriptions": definition.descriptions,
         "parameters": definition.parameter_descriptions,
+        "language_names": definition.language_names,
     });
     Ok(sha256_hex_bytes(&jcs_bytes(&value)?))
 }
@@ -1015,6 +1012,91 @@ fn sha256_hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod parity_runtime_tests {
     use super::*;
+
+    async fn refusal(handler: &crate::McHandler, name: &str, arguments: Value) -> String {
+        let outcome = handler
+            .dispatch_value(7, json!({"name": name, "arguments": arguments}))
+            .await;
+        let HandlerOutcome::Response(bytes) = outcome else {
+            panic!("expected tool refusal, got {outcome:?}");
+        };
+        let refused: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(refused["isError"], true);
+        refused["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn removed_advertised_string_caps_are_still_enforced_by_facades() {
+        let handler = crate::McHandler::new();
+        for (name, action, field, cap) in [
+            ("ctx_note", "write", "content", 65536),
+            ("ctx_note", "write", "surface_condition", 4096),
+            ("ctx_memory", "write", "content", 65536),
+            ("ctx_memory", "archive", "reason", 4096),
+            ("ctx_search", "", "query", 1024),
+        ] {
+            let mut arguments = json!({"action": action});
+            arguments[field] = json!("x".repeat(cap + 1));
+            assert_eq!(
+                refusal(&handler, name, arguments).await,
+                format!("Error: '{field}' exceeds the {cap}-byte limit."),
+                "{name}.{field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_query_required_refusal_is_unchanged() {
+        let handler = crate::McHandler::new();
+        assert_eq!(
+            refusal(&handler, "ctx_search", json!({})).await,
+            "Error: 'query' is required for ctx_search."
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_memory_id_schema_bounds_are_still_enforced_by_facade() {
+        let handler = crate::McHandler::new();
+        assert_eq!(
+            refusal(
+                &handler,
+                "ctx_memory",
+                json!({"action": "get", "ids": vec![1; 101]})
+            )
+            .await,
+            "Error: 'ids' exceeds the 100-item limit."
+        );
+        for id in [json!(-1), json!(0), json!(1.5)] {
+            assert_eq!(
+                refusal(
+                    &handler,
+                    "ctx_memory",
+                    json!({"action": "get", "ids": [id]})
+                )
+                .await,
+                "Error: 'ids' must contain only positive 64-bit integers."
+            );
+        }
+    }
+
+    #[test]
+    fn removed_expand_schema_bounds_are_still_enforced_by_runtime_mode_parser() {
+        for arguments in [json!({"message": -1}), json!({"message": 1.5})] {
+            assert_eq!(
+                crate::resolve_ctx_expand_mode(arguments.as_object().unwrap()).unwrap_err(),
+                "Error: message must be a non-negative integer."
+            );
+        }
+        for arguments in [
+            json!({"start": -1, "end": 3}),
+            json!({"start": 1.5, "end": 3}),
+            json!({"start": 1, "end": -1}),
+            json!({"start": 1, "end": 3.5}),
+        ] {
+            assert_eq!(crate::resolve_ctx_expand_mode(arguments.as_object().unwrap()).unwrap_err(),
+                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).");
+        }
+    }
 
     #[tokio::test]
     async fn reduce_advertises_optional_drop_but_execution_still_requires_it() {

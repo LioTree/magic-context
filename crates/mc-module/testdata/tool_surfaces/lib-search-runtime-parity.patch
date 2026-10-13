@@ -1,0 +1,25 @@
+--- a/crates/mc-module/src/lib.rs
++++ b/crates/mc-module/src/lib.rs
+@@ -14016,15 +14016,17 @@
+         };
+         let args = &args;
+         let Some(query) = non_empty_string_arg(args, "query") else {
+-            return tool_error_result("Error: 'query' is required for ctx_search.");
++            return tool_error_result("Error: 'query' is required.");
+         };
+         if let Err(error) = validate_string_cap(args, "query", MAX_QUERY_BYTES) {
+             return tool_error_result(format!("Error: {error}."));
+         }
+-        let limit = usize_arg(args, "limit")
+-            .filter(|value| *value > 0)
+-            .unwrap_or(8)
+-            .clamp(1, 25);
++        let limit = args
++            .get("limit")
++            .and_then(Value::as_f64)
++            .filter(|value| value.is_finite() && *value != 0.0)
++            .map(|value| value.floor().max(1.0) as usize)
++            .unwrap_or(10);
+         let from_ms = match parse_search_date_bound(args, "from", false) {
+             Ok(value) => value,
+             Err(error) => return tool_error_result(format!("Error: {error}")),

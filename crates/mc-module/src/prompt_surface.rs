@@ -5,106 +5,17 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use subc_protocol::manifest::{ExecutionMode, Tool};
 
-use super::{
-    ctx_expand_description, ctx_expand_schema, ctx_memory_description, ctx_memory_schema,
-    ctx_note_description, ctx_note_schema, ctx_search_description, ctx_search_schema,
-};
+use crate::config::McModuleConfig;
+use crate::tool_catalog::{self, Surface, TextFlags};
 
 pub const LIGHT_FALLBACK_NOTICE: &str = "prompt_surface selected light, but built-in light assets are not available yet; using the byte-identical full guidance and tool descriptions until light assets ship.";
 
 pub(crate) const GUIDANCE_FULL_PRIMARY: &str = include_str!("../assets/guidance_primary.txt");
 pub(crate) const GUIDANCE_FULL_NO_REDUCE: &str = include_str!("../assets/guidance_no_reduce.txt");
-
 const GUIDANCE_LIGHT_PRIMARY: Option<&str> =
     Some(include_str!("../assets/guidance_light_primary.txt"));
 const GUIDANCE_LIGHT_NO_REDUCE: Option<&str> =
     Some(include_str!("../assets/guidance_light_no_reduce.txt"));
-const TOOL_LIGHT_DESCRIPTIONS: Option<&[(&str, &str)]> = Some(&[
-    (
-        "ctx_reduce",
-        r#"Stamp an item as no longer needed for the work ahead. Not a delete: stamping QUEUES it, the item stays readable until Magic Context clears stamped items in one sweep, newest tags are protected, and a cleared item goes to the archive (recent: a [dropped §N§] placeholder; older: removed) recoverable via ctx_expand(tag=N). The question is "does this need to stay on my desk for what comes next?" — a file you keep editing stays, the grep that found it goes. Stamp used reads/searches/outputs, acted-on build/test output, redundant dumps, extracted pasted payloads; keep user messages, your own text, unresolved errors, raw evidence, exact wording that may matter. Look at each tag; never blanket-stamp "1-50". Grammar: "3-5", "1,2,9", "1-5,8,12-15"."#,
-    ),
-    (
-        "ctx_memory",
-        r#"Durable facts about this project, shared with every agent on it and kept for the months this work lasts; active ones are already in <project-memory> as `#id: fact`. Write one standalone fact when it must not have to be found again — a rule, an architecture fact, a constraint, a config value, a naming convention — especially what cost you turns. A pending intention with evidence is ctx_note, not memory. write (content + category); update one id (content; category optional); archive one or more ids (reason optional); merge two or more ids (content); get 1–20 ids in any status."#,
-    ),
-    (
-        "ctx_search",
-        r#"Search the archive — everything that ever happened here that is not on your desk: memories not in <project-memory>, compacted conversation, commits, notes. Phrase query as a natural-language question carrying the exact terms you expect ("where is the opencode source code path?", "why did we choose SQLite over postgres?", "how does the dreamer lease work?") — a keyword stack finds less. Sources (omit for all): memory (rules, conventions), message (compacted conversation; hits carry ordinals for ctx_expand), git_commit (when did this change), primer (reusable project Q&A the dreamer distils from recurring questions), note (parked follow-ups). Memory ids alone (`#7234`) resolve directly. from/to restrict every source to an inclusive UTC date range."#,
-    ),
-    (
-        "ctx_expand",
-        "Recover one item with tag=N (a §N§ or dropped placeholder number), not a message ordinal; text or one tool call with full input/output. message=N and start/end are whole-message ordinals from history/search, never tag numbers. Recover raw conversation behind a <session-history> heading or around a ctx_search hit: ctx_expand(start, end) returns [N] U:/A: lines (~15K-token cap; oversized ranges return the head and where to continue). verbose=true lists messages with per-part previews to pick one; message=N returns that message in full, including a tool output released with ctx_reduce. Ranges after the last compartment are your live tail, not expandable.",
-    ),
-    (
-        "ctx_note",
-        r#"Session notes are pending intentions: work you intend to return to, with findings attached ("take a note" always qualifies). Not active steps, an executing plan, or restart insurance; a record of how things stand (world-state, a design at a point in time) with nothing you intend to do about it — that goes stale silently; a fact worth keeping is memory, the rest is nothing. First line = title (<80 chars). write saves; read lists rows (note_ids for bodies); update changes one; dismiss retires 1–50. Dismiss a note when its work lands or is abandoned; a queue you never dismiss from stops being read. surface_condition parks it until an outside check against repo files, git, GitHub or the web holds."#,
-    ),
-]);
-
-const CTX_REDUCE_DESCRIPTION: &str = r#"Stamp an item on your desk as no longer needed for the work ahead. Not a delete: stamping QUEUES it, the item stays fully readable until Magic Context clears stamped items in one sweep, and the newest tags are protected so stamping recent output is harmless. A cleared item goes to the archive — a recent one leaves a `[dropped §N§]` placeholder, an older one leaves nothing — and `ctx_expand(tag=N)` is the way back. So the question before stamping is not "have I finished reading this?" but "does this need to stay on my desk for what comes next?" — a file you read and will keep editing stays; the grep that found it goes.
-
-Stamp: file reads, search results and tool outputs the work ahead no longer needs; build/test output after you acted on it; repeated or redundant dumps; data written to disk; status/log output that only confirmed what you expected; a large block pasted inside a user message once you have used it.
-Keep: user messages (never stamp one for its directive), your own conversation text, unresolved errors, raw evidence you haven't extracted yet, and outputs whose exact wording may still matter.
-
-Look at each tag before stamping it; never blanket-stamp a range like "1-50". Many small targeted stamps beat one sweep. `drop` accepts "3-5", "1,2,9", "1-5,8,12-15"."#;
-
-fn schema_with_preset_descriptions(
-    tool_id: &str,
-    mut schema: serde_json::Value,
-    preset: PromptSurfacePreset,
-) -> serde_json::Value {
-    if preset != PromptSurfacePreset::Light {
-        return schema;
-    }
-    let descriptions: &[(&str, &str)] = match tool_id {
-        "ctx_reduce" => &[("drop", "Tag IDs: \"3-5\", \"1,2,9\", \"1-5,8,12-15\".")],
-        "ctx_expand" => &[
-            ("tag", "Tag number from a §N§ tag or a [dropped §N§] placeholder, not a message ordinal. Returns that one item in full. Use alone."),
-            ("start", "First message ordinal of the range (a <session-history> heading's start, or a ctx_search hit), not a tag number."),
-            ("end", "Last message ordinal of the range, inclusive, not a tag number."),
-            ("verbose", "With start/end: one entry per message with previews instead of the transcript."),
-            ("message", "Message ordinal from a <session-history> heading or a ctx_search hit, not a tag number. Returns that one message in full. Use alone."),
-        ],
-        "ctx_note" => &[
-            ("action", "write | read | update | dismiss (default: write with content, else read)."),
-            ("content", "Note text: first line title (<80 chars), then detail."),
-            ("surface_condition", "A condition an outside checker can verify on its own, periodically (repository, releases, web — anything it can look up); never something only this conversation knows."),
-            ("filter", "Read filter: all, active, pending, ready, dismissed. Omitted: active notes plus every current smart note (pending included); active: only active-status notes."),
-            ("limit", "Rows per read (default 25)."),
-            ("offset", "Skip newest rows (default 0)."),
-            ("note_ids", "One id for update, 1–50 for dismiss or read (full bodies). Ignored by write."),
-        ],
-        "ctx_memory" => &[
-            ("action", "write | update | archive | merge | get"),
-            ("content", "One standalone fact (write, update, merge)."),
-            ("category", "Kind of fact (required for write; optional on update/merge)."),
-            ("ids", "Ids from <project-memory>: one for update, 1+ for archive, 2+ for merge, 1–20 for get."),
-            ("reason", "Why it is archived (optional)."),
-        ],
-        "ctx_search" => &[
-            ("query", "A natural-language question carrying the exact terms you expect in the answer."),
-            ("limit", "Maximum results (default 10)."),
-            ("from", "Earliest date, YYYY-MM-DD (inclusive)."),
-            ("to", "Latest date, YYYY-MM-DD (inclusive; default open)."),
-        ],
-        _ => &[],
-    };
-    if let Some(properties) = schema
-        .get_mut("properties")
-        .and_then(|value| value.as_object_mut())
-    {
-        for (name, description) in descriptions {
-            if let Some(property) = properties
-                .get_mut(*name)
-                .and_then(|value| value.as_object_mut())
-            {
-                property.insert("description".to_string(), json!(description));
-            }
-        }
-    }
-    schema
-}
 
 pub const PROMPT_SURFACE_TOOL_IDS: [&str; 5] = [
     "ctx_reduce",
@@ -248,21 +159,16 @@ pub(crate) fn without_smart_note_guidance(text: &str) -> String {
 }
 
 pub(crate) fn disable_smart_notes_in_tools(tools: &mut [Tool], preset: PromptSurfacePreset) {
+    let surface = match preset {
+        PromptSurfacePreset::Full => Surface::Full,
+        PromptSurfacePreset::Light => Surface::Light,
+    };
     for tool in tools.iter_mut().filter(|tool| tool.name == "ctx_note") {
         disable_smart_note_schema(&mut tool.schema);
-        let description = if preset == PromptSurfacePreset::Light {
-            TOOL_LIGHT_DESCRIPTIONS
-                .and_then(|descriptions| {
-                    descriptions
-                        .iter()
-                        .find_map(|(id, text)| (*id == "ctx_note").then_some(*text))
-                })
-                .map(str::to_string)
-                .unwrap_or_else(ctx_note_description)
-        } else {
-            ctx_note_description()
-        };
-        tool.description = Some(without_smart_note_description(&description));
+        let description = tool_catalog::definition()
+            .description(surface, "ctx_note")
+            .expect("note description");
+        tool.description = Some(without_smart_note_description(description));
     }
 }
 
@@ -301,104 +207,56 @@ pub fn warn_ignored_unknown_tool_description(tool_id: &str) {
     );
 }
 
-pub fn tool_manifest_falls_back(preset: PromptSurfacePreset) -> bool {
-    preset == PromptSurfacePreset::Light && TOOL_LIGHT_DESCRIPTIONS.is_none()
+pub fn tool_manifest_falls_back(_preset: PromptSurfacePreset) -> bool {
+    false
 }
 
 pub fn module_tools(selection: &PromptSurfaceSelection) -> Vec<Tool> {
-    let description = |tool_id: &str, full: String| {
-        selection
-            .tool_descriptions
-            .get(tool_id)
-            .cloned()
-            .or_else(|| {
-                (selection.preset == PromptSurfacePreset::Light)
-                    .then_some(TOOL_LIGHT_DESCRIPTIONS)
-                    .flatten()
-                    .and_then(|descriptions| {
-                        descriptions
-                            .iter()
-                            .find_map(|(id, text)| (*id == tool_id).then(|| (*text).to_string()))
-                    })
-            })
-            .unwrap_or(full)
+    let surface = match selection.preset {
+        PromptSurfacePreset::Full => Surface::Full,
+        PromptSurfacePreset::Light => Surface::Light,
     };
-
-    vec![
-        Tool {
-            name: "transform".to_string(),
+    let mut tools = vec![Tool {
+        name: "transform".to_string(),
+        description: Some("Cache-stable context transform: folds compacted history into m0/m1 and applies frozen reductions".to_string()),
+        execution_mode: ExecutionMode::Pure,
+        schema: json!({ "type": "object" }),
+    }];
+    // Share the catalog definition so startup and session discovery cannot
+    // advertise different schemas. McHandler's handle_ctx_*_facade methods
+    // validate execution arguments separately from this metadata.
+    for name in [
+        "ctx_reduce",
+        "ctx_memory",
+        "ctx_expand",
+        "ctx_search",
+        "ctx_note",
+    ] {
+        let definition = tool_catalog::definition();
+        let tool = definition.tool(name).expect("known context tool");
+        tools.push(Tool {
+            name: name.to_string(),
             description: Some(
-                "Cache-stable context transform: folds compacted history into m0/m1 and applies frozen reductions".to_string(),
+                selection
+                    .tool_descriptions
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        definition
+                            .description(surface, name)
+                            .expect("tool description")
+                            .to_string()
+                    }),
             ),
-            execution_mode: ExecutionMode::Pure,
-            schema: json!({ "type": "object" }),
-        },
-        Tool {
-            name: "ctx_reduce".to_string(),
-            description: Some(description(
-                "ctx_reduce",
-                CTX_REDUCE_DESCRIPTION.to_string(),
-            )),
-            execution_mode: ExecutionMode::Pure,
-            // This exact advertised shape is the Thalamus authorization contract. Prompt-surface
-            // selection may replace only the top-level description.
-            schema: schema_with_preset_descriptions(
-                "ctx_reduce",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "drop": {
-                            "type": "string",
-                            "description": "Tag IDs to drop: \"3-5\", \"1,2,9\", \"1-5,8,12-15\"."
-                        }
-                    },
-                    "required": ["drop"],
-                    "additionalProperties": false
-                }),
-                selection.preset,
-            ),
-        },
-        Tool {
-            name: "ctx_memory".to_string(),
-            description: Some(description("ctx_memory", ctx_memory_description())),
-            execution_mode: ExecutionMode::Mutating,
-            schema: schema_with_preset_descriptions(
-                "ctx_memory",
-                ctx_memory_schema(),
-                selection.preset,
-            ),
-        },
-        Tool {
-            name: "ctx_expand".to_string(),
-            description: Some(description("ctx_expand", ctx_expand_description())),
-            execution_mode: ExecutionMode::Pure,
-            schema: schema_with_preset_descriptions(
-                "ctx_expand",
-                ctx_expand_schema(),
-                selection.preset,
-            ),
-        },
-        Tool {
-            name: "ctx_search".to_string(),
-            description: Some(description("ctx_search", ctx_search_description())),
-            execution_mode: ExecutionMode::Pure,
-            schema: schema_with_preset_descriptions(
-                "ctx_search",
-                ctx_search_schema(),
-                selection.preset,
-            ),
-        },
-        Tool {
-            name: "ctx_note".to_string(),
-            description: Some(description("ctx_note", ctx_note_description())),
-            execution_mode: ExecutionMode::Mutating,
-            schema: schema_with_preset_descriptions(
-                "ctx_note",
-                ctx_note_schema(),
-                selection.preset,
-            ),
-        },
-    ]
+            execution_mode: if matches!(name, "ctx_memory" | "ctx_note") {
+                ExecutionMode::Mutating
+            } else {
+                ExecutionMode::Pure
+            },
+            schema: tool_catalog::input_schema(tool, surface).expect("tool schema"),
+        });
+    }
+    tools
 }
 
 pub fn session_tools(selection: &PromptSurfaceSelection) -> Vec<Tool> {
@@ -406,6 +264,87 @@ pub fn session_tools(selection: &PromptSurfaceSelection) -> Vec<Tool> {
         .into_iter()
         .filter(|tool| is_known_tool_id(&tool.name))
         .collect()
+}
+
+/// The pure catalog renderer, shared by provider discovery and offline parity
+/// checks. It never opens a store or persists a session's selected tool surface.
+pub fn catalog_for_config(
+    arguments: &serde_json::Value,
+    config: &McModuleConfig,
+) -> Result<serde_json::Value, String> {
+    tool_catalog::catalog_answer(
+        arguments,
+        &tool_catalog::CatalogConfig::from_module_config(config),
+    )
+    .map_err(|error| format!("{error:?}"))
+}
+
+/// Compose the same primary-agent or subagent guidance as the TypeScript plugin.
+/// The caller supplies whether the reduce tool is callable. A subagent without
+/// that tool gets an empty string instead of instructions for unavailable tags.
+pub fn compose_guidance(
+    selection: &PromptSurfaceSelection,
+    config: &McModuleConfig,
+    subagent: bool,
+    reduce_callable: bool,
+) -> String {
+    if subagent && !reduce_callable {
+        return String::new();
+    }
+    let surface = selection.preset.as_str();
+    let directive = primary_language_directive(config.language.as_deref());
+    let flags = TextFlags {
+        memory: config.memory_enabled,
+        dreamer: config.catalog.dreamer_runnable && config.smart_notes_enabled,
+        temporal: config.temporal_awareness,
+        caveman: config.caveman.enabled,
+        language: !directive.is_empty(),
+    };
+    let mut values = BTreeMap::new();
+    values.insert("language_directive", directive);
+    let name = if subagent {
+        format!("worker/{surface}")
+    } else if let Some(text) = &selection.guidance_override {
+        values.insert(
+            "override",
+            if config.smart_notes_enabled {
+                text.clone()
+            } else {
+                without_smart_note_guidance(text)
+            },
+        );
+        "override".to_string()
+    } else if reduce_callable {
+        format!("head/reduce/{surface}")
+    } else {
+        format!("head/no_reduce/{surface}")
+    };
+    tool_catalog::render_text(&name, &flags, &values).expect("compiled guidance template")
+}
+
+/// Return reply-language guidance, or an empty string for an unknown code.
+/// The name table comes from the macOS TypeScript capture in
+/// `testdata/tool_surfaces/golden.json`, not the Rust process's host ICU version.
+pub fn primary_language_directive(language: Option<&str>) -> String {
+    let code = language.unwrap_or_default().trim().to_ascii_lowercase();
+    let Some(name) = tool_catalog::definition().language_names.get(&code) else {
+        return String::new();
+    };
+    format!("Use {name} for your natural-language replies to the user unless the user explicitly asks for another language. Keep code, identifiers, file paths, commands, logs, and quoted text verbatim.")
+}
+
+/// Session tool metadata for a harness. Disabling smart notes selects the
+/// ordinary-note schema and description. Project identity stays authenticated
+/// transport state, not a model-chosen `memory_project` argument.
+pub fn session_tools_for_config(
+    selection: &PromptSurfaceSelection,
+    config: &McModuleConfig,
+) -> Vec<Tool> {
+    let mut tools = session_tools(selection);
+    if !config.smart_notes_enabled {
+        disable_smart_notes_in_tools(&mut tools, selection.preset);
+    }
+    tools
 }
 
 pub fn selection_freeze_identity(selection: &PromptSurfaceSelection) -> String {
@@ -538,11 +477,7 @@ mod tests {
         assert_eq!(light_tools.len(), full_tools.len());
         for (light, full) in light_tools.iter().zip(full_tools) {
             assert_eq!(light.name, full.name);
-            if light.name == "ctx_search" {
-                assert_eq!(light.schema, full.schema);
-            } else {
-                assert_ne!(light.schema, full.schema);
-            }
+            assert_ne!(light.schema, full.schema);
             assert_eq!(
                 without_descriptions(light.schema.clone()),
                 without_descriptions(full.schema.clone())

@@ -1,0 +1,35 @@
+--- a/crates/mc-module/src/lib.rs
++++ b/crates/mc-module/src/lib.rs
+@@ -13573,10 +13573,7 @@
+         let Some(action) = string_arg(args, "action") else {
+             return invalid_params_error("ctx_memory requires an action");
+         };
+-        if let Err(error) = validate_memory_id_arguments(args, action)
+-            .and_then(|_| validate_string_cap(args, "content", MAX_MEMORY_CONTENT_BYTES))
+-            .and_then(|_| validate_string_cap(args, "reason", MAX_SHORT_FIELD_BYTES))
+-        {
++        if let Err(error) = validate_memory_id_arguments(args, action) {
+             return tool_error_result(format!("Error: {error}."));
+         }
+         let is_mutation = matches!(action, "write" | "update" | "archive" | "merge");
+@@ -14018,9 +14015,6 @@
+         let Some(query) = non_empty_string_arg(args, "query") else {
+             return tool_error_result("Error: 'query' is required for ctx_search.");
+         };
+-        if let Err(error) = validate_string_cap(args, "query", MAX_QUERY_BYTES) {
+-            return tool_error_result(format!("Error: {error}."));
+-        }
+         let limit = usize_arg(args, "limit")
+             .filter(|value| *value > 0)
+             .unwrap_or(8)
+@@ -14345,9 +14339,7 @@
+                 }
+             }
+         }
+-        if let Err(error) = validate_string_cap(args, "content", MAX_NOTE_CONTENT_BYTES)
+-            .and_then(|_| validate_string_cap(args, "surface_condition", MAX_SHORT_FIELD_BYTES))
+-            .and_then(|_| validate_string_cap(args, "compiled_provider", MAX_SHORT_FIELD_BYTES))
++        if let Err(error) = validate_string_cap(args, "compiled_provider", MAX_SHORT_FIELD_BYTES)
+             .and_then(|_| validate_string_cap(args, "compiled_config", MAX_NOTE_CONTENT_BYTES))
+             .and_then(|_| validate_string_cap(args, "compile_status", MAX_SHORT_FIELD_BYTES))
+         {

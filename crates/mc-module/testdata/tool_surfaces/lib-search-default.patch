@@ -1,0 +1,11 @@
+--- a/crates/mc-module/src/lib.rs
++++ b/crates/mc-module/src/lib.rs
+@@ -14023,7 +14023,7 @@
+         }
+         let limit = usize_arg(args, "limit")
+             .filter(|value| *value > 0)
+-            .unwrap_or(8)
++            .unwrap_or(10)
+             .clamp(1, 25);
+         let from_ms = match parse_search_date_bound(args, "from", false) {
+             Ok(value) => value,
