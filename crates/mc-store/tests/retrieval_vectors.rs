@@ -4,6 +4,7 @@ mod drain;
 mod store;
 
 use drain::{ClaimOutcome, FinishOutcome, Registration};
+use mc_store::parity_schema_manifest;
 use mc_store::{
     compute_normalized_memory_hash,
     context_schema::BOOTSTRAP,
@@ -90,6 +91,12 @@ fn seed(db: &Connection) {
         "INSERT INTO session_projects(session_id,harness,project_path,updated_at)
         VALUES('session-a','opencode',?1,1)",
         [project()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO message_fts_rowid_map(session_id,message_ordinal,fts_rowid,message_time_ms)
+        VALUES('session-a',0,100,100),('session-a',1,101,200)",
+        [],
     )
     .unwrap();
 }
@@ -186,7 +193,7 @@ impl ChunkCatalog for Archive {
         };
         let mut statement = db.prepare("SELECT c.content FROM compartments c JOIN session_projects sp
             ON sp.session_id=c.session_id AND sp.harness=c.harness WHERE c.id=?1 AND sp.project_path=?2
-            AND c.session_id=?3 AND c.harness=?4 AND c.start_message=?5 AND c.end_message=?6")?;
+            AND c.session_id=?3 AND c.harness=?4 AND c.start_message<=?5 AND c.end_message>=?6")?;
         let mut rows = statement.query(params![
             compartment_id,
             passage.project,
@@ -739,4 +746,326 @@ fn chunk_replacement_removes_obsolete_windows_only_for_the_target_model() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values, vector(0));
     assert_eq!(rows[0].model_id, r.chunk_model_id);
+}
+
+fn read_scope() -> store::ResolvedVectorScope {
+    store::ResolvedVectorScope {
+        scope: parity_schema_manifest::StoreScope {
+            project: parity_schema_manifest::ProjectId("authenticated-project".into()),
+            session: parity_schema_manifest::SessionId("authenticated-session".into()),
+            generation: Generation(1),
+        },
+        authorized_memory_ids: [1, 2, 3, 4].into_iter().collect(),
+        memory_projects: [project().into()].into_iter().collect(),
+        compartment_projects: [project().into()].into_iter().collect(),
+        session_id: "session-a".into(),
+        harness: "opencode".into(),
+    }
+}
+fn certified_keys() -> store::CertifiedModelKeys {
+    let r = registration();
+    store::CertifiedModelKeys {
+        identity: parity_schema_manifest::EmbeddingIdentity {
+            provider: "fixture-provider".into(),
+            model: "fixture-model".into(),
+            dimensions: 4,
+            query_recipe: "query-fixture".into(),
+            passage_recipe: "passage-fixture".into(),
+            fingerprint: "fixture-fingerprint".into(),
+            epoch: 1,
+        },
+        memory_model_key: r.model_id,
+        chunk_model_key: r.chunk_model_id,
+    }
+}
+fn available<T: std::fmt::Debug>(result: CapabilityResult<T>) -> T {
+    match result {
+        CapabilityResult::Available { value } => value,
+        other => panic!("not available: {other:?}"),
+    }
+}
+fn unavailable_code<T>(result: CapabilityResult<T>) -> String {
+    match result {
+        CapabilityResult::Unavailable { reason } => reason.code,
+        _ => panic!("expected unavailable"),
+    }
+}
+
+#[test]
+fn retrieval_snapshot_filters_full_identity_and_authorized_memory_ids() {
+    let root = TempDir::new().unwrap();
+    let mut db = fresh(&root.path().join("context.db"));
+    seed(&db);
+    write_vectors(&mut db);
+    let resolved = read_scope();
+    let keys = certified_keys();
+    let tx = db.transaction().unwrap();
+    let reader = store::VectorReadSnapshot::new(&tx, &Archive, &resolved, Some(&keys));
+    let values = available(reader.read_memory_vectors(&resolved.scope, &[3, 1], &keys.identity));
+    assert_eq!(values.keys().copied().collect::<Vec<_>>(), vec![1, 3]);
+    assert_eq!(values[&1], vector(0));
+    assert_eq!(values[&3], vector(2));
+    assert!(available(reader.read_memory_vectors(&resolved.scope, &[], &keys.identity)).is_empty());
+    assert_eq!(
+        unavailable_code(reader.read_memory_vectors(&resolved.scope, &[99], &keys.identity)),
+        "vector_memory_unauthorized"
+    );
+    for field in 0..7 {
+        let mut other = keys.identity.clone();
+        match field {
+            0 => other.provider.push_str("-other"),
+            1 => other.model.push_str("-other"),
+            2 => other.dimensions += 1,
+            3 => other.query_recipe.push_str("-other"),
+            4 => other.passage_recipe.push_str("-other"),
+            5 => other.fingerprint.push_str("-other"),
+            _ => other.epoch += 1,
+        }
+        assert_eq!(
+            unavailable_code(reader.read_memory_vectors(&resolved.scope, &[1], &other)),
+            "vector_identity_unsupported",
+            "identity field {field}"
+        );
+        assert_eq!(
+            unavailable_code(reader.read_compartment_chunks(&resolved.scope, None, &other)),
+            "vector_identity_unsupported",
+            "chunk identity field {field}"
+        );
+    }
+    let mut other_scope = resolved.scope.clone();
+    other_scope.generation = Generation(2);
+    assert_eq!(
+        unavailable_code(reader.read_memory_vectors(&other_scope, &[1], &keys.identity)),
+        "vector_scope_mismatch"
+    );
+    let missing = store::VectorReadSnapshot::new(&tx, &Archive, &resolved, None);
+    assert_eq!(
+        unavailable_code(missing.read_memory_vectors(&resolved.scope, &[1], &keys.identity)),
+        "vector_identity_unavailable"
+    );
+    let mut unpopulated = keys.clone();
+    unpopulated.memory_model_key = "no-stored-vectors".into();
+    let empty = store::VectorReadSnapshot::new(&tx, &Archive, &resolved, Some(&unpopulated));
+    assert!(available(empty.read_memory_vectors(&resolved.scope, &[1], &keys.identity)).is_empty());
+}
+
+#[test]
+fn retrieval_snapshot_broadens_only_authorized_memories_and_reports_read_failures() {
+    let root = TempDir::new().unwrap();
+    let mut db = fresh(&root.path().join("context.db"));
+    seed(&db);
+    write_vectors(&mut db);
+    db.execute("INSERT INTO memories(id,project_path,category,content,normalized_hash,
+        first_seen_at,created_at,updated_at,last_seen_at) VALUES(10,'/workspace/foreign','fact','Foreign',?1,1,1,1,1)",
+        [compute_normalized_memory_hash("Foreign")]).unwrap();
+    let foreign = Passage {
+        source: Source::Memory { id: 10 },
+        project: "/workspace/foreign".into(),
+        text: "Foreign".into(),
+        content_hash: compute_normalized_memory_hash("Foreign"),
+        span: None,
+    };
+    let keys = certified_keys();
+    let mut resolved = read_scope();
+    resolved.authorized_memory_ids.insert(10);
+    resolved.memory_projects.insert(foreign.project.clone());
+    let tx = db.transaction().unwrap();
+    store::save_if_current(
+        &tx,
+        &Archive,
+        &foreign,
+        &keys.memory_model_key,
+        &vector(1),
+        123,
+    )
+    .unwrap();
+    tx.execute(
+        "UPDATE memory_embeddings SET embedding=x'010203' WHERE memory_id=2 AND model_id=?1",
+        [&keys.memory_model_key],
+    )
+    .unwrap();
+    let reader = store::VectorReadSnapshot::new(&tx, &Archive, &resolved, Some(&keys));
+    let values = available(reader.read_memory_vectors(&resolved.scope, &[10], &keys.identity));
+    assert_eq!(values[&10], vector(1));
+    match reader.read_memory_vectors(&resolved.scope, &[1, 2], &keys.identity) {
+        CapabilityResult::Degraded { value, reason } => {
+            assert_eq!(reason.code, "vector_rows_invalid");
+            assert_eq!(value.len(), 1);
+            assert!(value.contains_key(&1));
+        }
+        other => panic!("corrupt vector was not diagnosed: {other:?}"),
+    }
+    tx.commit().unwrap();
+    let mut absent = Connection::open_in_memory().unwrap();
+    let tx = absent.transaction().unwrap();
+    let reader = store::VectorReadSnapshot::new(&tx, &Archive, &resolved, Some(&keys));
+    assert_eq!(
+        unavailable_code(reader.read_memory_vectors(&resolved.scope, &[], &keys.identity)),
+        "vector_store_read_failed"
+    );
+    assert_eq!(
+        unavailable_code(reader.read_compartment_chunks(&resolved.scope, None, &keys.identity)),
+        "vector_store_read_failed"
+    );
+}
+
+#[test]
+fn retrieval_chunk_snapshot_uses_whole_bounds_message_dates_and_session_harness_scope() {
+    let root = TempDir::new().unwrap();
+    let mut db = fresh(&root.path().join("context.db"));
+    seed(&db);
+    write_vectors(&mut db);
+    db.execute(
+        "UPDATE compartments SET title='Current title',end_message=10 WHERE id=1",
+        [],
+    )
+    .unwrap();
+    db.execute("UPDATE message_fts_rowid_map SET message_time_ms=150 WHERE session_id='session-a' AND message_ordinal=1", []).unwrap();
+    db.execute(
+        "INSERT INTO message_fts_rowid_map(session_id,message_ordinal,fts_rowid,message_time_ms)
+        VALUES('session-a',10,110,300)",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO compartments(id,session_id,sequence,start_message,end_message,title,content,created_at,harness)
+        SELECT 2,'other-session',1,start_message,end_message,title,content,created_at,harness FROM compartments WHERE id=1", []).unwrap();
+    db.execute("INSERT INTO compartments(id,session_id,sequence,start_message,end_message,title,content,created_at,harness)
+        SELECT 3,session_id,2,start_message,end_message,title,content,created_at,'pi' FROM compartments WHERE id=1", []).unwrap();
+    db.execute(
+        "INSERT INTO session_projects(session_id,harness,project_path,updated_at)
+        VALUES('other-session','opencode',?1,1),('session-a','pi',?1,1)",
+        [project()],
+    )
+    .unwrap();
+    for (id, session, harness) in [(2, "other-session", "opencode"), (3, "session-a", "pi")] {
+        db.execute("INSERT INTO compartment_chunk_embeddings(compartment_id,session_id,project_path,harness,
+            window_index,start_ordinal,end_ordinal,chunk_hash,model_id,dims,vector,created_at)
+            SELECT ?1,?2,project_path,?3,window_index,start_ordinal,end_ordinal,chunk_hash,model_id,dims,vector,created_at
+            FROM compartment_chunk_embeddings WHERE compartment_id=1", params![id,session,harness]).unwrap();
+    }
+    let keys = certified_keys();
+    let resolved = read_scope();
+    let tx = db.transaction().unwrap();
+    let reader = store::VectorReadSnapshot::new(&tx, &Archive, &resolved, Some(&keys));
+    let rows = available(reader.read_compartment_chunks(&resolved.scope, None, &keys.identity));
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.compartment_id, 1);
+    assert_eq!(row.title, "Current title");
+    assert_eq!((row.start_ordinal, row.end_ordinal), (0, 10));
+    assert_eq!((row.window_start_ordinal, row.window_end_ordinal), (0, 1));
+    assert_eq!(
+        (row.first_message_time_ms, row.last_message_time_ms),
+        (Some(100), Some(300))
+    );
+    assert_eq!(row.identity, keys.identity);
+    assert_eq!(row.model_id, keys.chunk_model_key);
+    assert_eq!(row.values, vector(0));
+    assert_eq!(row.project_path, project());
+    assert_eq!(row.session_id, "session-a");
+    for (from, to, count) in [
+        (100, 100, 1),
+        (200, 250, 1),
+        (300, 300, 1),
+        (301, 400, 0),
+        (0, 99, 0),
+    ] {
+        let bounds = store::VectorDateBounds {
+            from_ms: from,
+            to_ms: to,
+        };
+        assert_eq!(
+            available(reader.read_compartment_chunks(
+                &resolved.scope,
+                Some(&bounds),
+                &keys.identity
+            ))
+            .len(),
+            count
+        );
+    }
+    let reversed = store::VectorDateBounds {
+        from_ms: 300,
+        to_ms: 100,
+    };
+    assert_eq!(
+        unavailable_code(reader.read_compartment_chunks(
+            &resolved.scope,
+            Some(&reversed),
+            &keys.identity
+        )),
+        "vector_date_bounds_invalid"
+    );
+    tx.execute(
+        "DELETE FROM message_fts_rowid_map WHERE session_id='session-a' AND message_ordinal=10",
+        [],
+    )
+    .unwrap();
+    let bounds = store::VectorDateBounds {
+        from_ms: 200,
+        to_ms: 250,
+    };
+    assert!(available(reader.read_compartment_chunks(
+        &resolved.scope,
+        Some(&bounds),
+        &keys.identity
+    ))
+    .is_empty());
+    let undated = available(reader.read_compartment_chunks(&resolved.scope, None, &keys.identity));
+    assert_eq!(undated.len(), 1);
+    assert_eq!(undated[0].last_message_time_ms, None);
+    tx.execute(
+        "UPDATE compartment_chunk_embeddings SET dims=3 WHERE compartment_id=1",
+        [],
+    )
+    .unwrap();
+    assert!(
+        matches!(reader.read_compartment_chunks(&resolved.scope, None, &keys.identity),
+        CapabilityResult::Degraded { value, reason } if value.is_empty() && reason.code == "vector_rows_invalid")
+    );
+}
+
+#[test]
+fn retrieval_snapshot_matches_real_typescript_dated_chunk_rows() {
+    let root = TempDir::new().unwrap();
+    let mut db = fresh(&root.path().join("context.db"));
+    seed(&db);
+    write_vectors(&mut db);
+    let resolved = read_scope();
+    let keys = certified_keys();
+    let tx = db.transaction().unwrap();
+    let reader = store::VectorReadSnapshot::new(&tx, &Archive, &resolved, Some(&keys));
+    for expected in golden().value["datedChunks"].as_array().unwrap() {
+        let dates = store::VectorDateBounds {
+            from_ms: expected["from"].as_i64().unwrap(),
+            to_ms: expected["to"].as_i64().unwrap(),
+        };
+        let rows = available(reader.read_compartment_chunks(
+            &resolved.scope,
+            Some(&dates),
+            &keys.identity,
+        ));
+        let actual: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                json!({ "compartmentId":row.compartment_id,
+            "title":row.title, "startOrdinal":row.start_ordinal, "endOrdinal":row.end_ordinal,
+            "windowIndex":row.window_index, "windowStartOrdinal":row.window_start_ordinal,
+            "windowEndOrdinal":row.window_end_ordinal })
+            })
+            .collect();
+        let expected_rows = expected["rows"].as_array().unwrap();
+        let mut metadata = expected_rows.clone();
+        for row in &mut metadata {
+            row.as_object_mut().unwrap().remove("values");
+        }
+        assert_eq!(json!(actual), json!(metadata), "date range {dates:?}");
+        for (actual, expected) in rows.iter().zip(expected_rows) {
+            let values = expected["values"].as_array().unwrap();
+            assert_eq!(actual.values.len(), values.len());
+            for (actual, expected) in actual.values.iter().zip(values) {
+                assert_eq!(f64::from(*actual), expected.as_f64().unwrap());
+            }
+        }
+    }
 }

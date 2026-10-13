@@ -2,9 +2,13 @@
 //! Source text writers must delete old vectors in the same transaction as a text change,
 //! because memory and commit vector rows do not persist the hash of their input text.
 
+use crate::parity_schema_manifest::{
+    CapabilityReason, CapabilityResult, EmbeddingIdentity, StoreScope,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_SELECTION: usize = 64;
 
@@ -493,4 +497,296 @@ pub fn memory_coverage(
             })
         },
     )
+}
+
+/// Certified correspondence between a complete query identity and persisted passage
+/// model keys. The integration layer must certify compatibility before constructing
+/// this value: the shared SQLite vector tables do not store every identity field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertifiedModelKeys {
+    pub identity: EmbeddingIdentity,
+    pub memory_model_key: String,
+    pub chunk_model_key: String,
+}
+
+/// Authorization and project aliases resolved once for a read transaction. Only
+/// memory projects/IDs may include workspace sources; compartment aliases must
+/// identify the caller's own project, session and harness.
+#[derive(Debug, Clone)]
+pub struct ResolvedVectorScope {
+    pub scope: StoreScope,
+    pub authorized_memory_ids: BTreeSet<i64>,
+    pub memory_projects: BTreeSet<String>,
+    pub compartment_projects: BTreeSet<String>,
+    pub session_id: String,
+    pub harness: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorDateBounds {
+    pub from_ms: i64,
+    pub to_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompartmentChunkVector {
+    pub compartment_id: i64,
+    pub session_id: String,
+    pub project_path: String,
+    pub title: String,
+    /// Whole-compartment bounds, not this embedding window's bounds.
+    pub start_ordinal: i64,
+    pub end_ordinal: i64,
+    pub first_message_time_ms: Option<i64>,
+    pub last_message_time_ms: Option<i64>,
+    pub window_index: i64,
+    pub window_start_ordinal: i64,
+    pub window_end_ordinal: i64,
+    pub model_id: String,
+    pub identity: EmbeddingIdentity,
+    pub values: Vec<f32>,
+}
+
+/// Both search reads borrow the same transaction, authorization snapshot and certified
+/// model mapping. Neither method performs retrieval scoring or broadens authorization.
+pub struct VectorReadSnapshot<'a, 'connection> {
+    db: &'a Transaction<'connection>,
+    chunks: &'a dyn ChunkCatalog,
+    resolved: &'a ResolvedVectorScope,
+    certified: Option<&'a CertifiedModelKeys>,
+}
+
+impl<'a, 'connection> VectorReadSnapshot<'a, 'connection> {
+    pub fn new(
+        db: &'a Transaction<'connection>,
+        chunks: &'a dyn ChunkCatalog,
+        resolved: &'a ResolvedVectorScope,
+        certified: Option<&'a CertifiedModelKeys>,
+    ) -> Self {
+        Self {
+            db,
+            chunks,
+            resolved,
+            certified,
+        }
+    }
+
+    fn model_key(
+        &self,
+        scope: &StoreScope,
+        identity: &EmbeddingIdentity,
+        kind: Kind,
+    ) -> Result<&str, CapabilityReason> {
+        if scope != &self.resolved.scope {
+            return Err(vector_reason(
+                "vector_scope_mismatch",
+                "The vector read scope differs from the authenticated snapshot",
+            ));
+        }
+        let Some(certified) = self.certified else {
+            return Err(vector_reason(
+                "vector_identity_unavailable",
+                "No certified identity-to-model-key mapping is installed",
+            ));
+        };
+        if identity != &certified.identity || identity.dimensions == 0 {
+            return Err(vector_reason(
+                "vector_identity_unsupported",
+                "The complete vector identity is not certified for this snapshot",
+            ));
+        }
+        let key = if kind == Kind::Chunk {
+            &certified.chunk_model_key
+        } else {
+            &certified.memory_model_key
+        };
+        if key.is_empty() {
+            return Err(vector_reason(
+                "vector_identity_unavailable",
+                "No persisted model key is certified for this vector corpus",
+            ));
+        }
+        Ok(key)
+    }
+
+    /// Return vectors keyed by authorized numeric memory IDs. A missing mapping or
+    /// failed SQL read is unavailable, not an available empty vector corpus.
+    pub fn read_memory_vectors(
+        &self,
+        scope: &StoreScope,
+        memory_ids: &[i64],
+        identity: &EmbeddingIdentity,
+    ) -> CapabilityResult<BTreeMap<i64, Vec<f32>>> {
+        let model_key = match self.model_key(scope, identity, Kind::Memory) {
+            Ok(key) => key,
+            Err(reason) => return CapabilityResult::Unavailable { reason },
+        };
+        if memory_ids
+            .iter()
+            .any(|id| !self.resolved.authorized_memory_ids.contains(id))
+        {
+            return CapabilityResult::Unavailable {
+                reason: vector_reason(
+                    "vector_memory_unauthorized",
+                    "Requested memory IDs are outside the authorized snapshot",
+                ),
+            };
+        }
+        let read = || -> rusqlite::Result<(BTreeMap<i64, Vec<f32>>, usize)> {
+            let mut statement = self.db.prepare(
+                "SELECT e.memory_id,e.embedding FROM memory_embeddings e JOIN memories m ON m.id=e.memory_id
+                 WHERE m.project_path IN (SELECT value FROM json_each(?1))
+                   AND e.memory_id IN (SELECT value FROM json_each(?2)) AND e.model_id=?3
+                 ORDER BY e.memory_id ASC",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    serde_json::to_string(&self.resolved.memory_projects).unwrap(),
+                    serde_json::to_string(memory_ids).unwrap(),
+                    model_key
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?;
+            let (mut values, mut invalid) = (BTreeMap::new(), 0);
+            for row in rows {
+                let (id, blob) = row?;
+                if let Some(vector) = decode(&blob, identity.dimensions as usize) {
+                    values.insert(id, vector);
+                } else {
+                    invalid += 1;
+                }
+            }
+            Ok((values, invalid))
+        };
+        vector_read_result(read())
+    }
+
+    /// Join raw windows to current titles and whole-compartment bounds. Date bounds
+    /// overlap the first/last message times; missing endpoints exclude dated reads.
+    /// The session/harness and own-project aliases never expand to workspace history.
+    pub fn read_compartment_chunks(
+        &self,
+        scope: &StoreScope,
+        dates: Option<&VectorDateBounds>,
+        identity: &EmbeddingIdentity,
+    ) -> CapabilityResult<Vec<CompartmentChunkVector>> {
+        let model_key = match self.model_key(scope, identity, Kind::Chunk) {
+            Ok(key) => key,
+            Err(reason) => return CapabilityResult::Unavailable { reason },
+        };
+        if dates.is_some_and(|bounds| bounds.from_ms > bounds.to_ms) {
+            return CapabilityResult::Unavailable {
+                reason: vector_reason(
+                    "vector_date_bounds_invalid",
+                    "Vector date bounds are reversed",
+                ),
+            };
+        }
+        let read = || -> rusqlite::Result<(Vec<CompartmentChunkVector>, usize)> {
+            let mut statement = self.db.prepare(
+                "SELECT e.compartment_id,e.session_id,e.project_path,c.title,c.start_message,c.end_message,
+                        start_map.message_time_ms,end_map.message_time_ms,e.window_index,e.start_ordinal,
+                        e.end_ordinal,e.model_id,e.dims,e.vector,e.chunk_hash
+                 FROM compartment_chunk_embeddings e JOIN compartments c ON c.id=e.compartment_id
+                 JOIN session_projects sp ON sp.session_id=c.session_id AND sp.harness=c.harness
+                 LEFT JOIN message_fts_rowid_map start_map ON start_map.session_id=c.session_id
+                   AND start_map.message_ordinal=c.start_message
+                 LEFT JOIN message_fts_rowid_map end_map ON end_map.session_id=c.session_id
+                   AND end_map.message_ordinal=c.end_message
+                 WHERE e.session_id=?1 AND c.session_id=?1 AND e.harness=?2 AND c.harness=?2
+                   AND e.project_path IN (SELECT value FROM json_each(?3))
+                   AND sp.project_path IN (SELECT value FROM json_each(?3)) AND e.model_id=?4
+                   AND (?5 IS NULL OR (start_map.message_time_ms<=?6 AND end_map.message_time_ms>=?5))
+                 ORDER BY e.compartment_id ASC,e.window_index ASC",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    self.resolved.session_id,
+                    self.resolved.harness,
+                    serde_json::to_string(&self.resolved.compartment_projects).unwrap(),
+                    model_key,
+                    dates.map(|bounds| bounds.from_ms),
+                    dates.map(|bounds| bounds.to_ms)
+                ],
+                |row| {
+                    let source = Passage {
+                        source: Source::Chunk {
+                            compartment_id: row.get(0)?,
+                            window_index: row.get(8)?,
+                        },
+                        project: row.get(2)?,
+                        text: String::new(),
+                        content_hash: row.get(14)?,
+                        span: Some(ChunkSpan {
+                            session_id: row.get(1)?,
+                            harness: self.resolved.harness.clone(),
+                            start_ordinal: row.get(9)?,
+                            end_ordinal: row.get(10)?,
+                        }),
+                    };
+                    Ok((
+                        CompartmentChunkVector {
+                            compartment_id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            project_path: row.get(2)?,
+                            title: row.get(3)?,
+                            start_ordinal: row.get(4)?,
+                            end_ordinal: row.get(5)?,
+                            first_message_time_ms: row.get(6)?,
+                            last_message_time_ms: row.get(7)?,
+                            window_index: row.get(8)?,
+                            window_start_ordinal: row.get(9)?,
+                            window_end_ordinal: row.get(10)?,
+                            model_id: row.get(11)?,
+                            identity: identity.clone(),
+                            values: Vec::new(),
+                        },
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, Vec<u8>>(13)?,
+                        source,
+                    ))
+                },
+            )?;
+            let (mut values, mut invalid) = (Vec::new(), 0);
+            for row in rows {
+                let (mut vector, dimensions, blob, passage) = row?;
+                if !self.chunks.current(self.db, &passage)? {
+                    continue;
+                }
+                if dimensions == i64::from(identity.dimensions) {
+                    if let Some(decoded) = decode(&blob, identity.dimensions as usize) {
+                        vector.values = decoded;
+                        values.push(vector);
+                        continue;
+                    }
+                }
+                invalid += 1;
+            }
+            Ok((values, invalid))
+        };
+        vector_read_result(read())
+    }
+}
+
+fn vector_reason(code: &str, message: &str) -> CapabilityReason {
+    CapabilityReason {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+fn vector_read_result<T>(result: rusqlite::Result<(T, usize)>) -> CapabilityResult<T> {
+    match result {
+        Ok((value, 0)) => CapabilityResult::Available { value },
+        Ok((value, invalid)) => CapabilityResult::Degraded {
+            value,
+            reason: vector_reason(
+                "vector_rows_invalid",
+                &format!("Ignored {invalid} vectors with invalid float32 data or dimensions"),
+            ),
+        },
+        Err(error) => CapabilityResult::Unavailable {
+            reason: vector_reason("vector_store_read_failed", &error.to_string()),
+        },
+    }
 }

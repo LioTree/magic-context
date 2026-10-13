@@ -45,6 +45,8 @@ try {
             VALUES(1,'session-a',1,0,1,'Vector fixture','Summary',1)`).run();
         db.prepare(`INSERT INTO session_projects(session_id,harness,project_path,updated_at)
             VALUES('session-a','opencode',?,1)`).run(project);
+        db.prepare(`INSERT INTO message_fts_rowid_map(session_id,message_ordinal,fts_rowid,message_time_ms)
+            VALUES('session-a',0,100,100),('session-a',1,101,200)`).run();
         for (let i = 0; i < vectors.length; i++) {
             // A subarray catches serializers that accidentally copy the whole backing buffer.
             const backing = new Float32Array([999, ...vectors[i], 999]);
@@ -83,6 +85,13 @@ try {
         decoded: { memory: memoryVectors, commit: commitVectors, chunk: chunkVectors },
         rankings: { memory: rank(memoryVectors), commit: rank(commitVectors), chunk: rank(chunkVectors) },
         coverage: memory.getMemoryEmbedCoverage(db, project, model),
+        datedChunks: [[100, 100], [150, 150], [200, 200], [201, 300], [0, 99]].map(([from, to]) => ({
+            from, to, rows: chunks.loadCompartmentChunkEmbeddingsForSearch(db, "session-a", project, chunkModel, { from, to })
+                .map((row: any) => ({ compartmentId: row.compartmentId, title: row.title,
+                    startOrdinal: row.startOrdinal, endOrdinal: row.endOrdinal, windowIndex: row.windowIndex,
+                    windowStartOrdinal: row.windowStartOrdinal, windowEndOrdinal: row.windowEndOrdinal,
+                    values: [...row.vector] })),
+        })),
         cosineEdges: [cosineSimilarity(new Float32Array(0), new Float32Array(0)),
             cosineSimilarity(query, new Float32Array(2)), cosineSimilarity(query, new Float32Array(4))],
     }, null, 2));
