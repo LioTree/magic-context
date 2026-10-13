@@ -53,7 +53,7 @@ const TEXT_REQUIRED_TOOLS: [&str; 3] = ["ctx_expand", "ctx_search", "ctx_note"];
 /// schema both match, so a different digest would silently turn stamping off
 /// there; any change ships together with the gateway change that recognises it.
 pub(crate) const FROZEN_CTX_REDUCE_SCHEMA_DIGEST: &str =
-    "4aef9a14d5c9c617b7e01c5698c1609dd97c55c30fd552fb64e3236346d21731";
+    "69c7dd3393dc8af19386eb80f849df7a1943126bfe1a14769bfff1182b88abf6";
 
 /// The params a tool item may carry: the role's shared vocabulary plus `model`.
 const TOOL_PARAMS: [&str; 5] = ["scope", "tool_descs", "exclude", "behavior", "model"];
@@ -1099,7 +1099,7 @@ mod parity_runtime_tests {
     }
 
     #[tokio::test]
-    async fn reduce_advertises_optional_drop_but_execution_still_requires_it() {
+    async fn reduce_advertises_required_drop_and_execution_requires_it() {
         let config = CatalogConfig::from_module_config(&McModuleConfig::default());
         let reduce = catalog_tool(
             definition().tool("ctx_reduce").unwrap(),
@@ -1107,7 +1107,8 @@ mod parity_runtime_tests {
             &config,
         )
         .unwrap();
-        assert!(reduce["input_schema"].get("required").is_none());
+        assert_eq!(reduce["input_schema"]["required"], json!(["drop"]));
+        assert_eq!(reduce["input_schema"].as_object().unwrap().len(), 4);
         assert_eq!(reduce["schema_digest"], FROZEN_CTX_REDUCE_SCHEMA_DIGEST);
 
         let handler = crate::McHandler::new();

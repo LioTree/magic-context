@@ -35,6 +35,7 @@ struct Extra {
 
 #[derive(Deserialize)]
 struct Golden {
+    known_divergences: Value,
     tools: Vec<ToolCase>,
     languages: Vec<Language>,
     rejected: Vec<String>,
@@ -46,8 +47,55 @@ struct Golden {
 fn golden() -> &'static Golden {
     static GOLDEN: OnceLock<Golden> = OnceLock::new();
     GOLDEN.get_or_init(|| {
-        serde_json::from_str(include_str!("../testdata/tool_surfaces/golden.json")).unwrap()
+        let golden: Golden =
+            serde_json::from_str(include_str!("../testdata/tool_surfaces/golden.json")).unwrap();
+        validate_known_divergences(&golden.known_divergences).unwrap();
+        golden
     })
+}
+
+fn known_divergences() -> Value {
+    // TypeScript's builder is wrong and will be changed to required: ["drop"].
+    // Execution already refuses missing drop, and the Claude Code gateway
+    // requires this exact four-key schema before it authorizes reduction.
+    json!([{
+        "name": "ctx_reduce.drop_requiredness",
+        "tool": "ctx_reduce",
+        "field": "input_schema.required",
+        "typescript": { "present": false },
+        "rust": { "present": true, "value": ["drop"] },
+        "reason": "TypeScript's builder is wrong and will be changed to required: [\"drop\"]. Execution already refuses missing drop; the Claude Code gateway requires the four-key schema."
+    }])
+}
+
+fn validate_known_divergences(actual: &Value) -> Result<(), String> {
+    if actual != &known_divergences() {
+        return Err("expected exactly the named ctx_reduce.drop_requiredness divergence".into());
+    }
+    Ok(())
+}
+
+fn compare_schema(name: &str, actual: &Value, expected: &Value) -> Result<(), String> {
+    let mut comparable = actual.clone();
+    if name == "ctx_reduce" {
+        if actual.get("required") != Some(&json!(["drop"])) {
+            return Err("ctx_reduce.drop_requiredness disappeared or changed on Rust".into());
+        }
+        if expected.get("required").is_some() {
+            return Err("ctx_reduce.drop_requiredness disappeared or changed on TypeScript".into());
+        }
+        let properties = comparable.as_object_mut().ok_or("expected schema object")?;
+        if properties.len() != 4 {
+            return Err("ctx_reduce must advertise exactly four schema keys".into());
+        }
+        properties.remove("required");
+    }
+    // Only the checked, named requiredness difference is omitted. Preserve all
+    // other fields, constraints, enum ordering and parameter-description bytes.
+    if serde_jcs::to_vec(&comparable).unwrap() != serde_jcs::to_vec(expected).unwrap() {
+        return Err(format!("unexpected schema divergence for {name}"));
+    }
+    Ok(())
 }
 
 fn config(mask: usize, language: &str, preset: PromptSurfacePreset) -> McModuleConfig {
@@ -113,13 +161,59 @@ fn assert_tool(actual: &Value, expected: &Value, context: &str) {
         expected["description"].as_str().unwrap().as_bytes(),
         "{context}: description"
     );
-    // Canonicalize object key order only: bounds, unions, enum/required order,
-    // defaults and every parameter-description byte remain part of the check.
-    assert_eq!(
-        serde_jcs::to_vec(&actual["input_schema"]).unwrap(),
-        serde_jcs::to_vec(&expected["input_schema"]).unwrap(),
-        "{context}: schema"
-    );
+    compare_schema(
+        actual["name"].as_str().unwrap(),
+        &actual["input_schema"],
+        &expected["input_schema"],
+    )
+    .unwrap_or_else(|error| panic!("{context}: {error}"));
+}
+
+#[test]
+fn requiredness_allowlist_rejects_disappearing_or_extra_divergences() {
+    let selection = PromptSurfaceSelection::default();
+    let tool = session_tools_for_config(&selection, &config(1 | 16 | 64, "", selection.preset))
+        .into_iter()
+        .find(|tool| tool.name == "ctx_reduce")
+        .unwrap();
+    let expected = golden()
+        .tools
+        .iter()
+        .find(|case| case.preset == PromptSurfacePreset::Full && case.smart)
+        .unwrap()
+        .tools
+        .iter()
+        .find(|tool| tool["name"] == "ctx_reduce")
+        .unwrap()["input_schema"]
+        .clone();
+    compare_schema("ctx_reduce", &tool.schema, &expected).unwrap();
+
+    let mut rust_optional = tool.schema.clone();
+    rust_optional.as_object_mut().unwrap().remove("required");
+    assert!(compare_schema("ctx_reduce", &rust_optional, &expected).is_err());
+    let mut typescript_fixed = expected.clone();
+    typescript_fixed["required"] = json!(["drop"]);
+    assert!(compare_schema("ctx_reduce", &tool.schema, &typescript_fixed).is_err());
+    let mut extra_required = tool.schema.clone();
+    extra_required["required"] = json!(["drop", "other"]);
+    assert!(compare_schema("ctx_reduce", &extra_required, &expected).is_err());
+    let mut changed_drop = tool.schema.clone();
+    changed_drop["properties"]["drop"]["type"] = json!("number");
+    assert!(compare_schema("ctx_reduce", &changed_drop, &expected).is_err());
+    let mut changed_root = tool.schema.clone();
+    changed_root["additionalProperties"] = json!(true);
+    assert!(compare_schema("ctx_reduce", &changed_root, &expected).is_err());
+    let mut extra_root = tool.schema.clone();
+    extra_root["title"] = json!("unexpected");
+    assert!(compare_schema("ctx_reduce", &extra_root, &expected).is_err());
+
+    assert!(validate_known_divergences(&json!([])).is_err());
+    let mut additional_allowance = known_divergences();
+    additional_allowance
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name": "other"}));
+    assert!(validate_known_divergences(&additional_allowance).is_err());
 }
 
 #[test]

@@ -1,26 +1,23 @@
 {
   "baseline": "b62632c1a49f4fc248120147aafc0520ef462178",
+  "known_divergences": [
+    {
+      "name": "ctx_reduce.drop_requiredness",
+      "tool": "ctx_reduce",
+      "field": "input_schema.required",
+      "typescript": {
+        "present": false
+      },
+      "rust": {
+        "present": true,
+        "value": [
+          "drop"
+        ]
+      },
+      "reason": "TypeScript's builder is wrong and will be changed to required: [\"drop\"]. Execution already refuses missing drop; the Claude Code gateway requires the four-key schema."
+    }
+  ],
   "deltas": [
-    {
-      "scope": "catalog",
-      "preset": "full",
-      "tool": "ctx_reduce",
-      "field": "input_schema.required",
-      "before": [
-        "drop"
-      ],
-      "after": null
-    },
-    {
-      "scope": "legacy",
-      "preset": "full",
-      "tool": "ctx_reduce",
-      "field": "input_schema.required",
-      "before": [
-        "drop"
-      ],
-      "after": null
-    },
     {
       "scope": "catalog",
       "preset": "full",
@@ -610,26 +607,6 @@
           ]
         }
       }
-    },
-    {
-      "scope": "catalog",
-      "preset": "light",
-      "tool": "ctx_reduce",
-      "field": "input_schema.required",
-      "before": [
-        "drop"
-      ],
-      "after": null
-    },
-    {
-      "scope": "legacy",
-      "preset": "light",
-      "tool": "ctx_reduce",
-      "field": "input_schema.required",
-      "before": [
-        "drop"
-      ],
-      "after": null
     },
     {
       "scope": "catalog",
@@ -1233,5 +1210,5 @@
       "override_after": "same primary override plus temporal/caveman/language clauses as TS builder"
     }
   ],
-  "note": "Full/light catalog authored descriptions and parameter descriptions are otherwise unchanged. Legacy guidance.get is not redirected until integration-owner.patch is applied; golden.json contains every exact config output of the new composer."
+  "note": "Full/light catalog authored descriptions and parameter descriptions are otherwise unchanged. Legacy guidance.get is not redirected until lib-guidance.patch is applied; golden.json contains every exact config output of the new composer."
 }

@@ -36,6 +36,33 @@ const toolNames = [
 	"ctx_memory",
 	"ctx_search",
 ] as const;
+// TypeScript's builder is wrong and will be changed to required: ["drop"].
+// Runtime refuses missing drop; the Claude Code authority gate also requires
+// that key in its exact four-key schema. No other difference is permitted.
+const knownDivergences = [
+	{
+		name: "ctx_reduce.drop_requiredness",
+		tool: "ctx_reduce",
+		field: "input_schema.required",
+		typescript: { present: false },
+		rust: { present: true, value: ["drop"] },
+		reason:
+			'TypeScript\'s builder is wrong and will be changed to required: ["drop"]. Execution already refuses missing drop; the Claude Code gateway requires the four-key schema.',
+	},
+];
+
+function advertisedSchema(
+	name: string,
+	schema: Record<string, unknown>,
+): Record<string, unknown> {
+	if (name !== "ctx_reduce") return schema;
+	if (Object.hasOwn(schema, "required")) {
+		throw new Error(
+			"The named ctx_reduce.drop_requiredness divergence disappeared on TypeScript; update the allowlist explicitly.",
+		);
+	}
+	return { ...schema, required: ["drop"] };
+}
 const lightDescriptions = {
 	ctx_reduce: light.CTX_REDUCE_LIGHT_DESCRIPTION,
 	ctx_expand: light.CTX_EXPAND_LIGHT_DESCRIPTION,
@@ -233,12 +260,19 @@ for (let mask = 0; mask < 128; mask++) {
 		});
 	}
 }
+for (const variant of tools) {
+	const reduce = variant.tools.find(
+		(snapshot) => snapshot.name === "ctx_reduce",
+	)!;
+	advertisedSchema(reduce.name, reduce.input_schema);
+}
 const golden = {
 	format: "magic-context/typescript-tool-surfaces/1",
 	generator: "bun crates/mc-module/testdata/tool_surfaces/generate.ts",
 	runtime: { bun: Bun.version, icu: process.versions.icu },
 	schema_dialect:
 		"OpenCode/Zod toJSONSchema(object(args)), root $schema omitted; all other constraints retained",
+	known_divergences: knownDivergences,
 	tools,
 	languages,
 	rejected,
@@ -253,6 +287,13 @@ const checkMode =
 	process.argv.includes("--report-icu-drift");
 if (checkMode) {
 	const saved = JSON.parse(readFileSync(goldenPath, "utf8")) as typeof golden;
+	if (
+		JSON.stringify(saved.known_divergences) !== JSON.stringify(knownDivergences)
+	) {
+		throw new Error(
+			"Expected exactly the named ctx_reduce.drop_requiredness allowlist entry.",
+		);
+	}
 	const expectedNames = Object.fromEntries(
 		saved.languages
 			.filter((row) => row.code)
@@ -349,7 +390,10 @@ if (process.argv.includes("--refresh-assets")) {
 	source = source.replace(
 		/("structure": )\{[\s\S]*?\n      \}/g,
 		(_matched, prefix: string) => {
-			const schema = structuredClone(full.tools[index++].input_schema) as {
+			const current = full.tools[index++];
+			const schema = structuredClone(
+				advertisedSchema(current.name, current.input_schema),
+			) as {
 				properties: Record<string, Record<string, unknown>>;
 			};
 			for (const property of Object.values(schema.properties))
@@ -472,7 +516,10 @@ if (reviewBaseline) {
 						before: description,
 						after: expected.description,
 					});
-				const next = expected.input_schema as typeof schema;
+				const next = advertisedSchema(
+					expected.name,
+					expected.input_schema,
+				) as typeof schema;
 				for (const key of new Set([
 					...Object.keys(schema),
 					...Object.keys(next),
@@ -535,7 +582,7 @@ if (reviewBaseline) {
 	});
 	writeFileSync(
 		resolve(import.meta.dir, "advertised-deltas.json"),
-		`${JSON.stringify({ baseline: reviewBaseline, deltas, language_deltas: languageDeltas, guidance_deltas: guidanceDeltas, note: "Full/light catalog authored descriptions and parameter descriptions are otherwise unchanged. Legacy guidance.get is not redirected until integration-owner.patch is applied; golden.json contains every exact config output of the new composer." }, null, 2)}\n`,
+		`${JSON.stringify({ baseline: reviewBaseline, known_divergences: knownDivergences, deltas, language_deltas: languageDeltas, guidance_deltas: guidanceDeltas, note: "Full/light catalog authored descriptions and parameter descriptions are otherwise unchanged. Legacy guidance.get is not redirected until lib-guidance.patch is applied; golden.json contains every exact config output of the new composer." }, null, 2)}\n`,
 	);
 	console.log(
 		`Recorded ${deltas.length} exact schema/description deltas, ${languageDeltas.length} language deltas, and two noncompacting-head guidance deltas for THALAMUS review.`,

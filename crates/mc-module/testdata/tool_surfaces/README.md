@@ -5,8 +5,20 @@
 no database or live store is opened. Zod schemas use the plugin's actual
 `normalizeToolArgSchemas` conversion. Only the root `$schema` annotation is
 omitted, as in the plugin's converter. Rust compares descriptions as UTF-8 bytes
-and schemas as JCS bytes; no bounds, enums, unions, required fields, defaults or
-parameter text are normalized away.
+and schemas as JCS bytes. The single explicit exception is
+`ctx_reduce.drop_requiredness`: Rust requires `drop`, while the TypeScript
+builder wrongly advertises it as optional. No other field, bound, enum, union,
+default or parameter text is normalized away.
+
+The golden's `known_divergences` array must contain exactly that named entry,
+with TypeScript's `required` absent and Rust's `required: ["drop"]` present.
+The parity check asserts both sides before omitting only this difference from
+the comparison. It fails if the divergence disappears on either side, changes
+shape, or any other field diverges; it also rejects an empty or expanded
+allowlist. Negative controls cover a fixed TypeScript builder, an optional Rust
+schema, extra required/root keys, a changed drop type and additionalProperties.
+TypeScript's builder is wrong and will be changed to `required: ["drop"]` in a
+separate task. Execution already refuses a missing drop.
 
 ## Generate and verify
 
@@ -21,13 +33,18 @@ bun crates/mc-module/testdata/tool_surfaces/generate.ts --review-baseline=b62632
 ```
 
 `--refresh-assets` updates only the five catalog schema structures and generated
-ICU name map; it does not change any TypeScript source. The review option emits
+ICU name map, preserving the gateway-required `required: ["drop"]` exception;
+it does not change any TypeScript source. Running
+`generate.ts --review-baseline=<commit>` emits
 `advertised-deltas.json`, the exact before/after schema and string list for
-THALAMUS coordination. The separately holdable reduce-schema commit changes
-its authorization digest from
-`69c7dd3393dc8af19386eb80f849df7a1943126bfe1a14769bfff1182b88abf6` to
-`4aef9a14d5c9c617b7e01c5698c1609dd97c55c30fd552fb64e3236346d21731`.
-Do not deploy this advertisement until the gateway recognizes that digest.
+THALAMUS coordination. THALAMUS rejected the optional reduce advertisement:
+its Claude Code authority gate requires exactly four schema keys, including
+`required: ["drop"]`, or reduction silently becomes unauthorized. The optional
+advertisement from commit `4d12af3c` is reverted. ck-mc retains its original
+authorization digest:
+`69c7dd3393dc8af19386eb80f849df7a1943126bfe1a14769bfff1182b88abf6`.
+The delta manifest records the known divergence separately, not as a changed
+Rust advertisement.
 
 The golden captures 20 tool schemas (five tools × full/light × smart on/off),
 48,896 guidance cases (all seven boolean switches × full/light × unset language
@@ -74,7 +91,7 @@ packages/plugin/node_modules/.bin/tsc --noEmit -p crates/mc-module/testdata/tool
 ```
 
 The full matrix takes about one to three minutes in an unoptimized Linux test binary.
-The four integration tests and five runtime tests passed. Runtime refusal tests
+The five integration tests and five runtime tests passed. Runtime refusal tests
 cover missing/blank/non-string drop, oversized note content/condition, memory
 content/reason, search query, memory ID count/nonpositive/fractional IDs, and
 negative/fractional expand selectors. The expand check exercises the exact mode
@@ -82,7 +99,7 @@ parser used by the facade; other checks invoke actual facade dispatch and assert
 both `isError` and the unchanged error text. Paging clamps are not falsely
 presented as refusals. Mutation of one character of `guidance_primary.txt`
 reddens only `legacy_guidance_assets_are_the_generated_enabled_baseline`; the
-other three integration tests remain green.
+other integration tests remain green.
 
 ## Serial integration follow-ups (not applied)
 
