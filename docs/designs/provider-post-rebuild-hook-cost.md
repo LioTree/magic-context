@@ -1,6 +1,12 @@
-# Provider post-rebuild hook cost: cache descriptors and prewarm
+# Provider post-rebuild hook cost: shadow preparation and admitted-cut finalization
 
-Status: proposal for review, **not authorized for implementation**. The canary
+Status: measured profile plus revised plan. Publishing a refrozen baseline before
+the next message changed its cut; splicing durable typed JSON into a step answer
+changed its bytes. That earlier proposal was **rejected** by the accepted review in
+`docs/reviews/provider-post-rebuild-hook-cost-review.md`. No revised preparation
+or consumption implementation is included in this revision of the plan. The next
+increment is authorized in the sequence below; offline proofs precede any rollout.
+The canary
 remains blocked; there is no 1.10× rebuild sign-off. P2 denotes the performance
 criterion that provider rebuild p50 is no more than 1.10× a full-array transform
 starting from the same durable snapshot. ALF is the owner's long-lived session
@@ -153,112 +159,185 @@ already represented by the compacted head, so an engine
 baseline cannot simply be reused as a hook baseline. The independent timers
 above now separate those operations, including serialization and lock wait.
 
-## Proposed design
+## Revised smallest safe step (review R1–R5)
 
-### 1. Disposable, bounded immutable-view cache and descriptors
+There is **no view cache, descriptor renderer or native-fragment splicing** in
+this work. The R2 witness proves that durable typed `CompactionMessage` JSON and
+Value-serialized step-answer JSON are equal as objects but unequal as bytes.
+R4 additionally found that a view-row locator omits native rendering dependencies,
+including signed-thinking ownership across the whole prefix. Both problems are
+excluded here; any later view/native ratio optimization needs a separate review.
 
-Keep the existing durable immutable view row as authority. Cache raw serialized
-view bytes plus compact engine/native offsets and descriptors, rather than an
-unbounded decoded JSON graph. Initially permit at most the applied and produced
-view per conversation, with a global byte limit and LRU eviction. Account retained
-buffer and descriptor capacities, not just serialized lengths; an oversized entry
-uses the uncached path. No limit changes the answer.
+### 1. Monotone store policy revision before preparation
 
-The key includes store instance/lease identity, project/session/harness,
-compaction id and immutable version, codec/encoding identity, and the reference's
-lineage/range/cut. A descent may share immutable bytes but has its own validated
-range descriptor. Do not carry cache entries across store replacement, reopen,
-reset, namespace/config/codec changes, invalidated views or missing durable rows.
-A new produced/applied reference evicts obsolete entries. Restart starts empty.
+Add the next contiguous unreleased store migration and a namespace-scoped,
+monotone provider-policy revision. Every write affecting ordinary-hook policy
+inputs must bump it **inside the same transaction**: policy parts and their
+measurements/protection, conversation settings/calibration/baseline, tags and
+consumption, lineage/cuts, bounded summaries and change-log insertion/clearing.
+Namespace rewrites invalidate every sharing conversation. Rollback rolls back
+its bumps; overflow must fail rather than wrap or silently convert the counter to
+a floating-point SQLite REAL value.
 
-The compaction interface should consume metadata descriptors for lineage/version
-checks before requesting payload bytes. A changed candidate digest can establish
-inequality cheaply; an equal digest must still use exact byte comparison, never
-hash equality alone. Rejected-view and `matches_served` checks retain their
-current semantics. Cache raw native fragments only when their sidecar, rendered
-content, protected/signed-thinking ownership and codec inputs all match. Do not
-reuse an old tail merely because its message id is unchanged.
+Use transaction-level SQL triggers where possible so other processes/direct SQL
+writers cannot bypass a Rust call-site convention. Inventory all affected tables
+and write paths, including deletion/reset/revert/namespace changes, in
+`docs/reports/provider-policy-revision-write-sites.md`. Tests exercise each writer and fail if a policy write
+skips revision advancement. Derived preparation storage is separate: writing
+its cache entry does not change the cold policy inputs or recursively invalidate
+its own revision key.
 
-Preserve response and served-message key order, escaping, unknown fields and
-signatures. Moving from typed/Value serialization to raw fragments is not
-assumed byte-equivalent: it needs an independent byte oracle, including response
-assembly and final host output. The existing one-row applied/produced decode reuse
-is a preliminary reduction, not this descriptor/cache implementation.
+Store lease/schema fencing, a settings key and a maximum ordinal are not revision
+validation. Every policy write listed above must bump the revision before a
+preparation can be considered consumable. Do not replace that counter with a
+full-policy reread/comparison inside the production hook.
 
-### 2. Prewarm the exact next ordinary-hook policy during the rebuild
+### 2. Side-effect-free preparation after engine commit
 
-Run prewarm **inside `host_step`, after the engine's provider-policy changes are
-durable and before the completed rebuild answer is serialized**. Its time is
-therefore inside the 30 s rebuild budget, not hidden background work or a larger
-hook deadline. It runs even if the host later rejects/loses the view; its cache is
-derived from the committed engine state, not from an invented acknowledgement.
+Add a provider-only preparation API inside the existing `host_step` critical
+section, after the engine's policy transaction commits and before the step answer
+returns. Do not release the conversation guard, spawn the preparation or create
+a historian barrier to move its cost out of rebuild timing.
 
-Prewarm uses the same effective lineage, engine namespace/coverage, resolved
-protected-token floor, protected-tool window, model calibration, baseline
-generation/length and hook-compatible part measurements as the uncached hook.
-Validate the summary's lineage/settings/baseline key against current inputs;
-`transform::channel1_inputs_from_parts` over every effective part remains the
-independent full-computation reference. Prewarm computes
-only reusable inputs/summary state: **no tag allocation, hook answer, cadence
-advance, hint delivery, served watermark or historian barrier**. Publish baseline
-restatement and summary atomically in a fenced transaction; failure leaves no
-partial summary. Changes between engine commit and prewarm must be accounted for
-or cause a retry/refusal, not a stale cache publication.
+Read a consistent policy snapshot and keep the **original** frozen baseline,
+its part measurements, generation/length and newest existing-message boundary.
+Also retain the effective ordered parts, trusted policy settings and a snapshot
+revision token described below. Running today's pure full computation at this
+point may report `needs_refreeze`; its resulting earlier-cut baseline is only a
+diagnostic and must never become the original baseline for the next hook.
 
-The subsequent hook admits its real message, applies changed-row replay and makes
-its normal decision. Prewarm cannot predict that message's carrier, temporal
-permission, hints or operations. Existing key changes, ancestry/cut changes,
-consumed tags, logged-change cap/ordering failures and untracked window/arc/hint
-members invalidate or rebuild the summary exactly as today. Cache-busting hooks
-still take their exact path; they must not silently use an ordinary prewarm.
+Preparation is disposable derived state, capped by part count and measured
+retained bytes, with at most one pending entry per conversation and a process-wide
+budget. A cap, restart, eviction or unsupported snapshot discards the entry and
+uses the exact current path. Persist only a derived preparation row keyed by the
+policy revision and retained original baseline/newest boundary; do not publish a
+normal hook summary, baseline or change-log checkpoint before admission. Prepared
+aggregates/measurement material must finalize the actual cut without a full policy
+reread or equality verification in the production hook.
 
-A safety-first prewarm that rereads everything merely moves ≈1.5 s into rebuilds
-and may **worsen P2**. The performance version should share the rebuild's parsed
-policy parts/projection traversal and construct hook-compatible measurements once,
-without substituting the engine's different measurements. This requires an
-explicit data handoff/summary publication API; do not expose or mutate full-array
-behavior to obtain it. If sharing cannot preserve the full oracle, retain the
-uncached computation and report the missed target.
+No tag allocation, operations, cadence/grace update, hint, historian work,
+receipt/version allocation, served watermark, acknowledgement or policy write is
+permitted. Do not call `commit_provider_hook_with_parts` as a shortcut: it also
+admits/promotes/burns data. Shadow preparation cannot change the later
+`save_host_setup` counters or be overwritten by a stale local conversation save,
+because it has no durable counters to save.
 
-## Acknowledgements and byte-identity proof
+### 3. Revision-checked finalization at the actual admitted cut
 
-No wire acknowledgement changes are proposed. The host still durably commits the
-issued fence and applies a validated view before acknowledging it. Prewarm and
-cache fill do not mark a produced view applied or advance a served frontier.
-Lost/late answers, non-structural retries, structural rejection, repeated request
-ids, descents and crashes continue to use the durable view/version receipts.
-Missing/corrupt/evicted cache data reloads authority or visibly refuses.
+At the real hook, compare the stored preparation revision with the current
+namespace policy revision **before that hook's own admission mutations**. Any
+intervening writer, namespace sibling, settings/protection change or log update
+that makes them differ takes today's exact cold path. Under the normal fenced
+hook transaction, replay the actual admission/promotion/burn changes made by that
+hook itself, finalize pending refreeze against the retained original baseline and
+the actual admitted newest cut, then commit through the existing hook write path.
+The hook's own changes advance the revision atomically with the same transaction.
+There is no O(session) shadow verification or independent cold recomputation on
+the production hook path.
 
-Acceptance needs cache enabled/disabled differentials over exact encoded answers,
-acknowledgements, final served requests **and functional stored state**. Retain the
-768-pass randomized/HARD comparison, 90-check host suite, 706-pass signed-thinking
-comparison and bounded-policy identity controls. Add restart/eviction/oversize,
-all cache-key invalidators, summary rollback and crash cuts around engine commit,
-prewarm publication, answer serialization and host acknowledgement. Force the
-1.5 s timeout and prove refusal or a provably exact replay. Mutations must neutralize
-key components, return stale descriptors, omit restatement and publish before
-commit; each corresponding named byte/state check must fail when its mutation is
-applied. An equality test over parsed JSON alone is
-not sufficient for ordering/escaping/signature preservation.
+Before the hook, pass synchronization can ingest the newly observed policy parts;
+those writes advance the revision and cause a conservative cold fallback. Do not
+ignore them or rebase a preparation onto an unverified snapshot just to obtain a
+cache hit. Subsequent optimization of such misses requires its own exact replay
+proof. Model/calibration, carrier, hints, cadence/grace and cache-busting permission
+remain the real hook's decisions, not predictions from the per-step status record
+available at preparation time.
 
-## Expected numbers and rollout blocks
+A revision miss, changed ancestry or unaccounted consumed tag, replay cap/order
+failure, cache-busting pass or unsupported delta follows today's exact computation
+and existing refusal behavior. Never restore a stale baseline, clear newer log
+rows, claim a larger hook deadline or modify full-array behavior to fit the cache.
+If consumption is eventually authorized, final baseline/settings/measurement and
+summary changes commit only through the normal hook transaction, with its existing
+rollback semantics and exact accounted frontier.
 
-Planning targets, **not measured promises**:
+The cut rule from review R1 is non-negotiable. On
+`hookcost_review_eager_refreeze_before_append_changes_hook_bytes`, publishing
+before ordinal 3 is admitted freezes one part; the cold hook after that admission
+freezes nine. Equal token totals are insufficient. Finalization must reproduce
+that nine-part baseline, one reclaimable tool output and exact channel-1
+reclaim-reminder append bytes.
 
-- Post-rebuild ordinary-hook module p99 ≤250 ms, with a stretch goal ≤50 ms;
-  end-to-end hook p99 ≤500 ms leaves ≥1,000 ms against the unchanged 1,500 ms
-  fence. Measure failures as failures, not successful latency samples.
-- Paired rebuild/full-array p50 ≤1.10×. With a 6–7 s full baseline, all additional
-  provider work must fit roughly 600–700 ms. Avoiding 1.2–1.6 s of prior-view
-  materialization and sharing the full policy traversal are necessary candidates;
-  prewarm alone is not evidence of meeting this budget. Report P2 including
-  prewarm, persistence, response encoding, sync/drain and actual output publication.
+### 4. Off-by-default consumption; equality proof is offline
 
-Use clean same-allocation paired snapshots, record load/CPU-pressure deltas, and retain
-five byte-equal pairs per binding. The present contended run cannot establish
-those quantiles. Separately blocked are incomplete background byte/page ledger
-and historian cadence, total SQL/logical-write coverage, raw response-wire bytes,
-physical/hash provenance and timestamp-bound canary event/capture continuity.
-Full-array stored-state differential proof and reconciliation merge/rerun are
-still required. Neither this proposal nor the diagnostic meters authorize
-switching on the provider pipeline for the ALF live canary.
+A new off-by-default setting gates consumption. With it off, the cold hook remains
+authoritative, answer bytes and functional policy state match today's behavior,
+and no extra O(session) verification is added to the production hook. Preparation
+remains non-serving derived data; its work is inside the 30 s rebuild budget and
+its costs are explicitly measured.
+
+The equality proof runs offline: copy the durable session snapshot before rebuild
+into two isolated stores, run preparation/finalization in one and the untouched
+cold hook in the other. Compare the
+prepared/finalized first hook with the untouched cold hook: ordered baseline parts,
+measurements, baseline generation/length, summary, full encoded answer and exact
+channel-1 append bytes. Use the real hook's current cadence/grace state, not a
+prepared or advanced state. A miss/cap/cache-bust follows the exact cold path; a
+comparison failure blocks rollout, not a hidden rewrite of the cold reference.
+
+No product shadow reread/recomputation is used to certify equality inside the
+1,500 ms hook. No consumption enablement in any live session is included in this
+work. Preparation, normal finalization and their revision bumps are separately
+timed with Linux pressure-stall information (CPU PSI) and load averages. First
+post-rebuild p50/p99 with consumption enabled determines whether reuse is useful;
+no current result claims it is.
+
+## Acknowledgements and acceptance
+
+Acknowledgements, receipts, immutable view eligibility and step response encoding
+are unchanged. Preparation neither marks a produced view applied nor advances a
+served frontier. Lost/late answers, structural rejection, descent, restart and
+missing preparation use the durable normal path. No native fragments are consumed.
+
+Keep all three accepted review witnesses as written, with
+`MC_HOOKCOST_REVIEW=1`: eager-refreeze-before-append and covered-tag refreeze in
+`step_transform_parity_tests.rs`, and durable/response fragment inequality in
+`compaction_review_tests.rs`. Add a positive warm/cold test using the exact
+`hookcost_review_eager_refreeze_before_append_changes_hook_bytes` fixture. The negative
+witness must still demonstrate one versus nine parts for eager publication; the
+new deferred path must match the independently captured cold nine-part result
+and append bytes after ordinal 3 is admitted. Add covered-tag mismatch, consumed
+shared tag, namespace sibling commit, ancestry/cut, cache-bust, overflow/cap,
+restart and changed-log-frontier cases.
+
+Acceptance splits twin arms from the **same pre-rebuild durable snapshot**, then
+runs rebuild and advancing real hooks with preparation off/on. Compare exact
+encoded hook/step answers, full served requests, acknowledgements/receipts and
+functional stored policy state at each cut. Do not compare two paths after both
+have both adopted a baseline published before the actual new parts are admitted,
+derive the expected value from the prepared
+result, or accept parsed JSON equality as byte equality. Verify zero preparation
+writes and unchanged cold output/state with consumption disabled.
+
+Mutation controls must publish the baseline early, omit the newest admitted parts,
+ignore a revision component, clear unaccounted changes and consume preparation
+without validation. Their specific byte/state tests must fail. Retain the 720-pass
+randomized plus 48-pass full-rebuild (HARD) tests in `step_transform_parity_tests.rs`,
+`pure-replay-differential.ts --provider-pipeline` (90 checks), the 706-pass
+`signed-thinking-differential.sh` audit and bounded-policy byte-identity controls
+before any consumption enablement. Include cuts after engine commit, preparation,
+real admission, normal baseline write, answer serialization and host acknowledgement.
+
+## Timing targets and blocked work
+
+The measured first-hook cost is predominantly reading/decoding all parts plus
+baseline conversion/extraction/restatement, not the 573-byte summary write. The
+revised experiment must report how much of that work preparation can safely reuse
+at the actual admitted cut. Initial shadow mode is a correctness experiment, not a
+promise of ≤250 ms module p99 or ≤1.10× rebuild/full-array p50. Do not infer p99
+from five diagnostic samples. Keep the 1,500 ms hook and 30,000 ms rebuild budgets.
+
+The first post-rebuild consumption measurement must report p50 and p99 for the
+17,000-message fixture used by `provider-post-rebuild-profile.ts`, recording CPU
+PSI/load and sample count, with setting-on/off correctness controls. The plan does not promise ≤250 ms or a useful speedup;
+no live setting is enabled until independent review accepts the exactness and
+measured benefit.
+
+The new consumption setting is disabled by default. A serving path remains gated on exact R1 reproduction,
+same-snapshot byte/state controls, revision-fence tests and useful end-to-end timings
+with PSI/load records. View/native caching is excluded and needs its own review
+for the ratio criterion. The ALF canary, live consumption, ≤1.10× sign-off and
+complete production-meter coverage remain blocked. Background ledger/cadence,
+total SQL/write coverage, raw response wire bytes, capture/event provenance and
+reconciliation gates remain separate requirements specified in
+`docs/reports/provider-pipeline-performance-gate.md`.
