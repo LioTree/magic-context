@@ -457,6 +457,10 @@ async fn cc_invalid_geometry_and_unsupported_evidence_refuse_before_ingest() {
         ),
         (
             "geometry",
+            json!({"geometry":{"usable_soft":50000,"usable_hard":60000,"absolute_wall":100001,"derivation":"gateway"}}),
+        ),
+        (
+            "geometry",
             json!({"geometry":{"usable_soft":50000,"usable_hard":90000,"absolute_wall":100000,"derivation":"gateway"},"output_reserve":20000}),
         ),
         ("geometry", json!({"output_reserve":1})),
@@ -554,17 +558,39 @@ async fn cc_original_inbound_envelope_size_is_checked_before_normalized_params()
 #[tokio::test(flavor = "current_thread")]
 async fn cc_without_fill_uses_request_estimate_and_soft_geometry_and_folds() {
     let dir = tempfile::tempdir().unwrap();
-    let h = handler(dir.path(), thalamus());
-    let mut b = binding(dir.path(), thalamus());
+    fold_with_catalog(dir.path(), dir.path(), Some(100000)).await;
+}
+
+async fn fold_with_catalog(db_root: &Path, route_root: &Path, window: Option<u64>) -> Vec<Value> {
+    let h = handler(db_root, thalamus());
+    let mut b = binding(route_root, thalamus());
     b.config.execute_threshold_percentage = 65.0;
     h.bind_route(7, b);
-    setup(&h).await;
+    response(
+        call(
+            &h,
+            "transform.declare",
+            json!({"session":"cc","harness":"claude-code","params":plan(),"preset":"head"}),
+        )
+        .await,
+    );
+    let mut setup_params = json!({"session":"cc","harness":"claude-code","request_id":"setup","params":plan(),"preset":"head","model":"fixture","composition":{},"lineage_id":"L","now":1});
+    if let Some(window) = window {
+        setup_params["context_window"] = json!(window);
+    }
+    response(call(&h, "compaction.setup", setup_params).await);
     let mut status = step(r#"{"role":"user","content":"history"}"#);
+    if let Some(window) = window {
+        status["context_window"] = json!(window);
+    } else {
+        status.as_object_mut().unwrap().remove("context_window");
+    }
     status["messages"].as_array_mut().unwrap().push(json!({"mid":"tail","ordinal":1,"message":{"role":"user","content":"tail"},"raw_message":r#"{"role":"user","content":"tail"}"#}));
     status["newest"] = json!({"mid":"tail","ordinal":1});
     status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
     status["geometry"] = json!({"usable_soft":50000,"usable_hard":60000,"absolute_wall":100000,"derivation":"gateway"});
     let first = response(call(&h, "compaction.step", status.clone()).await);
+    let mut answers = vec![first.clone()];
     let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
     let store = h.store.get().unwrap();
     store
@@ -606,7 +632,42 @@ async fn cc_without_fill_uses_request_estimate_and_soft_geometry_and_folds() {
             assert_eq!(answer["answer"], "compaction_message");
             assert!(answer.to_string().contains("fold without fill"));
         }
+        answers.push(answer);
     }
+    answers
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_absent_context_window_uses_attested_geometry_through_fold_identically() {
+    let known = tempfile::tempdir().unwrap();
+    let absent = tempfile::tempdir().unwrap();
+    let expected = fold_with_catalog(known.path(), known.path(), Some(100000)).await;
+    let actual = fold_with_catalog(absent.path(), known.path(), None).await;
+    assert_eq!(
+        actual, expected,
+        "geometry-only steps must preserve the full native answer"
+    );
+}
+
+#[tokio::test]
+async fn cc_missing_context_window_and_geometry_refuse_before_ingest() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    setup(&h).await;
+    let mut status = step(r#"{"role":"user","content":"history"}"#);
+    status.as_object_mut().unwrap().remove("context_window");
+    let outcome = call(&h, "compaction.step", status).await;
+    assert!(
+        matches!(outcome, HandlerOutcome::Error { code, message } if code == "invalid_params" && message.contains("context_window") && message.contains("geometry.absolute_wall"))
+    );
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    assert!(h
+        .store
+        .get()
+        .unwrap()
+        .load_provider_messages(&key.store_key(), "L")
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]

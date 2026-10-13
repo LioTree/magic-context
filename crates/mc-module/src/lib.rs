@@ -3935,6 +3935,7 @@ pub struct McHandler {
     /// lock-free map) is appropriate because writes are rare (once per route open/close)
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
+    native_route_locks: Mutex<HashMap<u16, Arc<Mutex<()>>>>,
     native_route_plans: Mutex<HashMap<u16, providers::NativeConnectionPlan>>,
     native_connection_sequence: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -4664,6 +4665,7 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
+            native_route_locks: Mutex::new(HashMap::new()),
             native_route_plans: Mutex::new(HashMap::new()),
             native_connection_sequence: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -5071,6 +5073,7 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
+            native_route_locks: Mutex::new(HashMap::new()),
             native_route_plans: Mutex::new(HashMap::new()),
             native_connection_sequence: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -5096,6 +5099,8 @@ impl McHandler {
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
     fn bind_route(&self, channel: u16, mut binding: SessionBinding) {
+        let route = self.native_route_lock(channel);
+        let _route = route.lock().expect("native route mutex");
         binding.connection_incarnation = self
             .native_connection_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -5533,6 +5538,8 @@ impl McHandler {
 
     /// Remove a route and evict process-local session state after its final binding closes.
     fn unbind_route(&self, channel: u16) {
+        let route = self.native_route_lock(channel);
+        let _route = route.lock().expect("native route mutex");
         self.threshold_logged_routes
             .lock()
             .expect("threshold log mutex")

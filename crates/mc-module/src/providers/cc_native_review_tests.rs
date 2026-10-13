@@ -376,8 +376,10 @@ async fn review_native_publication_fence_holds_lifecycle_lock_and_checks_generat
     let h = cc::handler(dir.path(), cc::thalamus());
     cc::setup(&h).await;
     let binding = h.facade_binding(7).unwrap();
-    let guard = h.native_publication_fence(&binding).unwrap();
-    assert!(h.bindings.try_lock().is_err());
+    let route = h.native_publication_lock(&binding).unwrap();
+    let guard = h.native_publication_fence(&binding, &route).unwrap();
+    assert!(route.try_lock().is_err());
+    assert!(h.bindings.try_lock().is_ok());
     drop(guard);
     h.bindings
         .lock()
@@ -386,7 +388,7 @@ async fn review_native_publication_fence_holds_lifecycle_lock_and_checks_generat
         .unwrap()
         .connection_incarnation += 1;
     assert!(
-        matches!(h.native_publication_fence(&binding),Err(HandlerOutcome::Error {code,..}) if code=="native_route_stale")
+        matches!(h.native_publication_fence(&binding, &route),Err(HandlerOutcome::Error {code,..}) if code=="native_route_stale")
     );
     h.bindings
         .lock()
@@ -404,6 +406,91 @@ async fn review_native_publication_fence_holds_lifecycle_lock_and_checks_generat
         .unwrap()
         .provider = "different".into();
     assert!(
-        matches!(h.native_publication_fence(&binding),Err(HandlerOutcome::Error {code,..}) if code=="native_route_stale")
+        matches!(h.native_publication_fence(&binding, &route),Err(HandlerOutcome::Error {code,..}) if code=="native_route_stale")
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_routes_progress_independently_and_rebind_fences_old_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = cc::handler(dir.path(), cc::thalamus());
+    cc::setup(&h).await;
+    let old_binding = h.facade_binding(7).unwrap();
+    let old_key = key(&h);
+    let before = snapshot(&h, &old_key);
+    let mut other = cc::binding(dir.path(), cc::thalamus());
+    other.session = "other".into();
+    h.bind_route(8, other);
+    let plan = json!({"serializer_profile":"claude-code-anthropic","observation":"answer"});
+    for (method, params) in [
+        (
+            "transform.declare",
+            json!({"session":"other","harness":"claude-code","params":plan,"preset":"head"}),
+        ),
+        (
+            "compaction.setup",
+            json!({"session":"other","harness":"claude-code","request_id":"setup","params":plan,"preset":"head","model":"fixture","context_window":100000,"composition":{},"lineage_id":"L","now":1}),
+        ),
+    ] {
+        assert!(matches!(
+            h.dispatch_value(8, json!({"method":method,"params":params}))
+                .await,
+            HandlerOutcome::Response(_)
+        ));
+    }
+    let route = h.native_publication_lock(&old_binding).unwrap();
+    let guard = h.native_publication_fence(&old_binding, &route).unwrap();
+    assert!(route.try_lock().is_err());
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let (rebind_tx, rebind_rx) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (progress, rebind_waited) = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut params = cc::step(r#"{"role":"user","content":"other route"}"#);
+            params["session"] = json!("other");
+            let outcome = runtime
+                .block_on(h.dispatch_value(8, json!({"method":"compaction.step","params":params})));
+            progress_tx.send(outcome).unwrap();
+        });
+        scope.spawn(|| {
+            started_tx.send(()).unwrap();
+            h.bind_route(7, cc::binding(dir.path(), cc::thalamus()));
+            rebind_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        // A held native call must not prevent another route from completing a
+        // real step, but its own rebind cannot finish before publication ends.
+        let progress = progress_rx.recv_timeout(Duration::from_secs(5));
+        let rebind_waited = matches!(
+            rebind_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        drop(guard);
+        (progress, rebind_waited)
+    });
+    assert!(
+        matches!(progress, Ok(HandlerOutcome::Response(_))),
+        "other route did not progress: {progress:?}"
+    );
+    assert!(rebind_waited, "same-route rebind overtook publication");
+    rebind_rx.recv().unwrap();
+    assert!(
+        matches!(h.native_publication_fence(&old_binding, &route), Err(HandlerOutcome::Error { code, .. }) if code == "native_route_stale"),
+        "the old route lock must recheck identity after rebind"
+    );
+    let stale = h
+        .provider_step(
+            old_binding,
+            &cc::step(r#"{"role":"user","content":"stale route"}"#),
+        )
+        .await;
+    assert_stale(match stale {
+        Err(outcome) => outcome,
+        Ok(bytes) => HandlerOutcome::Response(bytes),
+    });
+    assert_eq!(snapshot(&h, &old_key), before);
 }

@@ -241,7 +241,8 @@ impl McHandler {
             .await
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
-        let _route = self.native_publication_fence(&binding)?;
+        let route = self.native_publication_lock(&binding)?;
+        let _route = self.native_publication_fence(&binding, &route)?;
         let result = (|| {
             let pins = self.native_pins();
             if !pins.raw_view_read {

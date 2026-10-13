@@ -11,13 +11,43 @@ pub(crate) struct NativeConnectionPlan {
 }
 
 impl McHandler {
-    /// Keep the route table locked from the post-await identity check through
-    /// synchronous native writes and response construction. Bind and unbind
-    /// take this same lock, so neither can replace a checked route mid-commit.
-    pub(super) fn native_publication_fence(
+    pub(crate) fn native_route_lock(&self, channel: u16) -> Arc<Mutex<()>> {
+        // Retain each channel's lock across rebinds so old and new incarnations
+        // cannot acquire different locks for the same route. Channels are u16.
+        self.native_route_locks
+            .lock()
+            .expect("native route locks mutex")
+            .entry(channel)
+            .or_default()
+            .clone()
+    }
+
+    pub(super) fn native_publication_lock(
         &self,
         binding: &SessionBinding,
-    ) -> Result<std::sync::MutexGuard<'_, HashMap<u16, SessionBinding>>, HandlerOutcome> {
+    ) -> Result<Arc<Mutex<()>>, HandlerOutcome> {
+        let channel = self
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .iter()
+            .find_map(|(channel, current)| {
+                (current.connection_incarnation == binding.connection_incarnation)
+                    .then_some(*channel)
+            })
+            .ok_or_else(|| error("native_route_stale", "native route was unbound or replaced"))?;
+        Ok(self.native_route_lock(channel))
+    }
+
+    /// Hold only this route from the post-await identity check through native
+    /// publication. Bind, unbind and plan installation acquire the same lock.
+    /// Never wait for a route lock while holding the shared binding table.
+    pub(super) fn native_publication_fence<'a>(
+        &self,
+        binding: &SessionBinding,
+        route: &'a Mutex<()>,
+    ) -> Result<std::sync::MutexGuard<'a, ()>, HandlerOutcome> {
+        let guard = route.lock().expect("native route mutex");
         let bindings = self.bindings.lock().expect("bindings mutex");
         if !attested_claude_code(binding)
             || binding.connection_incarnation == 0
@@ -36,7 +66,7 @@ impl McHandler {
                 "native route incarnation or generation changed before publication",
             ));
         }
-        Ok(bindings)
+        Ok(guard)
     }
 
     pub(super) fn native_pins(&self) -> ClaudeCodeCapabilities {
@@ -197,6 +227,8 @@ impl McHandler {
         }
         // A reused channel is a different connection even for the same identity.
         // Check the bind incarnation again after awaits before installing its plan.
+        let route = self.native_route_lock(channel);
+        let _route = route.lock().expect("native route mutex");
         let mut bindings = self.bindings.lock().expect("bindings mutex");
         let current = bindings
             .get_mut(&channel)

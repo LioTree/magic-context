@@ -822,16 +822,70 @@ fn status(
     params: &Value,
     record: &Record,
 ) -> Result<transform::compaction::Status, HandlerOutcome> {
+    status_with_window(
+        params,
+        record,
+        resolve_context_window(params, record, None)?,
+    )
+}
+
+fn resolve_context_window(
+    params: &Value,
+    record: &Record,
+    native: Option<&compact::status::StepStatus>,
+) -> Result<u64, HandlerOutcome> {
+    if let Some(request) = native {
+        if let Some(geometry) = &request.geometry {
+            if !geometry.is_valid(request.context_window)
+                || request.output_reserve.is_some_and(|reserve| {
+                    geometry
+                        .usable_hard
+                        .checked_add(reserve)
+                        .is_none_or(|reserved| reserved > geometry.absolute_wall)
+                })
+            {
+                return Err(invalid_field("geometry"));
+            }
+        } else if request.output_reserve.is_some() {
+            return Err(invalid_field("geometry"));
+        }
+        // The attested provider wall substitutes for an unavailable model catalog.
+        // Do not reuse setup's window: it may describe a different step model.
+        return request
+            .context_window
+            .or_else(|| {
+                request
+                    .geometry
+                    .as_ref()
+                    .map(|geometry| geometry.absolute_wall)
+            })
+            .filter(|window| *window > 0)
+            .ok_or_else(|| {
+                invalid("context_window or geometry.absolute_wall must be known and positive")
+            });
+    }
+    params
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0)
+        .or_else(|| {
+            record
+                .setup
+                .as_ref()
+                .and_then(|setup| setup.request.context_window)
+        })
+        .ok_or_else(|| invalid("context_window must be known and positive"))
+}
+
+fn status_with_window(
+    params: &Value,
+    record: &Record,
+    window: u64,
+) -> Result<transform::compaction::Status, HandlerOutcome> {
     let lineage = params
         .get("lineage_id")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let window = params
-        .get("context_window")
-        .and_then(Value::as_u64)
-        .filter(|w| *w > 0)
-        .or_else(|| record.setup.as_ref().and_then(|s| s.request.context_window))
-        .ok_or_else(|| invalid("context_window must be known and positive"))?;
     let previous_usage = params
         .get("previous_usage")
         .filter(|v| v.is_object())
@@ -1218,21 +1272,20 @@ impl McHandler {
             })?)
             .map_err(transient)?;
         let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
+        let status_record = Record {
+            setup: Some(setup.setup.clone()),
+            ..Default::default()
+        };
+        let native_window = if codec == Codec::ClaudeCodeAnthropic {
+            Some(resolve_context_window(
+                params,
+                &status_record,
+                Some(&request),
+            )?)
+        } else {
+            None
+        };
         if codec == Codec::ClaudeCodeAnthropic {
-            if let Some(geometry) = &request.geometry {
-                if !geometry.is_valid(request.context_window)
-                    || request.output_reserve.is_some_and(|reserve| {
-                        geometry
-                            .usable_hard
-                            .checked_add(reserve)
-                            .is_none_or(|reserved| reserved > geometry.absolute_wall)
-                    })
-                {
-                    return Err(invalid_field("geometry"));
-                }
-            } else if request.output_reserve.is_some() {
-                return Err(invalid_field("geometry"));
-            }
             if request.fill.is_some() {
                 return Err(invalid_field("fill"));
             }
@@ -1403,13 +1456,10 @@ impl McHandler {
             .newest
             .as_ref()
             .is_some_and(|n| frontier <= n.ordinal);
-        let mut normalized = status(
-            params,
-            &Record {
-                setup: Some(setup.setup.clone()),
-                ..Default::default()
-            },
-        )?;
+        let mut normalized = match native_window {
+            Some(window) => status_with_window(params, &status_record, window)?,
+            None => status(params, &status_record)?,
+        };
         setup.setup.request.model = request.model.clone();
         if params
             .pointer("/prefix_rebuilding/reason")
@@ -1638,8 +1688,14 @@ impl McHandler {
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
         if host {
+            let route = attested_claude_code(&binding)
+                .then(|| self.native_publication_lock(&binding))
+                .transpose()?;
             let _route = if attested_claude_code(&binding) {
-                Some(self.native_publication_fence(&binding)?)
+                Some(self.native_publication_fence(
+                    &binding,
+                    route.as_ref().expect("native route lock"),
+                )?)
             } else {
                 None
             };
@@ -1794,7 +1850,8 @@ impl McHandler {
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
         if attested_claude_code(&binding) {
-            let _route = self.native_publication_fence(&binding)?;
+            let route = self.native_publication_lock(&binding)?;
+            let _route = self.native_publication_fence(&binding, &route)?;
             let conversation = store
                 .load_provider_conversation(&key.store_key())
                 .map_err(transient)?
