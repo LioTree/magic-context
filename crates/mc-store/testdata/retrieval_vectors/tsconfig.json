@@ -1,0 +1,15 @@
+{
+    "extends": "../../../../packages/plugin/tsconfig.json",
+    "compilerOptions": {
+        "rootDir": ".",
+        "typeRoots": [
+            "../../../../packages/plugin/node_modules/@types",
+            "../../../../packages/plugin/node_modules"
+        ],
+        "noEmit": true,
+        "emitDeclarationOnly": false
+    },
+    "include": ["generate.ts"],
+    "exclude": [],
+    "references": []
+}

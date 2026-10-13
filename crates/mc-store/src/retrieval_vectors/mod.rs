@@ -1,5 +1,8 @@
 //! Vector persistence extension; register store and drain implementations in this namespace.
 
+pub mod drain;
+pub mod store;
+
 use crate::parity_schema_manifest::*;
 
 pub struct UnavailableRetrievalVectors;

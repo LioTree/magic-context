@@ -297,7 +297,7 @@ pub fn read_git_commits_with_runner(
             }
             Err(error) if exclusion.is_some() && error.contains("bad object") => {
                 // A rewritten or garbage-collected excluded tip cannot bound the scan;
-            // retry without that reachability exclusion.
+                // retry without that reachability exclusion.
                 exclusion = None;
             }
             Err(error) => {
