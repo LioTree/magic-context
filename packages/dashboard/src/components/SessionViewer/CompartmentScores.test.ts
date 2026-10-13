@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { scoreLabel, scoresPending } from "./CompartmentScores";
+import { scoreLabel, scoresPending } from "./compartment-scores";
 
 describe("compartment score visibility", () => {
   test("original rows retain the single-score display", () => {
