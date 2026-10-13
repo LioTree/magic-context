@@ -181,7 +181,7 @@ impl Drop for DiagnosticProfileGuard {
 	patch(
 		compact,
 		"    let replay_ms = started.elapsed().as_secs_f64() * 1000.0;",
-		"    let replay_ms = started.elapsed().as_secs_f64() * 1000.0;\n    let diagnostic_prepare = Instant::now();",
+		'    let replay_ms = started.elapsed().as_secs_f64() * 1000.0;\n    mc_store::provider_meters::diagnostic_record("replay", replay_ms);\n    let diagnostic_prepare = Instant::now();',
 	);
 	patch(
 		compact,
@@ -233,10 +233,24 @@ impl Drop for DiagnosticProfileGuard {
 		"    let prepare_ms = started.elapsed().as_secs_f64() * 1000.0 - replay_ms;",
 		'    mc_store::provider_meters::diagnostic_record("rebuild_prepare_drops", diagnostic_drops.elapsed().as_secs_f64()*1000.0);\n    mc_store::provider_meters::diagnostic_record("rebuild_preparation_total", diagnostic_prepare.elapsed().as_secs_f64()*1000.0);\n    let prepare_ms = started.elapsed().as_secs_f64() * 1000.0 - replay_ms;',
 	);
+	patch(compact, "    let engine_ms = engine_started.elapsed().as_secs_f64() * 1000.0;",
+		'    let engine_ms = engine_started.elapsed().as_secs_f64() * 1000.0;\n    mc_store::provider_meters::diagnostic_record("engine", engine_ms);');
+	patch(compact, "        let wire = Codec::OpencodeAiSdk.encode_view(\n            &engine,\n            &template,\n            &super::codec_opencode::NativeRenderContext::from(&output.engine),\n        )?;",
+		'        let wire = mc_store::provider_meters::diagnostic_measure("view_build", || Codec::OpencodeAiSdk.encode_view(\n            &engine,\n            &template,\n            &super::codec_opencode::NativeRenderContext::from(&output.engine),\n        ))?;');
+	patch(compact, '                    save_host_view(store, &work.key, &view, "produced")?;',
+		'                    mc_store::provider_meters::diagnostic_measure("view_store", || save_host_view(store, &work.key, &view, "produced"))?;');
+	patch(compact, "replacement_json: serde_json::to_string(view).map_err(transient)?,",
+		'replacement_json: mc_store::provider_meters::diagnostic_measure("view_store_encode", || serde_json::to_string(view)).map_err(transient)?,');
+	patch(compact, '                    let mut answer = json!({"answer":"compaction_message","request_id":request.request_id,"compaction":view.wire});',
+		'                    let mut answer = mc_store::provider_meters::diagnostic_measure("response_value", || json!({"answer":"compaction_message","request_id":request.request_id,"compaction":view.wire}));');
+	patch(compact, '                prepared, preparation_ms = started.elapsed().as_secs_f64()*1000.0,\n                "provider policy preparation complete");',
+		'                prepared, preparation_ms = started.elapsed().as_secs_f64()*1000.0,\n                "provider policy preparation complete");\n            mc_store::provider_meters::diagnostic_record("preparation", started.elapsed().as_secs_f64()*1000.0);');
+	patch(compact, "        bytes(&answer)\n    }\n\n    fn provider_work(",
+		'        mc_store::provider_meters::diagnostic_measure("response_encode", || bytes(&answer))\n    }\n\n    fn provider_work(');
 	return changed;
 }
 
-interface StageProfile {
+export interface StageProfile {
 	kind: "hook" | "rebuild";
 	session: string;
 	harness: string;
@@ -274,7 +288,7 @@ export function systemSample() {
 		loadavg: optional("/proc/loadavg"),
 	};
 }
-function profileById(path: string, id: string): StageProfile {
+export function profileById(path: string, id: string): StageProfile {
 	const rows = readFileSync(path, "utf8")
 		.trim()
 		.split("\n")
@@ -310,7 +324,7 @@ export function psiDelta(
 }
 
 /** Instrument only a temporary source copy. Await real handlers directly to observe their full work, without altering the host's 1,500 ms timeout. */
-export async function postRebuildProfile() {
+export async function postRebuildProfile(measurement?: (driver: Driver, output: string, stores: string) => Promise<unknown>) {
 	assert.equal(process.platform, "linux", "run this diagnostic on Linux");
 	process.env.MC_POLICY_SUMMARY_SKIP_FULL_CHECK = "1";
 	const parent = join(
@@ -382,6 +396,14 @@ export async function postRebuildProfile() {
 	const stores = join(work, "stores");
 	mkdirSync(stores);
 	const driver = new Driver(copied.buildDriver(build), stores);
+	if (measurement) {
+		try { return await measurement(driver, output, stores); }
+		finally {
+			await driver.close();
+			for (const path of instrumentedPaths)
+				assert.equal(hash(readFileSync(join(ROOT, path))), hash(originals[path]!), `production source unchanged after profiling: ${path}`);
+		}
+	}
 	const samples = [];
 	try {
 		for (const host of ["OpenCode1", "OpenCode2"] as const) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { updateSessionMeta } from "../../plugin/src/features/magic-context/storage-meta";
@@ -9,16 +9,19 @@ import { providerSubjects } from "../../plugin/src/hooks/magic-context/host-runn
 import { percentile } from "../../plugin/scripts/perf-audit/provider-pipeline-gate";
 import { buildDriver, Driver, fixture, message, tools } from "./provider-pipeline-differential";
 import { psiDelta, systemSample } from "./provider-post-rebuild-profile";
+import { postRebuildProfile, type StageProfile } from "./provider-post-rebuild-profile";
+import { encodeOpenCodeMessagesToCk } from "../../plugin/src/hooks/magic-context/module-wire";
 
 /** Directly awaiting the real handler records misses; it does not enlarge the production host fence. */
-export async function preparationTiming(samples = 100) {
+export async function preparationTiming(samples = 100, diagnostic?: { driver: Driver; output: string; stores: string }) {
     assert.ok(samples >= 5);
     process.env.MC_POLICY_SUMMARY_SKIP_FULL_CHECK = "1";
     const root = join(tmpdir(), "magic-context", "provider-preparation-timing");
     mkdirSync(root, { recursive: true });
-    const work = mkdtempSync(join(root, "run-"));
-    mkdirSync(join(work, "stores"));
-    const driver = new Driver(buildDriver(join(work, "build")), join(work, "stores"));
+    const work = diagnostic ? join(diagnostic.stores, "..") : mkdtempSync(join(root, "run-"));
+    if (!diagnostic) mkdirSync(join(work, "stores"));
+    const driver = diagnostic?.driver ?? new Driver(buildDriver(join(work, "build")), join(work, "stores"));
+    const fullRows: {host: string; sample: number; module_ms: number; wall_ms: number; before: ReturnType<typeof systemSample>; after: ReturnType<typeof systemSample>; psi: ReturnType<typeof psiDelta>}[] = [];
     const rows: { host: string; setting: boolean; sample: number; request_id: string; rebuild_id: string; rebuild_before: ReturnType<typeof systemSample>; before: ReturnType<typeof systemSample>; after: ReturnType<typeof systemSample>; rebuild_psi: ReturnType<typeof psiDelta>; psi: ReturnType<typeof psiDelta>; wall_ms: number; rebuild_wall_ms: number }[] = [];
     try {
         for (const host of ["OpenCode1", "OpenCode2"] as const) {
@@ -61,7 +64,7 @@ export async function preparationTiming(samples = 100) {
                     // Alternate preparation off/on so neither always benefits from
                     // the other arm warming the filesystem and allocator caches.
                     const answers: string[][] = [];
-                    for (const setting of sample % 2 === 0 ? [false, true] : [true, false]) {
+                    for (const setting of sample % 2 === 0 ? [false, true, "full"] as const : ["full", true, false] as const) {
                         const branch = join(directory, `sample-${sample}-${setting}`);
                         mkdirSync(branch);
                         await f.sql(`VACUUM INTO '${join(branch, "store.db").replaceAll("'", "''")}'`, true);
@@ -72,6 +75,19 @@ export async function preparationTiming(samples = 100) {
                         await driver.send({ op: "create", rig, directory: branch, project_root: join(directory, "project"), harness: request.harness });
                         try {
                             driver.proveIsolation();
+                            if (setting === "full") {
+                                const before = systemSample();
+                                const start = performance.now();
+                                const full = await driver.send({ op: "full", rig, timing: true, messages: history,
+                                    ingress: encodeOpenCodeMessagesToCk(history), now: status.now, model, window: 4_000_000,
+                                    extra: { request_id: rebuildId } });
+                                const wall_ms = performance.now() - start;
+                                const after = systemSample();
+                                assert.ok(!full.error, JSON.stringify(full.error));
+                                assert.equal(full.ok.status, "ok");
+                                fullRows.push({host, sample, module_ms: full.module_ms, wall_ms, before, after, psi: psiDelta(before, after)});
+                                continue;
+                            }
                             const rebuild_before = systemSample();
                             const rebuildStart = performance.now();
                             const rebuilt = await driver.send({ op: "call", rig, raw_response: true, body: { method: "compaction.step", params: { ...status, consume_prepared_policy: setting } } });
@@ -101,7 +117,8 @@ export async function preparationTiming(samples = 100) {
                 await f.noReads();
             } finally { await f.close(); }
         }
-    } finally { await driver.close(); }
+    } finally { if (!diagnostic) await driver.close(); }
+    const stageProfiles: StageProfile[] = diagnostic ? readFileSync(diagnostic.output, "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
     const complete = rows.map(row => {
         const timings = driver.moduleCompletions.filter(value => value.request_id === row.request_id && value.method === "transform.hook");
         const outcomes = driver.preparationOutcomes.filter(value => value.request_id === row.request_id);
@@ -112,7 +129,18 @@ export async function preparationTiming(samples = 100) {
         assert.equal(outcomes.length, 1, "only the setting-on hook reports consumption");
         assert.equal(preparations.length, 1, "only the setting-on rebuild prepares");
         const at = row.setting === (row.sample % 2 !== 0) ? 0 : 1;
+        const full = fullRows.find(value => value.host === row.host && value.sample === row.sample)!;
+        const profiles = diagnostic ? {
+            rebuild: stageProfiles.filter(value => value.request_id === row.rebuild_id)[at]!,
+            hook: stageProfiles.filter(value => value.request_id === row.request_id)[at]!,
+        } : undefined;
+        if (diagnostic) {
+            assert.ok(profiles?.rebuild && profiles?.hook, "both arms must execute diagnostic stages");
+            for (const stage of ["engine", "replay", "view_build", "response_value", "response_encode", "view_store"])
+                assert.equal(profiles.rebuild.calls[stage], 1, `exactly one measured ${stage}`);
+        }
         return { ...row, module_ms: timings[at]!.module_ms, rebuild_module_ms: rebuilds[at]!.module_ms,
+            full_module_ms: full.module_ms, full_wall_ms: full.wall_ms, rebuild_ratio: rebuilds[at]!.module_ms / full.module_ms, profiles,
             preparation_ms: row.setting ? preparations[0]!.preparation_ms : 0,
             consumed: row.setting && outcomes[0]!.consumed,
             over_product_fence: row.wall_ms >= 1500 };
@@ -124,13 +152,26 @@ export async function preparationTiming(samples = 100) {
             wall_p50_ms: percentile(values.map(row => row.wall_ms), .5), wall_p99_ms: percentile(values.map(row => row.wall_ms), .99),
             rebuild_module_p50_ms: percentile(values.map(row => row.rebuild_module_ms), .5), rebuild_module_p99_ms: percentile(values.map(row => row.rebuild_module_ms), .99),
             preparation_p50_ms: percentile(values.map(row => row.preparation_ms), .5), preparation_p99_ms: percentile(values.map(row => row.preparation_ms), .99),
+            full_module_p50_ms: percentile(values.map(row => row.full_module_ms), .5), full_module_p99_ms: percentile(values.map(row => row.full_module_ms), .99),
+            paired_ratio_p50: percentile(values.map(row => row.rebuild_ratio), .5), paired_ratio_p99: percentile(values.map(row => row.rebuild_ratio), .99),
+            stage_quantiles: diagnostic ? Object.fromEntries(["rebuild", "hook"].map(kind => [kind,
+                Object.fromEntries([...new Set(values.flatMap(row => Object.keys(row.profiles![kind as "rebuild" | "hook"].stages_ms)))].map(stage => [stage, {
+                    p50_ms: percentile(values.map(row => row.profiles![kind as "rebuild" | "hook"].stages_ms[stage] ?? 0), .5),
+                    p99_ms: percentile(values.map(row => row.profiles![kind as "rebuild" | "hook"].stages_ms[stage] ?? 0), .99),
+                }]))])) : undefined,
             over_product_fence: values.filter(row => row.over_product_fence).length };
     }));
     assert.ok(lanes.filter(lane => lane.setting).every(lane => lane.consumed > 0), "timing must reach real consumption, not only cold fallback");
-    const result = { schema: 1, samples: complete, lanes, base_messages: 17_000, cpu_request: "linux,4c", work, bun: Bun.version,
+    const result = { schema: 2, samples: complete, full_samples: fullRows, lanes, base_messages: 17_000, cpu_request: "linux,4c", work, bun: Bun.version,
         setting: "rust_provider_preparation=false/true via real request control; same pre-rebuild snapshot", product_hook_fence_ms: 1500,
         measurement_kind: "synthetic_real_handler_first_post_rebuild", quantile: "nearest-rank; report misses, do not exclude them" };
     console.log(`PREPARATION_TIMING_RESULT=${JSON.stringify(result)}`);
     return result;
 }
-if (import.meta.main) await preparationTiming(Number(Bun.argv[2] ?? 100));
+if (import.meta.main) {
+    const samples = Number(Bun.argv[2] ?? 100);
+    const result = Bun.argv.includes("--profile")
+        ? await postRebuildProfile((driver, output, stores) => preparationTiming(samples, {driver, output, stores}))
+        : await preparationTiming(samples);
+    if (process.env.MC_TIMING_RESULT_OUT) writeFileSync(process.env.MC_TIMING_RESULT_OUT, JSON.stringify(result, null, 2) + "\n");
+}

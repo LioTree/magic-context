@@ -1,0 +1,2207 @@
+{
+  "schema": 1,
+  "revision": "305696db21740f3c1afeecec45c8e7efcccdbb50",
+  "bun": "1.4.2",
+  "cpu_request": "linux,4c",
+  "work": "/motor-home/tmp/magic-context/provider-post-rebuild-profile/run-VTDitk",
+  "measurement_kind": "diagnostic_only",
+  "product_changes": false,
+  "product_deadlines_changed": false,
+  "timing_scope": "real McHandler direct calls; rebuild followed by first hook; timers exist only in a scratch source archive",
+  "population": "five independent fresh 17k fixtures per binding; three full warmups, bootstrap, initial hook warmup, publication/model rebuild, measured first hook",
+  "contention_scope": "host and cgroup CPU PSI some-total deltas and cgroup cpu.stat; holder fields deliberately omitted",
+  "samples": [
+    {
+      "host": "OpenCode1",
+      "sample": 0,
+      "base_messages": 17000,
+      "fixture_messages_at_probe": 17002,
+      "before": {
+        "at": "2026-10-13T08:56:54.842Z",
+        "uptime": "08:56:54 up 8 days, 16:43,  0 users,  load average: 25.41, 21.58, 18.89",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3623805210000,
+          "user_usec": 3034288783000,
+          "system_usec": 589516427000,
+          "nice_usec": 191751384000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=6.08 avg60=15.03 avg300=12.59 total=18809284475\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=6.08 avg60=15.03 avg300=12.59 total=18809284475\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "25.41 21.58 18.89 14/2315 994"
+      },
+      "measurement_before": {
+        "at": "2026-10-13T08:57:33.380Z",
+        "uptime": "08:57:33 up 8 days, 16:44,  0 users,  load average: 23.52, 21.60, 19.01",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3624382323000,
+          "user_usec": 3034748782000,
+          "system_usec": 589633541000,
+          "nice_usec": 191776993000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=6.87 avg60=12.28 avg300=12.26 total=18813469024\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=6.87 avg60=12.28 avg300=12.26 total=18813469024\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "23.52 21.60 19.01 12/3162 998"
+      },
+      "rebuild_after": {
+        "at": "2026-10-13T08:57:45.333Z",
+        "uptime": "08:57:45 up 8 days, 16:44,  0 users,  load average: 21.93, 21.32, 18.95",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3624471931000,
+          "user_usec": 3034813866000,
+          "system_usec": 589658065000,
+          "nice_usec": 191781993000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=4.31 avg60=10.50 avg300=11.86 total=18813804534\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=4.31 avg60=10.50 avg300=11.86 total=18813804534\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "21.93 21.32 18.95 17/3054 1000"
+      },
+      "after": {
+        "at": "2026-10-13T08:57:46.713Z",
+        "uptime": "08:57:46 up 8 days, 16:44,  0 users,  load average: 22.10, 21.36, 18.97",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3624490800000,
+          "user_usec": 3034828531000,
+          "system_usec": 589662269000,
+          "nice_usec": 191782116000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=4.31 avg60=10.50 avg300=11.86 total=18814063236\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=4.31 avg60=10.50 avg300=11.86 total=18814063236\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "22.10 21.36 18.97 24/3028 1002"
+      },
+      "cpu_stat_delta": {
+        "usage_usec": 685590000,
+        "user_usec": 539748000,
+        "system_usec": 145842000,
+        "nice_usec": 30732000,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "measured_cpu_stat_delta": {
+        "usage_usec": 108477000,
+        "user_usec": 79749000,
+        "system_usec": 28728000,
+        "nice_usec": 5123000,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "psi_delta": {
+        "host_some_total_usec": 4778761,
+        "cgroup_some_total_usec": 4778761,
+        "wall_ms": 51871
+      },
+      "measured_psi_delta": {
+        "host_some_total_usec": 594212,
+        "cgroup_some_total_usec": 594212,
+        "wall_ms": 13333
+      },
+      "rebuild_psi_delta": {
+        "host_some_total_usec": 335510,
+        "cgroup_some_total_usec": 335510,
+        "wall_ms": 11953
+      },
+      "hook_psi_delta": {
+        "host_some_total_usec": 258702,
+        "cgroup_some_total_usec": 258702,
+        "wall_ms": 1380
+      },
+      "hook": {
+        "kind": "hook",
+        "session": "session",
+        "harness": "opencode",
+        "request_id": "probe-OpenCode1-0-a91c7bf0-c160-42b3-a5c7-e53474aa89fd",
+        "stages_ms": {
+          "baseline_convert_summary": 34.379103,
+          "baseline_convert_write": 283.463788,
+          "baseline_extract_clone": 113.339861,
+          "baseline_restate": 264.066639,
+          "change_log_clear": 0.060844,
+          "channel1_compute_baseline": 153.194697,
+          "effective_parts_read_decode": 264.84721,
+          "lock_wait": 0.0054,
+          "summary_build": 89.57184699999999,
+          "summary_serialize": 0.022322,
+          "summary_validate": 0.015590000000000001,
+          "summary_write": 5.109858
+        },
+        "calls": {
+          "baseline_convert_summary": 1,
+          "baseline_convert_write": 1,
+          "baseline_extract_clone": 1,
+          "baseline_restate": 1,
+          "change_log_clear": 1,
+          "channel1_compute_baseline": 1,
+          "effective_parts_read_decode": 1,
+          "lock_wait": 1,
+          "summary_build": 1,
+          "summary_serialize": 1,
+          "summary_validate": 1,
+          "summary_write": 1
+        },
+        "fields": {
+          "baseline_refrozen": 1,
+          "baseline_updates": 57801,
+          "changes_cleared": 0,
+          "effective_parts": 74804,
+          "summary_bytes": 573
+        },
+        "total_ms": 1370.0902589999998
+      },
+      "rebuild": {
+        "kind": "rebuild",
+        "session": "session",
+        "harness": "opencode",
+        "request_id": "rebuild-OpenCode1-0-c48519b4-ada7-4d47-a872-aecbd49feaf7",
+        "stages_ms": {
+          "baseline_extract_clone": 0.00029099999999999997,
+          "rebuild_preparation_total": 1468.3301470000001,
+          "rebuild_prepare_before_views": 484.324478,
+          "rebuild_prepare_drops": 0.131245,
+          "request_prepare_codec": 478.39464399999997,
+          "view_applied_engine_clone": 297.495431,
+          "view_json_decode": 282.74775800000003,
+          "view_lineage_rebase": 0.000871,
+          "view_materialization_total": 983.8726,
+          "view_produced_engine_clone": 396.46779100000003,
+          "view_sql_load": 7.143075
+        },
+        "calls": {
+          "baseline_extract_clone": 1,
+          "rebuild_preparation_total": 1,
+          "rebuild_prepare_before_views": 1,
+          "rebuild_prepare_drops": 1,
+          "request_prepare_codec": 1,
+          "view_applied_engine_clone": 1,
+          "view_json_decode": 1,
+          "view_lineage_rebase": 1,
+          "view_materialization_total": 1,
+          "view_produced_engine_clone": 1,
+          "view_sql_load": 1
+        },
+        "fields": {
+          "view_json_bytes": 28245519
+        },
+        "total_ms": 11788.589689
+      }
+    },
+    {
+      "host": "OpenCode1",
+      "sample": 1,
+      "base_messages": 17000,
+      "fixture_messages_at_probe": 17002,
+      "before": {
+        "at": "2026-10-13T08:57:47.149Z",
+        "uptime": "08:57:47 up 8 days, 16:44,  0 users,  load average: 22.10, 21.36, 18.97",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3624495907000,
+          "user_usec": 3034832405000,
+          "system_usec": 589663502000,
+          "nice_usec": 191782155000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=4.31 avg60=10.50 avg300=11.86 total=18814156350\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=4.31 avg60=10.50 avg300=11.86 total=18814156350\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "22.10 21.36 18.97 19/3025 1004"
+      },
+      "measurement_before": {
+        "at": "2026-10-13T08:58:18.065Z",
+        "uptime": "08:58:18 up 8 days, 16:44,  0 users,  load average: 18.32, 20.51, 18.77",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3624764472000,
+          "user_usec": 3035043638000,
+          "system_usec": 589720834000,
+          "nice_usec": 191788392000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=1.03 avg60=7.26 avg300=10.94 total=18814989959\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=1.03 avg60=7.26 avg300=10.94 total=18814989959\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "18.32 20.51 18.77 7/3424 1008"
+      },
+      "rebuild_after": {
+        "at": "2026-10-13T08:58:27.219Z",
+        "uptime": "08:58:27 up 8 days, 16:45,  0 users,  load average: 17.58, 20.28, 18.71",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3624851452000,
+          "user_usec": 3035117002000,
+          "system_usec": 589734450000,
+          "nice_usec": 191791016000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=0.70 avg60=6.41 avg300=10.65 total=18815063474\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=0.70 avg60=6.41 avg300=10.65 total=18815063474\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "17.58 20.28 18.71 12/3531 1010"
+      },
+      "after": {
+        "at": "2026-10-13T08:58:28.539Z",
+        "uptime": "08:58:28 up 8 days, 16:45,  0 users,  load average: 17.58, 20.28, 18.71",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3624868482000,
+          "user_usec": 3035132389000,
+          "system_usec": 589736093000,
+          "nice_usec": 191791033000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=0.57 avg60=6.20 avg300=10.58 total=18815076491\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=0.57 avg60=6.20 avg300=10.58 total=18815076491\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "17.58 20.28 18.71 15/3533 1012"
+      },
+      "cpu_stat_delta": {
+        "usage_usec": 372575000,
+        "user_usec": 299984000,
+        "system_usec": 72591000,
+        "nice_usec": 8878000,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "measured_cpu_stat_delta": {
+        "usage_usec": 104010000,
+        "user_usec": 88751000,
+        "system_usec": 15259000,
+        "nice_usec": 2641000,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "psi_delta": {
+        "host_some_total_usec": 920141,
+        "cgroup_some_total_usec": 920141,
+        "wall_ms": 41390
+      },
+      "measured_psi_delta": {
+        "host_some_total_usec": 86532,
+        "cgroup_some_total_usec": 86532,
+        "wall_ms": 10474
+      },
+      "rebuild_psi_delta": {
+        "host_some_total_usec": 73515,
+        "cgroup_some_total_usec": 73515,
+        "wall_ms": 9154
+      },
+      "hook_psi_delta": {
+        "host_some_total_usec": 13017,
+        "cgroup_some_total_usec": 13017,
+        "wall_ms": 1320
+      },
+      "hook": {
+        "kind": "hook",
+        "session": "session",
+        "harness": "opencode",
+        "request_id": "probe-OpenCode1-1-27030aa6-b40f-487c-95eb-731f2629a283",
+        "stages_ms": {
+          "baseline_convert_summary": 30.088058,
+          "baseline_convert_write": 267.574737,
+          "baseline_extract_clone": 111.208321,
+          "baseline_restate": 270.76978,
+          "change_log_clear": 0.068048,
+          "channel1_compute_baseline": 132.709651,
+          "effective_parts_read_decode": 265.20203399999997,
+          "lock_wait": 0.004588,
+          "summary_build": 65.713745,
+          "summary_serialize": 0.023053999999999998,
+          "summary_validate": 0.017844000000000002,
+          "summary_write": 6.99604
+        },
+        "calls": {
+          "baseline_convert_summary": 1,
+          "baseline_convert_write": 1,
+          "baseline_extract_clone": 1,
+          "baseline_restate": 1,
+          "change_log_clear": 1,
+          "channel1_compute_baseline": 1,
+          "effective_parts_read_decode": 1,
+          "lock_wait": 1,
+          "summary_build": 1,
+          "summary_serialize": 1,
+          "summary_validate": 1,
+          "summary_write": 1
+        },
+        "fields": {
+          "baseline_refrozen": 1,
+          "baseline_updates": 57801,
+          "changes_cleared": 0,
+          "effective_parts": 74804,
+          "summary_bytes": 573
+        },
+        "total_ms": 1310.78862
+      },
+      "rebuild": {
+        "kind": "rebuild",
+        "session": "session",
+        "harness": "opencode",
+        "request_id": "rebuild-OpenCode1-1-7fefd248-3ce0-4c9e-821f-97a7af325f96",
+        "stages_ms": {
+          "baseline_extract_clone": 0.000271,
+          "rebuild_preparation_total": 1312.64185,
+          "rebuild_prepare_before_views": 529.458679,
+          "rebuild_prepare_drops": 0.124774,
+          "request_prepare_codec": 521.183083,
+          "view_applied_engine_clone": 239.621827,
+          "view_json_decode": 297.296239,
+          "view_lineage_rebase": 0.000471,
+          "view_materialization_total": 783.055312,
+          "view_produced_engine_clone": 239.28161,
+          "view_sql_load": 6.840637999999999
+        },
+        "calls": {
+          "baseline_extract_clone": 1,
+          "rebuild_preparation_total": 1,
+          "rebuild_prepare_before_views": 1,
+          "rebuild_prepare_drops": 1,
+          "request_prepare_codec": 1,
+          "view_applied_engine_clone": 1,
+          "view_json_decode": 1,
+          "view_lineage_rebase": 1,
+          "view_materialization_total": 1,
+          "view_produced_engine_clone": 1,
+          "view_sql_load": 1
+        },
+        "fields": {
+          "view_json_bytes": 28245519
+        },
+        "total_ms": 8995.763936
+      }
+    },
+    {
+      "host": "OpenCode1",
+      "sample": 2,
+      "base_messages": 17000,
+      "fixture_messages_at_probe": 17002,
+      "before": {
+        "at": "2026-10-13T08:58:28.963Z",
+        "uptime": "08:58:28 up 8 days, 16:45,  0 users,  load average: 17.58, 20.28, 18.71",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3624874028000,
+          "user_usec": 3035136971000,
+          "system_usec": 589737057000,
+          "nice_usec": 191791033000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=0.57 avg60=6.20 avg300=10.58 total=18815091433\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=0.57 avg60=6.20 avg300=10.58 total=18815091433\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "17.58 20.28 18.71 13/3532 1014"
+      },
+      "measurement_before": {
+        "at": "2026-10-13T08:58:58.085Z",
+        "uptime": "08:58:58 up 8 days, 16:45,  0 users,  load average: 17.03, 19.86, 18.62",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3625152940000,
+          "user_usec": 3035355388000,
+          "system_usec": 589797552000,
+          "nice_usec": 191797305000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=9.29 avg60=6.40 avg300=10.15 total=18817047095\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=9.29 avg60=6.40 avg300=10.15 total=18817047095\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "17.03 19.86 18.62 16/3545 1018"
+      },
+      "rebuild_after": {
+        "at": "2026-10-13T08:59:08.379Z",
+        "uptime": "08:59:08 up 8 days, 16:45,  0 users,  load average: 15.64, 19.47, 18.50",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3625233053000,
+          "user_usec": 3035419745000,
+          "system_usec": 589813308000,
+          "nice_usec": 191801828000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=5.64 avg60=6.05 avg300=9.94 total=18817602062\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=5.64 avg60=6.05 avg300=9.94 total=18817602062\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "15.64 19.47 18.50 10/3215 1020"
+      },
+      "after": {
+        "at": "2026-10-13T08:59:09.570Z",
+        "uptime": "08:59:09 up 8 days, 16:45,  0 users,  load average: 15.64, 19.47, 18.50",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3625239522000,
+          "user_usec": 3035425227000,
+          "system_usec": 589814295000,
+          "nice_usec": 191802741000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=8.60 avg60=6.57 avg300=10.02 total=18817874910\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=8.60 avg60=6.57 avg300=10.02 total=18817874910\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "15.64 19.47 18.50 5/3205 1022"
+      },
+      "cpu_stat_delta": {
+        "usage_usec": 365494000,
+        "user_usec": 288256000,
+        "system_usec": 77238000,
+        "nice_usec": 11708000,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "measured_cpu_stat_delta": {
+        "usage_usec": 86582000,
+        "user_usec": 69839000,
+        "system_usec": 16743000,
+        "nice_usec": 5436000,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "psi_delta": {
+        "host_some_total_usec": 2783477,
+        "cgroup_some_total_usec": 2783477,
+        "wall_ms": 40607
+      },
+      "measured_psi_delta": {
+        "host_some_total_usec": 827815,
+        "cgroup_some_total_usec": 827815,
+        "wall_ms": 11485
+      },
+      "rebuild_psi_delta": {
+        "host_some_total_usec": 554967,
+        "cgroup_some_total_usec": 554967,
+        "wall_ms": 10294
+      },
+      "hook_psi_delta": {
+        "host_some_total_usec": 272848,
+        "cgroup_some_total_usec": 272848,
+        "wall_ms": 1191
+      },
+      "hook": {
+        "kind": "hook",
+        "session": "session",
+        "harness": "opencode",
+        "request_id": "probe-OpenCode1-2-d4ec9b7c-ab1f-4e59-9509-a161b8db143a",
+        "stages_ms": {
+          "baseline_convert_summary": 24.68298,
+          "baseline_convert_write": 243.10711099999997,
+          "baseline_extract_clone": 97.02146400000001,
+          "baseline_restate": 249.825151,
+          "change_log_clear": 0.056226,
+          "channel1_compute_baseline": 113.197384,
+          "effective_parts_read_decode": 250.41072800000003,
+          "lock_wait": 0.003907,
+          "summary_build": 60.308509,
+          "summary_serialize": 0.02682,
+          "summary_validate": 0.014908000000000001,
+          "summary_write": 4.51847
+        },
+        "calls": {
+          "baseline_convert_summary": 1,
+          "baseline_convert_write": 1,
+          "baseline_extract_clone": 1,
+          "baseline_restate": 1,
+          "change_log_clear": 1,
+          "channel1_compute_baseline": 1,
+          "effective_parts_read_decode": 1,
+          "lock_wait": 1,
+          "summary_build": 1,
+          "summary_serialize": 1,
+          "summary_validate": 1,
+          "summary_write": 1
+        },
+        "fields": {
+          "baseline_refrozen": 1,
+          "baseline_updates": 57801,
+          "changes_cleared": 0,
+          "effective_parts": 74804,
+          "summary_bytes": 573
+        },
+        "total_ms": 1182.578073
+      },
+      "rebuild": {
+        "kind": "rebuild",
+        "session": "session",
+        "harness": "opencode",
+        "request_id": "rebuild-OpenCode1-2-8da62fac-022e-490e-813e-ea4d78e0e1d6",
+        "stages_ms": {
+          "baseline_extract_clone": 0.00038,
+          "rebuild_preparation_total": 1459.734201,
+          "rebuild_prepare_before_views": 578.358303,
+          "rebuild_prepare_drops": 0.145442,
+          "request_prepare_codec": 568.859637,
+          "view_applied_engine_clone": 280.574269,
+          "view_json_decode": 317.741875,
+          "view_lineage_rebase": 0.0014529999999999999,
+          "view_materialization_total": 881.22756,
+          "view_produced_engine_clone": 275.0315,
+          "view_sql_load": 7.860799999999999
+        },
+        "calls": {
+          "baseline_extract_clone": 1,
+          "rebuild_preparation_total": 1,
+          "rebuild_prepare_before_views": 1,
+          "rebuild_prepare_drops": 1,
+          "request_prepare_codec": 1,
+          "view_applied_engine_clone": 1,
+          "view_json_decode": 1,
+          "view_lineage_rebase": 1,
+          "view_materialization_total": 1,
+          "view_produced_engine_clone": 1,
+          "view_sql_load": 1
+        },
+        "fields": {
+          "view_json_bytes": 28245519
+        },
+        "total_ms": 10152.996423999999
+      }
+    },
+    {
+      "host": "OpenCode1",
+      "sample": 3,
+      "base_messages": 17000,
+      "fixture_messages_at_probe": 17002,
+      "before": {
+        "at": "2026-10-13T08:59:10.002Z",
+        "uptime": "08:59:10 up 8 days, 16:45,  0 users,  load average: 15.64, 19.47, 18.50",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3625241194000,
+          "user_usec": 3035426770000,
+          "system_usec": 589814424000,
+          "nice_usec": 191802741000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=8.60 avg60=6.57 avg300=10.02 total=18817888305\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=8.60 avg60=6.57 avg300=10.02 total=18817888305\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "15.64 19.47 18.50 8/3206 1024"
+      },
+      "measurement_before": {
+        "at": "2026-10-13T08:59:42.498Z",
+        "uptime": "08:59:42 up 8 days, 16:46,  0 users,  load average: 13.65, 18.56, 18.23",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3625493554000,
+          "user_usec": 3035634106000,
+          "system_usec": 589859448000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=4.07 avg60=6.09 avg300=9.58 total=18819926201\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=4.07 avg60=6.09 avg300=9.58 total=18819926201\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "13.65 18.56 18.23 6/3399 1028"
+      },
+      "rebuild_after": {
+        "at": "2026-10-13T08:59:52.477Z",
+        "uptime": "08:59:52 up 8 days, 16:46,  0 users,  load average: 12.93, 18.25, 18.14",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3625559668000,
+          "user_usec": 3035685704000,
+          "system_usec": 589873964000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=2.27 avg60=5.37 avg300=9.30 total=18820108884\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=2.27 avg60=5.37 avg300=9.30 total=18820108884\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "12.93 18.25 18.14 9/3422 1030"
+      },
+      "after": {
+        "at": "2026-10-13T08:59:53.804Z",
+        "uptime": "08:59:53 up 8 days, 16:46,  0 users,  load average: 12.93, 18.25, 18.14",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3625569099000,
+          "user_usec": 3035693458000,
+          "system_usec": 589875641000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=1.85 avg60=5.19 avg300=9.23 total=18820114734\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=1.85 avg60=5.19 avg300=9.23 total=18820114734\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "12.93 18.25 18.14 6/3418 1033"
+      },
+      "cpu_stat_delta": {
+        "usage_usec": 327905000,
+        "user_usec": 266688000,
+        "system_usec": 61217000,
+        "nice_usec": 31144000,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "measured_cpu_stat_delta": {
+        "usage_usec": 75545000,
+        "user_usec": 59352000,
+        "system_usec": 16193000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "psi_delta": {
+        "host_some_total_usec": 2226429,
+        "cgroup_some_total_usec": 2226429,
+        "wall_ms": 43802
+      },
+      "measured_psi_delta": {
+        "host_some_total_usec": 188533,
+        "cgroup_some_total_usec": 188533,
+        "wall_ms": 11306
+      },
+      "rebuild_psi_delta": {
+        "host_some_total_usec": 182683,
+        "cgroup_some_total_usec": 182683,
+        "wall_ms": 9979
+      },
+      "hook_psi_delta": {
+        "host_some_total_usec": 5850,
+        "cgroup_some_total_usec": 5850,
+        "wall_ms": 1327
+      },
+      "hook": {
+        "kind": "hook",
+        "session": "session",
+        "harness": "opencode",
+        "request_id": "probe-OpenCode1-3-afce90e8-f4f1-4d50-bea4-e0558ca2b973",
+        "stages_ms": {
+          "baseline_convert_summary": 29.154642000000003,
+          "baseline_convert_write": 277.074616,
+          "baseline_extract_clone": 106.720255,
+          "baseline_restate": 255.150603,
+          "change_log_clear": 0.067446,
+          "channel1_compute_baseline": 133.610748,
+          "effective_parts_read_decode": 293.582898,
+          "lock_wait": 0.004559,
+          "summary_build": 60.347471,
+          "summary_serialize": 0.029193999999999998,
+          "summary_validate": 0.016641,
+          "summary_write": 4.279494
+        },
+        "calls": {
+          "baseline_convert_summary": 1,
+          "baseline_convert_write": 1,
+          "baseline_extract_clone": 1,
+          "baseline_restate": 1,
+          "change_log_clear": 1,
+          "channel1_compute_baseline": 1,
+          "effective_parts_read_decode": 1,
+          "lock_wait": 1,
+          "summary_build": 1,
+          "summary_serialize": 1,
+          "summary_validate": 1,
+          "summary_write": 1
+        },
+        "fields": {
+          "baseline_refrozen": 1,
+          "baseline_updates": 57801,
+          "changes_cleared": 0,
+          "effective_parts": 74804,
+          "summary_bytes": 573
+        },
+        "total_ms": 1320.449838
+      },
+      "rebuild": {
+        "kind": "rebuild",
+        "session": "session",
+        "harness": "opencode",
+        "request_id": "rebuild-OpenCode1-3-07772c90-1afb-4155-8115-4b5dbbb03924",
+        "stages_ms": {
+          "baseline_extract_clone": 0.00037099999999999996,
+          "rebuild_preparation_total": 1286.783549,
+          "rebuild_prepare_before_views": 516.753808,
+          "rebuild_prepare_drops": 0.112921,
+          "request_prepare_codec": 508.64818999999994,
+          "view_applied_engine_clone": 242.64199,
+          "view_json_decode": 287.056316,
+          "view_lineage_rebase": 0.000491,
+          "view_materialization_total": 769.914625,
+          "view_produced_engine_clone": 232.61479400000002,
+          "view_sql_load": 7.586806
+        },
+        "calls": {
+          "baseline_extract_clone": 1,
+          "rebuild_preparation_total": 1,
+          "rebuild_prepare_before_views": 1,
+          "rebuild_prepare_drops": 1,
+          "request_prepare_codec": 1,
+          "view_applied_engine_clone": 1,
+          "view_json_decode": 1,
+          "view_lineage_rebase": 1,
+          "view_materialization_total": 1,
+          "view_produced_engine_clone": 1,
+          "view_sql_load": 1
+        },
+        "fields": {
+          "view_json_bytes": 28245519
+        },
+        "total_ms": 9810.138027
+      }
+    },
+    {
+      "host": "OpenCode1",
+      "sample": 4,
+      "base_messages": 17000,
+      "fixture_messages_at_probe": 17002,
+      "before": {
+        "at": "2026-10-13T08:59:54.183Z",
+        "uptime": "08:59:54 up 8 days, 16:46,  0 users,  load average: 12.93, 18.25, 18.14",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3625571932000,
+          "user_usec": 3035695865000,
+          "system_usec": 589876067000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=1.85 avg60=5.19 avg300=9.23 total=18820119218\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=1.85 avg60=5.19 avg300=9.23 total=18820119218\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "12.93 18.25 18.14 7/3421 1035"
+      },
+      "measurement_before": {
+        "at": "2026-10-13T09:00:33.524Z",
+        "uptime": "09:00:33 up 8 days, 16:47,  0 users,  load average: 14.45, 18.06, 18.08",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3625889674000,
+          "user_usec": 3035963057000,
+          "system_usec": 589926617000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=1.77 avg60=4.42 avg300=8.57 total=18822005306\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=1.77 avg60=4.42 avg300=8.57 total=18822005306\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "14.45 18.06 18.08 18/3641 1040"
+      },
+      "rebuild_after": {
+        "at": "2026-10-13T09:00:46.926Z",
+        "uptime": "09:00:46 up 8 days, 16:47,  0 users,  load average: 20.94, 19.32, 18.49",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3626088761000,
+          "user_usec": 3036133384000,
+          "system_usec": 589955377000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=24.45 avg60=9.59 avg300=9.54 total=18826522393\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=24.45 avg60=9.59 avg300=9.54 total=18826522393\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "20.94 19.32 18.49 23/3836 1042"
+      },
+      "after": {
+        "at": "2026-10-13T09:00:48.429Z",
+        "uptime": "09:00:48 up 8 days, 16:47,  0 users,  load average: 20.94, 19.32, 18.49",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3626106989000,
+          "user_usec": 3036149905000,
+          "system_usec": 589957084000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=26.90 avg60=10.52 avg300=9.74 total=18827143141\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=26.90 avg60=10.52 avg300=9.74 total=18827143141\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "20.94 19.32 18.49 21/3883 1044"
+      },
+      "cpu_stat_delta": {
+        "usage_usec": 535057000,
+        "user_usec": 454040000,
+        "system_usec": 81017000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "measured_cpu_stat_delta": {
+        "usage_usec": 217315000,
+        "user_usec": 186848000,
+        "system_usec": 30467000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "psi_delta": {
+        "host_some_total_usec": 7023923,
+        "cgroup_some_total_usec": 7023923,
+        "wall_ms": 54246
+      },
+      "measured_psi_delta": {
+        "host_some_total_usec": 5137835,
+        "cgroup_some_total_usec": 5137835,
+        "wall_ms": 14905
+      },
+      "rebuild_psi_delta": {
+        "host_some_total_usec": 4517087,
+        "cgroup_some_total_usec": 4517087,
+        "wall_ms": 13402
+      },
+      "hook_psi_delta": {
+        "host_some_total_usec": 620748,
+        "cgroup_some_total_usec": 620748,
+        "wall_ms": 1503
+      },
+      "hook": {
+        "kind": "hook",
+        "session": "session",
+        "harness": "opencode",
+        "request_id": "probe-OpenCode1-4-ae2fbcdf-a01a-4424-8796-a0c2e808bd6a",
+        "stages_ms": {
+          "baseline_convert_summary": 30.282804,
+          "baseline_convert_write": 321.814723,
+          "baseline_extract_clone": 152.550342,
+          "baseline_restate": 289.251798,
+          "change_log_clear": 0.070182,
+          "channel1_compute_baseline": 139.751687,
+          "effective_parts_read_decode": 276.676491,
+          "lock_wait": 0.004809,
+          "summary_build": 71.860089,
+          "summary_serialize": 0.036298,
+          "summary_validate": 0.030397,
+          "summary_write": 8.718907
+        },
+        "calls": {
+          "baseline_convert_summary": 1,
+          "baseline_convert_write": 1,
+          "baseline_extract_clone": 1,
+          "baseline_restate": 1,
+          "change_log_clear": 1,
+          "channel1_compute_baseline": 1,
+          "effective_parts_read_decode": 1,
+          "lock_wait": 1,
+          "summary_build": 1,
+          "summary_serialize": 1,
+          "summary_validate": 1,
+          "summary_write": 1
+        },
+        "fields": {
+          "baseline_refrozen": 1,
+          "baseline_updates": 57801,
+          "changes_cleared": 0,
+          "effective_parts": 74804,
+          "summary_bytes": 573
+        },
+        "total_ms": 1496.66793
+      },
+      "rebuild": {
+        "kind": "rebuild",
+        "session": "session",
+        "harness": "opencode",
+        "request_id": "rebuild-OpenCode1-4-bddba259-87f1-49e4-ab66-58811f43a57b",
+        "stages_ms": {
+          "baseline_extract_clone": 0.00046,
+          "rebuild_preparation_total": 1961.98929,
+          "rebuild_prepare_before_views": 727.007651,
+          "rebuild_prepare_drops": 0.18387399999999998,
+          "request_prepare_codec": 716.067425,
+          "view_applied_engine_clone": 357.74728700000003,
+          "view_json_decode": 508.31819199999995,
+          "view_lineage_rebase": 0.0016229999999999999,
+          "view_materialization_total": 1234.793646,
+          "view_produced_engine_clone": 353.624636,
+          "view_sql_load": 15.071461
+        },
+        "calls": {
+          "baseline_extract_clone": 1,
+          "rebuild_preparation_total": 1,
+          "rebuild_prepare_before_views": 1,
+          "rebuild_prepare_drops": 1,
+          "request_prepare_codec": 1,
+          "view_applied_engine_clone": 1,
+          "view_json_decode": 1,
+          "view_lineage_rebase": 1,
+          "view_materialization_total": 1,
+          "view_produced_engine_clone": 1,
+          "view_sql_load": 1
+        },
+        "fields": {
+          "view_json_bytes": 28245519
+        },
+        "total_ms": 13271.994277
+      }
+    },
+    {
+      "host": "OpenCode2",
+      "sample": 0,
+      "base_messages": 17000,
+      "fixture_messages_at_probe": 17002,
+      "before": {
+        "at": "2026-10-13T09:00:49.689Z",
+        "uptime": "09:00:49 up 8 days, 16:47,  0 users,  load average: 20.94, 19.32, 18.49",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3626122166000,
+          "user_usec": 3036163104000,
+          "system_usec": 589959062000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=29.82 avg60=11.58 avg300=9.97 total=18827752331\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=29.82 avg60=11.58 avg300=9.97 total=18827752331\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "20.94 19.32 18.49 32/3861 1046"
+      },
+      "measurement_before": {
+        "at": "2026-10-13T09:01:35.986Z",
+        "uptime": "09:01:35 up 8 days, 16:48,  0 users,  load average: 20.80, 19.48, 18.59",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3626645416000,
+          "user_usec": 3036610626000,
+          "system_usec": 590034790000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=11.44 avg60=10.83 avg300=9.97 total=18832502092\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=11.44 avg60=10.83 avg300=9.97 total=18832502092\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "20.80 19.48 18.59 30/3897 1050"
+      },
+      "rebuild_after": {
+        "at": "2026-10-13T09:01:54.219Z",
+        "uptime": "09:01:54 up 8 days, 16:48,  0 users,  load average: 23.87, 20.24, 18.85",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3626908758000,
+          "user_usec": 3036833198000,
+          "system_usec": 590075560000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=25.22 avg60=14.31 avg300=10.80 total=18837068896\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=25.22 avg60=14.31 avg300=10.80 total=18837068896\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "23.87 20.24 18.85 54/4130 1052"
+      },
+      "after": {
+        "at": "2026-10-13T09:01:57.209Z",
+        "uptime": "09:01:57 up 8 days, 16:48,  0 users,  load average: 25.49, 20.63, 18.99",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3626958833000,
+          "user_usec": 3036872853000,
+          "system_usec": 590085980000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=26.81 avg60=14.96 avg300=10.96 total=18838088968\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=26.81 avg60=14.96 avg300=10.96 total=18838088968\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "25.49 20.63 18.99 29/4227 1055"
+      },
+      "cpu_stat_delta": {
+        "usage_usec": 836667000,
+        "user_usec": 709749000,
+        "system_usec": 126918000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "measured_cpu_stat_delta": {
+        "usage_usec": 313417000,
+        "user_usec": 262227000,
+        "system_usec": 51190000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "psi_delta": {
+        "host_some_total_usec": 10336637,
+        "cgroup_some_total_usec": 10336637,
+        "wall_ms": 67520
+      },
+      "measured_psi_delta": {
+        "host_some_total_usec": 5586876,
+        "cgroup_some_total_usec": 5586876,
+        "wall_ms": 21223
+      },
+      "rebuild_psi_delta": {
+        "host_some_total_usec": 4566804,
+        "cgroup_some_total_usec": 4566804,
+        "wall_ms": 18233
+      },
+      "hook_psi_delta": {
+        "host_some_total_usec": 1020072,
+        "cgroup_some_total_usec": 1020072,
+        "wall_ms": 2990
+      },
+      "hook": {
+        "kind": "hook",
+        "session": "session",
+        "harness": "opencode2",
+        "request_id": "probe-OpenCode2-0-88572cd5-2a67-407b-9d61-e4e6bfa5ca9f",
+        "stages_ms": {
+          "baseline_convert_summary": 67.05941299999999,
+          "baseline_convert_write": 612.976459,
+          "baseline_extract_clone": 230.276478,
+          "baseline_restate": 495.055855,
+          "change_log_clear": 0.17782299999999998,
+          "channel1_compute_baseline": 377.47701099999995,
+          "effective_parts_read_decode": 629.097857,
+          "lock_wait": 0.010339999999999998,
+          "summary_build": 168.79990899999999,
+          "summary_serialize": 0.09066,
+          "summary_validate": 0.025989,
+          "summary_write": 11.584522999999999
+        },
+        "calls": {
+          "baseline_convert_summary": 1,
+          "baseline_convert_write": 1,
+          "baseline_extract_clone": 1,
+          "baseline_restate": 1,
+          "change_log_clear": 1,
+          "channel1_compute_baseline": 1,
+          "effective_parts_read_decode": 1,
+          "lock_wait": 1,
+          "summary_build": 1,
+          "summary_serialize": 1,
+          "summary_validate": 1,
+          "summary_write": 1
+        },
+        "fields": {
+          "baseline_refrozen": 1,
+          "baseline_updates": 57801,
+          "changes_cleared": 0,
+          "effective_parts": 74804,
+          "summary_bytes": 573
+        },
+        "total_ms": 2960.638921
+      },
+      "rebuild": {
+        "kind": "rebuild",
+        "session": "session",
+        "harness": "opencode2",
+        "request_id": "rebuild-OpenCode2-0-47af163e-af84-477d-ab41-06da84d1110f",
+        "stages_ms": {
+          "baseline_extract_clone": 0.000671,
+          "rebuild_preparation_total": 1471.319382,
+          "rebuild_prepare_before_views": 607.1358220000001,
+          "rebuild_prepare_drops": 0.13060400000000003,
+          "request_prepare_codec": 598.6180009999999,
+          "view_applied_engine_clone": 264.15412599999996,
+          "view_json_decode": 318.72202799999997,
+          "view_lineage_rebase": 0.000612,
+          "view_materialization_total": 864.050291,
+          "view_produced_engine_clone": 271.244032,
+          "view_sql_load": 9.914736
+        },
+        "calls": {
+          "baseline_extract_clone": 1,
+          "rebuild_preparation_total": 1,
+          "rebuild_prepare_before_views": 1,
+          "rebuild_prepare_drops": 1,
+          "request_prepare_codec": 1,
+          "view_applied_engine_clone": 1,
+          "view_json_decode": 1,
+          "view_lineage_rebase": 1,
+          "view_materialization_total": 1,
+          "view_produced_engine_clone": 1,
+          "view_sql_load": 1
+        },
+        "fields": {
+          "view_json_bytes": 28245519
+        },
+        "total_ms": 17801.777148
+      }
+    },
+    {
+      "host": "OpenCode2",
+      "sample": 1,
+      "base_messages": 17000,
+      "fixture_messages_at_probe": 17002,
+      "before": {
+        "at": "2026-10-13T09:01:58.405Z",
+        "uptime": "09:01:58 up 8 days, 16:48,  0 users,  load average: 25.49, 20.63, 18.99",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3626978511000,
+          "user_usec": 3036889324000,
+          "system_usec": 590089187000,
+          "nice_usec": 191833885000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=28.29 avg60=15.61 avg300=11.12 total=18838541055\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=28.29 avg60=15.61 avg300=11.12 total=18838541055\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "25.49 20.63 18.99 58/4378 1057"
+      },
+      "measurement_before": {
+        "at": "2026-10-13T09:03:03.663Z",
+        "uptime": "09:03:03 up 8 days, 16:49,  0 users,  load average: 24.90, 22.19, 19.69",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3627668496000,
+          "user_usec": 3037474231000,
+          "system_usec": 590194265000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=2.69 avg60=12.23 avg300=11.55 total=18847813976\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=2.69 avg60=12.23 avg300=11.55 total=18847813976\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "24.90 22.19 19.69 10/3220 1062"
+      },
+      "rebuild_after": {
+        "at": "2026-10-13T09:03:17.658Z",
+        "uptime": "09:03:17 up 8 days, 16:49,  0 users,  load average: 24.13, 22.15, 19.72",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3627842664000,
+          "user_usec": 3037619426000,
+          "system_usec": 590223238000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=10.24 avg60=11.66 avg300=11.43 total=18849079759\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=10.24 avg60=11.66 avg300=11.43 total=18849079759\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "24.13 22.15 19.72 14/3127 1064"
+      },
+      "after": {
+        "at": "2026-10-13T09:03:19.553Z",
+        "uptime": "09:03:19 up 8 days, 16:49,  0 users,  load average: 24.13, 22.15, 19.72",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3627860306000,
+          "user_usec": 3037635694000,
+          "system_usec": 590224612000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=8.56 avg60=11.31 avg300=11.36 total=18849105063\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=8.56 avg60=11.31 avg300=11.36 total=18849105063\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "24.13 22.15 19.72 7/3042 1066"
+      },
+      "cpu_stat_delta": {
+        "usage_usec": 881795000,
+        "user_usec": 746370000,
+        "system_usec": 135425000,
+        "nice_usec": 24000,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "measured_cpu_stat_delta": {
+        "usage_usec": 191810000,
+        "user_usec": 161463000,
+        "system_usec": 30347000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "psi_delta": {
+        "host_some_total_usec": 10564008,
+        "cgroup_some_total_usec": 10564008,
+        "wall_ms": 81148
+      },
+      "measured_psi_delta": {
+        "host_some_total_usec": 1291087,
+        "cgroup_some_total_usec": 1291087,
+        "wall_ms": 15890
+      },
+      "rebuild_psi_delta": {
+        "host_some_total_usec": 1265783,
+        "cgroup_some_total_usec": 1265783,
+        "wall_ms": 13995
+      },
+      "hook_psi_delta": {
+        "host_some_total_usec": 25304,
+        "cgroup_some_total_usec": 25304,
+        "wall_ms": 1895
+      },
+      "hook": {
+        "kind": "hook",
+        "session": "session",
+        "harness": "opencode2",
+        "request_id": "probe-OpenCode2-1-89d235c7-2ed1-4535-812b-a6d9fa749bd4",
+        "stages_ms": {
+          "baseline_convert_summary": 34.486979,
+          "baseline_convert_write": 394.967743,
+          "baseline_extract_clone": 152.775052,
+          "baseline_restate": 402.028165,
+          "change_log_clear": 0.093145,
+          "channel1_compute_baseline": 166.767583,
+          "effective_parts_read_decode": 409.112219,
+          "lock_wait": 0.00528,
+          "summary_build": 81.586566,
+          "summary_serialize": 0.042159,
+          "summary_validate": 0.018014000000000002,
+          "summary_write": 6.480125
+        },
+        "calls": {
+          "baseline_convert_summary": 1,
+          "baseline_convert_write": 1,
+          "baseline_extract_clone": 1,
+          "baseline_restate": 1,
+          "change_log_clear": 1,
+          "channel1_compute_baseline": 1,
+          "effective_parts_read_decode": 1,
+          "lock_wait": 1,
+          "summary_build": 1,
+          "summary_serialize": 1,
+          "summary_validate": 1,
+          "summary_write": 1
+        },
+        "fields": {
+          "baseline_refrozen": 1,
+          "baseline_updates": 57801,
+          "changes_cleared": 0,
+          "effective_parts": 74804,
+          "summary_bytes": 573
+        },
+        "total_ms": 1887.7903119999999
+      },
+      "rebuild": {
+        "kind": "rebuild",
+        "session": "session",
+        "harness": "opencode2",
+        "request_id": "rebuild-OpenCode2-1-9c26a389-0f77-45fd-97ba-6471446402e6",
+        "stages_ms": {
+          "baseline_extract_clone": 0.0003,
+          "rebuild_preparation_total": 1437.111556,
+          "rebuild_prepare_before_views": 594.615436,
+          "rebuild_prepare_drops": 0.23813600000000001,
+          "request_prepare_codec": 585.292238,
+          "view_applied_engine_clone": 259.938331,
+          "view_json_decode": 311.558564,
+          "view_lineage_rebase": 0.001853,
+          "view_materialization_total": 842.2547470000001,
+          "view_produced_engine_clone": 259.855838,
+          "view_sql_load": 10.881264999999999
+        },
+        "calls": {
+          "baseline_extract_clone": 1,
+          "rebuild_preparation_total": 1,
+          "rebuild_prepare_before_views": 1,
+          "rebuild_prepare_drops": 1,
+          "request_prepare_codec": 1,
+          "view_applied_engine_clone": 1,
+          "view_json_decode": 1,
+          "view_lineage_rebase": 1,
+          "view_materialization_total": 1,
+          "view_produced_engine_clone": 1,
+          "view_sql_load": 1
+        },
+        "fields": {
+          "view_json_bytes": 28245519
+        },
+        "total_ms": 13866.794885000001
+      }
+    },
+    {
+      "host": "OpenCode2",
+      "sample": 2,
+      "base_messages": 17000,
+      "fixture_messages_at_probe": 17002,
+      "before": {
+        "at": "2026-10-13T09:03:20.066Z",
+        "uptime": "09:03:20 up 8 days, 16:49,  0 users,  load average: 24.13, 22.15, 19.72",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3627864043000,
+          "user_usec": 3037639216000,
+          "system_usec": 590224827000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=8.56 avg60=11.31 avg300=11.36 total=18849106021\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=8.56 avg60=11.31 avg300=11.36 total=18849106021\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "24.13 22.15 19.72 10/3045 1068"
+      },
+      "measurement_before": {
+        "at": "2026-10-13T09:03:50.042Z",
+        "uptime": "09:03:50 up 8 days, 16:50,  0 users,  load average: 17.67, 20.80, 19.35",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3628041539000,
+          "user_usec": 3037794990000,
+          "system_usec": 590246549000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=0.88 avg60=7.30 avg300=10.37 total=18849577268\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=0.88 avg60=7.30 avg300=10.37 total=18849577268\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "17.67 20.80 19.35 3/2939 1072"
+      },
+      "rebuild_after": {
+        "at": "2026-10-13T09:04:01.600Z",
+        "uptime": "09:04:01 up 8 days, 16:50,  0 users,  load average: 15.40, 20.14, 19.15",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3628118464000,
+          "user_usec": 3037860235000,
+          "system_usec": 590258229000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=4.64 avg60=6.98 avg300=10.16 total=18850281289\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=4.64 avg60=6.98 avg300=10.16 total=18850281289\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "15.40 20.14 19.15 9/2948 1074"
+      },
+      "after": {
+        "at": "2026-10-13T09:04:02.942Z",
+        "uptime": "09:04:02 up 8 days, 16:50,  0 users,  load average: 15.40, 20.14, 19.15",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3628127815000,
+          "user_usec": 3037867979000,
+          "system_usec": 590259836000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=4.64 avg60=6.98 avg300=10.16 total=18850369610\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=4.64 avg60=6.98 avg300=10.16 total=18850369610\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "15.40 20.14 19.15 8/2949 1076"
+      },
+      "cpu_stat_delta": {
+        "usage_usec": 263772000,
+        "user_usec": 228763000,
+        "system_usec": 35009000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "measured_cpu_stat_delta": {
+        "usage_usec": 86276000,
+        "user_usec": 72989000,
+        "system_usec": 13287000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "psi_delta": {
+        "host_some_total_usec": 1263589,
+        "cgroup_some_total_usec": 1263589,
+        "wall_ms": 42876
+      },
+      "measured_psi_delta": {
+        "host_some_total_usec": 792342,
+        "cgroup_some_total_usec": 792342,
+        "wall_ms": 12900
+      },
+      "rebuild_psi_delta": {
+        "host_some_total_usec": 704021,
+        "cgroup_some_total_usec": 704021,
+        "wall_ms": 11558
+      },
+      "hook_psi_delta": {
+        "host_some_total_usec": 88321,
+        "cgroup_some_total_usec": 88321,
+        "wall_ms": 1342
+      },
+      "hook": {
+        "kind": "hook",
+        "session": "session",
+        "harness": "opencode2",
+        "request_id": "probe-OpenCode2-2-2efb8036-6a13-4167-bc32-411d50b25226",
+        "stages_ms": {
+          "baseline_convert_summary": 30.149998,
+          "baseline_convert_write": 287.52952799999997,
+          "baseline_extract_clone": 120.24488699999999,
+          "baseline_restate": 262.203323,
+          "change_log_clear": 0.20521499999999998,
+          "channel1_compute_baseline": 126.511902,
+          "effective_parts_read_decode": 269.532207,
+          "lock_wait": 0.004088,
+          "summary_build": 62.698457,
+          "summary_serialize": 0.067928,
+          "summary_validate": 0.015469,
+          "summary_write": 4.881952
+        },
+        "calls": {
+          "baseline_convert_summary": 1,
+          "baseline_convert_write": 1,
+          "baseline_extract_clone": 1,
+          "baseline_restate": 1,
+          "change_log_clear": 1,
+          "channel1_compute_baseline": 1,
+          "effective_parts_read_decode": 1,
+          "lock_wait": 1,
+          "summary_build": 1,
+          "summary_serialize": 1,
+          "summary_validate": 1,
+          "summary_write": 1
+        },
+        "fields": {
+          "baseline_refrozen": 1,
+          "baseline_updates": 57801,
+          "changes_cleared": 0,
+          "effective_parts": 74804,
+          "summary_bytes": 573
+        },
+        "total_ms": 1333.637985
+      },
+      "rebuild": {
+        "kind": "rebuild",
+        "session": "session",
+        "harness": "opencode2",
+        "request_id": "rebuild-OpenCode2-2-8ab4cf2c-da0d-4d6b-a1eb-625ac0fe2eb2",
+        "stages_ms": {
+          "baseline_extract_clone": 0.000591,
+          "rebuild_preparation_total": 1256.620173,
+          "rebuild_prepare_before_views": 521.89356,
+          "rebuild_prepare_drops": 0.105147,
+          "request_prepare_codec": 515.265348,
+          "view_applied_engine_clone": 223.755767,
+          "view_json_decode": 279.759258,
+          "view_lineage_rebase": 0.000381,
+          "view_materialization_total": 734.619373,
+          "view_produced_engine_clone": 223.50551900000002,
+          "view_sql_load": 7.585124
+        },
+        "calls": {
+          "baseline_extract_clone": 1,
+          "rebuild_preparation_total": 1,
+          "rebuild_prepare_before_views": 1,
+          "rebuild_prepare_drops": 1,
+          "request_prepare_codec": 1,
+          "view_applied_engine_clone": 1,
+          "view_json_decode": 1,
+          "view_lineage_rebase": 1,
+          "view_materialization_total": 1,
+          "view_produced_engine_clone": 1,
+          "view_sql_load": 1
+        },
+        "fields": {
+          "view_json_bytes": 28245519
+        },
+        "total_ms": 11420.327735
+      }
+    },
+    {
+      "host": "OpenCode2",
+      "sample": 3,
+      "base_messages": 17000,
+      "fixture_messages_at_probe": 17002,
+      "before": {
+        "at": "2026-10-13T09:04:03.309Z",
+        "uptime": "09:04:03 up 8 days, 16:50,  0 users,  load average: 15.40, 20.14, 19.15",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3628130406000,
+          "user_usec": 3037870316000,
+          "system_usec": 590260090000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=4.64 avg60=6.98 avg300=10.16 total=18850377746\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=4.64 avg60=6.98 avg300=10.16 total=18850377746\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "15.40 20.14 19.15 8/2987 1078"
+      },
+      "measurement_before": {
+        "at": "2026-10-13T09:04:34.483Z",
+        "uptime": "09:04:34 up 8 days, 16:51,  0 users,  load average: 13.31, 19.19, 18.87",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3628419677000,
+          "user_usec": 3038122289000,
+          "system_usec": 590297388000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=2.95 avg60=5.40 avg300=9.44 total=18851494388\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=2.95 avg60=5.40 avg300=9.44 total=18851494388\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "13.31 19.19 18.87 12/3026 1090"
+      },
+      "rebuild_after": {
+        "at": "2026-10-13T09:04:44.654Z",
+        "uptime": "09:04:44 up 8 days, 16:51,  0 users,  load average: 12.77, 18.88, 18.77",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3628493539000,
+          "user_usec": 3038187072000,
+          "system_usec": 590306467000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=6.27 avg60=5.78 avg300=9.38 total=18852328430\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=6.27 avg60=5.78 avg300=9.38 total=18852328430\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "12.77 18.88 18.77 8/2715 1092"
+      },
+      "after": {
+        "at": "2026-10-13T09:04:45.999Z",
+        "uptime": "09:04:45 up 8 days, 16:51,  0 users,  load average: 12.77, 18.88, 18.77",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3628501782000,
+          "user_usec": 3038194381000,
+          "system_usec": 590307401000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=5.31 avg60=5.62 avg300=9.33 total=18852349473\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=5.31 avg60=5.62 avg300=9.33 total=18852349473\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "12.77 18.88 18.77 6/2782 1094"
+      },
+      "cpu_stat_delta": {
+        "usage_usec": 371376000,
+        "user_usec": 324065000,
+        "system_usec": 47311000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "measured_cpu_stat_delta": {
+        "usage_usec": 82105000,
+        "user_usec": 72092000,
+        "system_usec": 10013000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "psi_delta": {
+        "host_some_total_usec": 1971727,
+        "cgroup_some_total_usec": 1971727,
+        "wall_ms": 42690
+      },
+      "measured_psi_delta": {
+        "host_some_total_usec": 855085,
+        "cgroup_some_total_usec": 855085,
+        "wall_ms": 11516
+      },
+      "rebuild_psi_delta": {
+        "host_some_total_usec": 834042,
+        "cgroup_some_total_usec": 834042,
+        "wall_ms": 10171
+      },
+      "hook_psi_delta": {
+        "host_some_total_usec": 21043,
+        "cgroup_some_total_usec": 21043,
+        "wall_ms": 1345
+      },
+      "hook": {
+        "kind": "hook",
+        "session": "session",
+        "harness": "opencode2",
+        "request_id": "probe-OpenCode2-3-14f5c940-1a10-41cd-8fb1-dc8f8b7f0a94",
+        "stages_ms": {
+          "baseline_convert_summary": 27.752769,
+          "baseline_convert_write": 291.090255,
+          "baseline_extract_clone": 119.76079,
+          "baseline_restate": 262.535295,
+          "change_log_clear": 0.175569,
+          "channel1_compute_baseline": 127.885464,
+          "effective_parts_read_decode": 266.427343,
+          "lock_wait": 0.0037170000000000003,
+          "summary_build": 61.720085,
+          "summary_serialize": 0.060543,
+          "summary_validate": 0.02154,
+          "summary_write": 4.481031
+        },
+        "calls": {
+          "baseline_convert_summary": 1,
+          "baseline_convert_write": 1,
+          "baseline_extract_clone": 1,
+          "baseline_restate": 1,
+          "change_log_clear": 1,
+          "channel1_compute_baseline": 1,
+          "effective_parts_read_decode": 1,
+          "lock_wait": 1,
+          "summary_build": 1,
+          "summary_serialize": 1,
+          "summary_validate": 1,
+          "summary_write": 1
+        },
+        "fields": {
+          "baseline_refrozen": 1,
+          "baseline_updates": 57801,
+          "changes_cleared": 0,
+          "effective_parts": 74804,
+          "summary_bytes": 573
+        },
+        "total_ms": 1335.585542
+      },
+      "rebuild": {
+        "kind": "rebuild",
+        "session": "session",
+        "harness": "opencode2",
+        "request_id": "rebuild-OpenCode2-3-91b8269a-676f-4926-935b-2b69f6361a3b",
+        "stages_ms": {
+          "baseline_extract_clone": 0.00037099999999999996,
+          "rebuild_preparation_total": 1448.091246,
+          "rebuild_prepare_before_views": 606.6910290000001,
+          "rebuild_prepare_drops": 0.129974,
+          "request_prepare_codec": 599.25248,
+          "view_applied_engine_clone": 265.609962,
+          "view_json_decode": 294.687522,
+          "view_lineage_rebase": 0.000551,
+          "view_materialization_total": 841.267689,
+          "view_produced_engine_clone": 273.466635,
+          "view_sql_load": 7.488493
+        },
+        "calls": {
+          "baseline_extract_clone": 1,
+          "rebuild_preparation_total": 1,
+          "rebuild_prepare_before_views": 1,
+          "rebuild_prepare_drops": 1,
+          "request_prepare_codec": 1,
+          "view_applied_engine_clone": 1,
+          "view_json_decode": 1,
+          "view_lineage_rebase": 1,
+          "view_materialization_total": 1,
+          "view_produced_engine_clone": 1,
+          "view_sql_load": 1
+        },
+        "fields": {
+          "view_json_bytes": 28245519
+        },
+        "total_ms": 10002.582774
+      }
+    },
+    {
+      "host": "OpenCode2",
+      "sample": 4,
+      "base_messages": 17000,
+      "fixture_messages_at_probe": 17002,
+      "before": {
+        "at": "2026-10-13T09:04:46.378Z",
+        "uptime": "09:04:46 up 8 days, 16:51,  0 users,  load average: 12.31, 18.68, 18.71",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3628504331000,
+          "user_usec": 3038196514000,
+          "system_usec": 590307817000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=5.31 avg60=5.62 avg300=9.33 total=18852356888\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=5.31 avg60=5.62 avg300=9.33 total=18852356888\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "12.31 18.68 18.71 6/2788 1096"
+      },
+      "measurement_before": {
+        "at": "2026-10-13T09:05:21.894Z",
+        "uptime": "09:05:21 up 8 days, 16:52,  0 users,  load average: 15.77, 18.83, 18.76",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3628929531000,
+          "user_usec": 3038546869000,
+          "system_usec": 590382662000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=2.02 avg60=5.36 avg300=8.92 total=18854777120\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=2.02 avg60=5.36 avg300=8.92 total=18854777120\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "15.77 18.83 18.76 15/2917 1100"
+      },
+      "rebuild_after": {
+        "at": "2026-10-13T09:05:42.857Z",
+        "uptime": "09:05:42 up 8 days, 16:52,  0 users,  load average: 25.51, 20.84, 19.42",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3629057469000,
+          "user_usec": 3038638147000,
+          "system_usec": 590419322000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=0.65 avg60=4.02 avg300=8.37 total=18855000531\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=0.65 avg60=4.02 avg300=8.37 total=18855000531\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "25.51 20.84 19.42 7/2681 1102"
+      },
+      "after": {
+        "at": "2026-10-13T09:05:44.663Z",
+        "uptime": "09:05:44 up 8 days, 16:52,  0 users,  load average: 25.51, 20.84, 19.42",
+        "nproc": 4,
+        "cpu_stat": {
+          "usage_usec": 3629087481000,
+          "user_usec": 3038653515000,
+          "system_usec": 590433966000,
+          "nice_usec": 191833909000,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 0,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        },
+        "cpu_max": null,
+        "cpuset": "0-31",
+        "host_cpu_pressure": "some avg10=0.72 avg60=3.93 avg300=8.32 total=18855236230\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "cgroup_cpu_pressure": "some avg10=0.72 avg60=3.93 avg300=8.32 total=18855236230\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+        "loadavg": "25.51 20.84 19.42 39/2733 1104"
+      },
+      "cpu_stat_delta": {
+        "usage_usec": 583150000,
+        "user_usec": 457001000,
+        "system_usec": 126149000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "measured_cpu_stat_delta": {
+        "usage_usec": 157950000,
+        "user_usec": 106646000,
+        "system_usec": 51304000,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "psi_delta": {
+        "host_some_total_usec": 2879342,
+        "cgroup_some_total_usec": 2879342,
+        "wall_ms": 58285
+      },
+      "measured_psi_delta": {
+        "host_some_total_usec": 459110,
+        "cgroup_some_total_usec": 459110,
+        "wall_ms": 22769
+      },
+      "rebuild_psi_delta": {
+        "host_some_total_usec": 223411,
+        "cgroup_some_total_usec": 223411,
+        "wall_ms": 20963
+      },
+      "hook_psi_delta": {
+        "host_some_total_usec": 235699,
+        "cgroup_some_total_usec": 235699,
+        "wall_ms": 1806
+      },
+      "hook": {
+        "kind": "hook",
+        "session": "session",
+        "harness": "opencode2",
+        "request_id": "probe-OpenCode2-4-b7d7ef06-ad2a-4afe-a3d8-23bf4e6aa90c",
+        "stages_ms": {
+          "baseline_convert_summary": 28.258191,
+          "baseline_convert_write": 310.357238,
+          "baseline_extract_clone": 203.61140799999998,
+          "baseline_restate": 485.495603,
+          "change_log_clear": 0.23333600000000002,
+          "channel1_compute_baseline": 141.69057500000002,
+          "effective_parts_read_decode": 284.608116,
+          "lock_wait": 0.004969,
+          "summary_build": 62.259448,
+          "summary_serialize": 0.103694,
+          "summary_validate": 0.024887,
+          "summary_write": 9.89961
+        },
+        "calls": {
+          "baseline_convert_summary": 1,
+          "baseline_convert_write": 1,
+          "baseline_extract_clone": 1,
+          "baseline_restate": 1,
+          "change_log_clear": 1,
+          "channel1_compute_baseline": 1,
+          "effective_parts_read_decode": 1,
+          "lock_wait": 1,
+          "summary_build": 1,
+          "summary_serialize": 1,
+          "summary_validate": 1,
+          "summary_write": 1
+        },
+        "fields": {
+          "baseline_refrozen": 1,
+          "baseline_updates": 57801,
+          "changes_cleared": 0,
+          "effective_parts": 74804,
+          "summary_bytes": 573
+        },
+        "total_ms": 1797.533041
+      },
+      "rebuild": {
+        "kind": "rebuild",
+        "session": "session",
+        "harness": "opencode2",
+        "request_id": "rebuild-OpenCode2-4-4e7ee032-4687-4966-a7c5-74ab9cad793e",
+        "stages_ms": {
+          "baseline_extract_clone": 0.000381,
+          "rebuild_preparation_total": 1589.450047,
+          "rebuild_prepare_before_views": 640.021765,
+          "rebuild_prepare_drops": 0.44156700000000004,
+          "request_prepare_codec": 627.9106439999999,
+          "view_applied_engine_clone": 300.776155,
+          "view_json_decode": 336.775744,
+          "view_lineage_rebase": 0.000792,
+          "view_materialization_total": 948.9832289999999,
+          "view_produced_engine_clone": 299.729966,
+          "view_sql_load": 11.676988
+        },
+        "calls": {
+          "baseline_extract_clone": 1,
+          "rebuild_preparation_total": 1,
+          "rebuild_prepare_before_views": 1,
+          "rebuild_prepare_drops": 1,
+          "request_prepare_codec": 1,
+          "view_applied_engine_clone": 1,
+          "view_json_decode": 1,
+          "view_lineage_rebase": 1,
+          "view_materialization_total": 1,
+          "view_produced_engine_clone": 1,
+          "view_sql_load": 1
+        },
+        "fields": {
+          "view_json_bytes": 28245519
+        },
+        "total_ms": 20796.048595
+      }
+    }
+  ],
+  "provenance": [
+    {
+      "path": "crates/mc-store/src/provider_meters.rs",
+      "original_sha256": "9bd22229a8f7dc75339de1ff95f8beafb4664acb3b327076018be6c52eade181",
+      "diagnostic_sha256": "7c577630b4807b75e932a3cf3f1e1aae41a13bd64692c8f2027f4fe257bcbe32"
+    },
+    {
+      "path": "crates/mc-store/src/provider_log.rs",
+      "original_sha256": "d321ee1c65bdb9d9c08b7f9bd66551988322b3b34c26430dde093167354fc0e7",
+      "diagnostic_sha256": "5145ef92a351af2cd9e272a809b8cd93c7a23b5992ecc9e8b2b02d247554b3c7"
+    },
+    {
+      "path": "crates/mc-store/src/provider_log/policy_index.rs",
+      "original_sha256": "b1adce9c35ad95b61f24fecfc2e51962c7cb210c2497a14aca519243b462ab44",
+      "diagnostic_sha256": "734e5fe39b1f5d05152a9546769b9ed1ae11eaeb3781acc07f38a0137ac7e117"
+    },
+    {
+      "path": "crates/mc-module/src/providers/step_transform.rs",
+      "original_sha256": "e9edcf3daee23bfc5cd29a84012b2b08fd4c9f7543c8ec53790b4ce7c9abbe47",
+      "diagnostic_sha256": "5b7552097df1a49ee7e0acc1ffa702942fef208ae246993a1b0d8313a726c8bf"
+    },
+    {
+      "path": "crates/mc-module/src/providers/policy_summary.rs",
+      "original_sha256": "60582a145ef16eb699404c767291433aa08f4d02948782c8a41876fc1d29d5a0",
+      "diagnostic_sha256": "03edb24a3db61a6e98f5088a4da1377e91de6eba5c14ca26f1aec42c3e72427a"
+    },
+    {
+      "path": "crates/mc-module/src/providers/compaction.rs",
+      "original_sha256": "855b901a40ba95acaee5fcd08ae693611733bd2f697e139abbce0c466d9fdca9",
+      "diagnostic_sha256": "85ab8dea801b27565713dfd6c5e17c2e992ab95ea893d27ffe324f4265462c59"
+    }
+  ]
+}

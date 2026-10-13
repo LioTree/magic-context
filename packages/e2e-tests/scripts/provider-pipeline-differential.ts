@@ -245,9 +245,17 @@ fn provider_pipeline_driver() {
                             };
                         }
                     }
+                    let module_started = std::time::Instant::now();
                     match rig.handler.dispatch_value(channel, request).await {
                         HandlerOutcome::Response(bytes) => {
+                            let module_ms = module_started.elapsed().as_secs_f64()*1000.0;
                             if cmd["settle_tasks"] == true { tokio::task::yield_now().await; }
+                            if cmd["timing"] == true {
+                                let raw = String::from_utf8(bytes).unwrap();
+                                println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{},\"module_ms\":{}}}", raw, serde_json::to_string(&raw).unwrap(), module_ms);
+                                std::io::stdout().flush().unwrap();
+                                continue;
+                            }
                             if cmd["raw_response"] == true {
                                 let raw = String::from_utf8(bytes).unwrap();
                                 println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{}}}",raw,serde_json::to_string(&raw).unwrap());
