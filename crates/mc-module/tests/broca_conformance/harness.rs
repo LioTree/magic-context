@@ -1,4 +1,6 @@
 use super::*;
+#[path = "../support/executable.rs"]
+mod executable_staging;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -257,7 +259,13 @@ impl Rig {
                 "the kill test requires ck-mc built with drive-fault, not a concurrent deploy build");
         }
         let stderr = fs::File::create(self.dir.path().join("module.stderr")).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ck-mc"));
+        let executable = executable_staging::stage_executable(
+            Path::new(env!("CARGO_BIN_EXE_ck-mc")),
+            "ckdev-mc-broca-conformance",
+            "ck-mc",
+        )
+        .unwrap();
+        let mut command = Command::new(executable);
         command
             .args(["--subc"])
             .arg(&self.connection)
@@ -279,7 +287,9 @@ impl Rig {
         if let Some(point) = fault {
             command.env("MC_PROVIDER_FAULT_POINT", point);
         }
-        self.module = Some(Process(command.spawn().unwrap()));
+        self.module = Some(Process(
+            executable_staging::retry_spawn(|| command.spawn()).unwrap(),
+        ));
     }
 
     pub async fn wait_ready(&self) {

@@ -11796,8 +11796,22 @@ impl McStore {
             single_store_schema::apply_compartment_dates(conn, session_id, compartments)
         })?;
         let boundaries = self.cached_context_boundaries(session_id)?;
+        // Index the cached coordinates by sequence once: a long session has thousands of
+        // both, and a boundary can only match the row with its sequence. Each sequence
+        // keeps its boundaries in cache order, so the first match is the same one a scan
+        // of the whole list finds.
+        let mut by_sequence: HashMap<i64, Vec<&ResolvedContextBoundary>> = HashMap::new();
+        for boundary in &boundaries {
+            by_sequence
+                .entry(boundary.sequence)
+                .or_default()
+                .push(boundary);
+        }
         for row in compartments {
-            if let Some(boundary) = boundaries.iter().find(|boundary| boundary.matches(row)) {
+            if let Some(boundary) = by_sequence
+                .get(&row.sequence)
+                .and_then(|candidates| candidates.iter().find(|boundary| boundary.matches(row)))
+            {
                 boundary.apply(row);
             }
         }
@@ -17407,6 +17421,27 @@ fn set_memory_verification_tx(
                     continue;
                 };
                 let hash = compute_normalized_memory_hash(content);
+                // memories has UNIQUE(project_path, category, normalized_hash). A
+                // rewrite onto another memory's exact content would fail the whole
+                // transaction, so reject that row instead; merging the two is not
+                // the verifier's call.
+                let duplicate: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM memories
+                          WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
+                            AND id <> ?4
+                          LIMIT 1",
+                        params![memory.project_path, memory.category, hash, update.memory_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(duplicate_id) = duplicate {
+                    rejected.push(VerificationRejected {
+                        memory_id: update.memory_id,
+                        reason: format!("duplicate_of:{duplicate_id}"),
+                    });
+                    continue;
+                }
                 tx.execute(
                     "UPDATE memories
                         SET content = ?1, normalized_hash = ?2, updated_at = ?3,

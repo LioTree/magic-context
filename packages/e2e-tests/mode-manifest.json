@@ -75,14 +75,6 @@
             "hosts": ["opencode2"]
         },
         {
-            "path": "tests/checkout-claim.test.ts",
-            "tier": "ts-only",
-            "invocation": { "ts": true, "rust": false },
-            "rationale": "Agent checkout claim: real OpenCode 1, Pi and OMP hosts against a wire-level fake subc daemon playing ALF agent.for_host_session and engram claim.read refuse a held-elsewhere session before any Magic Context write or provider call, then serve it once the claim moves back; PID lsof proves throwaway-store containment. OpenCode 2 runs the same gate in its context hook (unit-tested against the same fake daemon); Rust mode goes through the TypeScript plugin's pass",
-            "contract_refs": ["AGENT-CHECKOUT-CLAIM"],
-            "hosts": ["opencode", "pi", "omp"]
-        },
-        {
             "path": "tests/cache-ttl-live-config.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
@@ -688,6 +680,31 @@
             "behavior": true
         },
         {
+            "path": "tests/subagent-temperature-hosts.test.ts",
+            "tier": "ts-only",
+            "invocation": {
+                "ts": true,
+                "rust": false
+            },
+            "rationale": "Real OpenCode 1, OpenCode 2 and Pi hosts run the historian against models whose metadata comes from a copied models.dev catalogue; the mock-captured request bodies prove Gemini 3.8 Flash gets the configured temperature and Codex GPT-6.1 Sol gets none, and lsof over every spawned process proves no live store is open. OMP shares the Pi calibration extension and has unit gates.",
+            "contract_refs": [
+                "S2-MIGRATION"
+            ],
+            "hosts": [
+                "opencode",
+                "opencode2",
+                "pi"
+            ],
+            "divergences": [
+                {
+                    "host": "omp",
+                    "reason": "OMP loads the same historian calibration extension as Pi, and its Gemini models carry no sampling flag either, so the shared catalogue fallback is covered by the Pi lane and the OMP unit gates in historian-calibration-extension.test.ts",
+                    "contract_ref": "packages/pi-plugin/src/historian-calibration-extension.test.ts"
+                }
+            ],
+            "behavior": true
+        },
+        {
             "path": "tests/long-running-session.test.ts",
             "tier": "both-modes",
             "invocation": {
@@ -828,6 +845,21 @@
             "contract_refs": [
                 "R22",
                 "R36"
+            ],
+            "hosts": [
+                "opencode2"
+            ]
+        },
+        {
+            "path": "tests/opencode2/empty-text-sentinels.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "OpenCode v2 lane: a system row Magic Context neutralizes on canonical Anthropic must leave the request instead of reaching the API as an empty text block (OpenCode 2 sends system rows to Claude models with native system updates as they are), checked against an Anthropic-strict mock on the real host; the v2 lane runs from its own invocation (bun test tests/opencode2), not through the v1 mode-selected spawn seam",
+            "contract_refs": [
+                "OC2-S1"
             ],
             "hosts": [
                 "opencode2"
@@ -1005,7 +1037,22 @@
                 "ts": false,
                 "rust": false
             },
-            "rationale": "OpenCode v2 lane: OpenCode 2 has no command.execute.before hook, so the TUI keymap layer is the only source of a /ctx-* command; asserts the real TUI's own record of the slash names the host accepted; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
+            "rationale": "OpenCode v2 lane: the server command registry is the single /ctx-* registration; asserts each command is listed once and that the real TUI adds no second slash layer; the v2 lane runs from its own invocation (bun test tests/opencode2), not through the v1 mode-selected spawn seam",
+            "contract_refs": [
+                "OC2-S1"
+            ],
+            "hosts": [
+                "opencode2"
+            ]
+        },
+        {
+            "path": "tests/opencode2/commands-s2-tui-feedback.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "OpenCode v2 lane: drives every server-registered /ctx-* command in a real TUI and asserts the user sees its feedback (dialogs, toasts, usage messages, sidebar refresh); the v2 lane runs from its own invocation (bun test tests/opencode2), not through the v1 mode-selected spawn seam",
             "contract_refs": [
                 "OC2-S1"
             ],
@@ -2877,6 +2924,14 @@
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
             "rationale": "Real OpenCode 2 generate hook: managed prefix and applied drops, read-only database, pure replay and counterfactual next-main wire identity",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/opencode2/generate-tool-tail.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 2 generate hook after a tool step: the side-question request replays the last served runner request byte for byte, including id-less tool results",
             "contract_refs": ["OC2-S1"],
             "hosts": ["opencode2"]
         },

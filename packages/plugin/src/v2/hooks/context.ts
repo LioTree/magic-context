@@ -7,7 +7,6 @@ import {
     pluginConfigReader,
 } from "../../config/live-run-config";
 import { getProtectedTokensTierOverrides } from "../../config/project-security";
-import { createSubcCheckoutClaimGate } from "../../features/magic-context/checkout-claim";
 import { summarizeManualDream } from "../../features/magic-context/dreamer/manual-summary";
 import { userMemoryCollectionEnabled } from "../../features/magic-context/dreamer/task-config";
 import { formatUnsupportedDreamTasks } from "../../features/magic-context/dreamer/task-registry";
@@ -78,7 +77,6 @@ import {
 import { lkgReplayLimit, measureLkgReplay } from "../../hooks/magic-context/lkg-replay-fit";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
-import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
 import {
@@ -129,6 +127,8 @@ import {
     withSqliteTransformPass,
 } from "../../shared/sqlite";
 import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/user-facing-codes";
+import { CTX_NOTE_DESCRIPTION, withoutSmartNoteText } from "../../tools/ctx-note/constants";
+import { CTX_NOTE_LIGHT_DESCRIPTION } from "../../tools/light-descriptions";
 import { applyJsonSchemaParameterDescriptions } from "../../tools/parameter-descriptions";
 import { createV2RustCompactionMarkerStrategy, trimToRecordedBoundary } from "../fold/boundary";
 import { hostMediaAsset, hostUsesMediaAssets, rememberHostMedia } from "../fold/host-media";
@@ -160,7 +160,7 @@ import { DeletedSessionTombstones } from "./deleted-session-tombstones";
 import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
 import { registerV2DreamScheduleTimer } from "./dream-timer";
 import { startDreamTrigger } from "./dream-trigger";
-import { V2GenerateReplay } from "./generate";
+import { generateReplayAnchor, V2GenerateReplay } from "./generate";
 import { HiddenChildHook, hiddenToolCallRefusal, registerHiddenChildAgents } from "./hidden-child";
 import { hiddenTerminalError } from "./hidden-terminal-error";
 import { V2LkgSystemReplay } from "./lkg-system";
@@ -303,6 +303,7 @@ export function createHostSeams(
         TransformDeps,
         | "hostRawMessages"
         | "hostMessageReconciliationSource"
+        | "hostPrepareRawOrdinals"
         | "hostProtectedTailBoundary"
         | "hostModelFallback"
         | "getModelKey"
@@ -313,6 +314,10 @@ export function createHostSeams(
     return {
         hostRawMessages: readAllForConversion,
         hostMessageReconciliationSource: reconciliationSource,
+        // The OpenCode 2 reader already knows each message's position in the
+        // session. The default warm-up indexes OpenCode 1's SQLite database,
+        // which is a different store and cannot prepare this reader's messages.
+        hostPrepareRawOrdinals: async () => true,
         hostProtectedTailBoundary: (args) =>
             resolveOpenCodeProtectedTailBoundary({
                 ...args,
@@ -465,6 +470,7 @@ export function applyV2PromptSurfaceTools(
     draft: SessionContext,
     runtime: PromptSurfaceRuntime,
     config: PromptSurfaceConfig | undefined,
+    smartNotesEnabled = true,
 ): void {
     if (!draft.tools) return;
     const modelKey = `${draft.model.providerID}/${draft.model.id}`;
@@ -472,8 +478,20 @@ export function applyV2PromptSurfaceTools(
     for (const id of ACTIVE_TOOL_IDS) {
         const tool = draft.tools[id];
         if (!tool) continue;
-        tool.description = registration.descriptionFor(id, tool.description);
-        applyJsonSchemaParameterDescriptions(id, tool.input, registration.preset);
+        tool.description =
+            id === "ctx_note" && !smartNotesEnabled
+                ? withoutSmartNoteText(
+                      registration.preset === "light"
+                          ? CTX_NOTE_LIGHT_DESCRIPTION
+                          : CTX_NOTE_DESCRIPTION,
+                  )
+                : registration.descriptionFor(id, tool.description);
+        applyJsonSchemaParameterDescriptions(
+            id,
+            tool.input,
+            registration.preset,
+            smartNotesEnabled,
+        );
     }
 }
 
@@ -599,10 +617,6 @@ export async function registerContext(context: V2Context) {
         return;
     }
     const liveConfigReader = pluginConfigReader(directory, config);
-    const checkoutClaim = createSubcCheckoutClaimGate(
-        "opencode",
-        () => config.subc?.connection_file ?? getDefaultSubcConnectionFile(),
-    );
     const compactionOff = !isCompactionEnabled(config);
     const conflicts = detectConflicts(directory, {
         compactionEnabled: !compactionOff,
@@ -821,6 +835,7 @@ export async function registerContext(context: V2Context) {
                 keepSubagents: config.keep_subagents === true,
                 ensureAgent: () => (hiddenAgentsReady ??= context.agent.reload()),
                 modelCatalog: () => Promise.resolve(context.model.list()),
+                historianTemperature: () => config.historian?.temperature,
                 openReader: openStoreReader,
             },
         );
@@ -847,6 +862,7 @@ export async function registerContext(context: V2Context) {
         );
         const trigger = startDreamTrigger(context, {
             config: dreamerAtBoot,
+            smartNotesEnabled: config.smart_notes.enabled,
             sample: () => {
                 const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
                 return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
@@ -1431,25 +1447,6 @@ export async function registerContext(context: V2Context) {
         // A deletion that races an in-flight pass must not let that pass rebuild
         // the state just cleared by the one deletion event.
         if (deletedSessions.has(draft.sessionID)) return;
-        // Before anything below writes for this session: refuse the turn when
-        // another machine holds the session's agent. This holds in compaction-off
-        // mode too; passing the draft through would keep working on an agent this
-        // machine does not hold.
-        const claimRefusal = await checkoutClaim.refusal(draft.sessionID, directory);
-        if (claimRefusal) {
-            pushNotification(
-                "toast",
-                { message: claimRefusal.message, variant: "error" },
-                draft.sessionID,
-            );
-            await refuseBeforeProvider(
-                context.session,
-                draft.sessionID,
-                "checkout-claim-held-elsewhere",
-                claimRefusal,
-            );
-            throw new V2ContextRefusal(claimRefusal.message, { cause: claimRefusal });
-        }
         const durableProvider =
             config.transform_mode === "rust" &&
             !compactionOff &&
@@ -1512,7 +1509,12 @@ export async function registerContext(context: V2Context) {
         // grows host state without bound and a light-preset session's shortened
         // descriptions become the baseline every later request (any session,
         // any model) starts from. Registration happens once, in tools.ts.
-        applyV2PromptSurfaceTools(draft, promptSurfaceRuntime, config.prompt_surface);
+        applyV2PromptSurfaceTools(
+            draft,
+            promptSurfaceRuntime,
+            config.prompt_surface,
+            config.smart_notes.enabled,
+        );
         const admissionDb = db ?? storage.current();
         const replayFits: NonNullable<
             Parameters<typeof tryMessagesTransformLkgReplay>[0]["replayFits"]
@@ -1655,6 +1657,7 @@ export async function registerContext(context: V2Context) {
             systemPrompt ??= createSystemPromptHashHandler({
                 db,
                 dreamerEnabled: config.dreamer !== undefined && !config.dreamer.disable,
+                smartNotesEnabled: config.smart_notes.enabled,
                 memoryEnabled:
                     config.memory.enabled &&
                     !!resolveProjectIdentityForSession(directory, config.allow_home_project),
@@ -2188,24 +2191,14 @@ export async function registerContext(context: V2Context) {
     };
     await context.session.hook("context", (draft) =>
         withSqliteTransformPass(async () => {
-            const anchor = draft.messages.at(-1)?.id;
+            const anchor = generateReplayAnchor(draft.messages);
             await runManagedContext(draft);
             // The shared last-good-request slot is saved before m[0] is replaced
             // by a host checkpoint message. Save the final message array here
             // so side questions reuse the exact history handed back to the host.
-            if (
-                !compactionOff &&
-                draft.messages.some(
-                    (message) =>
-                        message.id === HEAD_IDS[0] ||
-                        message.content.some(
-                            (part) =>
-                                typeof part.text === "string" &&
-                                part.text.includes("<session-history>"),
-                        ),
-                )
-            )
-                generateReplay.capture(draft, anchor);
+            if (!compactionOff) generateReplay.capture(draft, anchor);
+            else
+                sessionLog(draft.sessionID, "generate replay capture skipped: compaction-disabled");
         }),
     );
     await context.session.hook("generate", async (draft) => {
@@ -2289,6 +2282,7 @@ export async function registerContext(context: V2Context) {
         void runManualDreamNow({
             db: runDb,
             dreamer: manualDreamer,
+            smartNotesEnabled: config.smart_notes.enabled,
             projectIdentity:
                 resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
             directory,

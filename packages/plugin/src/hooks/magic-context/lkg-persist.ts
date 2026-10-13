@@ -223,8 +223,9 @@ function slotFingerprint(slot: LkgSlot): string {
 }
 
 /**
- * Persist a slot for the session, replacing any prior row. Best-effort: callers
- * treat a failure as "this process still has the in-memory slot" and log.
+ * Persist a slot for the session, replacing any prior row. Returns false on
+ * failure; callers decide whether memory-only replay is sufficient. Pi requires
+ * a successful commit before installing the request and mirroring its identities.
  *
  * Only the prefix slices whose hash differs from the stored slice's hash are
  * written. Comparing against the stored hashes, not a hash this process
@@ -237,10 +238,12 @@ export function saveLkgSlotToDb(
     db: Database,
     sessionId: string,
     slot: LkgSlot,
-    options: { force?: boolean } = {},
+    options: { force?: boolean; publishMetadata?: () => void } | (() => void) = {},
 ): boolean {
+    const { force, publishMetadata } =
+        typeof options === "function" ? { publishMetadata: options, force: false } : options;
     const fingerprint = slotFingerprint(slot);
-    if (!options.force && persistedFingerprints.get(db)?.get(sessionId) === fingerprint)
+    if (!force && !publishMetadata && persistedFingerprints.get(db)?.get(sessionId) === fingerprint)
         return true;
     const layout = layoutLkgPrefix(slot.jsonPrefix);
     try {
@@ -327,11 +330,19 @@ export function saveLkgSlotToDb(
                       ]
                     : []),
             );
+            // Safety metadata must share the request's commit, not a later callback.
+            publishMetadata?.();
         }).immediate();
         rememberFingerprint(db, sessionId, fingerprint);
         return true;
     } catch (error) {
-        sessionLog(sessionId, "LKG snapshot persistence failed (in-memory slot retained):", error);
+        // Paired Pi publication reports its optional failure once per session/reason.
+        if (!publishMetadata)
+            sessionLog(
+                sessionId,
+                "LKG snapshot persistence failed (in-memory slot retained):",
+                error,
+            );
         return false;
     }
 }

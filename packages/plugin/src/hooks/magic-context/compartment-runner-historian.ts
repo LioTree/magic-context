@@ -564,6 +564,7 @@ async function runHistorianPrompt(args: {
     /** Resolved historian fallback chain (forwarded to the prompt helper). */
     fallbackModels?: readonly ModelInput[];
     subagentKind?: SubagentKind;
+    accountingTask?: string | null;
     parentInvocationId?: number | null;
     /**
      * Keep the child open after a successful run and hand it back as `retained`, so
@@ -608,6 +609,15 @@ async function runHistorianPrompt(args: {
     }): number | null => {
         if (invocationRecorded) return null;
         invocationRecorded = true;
+        const actualModelRef =
+            completion?.providerId && completion.modelId
+                ? `${completion.providerId}/${completion.modelId}`
+                : null;
+        const usedConfiguredFallback =
+            actualModelRef !== null &&
+            (fallbackModels ?? []).some(
+                (candidate) => toModelEntry(candidate)?.model === actualModelRef,
+            );
         return recordChildInvocation({
             db: openDatabase(),
             parentSessionId,
@@ -616,6 +626,7 @@ async function runHistorianPrompt(args: {
                 agentId === HISTORIAN_EDITOR_AGENT
                     ? "historian_editor"
                     : (subagentKind ?? "historian"),
+            task: args.accountingTask ?? (usedConfiguredFallback ? "fallback" : null),
             startedAt,
             status: params.status,
             messages: params.messages,
@@ -984,6 +995,7 @@ async function runFallbackHistorianPass(args: {
             modelOverride,
             agentId: args.agentId,
             retainChild: args.retainChild,
+            accountingTask: isSessionModelLastResort ? "fallback-session" : "fallback",
         });
         if (!fallbackRun.ok || !fallbackRun.result) {
             lastError = fallbackRun.error ?? lastError;
