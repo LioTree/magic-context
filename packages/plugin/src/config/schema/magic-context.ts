@@ -935,6 +935,7 @@ export interface MagicContextConfig {
     rust_pipeline?: "full_request" | "provider";
     /** User-only opt-in for unfinished signed-thinking trigger parking and release obligations. */
     signed_thinking_hold?: "off" | "on";
+    rust_provider_preparation?: boolean;
     /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
      *  USER config only; project configs cannot disable it. Default: true. */
     auto_update?: boolean;
@@ -1155,6 +1156,12 @@ export const MagicContextConfigSchema = z
             .default("off")
             .describe(
                 "Experimental, user-level only: park withheld signed-thinking triggers and release them on a later safe pass. Off by default; existing thinking-binding protections remain enabled.",
+            ),
+        rust_provider_preparation: z
+            .boolean()
+            .default(false)
+            .describe(
+                "Experimental, user-level only: consume revision-matched provider hook preparation; disabled by default pending byte/state and timing review.",
             ),
         auto_update: z
             .boolean()

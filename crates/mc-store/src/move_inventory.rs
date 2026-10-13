@@ -6,9 +6,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Section-inventory protocol version serialized in move manifests.
-pub const INVENTORY_VERSION: u32 = 5;
+pub const INVENTORY_VERSION: u32 = 6;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 100;
-pub const STORE_SCHEMA_VERSION: u32 = 70;
+pub const STORE_SCHEMA_VERSION: u32 = 71;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2952,6 +2952,28 @@ pub const TABLES: &[TableInventory] = &[
     ),
     // Must move: a consumed-number fence cannot be reconstructed from replayed
     // answers. All conversations sharing the number space share this history.
+    table!(
+        Module,
+        "mc_provider_policy_revisions_v1",
+        Ship,
+        RowSelector::Predicate("engine_namespace IN (SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["engine_namespace"],
+        &["engine_namespace", "revision", "session"],
+        &[],
+        Some(KeyPolicy::PreserveOrRefuseCollision),
+        None
+    ),
+    table!(
+        Module,
+        "mc_provider_policy_preparations_v1",
+        LocalReset,
+        RowSelector::Predicate("conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["conv_key"],
+        &["conv_key", "engine_namespace", "policy_revision", "settings_key", "original_baseline_json", "newest_ordinal", "prepared_blob", "uncompressed_bytes", "session"],
+        &[],
+        None,
+        None
+    ),
     table!(
         Module,
         "mc_provider_consumed_tags_v1",

@@ -95,6 +95,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 route_targets,
             )
             .with_startup_smart_notes_enabled(smart_notes_enabled)
+            .with_startup_provider_resident_enabled(
+                mc_module::config::user_provider_resident_enabled(),
+            )
             .with_log_directory(logger.logs_dir().to_path_buf()),
         ),
     )

@@ -1777,6 +1777,7 @@ export async function registerContext(context: V2Context) {
                 transformMode: config.transform_mode,
                 rustPipeline: config.rust_pipeline,
                 signedThinkingHold: config.signed_thinking_hold,
+                rustProviderPreparation: config.rust_provider_preparation,
                 rustModeModuleClient,
                 rustModeProjectRoot: directory,
                 rustMemorySyncRequestedSessions,

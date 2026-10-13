@@ -416,7 +416,7 @@ mod generation_migration_tests {
         }).unwrap();
         drop(inner);
         let store = McStore::open_for_test(&descriptor).unwrap();
-        assert_eq!(store.module_store_schema_version().unwrap(), 70);
+        assert_eq!(store.module_store_schema_version().unwrap(), 71);
         let conversation = store.load_provider_conversation(&legacy).unwrap().unwrap();
         assert_eq!(conversation.engine_namespace, "legacy-engine");
         assert!(conversation.native_pins_json.is_none());

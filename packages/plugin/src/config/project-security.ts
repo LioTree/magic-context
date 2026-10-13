@@ -377,6 +377,12 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
             "Ignoring rust_pipeline from project config (security: only user-level config may select the Rust provider pipeline).",
         );
     }
+    if ("rust_provider_preparation" in projectRaw) {
+        delete projectRaw.rust_provider_preparation;
+        warnings.push(
+            "Ignoring rust_provider_preparation from project config (security: only user-level config may enable prepared provider policy consumption).",
+        );
+    }
 
     if ("profiles" in projectRaw) {
         delete projectRaw.profiles;

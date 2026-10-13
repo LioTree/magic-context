@@ -36,6 +36,14 @@ pub mod parity_schema_manifest;
 pub mod private_permissions;
 mod provider_legacy;
 mod provider_log;
+pub mod provider_meters;
+mod provider_preparation;
+mod provider_resident_read;
+pub use provider_preparation::{
+    ProviderPreparationWrite, ProviderStoredPreparation, MAX_PROVIDER_PREPARATION_BYTES,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use provider_resident_read::ProviderResidentAuthority;
 pub mod provider_records;
 pub mod retrieval_vectors;
 pub use provider_records::ProviderSessionKey;
@@ -3279,6 +3287,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 70,
         statements: include_str!("migrations/store_070_provider_generations.sql"),
+    },
+    Migration {
+        version: 71,
+        statements: include_str!("migrations/store_071_provider_policy_revision.sql"),
     },
 ];
 

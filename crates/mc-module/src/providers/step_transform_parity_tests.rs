@@ -47,7 +47,9 @@ fn corpus_inputs(seed: u64, passes: usize, mixed_tool: &str) -> Vec<Vec<Value>> 
     }).collect()
 }
 fn fixture(dir: &Path, memory_budget: f64, temporal: bool) -> (McHandler, String) {
-    let h = super::host_tests::handler(dir);
+    let h = super::host_tests::handler(dir).with_startup_provider_resident_enabled(
+        std::env::var("MC_RESIDENT_HOOKS").as_deref() == Ok("1"),
+    );
     let mut binding = h.facade_binding(7).unwrap();
     binding.history_budget_tokens = 2_000_000.0;
     binding.config.memory_enabled = true;
@@ -1240,4 +1242,508 @@ async fn r2_published_hard_failures_and_new_seeded_switch_controls_match_full_en
                 .0;
     }
     println!("r2 HARD companion: 29 published failures plus19 NEW controls, seed=0x3e9bc027,48 passes,{comparisons} exact new-message comparisons");
+}
+
+#[cfg(test)]
+mod hookcost_review_witnesses {
+    use super::*;
+
+    fn enabled() -> bool {
+        std::env::var("MC_HOOKCOST_REVIEW").as_deref() == Ok("1")
+    }
+
+    fn covered_fixture() -> (
+        TransformRequest,
+        Vec<mc_store::provider_records::ProviderPolicyPart>,
+        Value,
+    ) {
+        let values = vec![
+            message("covered", "user", json!([{"id":"u","type":"text","text":"already summarized"}]), 1, false),
+            message("tail", "assistant", json!((0..4).map(|n| json!({"id":format!("tool-{n}"),"type":"tool","tool":"read","callID":format!("call-tail-{n}"),"state":{"status":"completed","input":{},"output":"spent payload ".repeat(30000)}})).collect::<Vec<_>>()), 2, true),
+        ];
+        let req = request(&values, false);
+        let projection = ck_wire::project_messages(&req.messages).unwrap();
+        let tags = projection
+            .blocks
+            .iter()
+            .filter_map(|b| transform::taggable_source(b).map(|(kind, source)| (b, kind, source)))
+            .enumerate()
+            .map(|(n, (b, kind, source))| McTagRow {
+                tag_number: n as i64 + 1,
+                block_id: b.id.clone(),
+                kind: kind.as_store_kind().into(),
+                token_count: mc_tokenizer::estimate_tokens(&source) as i64,
+                created_at_ms: 1,
+                source_bytes: Arc::from([]),
+            })
+            .collect::<Vec<_>>();
+        let window = crate::protection_window::ProtectionWindow::from_persisted_rows_calibrated(
+            &tags, 0, 1.0,
+        );
+        let core = mc_core::CoreState::default();
+        let measured = crate::tail_hygiene::measure_tail_hygiene_with_pending_drops(
+            &projection,
+            &core,
+            Some(1),
+            &tags,
+            &window.tag_numbers,
+            &Default::default(),
+            &Default::default(),
+        );
+        let engine_baseline = crate::tail_hygiene::refresh_tail_hygiene_baseline_calibrated(
+            measured.clone(),
+            true,
+            None,
+            1,
+            crate::tail_hygiene::HygieneCalibration {
+                units_version: 2,
+                tools_ratio: 1.0,
+                prose_ratio: 1.0,
+            },
+        )
+        .baseline;
+        let parts = transform::capture_provider_parts(
+            &req,
+            &projection,
+            &core,
+            &measured.parts,
+            &tags,
+            true,
+        );
+        let settings = transform::provider_engine_settings(&mc_store::ModuleMeta {
+            coverage_ordinal: Some(1),
+            protected_tokens_effective: Some(0),
+            tail_hygiene_baseline: Some(engine_baseline),
+            ..Default::default()
+        });
+        (req, parts, settings)
+    }
+
+    #[test]
+    fn hookcost_review_covered_tag_forces_hook_refreeze() {
+        if !enabled() {
+            return;
+        }
+        let (_, parts, settings) = covered_fixture();
+        let before = &parts
+            .iter()
+            .find(|p| p.block_id == "covered#0")
+            .unwrap()
+            .measurement;
+        let hook = transform::channel1_inputs_from_parts(
+            &parts,
+            &settings,
+            0,
+            &Default::default(),
+            false,
+            false,
+            None,
+        );
+        let after = &hook.baseline.baseline_parts[0];
+        assert_eq!(before.tokens, 0);
+        assert_eq!(before.tag_number, None);
+        assert_eq!(after.tokens, 0);
+        assert_eq!(after.tag_number, Some(1));
+        assert_eq!(
+            crate::tail_hygiene::compared_field(before, after),
+            Some("tagNumber")
+        );
+        assert_eq!(
+            hook.baseline.baseline_generation,
+            settings["baseline"]["baseline_generation"]
+                .as_u64()
+                .unwrap()
+                + 1
+        );
+        println!(
+            "covered#0: engine tag=None, hook tag=Some(1), tokens=0; baseline generation {} -> {}",
+            settings["baseline"]["baseline_generation"], hook.baseline.baseline_generation
+        );
+    }
+
+    #[test]
+    fn hookcost_review_eager_refreeze_before_append_changes_hook_bytes() {
+        if !enabled() {
+            return;
+        }
+        let (_, parts, settings) = covered_fixture();
+        let prewarm = transform::channel1_inputs_from_parts(
+            &parts,
+            &settings,
+            0,
+            &Default::default(),
+            false,
+            false,
+            None,
+        );
+        let mut warm_parts = parts.clone();
+        // Publish the measurements frozen before the next message exists.
+        // The old newest message is consequently outside this frozen prefix.
+        for measurement in &prewarm.baseline.baseline_parts {
+            let id = measurement.key.split('\0').next().unwrap();
+            warm_parts
+                .iter_mut()
+                .find(|p| p.block_id == id)
+                .unwrap()
+                .measurement = measurement.clone();
+        }
+        let mut warm_settings = settings.clone();
+        let mut baseline = prewarm.baseline.clone();
+        baseline.baseline_parts.clear();
+        warm_settings["baseline"] = serde_json::to_value(baseline).unwrap();
+        warm_settings["baseline_len"] = json!(prewarm.baseline.baseline_parts.len());
+        let next_req = request(
+            &[message(
+                "next",
+                "assistant",
+                json!([{"id":"next-tool","type":"tool","tool":"read","callID":"call-next","state":{"status":"completed","input":{},"output":"new output"}}]),
+                3,
+                true,
+            )],
+            false,
+        );
+        let mut next_req = next_req;
+        next_req.messages[0].ordinal = 3;
+        let projection = ck_wire::project_messages(&next_req.messages).unwrap();
+        let mut next = admission_policy_parts(&next_req, &projection);
+        for p in &mut next {
+            if p.tag_kind.is_some() {
+                p.tag_number = Some(6);
+            }
+        }
+        let mut cold_parts = parts;
+        cold_parts.extend(next.clone());
+        warm_parts.extend(next);
+        let cold = transform::channel1_inputs_from_parts(
+            &cold_parts,
+            &settings,
+            0,
+            &Default::default(),
+            true,
+            false,
+            None,
+        );
+        let warm = transform::channel1_inputs_from_parts(
+            &warm_parts,
+            &warm_settings,
+            0,
+            &Default::default(),
+            true,
+            false,
+            None,
+        );
+        assert_eq!(
+            crate::tail_hygiene::effective_tail_hygiene(&cold.baseline),
+            crate::tail_hygiene::effective_tail_hygiene(&warm.baseline)
+        );
+        assert_eq!(cold.baseline.baseline_parts.len(), 9);
+        assert_eq!(warm.baseline.baseline_parts.len(), 1);
+        assert_eq!(cold.tool_outputs, 1);
+        assert_eq!(warm.tool_outputs, 0);
+        let cold_ops = host_channel1(&cold, &json!({})).0;
+        let warm_ops = host_channel1(&warm, &json!({})).0;
+        assert!(!cold_ops.is_empty());
+        assert!(!warm_ops.is_empty());
+        assert_ne!(
+            serde_json::to_vec(&cold_ops).unwrap(),
+            serde_json::to_vec(&warm_ops).unwrap()
+        );
+        println!("before next message: prewarm baseline_len=1; after next message: cold baseline_len=9, warm baseline_len=1; reclaimable tool outputs cold=1 warm=0; equal effective totals but different channel-1 append bytes");
+    }
+
+    #[test]
+    fn prepared_refreeze_finalizes_the_exact_r1_admitted_cut() {
+        prepared_cut_case("match");
+    }
+
+    fn prepared_cut_case(change: &str) {
+        let (_, parts, settings) = covered_fixture();
+        let root = std::env::temp_dir().join("magic-context/prepared-r1");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let mut store =
+            mc_store::McStore::open_for_test(&crate::test_support::descriptor(dir.path())).unwrap();
+        let key = mc_store::ProviderSessionKey {
+            project_root: "/fixture".into(),
+            session: "session".into(),
+            harness: "opencode".into(),
+            generation: None,
+        };
+        store.save_provider_conversation(&key, &mc_store::provider_records::ProviderConversation {
+            lineage_id: "L".into(), engine_namespace: "engine".into(), cursor_frontier: 3,
+            hook_counters_json: json!({"engine_policy":settings,"tag_high_water":5,"reserved_tag_high_water":5}).to_string(),
+            ..Default::default()
+        }).unwrap();
+        let sql = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+        sql.execute(
+            "INSERT INTO mc_provider_lineages_v1 VALUES (?1,'L',1,NULL,NULL,'session')",
+            [key.conversation_key()],
+        )
+        .unwrap();
+        for part in &parts {
+            sql.execute(
+                "INSERT INTO mc_provider_policy_parts_v1 VALUES (?1,'L',?2,?3,?4,'session')",
+                rusqlite::params![
+                    key.conversation_key(),
+                    part.ordinal,
+                    part.block_id,
+                    serde_json::to_string(part).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        let before = store
+            .load_provider_conversation(&key)
+            .unwrap()
+            .unwrap()
+            .hook_counters_json;
+        assert!(store
+            .prepare_provider_policy(&key, |index, counters| {
+                super::super::super::policy_summary::prepare_policy(
+                    index,
+                    &counters["engine_policy"],
+                    0,
+                    &Default::default(),
+                    None,
+                )
+            })
+            .unwrap());
+        assert_eq!(
+            store
+                .load_provider_conversation(&key)
+                .unwrap()
+                .unwrap()
+                .hook_counters_json,
+            before,
+            "preparation must not publish the earlier baseline"
+        );
+        match change {
+            "sibling" => {
+                let sibling = mc_store::ProviderSessionKey {
+                    harness: "opencode2".into(),
+                    ..key.clone()
+                };
+                store
+                    .save_provider_conversation(
+                        &sibling,
+                        &mc_store::provider_records::ProviderConversation {
+                            engine_namespace: "engine".into(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            "shared_tag" => {
+                sql.execute(
+                    "INSERT INTO mc_provider_consumed_tags_v1 VALUES ('engine',2,'session')",
+                    [],
+                )
+                .unwrap();
+            }
+            "covered_tag" => {
+                sql.execute("UPDATE mc_provider_policy_parts_v1 SET policy_json=json_set(policy_json,'$.tag_number',77) WHERE block_id='covered#0'", []).unwrap();
+            }
+            "settings" => {
+                sql.execute("UPDATE mc_provider_conversations_v2 SET hook_counters_json=json_set(hook_counters_json,'$.engine_policy.prose_ratio',2.0)", []).unwrap();
+            }
+            "key" => {
+                sql.execute(
+                    "UPDATE mc_provider_policy_preparations_v1 SET settings_key='unsupported'",
+                    [],
+                )
+                .unwrap();
+            }
+            "baseline" => {
+                sql.execute(
+                    "UPDATE mc_provider_policy_preparations_v1 SET original_baseline_json='null'",
+                    [],
+                )
+                .unwrap();
+            }
+            "cut" => {
+                sql.execute(
+                    "UPDATE mc_provider_policy_preparations_v1 SET newest_ordinal=99",
+                    [],
+                )
+                .unwrap();
+            }
+            "cap" => {
+                sql.execute(
+                    "UPDATE mc_provider_policy_preparations_v1 SET uncompressed_bytes=?1",
+                    [mc_store::MAX_PROVIDER_PREPARATION_BYTES as u64 + 1],
+                )
+                .unwrap();
+            }
+            "checksum" => {
+                sql.execute(
+                    "UPDATE mc_provider_policy_preparations_v1 SET prepared_blob=x'00'",
+                    [],
+                )
+                .unwrap();
+            }
+            "evicted" => {
+                sql.execute("DELETE FROM mc_provider_policy_preparations_v1", [])
+                    .unwrap();
+            }
+            "restart" => {
+                drop(store);
+                store =
+                    mc_store::McStore::open_for_test(&crate::test_support::descriptor(dir.path()))
+                        .unwrap();
+            }
+            "ancestry" => {
+                sql.execute(
+                    "INSERT INTO mc_provider_lineages_v1 VALUES (?1,'child',3,'L',1,'session')",
+                    [key.conversation_key()],
+                )
+                .unwrap();
+                sql.execute(
+                    "UPDATE mc_provider_conversations_v2 SET lineage_id='child'",
+                    [],
+                )
+                .unwrap();
+            }
+            "match" | "off" | "cache_bust" | "same_cut" => {}
+            _ => panic!("unknown preparation case {change}"),
+        }
+        let mut next_req = request(
+            &[message(
+                "next",
+                "assistant",
+                json!([{"id":"next-tool","type":"tool","tool":"read","callID":"call-next","state":{"status":"completed","input":{},"output":"new output"}}]),
+                3,
+                true,
+            )],
+            false,
+        );
+        next_req.messages[0].ordinal = 3;
+        let projection = ck_wire::project_messages(&next_req.messages).unwrap();
+        let mut next = admission_policy_parts(&next_req, &projection);
+        for part in &mut next {
+            if part.tag_kind.is_some() {
+                part.tag_number = Some(6);
+            }
+        }
+        let mut cold_parts = parts.clone();
+        cold_parts.extend(next.clone());
+        let cold_r1 = transform::channel1_inputs_from_parts(
+            &cold_parts,
+            &settings,
+            0,
+            &Default::default(),
+            true,
+            false,
+            None,
+        );
+        let lineage = mc_store::provider_records::ProviderLineage {
+            lineage_id: if change == "ancestry" { "child" } else { "L" }.into(),
+            first_ordinal: if change == "ancestry" { 3 } else { 1 },
+            descends_from: (change == "ancestry").then(|| "L".into()),
+            through_ordinal: (change == "ancestry").then_some(1),
+        };
+        let incoming = mc_store::provider_records::ProviderMessage {
+            ordinal: if change == "same_cut" { 2 } else { 3 },
+            mid: "next".into(),
+            message_bytes: b"{}".to_vec(),
+        };
+        if change == "same_cut" {
+            for part in &mut next {
+                part.ordinal = 2;
+            }
+        }
+        let (warm, cold) = store.commit_provider_hook_with_preparation(&key, mc_store::provider_records::ProviderHookRequest { lineage:&lineage,message:Some(&incoming),served_through_ordinal:Some(2),unserved_subjects:&[],repeat_subject:None }, &next,change != "off",|ctx| {
+            let cold = transform::channel1_inputs_from_parts(&ctx.policy_index.all_parts()?, &ctx.counters["engine_policy"], 0, &Default::default(), true, change == "cache_bust", None);
+            let (inputs,summary) = super::super::super::policy_summary::channel1_inputs(&ctx.policy_index,&ctx.counters["engine_policy"],0,&Default::default(),true,change == "cache_bust",None)?;
+            assert_eq!(ctx.policy_index.preparation_was_consumed(), matches!(change, "match" | "restart"), "{change}: mismatch must use the cold path; a valid R1 preparation must actually be consumed");
+            let mut counters = ctx.counters.clone();
+            counters["policy_baseline_updates"] = json!(inputs.baseline.baseline_parts.iter().map(|measurement| json!({"block_id":measurement.key.split('\0').next().unwrap(),"measurement":measurement})).collect::<Vec<_>>());
+            let mut baseline=inputs.baseline.clone();baseline.baseline_parts.clear();
+            counters["engine_policy"]["baseline"]=serde_json::to_value(baseline).unwrap();
+            counters["engine_policy"]["baseline_len"]=json!(inputs.baseline.baseline_parts.len());
+            Ok((mc_store::provider_records::ProviderHookWrite { answer:None,counters,policy_summary:summary },(inputs,cold)))
+        }).unwrap();
+        if matches!(change, "match" | "restart") {
+            assert_eq!(warm.baseline.baseline_parts.len(), 9);
+            assert_eq!(warm.tool_outputs, 1);
+            assert_eq!(
+                serde_json::to_vec(&warm.baseline).unwrap(),
+                serde_json::to_vec(&cold_r1.baseline).unwrap()
+            );
+        }
+        assert_eq!(
+            serde_json::to_vec(&warm.baseline).unwrap(),
+            serde_json::to_vec(&cold.baseline).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&host_channel1(&warm, &json!({})).0).unwrap(),
+            serde_json::to_vec(&host_channel1(&cold, &json!({})).0).unwrap()
+        );
+        assert_eq!(warm.users, cold.users);
+        assert_eq!(warm.tool_outputs, cold.tool_outputs);
+        assert_eq!(
+            serde_json::to_vec(&warm.hint).unwrap(),
+            serde_json::to_vec(&cold.hint).unwrap()
+        );
+    }
+
+    #[test]
+    fn prepared_policy_sibling_revision_mismatch_uses_cold_bytes() {
+        prepared_cut_case("sibling");
+    }
+    #[test]
+    fn prepared_policy_shared_consumed_tag_uses_cold_bytes() {
+        prepared_cut_case("shared_tag");
+    }
+    #[test]
+    fn prepared_policy_covered_tag_change_uses_cold_bytes() {
+        prepared_cut_case("covered_tag");
+    }
+    #[test]
+    fn prepared_policy_settings_revision_mismatch_uses_cold_bytes() {
+        prepared_cut_case("settings");
+    }
+    #[test]
+    fn prepared_policy_invalid_key_uses_cold_bytes() {
+        prepared_cut_case("key");
+    }
+    #[test]
+    fn prepared_policy_original_baseline_mismatch_uses_cold_bytes() {
+        prepared_cut_case("baseline");
+    }
+    #[test]
+    fn prepared_policy_cut_mismatch_uses_cold_bytes() {
+        prepared_cut_case("cut");
+    }
+    #[test]
+    fn prepared_policy_byte_cap_uses_cold_bytes() {
+        prepared_cut_case("cap");
+    }
+    #[test]
+    fn prepared_policy_corrupt_checksum_uses_cold_bytes() {
+        prepared_cut_case("checksum");
+    }
+    #[test]
+    fn prepared_policy_evicted_uses_cold_bytes() {
+        prepared_cut_case("evicted");
+    }
+    #[test]
+    fn prepared_policy_restart_retains_revision_checked_bytes() {
+        prepared_cut_case("restart");
+    }
+    #[test]
+    fn prepared_policy_disabled_uses_cold_bytes() {
+        prepared_cut_case("off");
+    }
+    #[test]
+    fn prepared_policy_cache_bust_uses_cold_bytes() {
+        prepared_cut_case("cache_bust");
+    }
+    #[test]
+    fn prepared_policy_ancestry_change_uses_cold_bytes() {
+        prepared_cut_case("ancestry");
+    }
+    #[test]
+    fn prepared_policy_unadvanced_cut_uses_cold_bytes() {
+        prepared_cut_case("same_cut");
+    }
 }

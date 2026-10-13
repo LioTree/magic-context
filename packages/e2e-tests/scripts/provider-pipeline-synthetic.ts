@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { Database } from "bun:sqlite";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 import { updateSessionMeta } from "../../plugin/src/features/magic-context/storage-meta";
 import { setLogLineForwarder } from "../../plugin/src/shared/logger";
 import { percentile } from "../../plugin/scripts/perf-audit/provider-pipeline-gate";
@@ -13,8 +15,9 @@ export async function syntheticReplay(count = 17000, samples = 20) {
     // checked against a full recomputation. Timing runs measure the replay alone;
     // the differential runs keep that check.
     process.env.MC_POLICY_SUMMARY_SKIP_FULL_CHECK = "1";
-    const root = resolve(import.meta.dir, "../../..");
-    const work = join(root, "target/provider-pipeline-driver");
+    const scratch = join(tmpdir(), "magic-context", "provider-performance");
+    mkdirSync(scratch, { recursive: true });
+    const work = mkdtempSync(join(scratch, "run-"));
     mkdirSync(join(work, "synthetic"), { recursive: true });
     const driver = new Driver(buildDriver(work), join(work, "synthetic"));
     const logs: string[] = [];
@@ -26,6 +29,12 @@ export async function syntheticReplay(count = 17000, samples = 20) {
             rmSync(directory, { recursive: true, force: true });
             const f = await fixture(driver, host, directory);
             try {
+                const openFiles = spawnSync("lsof", ["-p", `${process.pid},${driver.pid}`, "-Fn"], { encoding: "utf8" });
+                assert.equal(openFiles.status, 0, `lsof must prove fixture isolation: ${openFiles.stderr}`);
+                const stores = openFiles.stdout.split("\n").filter(line => line.startsWith("n") && /\.db(?:-wal|-shm)?$/.test(line));
+                assert.ok(stores.length > 0, "lsof must observe open fixture stores");
+                assert.ok(stores.every(line => line.slice(1).startsWith(`${work}/`)), `non-fixture store opened: ${stores.join("\n")}`);
+                console.error(`PROVIDER_ISOLATION ${JSON.stringify({ work, host, stores })}`);
                 updateSessionMeta(f.db, "session", { lastUsageContextLimit: 4000000 });
                 // Five-message cycles: one user, three tool-bearing assistants and
                 // one final assistant. Each tool message has text and two results.
@@ -119,6 +128,7 @@ export async function syntheticReplay(count = 17000, samples = 20) {
                         assert.equal(f.fallbacks.length, 0, "rebuild sample cannot silently fall back");
                         assert.deepEqual([...answer.messages], expected, "paired rebuild must match the full-request output");
                         rebuild.push(answer.pass_ms);
+                        console.log(`SYNTHETIC_REBUILD_SAMPLE=${JSON.stringify({ host, sample: n, full_ms: full.at(-1), provider_ms: answer.pass_ms, byte_parity: true })}`);
                     } finally { await driver.send({ op: "drop", rig }); }
                 }
                 const summary = (values: number[]) => ({ samples: values.length, p50_ms: percentile(values, .5), p95_ms: percentile(values, .95) });
@@ -126,6 +136,8 @@ export async function syntheticReplay(count = 17000, samples = 20) {
                     ordinary: summary(ordinary), hook_round_trip: summary(hookRoundTrips), full_request_engine_and_codec: summary(full),
                     provider_rebuild: rebuildBlocked ? null : summary(rebuild), rebuild_blocked: rebuildBlocked ?? null,
                     rebuild_vs_full_ratio: rebuildBlocked ? null : percentile(rebuild, .5) / percentile(full, .5) });
+                // Keep completed-binding evidence even if a later binding refuses a turn.
+                console.log(`SYNTHETIC_LANE_RESULT=${JSON.stringify(lanes.at(-1))}`);
                 await f.noReads();
             } finally { await f.close(); }
         }

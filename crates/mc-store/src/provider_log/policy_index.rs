@@ -31,6 +31,8 @@ pub struct ProviderPolicyIndex<'c> {
     /// legacy empty lineage.
     ancestry: Vec<(String, u64)>,
     rows_read: Cell<u64>,
+    preparation: Option<crate::ProviderStoredPreparation>,
+    preparation_consumed: Cell<bool>,
 }
 
 const PART_COLUMNS: &str = "p.lineage_id,p.ordinal,p.policy_json,EXISTS(SELECT 1 FROM mc_provider_consumed_tags_v1 t JOIN mc_provider_conversations_v2 c ON c.engine_namespace=t.engine_namespace WHERE c.conv_key=p.conv_key AND t.tag_number=json_extract(p.policy_json,'$.tag_number'))";
@@ -52,7 +54,7 @@ impl<'c> ProviderPolicyIndex<'c> {
             .query_row(
                 "SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE conv_key=?1",
                 [conv],
-                |r| r.get(0),
+                |r| crate::provider_meters::read_row(|| r.get(0)),
             )
             .optional()?
             .unwrap_or_default();
@@ -62,7 +64,26 @@ impl<'c> ProviderPolicyIndex<'c> {
             namespace,
             ancestry,
             rows_read: Cell::new(0),
+            preparation: None,
+            preparation_consumed: Cell::new(false),
         })
+    }
+
+    pub(crate) fn with_preparation(
+        mut self,
+        prepared: Option<crate::ProviderStoredPreparation>,
+    ) -> Self {
+        self.preparation = prepared;
+        self
+    }
+    pub fn preparation(&self) -> Option<&crate::ProviderStoredPreparation> {
+        self.preparation.as_ref()
+    }
+    pub fn mark_preparation_consumed(&self) {
+        self.preparation_consumed.set(true);
+    }
+    pub fn preparation_was_consumed(&self) -> bool {
+        self.preparation_consumed.get()
     }
 
     /// Leaf first: each lineage and the highest ordinal it contributes, ending
@@ -94,11 +115,7 @@ impl<'c> ProviderPolicyIndex<'c> {
     /// Whether a nearer lineage than `depth` holds its own row for the block.
     fn shadowed(&self, depth: usize, block_id: &str) -> rusqlite::Result<bool> {
         for (lineage, _) in &self.ancestry[..depth] {
-            let held: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND block_id=?3)",
-                params![self.conv, lineage, block_id],
-                |r| r.get(0),
-            )?;
+            let held: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND block_id=?3)", params![self.conv, lineage, block_id], |r| crate::provider_meters::read_row(|| r.get(0)))?;
             self.count(1);
             if held {
                 return Ok(true);
@@ -144,12 +161,14 @@ impl<'c> ProviderPolicyIndex<'c> {
         ))?;
         let rows = q
             .query_map(parameters, |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, u64>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, bool>(3)?,
-                ))
+                crate::provider_meters::read_row(|| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, u64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, bool>(3)?,
+                    ))
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         self.count(rows.len());
@@ -173,7 +192,11 @@ impl<'c> ProviderPolicyIndex<'c> {
             let rows = q
                 .query_map(
                     params![self.conv, lineage, as_i64((*cut).min(i64::MAX as u64))?],
-                    |r| Ok((r.get::<_, String>(2)?, r.get::<_, bool>(3)?)),
+                    |r| {
+                        crate::provider_meters::read_row(|| {
+                            Ok((r.get::<_, String>(2)?, r.get::<_, bool>(3)?))
+                        })
+                    },
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             self.count(rows.len());
@@ -201,7 +224,7 @@ impl<'c> ProviderPolicyIndex<'c> {
             .query_row(
                 "SELECT summary_json FROM mc_provider_policy_summaries_v1 WHERE conv_key=?1",
                 [&self.conv],
-                |r| r.get(0),
+                |r| crate::provider_meters::read_row(|| r.get(0)),
             )
             .optional()?)
     }
@@ -212,15 +235,17 @@ impl<'c> ProviderPolicyIndex<'c> {
         let mut q = self.conn.prepare_cached(&format!("SELECT d.lineage_id,d.block_id,d.previous_json,d.previous_consumed,p.ordinal,p.policy_json,EXISTS(SELECT 1 FROM mc_provider_consumed_tags_v1 t JOIN mc_provider_conversations_v2 c ON c.engine_namespace=t.engine_namespace WHERE c.conv_key=d.conv_key AND t.tag_number=json_extract(p.policy_json,'$.tag_number')) FROM mc_provider_policy_changes_v1 d LEFT JOIN mc_provider_policy_parts_v1 p ON p.conv_key=d.conv_key AND p.lineage_id=d.lineage_id AND p.block_id=d.block_id WHERE d.conv_key=?1 LIMIT {}", cap + 1))?;
         let rows = q
             .query_map([&self.conv], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, bool>(3)?,
-                    r.get::<_, Option<u64>>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, bool>(6)?,
-                ))
+                crate::provider_meters::read_row(|| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, bool>(3)?,
+                        r.get::<_, Option<u64>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, bool>(6)?,
+                    ))
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         self.count(rows.len());
@@ -256,11 +281,7 @@ impl<'c> ProviderPolicyIndex<'c> {
             let mut shadows = false;
             if previous.is_none() && current.is_some() {
                 for (older, _) in &self.ancestry[depth + 1..] {
-                    let held: bool = self.conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND block_id=?3)",
-                        params![self.conv, older, block_id],
-                        |r| r.get(0),
-                    )?;
+                    let held: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND block_id=?3)", params![self.conv, older, block_id], |r| crate::provider_meters::read_row(|| r.get(0)))?;
                     self.count(1);
                     shadows |= held;
                 }
@@ -364,6 +385,7 @@ impl<'c> ProviderPolicyIndex<'c> {
             let mut q = self.conn.prepare_cached(&format!("SELECT {PART_COLUMNS} FROM mc_provider_policy_parts_v1 p WHERE p.conv_key=?1 AND p.lineage_id=?2 AND p.ordinal<?3 ORDER BY p.ordinal DESC"))?;
             let mut rows = q.query(params![self.conv, lineage, as_i64(below)?])?;
             while let Some(row) = rows.next()? {
+                crate::provider_meters::read_row(|| ());
                 self.count(1);
                 let row_ordinal: u64 = row.get(1)?;
                 if best.as_ref().is_some_and(|b| b.ordinal > row_ordinal) {
@@ -409,6 +431,10 @@ pub(crate) fn save_policy_summary_tx(
 /// Drop a summary so the next hook rebuilds it; used before bulk rewrites so
 /// the change triggers record nothing.
 pub(crate) fn drop_policy_summary_tx(conn: &Connection, conv: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM mc_provider_policy_preparations_v1 WHERE conv_key=?1",
+        [conv],
+    )?;
     conn.execute(
         "DELETE FROM mc_provider_policy_summaries_v1 WHERE conv_key=?1",
         [conv],

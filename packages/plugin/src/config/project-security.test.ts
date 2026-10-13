@@ -477,3 +477,15 @@ it("signed_thinking_hold is off by default and cannot be changed by a project", 
         ).toBe("on");
     }
 });
+
+it("a project cannot enable prepared provider policy consumption", () => {
+    const raw: Record<string, unknown> = {
+        rust_provider_preparation: true,
+        transform_mode: "rust",
+    };
+    const warnings = stripUnsafeProjectConfigFields(raw);
+    expect(raw).toEqual({ transform_mode: "rust" });
+    expect(warnings).toEqual([
+        "Ignoring rust_provider_preparation from project config (security: only user-level config may enable prepared provider policy consumption).",
+    ]);
+});

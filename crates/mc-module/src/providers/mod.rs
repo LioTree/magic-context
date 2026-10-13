@@ -24,6 +24,9 @@ mod native_plan;
 mod native_view;
 mod policy_summary;
 mod records;
+#[cfg(test)]
+pub(crate) mod resident;
+pub(crate) mod resident_hooks;
 mod step_transform;
 #[cfg(test)]
 mod tests;
@@ -242,6 +245,38 @@ impl McHandler {
         method: &str,
         params: &Value,
     ) -> HandlerOutcome {
+        let started = Instant::now();
+        let hook_count = u64::from(method == "transform.hook");
+        let result = self
+            .handle_provider_value_inner(channel, method, params)
+            .await;
+        let (response_bytes, outcome) = match &result {
+            HandlerOutcome::Response(bytes) => (bytes.len(), "response"),
+            _ => (0, "refused"),
+        };
+        tracing::info!(
+            session_id = params.get("session").and_then(|v| v.as_str()).unwrap_or(""),
+            harness = params.get("harness").and_then(|v| v.as_str()).unwrap_or(""),
+            request_id = params
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            method,
+            hook_count,
+            response_bytes,
+            outcome,
+            module_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "provider module complete"
+        );
+        result
+    }
+
+    async fn handle_provider_value_inner(
+        &self,
+        channel: u16,
+        method: &str,
+        params: &Value,
+    ) -> HandlerOutcome {
         let mut binding = match self.facade_binding(channel) {
             Ok(binding) => binding,
             Err(_) => {
@@ -301,6 +336,24 @@ impl McHandler {
                         field,
                         "provider call does not match its bound conversation",
                     );
+                }
+            }
+            if method == "transform.hook" && self.provider_resident.is_enabled() {
+                if let (Some(store), Some(session), Some(harness)) = (
+                    self.store.get(),
+                    params.get("session").and_then(Value::as_str),
+                    params.get("harness").and_then(Value::as_str),
+                ) {
+                    if let Ok(key) = Key::new(&binding, session, harness) {
+                        if self
+                            .provider_resident
+                            .is_building(store.tag_cache_namespace(), &key)
+                        {
+                            return transient(
+                                "resident_not_ready: session rebuild or admission in progress",
+                            );
+                        }
+                    }
                 }
             }
             if attested_claude_code(&binding) {

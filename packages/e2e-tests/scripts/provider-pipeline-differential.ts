@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import {
     existsSync,
     mkdirSync,
+    mkdtempSync,
     readFileSync,
     readdirSync,
     rmSync,
@@ -23,6 +24,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createScheduler } from "../../plugin/src/features/magic-context/scheduler";
 import { runMigrations } from "../../plugin/src/features/magic-context/migrations";
@@ -69,6 +71,7 @@ const DRIVER = String.raw`
 #[test]
 fn provider_pipeline_driver() {
     use std::io::{BufRead, Write};
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).try_init();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         #[derive(Default)]
@@ -88,6 +91,12 @@ fn provider_pipeline_driver() {
             binding: SessionBinding,
             reads: Arc<ReadTrap>,
             namespaces: HashMap<String,u16>,
+            resident_enabled: bool,
+        }
+        fn scheduler_wait_ms() -> f64 {
+            std::fs::read_to_string("/proc/thread-self/schedstat").ok()
+                .and_then(|raw| raw.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .unwrap_or(0) as f64 / 1_000_000.0
         }
         let mut rigs: HashMap<String, Rig> = HashMap::new();
         for line in std::io::stdin().lock().lines() {
@@ -103,7 +112,7 @@ fn provider_pipeline_driver() {
                 json!({"armed":true})
             } else if op == "create" {
                 let config = McModuleConfig {
-                    inject_docs: false, memory_enabled: false, temporal_awareness: false,
+                    inject_docs: false, memory_enabled: cmd["memory_enabled"] == true, temporal_awareness: false,
                     protected_tokens_user: Some(0), protected_tools: if cmd["protect_bash"] == true {BTreeMap::from([("bash".into(),2)])} else {BTreeMap::new()},
                     execute_threshold_percentage: 90.0, cache_ttl: "never".into(),
                     ..default_test_config()
@@ -111,14 +120,17 @@ fn provider_pipeline_driver() {
                 let dir = if cmd["directory"].is_string() {None} else {Some(tempfile::tempdir().unwrap())};
                 let root = cmd["directory"].as_str().map(PathBuf::from).unwrap_or_else(||dir.as_ref().unwrap().path().into());
                 std::fs::create_dir_all(&root).unwrap();
-                let project = root.join("project");
+                 let project = cmd["project_root"].as_str().map(PathBuf::from).unwrap_or_else(||root.join("project"));
                 std::fs::create_dir_all(&project).unwrap();
                 let store = Arc::new(McStore::open_for_test(&crate::test_support::descriptor(&root)).unwrap());
+                let resident_enabled = cmd["resident_enabled"].as_bool().unwrap_or_else(|| std::env::var("MC_RESIDENT_HOOKS").as_deref() == Ok("1"));
                 let mut handler = McHandler::with_producer_factory_config_resolver(
                     Arc::new(TestProducerFactory {state:Arc::new(ProducerState::default())}),
-                    config.clone(), Arc::new(MissingSessionResolver));
+                    config.clone(), Arc::new(MissingSessionResolver))
+                    .with_startup_provider_resident_enabled(resident_enabled);
                 handler.store.set(store.clone()).ok().unwrap();
                 let binding = SessionBinding {
+                    connection_incarnation: 0, native_generation: None, principal: None,
                     project_root: project, harness: cmd["harness"].as_str().unwrap().into(),
                     session: "session".into(), model_key: None, config,
                     history_budget_tokens: 100000.0,
@@ -128,7 +140,7 @@ fn provider_pipeline_driver() {
                 let reads = Arc::new(ReadTrap::default());
                 handler.provider_runner = reads.clone();
                 let sql = rusqlite::Connection::open(root.join("store.db")).unwrap();
-                rigs.insert(name.into(), Rig {handler, store, sql, _dir: dir, binding, reads, namespaces:HashMap::new()});
+                rigs.insert(name.into(), Rig {handler, store, sql, _dir: dir, binding, reads, namespaces:HashMap::new(), resident_enabled});
                 json!({"created": true})
             } else {
                 let rig = rigs.get_mut(name).expect("created rig");
@@ -148,6 +160,33 @@ fn provider_pipeline_driver() {
                         },
                         "delete" => { rig.store.replace_compartments(namespace, &[]).unwrap(); },
                         "flush" => { rig.store.arm_soft_refresh(namespace).unwrap(); },
+                        "realistic_seed" => {
+                            let covered = cmd["covered"].as_i64().unwrap();
+                            let count = cmd["compartments"].as_i64().unwrap();
+                            let rows = (0..count).map(|i| {
+                                let start = i * covered / count + 1;
+                                let end = (i + 1) * covered / count;
+                                StoredCompartment { sequence: i + 1, start_message: start, end_message: end,
+                                    end_message_id: format!("synthetic-{}#0", end - 1),
+                                    title: format!("Fixture compartment {i}"),
+                                    content: format!("Completed investigation {i}: preserve the exact compartment ordering."),
+                                    p1: Some(format!("Investigation {i} complete.")), importance: 50,
+                                    ..Default::default() }
+                            }).collect::<Vec<_>>();
+                            rig.store.replace_compartments(namespace, &rows).unwrap();
+                            for i in 1..=cmd["memories"].as_i64().unwrap() {
+                                rig.store.seed_memory(i, rig.binding.project_root.to_str().unwrap(), "project",
+                                    &format!("Fixture memory {i}: independently preserve memory ordering."), 50).unwrap();
+                            }
+                        },
+                        "realistic_delta" => {
+                            let mut rows = rig.store.load_compartments(namespace).unwrap();
+                            let sample = cmd["sample"].as_u64().unwrap();
+                            let at = sample as usize % rows.len();
+                            rows[at].content.push_str(&format!(" Delta {sample}."));
+                            if let Some(p1) = &mut rows[at].p1 { p1.push_str(&format!(" Delta {sample}.")); }
+                            rig.store.replace_compartments(namespace, &rows).unwrap();
+                        },
                         "historian_start" | "historian_idle" => {
                             let mut loaded = rig.store.load(namespace).unwrap();
                             loaded.meta.historian.state = if cmd["event"] == "historian_start" {
@@ -163,8 +202,90 @@ fn provider_pipeline_driver() {
                         other => panic!("unknown event {other}"),
                     }
                     json!({"changed":true})
+                 } else if op == "settle" {
+                     tokio::task::yield_now().await;
+                     json!({"settled":true})
                 } else if op == "reads" {
                     json!(rig.reads.0.load(Ordering::SeqCst))
+                } else if op == "resident_stats" {
+                    rig.handler.provider_resident.stats()
+                } else if op == "resident_slow_once" {
+                    std::env::set_var("MC_RESIDENT_SLOW_REBUILD", "1");
+                    json!({"armed":true})
+                } else if op == "resident_clear_slow" {
+                    std::env::remove_var("MC_RESIDENT_SLOW_REBUILD");
+                    json!({"cleared":true})
+                } else if op == "resident_lean_load" {
+                    let original = mc_store::ProviderSessionKey { project_root:rig.binding.project_root.to_string_lossy().into(), session:"session".into(), harness:rig.binding.harness.clone(), generation:None };
+                    let conversation = rig.store.load_provider_conversation(&original).unwrap().unwrap();
+                    let from = rig.handler.provider_resident.stats()["sessions"].as_u64().unwrap();
+                    for n in from..cmd["sessions"].as_u64().unwrap() {
+                        let mut key = original.clone(); key.session = format!("lean-{n}");
+                        rig.store.save_provider_conversation(&key, &conversation).unwrap();
+                        let conv = key.conversation_key();
+                        let tx = rig.sql.transaction().unwrap();
+                        tx.execute("INSERT INTO mc_provider_lineages_v1 SELECT ?1,lineage_id,first_ordinal,descends_from,through_ordinal,?2 FROM mc_provider_lineages_v1 WHERE conv_key=?3", rusqlite::params![conv,key.session,original.conversation_key()]).unwrap();
+                        tx.execute("INSERT INTO mc_provider_policy_parts_v1 SELECT ?1,lineage_id,ordinal,block_id,policy_json,?2 FROM mc_provider_policy_parts_v1 WHERE conv_key=?3", rusqlite::params![conv,key.session,original.conversation_key()]).unwrap();
+                        tx.execute("INSERT INTO mc_provider_policy_summaries_v1 SELECT ?1,summary_json,?2 FROM mc_provider_policy_summaries_v1 WHERE conv_key=?3", rusqlite::params![conv,key.session,original.conversation_key()]).unwrap();
+                        tx.commit().unwrap();
+                        mc_tokenizer::estimate_tokens("resident tokenizer warmup");
+                        rig.handler.provider_resident.load_for_test(&rig.store, &key);
+                    }
+                    rig.handler.provider_resident.stats()
+                } else if op == "resident" {
+                    let key = mc_store::ProviderSessionKey { project_root: rig.binding.project_root.to_string_lossy().into(), session: "session".into(), harness: rig.binding.harness.clone(), generation: None };
+                    let authority = rig.store.read_provider_resident_authority(&key, 100000, 500, 128*1024*1024).unwrap();
+                    let namespace = &authority.conversation.engine_namespace;
+                    let loaded = rig.store.load(namespace).unwrap();
+                    let membership = rig.store.resolve_workspace_membership(key.project_root.as_str()).unwrap();
+                    let memory = rig.store.load_memory_render_snapshot(key.project_root.as_str(), membership.as_ref(), loaded.meta.expiry_cutoff_ms).unwrap();
+                    let scores = rig.store.load_compartment_score_snapshot(namespace, mc_store::ScoreSelector::Latest).unwrap();
+                    let tags = rig.store.load_tags_for_session(namespace).unwrap();
+                    let answers = rig.store.load_provider_hook_answers(&key).unwrap();
+                    let domains = json!({"engine":{"row_version":loaded.row_version,"core":loaded.core,"meta":loaded.meta},
+                        "tags":tags.iter().map(|tag|json!({"number":tag.tag_number,"block_id":tag.block_id,"kind":tag.kind,"tokens":tag.token_count,"created_at_ms":tag.created_at_ms,"source_bytes":tag.source_bytes.as_ref()})).collect::<Vec<_>>(),
+                        "memory":{"memories":memory.memories,"revisions":memory.revisions,"fragment_watermark":memory.fragment_watermark,
+                            "project_paths":memory.revision.project_paths,"reader_project_path":memory.revision.reader_project_path,"expiry_cutoff_ms":memory.revision.expiry_cutoff_ms,"max_memory_id":memory.revision.max_memory_id,"mutation_cursor":memory.revision.mutation_cursor},
+                        "compartments":scores.compartments,"scores":scores.importance_by_sequence,"score_watermark":scores.watermark,
+                        "workspace":membership.as_ref().map(|m|json!({"union_identities":m.union_identities,"own_identity":m.own_identity,"share_categories":m.share_categories,"display_name_by_path":m.display_name_by_path})),
+                        "answers":answers.iter().map(|a|json!({"lineage_id":a.lineage_id,"state":a.state,"ordinal":a.answer.ordinal,"ops_json":a.answer.ops_json,"tags":a.answer.tags,
+                            "subject_mid":a.answer.subject.subject_mid,"hook":a.answer.subject.hook,"subject_part":a.answer.subject.subject_part})).collect::<Vec<_>>(),
+                        "pending_drops":rig.store.load_provider_pending_drops(&key).unwrap()});
+                    let importance = scores.importance_by_sequence.iter().map(|(k,v)|(*k,*v)).collect();
+                    let started = std::time::Instant::now();
+                    let resident = crate::providers::resident::ResidentState::build(&authority, &domains, &scores.compartments, &importance,
+                        "offline-renderer-v1", "offline-tokenizer-v1", 128*1024*1024).unwrap();
+                    let build_ms = started.elapsed().as_secs_f64()*1000.0;
+                    let snapshot = resident.snapshot();
+                    assert_eq!(snapshot["domains"], domains);
+                    let conv = key.conversation_key();
+                    // The oracle reads physical rows independently of the new
+                    // capture/index packing; effective ancestry and consumption
+                    // are resolved before comparing every field, not just totals.
+                    let consumed = rig.sql.prepare("SELECT tag_number FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1").unwrap()
+                        .query_map([namespace], |r|r.get::<_,i64>(0)).unwrap().map(Result::unwrap).collect::<BTreeSet<_>>();
+                    let mut expected = BTreeMap::<String,(usize,Value)>::new();
+                    let mut q = rig.sql.prepare("SELECT lineage_id,ordinal,policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1").unwrap();
+                    for row in q.query_map([&conv], |r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,String>(2)?))).unwrap() {
+                        let (lineage, ordinal, raw) = row.unwrap();
+                        if let Some(depth) = authority.ancestry.iter().position(|(id,cut)|*id==lineage && ordinal<=*cut) {
+                            let mut part: Value = serde_json::from_str(&raw).unwrap();
+                            if part["tag_number"].as_i64().is_some_and(|n|consumed.contains(&n)) {part["active"]=json!(false);}
+                            let id=part["block_id"].as_str().unwrap().to_string();
+                            if expected.get(&id).is_none_or(|(held,_)|depth<*held) {expected.insert(id,(depth,part));}
+                        }
+                    }
+                    let mut expected = expected.into_values().map(|(_,part)|part).collect::<Vec<_>>();
+                    expected.sort_by_key(|part|(part["ordinal"].as_u64().unwrap(),part["block_index"].as_i64().unwrap()));
+                    assert_eq!(snapshot["parts"].as_array().unwrap().iter().map(|p|p["part"].clone()).collect::<Vec<_>>(),expected);
+                    let full = rig.store.load_provider_messages(&key, &authority.conversation.lineage_id).unwrap();
+                    let tail = full.iter().filter(|m|authority.coverage.is_none_or(|cut|m.ordinal>cut)).collect::<Vec<_>>();
+                    assert_eq!(tail.len(),authority.tail.len());
+                    for (at, message) in tail.iter().enumerate() {assert_eq!(snapshot["tail"][at]["native_bytes"],json!(message.message_bytes));}
+                    assert_eq!(authority.policy_revision,rig.store.provider_policy_revision(namespace).unwrap());
+                    json!({"parts":authority.parts.len(),"tail_blob_rows":authority.tail_blob_rows,"tail_bytes":authority.tail_blob_bytes,"fragments":snapshot["fragments"].as_array().unwrap().len(),
+                        "memories":memory.memories.len(),"compartments":scores.compartments.len(),"retained_bytes":resident.retained_bytes(),"build_ms":build_ms,
+                        "snapshot_sha256":mc_store::move_snapshot::digest(&serde_json::to_vec(&snapshot).unwrap()),"independent_parts_equal":true,"independent_tail_equal":true,"domains_equal":true,"policy_revision":authority.policy_revision})
                 } else if op == "inspect" {
                     let state = rig.store.load("session").unwrap();
                     let tags = rig.store.load_tags_for_session("session").unwrap();
@@ -172,11 +293,13 @@ fn provider_pipeline_driver() {
                     json!({"pending":rig.store.load_pending_agent_drops("session").unwrap().into_iter().map(|d|d.target_id).collect::<Vec<_>>(),"queue":queued,"version":state.core.version,
                         "model":state.meta.last_model_key,"floor":state.meta.protected_tokens_effective,
                         "coverage":state.meta.coverage_ordinal,"protected_tools":state.meta.protected_tool_block_ids,
-                        "units":state.core.frozen_units})
+                        "units":state.core.frozen_units,"boundary_id":state.core.boundary_id,
+                        "compartment_count":rig.store.load_compartments("session").unwrap().len()})
                 } else if op == "restart" {
                     let mut h = McHandler::with_producer_factory_config_resolver(
                         Arc::new(TestProducerFactory {state: Arc::new(ProducerState::default())}),
-                        rig.binding.config.clone(), Arc::new(MissingSessionResolver));
+                        rig.binding.config.clone(), Arc::new(MissingSessionResolver))
+                        .with_startup_provider_resident_enabled(rig.resident_enabled);
                     h.store.set(rig.store.clone()).ok().unwrap();
                     h.bind_route(7, rig.binding.clone());
                     h.set_guidance_now_ms_for_test(1);
@@ -239,15 +362,33 @@ fn provider_pipeline_driver() {
                             };
                         }
                     }
+                    let module_started = std::time::Instant::now();
+                    let cpu_started = cpu_time::ProcessTime::now();
+                    let scheduler_before = scheduler_wait_ms();
                     match rig.handler.dispatch_value(channel, request).await {
                         HandlerOutcome::Response(bytes) => {
+                            let module_ms = module_started.elapsed().as_secs_f64()*1000.0;
+                            if cmd["settle_tasks"] == true { tokio::task::yield_now().await; }
+                            if cmd["timing"] == true {
+                                let raw = String::from_utf8(bytes).unwrap();
+                                let (acquire,callback,finish) = mc_store::provider_meters::last_transaction_timing();
+                                println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{},\"module_ms\":{},\"cpu_ms\":{},\"scheduler_wait_ms\":{},\"db_acquire_ms\":{},\"db_callback_ms\":{},\"db_finish_ms\":{}}}", raw, serde_json::to_string(&raw).unwrap(), module_ms, cpu_started.elapsed().as_secs_f64()*1000.0,(scheduler_wait_ms()-scheduler_before).max(0.0),acquire,callback,finish);
+                                std::io::stdout().flush().unwrap();
+                                continue;
+                            }
+                            if cmd["raw_response"] == true {
+                                let raw = String::from_utf8(bytes).unwrap();
+                                println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{}}}",raw,serde_json::to_string(&raw).unwrap());
+                                std::io::stdout().flush().unwrap();
+                                continue;
+                            }
                             // Forward the handler's exact response, without a
                             // second parse/serialize of large bootstrap views.
                             println!("PROVIDER_DRIVER={{\"ok\":{}}}",String::from_utf8(bytes).unwrap());
                             std::io::stdout().flush().unwrap();
                             continue;
                         },
-                        HandlerOutcome::Error {code,message} => json!({"error":{"code":code,"message":message}}),
+                        HandlerOutcome::Error {code,message} => json!({"error":{"code":code,"message":message},"module_ms":module_started.elapsed().as_secs_f64()*1000.0,"cpu_ms":cpu_started.elapsed().as_secs_f64()*1000.0}),
                         HandlerOutcome::ErrorWithDetail {code,message,detail} => json!({"error":{"code":code,"message":message,"detail":detail}}),
                         other => panic!("unexpected outcome: {other:?}"),
                     }
@@ -344,8 +485,22 @@ export class Driver {
     private killPoint?: string;
     private killed = false;
     readonly faults: string[] = [];
+    readonly preparationOutcomes: { request_id: string; consumed: boolean }[] = [];
+    readonly preparationCompletions: { request_id: string; prepared: boolean; preparation_ms: number }[] = [];
+    readonly moduleCompletions: { request_id: string; method: string; module_ms: number }[] = [];
     get wasKilled() {
         return this.killed;
+    }
+    get pid() {
+        return this.child.pid;
+    }
+    proveIsolation(): void {
+        const opened = spawnSync("lsof", ["-p", `${process.pid},${this.pid}`, "-Fn"], { encoding: "utf8" });
+        assert.equal(opened.status, 0, `lsof must prove fixture isolation: ${opened.stderr}`);
+        const stores = opened.stdout.split("\n").filter(line => line.startsWith("n") && /\.db(?:-wal|-shm)?(?: \(deleted\))?$/.test(line));
+        assert.ok(stores.length > 0, "lsof must observe the fixture stores");
+        assert.ok(stores.every(line => line.slice(1).startsWith(`${this.directory}/`)), `store outside scratch root: ${stores.join("\n")}`);
+        console.error(`PROVIDER_ISOLATION ${JSON.stringify({ root: this.directory, stores })}`);
     }
     constructor(
         readonly binary: string,
@@ -394,7 +549,26 @@ export class Driver {
                         this.killed = true;
                         this.child.kill("SIGKILL");
                     }
-                } else process.stderr.write(`${line}\n`);
+                } else {
+                    if (line.includes("provider hook preparation outcome")) {
+                        const request = /request_id="([^"]+)"/.exec(line)?.[1];
+                        const consumed = /preparation_consumed=(true|false)/.exec(line)?.[1];
+                        if (request && consumed) this.preparationOutcomes.push({ request_id: request, consumed: consumed === "true" });
+                    }
+                    if (line.includes("provider module complete")) {
+                        const request = /request_id="([^"]+)"/.exec(line)?.[1];
+                        const method = /method="([^"]+)"/.exec(line)?.[1];
+                        const ms = /module_ms=([0-9.eE+-]+)/.exec(line)?.[1];
+                        if (request && method && ms) this.moduleCompletions.push({ request_id: request, method, module_ms: Number(ms) });
+                    }
+                    if (line.includes("provider policy preparation complete")) {
+                        const request = /request_id=([^ }]+)/.exec(line)?.[1];
+                        const prepared = /prepared=(true|false)/.exec(line)?.[1];
+                        const ms = /preparation_ms=([0-9.eE+-]+)/.exec(line)?.[1];
+                        if (request && prepared && ms) this.preparationCompletions.push({ request_id: request, prepared: prepared === "true", preparation_ms: Number(ms) });
+                    }
+                    process.stderr.write(`${line}\n`);
+                }
             }
         }
     }
@@ -483,18 +657,20 @@ function prefix(before: string[], after: string[]) {
 }
 
 let serial = 0;
-export async function fixture(driver: Driver, host: Host, directory?: string, protectBash = false) {
+export async function fixture(driver: Driver, host: Host, directory?: string, protectBash = false, memoryEnabled = false) {
     const rig = `${host}-${++serial}`;
     const harness = host === "OpenCode1" ? "opencode" : "opencode2";
-    await driver.send({ op: "create", rig, harness, directory, protect_bash: protectBash });
+    await driver.send({ op: "create", rig, harness, directory, protect_bash: protectBash, memory_enabled: memoryEnabled });
     const oracleRig = `${rig}-full`;
     await driver.send({
         op: "create",
         rig: oracleRig,
         harness,
         protect_bash: protectBash,
+        memory_enabled: memoryEnabled,
         directory: directory ? join(directory, "oracle") : undefined,
     });
+    driver.proveIsolation();
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
@@ -1070,8 +1246,8 @@ const cases: Case[] = [
             const queued = await f.call(drop);
             assert.match(
                 JSON.stringify(queued),
-                /Queued/,
-                `real provider reduction queues a tag: ${JSON.stringify(queued)}`,
+                /1 tag stamped\./,
+                `real provider reduction acknowledges a stamped tag: ${JSON.stringify(queued)}`,
             );
             assert.deepEqual(
                 (await f.inspect()).pending,
@@ -2163,7 +2339,9 @@ const cases: Case[] = [
 ];
 
 export async function runProviderPipelineDifferential(selected: string[] = []) {
-    const work = join(ROOT, "target/provider-pipeline-driver");
+    const scratch = join(tmpdir(), "magic-context", "provider-suite");
+    mkdirSync(scratch, { recursive: true });
+    const work = mkdtempSync(join(scratch, "run-"));
     mkdirSync(join(work, "stores"), { recursive: true });
     let driver: Driver | undefined;
     let checks = 0;

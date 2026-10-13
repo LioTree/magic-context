@@ -415,6 +415,7 @@ export async function sendEmergencyRefusalNotice(
 export interface TransformDeps {
     rustPipeline?: "full_request" | "provider";
     signedThinkingHold?: "off" | "on";
+    rustProviderPreparation?: boolean;
     cacheTtlConfig?: import("../../shared/model-cache-ttl").CacheTtlConfig;
     cacheTtlConfigured?: boolean;
     sampleCacheTtlConfig?: () => {
