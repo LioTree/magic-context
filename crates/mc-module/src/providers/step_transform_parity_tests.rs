@@ -1445,4 +1445,128 @@ mod hookcost_review_witnesses {
         );
         println!("before next message: prewarm baseline_len=1; after next message: cold baseline_len=9, warm baseline_len=1; reclaimable tool outputs cold=1 warm=0; equal effective totals but different channel-1 append bytes");
     }
+
+    #[test]
+    fn prepared_refreeze_finalizes_the_exact_r1_admitted_cut() {
+        let (_, parts, settings) = covered_fixture();
+        let root = std::env::temp_dir().join("magic-context/prepared-r1");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let store =
+            mc_store::McStore::open_for_test(&crate::test_support::descriptor(dir.path())).unwrap();
+        let key = mc_store::ProviderSessionKey {
+            project_root: "/fixture".into(),
+            session: "session".into(),
+            harness: "opencode".into(),
+        };
+        store.save_provider_conversation(&key, &mc_store::provider_records::ProviderConversation {
+            lineage_id: "L".into(), engine_namespace: "engine".into(), cursor_frontier: 3,
+            hook_counters_json: json!({"engine_policy":settings,"tag_high_water":5,"reserved_tag_high_water":5}).to_string(),
+            ..Default::default()
+        }).unwrap();
+        let sql = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+        sql.execute(
+            "INSERT INTO mc_provider_lineages_v1 VALUES (?1,'L',1,NULL,NULL,'session')",
+            [key.conversation_key()],
+        )
+        .unwrap();
+        for part in &parts {
+            sql.execute(
+                "INSERT INTO mc_provider_policy_parts_v1 VALUES (?1,'L',?2,?3,?4,'session')",
+                rusqlite::params![
+                    key.conversation_key(),
+                    part.ordinal,
+                    part.block_id,
+                    serde_json::to_string(part).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        let before = store
+            .load_provider_conversation(&key)
+            .unwrap()
+            .unwrap()
+            .hook_counters_json;
+        assert!(store
+            .prepare_provider_policy(&key, |index, counters| {
+                super::super::super::policy_summary::prepare_policy(
+                    index,
+                    &counters["engine_policy"],
+                    0,
+                    &Default::default(),
+                    None,
+                )
+            })
+            .unwrap());
+        assert_eq!(
+            store
+                .load_provider_conversation(&key)
+                .unwrap()
+                .unwrap()
+                .hook_counters_json,
+            before,
+            "preparation must not publish the earlier baseline"
+        );
+        let mut next_req = request(
+            &[message(
+                "next",
+                "assistant",
+                json!([{"id":"next-tool","type":"tool","tool":"read","callID":"call-next","state":{"status":"completed","input":{},"output":"new output"}}]),
+                3,
+                true,
+            )],
+            false,
+        );
+        next_req.messages[0].ordinal = 3;
+        let projection = ck_wire::project_messages(&next_req.messages).unwrap();
+        let mut next = admission_policy_parts(&next_req, &projection);
+        for part in &mut next {
+            if part.tag_kind.is_some() {
+                part.tag_number = Some(6);
+            }
+        }
+        let mut cold_parts = parts.clone();
+        cold_parts.extend(next.clone());
+        let cold = transform::channel1_inputs_from_parts(
+            &cold_parts,
+            &settings,
+            0,
+            &Default::default(),
+            true,
+            false,
+            None,
+        );
+        let lineage = mc_store::provider_records::ProviderLineage {
+            lineage_id: "L".into(),
+            first_ordinal: 1,
+            descends_from: None,
+            through_ordinal: None,
+        };
+        let incoming = mc_store::provider_records::ProviderMessage {
+            ordinal: 3,
+            mid: "next".into(),
+            message_bytes: b"{}".to_vec(),
+        };
+        let warm = store.commit_provider_hook_with_preparation(&key, mc_store::provider_records::ProviderHookRequest { lineage:&lineage,message:Some(&incoming),served_through_ordinal:Some(2),unserved_subjects:&[],repeat_subject:None }, &next,true,|ctx| {
+            assert!(ctx.policy_index.preparation().is_some());
+            let (inputs,summary) = super::super::super::policy_summary::channel1_inputs(&ctx.policy_index,&ctx.counters["engine_policy"],0,&Default::default(),true,false,None)?;
+            assert!(ctx.policy_index.preparation_was_consumed(), "R1 acceptance must execute preparation, not fall back to the cold oracle");
+            let mut counters = ctx.counters.clone();
+            counters["policy_baseline_updates"] = json!(inputs.baseline.baseline_parts.iter().map(|measurement| json!({"block_id":measurement.key.split('\0').next().unwrap(),"measurement":measurement})).collect::<Vec<_>>());
+            let mut baseline=inputs.baseline.clone();baseline.baseline_parts.clear();
+            counters["engine_policy"]["baseline"]=serde_json::to_value(baseline).unwrap();
+            counters["engine_policy"]["baseline_len"]=json!(inputs.baseline.baseline_parts.len());
+            Ok((mc_store::provider_records::ProviderHookWrite { answer:None,counters,policy_summary:summary },inputs))
+        }).unwrap();
+        assert_eq!(warm.baseline.baseline_parts.len(), 9);
+        assert_eq!(warm.tool_outputs, 1);
+        assert_eq!(
+            serde_json::to_vec(&warm.baseline).unwrap(),
+            serde_json::to_vec(&cold.baseline).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&host_channel1(&warm, &json!({})).0).unwrap(),
+            serde_json::to_vec(&host_channel1(&cold, &json!({})).0).unwrap()
+        );
+    }
 }

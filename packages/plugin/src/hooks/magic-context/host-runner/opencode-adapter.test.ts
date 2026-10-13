@@ -235,6 +235,34 @@ function fixture(host: "v1" | "v2", options: OpenCodeProviderOptions = {}) {
 }
 for (const host of ["v1", "v2"] as const)
     describe(`OpenCode ${host} provider adapter`, () => {
+        test("prepared policy is off by default and its opt-in does not change the frozen plan", async () => {
+            const f = fixture(host);
+            await f.pass([message("A")]);
+            expect(f.wires.every((w) => w.params.consume_prepared_policy === undefined)).toBe(true);
+            const plan = f.stored()!.state.plan_json;
+            f.deps.rustProviderPreparation = true;
+            const switched = message("B", "assistant");
+            (switched.info as any).model.modelID = "prepared-policy-model";
+            await f.pass([message("A"), switched]);
+            expect(
+                f.wires.filter((w) => w.method === "transform.hook").at(-1)!.params
+                    .consume_prepared_policy,
+            ).toBe(true);
+            expect(
+                f.wires.filter((w) => w.method === "compaction.step").at(-1)!.params
+                    .consume_prepared_policy,
+            ).toBe(true);
+            expect(f.stored()!.state.plan_json).toBe(plan);
+            f.deps.rustProviderPreparation = false;
+            const next = message("C", "assistant");
+            (next.info as any).model.modelID = "prepared-policy-model";
+            await f.pass([message("A"), switched, next]);
+            expect(
+                f.wires.filter((w) => w.method === "transform.hook").at(-1)!.params
+                    .consume_prepared_policy,
+            ).toBeUndefined();
+            expect(f.stored()!.state.plan_json).toBe(plan);
+        });
         test("pass meters count issued hooks, appends, applied rebuilds and historian pumps in the host lane", async () => {
             const meters: ProviderPassMeters[] = [];
             const f = fixture(host, { emitMeters: (row) => meters.push(row) });

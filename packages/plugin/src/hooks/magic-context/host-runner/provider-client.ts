@@ -400,6 +400,7 @@ export interface ProviderClientOptions {
     requestIdBytes?: number;
     now?: () => number;
     engineBudgetMs?: number;
+    consumePreparedPolicy?: () => boolean;
     /** Cold bootstrap pages may render a whole session; ordinary steps keep their cap. */
     bootstrapBudgetMs?: number;
 }
@@ -675,6 +676,9 @@ export class ProviderClient {
                 pass_complete: passComplete,
                 budget_ms: budget,
                 on_unavailable: policy,
+                ...(this.options.consumePreparedPolicy?.()
+                    ? { consume_prepared_policy: true }
+                    : {}),
             };
             decodeProviderRequest("transform.hook", control);
             const encoded = encodeHookRequest(control, ingest);
@@ -735,6 +739,7 @@ export class ProviderClient {
             last_not_applied: record.last_not_applied,
             descends_from: record.descends_from,
             unserved_subjects: this.unservedSubjects(record),
+            ...(this.options.consumePreparedPolicy?.() ? { consume_prepared_policy: true } : {}),
         };
         // Validate status metadata alone: known ingest and served content must never
         // be read or reserialized just to check identities, numbers or extensions.

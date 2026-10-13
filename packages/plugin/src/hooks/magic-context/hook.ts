@@ -192,6 +192,7 @@ export interface MagicContextDeps {
         };
         transform_mode?: ResolvedTransformMode;
         rust_pipeline?: "full_request" | "provider";
+        rust_provider_preparation?: boolean;
         /** Path to the subc daemon's connection file. Threaded to the module
          *  transport so a host that publishes it outside the default data-dir
          *  location (e.g. a systemd RuntimeDirectory) is actually reachable. */
@@ -835,6 +836,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         maybeAutoEmbedSession,
         transformMode: deps.config.transform_mode,
         rustPipeline: deps.config.rust_pipeline,
+        rustProviderPreparation: deps.config.rust_provider_preparation,
         promptSurface: deps.config.prompt_surface,
         promptSurfaceRuntime: deps.promptSurfaceRuntime,
         rustModeModuleClient,

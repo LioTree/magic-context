@@ -1767,6 +1767,7 @@ export async function registerContext(context: V2Context) {
                     : v2CompactionMarkerStrategy,
                 transformMode: config.transform_mode,
                 rustPipeline: config.rust_pipeline,
+                rustProviderPreparation: config.rust_provider_preparation,
                 rustModeModuleClient,
                 rustModeProjectRoot: directory,
                 rustMemorySyncRequestedSessions,

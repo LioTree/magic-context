@@ -468,6 +468,7 @@ export function createOpenCodeProviderTransform(
             harness,
             now,
             bootstrapBudgetMs: OPENCODE_PROVIDER_BOOTSTRAP_BUDGET_MS,
+            consumePreparedPolicy: () => deps.rustProviderPreparation === true,
             persistFence: async (fence) => {
                 commitHostRunnerFence(deps.db, key(id), fence.request_id, fence.newest);
                 s.state.issued_request_id = fence.request_id;

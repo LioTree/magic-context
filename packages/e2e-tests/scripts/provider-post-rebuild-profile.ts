@@ -246,7 +246,7 @@ interface StageProfile {
 	fields: Record<string, number>;
 	total_ms: number;
 }
-function systemSample() {
+export function systemSample() {
 	const run = (command: string, args: string[]) => {
 		const value = spawnSync(command, args, { encoding: "utf8" });
 		assert.equal(value.status, 0, `${command}: ${value.stderr}`);
@@ -287,7 +287,7 @@ function psiTotal(value: string | null): number | null {
 	const match = value?.match(/^some\s.*\btotal=(\d+)/m);
 	return match ? Number(match[1]) : null;
 }
-function psiDelta(
+export function psiDelta(
 	before: ReturnType<typeof systemSample>,
 	after: ReturnType<typeof systemSample>,
 ) {

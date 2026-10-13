@@ -7,7 +7,7 @@
 //! so a hook that keeps a summary does work proportional to what changed.
 use super::{ancestry_tx, as_i64, parse, sql_json, ProviderError, ProviderPolicyPart};
 use rusqlite::{params, Connection, OptionalExtension};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A policy row that changed since the conversation's summary was taken.
@@ -32,7 +32,7 @@ pub struct ProviderPolicyIndex<'c> {
     ancestry: Vec<(String, u64)>,
     rows_read: Cell<u64>,
     preparation: Option<crate::ProviderStoredPreparation>,
-    prepared_updates: RefCell<Option<serde_json::Value>>,
+    preparation_consumed: Cell<bool>,
 }
 
 const PART_COLUMNS: &str = "p.lineage_id,p.ordinal,p.policy_json,EXISTS(SELECT 1 FROM mc_provider_consumed_tags_v1 t JOIN mc_provider_conversations_v2 c ON c.engine_namespace=t.engine_namespace WHERE c.conv_key=p.conv_key AND t.tag_number=json_extract(p.policy_json,'$.tag_number'))";
@@ -65,7 +65,7 @@ impl<'c> ProviderPolicyIndex<'c> {
             ancestry,
             rows_read: Cell::new(0),
             preparation: None,
-            prepared_updates: RefCell::new(None),
+            preparation_consumed: Cell::new(false),
         })
     }
 
@@ -79,11 +79,11 @@ impl<'c> ProviderPolicyIndex<'c> {
     pub fn preparation(&self) -> Option<&crate::ProviderStoredPreparation> {
         self.preparation.as_ref()
     }
-    pub fn set_prepared_baseline_updates(&self, updates: serde_json::Value) {
-        self.prepared_updates.replace(Some(updates));
+    pub fn mark_preparation_consumed(&self) {
+        self.preparation_consumed.set(true);
     }
-    pub fn take_prepared_baseline_updates(&self) -> Option<serde_json::Value> {
-        self.prepared_updates.borrow_mut().take()
+    pub fn preparation_was_consumed(&self) -> bool {
+        self.preparation_consumed.get()
     }
 
     /// Leaf first: each lineage and the highest ordinal it contributes, ending

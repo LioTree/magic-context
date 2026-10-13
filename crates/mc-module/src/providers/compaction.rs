@@ -1327,6 +1327,30 @@ impl McHandler {
         conversation.last_answer_json = Some(answer_receipt(&answer));
         save_host_setup(store, &work.key, &mut conversation, &setup)?;
         fault("AnswerRecorded");
+        if params
+            .get("consume_prepared_policy")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && answer.get("answer").and_then(Value::as_str) == Some("compaction_message")
+        {
+            let started = Instant::now();
+            let prepared = store
+                .prepare_provider_policy(&work.key.store_key(), |index, counters| {
+                    super::policy_summary::prepare_policy(
+                        index,
+                        &counters["engine_policy"],
+                        work.binding.config.resolve_protected_tokens(100_000).floor,
+                        &work.binding.config.protected_tools,
+                        counters
+                            .pointer("/pass_context/model_key")
+                            .and_then(Value::as_str),
+                    )
+                })
+                .map_err(transient)?;
+            tracing::info!(session_id = %work.key.session, request_id = %request.request_id,
+                prepared, preparation_ms = started.elapsed().as_secs_f64()*1000.0,
+                "provider policy preparation complete");
+        }
         bytes(&answer)
     }
 

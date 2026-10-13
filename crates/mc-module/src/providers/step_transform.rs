@@ -17,6 +17,8 @@ mod review_tests;
 
 #[derive(Deserialize, Default)]
 struct HostHookFields {
+    #[serde(default)]
+    consume_prepared_policy: bool,
     subject_mid: Option<String>,
     subject_ordinal: Option<u64>,
     message: Option<Value>,
@@ -813,8 +815,8 @@ impl McHandler {
         }
         // The store owns P1's newest-held/monotonic confirmation check. Descent,
         // message admission and the revert clamp share that transaction.
-        let answer = store
-            .commit_provider_hook_with_parts(
+        let (answer, preparation_consumed) = store
+            .commit_provider_hook_with_preparation(
                 &key.store_key(),
                 ProviderHookRequest {
                     lineage: &lineage,
@@ -824,6 +826,7 @@ impl McHandler {
                     repeat_subject: Some(&subject),
                 },
                 &policy_parts,
+                fields.consume_prepared_policy,
                 |ctx| {
                     let mut counters = ctx.counters.clone();
                     super::historian::advance_ingest_watermarks(&mut counters, lineage_id, std::slice::from_ref(ingress));
@@ -962,11 +965,16 @@ impl McHandler {
                             counters,
                             policy_summary,
                         },
-                        answer,
+                        (answer, ctx.policy_index.preparation_was_consumed()),
                     ))
                 },
             )
             .map_err(provider_policy_error)?;
+        if fields.consume_prepared_policy {
+            tracing::info!(session_id = %key.session, harness = %key.harness,
+                request_id = params.get("request_id").and_then(|value| value.as_str()).unwrap_or(""),
+                preparation_consumed, "provider hook preparation outcome");
+        }
         fault("HookStateRecorded");
         if fields.pass_complete == Some(true) {
             self.schedule_provider_historian(binding, key);

@@ -187,6 +187,7 @@ describe("MagicContextConfigSchema", () => {
             expect(result).toEqual({
                 ...input,
                 rust_pipeline: "full_request",
+                rust_provider_preparation: false,
                 protected_tools: { todowrite: 1, ctx_reduce: 3 },
             });
         });
@@ -827,4 +828,15 @@ describe("MagicContextConfigSchema", () => {
             ).toThrow();
         });
     });
+});
+
+it("provider policy preparation consumption is opt-in", () => {
+    expect(MagicContextConfigSchema.parse({}).rust_provider_preparation).toBe(false);
+    expect(
+        MagicContextConfigSchema.parse({ rust_provider_preparation: true })
+            .rust_provider_preparation,
+    ).toBe(true);
+    expect(MagicContextConfigSchema.safeParse({ rust_provider_preparation: "true" }).success).toBe(
+        false,
+    );
 });

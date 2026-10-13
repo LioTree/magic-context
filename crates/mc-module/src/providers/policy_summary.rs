@@ -34,9 +34,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+#[path = "policy_summary_preparation.rs"]
+mod policy_summary_preparation;
 #[cfg(test)]
 #[path = "policy_summary_review_tests.rs"]
 mod review_tests;
+pub(crate) use policy_summary_preparation::prepare as prepare_policy;
 
 /// When more than this many policy rows changed since the summary was taken,
 /// rebuild it from every part instead of replaying the changes.
@@ -166,6 +169,7 @@ struct Settings {
     coverage: Option<u64>,
     floor: u64,
     tools_ratio: f64,
+    prose_ratio: f64,
     /// Normalized tool name to the number of its newest arcs kept protected.
     keep: BTreeMap<String, usize>,
     /// The frozen baseline, without its part list.
@@ -207,6 +211,7 @@ impl Settings {
                 .and_then(Value::as_u64)
                 .unwrap_or(protected_floor),
             tools_ratio: calibration.tools_ratio,
+            prose_ratio: calibration.prose_ratio,
             keep,
             previous,
             baseline_len: engine_policy
@@ -235,6 +240,10 @@ impl Settings {
 
     fn tail(&self, part: &ProviderPolicyPart) -> bool {
         transform::is_tail(part.ordinal, self.coverage)
+    }
+
+    fn preparation_key(&self, index: &ProviderPolicyIndex<'_>) -> String {
+        serde_json::json!([self.key(index), self.prose_ratio.to_bits()]).to_string()
     }
 }
 
@@ -722,6 +731,15 @@ fn replay(
     summary: PolicySummary,
     settings: &Settings,
 ) -> Result<Option<PolicySummary>, ProviderError> {
+    replay_measured(index, summary, settings, None)
+}
+
+fn replay_measured(
+    index: &ProviderPolicyIndex<'_>,
+    summary: PolicySummary,
+    settings: &Settings,
+    measured: Option<&mut Vec<policy_summary_preparation::MeasuredPart>>,
+) -> Result<Option<PolicySummary>, ProviderError> {
     let Some(changes) = index.changes(CHANGE_CAP)? else {
         return Ok(None);
     };
@@ -1046,6 +1064,22 @@ fn replay(
     }
     hint.retain(|_, list| !(list.entries.is_empty() && list.complete));
 
+    if let Some(measured) = measured {
+        measured.extend(
+            views
+                .current
+                .values()
+                .filter(|part| part.kind != "header")
+                .map(|part| {
+                    policy_summary_preparation::changed_measurement(
+                        part,
+                        settings,
+                        &new_protection,
+                        &new_neighbours,
+                    )
+                }),
+        );
+    }
     Ok(Some(PolicySummary {
         key: summary.key,
         totals,
@@ -1126,6 +1160,11 @@ pub(crate) fn channel1_inputs(
         model_key,
     );
     let key = settings.key(index);
+    if !cache_busting {
+        if let Some(prepared) = policy_summary_preparation::consume(index, &settings, carrier)? {
+            return Ok((prepared.0, Some(prepared.1)));
+        }
+    }
     if !cache_busting && settings.previous.is_some() {
         let held = index
             .summary()?

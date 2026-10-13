@@ -8,6 +8,7 @@ use crate::{McStore, ProviderSessionKey};
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
 pub const MAX_PROVIDER_PREPARATION_BYTES: usize = 64 * 1024 * 1024;
@@ -35,8 +36,15 @@ impl ProviderStoredPreparation {
                 "prepared policy exceeds its byte cap".into(),
             ));
         }
+        if self.prepared_blob.len() < 32
+            || &Sha256::digest(&self.prepared_blob[32..])[..] != &self.prepared_blob[..32]
+        {
+            return Err(ProviderError::Transient(
+                "prepared policy checksum changed".into(),
+            ));
+        }
         let mut decoded = String::new();
-        DeflateDecoder::new(self.prepared_blob.as_slice())
+        DeflateDecoder::new(&self.prepared_blob[32..])
             .take(MAX_PROVIDER_PREPARATION_BYTES as u64 + 1)
             .read_to_string(&mut decoded)
             .map_err(|e| ProviderError::Transient(e.to_string()))?;
@@ -100,7 +108,9 @@ impl McStore {
                 if prepared.prepared_json.len() > MAX_PROVIDER_PREPARATION_BYTES { return Ok(false); }
                 let mut compressed = DeflateEncoder::new(Vec::new(), Compression::fast());
                 compressed.write_all(prepared.prepared_json.as_bytes()).map_err(|e| ProviderError::Transient(e.to_string()))?;
-                let blob = compressed.finish().map_err(|e| ProviderError::Transient(e.to_string()))?;
+                let compressed = compressed.finish().map_err(|e| ProviderError::Transient(e.to_string()))?;
+                let mut blob = Sha256::digest(&compressed).to_vec();
+                blob.extend(compressed);
                 conn.execute("INSERT INTO mc_provider_policy_preparations_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,json_extract(?1,'$[1]')) ON CONFLICT(conv_key) DO UPDATE SET engine_namespace=excluded.engine_namespace,policy_revision=excluded.policy_revision,settings_key=excluded.settings_key,original_baseline_json=excluded.original_baseline_json,newest_ordinal=excluded.newest_ordinal,prepared_blob=excluded.prepared_blob,uncompressed_bytes=excluded.uncompressed_bytes", params![conv,conversation.engine_namespace,revision,prepared.settings_key,prepared.original_baseline_json,prepared.newest_ordinal,blob,prepared.prepared_json.len()])?;
                 Ok(true)
             };

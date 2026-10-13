@@ -114,7 +114,7 @@ fn provider_pipeline_driver() {
                 let dir = if cmd["directory"].is_string() {None} else {Some(tempfile::tempdir().unwrap())};
                 let root = cmd["directory"].as_str().map(PathBuf::from).unwrap_or_else(||dir.as_ref().unwrap().path().into());
                 std::fs::create_dir_all(&root).unwrap();
-                let project = root.join("project");
+                 let project = cmd["project_root"].as_str().map(PathBuf::from).unwrap_or_else(||root.join("project"));
                 std::fs::create_dir_all(&project).unwrap();
                 let store = Arc::new(McStore::open_for_test(&crate::test_support::descriptor(&root)).unwrap());
                 let mut handler = McHandler::with_producer_factory_config_resolver(
@@ -166,7 +166,10 @@ fn provider_pipeline_driver() {
                         other => panic!("unknown event {other}"),
                     }
                     json!({"changed":true})
-                } else if op == "reads" {
+                 } else if op == "settle" {
+                     tokio::task::yield_now().await;
+                     json!({"settled":true})
+                 } else if op == "reads" {
                     json!(rig.reads.0.load(Ordering::SeqCst))
                 } else if op == "inspect" {
                     let state = rig.store.load("session").unwrap();
@@ -244,6 +247,13 @@ fn provider_pipeline_driver() {
                     }
                     match rig.handler.dispatch_value(channel, request).await {
                         HandlerOutcome::Response(bytes) => {
+                            if cmd["settle_tasks"] == true { tokio::task::yield_now().await; }
+                            if cmd["raw_response"] == true {
+                                let raw = String::from_utf8(bytes).unwrap();
+                                println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{}}}",raw,serde_json::to_string(&raw).unwrap());
+                                std::io::stdout().flush().unwrap();
+                                continue;
+                            }
                             // Forward the handler's exact response, without a
                             // second parse/serialize of large bootstrap views.
                             println!("PROVIDER_DRIVER={{\"ok\":{}}}",String::from_utf8(bytes).unwrap());
@@ -347,6 +357,8 @@ export class Driver {
     private killPoint?: string;
     private killed = false;
     readonly faults: string[] = [];
+    readonly preparationOutcomes: { request_id: string; consumed: boolean }[] = [];
+    readonly moduleCompletions: { request_id: string; method: string; module_ms: number }[] = [];
     get wasKilled() {
         return this.killed;
     }
@@ -408,7 +420,20 @@ export class Driver {
                         this.killed = true;
                         this.child.kill("SIGKILL");
                     }
-                } else process.stderr.write(`${line}\n`);
+                } else {
+                    if (line.includes("provider hook preparation outcome")) {
+                        const request = /request_id="([^"]+)"/.exec(line)?.[1];
+                        const consumed = /preparation_consumed=(true|false)/.exec(line)?.[1];
+                        if (request && consumed) this.preparationOutcomes.push({ request_id: request, consumed: consumed === "true" });
+                    }
+                    if (line.includes("provider module complete")) {
+                        const request = /request_id="([^"]+)"/.exec(line)?.[1];
+                        const method = /method="([^"]+)"/.exec(line)?.[1];
+                        const ms = /module_ms=([0-9.eE+-]+)/.exec(line)?.[1];
+                        if (request && method && ms) this.moduleCompletions.push({ request_id: request, method, module_ms: Number(ms) });
+                    }
+                    process.stderr.write(`${line}\n`);
+                }
             }
         }
     }

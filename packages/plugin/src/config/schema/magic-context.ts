@@ -933,6 +933,7 @@ export interface MagicContextConfig {
     transform_mode: "ts" | "rust";
     /** Opt-in host provider pipeline; full_request preserves the existing Rust adapter. */
     rust_pipeline?: "full_request" | "provider";
+    rust_provider_preparation?: boolean;
     /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
      *  USER config only; project configs cannot disable it. Default: true. */
     auto_update?: boolean;
@@ -1145,6 +1146,12 @@ export const MagicContextConfigSchema = z
             .default("full_request")
             .describe(
                 'Experimental, user-level only, not for production use: off by default (full_request). The provider pipeline applies only with transform_mode: "rust" on OpenCode; full_request keeps the legacy request adapter.',
+            ),
+        rust_provider_preparation: z
+            .boolean()
+            .default(false)
+            .describe(
+                "Experimental, user-level only: consume revision-matched provider hook preparation; disabled by default pending byte/state and timing review.",
             ),
         auto_update: z
             .boolean()
