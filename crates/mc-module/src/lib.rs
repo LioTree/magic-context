@@ -15105,7 +15105,11 @@ impl McHandler {
         if let Some(method) = method {
             return match method {
                 "role.describe" => providers::describe(),
-                "compaction.setup" | "compaction.step" | "transform.declare" | "transform.hook" => {
+                "compaction.setup"
+                | "compaction.step"
+                | "compaction.view.read"
+                | "transform.declare"
+                | "transform.hook" => {
                     self.handle_provider_value(
                         channel,
                         method,

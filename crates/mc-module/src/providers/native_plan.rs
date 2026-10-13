@@ -116,6 +116,17 @@ impl McHandler {
         let plan_json =
             String::from_utf8(serde_jcs::to_vec(&request).map_err(invalid)?).map_err(invalid)?;
         if let Some(held) = &held {
+            let previous: DeclareRequest =
+                serde_json::from_str(held.native_plan_json.as_deref().ok_or_else(|| {
+                    invalid_field("claude_code", "stored native plan is missing")
+                })?)
+                .map_err(invalid)?;
+            if previous.claude_code != request.claude_code {
+                return Err(error(
+                    "native_selection_frozen",
+                    "native capability selection cannot change within a generation",
+                ));
+            }
             if held.native_pins_json.as_deref() != Some(&pins_json) {
                 return Err(invalid_field("claude_code", "stored native pins differ"));
             }
@@ -371,6 +382,17 @@ mod tests {
 mod selected_plan_tests {
     use super::*;
     use crate::providers::claude_code_tests as cc;
+    #[tokio::test]
+    async fn native_selection_cannot_silently_upgrade_within_a_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = cc::handler(dir.path(), cc::thalamus());
+        cc::setup(&h).await;
+        let binding = h.facade_binding(7).unwrap();
+        let declare = json!({"preset":"head","params":{"serializer_profile":"claude-code-anthropic","observation":"answer"},"claude_code":h.native_pins()});
+        assert!(
+            matches!(h.admit_native_plan(7,&binding,"transform.declare",&declare).await,Err(HandlerOutcome::Error {code,..}) if code=="native_selection_frozen")
+        );
+    }
     #[tokio::test]
     async fn internal_selected_bundle_freezes_full_declare_and_setup_without_publication() {
         let dir = tempfile::tempdir().unwrap();

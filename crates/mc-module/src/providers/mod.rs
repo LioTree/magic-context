@@ -18,6 +18,7 @@ mod codec_opencode;
 mod compaction;
 mod historian;
 mod native_plan;
+mod native_view;
 mod policy_summary;
 mod records;
 mod step_transform;
@@ -47,6 +48,7 @@ pub(crate) fn inbound_ceiling(
         let field = match operation {
             Some("compaction.step") => "messages",
             Some("transform.hook") => "message",
+            Some("compaction.view.read") => "raw_view",
             _ => return None,
         };
         return Some(invalid_field(
@@ -324,6 +326,9 @@ impl McHandler {
         let result = match method {
             "compaction.setup" => self.provider_setup(binding, params).await,
             "compaction.step" => self.provider_step(binding, params).await,
+            "compaction.view.read" if attested_claude_code(&binding) => {
+                self.provider_native_view_read(binding, params).await
+            }
             "transform.hook" => self.provider_hook(binding, params).await,
             _ => Err(invalid("unknown provider method")),
         };

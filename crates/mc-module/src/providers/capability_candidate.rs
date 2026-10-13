@@ -49,7 +49,17 @@ fn build_candidate() -> ClaudeCodeCapabilities {
         "codec-sha256:{}",
         sha256_hex(include_bytes!("codec_claude_code.rs"))
     );
-    let provider_generation = format!("key-sha256:{}", sha256_hex(include_bytes!("records.rs")));
+    let provider_generation = format!(
+        "key-sha256:{}",
+        sha256_hex(
+            &serde_jcs::to_vec(&json!({
+                "identity":sha256_hex(include_bytes!("records.rs")),
+                "plan":sha256_hex(include_bytes!("native_plan.rs")),
+                "view":sha256_hex(include_bytes!("native_view.rs")),
+            }))
+            .expect("native format fingerprints")
+        )
+    );
     ClaudeCodeCapabilities {
         capability: hooks::claude_code::CAPABILITY.into(),
         principal: format!("reserved:{CLAUDE_CODE_MODULE}"),
@@ -101,12 +111,11 @@ fn build_candidate() -> ClaudeCodeCapabilities {
             // A message plus its raw sidecar is smaller than the whole RPC that
             // contains it. Admission now checks this per-message bound explicitly.
             single_message_bytes: HOST_ENVELOPE_BYTES - 1,
-            // compaction.view.read is not implemented or offered. The required
-            // schema value leaves one byte of envelope headroom if paging later
-            // ships; raw_view_read=false grants no retrieval operation today.
+            // Page serialization shrinks this raw-byte allowance until the
+            // escaped reply, including its metadata, is strictly below the cap.
             view_page_bytes: HOST_ENVELOPE_BYTES - 1,
         },
-        raw_view_read: false,
+        raw_view_read: true,
         digest: "sha256".into(),
         cache_policy_revision: cache_policy::REVISION.to_string(),
         canonical_reduce: false,

@@ -332,6 +332,30 @@ async fn cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes
     assert!(String::from_utf8(bytes).unwrap().contains(&raw.join(",")));
     assert_eq!(answer["head_slots"], committed["head_slots"]);
     assert_eq!(answer["head_slots"].as_array().unwrap().len(), 2);
+    let frozen: compact::view::FrozenView =
+        serde_json::from_value(answer["compaction"]["raw_view"].clone()).unwrap();
+    frozen.validate().unwrap();
+    let full = format!("[{}]", raw.join(","));
+    assert_eq!(
+        frozen.payload,
+        compact::view::RawPayload::Inline {
+            bytes: full.clone()
+        }
+    );
+    assert_eq!(
+        frozen.endpoint,
+        compact::view::NativeEndpoint {
+            message_id: "m".into(),
+            part_index: 0
+        }
+    );
+    let mut read = json!({"request_id":"read","view_id":frozen.view.view_id,"version":frozen.view.version,"sha256":frozen.view.sha256,"byte_cursor":0});
+    let page = response(call(&h, "compaction.view.read", read.clone()).await);
+    assert_eq!(page["answer"], "page");
+    assert_eq!(page["bytes"], full);
+    read["sha256"] = json!("0".repeat(64));
+    let rejected = response(call(&h, "compaction.view.read", read).await);
+    assert_eq!(rejected["code"], "digest_mismatch");
     for slot in answer["head_slots"].as_array().unwrap() {
         let index = slot["index"].as_u64().unwrap() as usize;
         assert_eq!(slot["bytes_sha256"], sha256_hex(raw[index].as_bytes()));

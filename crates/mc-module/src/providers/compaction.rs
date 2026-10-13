@@ -85,22 +85,22 @@ struct HostSetup {
     cache_policy: Option<Value>,
 }
 #[derive(Serialize, Deserialize)]
-struct HostView {
-    engine: transform::compaction::View,
-    wire: compact::answer::CompactionMessage,
+pub(super) struct HostView {
+    pub(super) engine: transform::compaction::View,
+    pub(super) wire: compact::answer::CompactionMessage,
     #[serde(default)]
-    coverage: Option<HostCoverage>,
+    pub(super) coverage: Option<HostCoverage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    raw_replacement: Option<Vec<String>>,
+    pub(super) raw_replacement: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    head_slots: Option<Vec<Value>>,
+    pub(super) head_slots: Option<Vec<Value>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct HostCoverage {
-    end_mid: String,
-    ordinal: u64,
+pub(super) struct HostCoverage {
+    pub(super) end_mid: String,
+    pub(super) ordinal: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    endpoint: Option<compact::view::NativeEndpoint>,
+    pub(super) endpoint: Option<compact::view::NativeEndpoint>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -389,6 +389,9 @@ fn load_host_view(
         .map_err(|e| transient(format!("load provider views: {e}")))?
         .ok_or_else(|| transient("recorded provider view is missing"))?;
     let mut view: HostView = serde_json::from_str(&row.replacement_json).map_err(transient)?;
+    if key.generation.is_some() {
+        super::native_view::validate(key, &view)?;
+    }
     // Immutable bytes are shared by a descent; only the in-memory range's
     // lineage changes. Never rewrite a frozen view at an existing version.
     view.engine.range.lineage_id = summary.range.lineage_id.clone();
@@ -705,8 +708,8 @@ fn execute_host(
     let transform::compaction::Answer::Replacement(engine) = output.answer else {
         return Ok(None);
     };
-    let (wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) =
-        previous.filter(|p| {
+    let (mut wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) = previous
+        .filter(|p| {
             status
                 .last_not_applied
                 .is_some_and(|n| !n.structural && n.version == p.engine.version)
@@ -785,6 +788,17 @@ fn execute_host(
                 message, &boundary,
             )?);
         }
+        wire.raw_view = super::native_view::frozen_for_plan(
+            &work.key,
+            &engine,
+            conversation,
+            coverage
+                .as_ref()
+                .and_then(|coverage| coverage.endpoint.as_ref()),
+            raw_replacement
+                .as_deref()
+                .ok_or_else(|| invalid_field("raw_view"))?,
+        )?;
     }
     Ok(Some(HostView {
         engine,
@@ -1068,7 +1082,7 @@ impl McHandler {
             .max(setup.setup.state.version_high_water)
             .checked_add(1)
             .ok_or_else(|| transient("version exhausted"))?;
-        let view = if let Some(summary) = &setup.applied {
+        let mut view = if let Some(summary) = &setup.applied {
             let mut view = load_host_view(store, key, summary)?;
             view.engine.version = high;
             view.wire.version = high;
@@ -1122,6 +1136,18 @@ impl McHandler {
                 head_slots: (codec == Codec::ClaudeCodeAnthropic).then(Vec::new),
             }
         };
+        if codec == Codec::ClaudeCodeAnthropic && view.wire.raw_view.is_some() {
+            view.wire.raw_view = Some(Box::new(super::native_view::freeze(
+                key,
+                &view.engine,
+                view.coverage
+                    .as_ref()
+                    .and_then(|coverage| coverage.endpoint.as_ref()),
+                view.raw_replacement
+                    .as_deref()
+                    .ok_or_else(|| invalid_field("raw_view"))?,
+            )?));
+        }
         save_host_view(store, key, &view, "applied")?;
         setup.setup.state.version_high_water = high;
         setup.applied = Some(ViewSummary::from(&view.engine));
@@ -1218,6 +1244,14 @@ impl McHandler {
                         .any(|v| Some(v.version) == version)
                 {
                     return Err(invalid_field(field));
+                }
+                if codec == Codec::ClaudeCodeAnthropic {
+                    let summary = [&setup.applied, &setup.produced]
+                        .into_iter()
+                        .flatten()
+                        .find(|view| Some(view.version) == version)
+                        .ok_or_else(|| invalid_field(field))?;
+                    load_host_view(store, &work.key, summary)?;
                 }
             }
         }
@@ -1500,6 +1534,7 @@ impl McHandler {
                             && matches!(
                                 code.as_str(),
                                 "signed_prefix_edit"
+                                    | "native_endpoint_missing"
                                     | "invalid_signed_tool_boundary"
                                     | "native_endpoint_unrepresentable"
                             ) =>
