@@ -635,7 +635,7 @@ async fn review_staging_corruption_is_refused_without_replacing_rows() {
     bytes[offset..offset + old.len()].copy_from_slice(b"CORRUPT! note");
     std::fs::write(&path, &bytes).unwrap();
     let refused = call(&d, role::ops::ACTIVATE, params(&refs)).await;
-    assert_eq!(refusal(refused.clone()), "unavailable");
+    assert_eq!(refusal(refused.clone()), "digest_mismatch");
     match refused {
         HandlerOutcome::ErrorWithDetail { detail, .. } => {
             assert_eq!(detail["reason"], "staging_digest_mismatch")
@@ -891,7 +891,7 @@ async fn review_undo_corruption_refuses_activation_and_abort_without_new_writes(
     let rows = module_shipped_rows(&d);
     for op in [role::ops::ACTIVATE, role::ops::ABORT] {
         let error = call(&d, op, params(&refs)).await;
-        assert_eq!(refusal(error.clone()), "unavailable");
+        assert_eq!(refusal(error.clone()), "digest_mismatch");
         match error {
             HandlerOutcome::ErrorWithDetail { detail, .. } => {
                 assert_eq!(detail["reason"], "undo_digest_mismatch")

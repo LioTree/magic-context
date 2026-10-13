@@ -257,14 +257,26 @@ fn published_refusal_rows_details_and_session_refs() {
         );
     }
     let allowed = file("op-refusals.json");
+    let amendments = file("digest-mismatch.json");
+    let additions = rows(&amendments, "op_additions");
+    assert_eq!(additions.len(), 2);
+    let mut amended = BTreeSet::new();
     assert_eq!(rows(&allowed, "ops").len(), 10);
     for row in rows(&allowed, "ops") {
         let op = Op::from_method(&format!("agent_data.{}", row["op"].as_str().unwrap())).unwrap();
-        assert_eq!(
-            serde_json::from_value::<Vec<RefusalCode>>(row["codes"].clone()).unwrap(),
-            role::errors::allowed_refusals(op)
-        );
+        let mut codes = serde_json::from_value::<Vec<RefusalCode>>(row["codes"].clone()).unwrap();
+        for addition in additions
+            .iter()
+            .filter(|addition| addition["op"] == row["op"])
+        {
+            assert!(amended.insert(op.method()), "duplicate refusal amendment");
+            codes.extend(
+                serde_json::from_value::<Vec<RefusalCode>>(addition["codes"].clone()).unwrap(),
+            );
+        }
+        assert_eq!(codes, role::errors::allowed_refusals(op));
     }
+    assert_eq!(amended.len(), additions.len());
     for case in rows(&allowed, "cases") {
         let op = Op::from_method(&format!("agent_data.{}", case["op"].as_str().unwrap())).unwrap();
         let code: RefusalCode = serde_json::from_value(case["code"].clone()).unwrap();
@@ -282,5 +294,78 @@ fn published_refusal_rows_details_and_session_refs() {
         };
         assert_eq!(tuple.reference(), case["sessionRef"]);
         assert!(role::refs::is_session_ref(&tuple.reference()));
+    }
+}
+
+#[tokio::test]
+async fn published_digest_mismatch_vectors_pin_adapter_refusals_and_driver_actions() {
+    let vectors = file("digest-mismatch.json");
+    let cases = rows(&vectors, "refusals");
+    assert_eq!(cases.len(), 2);
+    for (case, op) in cases.iter().zip([Op::Activate, Op::Abort]) {
+        let body: ErrorBody = serde_json::from_value(case["body"].clone()).unwrap();
+        assert_eq!(
+            canonical(&serde_json::to_value(&body).unwrap()),
+            canonical(&case["body"])
+        );
+        assert_eq!(body.code, RefusalCode::DigestMismatch);
+        assert_eq!(body.code.is_known(), case["named"].as_bool().unwrap());
+        assert!(role::errors::may_refuse(op, &body.code));
+        assert_eq!(
+            op.method(),
+            format!("agent_data.{}", case["op"].as_str().unwrap())
+        );
+        let action = role::errors::driver_action_for(op, &body.code);
+        let expected = match case["driver"].as_str().unwrap() {
+            "terminal_for_step" => DriverAction::TerminalForStep,
+            "retry_after_operator" => DriverAction::RetryAfterOperator,
+            _ => panic!("{case}"),
+        };
+        assert_eq!(action, expected);
+        assert_eq!(action.retryable(), case["retryable"].as_bool().unwrap());
+        let detail = body.digest_mismatch_detail().unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&detail).unwrap(),
+            case["body"]["detail"]
+        );
+        assert_eq!(body.typed_detail().unwrap(), None);
+        let built = ErrorBody::with_digest_mismatch_detail(
+            detail,
+            case["body"]["message"].as_str().unwrap(),
+        );
+        assert_eq!(serde_json::to_value(built).unwrap(), case["body"]);
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let door = Arc::new(FakeDoor::default());
+        let s = make(source.path(), door.clone()).await;
+        let d = make(destination.path(), door.clone()).await;
+        seed(&s, SESSION);
+        observe(&s, SESSION).await;
+        let refs = vec![reference(SESSION)];
+        prepared(&s, &door, &refs).await;
+        reply(call(&d, role::ops::IMPORT, params(&refs)).await);
+        let root = d.agent_data.as_ref().unwrap().root().unwrap();
+        let directory = directory(&root, CUT, &refs[0].r#ref);
+        let path = if op == Op::Abort {
+            *d.agent_data.as_ref().unwrap().crash_after.lock().unwrap() = Some(1);
+            assert_eq!(
+                refusal(call(&d, role::ops::ACTIVATE, params(&refs)).await),
+                "unavailable"
+            );
+            directory.join("undo/context-0.bin")
+        } else {
+            directory.join("context-0.bin")
+        };
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let refusal = call(&d, op.method(), params(&refs)).await;
+        match refusal {
+            HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
+                assert_eq!(code, body.code.as_str(), "{}", case["name"]);
+                assert_eq!(detail, case["body"]["detail"]);
+            }
+            other => panic!("{}: expected vector refusal, got {other:?}", case["name"]),
+        }
     }
 }

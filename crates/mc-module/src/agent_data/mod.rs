@@ -1236,7 +1236,7 @@ impl AgentDataService {
                 &directory(root, cut_id, &snapshot.header.session_ref),
                 "activate",
                 mover,
-                "staging_digest_mismatch",
+                role::errors::digest_mismatch_reason::STAGING_DIGEST_MISMATCH,
             )?;
         }
         for header in &cut.undo {
@@ -1247,7 +1247,7 @@ impl AgentDataService {
                 &directory(root, cut_id, &header.session_ref).join("undo"),
                 "abort",
                 mover,
-                "undo_digest_mismatch",
+                role::errors::digest_mismatch_reason::UNDO_DIGEST_MISMATCH,
             )?;
         }
         if cut.intent.is_none() {
@@ -1311,7 +1311,7 @@ impl AgentDataService {
                     &directory(root, cut_id, &header.session_ref).join("undo"),
                     "abort",
                     mover,
-                    "undo_digest_mismatch",
+                    role::errors::digest_mismatch_reason::UNDO_DIGEST_MISMATCH,
                 )?;
             }
             self.replace_halves(
@@ -1379,9 +1379,9 @@ impl AgentDataService {
             phase,
             mover,
             if phase == "abort" {
-                "undo_digest_mismatch"
+                role::errors::digest_mismatch_reason::UNDO_DIGEST_MISMATCH
             } else {
-                "staging_digest_mismatch"
+                role::errors::digest_mismatch_reason::STAGING_DIGEST_MISMATCH
             },
         )?;
         for (i, half) in header.halves.iter().enumerate() {
@@ -1494,7 +1494,7 @@ impl AgentDataService {
                 &directory(root, cut_id, &header.session_ref).join("undo"),
                 "abort",
                 mover,
-                "undo_digest_mismatch",
+                role::errors::digest_mismatch_reason::UNDO_DIGEST_MISMATCH,
             )?;
         }
         let cut = journal.cuts.entry(cut_id.into()).or_default();
@@ -1658,12 +1658,10 @@ impl AgentDataService {
                     {
                         tracing::error!(cut_id,reason,session=%half.session,store=side,"move image is corrupt; preserve the preimages and repair or abort the move");
                     }
-                    let mut error = storage(format!(
-                        "{reason}: {side} image does not match its saved digest"
+                    return Err(ErrorBody::with_digest_mismatch_detail(
+                        role::errors::DigestMismatchDetail::new(reason),
+                        format!("{reason}: {side} image does not match its saved digest"),
                     ));
-                    error.detail =
-                        Some(json!({"reason":reason,"session_id":half.session,"store":side}));
-                    return Err(error);
                 }
             }
         }
