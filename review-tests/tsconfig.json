@@ -1,0 +1,8 @@
+{
+  "extends": "../packages/e2e-tests/tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "typeRoots": ["../packages/plugin/node_modules", "../packages/plugin/node_modules/@types"]
+  },
+  "include": ["*.ts"]
+}
