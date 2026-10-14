@@ -120,9 +120,9 @@ macro_rules! table {
 /// Stable table order for the v1 stream; each store half is filtered from this
 /// explicit list. Schema discovery is validation only and never grants shipping.
 pub const TABLES: &[TableInventory] = &[
-    // Install the namespace fence before any conversation or policy input.
-    // Enabled revision triggers then advance the imported token instead of
-    // creating a row that collides with its later insertion.
+    // Import each namespace's policy revision row before its conversation and
+    // policy rows. Their insert triggers then increment the imported revision
+    // instead of creating a row that would collide with its later import.
     table!(
         Module,
         "mc_provider_policy_revisions_v1",

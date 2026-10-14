@@ -1303,8 +1303,8 @@ fn inventory_versions_six_and_seven_refuse_cross_order_before_writes() {
         sections.push((table, bytes[start..input.position() as usize].to_vec()));
     }
     assert_eq!(sections[0].0.table, "mc_provider_policy_revisions_v1");
-    // Version 6 used the same schema/columns but put this section immediately
-    // before consumed tags. Rebuild that pinned order, not the current reader's.
+    // Reconstruct inventory version 6's section order, with policy revisions
+    // immediately before consumed tags, to test rejection of the old stream.
     let revision = sections.remove(0);
     let old_position = sections
         .iter()
@@ -1350,8 +1350,9 @@ fn inventory_versions_six_and_seven_refuse_cross_order_before_writes() {
         unchanged,
         "v6 into v7 may not reserve or install"
     );
-    // The v6 receiver used this same strict section-name check with its old
-    // first table. It rejects v7 before any reservation or row insertion.
+    // A version-6 receiver expects its old first section name. The strict
+    // section-name check rejects the version-7 stream before reserving or
+    // inserting rows, just as the current receiver rejects version 6 above.
     let old_first = sections[0].0;
     let mut old_receiver = std::io::Cursor::new(&bytes);
     assert!(matches!(
