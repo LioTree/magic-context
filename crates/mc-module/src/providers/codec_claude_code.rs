@@ -118,12 +118,84 @@ fn transport_block(block: &Value, nested: bool) -> bool {
             ))
 }
 
+/// Only a scalar and a singleton, unadorned text block can differ in form.
+/// All message fields outside content must still match, including the role.
+fn text_form_flip(left: &Value, right: &Value) -> bool {
+    let Some((left, right)) = left.as_object().zip(right.as_object()) else {
+        return false;
+    };
+    let text_block = |value: &Value| {
+        let blocks = value.as_array()?;
+        let [block] = blocks.as_slice() else {
+            return None;
+        };
+        let block = block.as_object()?;
+        (block.len() == 2 && block.get("type")?.as_str()? == "text")
+            .then(|| block.get("text")?.as_str().map(str::to_owned))?
+    };
+    let (Some(a), Some(b)) = (left.get("content"), right.get("content")) else {
+        return false;
+    };
+    let equal_text = match (a.as_str(), b.as_str()) {
+        (Some(text), None) => text_block(b).as_deref() == Some(text),
+        (None, Some(text)) => text_block(a).as_deref() == Some(text),
+        _ => false,
+    };
+    equal_text
+        && left.len() == right.len()
+        && left
+            .iter()
+            .all(|(key, value)| key == "content" || right.get(key) == Some(value))
+}
+
+/// Substitute the first stored envelope before checking immutable message rows.
+/// This runs under the provider lock. Rendering must retain the original bytes:
+/// Anthropic thinking signatures depend on the exact preceding message prefix.
+pub(super) fn preserve_stored_forms(
+    store: &McStore,
+    key: &Key,
+    lineage: &mc_store::provider_records::ProviderLineage,
+    messages: &mut [mc_store::provider_records::ProviderMessage],
+) -> Result<(), HandlerOutcome> {
+    for message in messages {
+        let lookup = match (&lineage.descends_from, lineage.through_ordinal) {
+            (Some(parent), Some(cut)) if message.ordinal <= cut => parent.as_str(),
+            _ => lineage.lineage_id.as_str(),
+        };
+        let Some(stored) = store
+            .load_provider_message(&key.store_key(), lookup, message.ordinal, &message.mid)
+            .map_err(transient)?
+        else {
+            continue;
+        };
+        let incoming: Value = serde_json::from_slice(&message.message_bytes).map_err(transient)?;
+        let original: Value = serde_json::from_slice(&stored.message_bytes).map_err(transient)?;
+        if text_form_flip(&incoming["message"], &original["message"]) {
+            let current = incoming["raw_message"]
+                .as_str()
+                .ok_or_else(|| invalid_raw("missing raw_message"))?;
+            let first = original["raw_message"]
+                .as_str()
+                .ok_or_else(|| invalid_raw("missing raw_message"))?;
+            // Only content's form may change. Whitespace, escaping and member
+            // order outside that value remain part of the immutable raw identity.
+            if field(current, "content", "null")? == field(first, "content", "null")? {
+                message.message_bytes.clone_from(&stored.message_bytes);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn envelope(message: &Value, raw: Option<&Value>) -> Result<Value, HandlerOutcome> {
     let raw = raw
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_raw("Claude Code requires raw_message"))?;
     let parsed = parse_unique_json(raw)?;
-    if &parsed != message || has_marker(&parsed) {
+    if (&parsed != message && !text_form_flip(&parsed, message))
+        || has_marker(&parsed)
+        || has_marker(message)
+    {
         return Err(invalid_raw(
             "raw_message must equal message and exclude transport cache_control",
         ));
@@ -135,7 +207,7 @@ pub(super) fn envelope(message: &Value, raw: Option<&Value>) -> Result<Value, Ha
     {
         return Err(invalid_raw("invalid Anthropic message role/content"));
     }
-    Ok(json!({"message":message,"raw_message":raw}))
+    Ok(json!({"message":parsed,"raw_message":raw}))
 }
 
 /// Build and validate {message, raw_message} from the decoded commons fields.

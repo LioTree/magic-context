@@ -449,11 +449,17 @@ impl McHandler {
                 p.subject_part = id.clone();
             }
         }
-        let input = ProviderMessage {
+        let mut input = ProviderMessage {
             mid: mid.into(),
             ordinal,
             message_bytes: serde_json::to_vec(&message).map_err(transient)?,
         };
+        super::codec_claude_code::preserve_stored_forms(
+            &store,
+            &key,
+            &lineage,
+            std::slice::from_mut(&mut input),
+        )?;
         // Claude Code does not yet authorize tool reductions or delivery notices
         // through this plan. Record an unchanged hook result instead of proposing
         // edits that could change the prefix bound to a thinking signature.
