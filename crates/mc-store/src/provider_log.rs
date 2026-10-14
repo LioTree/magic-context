@@ -1044,6 +1044,37 @@ impl McStore {
             .inner
             .with_conn(|conn| lineage_tx(conn, &key.conversation_key(), lineage_id))?)
     }
+
+    /// An explicit setup can start a separate root without declaring ancestry.
+    /// Ordinary status and hook admission still reject undeclared new roots.
+    /// Old messages and frozen views remain immutable; view publication is still
+    /// scoped by the provider to the active lineage.
+    pub fn start_provider_root_lineage(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &ProviderLineage,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|conn| {
+            let conv = key.conversation_key();
+            if lineage.descends_from.is_some() || lineage.through_ordinal.is_some() {
+                return Err(rusqlite::Error::InvalidParameterName("descends_from".into()));
+            }
+            if let Some(held) = lineage_tx(conn, &conv, &lineage.lineage_id)? {
+                return if held == *lineage { Ok(()) } else {
+                    Err(rusqlite::Error::InvalidParameterName("lineage_id".into()))
+                };
+            }
+            remove_policy_tx(conn, &conv, "1=1", [&conv])?;
+            burn_where_tx(conn, &conv, "1=1", [&conv])?;
+            conn.execute("UPDATE mc_provider_hook_answers_v1 SET state='burned' WHERE conv_key=?1 AND state IN ('pending','live')", [&conv])?;
+            conn.execute(
+                "INSERT INTO mc_provider_lineages_v1 VALUES (?1,?2,?3,NULL,NULL,json_extract(?1,'$[1]'))",
+                params![conv, lineage.lineage_id, as_i64(lineage.first_ordinal)?],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
     /// Advance a frozen view's application state without reading or rewriting
     /// replacement bytes. An invalidated/rejected view cannot become applied.
     pub fn set_provider_view_state(
@@ -1338,6 +1369,22 @@ impl McStore {
         Ok(self
             .inner
             .with_conn(|conn| messages_tx(conn, &key.conversation_key(), lineage))?)
+    }
+
+    /// Read a stored MID/ordinal pair, following `descends_from` through its cut.
+    /// A resend of one message does not need to load the entire message log.
+    pub fn load_provider_message(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+        ordinal: u64,
+        mid: &str,
+    ) -> Result<Option<ProviderMessage>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let (message, _) =
+                held_message_tx(conn, &key.conversation_key(), lineage, ordinal, mid)?;
+            Ok(message.filter(|message| message.mid == mid))
+        })?)
     }
     pub fn provider_frontier(
         &self,

@@ -135,8 +135,24 @@ fn host_lineage(
     params: &Value,
     request: &compact::status::StepStatus,
 ) -> Result<ProviderLineage, HandlerOutcome> {
+    host_lineage_fields(
+        store,
+        key,
+        params,
+        &request.lineage_id,
+        request.messages.first().map_or(1, |m| m.ordinal),
+    )
+}
+
+fn host_lineage_fields(
+    store: &McStore,
+    key: &Key,
+    params: &Value,
+    lineage_id: &str,
+    first_ordinal: u64,
+) -> Result<ProviderLineage, HandlerOutcome> {
     let held = store
-        .load_provider_lineage(&key.store_key(), &request.lineage_id)
+        .load_provider_lineage(&key.store_key(), lineage_id)
         .map_err(transient)?;
     let descent = params.get("descends_from").filter(|v| !v.is_null());
     let parent = descent
@@ -163,11 +179,11 @@ fn host_lineage(
         return Ok(held);
     }
     Ok(ProviderLineage {
-        lineage_id: request.lineage_id.clone(),
+        lineage_id: lineage_id.into(),
         first_ordinal: cut
             .map(|n| n.checked_add(1).ok_or_else(|| invalid_field("lineage_id")))
             .transpose()?
-            .unwrap_or_else(|| request.messages.first().map_or(1, |m| m.ordinal)),
+            .unwrap_or(first_ordinal),
         descends_from: parent.map(str::to_string),
         through_ordinal: cut,
     })
@@ -1263,6 +1279,7 @@ impl McHandler {
         key: &Key,
         request: compact::setup::SetupRequest,
         chosen: transform::compaction::Preset,
+        params: &Value,
     ) -> Result<Vec<u8>, HandlerOutcome> {
         let codec = Codec::from_params(&Value::Object(request.params.clone()))?;
         if !binding.config.compaction_enabled {
@@ -1346,8 +1363,80 @@ impl McHandler {
                 chosen,
             )?);
         }
-        // Setup is an insertion, not an engine opportunity. In particular, it
-        // must not seed or mutate frozen full-request state during a switch.
+        let setup_lineage = if codec == Codec::ClaudeCodeAnthropic {
+            request
+                .lineage_id
+                .as_deref()
+                .map(|id| host_lineage_fields(store, key, params, id, 0))
+                .transpose()?
+        } else {
+            None
+        };
+        if let Some(lineage) = &setup_lineage {
+            conversation.lineage_id.clone_from(&lineage.lineage_id);
+            if let Some(parent) = &lineage.descends_from {
+                let frontier = store
+                    .provider_frontier(&key.store_key(), parent)
+                    .map_err(transient)?;
+                if frontier <= lineage.through_ordinal.expect("paired descent") {
+                    return bytes(&gap_answer(&request.request_id, frontier));
+                }
+            }
+        }
+        if let (Some(lineage), Some(applied)) = (&setup_lineage, &setup.applied) {
+            let cut = ancestor_cut(store, key, lineage, &applied.range.lineage_id)?;
+            if !applied.range.lineage_id.is_empty()
+                && cut.is_none_or(|cut| applied.range.to > 0 && cut < applied.range.to - 1)
+            {
+                // Ranges belong to a lineage. An unrelated setup cannot inherit
+                // an applied prefix; a descendant may inherit only its declared cut.
+                let id = format!(
+                    "mc-{}",
+                    sha256_hex(
+                        serde_json::to_vec(&json!([
+                            setup.setup.state.compaction_id,
+                            lineage.lineage_id,
+                            conversation.version_high_water,
+                            request.request_id,
+                            request.now,
+                        ]))
+                        .map_err(transient)?
+                        .as_slice()
+                    )
+                );
+                setup.setup.state = transform::compaction::State::new(id, chosen);
+                setup.setup.request = request.clone();
+                setup.applied = None;
+                setup.produced = None;
+                setup.invalidated = false;
+                setup.repair_pending = false;
+                // The native namespace is immutable. Reset its engine cache,
+                // not its identity, so old heads cannot seed the new conversation.
+                let row_version = store
+                    .load_meta(&conversation.engine_namespace)
+                    .map_err(transient)?
+                    .row_version;
+                if row_version.is_some() {
+                    store
+                        .reset_session_for_recomp(&conversation.engine_namespace, row_version)
+                        .map_err(transient)?;
+                }
+                conversation.hook_counters_json = "{}".into();
+                conversation.historian_model_chain_json = "[]".into();
+                conversation.lineage_id = lineage.lineage_id.clone();
+                conversation.cursor_frontier = 0;
+                conversation.served_through_ordinal = None;
+                conversation.wait_request = None;
+                if lineage.descends_from.is_none() {
+                    store
+                        .start_provider_root_lineage(&key.store_key(), lineage)
+                        .map_err(transient)?;
+                }
+            }
+        }
+        // Setup does not run the engine or seed a head. A transport switch
+        // within the same lineage leaves its frozen engine state untouched;
+        // only a setup that cannot inherit the applied prefix resets it above.
         let high = conversation
             .version_high_water
             .max(setup.setup.state.version_high_water)
@@ -1355,6 +1444,9 @@ impl McHandler {
             .ok_or_else(|| transient("version exhausted"))?;
         let mut view = if let Some(summary) = &setup.applied {
             let mut view = load_host_view(store, key, summary)?;
+            if let Some(lineage) = &setup_lineage {
+                view.engine.range.lineage_id.clone_from(&lineage.lineage_id);
+            }
             view.engine.version = high;
             view.wire.version = high;
             view
@@ -1546,7 +1638,7 @@ impl McHandler {
                 return bytes(&gap_answer(&request.request_id, frontier));
             }
         }
-        let messages = request
+        let mut messages = request
             .messages
             .iter()
             .map(|m| {
@@ -1563,6 +1655,14 @@ impl McHandler {
                 })
             })
             .collect::<Result<Vec<_>, HandlerOutcome>>()?;
+        if codec == Codec::ClaudeCodeAnthropic {
+            super::codec_claude_code::preserve_stored_forms(
+                store,
+                &work.key,
+                &lineage,
+                &mut messages,
+            )?;
+        }
         let unserved = params
             .get("unserved_subjects")
             .map(|v| {
@@ -1907,7 +2007,7 @@ impl McHandler {
             } else {
                 None
             };
-            return self.host_setup(&store, binding, &key, request, chosen);
+            return self.host_setup(&store, binding, &key, request, chosen, params);
         }
         let mut record = self.provider_store.load(&key)?;
         if record.catalog.is_none() {

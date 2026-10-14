@@ -1,5 +1,6 @@
-//! Claude Code routes require daemon-confirmed gateway identity; admitted message
-//! IDs cannot later name different bytes. These tests do not use an LLM runner.
+//! Claude Code routes require the daemon to identify the caller as THALAMUS.
+//! Stored message IDs retain their first bytes across scalar/single-text-block
+//! form flips; all other changes remain conflicts. No LLM runner is used here.
 use super::*;
 
 pub(super) fn binding(root: &Path, principal: Option<subc_protocol::Principal>) -> SessionBinding {
@@ -935,4 +936,365 @@ async fn first_head_sequence(first_raw: &str, last_part: u64, cut_unfolded: bool
         cut
     );
     assert_eq!(native_read(&h, &frozen.view).await, prefix);
+}
+
+const FORM_SCALAR: &str = r#"{ "role":"system", "content":"cache marker text" }"#;
+const FORM_BLOCKS: &str =
+    r#"{ "role":"system", "content":[{"type":"text","text":"cache marker text"}] }"#;
+
+#[tokio::test]
+async fn cc_known_mid_string_then_blocks_keeps_first_bytes() {
+    form_flip_sequence(FORM_SCALAR, FORM_BLOCKS).await;
+}
+
+#[tokio::test]
+async fn cc_known_mid_blocks_then_string_keeps_first_bytes() {
+    form_flip_sequence(FORM_BLOCKS, FORM_SCALAR).await;
+}
+
+async fn form_flip_sequence(first: &str, flipped: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    setup(&h).await;
+    response(call(&h, "compaction.step", step(first)).await);
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    let store = h.store.get().unwrap();
+    let original = store.load_provider_messages(&key.store_key(), "L").unwrap();
+    for (turn, raw) in [flipped, first, flipped, first].into_iter().enumerate() {
+        let mut status = step(raw);
+        status["request_id"] = json!(format!("flip-{turn}"));
+        // `message` can describe the first-stored form while `raw_message`
+        // carries the form received from Claude Code on this turn.
+        status["messages"][0]["message"] = serde_json::from_str::<Value>(first).unwrap();
+        response(call(&h, "compaction.step", status).await);
+        assert_eq!(
+            store.load_provider_messages(&key.store_key(), "L").unwrap(),
+            original
+        );
+    }
+    let scalar = r#"{ "role":"assistant", "content":"hook text" }"#;
+    let blocks = r#"{ "role":"assistant", "content":[{"type":"text","text":"hook text"}] }"#;
+    let hook_first = if first == FORM_SCALAR { scalar } else { blocks };
+    let hook_flip = if first == FORM_SCALAR { blocks } else { scalar };
+    for (turn, raw) in [hook_first, hook_flip, hook_first, hook_flip]
+        .into_iter()
+        .enumerate()
+    {
+        let hook = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":format!("hook-{turn}"),"params":plan(),"subject_mid":"hook","subject_ordinal":1,"message":serde_json::from_str::<Value>(hook_first).unwrap(),"raw_message":raw,"hook":"post_assistant","blocks":["hook text"]});
+        assert_eq!(
+            response(call(&h, "transform.hook", hook).await)["answer"],
+            "pass"
+        );
+        let mut status = step(first);
+        status["request_id"] = json!(format!("after-hook-{turn}"));
+        status["messages"].as_array_mut().unwrap().push(json!({"mid":"hook","ordinal":1,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw}));
+        status["newest"] = json!({"mid":"hook","ordinal":1});
+        response(call(&h, "compaction.step", status).await);
+        let held = store.load_provider_messages(&key.store_key(), "L").unwrap();
+        assert_eq!(held[0], original[0]);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&held[1].message_bytes).unwrap()["raw_message"],
+            hook_first
+        );
+    }
+}
+
+#[tokio::test]
+async fn cc_known_mid_non_equivalent_changes_remain_conflicts() {
+    for first in [FORM_SCALAR, FORM_BLOCKS] {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        setup(&h).await;
+        response(call(&h, "compaction.step", step(first)).await);
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        let original = store.load_provider_messages(&key.store_key(), "L").unwrap();
+        for raw in [
+            r#"{ "role":"system", "content":"changed text" }"#,
+            r#"{ "role":"user", "content":"cache marker text" }"#,
+            r#"{ "role":"system", "content":[{"type":"text","text":"cache marker text","extra":true}] }"#,
+            r#"{ "role":"system", "content":[{"type":"text","text":"cache marker text"},{"type":"text","text":""}] }"#,
+            r#"{ "role":"system", "content":"cache marker text", "extra":true }"#,
+            if first == FORM_SCALAR {
+                r#"{ "content":[{"type":"text","text":"cache marker text"}], "role":"system" }"#
+            } else {
+                r#"{ "content":"cache marker text", "role":"system" }"#
+            },
+            if first == FORM_SCALAR {
+                r#"{ "role":"system",  "content":[{"type":"text","text":"cache marker text"}] }"#
+            } else {
+                r#"{ "role":"system",  "content":"cache marker text" }"#
+            },
+            if first == FORM_SCALAR {
+                r#"{"role":"system","content":"cache marker text"}"#
+            } else {
+                r#"{"role":"system","content":[{"type":"text","text":"cache marker text"}]}"#
+            },
+        ] {
+            assert_eq!(
+                code(call(&h, "compaction.step", step(raw)).await),
+                "invalid_params"
+            );
+            assert_eq!(
+                store.load_provider_messages(&key.store_key(), "L").unwrap()[0],
+                original[0]
+            );
+        }
+        let hook_raw = r#"{ "role":"assistant", "content":"original hook" }"#;
+        let mut hook = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"hook-original","params":plan(),"subject_mid":"hook","subject_ordinal":1,"message":serde_json::from_str::<Value>(hook_raw).unwrap(),"raw_message":hook_raw,"hook":"post_assistant","blocks":["original hook"]});
+        assert_eq!(
+            response(call(&h, "transform.hook", hook.clone()).await)["answer"],
+            "pass"
+        );
+        let held = store.load_provider_messages(&key.store_key(), "L").unwrap();
+        let changed = r#"{ "role":"assistant", "content":[{"type":"text","text":"original hook","extra":true}] }"#;
+        hook["message"] = serde_json::from_str::<Value>(changed).unwrap();
+        hook["raw_message"] = json!(changed);
+        assert_eq!(
+            code(call(&h, "transform.hook", hook).await),
+            "invalid_params"
+        );
+        assert_eq!(
+            store.load_provider_messages(&key.store_key(), "L").unwrap(),
+            held
+        );
+    }
+}
+
+#[test]
+fn cc_form_flip_identity_fingerprints_match_without_rewriting_raw() {
+    let project = |raw: &str| {
+        let entry = compact::status::StatusMessage {
+            raw_message: None,
+            ordinal: 0,
+            mid: "m".into(),
+            message: super::codec_claude_code::from_wire(
+                &serde_json::from_str::<Value>(raw).unwrap(),
+                Some(raw),
+            )
+            .unwrap(),
+        };
+        let ingress = super::codec_claude_code::decode_message(&entry).unwrap();
+        let projected = ck_wire::project_messages(std::slice::from_ref(&ingress)).unwrap();
+        assert_eq!(super::codec_claude_code::render(&ingress.ck).unwrap(), raw);
+        projected.identity_by_mid
+    };
+    assert_eq!(project(FORM_SCALAR), project(FORM_BLOCKS));
+}
+
+async fn native_setup_for_lineage(h: &McHandler, lineage: &str, descent: Option<Value>) -> Value {
+    let pins = h.native_pins();
+    let declare = json!({"preset":"head","params":plan(),"composition":{},"claude_code":pins});
+    h.admit_native_plan(
+        7,
+        &h.facade_binding(7).unwrap(),
+        "transform.declare",
+        &declare,
+    )
+    .await
+    .unwrap();
+    let mut request = json!({"session":"cc","harness":"claude-code","request_id":format!("setup-{lineage}"),"preset":"head","params":plan(),"composition":{},"claude_code":pins,"model":"fixture","context_window":100000,"lineage_id":lineage,"now":1});
+    if let Some(descent) = descent {
+        request["descends_from"] = descent;
+    }
+    let bytes = h
+        .provider_setup(h.facade_binding(7).unwrap(), &request)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn native_step(h: &McHandler, status: &Value) -> Value {
+    let bytes = h
+        .provider_step(h.facade_binding(7).unwrap(), status)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn cc_covered_form_flip_keeps_frozen_prefix_and_does_not_emit_unfrozen_tail() {
+    for (first, flipped) in [
+        (
+            r#"{ "role":"user", "content":"first user" }"#,
+            r#"{ "role":"user", "content":[{"type":"text","text":"first user"}] }"#,
+        ),
+        (
+            r#"{ "role":"user", "content":[{"type":"text","text":"first user"}] }"#,
+            r#"{ "role":"user", "content":"first user" }"#,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        native_setup_for_lineage(&h, "L", None).await;
+        let tail = r#"{ "role":"assistant", "content":"unfrozen tail" }"#;
+        let tail_flip =
+            r#"{ "role":"assistant", "content":[{"type":"text","text":"unfrozen tail"}] }"#;
+        let mut status = step(first);
+        status["messages"].as_array_mut().unwrap().push(json!({"mid":"tail","ordinal":1,"message":serde_json::from_str::<Value>(tail).unwrap(),"raw_message":tail}));
+        status["newest"] = json!({"mid":"tail","ordinal":1});
+        let answer = native_step(&h, &status).await;
+        assert_eq!(answer["coverage"]["ordinal"], 0);
+        let frozen: compact::view::FrozenView =
+            serde_json::from_value(answer["compaction"]["raw_view"].clone()).unwrap();
+        let prefix = native_read(&h, &frozen.view).await;
+        assert!(prefix.ends_with(&format!(",{first}]")));
+        assert!(!prefix.contains("unfrozen tail"));
+        assert_eq!(frozen.retained_tail, Some(vec![]));
+        status["last_applied"] = json!({"compaction_id":answer["compaction"]["compaction_id"],"version":answer["compaction"]["version"]});
+        for (turn, raw) in [flipped, first, flipped].into_iter().enumerate() {
+            status["messages"][0]["message"] = serde_json::from_str::<Value>(raw).unwrap();
+            status["messages"][0]["raw_message"] = json!(raw);
+            status["messages"][1]["message"] = serde_json::from_str::<Value>(tail_flip).unwrap();
+            status["messages"][1]["raw_message"] = json!(tail_flip);
+            status["request_id"] = json!(format!("covered-flip-{turn}"));
+            assert_eq!(native_step(&h, &status).await["answer"], "noop");
+            assert_eq!(native_read(&h, &frozen.view).await, prefix);
+            assert_eq!(
+                native_read(&h, frozen.cut_replacement_ref.as_ref().unwrap()).await,
+                prefix
+            );
+        }
+        let repeated_setup = native_setup_for_lineage(&h, "L", None).await;
+        let repeated: compact::view::FrozenView =
+            serde_json::from_value(repeated_setup["initial"]["raw_view"].clone()).unwrap();
+        assert_eq!(native_read(&h, &repeated.view).await, prefix);
+        assert!(!repeated_setup.to_string().contains("unfrozen tail"));
+    }
+}
+
+#[tokio::test]
+async fn cc_setup_unrelated_lineage_starts_fresh_but_descendant_keeps_applied_view() {
+    for descendant in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        native_setup_for_lineage(&h, "L", None).await;
+        let raw = r#"{ "role":"user", "content":"old lineage original" }"#;
+        let hook = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"old-hook","params":plan(),"subject_mid":"m","subject_ordinal":0,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw,"hook":"pre_user","blocks":["old lineage original"]});
+        assert_eq!(
+            response(call(&h, "transform.hook", hook).await)["answer"],
+            "pass"
+        );
+        let mut status = step(raw);
+        let produced = native_step(&h, &status).await;
+        assert_eq!(produced["compaction"]["range"], json!({"from":0,"to":1}));
+        status["last_applied"] = json!({"compaction_id":produced["compaction"]["compaction_id"],"version":produced["compaction"]["version"]});
+        status["request_id"] = json!("ack-old");
+        assert_eq!(native_step(&h, &status).await["answer"], "noop");
+        let old_frozen: compact::view::FrozenView =
+            serde_json::from_value(produced["compaction"]["raw_view"].clone()).unwrap();
+        let old_bytes = native_read(&h, &old_frozen.view).await;
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        let old_row = store
+            .load_provider_view(&key.store_key(), old_frozen.view.version)
+            .unwrap()
+            .unwrap();
+        let descent = descendant.then(|| json!({"lineage_id":"L","through_ordinal":0}));
+        let missing = native_setup_for_lineage(
+            &h,
+            "missing",
+            Some(json!({"lineage_id":"L","through_ordinal":999})),
+        )
+        .await;
+        assert_eq!(missing["answer"], "refuse");
+        assert_eq!(missing["code"], "history_unreadable");
+        assert_eq!(native_read(&h, &old_frozen.view).await, old_bytes);
+        let ready = native_setup_for_lineage(&h, "new", descent.clone()).await;
+        assert!(
+            ready["initial"]["version"].as_u64().unwrap()
+                > produced["compaction"]["version"].as_u64().unwrap()
+        );
+        if descendant {
+            assert_eq!(
+                ready["initial"]["compaction_id"],
+                produced["compaction"]["compaction_id"]
+            );
+            assert_eq!(
+                ready["initial"]["replacement"],
+                produced["compaction"]["replacement"]
+            );
+            let frozen: compact::view::FrozenView =
+                serde_json::from_value(ready["initial"]["raw_view"].clone()).unwrap();
+            assert_eq!(frozen.lineage_id, "new");
+            assert_eq!(native_read(&h, &frozen.view).await, old_bytes);
+        } else {
+            assert_ne!(
+                ready["initial"]["compaction_id"],
+                produced["compaction"]["compaction_id"]
+            );
+            assert_eq!(ready["initial"]["range"], json!({"from":0,"to":0}));
+            assert_eq!(ready["initial"]["replacement"], json!([]));
+            assert!(ready["initial"].get("raw_view").is_none());
+            assert!(store
+                .load_provider_hook_answers(&key.store_key())
+                .unwrap()
+                .iter()
+                .all(|answer| answer.state == "burned"));
+            let engine = store.load(&key.engine_key()).unwrap();
+            assert!(!engine.meta.initialized);
+            assert!(engine.core.frozen_units.is_empty());
+        }
+        let new_raw = r#"{ "role":"user", "content":"new lineage original" }"#;
+        let mut next = step(new_raw);
+        next["lineage_id"] = json!("new");
+        next["request_id"] = json!("new-step");
+        next["messages"][0]["mid"] = json!("new-mid");
+        next["messages"][0]["ordinal"] = json!(if descendant { 1 } else { 0 });
+        next["newest"] = json!({"mid":"new-mid","ordinal":if descendant {1} else {0}});
+        next["last_applied"] = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+        if let Some(descent) = descent {
+            next["descends_from"] = descent;
+            let flipped =
+                r#"{ "role":"user", "content":[{"type":"text","text":"old lineage original"}] }"#;
+            next["messages"].as_array_mut().unwrap().insert(0, json!({"mid":"m","ordinal":0,"message":serde_json::from_str::<Value>(flipped).unwrap(),"raw_message":flipped}));
+        }
+        let next_answer = native_step(&h, &next).await;
+        if descendant {
+            assert_eq!(next_answer["answer"], "noop");
+        } else {
+            assert_eq!(next_answer["answer"], "compaction_message");
+            assert!(next_answer.to_string().contains("new lineage original"));
+            assert!(!next_answer.to_string().contains("old lineage original"));
+        }
+        assert_eq!(
+            store
+                .load_provider_view(&key.store_key(), old_frozen.view.version)
+                .unwrap()
+                .unwrap()
+                .replacement_json,
+            old_row.replacement_json
+        );
+        let read = json!({"request_id":"old-read","view_id":old_frozen.view.view_id,"version":old_frozen.view.version,"sha256":old_frozen.view.sha256,"byte_cursor":0});
+        let bytes = h
+            .provider_native_view_read(h.facade_binding(7).unwrap(), &read)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["answer"],
+            "refuse"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cc_setup_new_root_next_step_proceeds_without_old_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    native_setup_for_lineage(&h, "L", None).await;
+    let mut status = step(r#"{"role":"user","content":"old root"}"#);
+    let first = native_step(&h, &status).await;
+    status["last_applied"] = json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
+    status["request_id"] = json!("old-ack");
+    assert_eq!(native_step(&h, &status).await["answer"], "noop");
+    let ready = native_setup_for_lineage(&h, "unrelated", None).await;
+    let mut next = step(r#"{"role":"user","content":"new root"}"#);
+    next["lineage_id"] = json!("unrelated");
+    next["messages"][0]["mid"] = json!("new-mid");
+    next["newest"]["mid"] = json!("new-mid");
+    next["last_applied"] = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    let answer = native_step(&h, &next).await;
+    assert_eq!(answer["answer"], "compaction_message");
+    assert!(answer.to_string().contains("new root"));
+    assert!(!answer.to_string().contains("old root"));
 }
