@@ -233,6 +233,97 @@ function fixture(host: "v1" | "v2", options: OpenCodeProviderOptions = {}) {
         },
     };
 }
+
+test("provider-native projection excludes display metadata from pages, hooks, stored rows and restarted views", async () => {
+    const toolMessage = (id: string): MessageLike => ({
+        ...message(id, "assistant"),
+        parts: [
+            {
+                type: "tool",
+                tool: "edit",
+                callID: `${id}-edit`,
+                metadata: { anthropic: { signature: "keep-provider-metadata" } },
+                state: {
+                    status: "completed",
+                    input: { filePath: "a.ts", oldString: "a", newString: "b" },
+                    output: "Edit applied successfully.",
+                    attachments: [],
+                    title: "display-title",
+                    time: { start: 1, end: 2, compacted: 3 },
+                    metadata: { diagnostics: "display-diagnostics" },
+                },
+            },
+            {
+                id: `${id}-error`,
+                type: "tool",
+                tool: "bash",
+                callID: `${id}-bash`,
+                state: {
+                    status: "error",
+                    input: { command: "sleep 1" },
+                    error: "aborted",
+                    time: { start: 1, end: 2 },
+                    metadata: {
+                        interrupted: true,
+                        output: "keep-partial-output",
+                        diagnostics: "display-diagnostics",
+                    },
+                },
+            },
+        ],
+    });
+    const assertProjected = (value: unknown) => {
+        const json = JSON.stringify(value);
+        expect(json).not.toContain("display-diagnostics");
+        expect(json).not.toContain("display-title");
+        expect(json).toContain("keep-provider-metadata");
+        expect(json).toContain("keep-partial-output");
+    };
+    for (const host of ["v1", "v2"] as const) {
+        const f = fixture(host);
+        const first = toolMessage("first");
+        const appended = toolMessage("appended");
+        assertProjected(await f.pass([first]));
+        assertProjected(await f.pass([first, appended]));
+        const pages = f.wires.filter((w) => w.method === "compaction.step");
+        const hooks = f.wires.filter((w) => w.method === "transform.hook");
+        expect(pages.flatMap((w) => w.params.messages).map((m) => m.mid)).toEqual(["first"]);
+        expect(hooks.length).toBe(3);
+        expect(hooks.every((w) => w.params.subject_mid === "appended")).toBe(true);
+        assertProjected(pages);
+        assertProjected(hooks);
+        const stored = f.stored()!;
+        expect(stored.ids.get("first")).toBe(1);
+        expect(stored.ids.get("appended")).toBe(2);
+        assertProjected(stored.entries.map((e) => JSON.parse(e.ingest_json)));
+        assertProjected(JSON.parse(stored.views[0]!.replacement_json));
+        expect(JSON.stringify(first)).toContain("display-diagnostics");
+        f.restart();
+        assertProjected(await f.pass([first, appended]));
+        expect(f.wires.filter((w) => w.method === "transform.hook").length).toBe(3);
+    }
+
+    // The v2 adapter saves original tools in info.magicContextHostReplay to
+    // rebuild call/result pairs after restart. Filtering only parts[] would
+    // leave diagnostics in that nested copy.
+    const f = fixture("v2");
+    const draft: SessionContext = {
+        sessionID: "session",
+        model: { providerID: "openai", id: "gpt-5.6" },
+        agent: "build",
+        system: [],
+        tools: {},
+        options: {},
+        messages: [{ id: "native", role: "assistant", content: toolMessage("native").parts }],
+    } as SessionContext;
+    const mapped = adaptPayload(draft);
+    assertProjected(await f.pass(mapped.messages as MessageLike[]));
+    assertProjected(f.wires);
+    assertProjected(JSON.parse(f.stored()!.views[0]!.replacement_json));
+    f.restart();
+    assertProjected(await f.pass(mapped.messages as MessageLike[]));
+});
+
 for (const host of ["v1", "v2"] as const)
     describe(`OpenCode ${host} provider adapter`, () => {
         test("adapter methods keep usage durable and admit the exact last served view plus raw tail", async () => {

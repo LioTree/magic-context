@@ -110,11 +110,62 @@ export function providerVisiblePart(part: unknown): unknown {
  * same object when no part changes.
  */
 export function providerVisibleMessage<T>(message: T): T {
+    return projectMessageParts(message, providerVisiblePart);
+}
+
+// The Rust context module (ck-mc) and the host's automatic output-removal policy
+// read these keys to recognize user answers.
+// They are not model fields, but discarding them would make answers reclaimable.
+const KEPT_POLICY_METADATA_FIELDS = [
+    "userAnswer",
+    "answers",
+    "answer",
+    "selectedOptions",
+    "customInput",
+    "results",
+] as const;
+
+function policyMetadata(metadata: unknown): Record<string, unknown> {
+    if (!isRecord(metadata)) return {};
+    const kept: Record<string, unknown> = {};
+    for (const field of KEPT_POLICY_METADATA_FIELDS) {
+        if (!Object.hasOwn(metadata, field)) continue;
+        kept[field] =
+            field === "results" && Array.isArray(metadata.results)
+                ? metadata.results.map(policyMetadata)
+                : metadata[field];
+    }
+    return kept;
+}
+
+/** Keep model fields and the answer markers that prevent automatic tool-output removal. */
+export function providerNativePart(part: unknown): unknown {
+    const visible = providerVisiblePart(part);
+    if (!isRecord(part) || part.type !== "tool" || !isRecord(part.state) || !isRecord(visible))
+        return visible;
+    const policy = policyMetadata(part.state.metadata);
+    if (Object.keys(policy).length === 0) return visible;
+    const state = visible.state as Record<string, unknown>;
+    return {
+        ...visible,
+        state: {
+            ...state,
+            metadata: { ...(isRecord(state.metadata) ? state.metadata : {}), ...policy },
+        },
+    };
+}
+
+/** Native provider storage keeps model fields and metadata identifying protected user answers. */
+export function providerNativeMessage<T>(message: T): T {
+    return projectMessageParts(message, providerNativePart);
+}
+
+function projectMessageParts<T>(message: T, projectPart: (part: unknown) => unknown): T {
     if (!isRecord(message) || !Array.isArray(message.parts)) return message;
     let parts: unknown[] | undefined;
     for (let index = 0; index < message.parts.length; index += 1) {
         const part = message.parts[index];
-        const view = providerVisiblePart(part);
+        const view = projectPart(part);
         if (view !== part) {
             parts ??= message.parts.slice(0, index);
             parts.push(view);

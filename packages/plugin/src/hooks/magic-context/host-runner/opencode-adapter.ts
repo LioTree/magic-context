@@ -29,6 +29,7 @@ import { EmergencyFailClosedError } from "../emergency-fail-closed";
 import { createHistorianHostRunner } from "../historian-host-runner";
 import { type ModuleStateSyncState, syncModuleState } from "../module-state-sync";
 import { resolveOrdinalsForModule } from "../module-wire";
+import { providerNativeMessage } from "../provider-visible-parts";
 import { hasRawSessionMessageById } from "../read-session-chunk";
 import { isRawCompactionSummaryInfo } from "../read-session-raw";
 import type { createRustModeTransform, HistorianHostRunnerSeam } from "../rust-mode-transform";
@@ -214,10 +215,15 @@ export function providerIncoming(message: MessageLike): Incoming<MessageLike> {
                 : "terminal";
         },
         read: () => {
+            // This shared input becomes ck-mc's hook and bootstrap/history JSON.
+            // LSP diagnostics are host UI data, not model input. Reuse replay's
+            // model projection, plus the answer markers needed to prevent removal
+            // of user answers, before the context module stores rows or views.
+            const visible = providerNativeMessage(message);
             // Persist the projected identity in ingest as well as the hook. The
             // module can address the same part after a rebuild changes part order.
             let changed = false;
-            const parts = message.parts.map((p, index) => {
+            const parts = visible.parts.map((p, index) => {
                 const tool = part(p);
                 if (
                     tool.type !== "tool" ||
@@ -230,10 +236,10 @@ export function providerIncoming(message: MessageLike): Incoming<MessageLike> {
             });
             const replay = hostReplay.get(message);
             return replay
-                ? { ...message, info: { ...message.info, magicContextHostReplay: replay() }, parts }
+                ? { ...visible, info: { ...visible.info, magicContextHostReplay: replay() }, parts }
                 : changed
-                  ? { ...message, parts }
-                  : message;
+                  ? { ...visible, parts }
+                  : visible;
         },
     };
 }
