@@ -4292,6 +4292,24 @@ function boundaryPrecedesWindow(sessionId: string, boundary: string, firstLiveId
     return precedes;
 }
 
+function logBoundaryPrecedesWindow(
+    options: M0M1RenderOptions,
+    boundary: string,
+    firstLiveId: string,
+): void {
+    const { sessionId } = options;
+    absentBoundaryEpisodeBySession.delete(sessionId);
+    if (precedesWindowLoggedBySession.get(sessionId) === boundary) return;
+    precedesWindowLoggedBySession.set(sessionId, boundary);
+    // Earlier in the same pass, compartment injection may have cut through the
+    // boundary and reduction may have removed empty tool-only steps after it.
+    // Do not imply that the host omitted those rows from its window.
+    sessionLog(
+        sessionId,
+        `prefix trim: boundary ${boundary} precedes the first remaining message ${firstLiveId}; rows between were cut with the summarized history or removed by reduction this pass; pass=${options.isCacheBustingPass ? "priced" : "defer"}; nothing to cut`,
+    );
+}
+
 /** Classify and log a boundary missing from the live array. Never mutates messages. */
 function classifyAbsentBoundary(
     options: M0M1RenderOptions,
@@ -4302,20 +4320,7 @@ function classifyAbsentBoundary(
     const pass = options.isCacheBustingPass ? "priced" : "defer";
     const firstLiveId = firstPersistedLiveId(messages);
     if (firstLiveId !== null && boundaryPrecedesWindow(sessionId, boundary, firstLiveId)) {
-        absentBoundaryEpisodeBySession.delete(sessionId);
-        if (precedesWindowLoggedBySession.get(sessionId) !== boundary) {
-            precedesWindowLoggedBySession.set(sessionId, boundary);
-            // Earlier in the same pass, compartment injection may already have cut
-            // the window through the boundary, and reduction may have removed
-            // messages after it (a message whose only tool calls were dropped
-            // is left empty and removed). A boundary before the first remaining
-            // message therefore does not by itself mean the host's window
-            // started after it, and the line is worded not to suggest that.
-            sessionLog(
-                sessionId,
-                `prefix trim: boundary ${boundary} precedes the first remaining message ${firstLiveId}; rows between were cut with the summarized history or removed by reduction this pass; pass=${pass}; nothing to cut`,
-            );
-        }
+        logBoundaryPrecedesWindow(options, boundary, firstLiveId);
         return "boundary-precedes-window";
     }
     precedesWindowLoggedBySession.delete(sessionId);
@@ -4443,6 +4448,8 @@ function trimToPreparedPrefix(
                 } else {
                     let lastSourcePosition = -1;
                     let sawPersistedRow = false;
+                    let firstLivePosition: number | undefined;
+                    let firstLiveId: string | undefined;
                     let liveOrderError: string | null = null;
                     const retained: MessageLike[] = [];
                     for (const [index, message] of options.messages.entries()) {
@@ -4469,6 +4476,10 @@ function trimToPreparedPrefix(
                             liveOrderError = `live message ${id} violates immutable source order`;
                             break;
                         }
+                        if (firstLivePosition === undefined) {
+                            firstLivePosition = position;
+                            firstLiveId = id;
+                        }
                         lastSourcePosition = position;
                         if (
                             position > boundaryPosition ||
@@ -4479,6 +4490,17 @@ function trimToPreparedPrefix(
                     }
                     if (liveOrderError) status = refuse(liveOrderError);
                     else {
+                        // The pre-edit message order shows the summarized-history boundary
+                        // preceded the first live row, even if preparation or reduction
+                        // removed the boundary. Log that here: the edited array alone
+                        // would no longer contain the evidence for that ordering.
+                        if (
+                            firstLiveId &&
+                            firstLivePosition !== undefined &&
+                            firstLivePosition > boundaryPosition
+                        ) {
+                            logBoundaryPrecedesWindow(options, boundary, firstLiveId);
+                        }
                         options.messages.splice(0, options.messages.length, ...retained);
                         const preserveBoundary = isPartialCompartmentEnd(
                             options.db,
