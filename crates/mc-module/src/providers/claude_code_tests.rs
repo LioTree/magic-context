@@ -2,6 +2,8 @@
 //! Stored message IDs retain their first bytes across scalar/single-text-block
 //! form flips; all other changes remain conflicts. No LLM runner is used here.
 use super::*;
+#[path = "late_descent_tests.rs"]
+mod late_descent_tests;
 
 pub(super) fn binding(root: &Path, principal: Option<subc_protocol::Principal>) -> SessionBinding {
     SessionBinding {
@@ -1680,7 +1682,7 @@ async fn cc_setup_without_parent_first_hook_establishes_identity_parent_descent(
 }
 
 #[tokio::test]
-async fn cc_setup_root_with_messages_or_nonidentity_view_refuses_reparenting() {
+async fn cc_setup_root_with_mismatched_prefix_or_nonidentity_view_refuses_reparenting() {
     for applied_view in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let h = handler(dir.path(), thalamus());
@@ -1735,16 +1737,21 @@ async fn cc_setup_root_with_messages_or_nonidentity_view_refuses_reparenting() {
         status["messages"][0]["ordinal"] = json!(1);
         status["newest"] = json!({"mid":"new-mid","ordinal":1});
         status["descends_from"] = json!({"lineage_id":"parent","through_ordinal":0});
+        let expected_field = if applied_view {
+            "lineage_id"
+        } else {
+            "messages"
+        };
         let result = h.provider_step(h.facade_binding(7).unwrap(), &status).await;
         assert!(
-            matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "lineage_id"),
+            matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == expected_field),
             "occupied root reparented: {result:?}"
         );
         hook["descends_from"] = status["descends_from"].clone();
         hook["subject_ordinal"] = json!(1);
         let outcome = call(&h, "transform.hook", hook).await;
         assert!(
-            matches!(outcome, HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. } if code == "invalid_params" && detail["field"] == "lineage_id"),
+            matches!(outcome, HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. } if code == "invalid_params" && detail["field"] == expected_field),
             "occupied hook reparented: {outcome:?}"
         );
         assert_eq!(

@@ -653,3 +653,274 @@ fn views_are_frozen_at_a_version_and_only_application_state_changes() {
         r#"[ {"frozen":true} ]"#
     );
 }
+
+fn late_descent_fixture(
+    dir: &std::path::Path,
+) -> (
+    McStore,
+    ProviderSessionKey,
+    ProviderLineage,
+    ProviderLineage,
+) {
+    let store = McStore::open_for_test(&descriptor(dir)).unwrap();
+    let key = ProviderSessionKey {
+        harness: "claude-code".into(),
+        generation: Some(crate::provider_records::ProviderGeneration {
+            profile: "profile".into(),
+            provider: "provider".into(),
+        }),
+        ..key()
+    };
+    store
+        .save_provider_conversation(
+            &key,
+            &ProviderConversation {
+                native_pins_json: Some(
+                    json!({"profile_generation":"profile","provider_generation":"provider"})
+                        .to_string(),
+                ),
+                native_plan_json: Some("{}".into()),
+                engine_namespace: "engine".into(),
+                lineage_id: "parent".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let parent = lineage("parent", 0);
+    store
+        .commit_provider_status(&key, &parent, &[message(0)], None, &[])
+        .unwrap();
+    let child = lineage("child", 0);
+    store.start_provider_root_lineage(&key, &child).unwrap();
+    store
+        .save_provider_conversation(
+            &key,
+            &ProviderConversation {
+                native_pins_json: Some(
+                    json!({"profile_generation":"profile","provider_generation":"provider"})
+                        .to_string(),
+                ),
+                native_plan_json: Some("{}".into()),
+                engine_namespace: "engine".into(),
+                lineage_id: "child".into(),
+                setup_json: Some("{}".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .save_provider_view(
+            &key,
+            &ProviderView {
+                version: 4,
+                lineage_id: "child".into(),
+                range_from: 0,
+                range_to: 0,
+                replacement_json: "[]".into(),
+                state: "applied".into(),
+            },
+        )
+        .unwrap();
+    let descendant = ProviderLineage {
+        first_ordinal: 1,
+        descends_from: Some("parent".into()),
+        through_ordinal: Some(0),
+        ..child.clone()
+    };
+    (store, key, child, descendant)
+}
+
+fn late_hook(
+    store: &McStore,
+    key: &ProviderSessionKey,
+    child: &ProviderLineage,
+    message: &ProviderMessage,
+    ops: &str,
+    tagged: bool,
+) {
+    store
+        .commit_provider_hook(
+            key,
+            ProviderHookRequest {
+                lineage: child,
+                message: Some(message),
+                served_through_ordinal: None,
+                unserved_subjects: &[],
+                repeat_subject: None,
+            },
+            |ctx| {
+                Ok((
+                    ProviderHookWrite {
+                        answer: Some(ProviderHookAnswer {
+                            subject: subject(&message.mid, ""),
+                            ordinal: message.ordinal,
+                            ops_json: ops.into(),
+                            tags: if tagged {
+                                vec![ProviderAnswerTag {
+                                    number: 1,
+                                    block_id: format!("{}#0", message.mid),
+                                    kind: "tool_result".into(),
+                                    source: "payload".into(),
+                                    token_count: 2,
+                                    created_at_ms: 10,
+                                }]
+                            } else {
+                                vec![]
+                            },
+                        }),
+                        counters: ctx.counters.clone(),
+                        policy_summary: None,
+                    },
+                    (),
+                ))
+            },
+        )
+        .unwrap();
+}
+
+fn assert_late_refusal(
+    store: &McStore,
+    key: &ProviderSessionKey,
+    child: &ProviderLineage,
+    descendant: &ProviderLineage,
+    field: &str,
+) {
+    let before = store
+        .load_provider_messages(key, &child.lineage_id)
+        .unwrap();
+    let conversation =
+        serde_json::to_value(store.load_provider_conversation(key).unwrap()).unwrap();
+    let result = store.commit_provider_status(key, descendant, &[message(1)], None, &[]);
+    assert!(
+        matches!(result, Err(ProviderError::InvalidParams { field: actual }) if actual == field),
+        "{result:?}"
+    );
+    assert_eq!(
+        store
+            .load_provider_lineage(key, &child.lineage_id)
+            .unwrap()
+            .as_ref(),
+        Some(child)
+    );
+    assert_eq!(
+        store
+            .load_provider_messages(key, &child.lineage_id)
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        serde_json::to_value(store.load_provider_conversation(key).unwrap()).unwrap(),
+        conversation
+    );
+}
+
+#[test]
+fn late_descent_accepts_pass_hooks_and_matching_prefix_and_new_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, key, child, descendant) = late_descent_fixture(dir.path());
+    late_hook(&store, &key, &child, &message(0), "[]", false);
+    late_hook(&store, &key, &child, &message(1), "[]", false);
+    store
+        .commit_provider_status(&key, &descendant, &[message(2)], None, &[])
+        .unwrap();
+    assert_eq!(
+        store.load_provider_messages(&key, "child").unwrap(),
+        vec![message(0), message(1), message(2)]
+    );
+    assert_eq!(
+        store.load_provider_lineage(&key, "child").unwrap().as_ref(),
+        Some(&descendant)
+    );
+    store
+        .commit_provider_status(&key, &descendant, &[], None, &[])
+        .unwrap();
+}
+
+#[test]
+fn late_descent_refuses_nonpass_hook_answer() {
+    for (ops, tagged) in [
+        ("[{\"op\":\"append\",\"block\":0,\"text\":\"edit\"}]", false),
+        ("[]", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, key, child, descendant) = late_descent_fixture(dir.path());
+        late_hook(&store, &key, &child, &message(1), ops, tagged);
+        assert_late_refusal(&store, &key, &child, &descendant, "hook_answer");
+    }
+}
+
+#[test]
+fn late_descent_refuses_mismatched_retained_message() {
+    for ordinal in [0, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, key, child, mut descendant) = late_descent_fixture(dir.path());
+        // Ordinal 0 is inside the retained prefix; ordinal 1 is its inclusive cut.
+        store
+            .commit_provider_status(&key, &lineage("parent", 0), &[message(1)], None, &[])
+            .unwrap();
+        descendant.through_ordinal = Some(1);
+        descendant.first_ordinal = 2;
+        let mut changed = message(ordinal);
+        changed.message_bytes = b"{\"text\":\"different\"}".to_vec();
+        late_hook(&store, &key, &child, &changed, "[]", false);
+        assert_late_refusal(&store, &key, &child, &descendant, "messages");
+    }
+}
+
+#[test]
+fn late_descent_refuses_nonidentity_frozen_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, key, child, descendant) = late_descent_fixture(dir.path());
+    store
+        .save_provider_view(
+            &key,
+            &ProviderView {
+                version: 5,
+                lineage_id: "child".into(),
+                range_from: 0,
+                range_to: 1,
+                replacement_json: "[]".into(),
+                state: "not_applied".into(),
+            },
+        )
+        .unwrap();
+    assert_late_refusal(&store, &key, &child, &descendant, "lineage_id");
+}
+
+#[test]
+fn late_descent_admission_is_atomic_and_link_is_immutable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, key, child, descendant) = late_descent_fixture(dir.path());
+    late_hook(&store, &key, &child, &message(0), "[]", false);
+    let mut changed = message(0);
+    changed.message_bytes = b"{\"text\":\"conflicting page\"}".to_vec();
+    assert!(store
+        .commit_provider_status(&key, &descendant, &[changed], None, &[])
+        .is_err());
+    assert_eq!(
+        store.load_provider_lineage(&key, "child").unwrap().as_ref(),
+        Some(&child)
+    );
+    assert_eq!(
+        store.load_provider_messages(&key, "child").unwrap(),
+        vec![message(0)]
+    );
+    store
+        .commit_provider_status(&key, &descendant, &[message(1)], None, &[])
+        .unwrap();
+    let contradiction = ProviderLineage {
+        first_ordinal: 2,
+        through_ordinal: Some(1),
+        ..descendant.clone()
+    };
+    assert!(matches!(
+        store.commit_provider_status(&key, &contradiction, &[], None, &[]),
+        Err(ProviderError::InvalidParams {
+            field: "lineage_id"
+        })
+    ));
+    assert_eq!(
+        store.load_provider_lineage(&key, "child").unwrap().as_ref(),
+        Some(&descendant)
+    );
+}

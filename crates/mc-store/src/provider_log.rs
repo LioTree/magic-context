@@ -676,27 +676,63 @@ fn acknowledged_through_tx(
     }
     Ok(Some(served))
 }
-fn empty_setup_root_tx(
+fn compatible_setup_root_tx(
     conn: &Connection,
     conv: &str,
     held: &ProviderLineage,
-) -> rusqlite::Result<bool> {
+    proposed: &ProviderLineage,
+) -> Result<bool, ProviderError> {
     if held.descends_from.is_some() || held.through_ordinal.is_some() || held.first_ordinal != 0 {
         return Ok(false);
     }
-    // A setup-only root has an applied identity view but no admitted transcript.
-    // Even a rejected non-identity view makes adoption unsafe: it may previously
-    // have been applied, because application state is mutable rather than a log.
-    conn.query_row(
+    // Hooks precede a step's first descent declaration. Unchanged answers and
+    // matching retained bytes do not commit the child to a root interpretation.
+    // A non-identity view may have been applied even if it is now rejected.
+    let identity_only: bool = conn.query_row(
         "SELECT
          EXISTS(SELECT 1 FROM mc_provider_conversations_v2 WHERE conv_key=?1 AND lineage_id=?2 AND setup_json IS NOT NULL)
          AND EXISTS(SELECT 1 FROM mc_provider_views_v1 WHERE conv_key=?1 AND lineage_id=?2 AND range_from=0 AND range_to=0 AND state='applied')
-         AND NOT EXISTS(SELECT 1 FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2)
-         AND NOT EXISTS(SELECT 1 FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2)
-         AND NOT EXISTS(SELECT 1 FROM mc_provider_views_v1 WHERE conv_key=?1 AND lineage_id=?2 AND (range_from<>0 OR range_to<>0))",
+          AND NOT EXISTS(SELECT 1 FROM mc_provider_views_v1 WHERE conv_key=?1 AND lineage_id=?2 AND (range_from<>0 OR range_to<>0))",
         params![conv, held.lineage_id],
         |r| r.get(0),
-    )
+    )?;
+    if !identity_only {
+        return Ok(false);
+    }
+    let nonpass: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2
+         AND (json_type(ops_json)<>'array' OR json_array_length(ops_json)<>0
+           OR json_type(tags_json)<>'array' OR json_array_length(tags_json)<>0))",
+        params![conv, held.lineage_id], |r| r.get(0),
+    )?;
+    if nonpass {
+        return Err(ProviderError::InvalidParams {
+            field: "hook_answer",
+        });
+    }
+    let (Some(parent), Some(cut)) = (&proposed.descends_from, proposed.through_ordinal) else {
+        return Ok(false);
+    };
+    let mut q = conn.prepare("SELECT ordinal,mid,message_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3")?;
+    let messages = q
+        .query_map(params![conv, held.lineage_id, as_i64(cut)?], |r| {
+            Ok(ProviderMessage {
+                ordinal: r.get(0)?,
+                mid: r.get(1)?,
+                message_bytes: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for message in messages {
+        if held_message_tx(conn, conv, parent, message.ordinal, &message.mid)?
+            .0
+            .as_ref()
+            != Some(&message)
+        {
+            return Err(ProviderError::InvalidParams { field: "messages" });
+        }
+    }
+    Ok(true)
 }
 
 fn ensure_lineage_tx(
@@ -712,7 +748,7 @@ fn ensure_lineage_tx(
         }
         if !allow_setup_root_descent
             || row.descends_from.is_none()
-            || !empty_setup_root_tx(conn, conv, held)?
+            || !compatible_setup_root_tx(conn, conv, held, row)?
         {
             return Err(ProviderError::InvalidParams {
                 field: "lineage_id",
@@ -745,6 +781,17 @@ fn ensure_lineage_tx(
                 return Err(ProviderError::Transient(
                     "unsatisfied lineage descent".into(),
                 ));
+            }
+            if held.is_some() {
+                // The retained prefix is now read from the parent. Its proven
+                // identical child copies must not appear twice in effective history.
+                remove_policy_tx(
+                    conn,
+                    conv,
+                    "lineage_id=?2 AND ordinal<=?3",
+                    params![conv, row.lineage_id, as_i64(cut)?],
+                )?;
+                conn.execute("DELETE FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3", params![conv, row.lineage_id, as_i64(cut)?])?;
             }
             for (ancestor, _) in ancestors {
                 remove_policy_tx(

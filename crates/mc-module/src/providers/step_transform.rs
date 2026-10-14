@@ -444,9 +444,57 @@ impl McHandler {
         let mut request: TransformRequest = decode(
             &json!({"v":2,"kind":"transform.hook","serializer_profile":"claude-code-anthropic","session_id":key.engine_key(),"render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}),
         )?;
-        codec::Codec::ClaudeCodeAnthropic.prepare_request(&mut request, &[entry])?;
-        let projection = ck_wire::project_messages(&request.messages).map_err(transient)?;
+        // Pair the addressed result against preceding provider-owned history,
+        // including the retained parent prefix of a first hook declaration.
+        let needs_pairing = ingress
+            .ck
+            .content
+            .iter()
+            .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }));
+        let mut prior = if !needs_pairing {
+            Vec::new()
+        } else if let Some(parent) = &lineage.descends_from {
+            let cut = lineage.through_ordinal.expect("paired descent");
+            let mut prior = store
+                .load_provider_messages(&key.store_key(), parent)
+                .map_err(transient)?;
+            prior.retain(|message| message.ordinal <= cut);
+            prior.extend(
+                store
+                    .load_provider_messages(&key.store_key(), lineage_id)
+                    .map_err(transient)?
+                    .into_iter()
+                    .filter(|message| message.ordinal > cut),
+            );
+            prior
+        } else {
+            store
+                .load_provider_messages(&key.store_key(), lineage_id)
+                .map_err(transient)?
+        };
+        prior.retain(|message| message.ordinal < ordinal);
+        let mut entries = prior
+            .into_iter()
+            .map(|message| {
+                Ok(compact::status::StatusMessage {
+                    raw_message: None,
+                    mid: message.mid,
+                    ordinal: message.ordinal,
+                    message: serde_json::from_slice(&message.message_bytes).map_err(transient)?,
+                })
+            })
+            .collect::<Result<Vec<_>, HandlerOutcome>>()?;
+        entries.push(entry);
+        codec::Codec::ClaudeCodeAnthropic.prepare_request(&mut request, &entries)?;
+        let projection = ck_wire::project_messages(&request.messages).map_err(|problem| {
+            if matches!(problem, ck_wire::CkWireError::UnpairedToolResult { .. }) {
+                error("unpaired_tool_result", problem.to_string())
+            } else {
+                transient(problem)
+            }
+        })?;
         let mut parts = admission_policy_parts(&request, &projection);
+        parts.retain(|part| part.mid == mid);
         for p in &mut parts {
             if let Some(ck_wire::CkKind::ToolResult { id, .. }) = ingress
                 .ck
