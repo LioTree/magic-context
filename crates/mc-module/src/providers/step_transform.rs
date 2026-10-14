@@ -444,8 +444,11 @@ impl McHandler {
         let mut request: TransformRequest = decode(
             &json!({"v":2,"kind":"transform.hook","serializer_profile":"claude-code-anthropic","session_id":key.engine_key(),"render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}),
         )?;
-        // Pair the addressed result against preceding provider-owned history,
-        // including the retained parent prefix of a first hook declaration.
+        // Hook commits persist the immutable native ingest in the provider log,
+        // before step admission and independently of pending answer edits. Loading
+        // that log lets post_tool pair with an earlier post_assistant after restart;
+        // burning an unserved answer does not erase its tool-use ingest. Include
+        // the retained parent prefix when a hook first declares a descent.
         let needs_pairing = ingress
             .ck
             .content

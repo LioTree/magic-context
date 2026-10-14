@@ -2,8 +2,12 @@
 //! Stored message IDs retain their first bytes across scalar/single-text-block
 //! form flips; all other changes remain conflicts. No LLM runner is used here.
 use super::*;
+#[path = "context_fixture_tests.rs"]
+mod context_fixture_tests;
 #[path = "late_descent_tests.rs"]
 mod late_descent_tests;
+#[path = "pending_hook_pairing_tests.rs"]
+mod pending_hook_pairing_tests;
 
 pub(super) fn binding(root: &Path, principal: Option<subc_protocol::Principal>) -> SessionBinding {
     SessionBinding {
