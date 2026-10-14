@@ -1528,6 +1528,334 @@ async fn cc_legacy_identity_child_setup_refuses_missing_ancestry_then_repairs_on
     ));
 }
 
+async fn late_identity_parent_descent(first_hook: bool, retained: u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    identity_parent_after_empty_fork(&h).await;
+    if retained > 1 {
+        let mut page = step(r#"{"role":"user","content":"retained parent text"}"#);
+        page["session"] = json!("fresh-provider-session");
+        page["lineage_id"] = json!("parent");
+        let template = page["messages"][0].clone();
+        page["messages"] = json!((1..=retained)
+            .map(|ordinal| {
+                let mut message = template.clone();
+                message["ordinal"] = json!(ordinal);
+                message["mid"] = json!(format!("parent-{ordinal}"));
+                message
+            })
+            .collect::<Vec<_>>());
+        page["newest"] = json!({"mid":format!("parent-{retained}"),"ordinal":retained});
+        page["more"] = json!(true);
+        assert_eq!(native_step(&h, &page).await["answer"], "wait");
+    }
+    let key = Key::new(
+        &h.facade_binding(7).unwrap(),
+        "fresh-provider-session",
+        "claude-code",
+    )
+    .unwrap();
+    let store = h.store.get().unwrap();
+    let parent_messages = store
+        .load_provider_messages(&key.store_key(), "parent")
+        .unwrap();
+    assert_eq!(
+        store
+            .load_provider_view(&key.store_key(), 1)
+            .unwrap()
+            .unwrap()
+            .range_to,
+        0
+    );
+
+    // The pinned setup type has no descends_from field. A host using that type
+    // must send its previous transcript lineage and last retained ordinal on
+    // its first step or hook instead.
+    let ready = native_setup_for_lineage(&h, "late-child", None).await;
+    assert_eq!(ready["initial"]["version"], 4);
+    assert_eq!(ready["initial"]["range"], json!({"from":0,"to":0}));
+    let identity = store
+        .load_provider_view(&key.store_key(), 4)
+        .unwrap()
+        .unwrap();
+    let root = store
+        .load_provider_lineage(&key.store_key(), "late-child")
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.descends_from, None);
+    assert!(store
+        .load_provider_messages(&key.store_key(), "late-child")
+        .unwrap()
+        .is_empty());
+    let descent = json!({"lineage_id":"parent","through_ordinal":retained - 1});
+    let raw = r#"{"role":"user","content":"late child text"}"#;
+    if first_hook {
+        let hook = json!({"session":"fresh-provider-session","harness":"claude-code","lineage_id":"late-child","descends_from":descent,"step_id":"late-first-hook","params":plan(),"subject_mid":"late-mid","subject_ordinal":retained,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw,"hook":"pre_user","blocks":["late child text"]});
+        let outcome = call(&h, "transform.hook", hook).await;
+        assert!(
+            matches!(outcome, HandlerOutcome::Response(_)),
+            "first hook: {outcome:?}"
+        );
+        assert_eq!(response(outcome)["answer"], "pass");
+    }
+    let mut status = step(raw);
+    status["session"] = json!("fresh-provider-session");
+    status["lineage_id"] = json!("late-child");
+    status["messages"][0]["mid"] = json!("late-mid");
+    status["messages"][0]["ordinal"] = json!(retained);
+    status["newest"] = json!({"mid":"late-mid","ordinal":retained});
+    status["last_applied"] = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    if !first_hook {
+        status["descends_from"] = descent.clone();
+    }
+    let result = h.provider_step(h.facade_binding(7).unwrap(), &status).await;
+    assert!(
+        result.is_ok(),
+        "setup without ancestry, first step: {result:?}"
+    );
+    let answer: Value = serde_json::from_slice(&result.unwrap()).unwrap();
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+    if answer["answer"] == "compaction_message" {
+        assert!(answer["compaction"]["version"].as_u64().unwrap() > 4);
+    }
+    let lineage = store
+        .load_provider_lineage(&key.store_key(), "late-child")
+        .unwrap()
+        .unwrap();
+    assert_eq!(lineage.descends_from.as_deref(), Some("parent"));
+    assert_eq!(lineage.through_ordinal, Some(retained - 1));
+    assert_eq!(lineage.first_ordinal, retained);
+    let messages = store
+        .load_provider_messages(&key.store_key(), "late-child")
+        .unwrap();
+    assert_eq!(
+        &messages[..retained as usize],
+        &parent_messages[..retained as usize]
+    );
+    assert_eq!(messages.len(), retained as usize + 1);
+    assert_eq!(
+        store
+            .provider_frontier(&key.store_key(), "late-child")
+            .unwrap(),
+        retained + 1
+    );
+    assert_eq!(
+        store
+            .load_provider_view(&key.store_key(), 4)
+            .unwrap()
+            .unwrap()
+            .replacement_json,
+        identity.replacement_json
+    );
+    status["descends_from"] = descent;
+    status["request_id"] = json!("repeat-descent");
+    native_step(&h, &status).await;
+    status.as_object_mut().unwrap().remove("descends_from");
+    status["request_id"] = json!("omit-descent");
+    native_step(&h, &status).await;
+    status["descends_from"] = json!({"lineage_id":"parent","through_ordinal":retained});
+    let result = h.provider_step(h.facade_binding(7).unwrap(), &status).await;
+    assert!(
+        matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "lineage_id")
+    );
+}
+
+#[tokio::test]
+async fn cc_setup_without_parent_first_step_establishes_identity_parent_descent() {
+    late_identity_parent_descent(false, 1).await;
+}
+
+#[tokio::test]
+async fn cc_setup_without_parent_first_step_retains_n_parent_messages() {
+    late_identity_parent_descent(false, 3).await;
+}
+
+#[tokio::test]
+async fn cc_setup_without_parent_first_hook_establishes_identity_parent_descent() {
+    late_identity_parent_descent(true, 1).await;
+}
+
+#[tokio::test]
+async fn cc_setup_root_with_messages_or_nonidentity_view_refuses_reparenting() {
+    for applied_view in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        identity_parent_after_empty_fork(&h).await;
+        native_setup_for_lineage(&h, "occupied", None).await;
+        let key = Key::new(
+            &h.facade_binding(7).unwrap(),
+            "fresh-provider-session",
+            "claude-code",
+        )
+        .unwrap();
+        let store = h.store.get().unwrap();
+        let raw = r#"{"role":"user","content":"occupied root"}"#;
+        let mut hook = json!({"session":"fresh-provider-session","harness":"claude-code","lineage_id":"occupied","step_id":"occupied-hook","params":plan(),"subject_mid":"occupied-mid","subject_ordinal":0,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw,"hook":"pre_user","blocks":["occupied root"]});
+        if applied_view {
+            // Normally a non-identity view requires messages. Isolate the view
+            // fence with a temporary fixture so the message fence cannot mask it.
+            let mut view = store
+                .load_provider_view(&key.store_key(), 4)
+                .unwrap()
+                .unwrap();
+            view.version = 5;
+            view.range_to = 1;
+            let mut frozen: Value = serde_json::from_str(&view.replacement_json).unwrap();
+            frozen["engine"]["version"] = json!(5);
+            frozen["engine"]["range"]["to"] = json!(1);
+            frozen["wire"]["version"] = json!(5);
+            frozen["wire"]["range"]["to"] = json!(1);
+            view.replacement_json = frozen.to_string();
+            store.save_provider_view(&key.store_key(), &view).unwrap();
+        } else {
+            assert_eq!(
+                response(call(&h, "transform.hook", hook.clone()).await)["answer"],
+                "pass"
+            );
+            assert_eq!(
+                store
+                    .load_provider_messages(&key.store_key(), "occupied")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let before = store
+            .load_provider_lineage(&key.store_key(), "occupied")
+            .unwrap()
+            .unwrap();
+        let mut status = step(raw);
+        status["session"] = json!("fresh-provider-session");
+        status["lineage_id"] = json!("occupied");
+        status["messages"][0]["mid"] = json!("new-mid");
+        status["messages"][0]["ordinal"] = json!(1);
+        status["newest"] = json!({"mid":"new-mid","ordinal":1});
+        status["descends_from"] = json!({"lineage_id":"parent","through_ordinal":0});
+        let result = h.provider_step(h.facade_binding(7).unwrap(), &status).await;
+        assert!(
+            matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "lineage_id"),
+            "occupied root reparented: {result:?}"
+        );
+        hook["descends_from"] = status["descends_from"].clone();
+        hook["subject_ordinal"] = json!(1);
+        let outcome = call(&h, "transform.hook", hook).await;
+        assert!(
+            matches!(outcome, HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. } if code == "invalid_params" && detail["field"] == "lineage_id"),
+            "occupied hook reparented: {outcome:?}"
+        );
+        assert_eq!(
+            store
+                .load_provider_lineage(&key.store_key(), "occupied")
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn cc_late_descent_refuses_unknown_parent_and_unheld_cut_without_adoption() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    identity_parent_after_empty_fork(&h).await;
+    native_setup_for_lineage(&h, "late-child", None).await;
+    let key = Key::new(
+        &h.facade_binding(7).unwrap(),
+        "fresh-provider-session",
+        "claude-code",
+    )
+    .unwrap();
+    let store = h.store.get().unwrap();
+    let root = store
+        .load_provider_lineage(&key.store_key(), "late-child")
+        .unwrap()
+        .unwrap();
+    let raw = r#"{"role":"user","content":"late child text"}"#;
+    let mut status = step(raw);
+    status["session"] = json!("fresh-provider-session");
+    status["lineage_id"] = json!("late-child");
+    status["descends_from"] = json!({"lineage_id":"unknown","through_ordinal":0});
+    let result = h.provider_step(h.facade_binding(7).unwrap(), &status).await;
+    assert!(
+        matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "lineage_id")
+    );
+    let hook = json!({"session":"fresh-provider-session","harness":"claude-code","lineage_id":"late-child","descends_from":status["descends_from"],"step_id":"unknown-hook","params":plan(),"subject_mid":"late-mid","subject_ordinal":1,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw,"hook":"pre_user","blocks":["late child text"]});
+    let outcome = call(&h, "transform.hook", hook).await;
+    assert!(
+        matches!(outcome, HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. } if code == "invalid_params" && detail["field"] == "lineage_id")
+    );
+    status["descends_from"] = json!({"lineage_id":"parent","through_ordinal":999});
+    let answer = native_step(&h, &status).await;
+    assert_eq!(answer["code"], "history_unreadable");
+    assert_eq!(answer["detail"]["history_gap_from"], 1);
+    assert_eq!(
+        store
+            .load_provider_lineage(&key.store_key(), "late-child")
+            .unwrap()
+            .unwrap(),
+        root
+    );
+    assert!(store
+        .load_provider_messages(&key.store_key(), "late-child")
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn cc_late_descent_admission_rolls_back_on_conflicting_retained_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    identity_parent_after_empty_fork(&h).await;
+    native_setup_for_lineage(&h, "late-child", None).await;
+    let key = Key::new(
+        &h.facade_binding(7).unwrap(),
+        "fresh-provider-session",
+        "claude-code",
+    )
+    .unwrap();
+    let store = h.store.get().unwrap();
+    let root = store
+        .load_provider_lineage(&key.store_key(), "late-child")
+        .unwrap()
+        .unwrap();
+    let mut status = step(r#"{"role":"user","content":"changed retained message"}"#);
+    status["session"] = json!("fresh-provider-session");
+    status["lineage_id"] = json!("late-child");
+    status["descends_from"] = json!({"lineage_id":"parent","through_ordinal":0});
+    let result = h.provider_step(h.facade_binding(7).unwrap(), &status).await;
+    assert!(
+        matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "messages")
+    );
+    assert_eq!(
+        store
+            .load_provider_lineage(&key.store_key(), "late-child")
+            .unwrap()
+            .unwrap(),
+        root
+    );
+    assert!(store
+        .load_provider_messages(&key.store_key(), "late-child")
+        .unwrap()
+        .is_empty());
+    let parent = store
+        .load_provider_messages(&key.store_key(), "parent")
+        .unwrap();
+    status["messages"][0] = json!({"mid":parent[0].mid,"ordinal":0,"message":serde_json::from_slice::<Value>(&parent[0].message_bytes).unwrap()["message"],"raw_message":serde_json::from_slice::<Value>(&parent[0].message_bytes).unwrap()["raw_message"]});
+    native_step(&h, &status).await;
+    assert_eq!(
+        store
+            .load_provider_lineage(&key.store_key(), "late-child")
+            .unwrap()
+            .unwrap()
+            .descends_from
+            .as_deref(),
+        Some("parent")
+    );
+}
+
 async fn identity_parent_after_empty_fork(h: &McHandler) -> Value {
     native_setup_for_lineage(h, "L", None).await;
     let old = native_step(h, &step(r#"{"role":"user","content":"old root"}"#)).await;

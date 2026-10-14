@@ -144,7 +144,7 @@ fn host_lineage(
     )
 }
 
-fn host_lineage_fields(
+pub(super) fn host_lineage_fields(
     store: &McStore,
     key: &Key,
     params: &Value,
@@ -170,13 +170,34 @@ fn host_lineage_fields(
                 .ok_or_else(|| invalid_field("lineage_id"))
         })
         .transpose()?;
+    if key.generation.is_some() {
+        if let Some(parent) = parent {
+            if parent == lineage_id
+                || store
+                    .load_provider_lineage(&key.store_key(), parent)
+                    .map_err(transient)?
+                    .is_none()
+            {
+                return Err(invalid_field("lineage_id"));
+            }
+        }
+    }
     if let Some(held) = held {
         if descent.is_some()
             && (held.descends_from.as_deref() != parent || held.through_ordinal != cut)
         {
-            return Err(invalid_field("lineage_id"));
+            if key.generation.is_none()
+                || held.descends_from.is_some()
+                || held.through_ordinal.is_some()
+            {
+                return Err(invalid_field("lineage_id"));
+            }
+            // Claude Code setup can precede the host's first ancestry declaration.
+            // Propose the link here; the admission transaction must prove that
+            // this root has no messages or non-identity views before replacing it.
+        } else {
+            return Ok(held);
         }
-        return Ok(held);
     }
     Ok(ProviderLineage {
         lineage_id: lineage_id.into(),

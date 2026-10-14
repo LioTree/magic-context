@@ -676,30 +676,77 @@ fn acknowledged_through_tx(
     }
     Ok(Some(served))
 }
+fn empty_setup_root_tx(
+    conn: &Connection,
+    conv: &str,
+    held: &ProviderLineage,
+) -> rusqlite::Result<bool> {
+    if held.descends_from.is_some() || held.through_ordinal.is_some() || held.first_ordinal != 0 {
+        return Ok(false);
+    }
+    // A setup-only root has an applied identity view but no admitted transcript.
+    // Even a rejected non-identity view makes adoption unsafe: it may previously
+    // have been applied, because application state is mutable rather than a log.
+    conn.query_row(
+        "SELECT
+         EXISTS(SELECT 1 FROM mc_provider_conversations_v2 WHERE conv_key=?1 AND lineage_id=?2 AND setup_json IS NOT NULL)
+         AND EXISTS(SELECT 1 FROM mc_provider_views_v1 WHERE conv_key=?1 AND lineage_id=?2 AND range_from=0 AND range_to=0 AND state='applied')
+         AND NOT EXISTS(SELECT 1 FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2)
+         AND NOT EXISTS(SELECT 1 FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2)
+         AND NOT EXISTS(SELECT 1 FROM mc_provider_views_v1 WHERE conv_key=?1 AND lineage_id=?2 AND (range_from<>0 OR range_to<>0))",
+        params![conv, held.lineage_id],
+        |r| r.get(0),
+    )
+}
+
 fn ensure_lineage_tx(
     conn: &Connection,
     conv: &str,
     row: &ProviderLineage,
+    allow_setup_root_descent: bool,
 ) -> Result<(), ProviderError> {
-    if let Some(held) = lineage_tx(conn, conv, &row.lineage_id)? {
-        if held != *row {
+    let held = lineage_tx(conn, conv, &row.lineage_id)?;
+    if let Some(held) = &held {
+        if held == row {
+            return Ok(());
+        }
+        if !allow_setup_root_descent
+            || row.descends_from.is_none()
+            || !empty_setup_root_tx(conn, conv, held)?
+        {
             return Err(ProviderError::InvalidParams {
                 field: "lineage_id",
             });
         }
-        return Ok(());
     }
     match (&row.descends_from, row.through_ordinal) {
         (Some(parent), Some(cut))
             if parent != &row.lineage_id && row.first_ordinal == cut.saturating_add(1) =>
         {
-            if lineage_tx(conn, conv, parent)?.is_none() || frontier_tx(conn, conv, parent)? <= cut
+            if lineage_tx(conn, conv, parent)?.is_none() {
+                return Err(if allow_setup_root_descent {
+                    ProviderError::InvalidParams {
+                        field: "lineage_id",
+                    }
+                } else {
+                    ProviderError::Transient("unsatisfied lineage descent".into())
+                });
+            }
+            let ancestors = ancestry_tx(conn, conv, parent)?;
+            if ancestors
+                .iter()
+                .any(|(ancestor, _)| ancestor.lineage_id == row.lineage_id)
             {
+                return Err(ProviderError::InvalidParams {
+                    field: "lineage_id",
+                });
+            }
+            if frontier_tx(conn, conv, parent)? <= cut {
                 return Err(ProviderError::Transient(
                     "unsatisfied lineage descent".into(),
                 ));
             }
-            for (ancestor, _) in ancestry_tx(conn, conv, parent)? {
+            for (ancestor, _) in ancestors {
                 remove_policy_tx(
                     conn,
                     conv,
@@ -734,7 +781,11 @@ fn ensure_lineage_tx(
         }
     }
     conn.execute(
-        "INSERT INTO mc_provider_lineages_v1 VALUES (?1,?2,?3,?4,?5,json_extract(?1,'$[1]'))",
+        if held.is_some() {
+            "UPDATE mc_provider_lineages_v1 SET first_ordinal=?3,descends_from=?4,through_ordinal=?5 WHERE conv_key=?1 AND lineage_id=?2"
+        } else {
+            "INSERT INTO mc_provider_lineages_v1 VALUES (?1,?2,?3,?4,?5,json_extract(?1,'$[1]'))"
+        },
         params![
             conv,
             row.lineage_id,
@@ -1090,7 +1141,12 @@ impl McStore {
                         field: "lineage_id",
                     });
                 }
-                ensure_lineage_tx(conn, &key.conversation_key(), lineage)
+                ensure_lineage_tx(
+                    conn,
+                    &key.conversation_key(),
+                    lineage,
+                    key.generation.is_some(),
+                )
             };
             operation().map_err(|error| {
                 refusal = Some(error);
@@ -1303,7 +1359,7 @@ impl McStore {
                 let conv = key.conversation_key();
                 let c = conversation_tx(conn,key)?.ok_or_else(||ProviderError::Transient("provider conversation is not initialized".into()))?;
                 let new_lineage = lineage_tx(conn,&conv,&request.lineage.lineage_id)?.is_none();
-                ensure_lineage_tx(conn,&conv,request.lineage)?;
+                ensure_lineage_tx(conn,&conv,request.lineage,key.generation.is_some())?;
                 for m in messages {insert_message_tx(conn,&conv,&request.lineage.lineage_id,m)?;}
                 let frontier = if c.lineage_id==request.lineage.lineage_id && c.cursor_frontier>0 {
                     extend_frontier_tx(conn,&conv,&request.lineage.lineage_id,c.cursor_frontier)?

@@ -414,24 +414,8 @@ impl McHandler {
         {
             return Err(error("not_subscribed", "CC hook is not declared"));
         }
-        let lineage = store
-            .load_provider_lineage(&key.store_key(), lineage_id)
-            .map_err(transient)?
-            .unwrap_or(ProviderLineage {
-                lineage_id: lineage_id.into(),
-                first_ordinal: fields
-                    .descends_from
-                    .as_ref()
-                    .map_or(ordinal, |d| d.through_ordinal.saturating_add(1)),
-                descends_from: fields.descends_from.as_ref().map(|d| d.lineage_id.clone()),
-                through_ordinal: fields.descends_from.as_ref().map(|d| d.through_ordinal),
-            });
-        if fields.descends_from.as_ref().is_some_and(|d| {
-            lineage.descends_from.as_deref() != Some(&d.lineage_id)
-                || lineage.through_ordinal != Some(d.through_ordinal)
-        }) {
-            return Err(invalid_field("descends_from", "descent changed"));
-        }
+        let lineage =
+            super::compaction::host_lineage_fields(&store, &key, params, lineage_id, ordinal)?;
         let subject = ProviderSubject {
             subject_mid: mid.into(),
             hook: hook_name.into(),
