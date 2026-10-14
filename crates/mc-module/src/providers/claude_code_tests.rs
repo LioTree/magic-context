@@ -1306,12 +1306,13 @@ async fn cc_setup_unknown_or_mismatched_parent_is_refused_by_name() {
     identity_parent_after_empty_fork(&h).await;
     let pins = h.native_pins();
     let request = json!({"session":"fresh-provider-session","harness":"claude-code","request_id":"unknown-parent","preset":"head","params":plan(),"composition":{},"claude_code":pins,"model":"fixture","context_window":100000,"lineage_id":"child","descends_from":{"lineage_id":"unknown","through_ordinal":0},"now":1});
-    let result = h
-        .provider_setup(h.facade_binding(7).unwrap(), &request)
-        .await;
-    assert!(
-        matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "lineage_id")
-    );
+    let answer: Value = serde_json::from_slice(
+        &h.provider_setup(h.facade_binding(7).unwrap(), &request)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(answer["code"], "history_unreadable");
     let ready = native_setup_for_lineage(
         &h,
         "child",
@@ -1778,15 +1779,11 @@ async fn cc_late_descent_refuses_unknown_parent_and_unheld_cut_without_adoption(
     status["session"] = json!("fresh-provider-session");
     status["lineage_id"] = json!("late-child");
     status["descends_from"] = json!({"lineage_id":"unknown","through_ordinal":0});
-    let result = h.provider_step(h.facade_binding(7).unwrap(), &status).await;
-    assert!(
-        matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "lineage_id")
-    );
+    let answer = native_step(&h, &status).await;
+    assert_eq!(answer["code"], "history_unreadable");
     let hook = json!({"session":"fresh-provider-session","harness":"claude-code","lineage_id":"late-child","descends_from":status["descends_from"],"step_id":"unknown-hook","params":plan(),"subject_mid":"late-mid","subject_ordinal":1,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw,"hook":"pre_user","blocks":["late child text"]});
     let outcome = call(&h, "transform.hook", hook).await;
-    assert!(
-        matches!(outcome, HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. } if code == "invalid_params" && detail["field"] == "lineage_id")
-    );
+    assert_eq!(code(outcome), "history_unreadable");
     status["descends_from"] = json!({"lineage_id":"parent","through_ordinal":999});
     let answer = native_step(&h, &status).await;
     assert_eq!(answer["code"], "history_unreadable");

@@ -414,8 +414,17 @@ impl McHandler {
         {
             return Err(error("not_subscribed", "CC hook is not declared"));
         }
-        let lineage =
-            super::compaction::host_lineage_fields(&store, &key, params, lineage_id, ordinal)?;
+        let descent = call.descends_from.as_ref().map(|parent| {
+            compact::status::DescendsFrom::new(&parent.lineage_id, parent.through_ordinal)
+        });
+        let lineage = super::compaction::claude_code_lineage_fields(
+            &store,
+            &key,
+            descent.as_ref(),
+            lineage_id,
+            ordinal,
+            None,
+        )?;
         let subject = ProviderSubject {
             subject_mid: mid.into(),
             hook: hook_name.into(),

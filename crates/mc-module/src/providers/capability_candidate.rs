@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 
 pub(super) static CANDIDATE: LazyLock<ClaudeCodeCapabilities> = LazyLock::new(build_candidate);
 
-fn locked_package(name: &str) -> (String, String) {
+fn locked_package(name: &str) -> String {
     let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
     let mut matches = lock.split("[[package]]").filter(|block| {
         block
@@ -26,24 +26,21 @@ fn locked_package(name: &str) -> (String, String) {
             .expect("locked package field")
             .to_owned()
     };
-    (
-        value("version"),
-        value("source")
-            .rsplit('#')
-            .next()
-            .expect("git revision")
-            .to_owned(),
-    )
+    assert_eq!(
+        value("source"),
+        "registry+https://github.com/rust-lang/crates.io-index"
+    );
+    value("version")
 }
 
 fn build_candidate() -> ClaudeCodeCapabilities {
-    let (compaction_version, revision) = locked_package("cortexkit-role-compaction-provider");
-    let (transform_version, transform_revision) =
-        locked_package("cortexkit-role-step-transform-provider");
-    assert_eq!(
-        revision, transform_revision,
-        "provider roles must share their commons pin"
-    );
+    let compaction_version = locked_package("cortexkit-role-compaction-provider");
+    let transform_version = locked_package("cortexkit-role-step-transform-provider");
+    // Both registry releases were published from the commons source revision below.
+    // Cargo.lock records registry checksums rather than the publication's Git SHA.
+    let revision = "563e0984e2765710672220bbfecfb46a3b7f56c7".to_owned();
+    assert_eq!(compaction_version, "0.2.2");
+    assert_eq!(transform_version, "0.2.1");
     // The format fingerprints also select native conversation/message/view keys.
     // Legacy keys omit generations and retain their previous bytes and namespaces.
     let profile_generation = format!(

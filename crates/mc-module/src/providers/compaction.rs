@@ -4,6 +4,9 @@ use super::*;
 #[cfg(test)]
 #[path = "compaction_review_tests.rs"]
 mod compaction_review_tests;
+#[cfg(test)]
+#[path = "setup_descent_tests.rs"]
+mod setup_descent_tests;
 use mc_store::provider_records::{
     ProviderConversation, ProviderError, ProviderLineage, ProviderMessage, ProviderSubject,
     ProviderView,
@@ -135,6 +138,16 @@ fn host_lineage(
     params: &Value,
     request: &compact::status::StepStatus,
 ) -> Result<ProviderLineage, HandlerOutcome> {
+    if key.generation.is_some() {
+        return claude_code_lineage_fields(
+            store,
+            key,
+            request.descends_from.as_ref(),
+            &request.lineage_id,
+            request.messages.first().map_or(0, |m| m.ordinal),
+            Some(&request.request_id),
+        );
+    }
     host_lineage_fields(
         store,
         key,
@@ -142,6 +155,86 @@ fn host_lineage(
         &request.lineage_id,
         request.messages.first().map_or(1, |m| m.ordinal),
     )
+}
+
+pub(super) fn claude_code_lineage_fields(
+    store: &McStore,
+    key: &Key,
+    declaration: Option<&compact::status::DescendsFrom>,
+    lineage_id: &str,
+    first_ordinal: u64,
+    request_id: Option<&str>,
+) -> Result<ProviderLineage, HandlerOutcome> {
+    let held = store
+        .load_provider_lineage(&key.store_key(), lineage_id)
+        .map_err(transient)?;
+    let saved = held.as_ref().and_then(|row| {
+        row.descends_from
+            .as_ref()
+            .zip(row.through_ordinal)
+            .map(|(parent, cut)| compact::status::DescendsFrom::new(parent, cut))
+    });
+    let mut link: compact::lineage::DescentLink =
+        serde_json::from_value(json!({"descends_from": saved})).map_err(transient)?;
+    let mut storage_error: Option<mc_store::McStoreError> = None;
+    let mut gap = 0;
+    let result = link.declare(declaration, |parent| {
+        #[cfg(test)]
+        setup_descent_tests::record_history_check();
+        let checked = (|| {
+            if parent.lineage_id == lineage_id
+                || store
+                    .load_provider_lineage(&key.store_key(), &parent.lineage_id)?
+                    .is_none()
+            {
+                return Ok(false);
+            }
+            gap = store.provider_frontier(&key.store_key(), &parent.lineage_id)?;
+            Ok(gap > parent.through_ordinal)
+        })();
+        match checked {
+            Ok(held) => held,
+            Err(error) => {
+                storage_error = Some(error);
+                false
+            }
+        }
+    });
+    if let Some(error) = storage_error {
+        return Err(transient(error));
+    }
+    if let Err(problem) = result {
+        return Err(if let Some(field) = problem.field() {
+            invalid_field(field)
+        } else if let Some(request_id) = request_id {
+            HandlerOutcome::Response(bytes(&gap_answer(request_id, gap))?)
+        } else {
+            error(
+                problem.code(),
+                "The provider does not hold the complete lineage",
+            )
+        });
+    }
+    if let Some(held) = held.filter(|_| saved.is_some() || declaration.is_none()) {
+        return Ok(held);
+    }
+    // An undeclared setup is not a root commitment. The first declaration
+    // proposes a link, which the store saves atomically with admission.
+    let descent = link.descends_from();
+    Ok(ProviderLineage {
+        lineage_id: lineage_id.into(),
+        first_ordinal: descent
+            .map(|parent| {
+                parent
+                    .through_ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_field("lineage_id"))
+            })
+            .transpose()?
+            .unwrap_or(first_ordinal),
+        descends_from: descent.map(|parent| parent.lineage_id.clone()),
+        through_ordinal: descent.map(|parent| parent.through_ordinal),
+    })
 }
 
 pub(super) fn host_lineage_fields(
@@ -704,6 +797,13 @@ fn execute_host(
     // outstanding repair until acknowledgement, so a lost answer can be replayed
     // even though the engine's newly committed head is already complete.
     let mut status = status.clone();
+    if codec == Codec::ClaudeCodeAnthropic
+        && native_status.is_some_and(|request| request.newest.is_none())
+    {
+        // An empty status page can still select inherited history. When the
+        // caller omits newest, the engine's range must name that held input.
+        status.newest_ordinal = template.messages.last().map(|message| message.ordinal);
+    }
     status.prefix_rebuilding |= setup.repair_pending;
     let status = &status;
     let mut state = setup.setup.state.clone();
@@ -1300,7 +1400,6 @@ impl McHandler {
         key: &Key,
         request: compact::setup::SetupRequest,
         chosen: transform::compaction::Preset,
-        params: &Value,
     ) -> Result<Vec<u8>, HandlerOutcome> {
         let codec = Codec::from_params(&Value::Object(request.params.clone()))?;
         if !binding.config.compaction_enabled {
@@ -1311,6 +1410,33 @@ impl McHandler {
                 provider_code: None,
             });
         }
+        // Validate descent before recording setup, views, or engine state: a
+        // refused declaration must leave every durable provider record unchanged.
+        let setup_lineage = if codec == Codec::ClaudeCodeAnthropic {
+            if request.descends_from.is_some() && request.lineage_id.is_none() {
+                return Err(invalid_field("lineage_id"));
+            }
+            let lineage = request
+                .lineage_id
+                .as_deref()
+                .map(|id| {
+                    claude_code_lineage_fields(
+                        store,
+                        key,
+                        request.descends_from.as_ref(),
+                        id,
+                        0,
+                        Some(&request.request_id),
+                    )
+                })
+                .transpose();
+            match lineage {
+                Err(HandlerOutcome::Response(answer)) => return Ok(answer),
+                result => result?,
+            }
+        } else {
+            None
+        };
         let mut conversation = store
             .load_provider_conversation(&key.store_key())
             .map_err(transient)?
@@ -1384,35 +1510,11 @@ impl McHandler {
                 chosen,
             )?);
         }
-        let setup_lineage = if codec == Codec::ClaudeCodeAnthropic {
-            request
-                .lineage_id
-                .as_deref()
-                .map(|id| host_lineage_fields(store, key, params, id, 0))
-                .transpose()?
-        } else {
-            None
-        };
         let switching_lineage = setup_lineage
             .as_ref()
             .is_some_and(|lineage| conversation.lineage_id != lineage.lineage_id);
         if let Some(lineage) = &setup_lineage {
             conversation.lineage_id.clone_from(&lineage.lineage_id);
-            if let Some(parent) = &lineage.descends_from {
-                if store
-                    .load_provider_lineage(&key.store_key(), parent)
-                    .map_err(transient)?
-                    .is_none()
-                {
-                    return Err(invalid_field("lineage_id"));
-                }
-                let frontier = store
-                    .provider_frontier(&key.store_key(), parent)
-                    .map_err(transient)?;
-                if frontier <= lineage.through_ordinal.expect("paired descent") {
-                    return bytes(&gap_answer(&request.request_id, frontier));
-                }
-            }
         }
         if let (Some(lineage), Some(applied)) = (&setup_lineage, &setup.applied) {
             let cut = ancestor_cut(store, key, lineage, &applied.range.lineage_id)?;
@@ -1466,8 +1568,7 @@ impl McHandler {
             }
         }
         if let Some(lineage) = setup_lineage.as_ref().filter(|l| l.descends_from.is_some()) {
-            // MC also accepts descends_from on setup. Save its parent ID and last
-            // retained ordinal so later calls do not have to repeat those fields.
+            // Save the validated parent and cut so later calls can omit descent.
             store
                 .start_provider_descendant_lineage(&key.store_key(), lineage)
                 .map_err(|error| match error {
@@ -1651,7 +1752,10 @@ impl McHandler {
                 return Err(invalid_field("messages"));
             }
         }
-        let lineage = host_lineage(store, &work.key, params, &request)?;
+        let lineage = match host_lineage(store, &work.key, params, &request) {
+            Err(HandlerOutcome::Response(answer)) => return Ok(answer),
+            result => result?,
+        };
         // An acknowledgement names a frozen object, not just a sequence number.
         // Validate both components before admission can promote or burn anything.
         for field in ["last_applied", "last_not_applied"] {
@@ -1676,7 +1780,11 @@ impl McHandler {
                 }
             }
         }
-        if let Some(parent) = &lineage.descends_from {
+        if let Some(parent) = lineage
+            .descends_from
+            .as_ref()
+            .filter(|_| codec != Codec::ClaudeCodeAnthropic)
+        {
             let cut = lineage.through_ordinal.expect("paired descent");
             let frontier = store
                 .provider_frontier(&work.key.store_key(), parent)
@@ -2059,7 +2167,7 @@ impl McHandler {
             } else {
                 None
             };
-            return self.host_setup(&store, binding, &key, request, chosen, params);
+            return self.host_setup(&store, binding, &key, request, chosen);
         }
         let mut record = self.provider_store.load(&key)?;
         if record.catalog.is_none() {
