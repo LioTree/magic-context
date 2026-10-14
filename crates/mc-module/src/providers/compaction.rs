@@ -207,13 +207,14 @@ fn ancestor_cut(
     }
 }
 
-fn non_tag_messages(
+fn non_tag_messages_since(
     store: &McStore,
     key: &Key,
     lineage: &ProviderLineage,
+    first: u64,
 ) -> Result<Vec<compact::status::StatusMessage>, HandlerOutcome> {
     let mut messages = store
-        .load_provider_messages(&key.store_key(), &lineage.lineage_id)
+        .load_provider_messages_since(&key.store_key(), &lineage.lineage_id, first)
         .map_err(transient)?
         .into_iter()
         .map(|m| {
@@ -236,7 +237,7 @@ fn non_tag_messages(
     }
     let mut cuts: HashMap<String, Option<u64>> = HashMap::new();
     for stored in store
-        .load_provider_hook_answers(&key.store_key())
+        .load_provider_hook_answers_since(&key.store_key(), first)
         .map_err(transient)?
     {
         if stored.state != "live" {
@@ -285,6 +286,9 @@ fn non_tag_messages(
                     || (note.is_none() && text.starts_with("\n\n<system-reminder>\n")
                         && text.contains("spent tool output") && text.ends_with("\n</system-reminder>")))
             });
+        }
+        if ops.is_empty() {
+            continue;
         }
         let parts = message
             .message
@@ -357,7 +361,13 @@ fn save_host_setup(
     conversation.rebuild_epoch = setup.setup.state.rebuild_epoch;
     store
         .save_provider_conversation(&key.store_key(), conversation)
-        .map_err(transient)
+        .map_err(transient)?;
+    if matches!(key.harness.as_str(), "opencode" | "opencode2") {
+        store
+            .prune_provider_views_from_conversation(&key.store_key())
+            .map_err(transient)?;
+    }
+    Ok(())
 }
 
 fn save_host_view(
@@ -366,6 +376,9 @@ fn save_host_view(
     view: &HostView,
     state: &str,
 ) -> Result<(), HandlerOutcome> {
+    if matches!(key.harness.as_str(), "opencode" | "opencode2") {
+        return super::view_recipe::save(store, key, view, state);
+    }
     store
         .save_provider_view(
             &key.store_key(),
@@ -386,6 +399,12 @@ fn load_host_view(
     key: &Key,
     summary: &ViewSummary,
 ) -> Result<HostView, HandlerOutcome> {
+    if matches!(key.harness.as_str(), "opencode" | "opencode2") {
+        if let Some(mut view) = super::view_recipe::load(store, key, summary.version)? {
+            view.engine.range.lineage_id = summary.range.lineage_id.clone();
+            return Ok(view);
+        }
+    }
     let row = store
         .load_provider_view(&key.store_key(), summary.version)
         .map_err(|e| transient(format!("load provider views: {e}")))?
@@ -407,6 +426,7 @@ struct Work {
     project_path: String,
     project_directory: String,
     note_project_path: String,
+    resident_folds: bool,
 }
 
 /// Metadata-only skip check shared by the handler and real-state comparison
@@ -578,12 +598,15 @@ fn execute_host(
     native_status: Option<&compact::status::StepStatus>,
 ) -> Result<Option<HostView>, HandlerOutcome> {
     let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
-    let messages = non_tag_messages(store, &work.key, lineage)?;
+    let started = Instant::now();
+    let messages = non_tag_messages_since(store, &work.key, lineage, 0)?;
+    let replay_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut template: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
         "serializer_profile":codec.serializer_profile().wire_id(),"session_id":conversation.engine_namespace,
         "render_config":serde_json::to_string(&setup.setup.request.params).map_err(transient)?,
         "model_key":setup.setup.request.model,"messages":[],"tool_present":true,"auto_search_enabled":false}))?;
     codec.prepare_request(&mut template, &messages)?;
+    template.native_tail_section = work.resident_folds && codec == Codec::OpencodeAiSdk;
     if codec == Codec::ClaudeCodeAnthropic {
         if let Some(native_status) = native_status {
             template.geometry =
@@ -670,23 +693,40 @@ fn execute_host(
     status.prefix_rebuilding |= setup.repair_pending;
     let status = &status;
     let mut state = setup.setup.state.clone();
-    state.last_applied = setup
-        .applied
-        .as_ref()
-        .map(|s| load_host_view(store, &work.key, s).map(|v| v.engine))
-        .transpose()?;
     let previous = setup
         .produced
         .as_ref()
         .map(|s| load_host_view(store, &work.key, s))
         .transpose()?;
+    state.last_applied = setup
+        .applied
+        .as_ref()
+        .map(|summary| {
+            // Acknowledged and produced references usually name the same immutable
+            // row. Decode it once, retaining each reference's descended lineage.
+            if let Some(view) = previous
+                .as_ref()
+                .filter(|v| v.engine.version == summary.version)
+            {
+                let mut engine = view.engine.clone();
+                engine.range.lineage_id = summary.range.lineage_id.clone();
+                Ok(engine)
+            } else {
+                load_host_view(store, &work.key, summary).map(|v| v.engine)
+            }
+        })
+        .transpose()?;
     state.last_produced = previous.as_ref().map(|v| v.engine.clone());
-    let live = store
-        .load_provider_hook_answers(&work.key.store_key())
-        .map_err(transient)?;
     let pending = store
         .load_provider_pending_drops(&work.key.store_key())
         .map_err(transient)?;
+    let live = if pending.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .load_provider_hook_answers(&work.key.store_key())
+            .map_err(transient)?
+    };
     let targets = live
         .iter()
         .filter(|a| a.state == "live")
@@ -697,6 +737,8 @@ fn execute_host(
     store
         .append_pending_agent_drops(&conversation.engine_namespace, &targets, now_ms())
         .map_err(transient)?;
+    let prepare_ms = started.elapsed().as_secs_f64() * 1000.0 - replay_ms;
+    let engine_started = Instant::now();
     let output =
         host_engine_step(store, &template, &context, status, &mut state).map_err(|error| {
             if codec == Codec::ClaudeCodeAnthropic {
@@ -705,6 +747,7 @@ fn execute_host(
                 transient(error)
             }
         })?;
+    let engine_ms = engine_started.elapsed().as_secs_f64() * 1000.0;
     // Keep only scalars in Setup. Engine and native bytes are committed together
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
@@ -804,6 +847,10 @@ fn execute_host(
                 .ok_or_else(|| invalid_field("raw_view"))?,
         )?;
     }
+    tracing::info!(session_id = %work.key.session, harness = %work.key.harness,
+        replay_ms, prepare_ms, engine_ms,
+        encode_ms = started.elapsed().as_secs_f64() * 1000.0 - replay_ms - prepare_ms - engine_ms,
+        "provider rebuild stages");
     let mut view = HostView {
         engine,
         wire,
@@ -1201,6 +1248,13 @@ impl McHandler {
         params: &Value,
         request: compact::status::StepStatus,
     ) -> Result<Vec<u8>, HandlerOutcome> {
+        let _span =
+            tracing::info_span!("provider_step", request_id = %request.request_id).entered();
+        let _meters = mc_store::provider_meters::ProviderStoreMeter::start(
+            &work.key.session,
+            &work.key.harness,
+            &request.request_id,
+        );
         let envelope_bytes =
             serde_json::to_vec(&json!({"method":"compaction.step","params":params}))
                 .map_err(transient)?
@@ -1599,6 +1653,30 @@ impl McHandler {
         conversation.last_answer_json = Some(answer_receipt(&answer));
         save_host_setup(store, &work.key, &mut conversation, &setup)?;
         fault("AnswerRecorded");
+        if params
+            .get("consume_prepared_policy")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && answer.get("answer").and_then(Value::as_str) == Some("compaction_message")
+        {
+            let started = Instant::now();
+            let prepared = store
+                .prepare_provider_policy(&work.key.store_key(), |index, counters| {
+                    super::policy_summary::prepare_policy(
+                        index,
+                        &counters["engine_policy"],
+                        work.binding.config.resolve_protected_tokens(100_000).floor,
+                        &work.binding.config.protected_tools,
+                        counters
+                            .pointer("/pass_context/model_key")
+                            .and_then(Value::as_str),
+                    )
+                })
+                .map_err(transient)?;
+            tracing::info!(session_id = %work.key.session, request_id = %request.request_id,
+                prepared, preparation_ms = started.elapsed().as_secs_f64()*1000.0,
+                "provider policy preparation complete");
+        }
         match raw_replacement {
             Some(raw) => super::codec_claude_code::answer_bytes(&answer, &raw),
             None => bytes(&answer),
@@ -1613,6 +1691,7 @@ impl McHandler {
     ) -> Result<Work, HandlerOutcome> {
         let route = self.route_project(store, &binding)?;
         Ok(Work {
+            resident_folds: self.provider_resident.is_enabled(),
             project_directory: binding.project_root.to_string_lossy().into_owned(),
             note_project_path: route.key.clone(),
             project_path: route.key,

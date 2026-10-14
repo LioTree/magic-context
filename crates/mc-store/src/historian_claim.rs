@@ -347,6 +347,12 @@ fn store_meta(
     let meta_json = crate::cache_codec::encode_small_meta(meta).map_err(|error| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error.to_string())))
     })?;
+    let old: String = tx.query_row(
+        "SELECT meta FROM mc_cache_state WHERE session_id=?1",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let meta_json = crate::cache_codec::preserve_native_marker(meta_json, &old)?;
     let affected = tx.execute(
         "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
          WHERE session_id = ?1 AND row_version = ?4",

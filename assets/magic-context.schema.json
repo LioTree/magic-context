@@ -59,6 +59,11 @@
         "on"
       ]
     },
+    "rust_provider_preparation": {
+      "default": false,
+      "description": "Experimental, user-level only: consume revision-matched provider hook preparation; disabled by default pending byte/state and timing review.",
+      "type": "boolean"
+    },
     "auto_update": {
       "description": "Enable automatic npm self-update checks for the OpenCode plugin. Security: USER-only in config loader, so hostile project configs cannot suppress updates.",
       "type": "boolean"

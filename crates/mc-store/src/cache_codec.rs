@@ -28,6 +28,11 @@ use serde_json::value::RawValue;
 
 use crate::{row_state_hash_128, ModuleMeta, ResolvedContextBoundary, TailHygieneBaseline};
 
+mod field_filter;
+mod native_tail;
+use field_filter::RecordFields;
+pub(crate) use native_tail::{encode_native_row, preserve_native_marker};
+
 /// Units per row of `mc_cache_frozen_chunks`. Chunk `i` holds units `64 * i ..`; every chunk
 /// but the last is full. Migration 63 uses the same number, so it must not change without a
 /// migration that re-cuts every stored chunk.
@@ -175,6 +180,12 @@ impl std::fmt::Display for CodecError {
 }
 
 impl std::error::Error for CodecError {}
+
+impl From<rusqlite::Error> for CodecError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Serde(format!("native tail source read: {error}"))
+    }
+}
 
 impl From<CodecError> for rusqlite::Error {
     fn from(error: CodecError) -> Self {
@@ -325,18 +336,33 @@ pub(crate) fn decode_small_core(json: &str) -> Result<CoreState, CodecError> {
 /// Parse the small `meta` blob, which carries everything but the two hashed sections.
 pub(crate) fn decode_small_meta(json: &str) -> Result<ModuleMeta, CodecError> {
     let parsed = entries(json)?;
-    reject_moved_keys(&parsed, &[SECTION_BOUNDARIES, SECTION_TAIL])?;
-    serde_json::from_str(json).map_err(|error| CodecError::Serde(error.to_string()))
+    let native = native_tail::reference(json)?;
+    reject_moved_keys(
+        &parsed,
+        if native.is_some() {
+            &[SECTION_BOUNDARIES]
+        } else {
+            &[SECTION_BOUNDARIES, SECTION_TAIL]
+        },
+    )?;
+    let small = object_from_entries(
+        parsed
+            .0
+            .iter()
+            .filter(|(key, _)| native.is_none() || key != SECTION_TAIL),
+    );
+    serde_json::from_str(&small).map_err(|error| CodecError::Serde(error.to_string()))
 }
 
 /// Serialize `meta` without the two hashed sections. Any value a caller left in them is
 /// dropped: only the codec's section writers may store them.
 pub(crate) fn encode_small_meta(meta: &ModuleMeta) -> Result<String, CodecError> {
-    let full = serde_json::to_string(meta).map_err(|error| CodecError::Serde(error.to_string()))?;
-    let parsed = entries(&full)?;
-    Ok(object_from_entries(parsed.0.iter().filter(|(key, _)| {
-        key != SECTION_BOUNDARIES && key != SECTION_TAIL
-    })))
+    serde_json::to_string(&RecordFields {
+        value: meta,
+        omit: &[SECTION_BOUNDARIES, SECTION_TAIL],
+        baseline_parts: None,
+    })
+    .map_err(|error| CodecError::Serde(error.to_string()))
 }
 
 /// One small row of `mc_cache_state` as stored.
@@ -494,11 +520,29 @@ pub(crate) fn read_decoded(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> Result<Option<DecodedRow>, rusqlite::Error> {
+    if conn.is_autocommit() {
+        let transaction = conn.unchecked_transaction()?;
+        let decoded = read_decoded_in_cut(&transaction, session_id)?;
+        transaction.commit()?;
+        return Ok(decoded);
+    }
+    read_decoded_in_cut(conn, session_id)
+}
+
+fn read_decoded_in_cut(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Option<DecodedRow>, rusqlite::Error> {
     let Some(row) = read_small_row(conn, session_id)? else {
         return Ok(None);
     };
     let sections = read_sections(conn, session_id)?;
-    Ok(Some(decode_row(row, sections)?))
+    let native = native_tail::reference(&row.meta)?;
+    let mut decoded = decode_row(row, sections)?;
+    if let Some(reference) = native {
+        native_tail::hydrate(conn, session_id, &reference, &mut decoded)?;
+    }
+    Ok(Some(decoded))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -533,6 +577,7 @@ pub(crate) fn decode_row(
     #[cfg(any(test, feature = "test-support"))]
     FULL_DECODES.with(|count| count.set(count.get() + 1));
     let mut core = decode_small_core(&row.core_state)?;
+    let native = native_tail::reference(&row.meta)?;
     let mut meta = decode_small_meta(&row.meta)?;
     let index = SectionIndex::parse(&row.section_index);
     let sv = index.as_ref().map_or(0, |index| index.sv);
@@ -565,14 +610,16 @@ pub(crate) fn decode_row(
             SectionState::Discarded(DiscardReason::IndexUnreadable),
             None,
         ),
-        Some(index) => decode_hashed::<TailHygieneBaseline>(
+        Some(index) => decode_hashed::<native_tail::TailBody>(
             sv,
             index.t.as_ref(),
             sections.tail.as_deref(),
             |_| 1,
         ),
     };
-    meta.tail_hygiene_baseline = tail_value;
+    meta.tail_hygiene_baseline = tail_value
+        .map(|body| body.into_baseline(native.as_ref()))
+        .transpose()?;
 
     Ok(DecodedRow {
         row_version: row.row_version,
@@ -704,6 +751,20 @@ fn encoded(body: String) -> EncodedBody {
 /// of its 64 units, so a chunk migration 63 wrote hashes the same as this encoder's output
 /// for the same units, and the first commit after the migration rewrites only real changes.
 pub(crate) fn encode_row(core: &CoreState, meta: &ModuleMeta) -> Result<EncodedRow, CodecError> {
+    let tail = meta
+        .tail_hygiene_baseline
+        .as_ref()
+        .map(|value| serde_json::to_string(value).map(encoded))
+        .transpose()
+        .map_err(|error| CodecError::Serde(error.to_string()))?;
+    encode_row_parts(core, meta, tail)
+}
+
+pub(crate) fn encode_row_parts(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    tail: Option<EncodedBody>,
+) -> Result<EncodedRow, CodecError> {
     let serde = |error: serde_json::Error| CodecError::Serde(error.to_string());
     // Destructured exhaustively so a field added to `CoreState` fails to compile here
     // instead of being dropped from the stored row.
@@ -734,28 +795,15 @@ pub(crate) fn encode_row(core: &CoreState, meta: &ModuleMeta) -> Result<EncodedR
         .collect::<Result<Vec<_>, _>>()
         .map_err(serde)?;
 
-    // One serialization of the whole meta; the two sections are cut out of it as their exact
-    // bytes, so a section body is byte-identical to serializing the value on its own.
-    let full_meta = serde_json::to_string(meta).map_err(serde)?;
-    let parsed = entries(&full_meta)?;
-    let mut boundaries = None;
-    let mut tail = None;
-    for (key, value) in &parsed.0 {
-        if key == SECTION_BOUNDARIES {
-            boundaries = Some((
-                encoded(value.get().to_string()),
-                meta.resolved_compartment_boundaries.len() as u64,
-            ));
-        } else if key == SECTION_TAIL {
-            tail = Some(encoded(value.get().to_string()));
-        }
-    }
-    let meta_json = object_from_entries(
-        parsed
-            .0
-            .iter()
-            .filter(|(key, _)| key != SECTION_BOUNDARIES && key != SECTION_TAIL),
-    );
+    let meta_json = encode_small_meta(meta)?;
+    let boundaries = if meta.resolved_compartment_boundaries.is_empty() {
+        None
+    } else {
+        Some((
+            encoded(serde_json::to_string(&meta.resolved_compartment_boundaries).map_err(serde)?),
+            meta.resolved_compartment_boundaries.len() as u64,
+        ))
+    };
     Ok(EncodedRow {
         core_json,
         meta_json,
@@ -1089,3 +1137,15 @@ fn write_hashed(
 
 #[cfg(test)]
 mod tests;
+
+/// Read the policy cut ID referenced by the cached baseline. Retention callers
+/// use this accessor so only the codec interprets its versioned JSON marker.
+pub(crate) fn native_tail_cut(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+) -> rusqlite::Result<Option<u64>> {
+    let Some(row) = read_small_row(conn, namespace)? else {
+        return Ok(None);
+    };
+    Ok(native_tail::reference(&row.meta)?.map(|reference| reference.cut_id))
+}

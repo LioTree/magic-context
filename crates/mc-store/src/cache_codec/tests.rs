@@ -1196,6 +1196,15 @@ fn rewind_to_62(store: &McStore) {
         for name in names {
             conn.execute_batch(&format!("DROP TRIGGER temp.\"{name}\""))?;
         }
+        // Version 71 installs policy-revision triggers on older tag/cache
+        // tables too. Remove them before deleting the provider tables that
+        // their namespace lookups reference in this version-62 fixture.
+        let names = conn.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE '%_revision_%' OR name LIKE 'mc_provider_preparation_%')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for name in names {
+            conn.execute_batch(&format!("DROP TRIGGER \"{name}\""))?;
+        }
         Ok(())
     }).unwrap();
     exec(
@@ -1204,7 +1213,13 @@ fn rewind_to_62(store: &McStore) {
          DROP TABLE mc_pass_trace_history;
          DROP TABLE mc_cache_frozen_chunks;
          DROP TABLE mc_cache_sections;
-          DROP TABLE mc_provider_conversations_v2;
+          DROP TABLE mc_provider_view_overrides_v1;
+          DROP TABLE mc_provider_views_v2;
+          DROP TABLE mc_provider_policy_overrides_v1;
+          DROP TABLE mc_provider_policy_cuts_v1;
+           DROP TABLE mc_provider_conversations_v2;
+          DROP TABLE mc_provider_policy_preparations_v1;
+          DROP TABLE mc_provider_policy_revisions_v1;
           DROP TABLE mc_provider_lineages_v1;
           DROP TABLE mc_provider_messages_v1;
           DROP TABLE mc_provider_hook_answers_v1;
@@ -2148,4 +2163,68 @@ fn meta_unknown_keys_are_ignored_and_absent_score_watermark_is_base() {
             .score_selection_watermark,
         17
     );
+}
+
+#[test]
+fn filtered_scalar_encoder_preserves_v72_full_array_section_and_header_bytes() {
+    for count in [0, 1, 63, 64, 65, 500, 75_000] {
+        let meta = ModuleMeta {
+            initialized: true,
+            coverage_ordinal: Some(42),
+            last_model_key: "model/café/🦀".into(),
+            resolved_compartment_boundaries: vec![boundary(0), boundary(1)],
+            tail_hygiene_baseline: Some(TailHygieneBaseline {
+                baseline_u: 17,
+                baseline_t: 29,
+                hygiene_tools_ratio: 1.1,
+                baseline_parts: (0..count)
+                    .map(|i| crate::TailHygienePartMeasurement {
+                        key: format!("m{i}#0\0text"),
+                        content_hash: format!("hash-{i}"),
+                        kind: crate::TailHygienePartKind::Text,
+                        tokens: 7,
+                        u_tokens: 3,
+                        tag_number: Some(i as i64),
+                        tag_status: Some("active".into()),
+                        protected: i % 3 == 0,
+                        queued_for_drop: i % 7 == 0,
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let full = serde_json::to_string(&meta).unwrap();
+        let parsed = entries(&full).unwrap();
+        let old_small = object_from_entries(
+            parsed
+                .0
+                .iter()
+                .filter(|(key, _)| key != SECTION_TAIL && key != SECTION_BOUNDARIES),
+        );
+        let actual = encode_row(&core_with(units(0..70)), &meta).unwrap();
+        assert_eq!(
+            actual.meta_json, old_small,
+            "header changed for {count} parts"
+        );
+        for (key, raw) in &parsed.0 {
+            if key == SECTION_TAIL {
+                assert_eq!(actual.tail.as_ref().unwrap().body, raw.get());
+            }
+            if key == SECTION_BOUNDARIES {
+                assert_eq!(actual.boundaries.as_ref().unwrap().0.body, raw.get());
+            }
+        }
+        assert_eq!(
+            meta.tail_hygiene_baseline
+                .as_ref()
+                .unwrap()
+                .clone_without_parts(),
+            {
+                let mut old = meta.tail_hygiene_baseline.clone().unwrap();
+                old.baseline_parts.clear();
+                old
+            }
+        );
+    }
 }

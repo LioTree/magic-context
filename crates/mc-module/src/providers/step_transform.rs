@@ -17,6 +17,8 @@ mod review_tests;
 
 #[derive(Deserialize, Default)]
 struct HostHookFields {
+    #[serde(default)]
+    consume_prepared_policy: bool,
     subject_mid: Option<String>,
     subject_ordinal: Option<u64>,
     message: Option<Value>,
@@ -872,7 +874,49 @@ impl McHandler {
             .store_for_request()
             .await
             .map_err(StoreRefusal::into_outcome)?;
+        let mut resident = self
+            .provider_resident
+            .begin(store.tag_cache_namespace(), &key)
+            .map_err(transient)?;
         let _serial = self.provider_serial.lock_for(&key).await;
+        if let Some(lease) = resident.as_mut().filter(|lease| lease.cold) {
+            let started = Instant::now();
+            // Initialize token counting during the first hook's database rebuild;
+            // the next hook adding a message must not pay that one-time cost.
+            mc_tokenizer::estimate_tokens("resident tokenizer warmup");
+            #[cfg(all(test, feature = "drive-fault"))]
+            if std::env::var("MC_RESIDENT_SLOW_REBUILD").as_deref() == Ok("1") {
+                std::thread::sleep(Duration::from_millis(HOOK_BUDGET_MS + 1));
+            }
+            lease.state = store
+                .read_provider_resident_policy(&key.store_key(), |index, counters| {
+                    super::policy_summary::ResidentPolicy::rebuild(
+                        index,
+                        counters,
+                        binding.config.resolve_protected_tokens(100_000).floor,
+                        &binding.config.protected_tools,
+                    )
+                })
+                .map_err(transient)?;
+            let rebuild_ms = started.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(session_id = %key.session, harness = %key.harness, rebuild_ms,
+                retained_bytes = lease.state.retained_bytes(),
+                "provider resident hook state rebuilt");
+            if rebuild_ms + 10.0 > HOOK_BUDGET_MS as f64 {
+                resident.take().expect("resident lease").publish();
+                return Err(transient(
+                    "resident_not_ready: rebuild completed; retry the hook",
+                ));
+            }
+        }
+        let _meters = mc_store::provider_meters::ProviderStoreMeter::start(
+            &key.session,
+            &key.harness,
+            params
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
         let c = store
             .load_provider_conversation(&key.store_key())
             .map_err(transient)?
@@ -1036,8 +1080,8 @@ impl McHandler {
         }
         // The store owns P1's newest-held/monotonic confirmation check. Descent,
         // message admission and the revert clamp share that transaction.
-        let answer = store
-            .commit_provider_hook_with_parts(
+        let (answer, preparation_consumed) = store
+            .commit_provider_hook_with_preparation(
                 &key.store_key(),
                 ProviderHookRequest {
                     lineage: &lineage,
@@ -1047,6 +1091,7 @@ impl McHandler {
                     repeat_subject: Some(&subject),
                 },
                 &policy_parts,
+                fields.consume_prepared_policy,
                 |ctx| {
                     let mut counters = ctx.counters.clone();
                     super::historian::advance_ingest_watermarks(&mut counters, lineage_id, std::slice::from_ref(ingress));
@@ -1128,7 +1173,11 @@ impl McHandler {
                     let carrier=hook==Hook::PostTool && targets.iter().any(|t|carrier_block.is_some_and(|p|p.block_id==t.id));
                     let cache_busting=temporal_permitted && !matches!(c.preset.as_deref(),Some("worker"|"subagent"|"reader"));
                     let pass_model=ctx.counters.pointer("/pass_context/model_key").and_then(Value::as_str);
-                    let (inputs,policy_summary)=super::policy_summary::channel1_inputs(&ctx.policy_index,&ctx.counters["engine_policy"],binding.config.resolve_protected_tokens(100_000).floor,&binding.config.protected_tools,carrier,cache_busting,pass_model)?;
+                    let (inputs,policy_summary)=if let Some(lease) = resident.as_mut() {
+                        super::policy_summary::resident_channel1_inputs(&mut lease.state,&ctx.policy_index,&ctx.counters["engine_policy"],binding.config.resolve_protected_tokens(100_000).floor,&binding.config.protected_tools,carrier,cache_busting,pass_model)?
+                    } else {
+                        super::policy_summary::channel1_inputs(&ctx.policy_index,&ctx.counters["engine_policy"],binding.config.resolve_protected_tokens(100_000).floor,&binding.config.protected_tools,carrier,cache_busting,pass_model)?
+                    };
                     if cache_busting {counters["engine_policy"]["calibration"]=serde_json::to_value(crate::decision_calibration::DecisionCalibration::freeze_for_model(pass_model)).expect("calibration JSON");}
                     if ctx.counters.pointer("/engine_policy/baseline/baseline_generation").and_then(Value::as_u64)!=Some(inputs.baseline.baseline_generation) {
                         counters["policy_baseline_updates"]=json!(inputs.baseline.baseline_parts.iter().map(|m|json!({"block_id":m.key.split('\0').next().unwrap_or(""),"measurement":m})).collect::<Vec<_>>());
@@ -1185,12 +1234,20 @@ impl McHandler {
                             counters,
                             policy_summary,
                         },
-                        answer,
+                        (answer, ctx.policy_index.preparation_was_consumed()),
                     ))
                 },
             )
             .map_err(provider_policy_error)?;
+        if fields.consume_prepared_policy {
+            tracing::info!(session_id = %key.session, harness = %key.harness,
+                request_id = params.get("request_id").and_then(|value| value.as_str()).unwrap_or(""),
+                preparation_consumed, "provider hook preparation outcome");
+        }
         fault("HookStateRecorded");
+        if let Some(lease) = resident {
+            lease.publish();
+        }
         if fields.pass_complete == Some(true) {
             self.schedule_provider_historian(binding, key);
         }
@@ -1710,6 +1767,45 @@ mod host_tests {
     pub(super) async fn admit(h: &McHandler, ch: u16) {
         response(dispatch(h, ch, "transform.declare", json!({"params":plan()})).await);
     }
+
+    #[tokio::test]
+    async fn resident_hook_during_rebuild_refuses_before_the_plan_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path()).with_startup_provider_resident_enabled(true);
+        admit(&h, 7).await;
+        let binding = h.facade_binding(7).unwrap();
+        let key = Key::new(&binding, "s", "opencode").unwrap();
+        let _lease = h
+            .provider_resident
+            .begin(h.store.get().unwrap().tag_cache_namespace(), &key)
+            .unwrap()
+            .unwrap();
+        let _serial = h.provider_serial.lock_for(&key).await;
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(50),
+            dispatch(
+                &h,
+                7,
+                "transform.hook",
+                hook(
+                    "fresh",
+                    0,
+                    "pre_user",
+                    &["fresh"],
+                    text("fresh", "user", "fresh"),
+                ),
+            ),
+        )
+        .await
+        .expect("a rebuilding hook must not wait for the plan lock");
+        match outcome {
+            HandlerOutcome::Error { code, message } => {
+                assert_eq!(code, "transient");
+                assert!(message.starts_with("resident_not_ready:"));
+            }
+            other => panic!("rebuilding hook unexpectedly served: {other:?}"),
+        }
+    }
     pub(super) async fn sync_pass(h: &McHandler, appended: &[(u64, Value)]) {
         let tail = appended
             .last()
@@ -1734,6 +1830,137 @@ mod host_tests {
         }
         p
     }
+    #[tokio::test]
+    async fn next_native_hook_after_agent_move_import_matches_source_bytes_and_tags() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = handler(source_dir.path()).with_startup_provider_resident_enabled(true);
+        source.set_guidance_now_ms_for_test(1);
+        admit(&source, 7).await;
+        let first = text(
+            "seed",
+            "user",
+            "preserve the source policy and tag identity",
+        );
+        response(
+            dispatch(
+                &source,
+                7,
+                "transform.hook",
+                hook(
+                    "seed",
+                    0,
+                    "pre_user",
+                    &["preserve the source policy and tag identity"],
+                    first.clone(),
+                ),
+            )
+            .await,
+        );
+        sync_pass(&source, &[(0, first)]).await;
+        let source_store = source.store.get().unwrap();
+        let binding = source.facade_binding(7).unwrap();
+        let key = Key::new(&binding, "s", "opencode").unwrap();
+        let conversation = source_store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let staging = target_dir.path().join("snapshot");
+        let cut = mc_store::move_store::CutBinding {
+            cut_id: "next-native-hook-cut".into(),
+            session_ref: "0123456789abcdef".into(),
+            host_session_id: "s".into(),
+            host_end_offset: 42,
+            host_cut: json!({}),
+            mc_start_offset: 100,
+        };
+        let mut export = source_store.move_store().unwrap();
+        export.acquire_fence(&cut).unwrap();
+        export.freeze(&cut.cut_id).unwrap();
+        export.capture(&cut.cut_id, &staging).unwrap();
+        let source_revision = source_store
+            .provider_policy_revision(&conversation.engine_namespace)
+            .unwrap();
+        let descriptor = StorageDescriptor {
+            module_id: DEFAULT_MODULE_ID.into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: target_dir.path().join("store.db").to_string_lossy().into(),
+            },
+        };
+        let target_store = Arc::new(McStore::open_for_test(&descriptor).unwrap());
+        let mut import = target_store.move_store().unwrap();
+        import
+            .reserve_install(&cut, "next-hook-digest", &staging)
+            .unwrap();
+        while !import.install_batch(&cut.cut_id).unwrap().complete {}
+        import
+            .finish_install(&cut.cut_id, "next-hook-result")
+            .unwrap();
+        import.activate_for_test(&cut.cut_id).unwrap();
+        assert!(
+            target_store
+                .provider_policy_revision(&conversation.engine_namespace)
+                .unwrap()
+                > source_revision
+        );
+        export.release_source(&cut.cut_id, false).unwrap();
+        let mut target = McHandler::new().with_startup_provider_resident_enabled(true);
+        target.store.set(target_store.clone()).ok().unwrap();
+        target.provider_runner = Arc::new(NoReads);
+        target.bind_route(7, binding);
+        target.set_guidance_now_ms_for_test(1);
+        admit(&target, 7).await;
+        let mut next = hook(
+            "next",
+            1,
+            "pre_user",
+            &["the same post-move request"],
+            text("next", "user", "the same post-move request"),
+        );
+        next["step_id"] = json!("next-after-move");
+        next["request_id"] = json!("same-hook-after-move");
+        let raw = |answer| match answer {
+            HandlerOutcome::Response(bytes) => bytes,
+            other => panic!("native hook must serve, not refuse: {other:?}"),
+        };
+        let expected = raw(dispatch(&source, 7, "transform.hook", next.clone()).await);
+        let actual = raw(dispatch(&target, 7, "transform.hook", next).await);
+        assert_eq!(
+            actual, expected,
+            "the first imported hook must match source response bytes"
+        );
+        let functional_tags = |store: &McStore| {
+            store
+                .load_tags_for_session(&conversation.engine_namespace)
+                .unwrap()
+                .into_iter()
+                .map(|tag| {
+                    (
+                        tag.tag_number,
+                        tag.block_id,
+                        tag.kind,
+                        tag.token_count,
+                        tag.source_bytes,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            functional_tags(&target_store),
+            functional_tags(source_store)
+        );
+        assert_eq!(
+            target_store
+                .load_provider_pending_drops(&key.store_key())
+                .unwrap(),
+            source_store
+                .load_provider_pending_drops(&key.store_key())
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn pre_switch_engine_tags_queue_in_full_request_delivery_lane() {
         let dir = tempfile::tempdir().unwrap();

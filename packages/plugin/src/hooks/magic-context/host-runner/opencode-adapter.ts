@@ -1,6 +1,14 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { drainSingleStoreEmbeddingWatermarks } from "../../../features/magic-context/memory/single-store-embedding-drain";
+import {
+    currentProviderMeters,
+    meterProviderCall,
+    meterProviderStage,
+    type ProviderPassMeters,
+    withoutProviderMeters,
+    withProviderMeters,
+} from "../../../features/magic-context/provider-meters";
 import { computeHardCacheExpired } from "../../../features/magic-context/scheduler";
 import {
     commitHostRunnerAnswer,
@@ -346,6 +354,7 @@ interface Session {
     replaceRecord?: string;
 }
 export interface OpenCodeProviderOptions {
+    emitMeters?: (meters: ProviderPassMeters) => void;
     now?: () => number;
     /** Await newly saved hook ops/unavailability before serving messages; context.db owns their replay. */
     onOutcome?: (messageId: string, subject: Subject, outcome: HookOutcome) => Promise<void>;
@@ -405,16 +414,18 @@ export function createOpenCodeProviderTransform(
                 return async (args: Parameters<typeof target.call>[0]) => {
                     checkpoint();
                     const pass = passContext.getStore();
-                    const result = await stage(
-                        target.call({
-                            ...args,
-                            signal: pass
-                                ? AbortSignal.any([
-                                      pass.signal,
-                                      ...(args.signal ? [args.signal] : []),
-                                  ])
-                                : args.signal,
-                        }),
+                    const result = await meterProviderCall(args.method, () =>
+                        stage(
+                            target.call({
+                                ...args,
+                                signal: pass
+                                    ? AbortSignal.any([
+                                          pass.signal,
+                                          ...(args.signal ? [args.signal] : []),
+                                      ])
+                                    : args.signal,
+                            }),
+                        ),
                     );
                     checkpoint();
                     return result;
@@ -529,6 +540,7 @@ export function createOpenCodeProviderTransform(
             harness,
             now,
             bootstrapBudgetMs: OPENCODE_PROVIDER_BOOTSTRAP_BUDGET_MS,
+            consumePreparedPolicy: () => deps.rustProviderPreparation === true,
             persistFence: async (fence) => {
                 write(() =>
                     commitHostRunnerFence(deps.db, key(id), fence.request_id, fence.newest),
@@ -749,6 +761,12 @@ export function createOpenCodeProviderTransform(
         output: { messages: unknown[] },
         meta: SessionMeta,
     ): Promise<void> {
+        const meters = currentProviderMeters();
+        if (meters) {
+            meters.fallback_count++;
+            meters.pass_kind = "exit";
+            meters.pipeline = "full_request";
+        }
         const namespace =
             s?.metadata.fullRequestNamespace ??
             (s?.record.pipeline_exit?.reseed_full_request
@@ -798,6 +816,8 @@ export function createOpenCodeProviderTransform(
     }
     const reseeded = new Map<string, Legacy>();
     function recover(id: string, messages: MessageLike[]): void {
+        const meters = currentProviderMeters();
+        if (meters) meters.recovery_count++;
         deps.onRustEngineReconnectRefusal?.({
             sessionId: id,
             projectRoot,
@@ -817,6 +837,11 @@ export function createOpenCodeProviderTransform(
         checkpoint();
         checkFailure(result);
         if (result.status === "unavailable") {
+            if (s.metadata.active && ["timeout", "late", "aborted"].includes(result.reason)) {
+                throw new EmergencyFailClosedError(
+                    `Provider step did not complete before its fence: ${result.reason}`,
+                );
+            }
             const error = part(result.error ?? {});
             if (error.code === "invalid_params" && part(error.detail ?? {}).field === "messages") {
                 throw new StepOrdinalConflict("Status conflicts with module-ahead ingest");
@@ -879,6 +904,11 @@ export function createOpenCodeProviderTransform(
         }
         let hardMaterializedAt: number | undefined;
         if (applied) {
+            const meters = currentProviderMeters();
+            if (meters) {
+                meters.rebuild_count++;
+                meters.pass_kind = "rebuild";
+            }
             s.metadata.active = true;
             // SOFT flush/pressure views do not consume the idle HARD trigger.
             const decision =
@@ -1331,6 +1361,27 @@ export function createOpenCodeProviderTransform(
         meta: SessionMeta,
         conflictRetry = 0,
     ): Promise<void> {
+        return withProviderMeters(
+            id,
+            harness === "opencode" ? "OpenCode1" : "OpenCode2",
+            null,
+            () => runPass(id, messages, output, meta, conflictRetry),
+            (meters) => {
+                sessionLog(
+                    id,
+                    `rust pass: decision=${meters.pass_kind} reason=provider_pipeline pipeline=${meters.pipeline} pass_id=${meters.pass_id} elapsed=${meters.pass_ms} ms provider_meters=${JSON.stringify(meters)}`,
+                );
+                options.emitMeters?.(structuredClone(meters));
+            },
+        );
+    }
+    async function runPass(
+        id: string,
+        messages: MessageLike[],
+        output: { messages: unknown[] },
+        meta: SessionMeta,
+        conflictRetry = 0,
+    ): Promise<void> {
         checkpoint();
         // A legacy handoff preserves its original exception type. In particular,
         // BUSY must still be eligible for the legacy wrapper's LKG recovery.
@@ -1371,13 +1422,21 @@ export function createOpenCodeProviderTransform(
                     ? s
                     : undefined;
             if (!s?.metadata.active || reentry) {
-                s = await bootstrap(id, s, messages, meta, reentry);
+                const meters = currentProviderMeters();
+                if (meters) meters.pass_kind = "bootstrap";
+                s = await meterProviderStage("bootstrap", () =>
+                    bootstrap(id, s, messages, meta, reentry),
+                );
                 if (!s?.metadata.active || s.record.pipeline_exit) {
                     return fallback(id, s, messages, output, meta);
                 }
-                publishMessages(output, assemble(s.record));
+                const bootstrapped = s;
+                await meterProviderStage("publish", () =>
+                    publishMessages(output, assemble(bootstrapped.record)),
+                );
                 afterCommit(() => {
-                    void historian?.pump(id);
+                    if (meters) meters.historian_pump_count += historian ? 1 : 0;
+                    void withoutProviderMeters(() => historian?.pump(id));
                 });
                 return;
             }
@@ -1401,11 +1460,13 @@ export function createOpenCodeProviderTransform(
             committedBeforePass = s.record.next_ordinal - 1;
             // Id classification precedes sync; trigger eligibility is after the
             // synchronized chain and the last hook's pass-complete barrier.
-            await sync(id, s, scan.appends.length === 0);
+            await meterProviderStage("state_sync", () => sync(id, s, scan.appends.length === 0));
             const controls = inputs(id, messages, meta);
             const admissions: Admitted[] = [];
             let completedHook = false;
             for (let attempt = 0; attempt < 2; attempt++) {
+                const meters = currentProviderMeters();
+                if (meters && attempt > 0) meters.retry_count++;
                 admissions.length = 0;
                 completedHook = false;
                 let conflict = false;
@@ -1435,16 +1496,39 @@ export function createOpenCodeProviderTransform(
                     const outcomes: HookOutcome[] = [];
                     for (const [j, subject] of subjects.entries()) {
                         const complete = i === scan.appends.length - 1 && j === subjects.length - 1;
-                        const result = await s.client.hook(
-                            s.record,
-                            { ...subject, subject_ordinal: candidate.ordinal },
-                            admitted.ingest,
-                            complete ? true : undefined,
-                            passContext.getStore()?.signal,
+                        const result = await meterProviderStage("hook_transport", () =>
+                            s.client.hook(
+                                s.record,
+                                { ...subject, subject_ordinal: candidate.ordinal },
+                                admitted.ingest,
+                                complete ? true : undefined,
+                                passContext.getStore()?.signal,
+                            ),
                         );
                         checkpoint();
                         completedHook ||= complete;
                         checkFailure(result);
+                        if (result.status === "unavailable") {
+                            const error = part(result.error ?? {});
+                            if (
+                                error.code === "transient" &&
+                                typeof error.message === "string" &&
+                                error.message.startsWith("resident_not_ready:")
+                            ) {
+                                throw new EmergencyFailClosedError(error.message);
+                            }
+                        }
+                        // A deadline is not proof that the module did no work. It
+                        // may have committed a tag whose answer is still in flight;
+                        // serving the raw append would lose that tag on this turn.
+                        if (
+                            result.status === "unavailable" &&
+                            ["timeout", "late", "aborted"].includes(result.reason)
+                        ) {
+                            throw new EmergencyFailClosedError(
+                                `Provider hook did not complete before its fence: ${result.reason}`,
+                            );
+                        }
                         if (ordinalConflict(result)) {
                             conflict = true;
                             break;
@@ -1510,7 +1594,8 @@ export function createOpenCodeProviderTransform(
             }
             // A final append without a subscribed hook still ends the pass. Signal
             // completion after every append is recorded, not in the pre-ingest sync.
-            if (scan.appends.length && !completedHook) await sync(id, s, true);
+            if (scan.appends.length && !completedHook)
+                await meterProviderStage("state_sync", () => sync(id, s, true));
             controls.newest = {
                 ordinal: s.record.next_ordinal - 1,
                 mid: s.metadata.newestMid ?? "empty",
@@ -1536,14 +1621,16 @@ export function createOpenCodeProviderTransform(
                 // Continuation pages may not apply views. This same bounded paging
                 // lane is also needed when several frozen-raw appends exceed 3 MiB.
                 const pending = s;
-                await stage(
-                    s.client.bootstrap(
-                        s.record,
-                        controls,
-                        async (page) => {
-                            await answer(id, pending, page, controls, messages);
-                        },
-                        passContext.getStore()?.signal,
+                await meterProviderStage("rebuild", () =>
+                    stage(
+                        s.client.bootstrap(
+                            s.record,
+                            controls,
+                            async (page) => {
+                                await answer(id, pending, page, controls, messages);
+                            },
+                            passContext.getStore()?.signal,
+                        ),
                     ),
                 );
             }
@@ -1561,15 +1648,19 @@ export function createOpenCodeProviderTransform(
                     );
                 }
                 checkpoint();
-                publishMessages(
-                    output,
-                    assemble(
-                        s.record,
-                        scan.passthrough.map((p) => p.read()),
+                await meterProviderStage("publish", () =>
+                    publishMessages(
+                        output,
+                        assemble(
+                            s.record,
+                            scan.passthrough.map((p) => p.read()),
+                        ),
                     ),
                 );
                 afterCommit(() => {
-                    void historian?.pump(id);
+                    const meters = currentProviderMeters();
+                    if (meters) meters.historian_pump_count += historian ? 1 : 0;
+                    void withoutProviderMeters(() => historian?.pump(id));
                 });
             }
         } catch (error) {
@@ -1593,6 +1684,8 @@ export function createOpenCodeProviderTransform(
                     held.pendingDescent = through;
                     save(id, held);
                     busy.delete(id);
+                    const meters = currentProviderMeters();
+                    if (meters) meters.retry_count++;
                     return await run(id, messages, output, meta, conflictRetry + 1);
                 }
             }

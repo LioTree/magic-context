@@ -7,9 +7,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Section-inventory protocol version serialized in move manifests.
-pub const INVENTORY_VERSION: u32 = 5;
+pub const INVENTORY_VERSION: u32 = 7;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 100;
-pub const STORE_SCHEMA_VERSION: u32 = 70;
+pub const STORE_SCHEMA_VERSION: u32 = 72;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +121,20 @@ macro_rules! table {
 /// Stable table order for the v1 stream; each store half is filtered from this
 /// explicit list. Schema discovery is validation only and never grants shipping.
 pub const TABLES: &[TableInventory] = &[
+    // Import each namespace's policy revision row before its conversation and
+    // policy rows. Their insert triggers then increment the imported revision
+    // instead of creating a row that would collide with its later import.
+    table!(
+        Module,
+        "mc_provider_policy_revisions_v1",
+        Ship,
+        RowSelector::Predicate("engine_namespace IN (SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["engine_namespace"],
+        &["engine_namespace", "revision", "session"],
+        &[],
+        Some(KeyPolicy::PreserveOrRefuseCollision),
+        None
+    ),
     table!(
         Module,
         "mc_move_tag_epochs",
@@ -2860,7 +2874,11 @@ pub const TABLES: &[TableInventory] = &[
             "ordinal",
             "mid",
             "message_bytes",
-            "session"
+            "session",
+            "frozen_policy_format",
+            "frozen_policy_raw_bytes",
+            "frozen_policy_parts",
+            "frozen_policy_bytes"
         ],
         &[],
         Some(KeyPolicy::PreserveOrRefuseCollision),
@@ -2915,6 +2933,34 @@ pub const TABLES: &[TableInventory] = &[
         Some(KeyPolicy::PreserveOrRefuseCollision),
         None
     ),
+    table!(
+        Module, "mc_provider_policy_cuts_v1", Ship,
+        RowSelector::Predicate("conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["conv_key", "cut_id"],
+        &["conv_key", "cut_id", "lineage_id", "frozen_through_ordinal", "frozen_part_count", "baseline_json", "defaults_json", "prefix_totals_json", "policy_key", "session"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None
+    ),
+    table!(
+        Module, "mc_provider_policy_overrides_v1", Ship,
+        RowSelector::Predicate("conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["conv_key", "source_lineage_id", "block_id"],
+        &["conv_key", "source_lineage_id", "block_id", "ordinal", "cut_id", "override_json", "session"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None
+    ),
+    table!(
+        Module, "mc_provider_views_v2", Ship,
+        RowSelector::Predicate("conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["conv_key", "version"],
+        &["conv_key", "version", "lineage_id", "range_from", "range_to", "base_version", "policy_cut_id", "view_meta_json", "sequence_json", "new_head_history_bytes", "head_history_format", "serializer_profile", "render_key", "tokenizer_key", "state", "session"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None
+    ),
+    table!(
+        Module, "mc_provider_view_overrides_v1", Ship,
+        RowSelector::Predicate("conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["conv_key", "version", "source_lineage_id", "mid", "block_index"],
+        &["conv_key", "version", "source_lineage_id", "mid", "ordinal", "block_index", "block_id", "action", "patch_json", "session"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None
+    ),
     // Derived from mc_provider_policy_parts_v1: an absent summary makes the next
     // hook rebuild it from those rows, and its change log only describes changes
     // since that summary, so neither table moves with a session.
@@ -2951,8 +2997,18 @@ pub const TABLES: &[TableInventory] = &[
         None,
         None
     ),
-    // Must move: a consumed-number fence cannot be reconstructed from replayed
-    // answers. All conversations sharing the number space share this history.
+
+    table!(
+        Module,
+        "mc_provider_policy_preparations_v1",
+        LocalReset,
+        RowSelector::Predicate("conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["conv_key"],
+        &["conv_key", "engine_namespace", "policy_revision", "settings_key", "original_baseline_json", "newest_ordinal", "prepared_blob", "uncompressed_bytes", "session"],
+        &[],
+        None,
+        None
+    ),
     table!(
         Module,
         "mc_provider_consumed_tags_v1",

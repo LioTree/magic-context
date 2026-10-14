@@ -397,21 +397,19 @@ async fn structural_rejected_view_cannot_be_acknowledged_on_a_later_pass() {
     rejected["last_not_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":version,"reason":"structural"});
     response(h.provider_step(b.clone(), &rejected).await);
     let row = s
-        .load_provider_views(&k.store_key())
+        .resolve_provider_view_catalog(&k.store_key(), version)
         .unwrap()
-        .into_iter()
-        .find(|r| r.version == version)
-        .unwrap();
+        .unwrap()
+        .recipe;
     let mut late_ack = step("late-ack", vec![], 1);
     late_ack["last_applied"] =
         json!({"compaction_id":view["compaction"]["compaction_id"],"version":version});
     let _result = h.provider_step(b, &late_ack).await;
     let later = s
-        .load_provider_views(&k.store_key())
+        .resolve_provider_view_catalog(&k.store_key(), version)
         .unwrap()
-        .into_iter()
-        .find(|r| r.version == version)
-        .unwrap();
+        .unwrap()
+        .recipe;
     assert_eq!([row.state.as_str(), later.state.as_str()], ["not_applied", "not_applied"],
         "a structural rejection must reach the terminal-state guard, and a later stale acknowledgement must not resurrect it");
 }
@@ -429,11 +427,10 @@ async fn acknowledgement_with_a_foreign_compaction_id_cannot_apply_a_view() {
     ack["last_applied"] = json!({"compaction_id":"foreign-conversation","version":version});
     let _result = h.provider_step(b, &ack).await;
     let row = s
-        .load_provider_views(&k.store_key())
+        .resolve_provider_view_catalog(&k.store_key(), version)
         .unwrap()
-        .into_iter()
-        .find(|r| r.version == version)
-        .unwrap();
+        .unwrap()
+        .recipe;
     assert_eq!(
         row.state, "produced",
         "the id/version acknowledgement pair must identify the held compaction"
@@ -622,13 +619,12 @@ async fn module_ahead_descent_after_restart_burns_stranded_tags_without_rewritin
     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
     let view = response(h.provider_step(b.clone(), &boot).await);
     let version = view["compaction"]["version"].as_u64().unwrap();
-    let frozen = s
-        .load_provider_views(&k.store_key())
-        .unwrap()
-        .into_iter()
-        .find(|v| v.version == version)
-        .unwrap()
-        .replacement_json;
+    let frozen = serde_json::to_string(
+        &super::super::view_recipe::load(&s, &k, version)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     pending_hook(&s, &k, 2);
     s.queue_provider_drops(&k.store_key(), &[1]).unwrap();
     // The host died before durably appending m2. A retry admits a different id
@@ -668,13 +664,10 @@ async fn module_ahead_descent_after_restart_burns_stranded_tags_without_rewritin
         .unwrap()
         .is_empty());
     assert!(s.load_tags_for_session("s").unwrap().is_empty());
-    let held = s
-        .load_provider_views(&k.store_key())
+    let held = super::super::view_recipe::load(&s, &k, version)
         .unwrap()
-        .into_iter()
-        .find(|v| v.version == version)
         .unwrap();
-    assert_eq!(held.replacement_json, frozen);
+    assert_eq!(serde_json::to_string(&held).unwrap(), frozen);
     publication(&s, 0, 1, "AFTER-DESCENT-HISTORY");
     let mut cold = step("cold-child", vec![], 2);
     cold["lineage_id"] = json!("child");
@@ -1169,4 +1162,43 @@ async fn r3_randomized_host_full_engine_240_passes() {
         mismatches.len()
     );
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[tokio::test]
+async fn hookcost_review_durable_wire_fragment_is_not_response_wire_fragment() {
+    if std::env::var("MC_HOOKCOST_REVIEW").as_deref() != Ok("1") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (h, binding, store, key, _) = fixture(dir.path());
+    response(h.provider_setup(binding.clone(), &setup_request()).await);
+    let mut boot = step("boot", vec![message(1), message(2)], 2);
+    boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+    let answer_bytes = h.provider_step(binding, &boot).await.unwrap();
+    let answer: Value = serde_json::from_slice(&answer_bytes).unwrap();
+    assert_eq!(answer["answer"], "compaction_message");
+    let version = answer["compaction"]["version"].as_u64().unwrap();
+    let row = store
+        .load_provider_view(&key.store_key(), version)
+        .unwrap()
+        .unwrap();
+    let view: HostView = serde_json::from_str(&row.replacement_json).unwrap();
+    let durable_fragment = serde_json::to_string(&view.wire).unwrap();
+    let response_fragment = serde_json::to_string(&answer["compaction"]).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&durable_fragment).unwrap(),
+        answer["compaction"]
+    );
+    assert_ne!(durable_fragment.as_bytes(), response_fragment.as_bytes());
+    let raw_assembled = String::from_utf8(answer_bytes.clone()).unwrap().replacen(
+        &response_fragment,
+        &durable_fragment,
+        1,
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&raw_assembled).unwrap(),
+        answer
+    );
+    assert_ne!(raw_assembled.as_bytes(), answer_bytes.as_slice());
+    println!("typed durable CompactionMessage and Value response compaction are JSON-equal but byte-unequal; substituting the durable fragment changes the encoded answer");
 }

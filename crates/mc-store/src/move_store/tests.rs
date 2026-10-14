@@ -1282,3 +1282,86 @@ fn review_module_move_preserves_populated_projection_and_fragment_references() {
         loaded.meta.memory_projection
     );
 }
+
+#[test]
+fn inventory_versions_six_and_seven_refuse_cross_order_before_writes() {
+    assert_eq!(move_inventory::INVENTORY_VERSION, 7);
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = seeded(source_dir.path(), 1, 10);
+    let payload_dir = tempfile::tempdir().unwrap();
+    let current = payload_dir.path().join("v7");
+    let _source_move = capture(&source, "version-cut", &current);
+    let bytes = std::fs::read(&current).unwrap();
+    let mut input = std::io::Cursor::new(&bytes);
+    let mut sections = Vec::new();
+    for table in codec::ship_tables(Store::Module) {
+        let start = input.position() as usize;
+        let count = codec::read_section(&mut input, table).unwrap();
+        for _ in 0..count {
+            codec::read_row(&mut input, table).unwrap();
+        }
+        sections.push((table, bytes[start..input.position() as usize].to_vec()));
+    }
+    assert_eq!(sections[0].0.table, "mc_provider_policy_revisions_v1");
+    // Reconstruct inventory version 6's section order, with policy revisions
+    // immediately before consumed tags, to test rejection of the old stream.
+    let revision = sections.remove(0);
+    let old_position = sections
+        .iter()
+        .position(|(table, _)| table.table == "mc_provider_consumed_tags_v1")
+        .unwrap();
+    sections.insert(old_position, revision);
+    let old = payload_dir.path().join("v6");
+    std::fs::write(
+        &old,
+        sections
+            .iter()
+            .flat_map(|(_, bytes)| bytes.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let target = open(target_dir.path());
+    let before = |store: &McStore| {
+        store.inner.with_conn(|conn| {
+        let mut query = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?;
+        let tables = query.query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows=Vec::new();
+        for table in tables {
+            let mut query=conn.prepare(&format!("SELECT * FROM {} ORDER BY rowid",codec::quoted(&table)))?;
+            let columns=query.column_count();
+            let values=query.query_map([],|row|(0..columns).map(|i|row.get::<_,Value>(i)).collect::<rusqlite::Result<Vec<_>>>())?.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.push((table,values));
+        }
+        Ok(rows)
+    }).unwrap()
+    };
+    let unchanged = before(&target);
+    let mut import = target.move_store().unwrap();
+    assert_eq!(
+        import
+            .reserve_install(&binding("version-cut"), "digest", &old)
+            .unwrap_err()
+            .code(),
+        "inventory_mismatch"
+    );
+    assert_eq!(
+        before(&target),
+        unchanged,
+        "v6 into v7 may not reserve or install"
+    );
+    // A version-6 receiver expects its old first section name. The strict
+    // section-name check rejects the version-7 stream before reserving or
+    // inserting rows, just as the current receiver rejects version 6 above.
+    let old_first = sections[0].0;
+    let mut old_receiver = std::io::Cursor::new(&bytes);
+    assert!(matches!(
+        codec::read_section(&mut old_receiver, old_first),
+        Err(SnapshotError::Invalid("inventory_mismatch"))
+    ));
+    assert_eq!(
+        before(&target),
+        unchanged,
+        "v7 into v6 may not write either"
+    );
+}

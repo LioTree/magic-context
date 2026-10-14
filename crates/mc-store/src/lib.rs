@@ -36,6 +36,22 @@ pub mod parity_schema_manifest;
 pub mod private_permissions;
 mod provider_legacy;
 mod provider_log;
+mod provider_policy_overlay;
+#[cfg(test)]
+mod provider_v2_tests;
+mod provider_view_recipe;
+pub use provider_view_recipe::{
+    ProviderResolvedView, ProviderViewRecipe, ProviderViewSegment, ProviderViewTreatment,
+    MAX_VIEW_ANCESTOR_BYTES, MAX_VIEW_BASE_DEPTH,
+};
+pub mod provider_meters;
+mod provider_preparation;
+mod provider_resident_read;
+pub use provider_preparation::{
+    ProviderPreparationWrite, ProviderStoredPreparation, MAX_PROVIDER_PREPARATION_BYTES,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use provider_resident_read::ProviderResidentAuthority;
 pub mod provider_records;
 pub mod retrieval_vectors;
 pub use provider_records::ProviderSessionKey;
@@ -3280,6 +3296,14 @@ const MIGRATIONS: &[Migration] = &[
         version: 70,
         statements: include_str!("migrations/store_070_provider_generations.sql"),
     },
+    Migration {
+        version: 71,
+        statements: include_str!("migrations/store_071_provider_policy_revision.sql"),
+    },
+    Migration {
+        version: 72,
+        statements: include_str!("migrations/store_072_provider_policy_baselines_views.sql"),
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -4725,6 +4749,32 @@ pub struct TailHygieneBaseline {
     /// Channel-1 band observed before ctx_reduce; empty only for a legacy/unfired cycle.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub channel1_post_reduce_grace_pre_level: String,
+}
+
+impl TailHygieneBaseline {
+    /// Copy baseline scalars for policy decisions without copying the historical
+    /// measurement vector, which is stored or resolved separately.
+    pub fn clone_without_parts(&self) -> Self {
+        Self {
+            protected_tools_policy: self.protected_tools_policy.clone(),
+            baseline_u: self.baseline_u,
+            baseline_t: self.baseline_t,
+            turn_delta_u: self.turn_delta_u,
+            turn_delta_t: self.turn_delta_t,
+            hygiene_units_version: self.hygiene_units_version,
+            hygiene_tools_ratio: self.hygiene_tools_ratio,
+            hygiene_prose_ratio: self.hygiene_prose_ratio,
+            effective_token_buckets: self.effective_token_buckets.clone(),
+            baseline_generation: self.baseline_generation,
+            computed_at_ms: self.computed_at_ms,
+            evaluable: self.evaluable,
+            generation_invalidated: self.generation_invalidated,
+            baseline_parts: Vec::new(),
+            content_signature: self.content_signature.clone(),
+            channel1_post_reduce_grace_baseline_u: self.channel1_post_reduce_grace_baseline_u,
+            channel1_post_reduce_grace_pre_level: self.channel1_post_reduce_grace_pre_level.clone(),
+        }
+    }
 }
 
 /// Compartment coverage composed into one frozen prefix unit. Empty fields mean the unit
@@ -8719,10 +8769,11 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Delete every row whose ownership is expressed by an exact `session_id` column.
-    /// Project memories and smart notes survive because their ownership is project-scoped.
-    /// The session's `context.db` history rows and session notes go in one transaction, then
-    /// every `store.db` cache, overlay and producer ledger row in another.
+    /// Delete rows owned by the exact session, including native provider messages,
+    /// measurements and rendered views. Project memories and smart notes survive.
+    /// History and notes in `context.db` are deleted first, followed by the cache
+    /// and provider state in `store.db`. These are separate SQLite connections,
+    /// so callers may safely retry deletion after either transaction completes.
     pub fn delete_session(
         &self,
         session_id: &str,
@@ -8770,24 +8821,51 @@ impl McStore {
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
+            let mut namespaces = vec![session_id.to_owned()];
+            let mut query = tx.prepare_cached(
+                "SELECT DISTINCT c.engine_namespace FROM mc_provider_conversations_v2 c WHERE c.session=?1 AND c.harness IN ('opencode','opencode2') AND c.engine_namespace<>?1 AND NOT EXISTS (SELECT 1 FROM mc_provider_conversations_v2 other WHERE other.engine_namespace=c.engine_namespace AND other.session<>?1)",
+            )?;
+            namespaces.extend(query.query_map([session_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?);
             let mut deleted = 0usize;
+            // Recipes reference other recipes, cuts and native messages. Remove all
+            // recipe rows for the session before deleting any of those sources.
+            for table in ["mc_provider_view_overrides_v1", "mc_provider_views_v2"] {
+                deleted = deleted.saturating_add(tx.execute(
+                    &format!("DELETE FROM {table} WHERE session = ?1"),
+                    params![session_id],
+                )?);
+            }
             for table in tables {
                 if ["mc_move_fences", "mc_move_cuts", "mc_move_installs", "mc_move_key_map", "mc_move_tag_epochs"].contains(&table.as_str()) {
                     continue;
                 }
                 let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-                let has_session_id = {
+                let session_column = {
                     let mut stmt = tx.prepare(&format!("PRAGMA table_info({quoted})"))?;
                     let columns = stmt
                         .query_map([], |row| row.get::<_, String>(1))?
                         .collect::<Result<Vec<_>, _>>()?;
-                    columns.into_iter().any(|column| column == "session_id")
+                    if columns.iter().any(|column| column == "session_id") {
+                        Some("session_id")
+                    } else if table.starts_with("mc_provider_")
+                        && columns.iter().any(|column| column == "session")
+                    {
+                        Some("session")
+                    } else {
+                        None
+                    }
                 };
-                if has_session_id {
-                    deleted = deleted.saturating_add(tx.execute(
-                        &format!("DELETE FROM {quoted} WHERE session_id = ?1"),
-                        params![session_id],
-                    )?);
+                if let Some(column) = session_column {
+                    // Native provider cache/tag rows use the conversation's engine
+                    // namespace; their session ID is not the host's session ID.
+                    let keys = if column == "session_id" { &namespaces[..] } else { &namespaces[..1] };
+                    for key in keys {
+                        deleted = deleted.saturating_add(tx.execute(
+                            &format!("DELETE FROM {quoted} WHERE {column} = ?1"),
+                            params![key],
+                        )?);
+                    }
                 }
             }
             Ok(deleted)
@@ -8943,6 +9021,18 @@ impl McStore {
             .map_err(|error| McStoreError::Serde(error.to_string()))?;
         let outcome = self.inner.with_conn_fenced(|tx| {
             move_store::check_writer(tx, session_id)?;
+            let old: Option<String> = tx
+                .query_row(
+                    "SELECT meta FROM mc_cache_state WHERE session_id=?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let meta_json = if let Some(old) = old {
+                cache_codec::preserve_native_marker(meta_json, &old)?
+            } else {
+                meta_json
+            };
             let current: Option<(i64, bool)> = tx
                 .query_row(
                     "SELECT row_version, meta = ?2 FROM mc_cache_state WHERE session_id = ?1",
@@ -11028,8 +11118,13 @@ impl McStore {
                 });
             }
         }
-        let encoded = cache_codec::encode_row(core, meta)
-            .map_err(|error| McStoreError::Serde(error.to_string()))?;
+        let native_requested = provider_policy.is_some_and(|policy| policy.native_tail_section);
+        let mut encoded = if native_requested {
+            cache_codec::encode_row_parts(core, meta, None)
+        } else {
+            cache_codec::encode_row(core, meta)
+        }
+        .map_err(|error| McStoreError::Serde(error.to_string()))?;
         let fingerprint = row_state_fingerprint(meta);
         let scheduler_observation_json = scheduler_observation
             .map(serialize_scheduler_observation)
@@ -11155,6 +11250,16 @@ impl McStore {
                 || overlays.channel1_append.is_some()
                 || !consumed_drop_ids.is_empty()
                 || !first_applied_command_ids.is_empty();
+
+            if let Some(policy) = provider_policy {
+                provider_log::save_engine_policy_tx(tx, session_id, policy)?;
+                if native_requested {
+                    encoded = match cache_codec::encode_native_row(tx, session_id, core, meta, policy)? {
+                        Some(native) => native,
+                        None => cache_codec::encode_row(core, meta)?,
+                    };
+                }
+            }
 
             // The chunk and section rows. A bootstrap starts from nothing: rows a previous
             // life of the session left behind are deleted, not diffed against. A commit with
@@ -11424,9 +11529,7 @@ impl McStore {
                     params![session_id, drop_id],
                 )?;
             }
-            if let Some(policy)=provider_policy {
-                provider_log::save_engine_policy_tx(tx,session_id,policy)?;
-            }
+
             Ok(CommitOutcome::Committed(accepted_version))
         })?;
 

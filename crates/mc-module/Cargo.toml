@@ -76,6 +76,9 @@ nix = { version = "0.31.3", features = ["fs"] }
 drive-fault = []
 
 [dev-dependencies]
+# Zlib decoding in tests compares stored message policy facts with the serving
+# snapshot without using the serving code's policy resolver.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 cpu-time = "1"
 subc-core = { workspace = true }
 # Embedded real-daemon coverage of HELLO_ACK/open versus the first plan fetch.

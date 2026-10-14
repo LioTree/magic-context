@@ -1519,7 +1519,7 @@ mod tests {
             .store
             .get()
             .unwrap()
-            .load_provider_views(&key(&h).store_key())
+            .load_provider_view_recipe_versions(&key(&h).store_key())
             .unwrap();
         let mut low = step("after-publication", 80);
         low["last_applied"] = applied["compaction"].clone();
@@ -1532,10 +1532,10 @@ mod tests {
             .store
             .get()
             .unwrap()
-            .load_provider_views(&key(&h).store_key())
+            .load_provider_view_recipe_versions(&key(&h).store_key())
             .unwrap();
         assert_eq!(before.len(), after.len());
-        assert_eq!(before[0].replacement_json, after[0].replacement_json);
+        assert_eq!(before, after);
     }
 
     #[tokio::test]

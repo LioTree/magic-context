@@ -22,6 +22,7 @@ import {
     recordIndexedMessageTime,
     recordMessageFtsRowid,
 } from "./message-fts-rowid-map";
+import { markSessionCleanupPending } from "./storage-meta-session";
 import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
 import { TAG_TOMBSTONE_OWNER_PREFIX } from "./storage-tag-identity-revision";
 
@@ -1106,6 +1107,17 @@ function sweepOrphanedOpenCodeMessageIndexesInBackground(
             const eligibleSessionIds = missingSessionIds.filter((sessionId) =>
                 stillEligible.get(sessionId, cutoff),
             );
+            // A provider ledger proves module ownership for this harness/session.
+            // Keep its project coordinate until the existing Rust cleanup retry
+            // acknowledges deletion; sessions without a ledger retain host-only cleanup.
+            const hasProviderLedger = db.prepare(
+                "SELECT 1 FROM host_runner_state WHERE session_id = ? AND harness = ? LIMIT 1",
+            );
+            for (const sessionId of eligibleSessionIds) {
+                if (hasProviderLedger.get(sessionId, harness)) {
+                    markSessionCleanupPending(db, sessionId, true);
+                }
+            }
             deleted = deleteSessionScopedRows(db, eligibleSessionIds, harness);
             persistMessageHistoryOrphanSweepState(db, nextCursor, completedAt, harness);
             db.exec("COMMIT");

@@ -1048,7 +1048,14 @@ fn discard_tables() -> Vec<&'static move_inventory::TableInventory> {
     let mut tables = move_inventory::tables(Store::Module)
         .filter(|t| t.class != Class::NotSession && matches!(t.rows, RowSelector::Predicate(_)))
         .collect::<Vec<_>>();
-    tables.sort_by_key(|t| t.table == "mc_tag_cache_generations");
+    // Remove revision rows after conversations and policy rows: their delete
+    // triggers recreate a missing revision row, leaving an orphan if it was
+    // removed first. Import uses the opposite order to avoid insert collisions.
+    tables.sort_by_key(|t| match t.table {
+        "mc_provider_policy_revisions_v1" => 1,
+        "mc_tag_cache_generations" => 2,
+        _ => 0,
+    });
     tables
 }
 fn remove_file(path: Option<&str>) -> Result<(), MoveError> {

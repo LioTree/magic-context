@@ -173,6 +173,7 @@ pub struct ProviderPolicyPart {
 pub struct ProviderEnginePolicy {
     pub parts: Vec<ProviderPolicyPart>,
     pub settings: Value,
+    pub native_tail_section: bool,
 }
 
 pub(crate) fn save_engine_policy_tx(
@@ -180,24 +181,41 @@ pub(crate) fn save_engine_policy_tx(
     namespace: &str,
     policy: &ProviderEnginePolicy,
 ) -> rusqlite::Result<()> {
-    let mut q=conn.prepare("SELECT conv_key,lineage_id,hook_counters_json FROM mc_provider_conversations_v2 WHERE engine_namespace=?1")?;
+    let mut q=conn.prepare("SELECT conv_key,lineage_id,hook_counters_json,harness FROM mc_provider_conversations_v2 WHERE engine_namespace=?1")?;
     let conversations = q
         .query_map([namespace], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
+            crate::provider_meters::read_row(|| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (conv, lineage, raw) in conversations {
+    for (conv, lineage, raw, harness) in conversations {
+        let policy_started = std::time::Instant::now();
+        let mut policy_written = 0usize;
         // Every policy part is rewritten below. Dropping the summary first means
         // the change triggers log nothing, and the next hook rebuilds it.
         drop_policy_summary_tx(conn, &conv)?;
+        let native_v2=matches!(harness.as_str(),"opencode"|"opencode2") && conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",params![conv,lineage],|r|r.get::<_,bool>(0))?;
+        let old_frozen = if native_v2 {
+            conn.query_row("SELECT frozen_through_ordinal FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 ORDER BY cut_id DESC LIMIT 1",[&conv],|r|r.get::<_,Option<u64>>(0)).optional()?.flatten()
+        } else {
+            None
+        };
         // One prepared statement for the whole lineage, and an unchanged row is
         // left alone so its indexes need no maintenance.
         let mut upsert = conn.prepare_cached("INSERT INTO mc_provider_policy_parts_v1 VALUES (?1,?2,?3,?4,?5,json_extract(?1,'$[1]')) ON CONFLICT(conv_key,lineage_id,block_id) DO UPDATE SET policy_json=excluded.policy_json WHERE mc_provider_policy_parts_v1.policy_json IS NOT excluded.policy_json")?;
+        let coverage = policy.settings.get("coverage").and_then(Value::as_u64);
         for part in &policy.parts {
+            if old_frozen.is_some_and(|n| part.ordinal <= n)
+                && coverage.is_some_and(|n| part.ordinal <= n)
+            {
+                continue;
+            }
             upsert.execute(params![
                 conv,
                 lineage,
@@ -205,13 +223,40 @@ pub(crate) fn save_engine_policy_tx(
                 part.block_id,
                 serde_json::to_string(part).map_err(sql_json)?
             ])?;
+            policy_written += 1;
         }
         let mut counters = parse(&raw)?;
         counters["engine_policy"] = policy.settings.clone();
+        if native_v2 {
+            let mut parts = Vec::new();
+            if let Some(coverage) = coverage {
+                let mut q=conn.prepare_cached("SELECT policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 ORDER BY ordinal,block_id")?;
+                for raw in
+                    q.query_map(params![conv, lineage, coverage], |r| r.get::<_, String>(0))?
+                {
+                    parts.push(serde_json::from_str(&raw?).map_err(sql_json)?);
+                }
+            }
+            let cut = crate::provider_policy_overlay::freeze_cut_tx(
+                conn,
+                &conv,
+                &lineage,
+                coverage,
+                &policy.settings,
+                &parts,
+            )
+            .map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                    e.to_string(),
+                )))
+            })?;
+            counters["engine_policy"]["baseline_cut_id"] = json!(cut);
+        }
         conn.execute(
             "UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1",
             params![conv, counters.to_string()],
         )?;
+        tracing::info!(namespace=%namespace,parts_supplied=policy.parts.len(),parts_written=policy_written,policy_store_ms=policy_started.elapsed().as_secs_f64()*1000.0,"provider engine policy store stages");
     }
     Ok(())
 }
@@ -228,7 +273,7 @@ fn admit_policy_parts_tx(
     rearm_all: bool,
 ) -> rusqlite::Result<()> {
     for part in parts {
-        let held:Option<String>=conn.query_row("SELECT policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND block_id=?3",params![conv,lineage,part.block_id],|r|r.get(0)).optional()?;
+        let held:Option<String>=conn.query_row("SELECT policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND block_id=?3", params![conv,lineage,part.block_id], |r| crate::provider_meters::read_row(|| r.get(0))).optional()?;
         if let Some(held) = held {
             let held: ProviderPolicyPart = serde_json::from_str(&held).map_err(sql_json)?;
             if let Some(number) = held.tag_number {
@@ -252,7 +297,7 @@ fn admit_policy_parts_tx(
         }
         let mut part = part.clone();
         if part.tag_kind.is_some() && part.tag_number.is_none() {
-            part.tag_number=conn.query_row("SELECT tag_number FROM mc_tags WHERE session_id=?1 AND block_id=?2 ORDER BY tag_number DESC LIMIT 1",params![namespace,part.block_id],|r|r.get(0)).optional()?;
+            part.tag_number=conn.query_row("SELECT tag_number FROM mc_tags WHERE session_id=?1 AND block_id=?2 ORDER BY tag_number DESC LIMIT 1", params![namespace,part.block_id], |r| crate::provider_meters::read_row(|| r.get(0))).optional()?;
             if let Some(number) = part.tag_number {
                 *high = (*high).max(number);
             } else {
@@ -296,7 +341,7 @@ fn adjust_policy_tx(
     let raw: String = conn.query_row(
         "SELECT hook_counters_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
         [conv],
-        |r| r.get(0),
+        |r| crate::provider_meters::read_row(|| r.get(0)),
     )?;
     let mut counters = parse(&raw)?;
     let mut totals = policy_totals(&counters)?;
@@ -322,7 +367,7 @@ fn remove_policy_tx(
     let mut q = conn.prepare(&format!("SELECT answer_seq,policy_json FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND state IN ('pending','live') AND {predicate}"))?;
     let rows = q
         .query_map(parameters, |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            crate::provider_meters::read_row(|| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (seq, raw) in rows {
@@ -349,7 +394,7 @@ fn surviving_policy_state_tx(
     let counters: String = conn.query_row(
         "SELECT hook_counters_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
         [conv],
-        |r| r.get(0),
+        |r| crate::provider_meters::read_row(|| r.get(0)),
     )?;
     let mut channel = parse(&counters)?
         .pointer("/engine_policy/cadence")
@@ -368,7 +413,7 @@ fn surviving_policy_state_tx(
                 "json_extract(policy_json,'$.cadence_event.fire')=1",
             ),
         ] {
-            let row:Option<(i64,String)>=conn.query_row(&format!("SELECT answer_seq,json_extract(policy_json,'$.cadence_event') FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 AND state IN ('pending','live') AND {predicate} ORDER BY answer_seq DESC LIMIT 1"),params![conv,ancestor.lineage_id,as_i64(cut)?],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let row:Option<(i64,String)>=conn.query_row(&format!("SELECT answer_seq,json_extract(policy_json,'$.cadence_event') FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 AND state IN ('pending','live') AND {predicate} ORDER BY answer_seq DESC LIMIT 1"), params![conv,ancestor.lineage_id,as_i64(cut)?], |r| crate::provider_meters::read_row(|| Ok((r.get(0)?,r.get(1)?)))).optional()?;
             if let Some((seq, raw)) = row {
                 if slot.as_ref().is_none_or(|(held, _)| seq > *held) {
                     *slot = Some((seq, parse(&raw)?));
@@ -413,13 +458,15 @@ pub fn consume_provider_drops_tx(
         let mut q=conn.prepare("SELECT a.answer_seq,a.policy_json,t.key,json_extract(t.value,'$.kind'),coalesce(json_extract(t.value,'$.token_count'),0) FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) t WHERE a.conv_key=?1 AND a.state IN ('pending','live') AND json_extract(t.value,'$.number')=?2")?;
         let rows = q
             .query_map(params![conv, number], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
-                ))
+                crate::provider_meters::read_row(|| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (seq, raw, index, kind, tokens) in rows {
@@ -508,7 +555,7 @@ fn parse(raw: &str) -> rusqlite::Result<Value> {
 }
 
 fn tag_consumed_tx(conn: &Connection, namespace: &str, number: i64) -> rusqlite::Result<bool> {
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1 AND tag_number=?2)",params![namespace,number],|row|row.get(0))
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1 AND tag_number=?2)", params![namespace,number], |row| crate::provider_meters::read_row(|| row.get(0)))
 }
 fn as_i64(n: u64) -> rusqlite::Result<i64> {
     i64::try_from(n).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
@@ -517,9 +564,9 @@ pub(crate) fn conversation_tx(
     conn: &Connection,
     key: &ProviderSessionKey,
 ) -> rusqlite::Result<Option<ProviderConversation>> {
-    conn.query_row("SELECT lineage_id,preset,params_json,setup_json,engine_namespace,version_high_water,rebuild_epoch,hook_counters_json,last_answer_json,wait_request,cursor_frontier,served_through_ordinal,historian_model_chain_json,native_pins_json,native_plan_json FROM mc_provider_conversations_v2 WHERE conv_key=?1", [key.conversation_key()], |r| Ok(ProviderConversation {
+    conn.query_row("SELECT lineage_id,preset,params_json,setup_json,engine_namespace,version_high_water,rebuild_epoch,hook_counters_json,last_answer_json,wait_request,cursor_frontier,served_through_ordinal,historian_model_chain_json,native_pins_json,native_plan_json FROM mc_provider_conversations_v2 WHERE conv_key=?1", [key.conversation_key()], |r| crate::provider_meters::read_row(|| Ok(ProviderConversation {
         lineage_id:r.get(0)?, preset:r.get(1)?, params_json:r.get(2)?, setup_json:r.get(3)?, engine_namespace:r.get(4)?, version_high_water:r.get(5)?, rebuild_epoch:r.get(6)?, hook_counters_json:r.get(7)?, last_answer_json:r.get(8)?, wait_request:r.get(9)?, cursor_frontier:r.get(10)?, served_through_ordinal:r.get(11)?, historian_model_chain_json:r.get(12)?, native_pins_json:r.get(13)?,native_plan_json:r.get(14)?,
-    })).optional()
+    }))).optional()
 }
 pub(crate) fn save_conversation_tx(
     conn: &Connection,
@@ -537,10 +584,10 @@ fn lineage_tx(
     conv: &str,
     lineage: &str,
 ) -> rusqlite::Result<Option<ProviderLineage>> {
-    conn.query_row("SELECT lineage_id,first_ordinal,descends_from,through_ordinal FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2", params![conv,lineage], |r| Ok(ProviderLineage {lineage_id:r.get(0)?,first_ordinal:r.get(1)?,descends_from:r.get(2)?,through_ordinal:r.get(3)?})).optional()
+    conn.query_row("SELECT lineage_id,first_ordinal,descends_from,through_ordinal FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2", params![conv,lineage], |r| crate::provider_meters::read_row(|| Ok(ProviderLineage {lineage_id:r.get(0)?,first_ordinal:r.get(1)?,descends_from:r.get(2)?,through_ordinal:r.get(3)?}))).optional()
 }
 /// Leaf first, with each ancestor bounded by all intervening cuts.
-fn ancestry_tx(
+pub(crate) fn ancestry_tx(
     conn: &Connection,
     conv: &str,
     lineage: &str,
@@ -574,10 +621,12 @@ fn messages_tx(
         let mut q = conn.prepare("SELECT ordinal,mid,message_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 ORDER BY ordinal")?;
         messages.extend(
             q.query_map(params![conv, row.lineage_id, as_i64(through)?], |r| {
-                Ok(ProviderMessage {
-                    ordinal: r.get(0)?,
-                    mid: r.get(1)?,
-                    message_bytes: r.get(2)?,
+                crate::provider_meters::read_row(|| {
+                    Ok(ProviderMessage {
+                        ordinal: r.get(0)?,
+                        mid: r.get(1)?,
+                        message_bytes: r.get(2)?,
+                    })
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?,
@@ -597,7 +646,7 @@ fn frontier_tx(conn: &Connection, conv: &str, lineage: &str) -> rusqlite::Result
         let mut q = conn.prepare("SELECT ordinal FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 ORDER BY ordinal")?;
         ordinals.extend(
             q.query_map(params![conv, row.lineage_id, as_i64(through)?], |r| {
-                r.get::<_, u64>(0)
+                crate::provider_meters::read_row(|| r.get::<_, u64>(0))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?,
         );
@@ -628,7 +677,7 @@ fn extend_frontier_tx(
             if next > *cut {
                 continue;
             }
-            held = conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal=?3)",params![conv,row.lineage_id,as_i64(next)?],|r|r.get(0))?;
+            held = conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal=?3)", params![conv,row.lineage_id,as_i64(next)?], |r| crate::provider_meters::read_row(|| r.get(0)))?;
             if held {
                 break;
             }
@@ -663,10 +712,7 @@ fn acknowledged_through_tx(
     };
     let mut newest = None;
     for (ancestor, cut) in ancestry_tx(conn, conv, &row.lineage_id)? {
-        let held: Option<u64> = conn.query_row(
-            "SELECT max(ordinal) FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3",
-            params![conv, ancestor.lineage_id, as_i64(cut)?], |r| r.get(0),
-        )?;
+        let held: Option<u64> = conn.query_row("SELECT max(ordinal) FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3", params![conv, ancestor.lineage_id, as_i64(cut)?], |r| crate::provider_meters::read_row(|| r.get(0)))?;
         newest = newest.max(held);
     }
     if served > newest.unwrap_or(0) || previous.is_some_and(|n| served < n) {
@@ -717,9 +763,9 @@ fn ensure_lineage_tx(
         }
         (None, None) => {
             let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND (lineage_id<>'' OR EXISTS(SELECT 1 FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id='')))",
                 [conv],
-                |r| r.get(0),
+                |r| crate::provider_meters::read_row(|| r.get(0)),
             )?;
             if exists {
                 return Err(ProviderError::InvalidParams {
@@ -756,10 +802,10 @@ fn held_message_tx(
     let mut at_mid = None;
     for (row, through) in ancestry_tx(conn, conv, lineage)? {
         if ordinal <= through && at_ordinal.is_none() {
-            at_ordinal = conn.query_row("SELECT ordinal,mid,message_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal=?3", params![conv,row.lineage_id,as_i64(ordinal)?], |r| Ok(ProviderMessage {ordinal:r.get(0)?,mid:r.get(1)?,message_bytes:r.get(2)?})).optional()?;
+            at_ordinal = conn.query_row("SELECT ordinal,mid,message_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal=?3", params![conv,row.lineage_id,as_i64(ordinal)?], |r| crate::provider_meters::read_row(|| Ok(ProviderMessage {ordinal:r.get(0)?,mid:r.get(1)?,message_bytes:r.get(2)?}))).optional()?;
         }
         if at_mid.is_none() {
-            at_mid = conn.query_row("SELECT ordinal FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND mid=?3 AND ordinal<=?4",params![conv,row.lineage_id,mid,as_i64(through)?], |r|r.get(0)).optional()?;
+            at_mid = conn.query_row("SELECT ordinal FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND mid=?3 AND ordinal<=?4", params![conv,row.lineage_id,mid,as_i64(through)?], |r| crate::provider_meters::read_row(|| r.get(0))).optional()?;
         }
     }
     Ok((at_ordinal, at_mid))
@@ -802,9 +848,11 @@ pub(crate) fn insert_message_tx(
     serde_json::from_slice::<Value>(&m.message_bytes)
         .map_err(|e| ProviderError::Transient(e.to_string()))?;
     conn.execute(
-        "INSERT INTO mc_provider_messages_v1 VALUES (?1,?2,?3,?4,?5,json_extract(?1,'$[1]'))",
+        "INSERT INTO mc_provider_messages_v1 (conv_key,lineage_id,ordinal,mid,message_bytes,session) VALUES (?1,?2,?3,?4,?5,json_extract(?1,'$[1]'))",
         params![conv, lineage, as_i64(m.ordinal)?, m.mid, m.message_bytes],
     )?;
+    crate::provider_meters::payload(m.message_bytes.len());
+    crate::provider_meters::budget("message", m.message_bytes.len());
     Ok(true)
 }
 fn burn_where_tx(
@@ -851,7 +899,18 @@ pub(crate) fn insert_tags_tx(
         if tag_consumed_tx(conn, namespace, t.tag_number)? {
             continue;
         }
-        conn.execute("INSERT OR IGNORE INTO mc_tags (session_id,tag_number,block_id,kind,token_count,created_at_ms,source_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![namespace,t.tag_number,t.block_id,t.kind,t.token_count,t.created_at_ms,t.source_bytes.as_ref()])?;
+        let inserted = conn.execute("INSERT OR IGNORE INTO mc_tags (session_id,tag_number,block_id,kind,token_count,created_at_ms,source_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![namespace,t.tag_number,t.block_id,t.kind,t.token_count,t.created_at_ms,t.source_bytes.as_ref()])?;
+        if inserted != 0 && crate::provider_meters::enabled() {
+            let bytes = namespace.len()
+                + t.block_id.len()
+                + t.kind.len()
+                + t.tag_number.to_string().len()
+                + t.token_count.to_string().len()
+                + t.created_at_ms.to_string().len()
+                + t.source_bytes.len();
+            crate::provider_meters::payload(bytes);
+            crate::provider_meters::budget("tag", bytes);
+        }
     }
     Ok(())
 }
@@ -868,7 +927,9 @@ fn promote_tx(
         let mut q = conn.prepare("SELECT answer_seq,tags_json FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2 AND state='pending' AND ordinal<=?3 AND legacy_json IS NULL")?;
         let answers = q
             .query_map(params![conv, row.lineage_id, as_i64(through)?], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                crate::provider_meters::read_row(|| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (seq, tags) in answers {
@@ -966,7 +1027,7 @@ impl McStore {
     }
 
     pub fn has_provider_namespace(&self, namespace: &str) -> Result<bool, McStoreError> {
-        Ok(self.inner.with_conn(|conn|conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_conversations_v2 WHERE engine_namespace=?1)",[namespace],|r|r.get(0)))?)
+        Ok(self.inner.with_conn(|conn|conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_conversations_v2 WHERE engine_namespace=?1)", [namespace], |r| crate::provider_meters::read_row(|| r.get(0))))?)
     }
     pub fn load_provider_policy_totals(
         &self,
@@ -988,7 +1049,7 @@ impl McStore {
             let Some(c)=conversation_tx(conn,key)? else {return Ok(false)};
             if tag_consumed_tx(conn,&c.engine_namespace,number)? {return Ok(false);}
             for (ancestor,cut) in ancestry_tx(conn,&key.conversation_key(),&c.lineage_id)? {
-                let known:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) t WHERE a.conv_key=?1 AND a.lineage_id=?2 AND a.ordinal<=?3 AND a.state IN ('pending','live') AND a.legacy_json IS NULL AND json_extract(t.value,'$.number')=?4 AND NOT coalesce(json_extract(t.value,'$.consumed'),false))",params![key.conversation_key(),ancestor.lineage_id,as_i64(cut)?,number],|r|r.get(0))?;
+                let known:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) t WHERE a.conv_key=?1 AND a.lineage_id=?2 AND a.ordinal<=?3 AND a.state IN ('pending','live') AND a.legacy_json IS NULL AND json_extract(t.value,'$.number')=?4 AND NOT coalesce(json_extract(t.value,'$.consumed'),false))", params![key.conversation_key(),ancestor.lineage_id,as_i64(cut)?,number], |r| crate::provider_meters::read_row(|| r.get(0)))?;
                 if known {return Ok(true)}
             }
             Ok(false)
@@ -1014,14 +1075,14 @@ impl McStore {
             }
             conn.query_row(
                 "SELECT block_id FROM mc_tags WHERE session_id=?1 AND tag_number=?2
-                 AND NOT EXISTS (
-                   SELECT 1 FROM mc_provider_hook_answers_v1 a
-                   JOIN mc_provider_conversations_v2 owner ON owner.conv_key=a.conv_key,
-                   json_each(a.tags_json) t
-                   WHERE owner.engine_namespace=?1 AND a.legacy_json IS NULL
-                     AND json_extract(t.value,'$.number')=?2)",
+             AND NOT EXISTS (
+               SELECT 1 FROM mc_provider_hook_answers_v1 a
+               JOIN mc_provider_conversations_v2 owner ON owner.conv_key=a.conv_key,
+               json_each(a.tags_json) t
+               WHERE owner.engine_namespace=?1 AND a.legacy_json IS NULL
+                 AND json_extract(t.value,'$.number')=?2)",
                 params![c.engine_namespace, number],
-                |row| row.get(0),
+                |row| crate::provider_meters::read_row(|| row.get(0)),
             )
             .optional()
         })?)
@@ -1057,21 +1118,21 @@ impl McStore {
         }
         let refusal = self.inner.with_conn_fenced(|conn| {
             let conv = key.conversation_key();
-            let held: Option<String> = conn
+            let held: Option<(String,bool)> = conn
                 .query_row(
-                    "SELECT state FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2",
+                    "SELECT state,1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2 UNION ALL SELECT state,0 FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2 LIMIT 1",
                     params![conv, as_i64(version)?],
-                    |r| r.get(0),
+                    |r| crate::provider_meters::read_row(|| Ok((r.get(0)?,r.get(1)?))),
                 )
                 .optional()?;
-            let Some(held) = held else {
+            let Some((held,v2)) = held else {
                 return Ok(Some("version"));
             };
             if held == "not_applied" && state == "applied" {
                 return Ok(Some("state"));
             }
             conn.execute(
-                "UPDATE mc_provider_views_v1 SET state=?3 WHERE conv_key=?1 AND version=?2",
+                if v2 {"UPDATE mc_provider_views_v2 SET state=?3 WHERE conv_key=?1 AND version=?2"} else {"UPDATE mc_provider_views_v1 SET state=?3 WHERE conv_key=?1 AND version=?2"},
                 params![conv, as_i64(version)?, state],
             )?;
             Ok(None)
@@ -1099,7 +1160,7 @@ impl McStore {
         decide: impl FnOnce(&ProviderHookContext<'_>) -> Result<(ProviderHookWrite, T), ProviderError>,
     ) -> Result<T, ProviderError> {
         let messages = request.message.map(std::slice::from_ref).unwrap_or(&[]);
-        self.commit_provider_delta(key, request, messages, None, &[], None, decide)
+        self.commit_provider_delta(key, request, messages, None, &[], None, false, decide)
     }
 
     pub fn commit_provider_hook_with_parts<T>(
@@ -1110,7 +1171,23 @@ impl McStore {
         decide: impl FnOnce(&ProviderHookContext<'_>) -> Result<(ProviderHookWrite, T), ProviderError>,
     ) -> Result<T, ProviderError> {
         let messages = request.message.map(std::slice::from_ref).unwrap_or(&[]);
-        self.commit_provider_delta(key, request, messages, None, parts, None, decide)
+        self.commit_provider_delta(key, request, messages, None, parts, None, false, decide)
+    }
+
+    /// Load preparation only if its saved revision equals the store's current
+    /// revision before admitting the message in `request`. A mismatch gives the
+    /// callback no preparation. Its later admission changes and cache cleanup
+    /// remain in this same transaction, so failure rolls all of them back.
+    pub fn commit_provider_hook_with_preparation<T>(
+        &self,
+        key: &ProviderSessionKey,
+        request: ProviderHookRequest<'_>,
+        parts: &[ProviderPolicyPart],
+        consume: bool,
+        decide: impl FnOnce(&ProviderHookContext<'_>) -> Result<(ProviderHookWrite, T), ProviderError>,
+    ) -> Result<T, ProviderError> {
+        let messages = request.message.map(std::slice::from_ref).unwrap_or(&[]);
+        self.commit_provider_delta(key, request, messages, None, parts, None, consume, decide)
     }
 
     pub fn admit_provider_pass(
@@ -1134,6 +1211,7 @@ impl McStore {
             None,
             parts,
             Some(context),
+            false,
             |ctx| {
                 Ok((
                     ProviderHookWrite {
@@ -1170,6 +1248,7 @@ impl McStore {
             None,
             &[],
             None,
+            false,
             |ctx| {
                 Ok((
                     ProviderHookWrite {
@@ -1204,6 +1283,7 @@ impl McStore {
             if page.more { None } else { page.newest },
             &[],
             None,
+            false,
             |ctx| {
                 Ok((
                     ProviderHookWrite {
@@ -1239,13 +1319,23 @@ impl McStore {
         complete_through: Option<u64>,
         parts: &[ProviderPolicyPart],
         pass_context: Option<&Value>,
+        consume_preparation: bool,
         decide: impl FnOnce(&ProviderHookContext<'_>) -> Result<(ProviderHookWrite, T), ProviderError>,
     ) -> Result<T, ProviderError> {
+        let mut meter = crate::provider_meters::WriteMeter::begin();
         let mut refusal = None;
+        let started = std::time::Instant::now();
+        let mut acquired_ms = 0.0;
+        let mut callback_ms = 0.0;
         let result = self.inner.with_conn_fenced(|conn| {
+            acquired_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let callback_started = std::time::Instant::now();
             let operation = || -> Result<T,ProviderError> {
                 let conv = key.conversation_key();
                 let c = conversation_tx(conn,key)?.ok_or_else(||ProviderError::Transient("provider conversation is not initialized".into()))?;
+                let preparation = if consume_preparation {
+                    crate::provider_preparation::matching_preparation_tx(conn, key, &c.engine_namespace)?
+                } else { None };
                 let new_lineage = lineage_tx(conn,&conv,&request.lineage.lineage_id)?.is_none();
                 ensure_lineage_tx(conn,&conv,request.lineage)?;
                 for m in messages {insert_message_tx(conn,&conv,&request.lineage.lineage_id,m)?;}
@@ -1265,7 +1355,7 @@ impl McStore {
                         conn.execute("UPDATE mc_provider_policy_parts_v1 SET policy_json=json_set(policy_json,'$.active',json('false')) WHERE conv_key=?1 AND json_extract(policy_json,'$.served')=0 AND json_extract(policy_json,'$.tag_number') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) t WHERE a.conv_key=?1 AND a.state IN ('pending','live') AND json_extract(t.value,'$.number')=json_extract(mc_provider_policy_parts_v1.policy_json,'$.tag_number'))",[&conv])?;
                         for m in messages {
                             let mut q=conn.prepare("SELECT subject_mid,hook,subject_part FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2 AND subject_mid=?3 AND state='pending'")?;
-                            let subjects=q.query_map(params![conv,request.lineage.lineage_id,m.mid],|r|Ok(ProviderSubject {subject_mid:r.get(0)?,hook:r.get(1)?,subject_part:r.get(2)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                            let subjects=q.query_map(params![conv,request.lineage.lineage_id,m.mid], |r| crate::provider_meters::read_row(|| Ok(ProviderSubject {subject_mid:r.get(0)?,hook:r.get(1)?,subject_part:r.get(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
                             for subject in subjects {burn_subject_tx(conn,&conv,&request.lineage.lineage_id,&subject)?;}
                         }
                     }
@@ -1282,13 +1372,13 @@ impl McStore {
                 let mut counters = parse(&current.hook_counters_json)?;
                 counters["policy_state"] = surviving_policy_state_tx(conn,&conv,&request.lineage.lineage_id)?;
                 let policy = policy_totals(&counters)?;
-                let live_max: i64 = conn.query_row("SELECT coalesce(max(tag_number),0) FROM mc_tags WHERE session_id=?1",[&c.engine_namespace],|r|r.get(0))?;
+                let live_max: i64 = conn.query_row("SELECT coalesce(max(tag_number),0) FROM mc_tags WHERE session_id=?1", [&c.engine_namespace], |r| crate::provider_meters::read_row(|| r.get(0)))?;
                 let tag_high_water = counters.get("tag_high_water").and_then(Value::as_i64).unwrap_or(0).max(counters.get("high_water").and_then(Value::as_i64).unwrap_or(0)).max(live_max);
                 let mut reserved_high=tag_high_water.max(counters.get("reserved_tag_high_water").and_then(Value::as_i64).unwrap_or(0));
                 admit_policy_parts_tx(conn,&conv,&request.lineage.lineage_id,&c.engine_namespace,parts,&mut reserved_high,request.repeat_subject,pass_context.is_some())?;
                 counters["reserved_tag_high_water"]=json!(reserved_high);
                 if let Some(context)=pass_context {counters["pass_context"]=context.clone();}
-                let policy_index=ProviderPolicyIndex::new(conn,&conv,&request.lineage.lineage_id)?;
+                let policy_index=ProviderPolicyIndex::new(conn,&conv,&request.lineage.lineage_id)?.with_preparation(preparation);
                 let mut mids=BTreeSet::new();
                 if let Some(m)=request.message {
                     mids.insert(m.mid.clone());
@@ -1311,22 +1401,43 @@ impl McStore {
                         high=high.max(t.number);
                     }
                     burn_subject_tx(conn,&conv,&request.lineage.lineage_id,&a.subject)?;
-                    conn.execute("INSERT INTO mc_provider_hook_answers_v1 (conv_key,answer_seq,lineage_id,subject_mid,hook,subject_part,ordinal,ops_json,tags_json,state,session) VALUES (?1,(SELECT coalesce(max(answer_seq),-1)+1 FROM mc_provider_hook_answers_v1 WHERE conv_key=?1),?2,?3,?4,?5,?6,?7,?8,'pending',json_extract(?1,'$[1]'))",params![conv,request.lineage.lineage_id,a.subject.subject_mid,a.subject.hook,a.subject.subject_part,as_i64(a.ordinal)?,a.ops_json,serde_json::to_string(&a.tags).map_err(sql_json)?])?;
+                    let tags_json = serde_json::to_string(&a.tags).map_err(sql_json)?;
+                    conn.execute("INSERT INTO mc_provider_hook_answers_v1 (conv_key,answer_seq,lineage_id,subject_mid,hook,subject_part,ordinal,ops_json,tags_json,state,session) VALUES (?1,(SELECT coalesce(max(answer_seq),-1)+1 FROM mc_provider_hook_answers_v1 WHERE conv_key=?1),?2,?3,?4,?5,?6,?7,?8,'pending',json_extract(?1,'$[1]'))",params![conv,request.lineage.lineage_id,a.subject.subject_mid,a.subject.hook,a.subject.subject_part,as_i64(a.ordinal)?,a.ops_json,tags_json])?;
+                    crate::provider_meters::payload(a.ops_json.len());
+                    crate::provider_meters::payload(tags_json.len());
+                    crate::provider_meters::budget("answer", a.ops_json.len() + tags_json.len());
                     conn.execute("UPDATE mc_provider_hook_answers_v1 SET policy_json=?2 WHERE conv_key=?1 AND answer_seq=(SELECT max(answer_seq) FROM mc_provider_hook_answers_v1 WHERE conv_key=?1)",params![conv,answer_policy.to_string()])?;
+                    crate::provider_meters::payload(answer_policy.to_string().len());
+                    crate::provider_meters::budget("state", answer_policy.to_string().len());
                 }
                 if !write.counters.is_object() {return Err(ProviderError::Transient("hook counters must be an object".into()))}
                 write.counters["tag_high_water"]=json!(high);
                 conn.execute("UPDATE mc_provider_conversations_v2 SET lineage_id=?2,served_through_ordinal=?3,hook_counters_json=?4,cursor_frontier=?5 WHERE conv_key=?1",params![conv,request.lineage.lineage_id,acknowledged.map(as_i64).transpose()?,write.counters.to_string(),as_i64(frontier)?])?;
+                crate::provider_meters::payload(write.counters.to_string().len());
+                crate::provider_meters::budget("state", write.counters.to_string().len());
                 if let Some(metrics) = answer_policy.get("metrics") {
                     let metrics: ProviderPolicyTotals = serde_json::from_value(metrics.clone()).map_err(sql_json)?;
                     adjust_policy_tx(conn,&conv,&metrics,1)?;
                 }
+                if consume_preparation {
+                    conn.execute("DELETE FROM mc_provider_policy_preparations_v1 WHERE conv_key=?1", [&conv])?;
+                }
                 Ok(value)
             };
-            operation().map_err(|e| {refusal=Some(e);rusqlite::Error::InvalidQuery})
+            let result = operation().map_err(|e| {refusal=Some(e);rusqlite::Error::InvalidQuery});
+            callback_ms = callback_started.elapsed().as_secs_f64() * 1000.0;
+            result
         });
+        crate::provider_meters::transaction_timing(
+            acquired_ms,
+            callback_ms,
+            (started.elapsed().as_secs_f64() * 1000.0 - acquired_ms - callback_ms).max(0.0),
+        );
         match result {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                meter.commit();
+                Ok(value)
+            }
             Err(e) => Err(refusal.unwrap_or_else(|| ProviderError::Storage(e.into()))),
         }
     }
@@ -1339,14 +1450,81 @@ impl McStore {
             .inner
             .with_conn(|conn| messages_tx(conn, &key.conversation_key(), lineage))?)
     }
+    /// Native range reads never decode the covered prefix before discarding it.
+    pub fn load_provider_messages_since(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+        first: u64,
+    ) -> Result<Vec<ProviderMessage>, McStoreError> {
+        Ok(self
+            .load_provider_message_sources_since(key, lineage, first)?
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect())
+    }
+
+    pub fn load_provider_message_sources_since(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+        first: u64,
+    ) -> Result<Vec<(String, ProviderMessage)>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+        let conv=key.conversation_key();
+        let mut messages=BTreeMap::new();
+        for (lineage,cut) in ancestry_tx(conn,&conv,lineage)? {
+            let mut q=conn.prepare_cached("SELECT ordinal,mid,message_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal>=?3 AND ordinal<=?4 ORDER BY ordinal")?;
+            for message in q.query_map(params![conv,lineage.lineage_id,first.min(i64::MAX as u64),cut.min(i64::MAX as u64)],|r|Ok(ProviderMessage {ordinal:r.get(0)?,mid:r.get(1)?,message_bytes:r.get(2)?}))? {
+                let message=message?; messages.entry(message.ordinal).or_insert((lineage.lineage_id.clone(),message));
+            }
+        }
+        Ok(messages.into_values().collect())
+    })?)
+    }
+
+    pub fn provider_range_start(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+    ) -> Result<u64, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let conv=key.conversation_key();
+            let mut first=None;
+            for (lineage,cut) in ancestry_tx(conn,&conv,lineage)? {
+                let ordinal:Option<u64>=conn.query_row("SELECT ordinal FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 ORDER BY ordinal LIMIT 1",params![conv,lineage.lineage_id,cut.min(i64::MAX as u64)],|r|r.get(0)).optional()?;
+                if let Some(ordinal)=ordinal {first=Some(first.map_or(ordinal,|old:u64|old.min(ordinal)));}
+            }
+            Ok(first.unwrap_or(0))
+        })?)
+    }
+
+    pub fn load_provider_hook_answers_since(
+        &self,
+        key: &ProviderSessionKey,
+        first: u64,
+    ) -> Result<Vec<ProviderStoredAnswer>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut q=conn.prepare_cached("SELECT lineage_id,ordinal,subject_mid,hook,subject_part,ops_json,tags_json,state FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND ordinal>=?2 AND legacy_json IS NULL ORDER BY answer_seq")?;
+            let rows=q.query_map(params![key.conversation_key(),first.min(i64::MAX as u64)],|r|Ok(ProviderStoredAnswer {lineage_id:r.get(0)?,state:r.get(7)?,answer:ProviderHookAnswer {ordinal:r.get(1)?,subject:ProviderSubject {subject_mid:r.get(2)?,hook:r.get(3)?,subject_part:r.get(4)?},ops_json:r.get(5)?,tags:serde_json::from_str(&r.get::<_,String>(6)?).map_err(sql_json)?}}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?)
+    }
+
     pub fn provider_frontier(
         &self,
         key: &ProviderSessionKey,
         lineage: &str,
     ) -> Result<u64, McStoreError> {
-        Ok(self
-            .inner
-            .with_conn(|conn| frontier_tx(conn, &key.conversation_key(), lineage))?)
+        Ok(self.inner.with_conn(|conn| {
+            let conv = key.conversation_key();
+            if let Some(c) = conversation_tx(conn, key)? {
+                if c.lineage_id == lineage && c.cursor_frontier > 0 {
+                    return extend_frontier_tx(conn, &conv, lineage, c.cursor_frontier);
+                }
+            }
+            frontier_tx(conn, &conv, lineage)
+        })?)
     }
     pub fn load_provider_hook_answers(
         &self,
@@ -1354,10 +1532,10 @@ impl McStore {
     ) -> Result<Vec<ProviderStoredAnswer>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             let mut q=conn.prepare("SELECT lineage_id,subject_mid,hook,subject_part,ordinal,ops_json,tags_json,state FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND legacy_json IS NULL ORDER BY answer_seq")?;
-            let rows = q.query_map([key.conversation_key()],|r| {
+            let rows = q.query_map([key.conversation_key()], |r| crate::provider_meters::read_row(|| {
                 let tags:String=r.get(6)?;
                 Ok(ProviderStoredAnswer {lineage_id:r.get(0)?,answer:ProviderHookAnswer {subject:ProviderSubject {subject_mid:r.get(1)?,hook:r.get(2)?,subject_part:r.get(3)?},ordinal:r.get(4)?,ops_json:r.get(5)?,tags:serde_json::from_str(&tags).map_err(sql_json)?},state:r.get(7)?})
-            })?.collect();
+            }))?.collect();
             rows
         })?)
     }
@@ -1383,7 +1561,7 @@ impl McStore {
             let conv=key.conversation_key();
 
             parse(&view.replacement_json)?;
-            let held=conn.query_row("SELECT lineage_id,range_from,range_to,replacement_json FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2",params![conv,as_i64(view.version)?],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,String>(3)?))).optional()?;
+            let held=conn.query_row("SELECT lineage_id,range_from,range_to,replacement_json FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2", params![conv,as_i64(view.version)?], |r| crate::provider_meters::read_row(|| Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,String>(3)?)))).optional()?;
             if held.is_some_and(|h|h!=(view.lineage_id.clone(),view.range_from,view.range_to,view.replacement_json.clone())) {return Err(rusqlite::Error::InvalidQuery)}
             conn.execute("INSERT INTO mc_provider_views_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,'{}',json_extract(?1,'$[1]')) ON CONFLICT(conv_key,version) DO UPDATE SET state=excluded.state",params![conv,as_i64(view.version)?,view.lineage_id,as_i64(view.range_from)?,as_i64(view.range_to)?,view.replacement_json,view.state])?;
             Ok(())
@@ -1396,7 +1574,7 @@ impl McStore {
     ) -> Result<Vec<ProviderView>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             let mut q=conn.prepare("SELECT version,lineage_id,range_from,range_to,replacement_json,state FROM mc_provider_views_v1 WHERE conv_key=?1 ORDER BY version")?;
-            let rows=q.query_map([key.conversation_key()],|r|Ok(ProviderView {version:r.get(0)?,lineage_id:r.get(1)?,range_from:r.get(2)?,range_to:r.get(3)?,replacement_json:r.get(4)?,state:r.get(5)?}))?.collect();
+            let rows=q.query_map([key.conversation_key()], |r| crate::provider_meters::read_row(|| Ok(ProviderView {version:r.get(0)?,lineage_id:r.get(1)?,range_from:r.get(2)?,range_to:r.get(3)?,replacement_json:r.get(4)?,state:r.get(5)?})))?.collect();
             rows
         })?)
     }
@@ -1409,7 +1587,7 @@ impl McStore {
         version: u64,
     ) -> Result<Option<ProviderView>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            conn.query_row("SELECT version,lineage_id,range_from,range_to,replacement_json,state FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2", params![key.conversation_key(), as_i64(version)?], |r| Ok(ProviderView {version:r.get(0)?,lineage_id:r.get(1)?,range_from:r.get(2)?,range_to:r.get(3)?,replacement_json:r.get(4)?,state:r.get(5)?})).optional()
+            conn.query_row("SELECT version,lineage_id,range_from,range_to,replacement_json,state FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2", params![key.conversation_key(), as_i64(version)?], |r| crate::provider_meters::read_row(|| Ok(ProviderView {version:r.get(0)?,lineage_id:r.get(1)?,range_from:r.get(2)?,range_to:r.get(3)?,replacement_json:r.get(4)?,state:r.get(5)?}))).optional()
         })?)
     }
     pub fn queue_provider_drops(
@@ -1423,13 +1601,13 @@ impl McStore {
             let mut changed=false;
             for number in numbers {
                 if tag_consumed_tx(conn,&c.engine_namespace,*number)? {return Err(rusqlite::Error::InvalidQuery);}
-                let known:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) t WHERE a.conv_key=?1 AND a.state IN ('pending','live') AND a.legacy_json IS NULL AND json_extract(t.value,'$.number')=?2 AND NOT coalesce(json_extract(t.value,'$.consumed'),false))",params![conv,number],|r|r.get(0))?;
+                let known:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) t WHERE a.conv_key=?1 AND a.state IN ('pending','live') AND a.legacy_json IS NULL AND json_extract(t.value,'$.number')=?2 AND NOT coalesce(json_extract(t.value,'$.consumed'),false))", params![conv,number], |r| crate::provider_meters::read_row(|| r.get(0)))?;
                 if !known {return Err(rusqlite::Error::InvalidQuery)}
                 if conn.execute("INSERT INTO mc_provider_pending_drops_v1 VALUES (?1,?2,json_extract(?1,'$[1]')) ON CONFLICT DO NOTHING",params![conv,number])?==0 {continue;}
                 changed=true;
                 conn.execute("UPDATE mc_provider_policy_parts_v1 SET policy_json=json_set(policy_json,'$.queued',json('true')) WHERE conv_key=?1 AND json_extract(policy_json,'$.tag_number')=?2",params![conv,number])?;
                 let mut q=conn.prepare("SELECT a.answer_seq,a.policy_json,json_extract(t.value,'$.kind'),json_extract(t.value,'$.token_count') FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) t WHERE a.conv_key=?1 AND a.state IN ('pending','live') AND json_extract(t.value,'$.number')=?2")?;
-                let rows=q.query_map(params![conv,number],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                let rows=q.query_map(params![conv,number], |r| crate::provider_meters::read_row(|| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?))))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 for (seq,raw,kind,tokens) in rows {
                     let mut policy=parse(&raw)?;
                     let mut metrics:ProviderPolicyTotals=serde_json::from_value(policy.get("metrics").cloned().unwrap_or_else(||json!({}))).map_err(sql_json)?;
@@ -1441,7 +1619,7 @@ impl McStore {
                 }
             }
             if changed {
-                let raw:String=conn.query_row("SELECT hook_counters_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",[&conv],|r|r.get(0))?;
+                let raw:String=conn.query_row("SELECT hook_counters_json FROM mc_provider_conversations_v2 WHERE conv_key=?1", [&conv], |r| crate::provider_meters::read_row(|| r.get(0)))?;
                 let mut counters=parse(&raw)?;
                 counters["engine_policy"]["reduce_suppressed"]=json!(true);
                 conn.execute("UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1",params![conv,counters.to_string()])?;
@@ -1465,7 +1643,7 @@ impl McStore {
     ) -> Result<Vec<i64>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             let mut q=conn.prepare("SELECT tag_number FROM mc_provider_pending_drops_v1 WHERE conv_key=?1 ORDER BY tag_number")?;
-            let rows=q.query_map([key.conversation_key()],|r|r.get(0))?.collect();rows
+            let rows=q.query_map([key.conversation_key()], |r| crate::provider_meters::read_row(|| r.get(0)))?.collect();rows
         })?)
     }
 }
@@ -1520,7 +1698,7 @@ mod lineage_metadata_tests {
             conn.execute("INSERT INTO mc_provider_lineages_v1 VALUES (?1,'child',4001,'root',4000,'session')", [&conv])?;
             // Deliberately unreadable JSON proves this query cannot be satisfied
             // by decoding a compatibility record or a message payload.
-            conn.execute("INSERT INTO mc_provider_messages_v1 VALUES (?1,'root',4000,'m4000',x'ff','session')", [&conv])?;
+            conn.execute("INSERT INTO mc_provider_messages_v1(conv_key,lineage_id,ordinal,mid,message_bytes,session) VALUES (?1,'root',4000,'m4000',x'ff','session')", [&conv])?;
             Ok(())
         }).unwrap();
         assert_eq!(
@@ -1760,7 +1938,7 @@ mod policy_tests {
         assert_eq!(store.load_provider_policy_totals(&key).unwrap(), expected);
         let recomputed=store.inner.with_conn(|conn| {
             let mut totals=ProviderPolicyTotals::default();
-            let rows=conn.prepare("SELECT policy_json FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND state IN ('pending','live')")?.query_map([key.conversation_key()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let rows=conn.prepare("SELECT policy_json FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND state IN ('pending','live')")?.query_map([key.conversation_key()], |r| crate::provider_meters::read_row(|| r.get::<_,String>(0)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             for row in rows {let m:ProviderPolicyTotals=serde_json::from_value(parse(&row)?.get("metrics").cloned().unwrap_or_else(||json!({}))).map_err(sql_json)?;totals.text_tokens+=m.text_tokens;totals.tool_tokens+=m.tool_tokens;totals.reclaimable_tokens+=m.reclaimable_tokens;totals.tool_outputs+=m.tool_outputs;totals.real_users+=m.real_users;}
             Ok(totals)
         }).unwrap();
@@ -1851,7 +2029,7 @@ mod policy_tests {
             for table in ["mc_provider_conversations_v2","mc_provider_hook_answers_v1","mc_provider_pending_drops_v1"] {
                 for op in ["INSERT","UPDATE","DELETE"] {conn.execute_batch(&format!("CREATE TRIGGER guard_{table}_{op} BEFORE {op} ON {table} BEGIN SELECT RAISE(ABORT,'non-provider commit wrote provider state'); END;"))?;}
             }
-            let plan: String=conn.query_row("EXPLAIN QUERY PLAN SELECT project_root,session,harness FROM mc_provider_conversations_v2 WHERE engine_namespace=?1",["not-provider"],|r|r.get(3))?;
+            let plan: String=conn.query_row("EXPLAIN QUERY PLAN SELECT project_root,session,harness FROM mc_provider_conversations_v2 WHERE engine_namespace=?1", ["not-provider"], |r| crate::provider_meters::read_row(|| r.get(3)))?;
             assert!(plan.contains("mc_provider_conversations_engine_namespace"),"{plan}");
             Ok(())
         }).unwrap();
@@ -1862,7 +2040,7 @@ mod policy_tests {
             .unwrap();
         store.commit("control", None, &core, &meta).unwrap();
         let encoded = |namespace: &str| {
-            store.inner.with_conn(|conn|conn.query_row("SELECT core_state,meta,section_index FROM mc_cache_state WHERE session_id=?1",[namespace],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))).unwrap()
+            store.inner.with_conn(|conn|conn.query_row("SELECT core_state,meta,section_index FROM mc_cache_state WHERE session_id=?1", [namespace], |r| crate::provider_meters::read_row(|| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))))).unwrap()
         };
         assert_eq!(encoded("not-provider"), encoded("control"));
         assert_eq!(

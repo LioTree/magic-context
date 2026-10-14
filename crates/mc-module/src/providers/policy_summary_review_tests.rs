@@ -487,7 +487,7 @@ impl Fixture {
         let user = rng.chance(40);
         let role = if user { "user" } else { "assistant" };
         self.sql(&format!(
-            "INSERT INTO mc_provider_messages_v1 VALUES ({c},{l},{ordinal},{m},X'7b7d',json_extract({c},'$[1]'))",
+            "INSERT INTO mc_provider_messages_v1(conv_key,lineage_id,ordinal,mid,message_bytes,session) VALUES ({c},{l},{ordinal},{m},X'7b7d',json_extract({c},'$[1]'))",
             c = q(&self.conv),
             l = q(&self.lineage.lineage_id),
             m = q(&mid),

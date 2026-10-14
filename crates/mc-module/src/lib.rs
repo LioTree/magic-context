@@ -3893,6 +3893,7 @@ pub struct McHandler {
     frozen_tool_catalogs: Mutex<HashMap<(PathBuf, String), tool_catalog::FrozenCatalog>>,
     provider_store: Arc<providers::Storage>,
     provider_serial: Arc<providers::ProviderSerial>,
+    provider_resident: providers::resident_hooks::ResidentHooks,
     provider_runner: Arc<dyn session_resolver::ProviderRunner>,
     provider_historian_worker: OnceLock<Arc<McHandler>>,
     #[cfg(test)]
@@ -4632,6 +4633,7 @@ impl McHandler {
             frozen_tool_catalogs: Mutex::new(HashMap::new()),
             provider_store,
             provider_serial: Arc::new(providers::ProviderSerial::default()),
+            provider_resident: providers::resident_hooks::ResidentHooks::default(),
             provider_runner,
             provider_historian_worker: OnceLock::new(),
             #[cfg(test)]
@@ -5051,6 +5053,7 @@ impl McHandler {
             frozen_tool_catalogs: Mutex::new(HashMap::new()),
             provider_store,
             provider_serial: Arc::new(providers::ProviderSerial::default()),
+            provider_resident: providers::resident_hooks::ResidentHooks::default(),
             provider_runner: Arc::new(session_resolver::MissingProviderRunner),
             provider_historian_worker: OnceLock::new(),
             provider_historian_gate: Mutex::new(None),
@@ -5866,6 +5869,13 @@ impl McHandler {
             .lock()
             .expect("config mutex")
             .freeze_smart_notes_enabled(enabled);
+        self
+    }
+
+    /// Cache native-host hook policy totals and protection indexes in this process.
+    /// Generic runner callbacks still fetch transcripts at reminder cadence.
+    pub fn with_startup_provider_resident_enabled(mut self, enabled: bool) -> Self {
+        self.provider_resident = providers::resident_hooks::ResidentHooks::enabled(enabled);
         self
     }
 

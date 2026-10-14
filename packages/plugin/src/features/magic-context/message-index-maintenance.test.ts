@@ -1,9 +1,11 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { _resetHarnessForTesting, getHarness, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -18,7 +20,7 @@ import {
 import { runMigrations } from "./migrations";
 import { advanceSessionActivity, readSessionActivity } from "./session-activity";
 import { initializeDatabase } from "./storage-db";
-import { clearSession } from "./storage-meta-session";
+import { clearSession, retryPendingRustSessionCleanupsForProject } from "./storage-meta-session";
 import { deleteSessionScopedRows } from "./storage-session-tables";
 import {
     tagIdentityRevisionKey,
@@ -40,8 +42,8 @@ function createOpenCodeDb(liveSessionIds: string[]): string {
     return path;
 }
 
-function createStoreDb(): Database {
-    const db = new Database(":memory:");
+function createStoreDb(path = ":memory:"): Database {
+    const db = new Database(path);
     initializeDatabase(db);
     runMigrations(db);
     return db;
@@ -212,6 +214,130 @@ describe("message history orphan maintenance", () => {
             ]) {
                 expect(countRows(db, table, sessionId), `${table} lost Rust cleanup state`).toBe(1);
             }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("marks only matching provider orphans and leaves host-only cleanup unchanged", async () => {
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
+        for (const id of ["native", "host-only", "other-harness", "live"]) {
+            seedSessionScopedRows(db, id, old);
+            db.prepare("INSERT INTO session_projects VALUES (?, 'opencode', 'git:shared', ?)").run(
+                id,
+                old,
+            );
+        }
+        const insertLedger = db.prepare(`INSERT INTO host_runner_state
+            (session_id,harness,lineage_id,ancestry_json,next_ordinal,cursor,served_through_ordinal,unserved_json)
+            VALUES (?,?,'L','[]',1,1,0,'[]')`);
+        insertLedger.run("native", "opencode");
+        insertLedger.run("live", "opencode");
+        insertLedger.run("other-harness", "opencode2");
+        const hostPath = createOpenCodeDb(["live"]);
+        try {
+            for (let pass = 0; pass < 2; pass++) {
+                const result = sweepOrphanedOpenCodeMessageIndexes(
+                    db,
+                    () => new Database(hostPath, { readonly: true }),
+                    { now, cooldownMs: 0 },
+                );
+                expect(result.deleted).toBe(pass === 0 ? 2 : 0);
+                expect(countRows(db, "pending_session_cleanup", "native")).toBe(1);
+                expect(countRows(db, "session_projects", "native")).toBe(1);
+            }
+            expect(countRows(db, "session_meta", "host-only")).toBe(0);
+            expect(countRows(db, "session_meta", "other-harness")).toBe(0);
+            expect(countRows(db, "session_meta", "live")).toBe(1);
+            expect(
+                db.prepare("SELECT session_id,harness FROM pending_session_cleanup").all(),
+            ).toEqual([{ session_id: "native", harness: "opencode:rust" }]);
+            const deleted: string[] = [];
+            expect(
+                await retryPendingRustSessionCleanupsForProject(db, "git:shared", async (id) => {
+                    deleted.push(id);
+                }),
+            ).toEqual({ attempted: 1, cleared: 1, failedSessionIds: [] });
+            expect(deleted).toEqual(["native"]);
+            expect(countRows(db, "session_meta", "native")).toBe(0);
+            expect(countRows(db, "session_meta", "live")).toBe(1);
+            expect(
+                await retryPendingRustSessionCleanupsForProject(db, "git:shared", async () => {
+                    throw new Error("already-clean session must not be retried");
+                }),
+            ).toEqual({ attempted: 0, cleared: 0, failedSessionIds: [] });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("kill after provider marker insertion retains the orphan retry coordinate", () => {
+        const directory = createTestTempDirFromPath(join(tmpdir(), "provider-orphan-kill-"));
+        tempDirectories.push(directory);
+        const path = join(directory, "context.db");
+        const now = 2_000_000_000_000;
+        const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
+        let db = createStoreDb(path);
+        seedSessionScopedRows(db, "native", old);
+        db.prepare("INSERT INTO session_projects VALUES ('native','opencode','git:shared',?)").run(
+            old,
+        );
+        db.exec(`INSERT INTO host_runner_state
+            (session_id,harness,lineage_id,ancestry_json,next_ordinal,cursor,served_through_ordinal,unserved_json)
+            VALUES ('native','opencode','L','[]',1,1,0,'[]')`);
+        closeQuietly(db);
+        const hostPath = createOpenCodeDb([]);
+        const child = spawnSync(
+            process.execPath,
+            [
+                "-e",
+                `
+            import { Database } from ${JSON.stringify(fileURLToPath(new URL("../../shared/sqlite.ts", import.meta.url)))};
+            import { sweepOrphanedOpenCodeMessageIndexes } from ${JSON.stringify(fileURLToPath(new URL("./message-index.ts", import.meta.url)))};
+            import { setHarness } from ${JSON.stringify(fileURLToPath(new URL("../../shared/harness.ts", import.meta.url)))};
+            import { writeSync } from "node:fs";
+            setHarness("opencode");
+            const db = new Database(${JSON.stringify(path)});
+            const prepare = db.prepare.bind(db);
+            db.prepare = (sql) => {
+                const statement = prepare(sql);
+                if (!sql.includes("INSERT INTO pending_session_cleanup")) return statement;
+                return new Proxy(statement, { get(target, property) {
+                    if (property === "get") return (...args) => {
+                        target.get(...args);
+                        writeSync(1, "ORPHAN_MARKER_INSERTED_BEFORE_DELETE\\n");
+                        process.kill(process.pid, "SIGKILL");
+                    };
+                    const value = Reflect.get(target, property, target);
+                    return typeof value === "function" ? value.bind(target) : value;
+                }});
+            };
+            sweepOrphanedOpenCodeMessageIndexes(db,
+                () => new Database(${JSON.stringify(hostPath)}, {readonly:true}), {now:${now}});
+        `,
+            ],
+            { encoding: "utf8", timeout: 30_000, windowsHide: true },
+        );
+        expect(child.stdout).toContain("ORPHAN_MARKER_INSERTED_BEFORE_DELETE");
+        expect(child.signal).toBe("SIGKILL");
+        db = new Database(path);
+        try {
+            // The marker and host deletion share a transaction. A kill rolls the
+            // marker back, leaving both the project coordinate and ledger to retry.
+            expect(countRows(db, "pending_session_cleanup", "native")).toBe(0);
+            expect(countRows(db, "session_projects", "native")).toBe(1);
+            expect(countRows(db, "host_runner_state", "native")).toBe(1);
+            expect(
+                sweepOrphanedOpenCodeMessageIndexes(
+                    db,
+                    () => new Database(hostPath, { readonly: true }),
+                    { now },
+                ),
+            ).toMatchObject({ deleted: 0 });
+            expect(countRows(db, "pending_session_cleanup", "native")).toBe(1);
+            expect(countRows(db, "session_projects", "native")).toBe(1);
         } finally {
             closeQuietly(db);
         }

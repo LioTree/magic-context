@@ -4357,6 +4357,7 @@ mod tests {
 
     fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
+            native_tail_section: false,
             cache_ttl: None,
             effective_execute_threshold: None,
             auto_search_enabled: true,
