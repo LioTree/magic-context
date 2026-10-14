@@ -55,6 +55,10 @@ serde_jcs = "0.2"
 nix = { version = "0.31.3", features = ["fs"] }
 
 [features]
+# Enable only in throwaway ck-mc binaries used to test Claude Code gateway attachment.
+# It publishes the pinned profile and provider compatibility bundle the gateway checks;
+# never make this a release default.
+advertise-claude-code-candidate = []
 # Joint CC rig-drive fault injection. DEFAULT OFF.
 #
 # A default (deploy) build does not contain the corruption path at all: every line

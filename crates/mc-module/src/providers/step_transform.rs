@@ -267,9 +267,24 @@ pub fn declaration(params: &Value) -> Result<hooks::subscription::Declaration, H
             .with_on_unavailable(OnUnavailable::Pass),
         );
     }
+    #[cfg(feature = "advertise-claude-code-candidate")]
+    let claude_code = match request.claude_code.as_ref() {
+        Some(selection) if selection == &*super::capability_candidate::CANDIDATE => {
+            Some(super::capability_candidate::CANDIDATE.clone())
+        }
+        Some(_) => {
+            return Err(invalid_field(
+                "claude_code",
+                "declaration requires the exact advertised candidate",
+            ));
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "advertise-claude-code-candidate"))]
+    let claude_code = None;
     Ok(Declaration {
         subscriptions,
-        claude_code: None,
+        claude_code,
     })
 }
 

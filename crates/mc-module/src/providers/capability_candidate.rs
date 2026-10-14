@@ -1,5 +1,6 @@
-//! Compiled native format pins, used internally without advertising the capability.
-//! Keep public discovery/declaration disabled until module and host activation is coordinated.
+//! Pins the profile, provider generations, and wire limits for Claude Code attachment.
+//! The bundle is published only by an explicit default-off feature so releases do not
+//! claim support for this lane.
 use super::*;
 use hooks::claude_code::{ClaudeCodeCapabilities, PayloadCaps};
 use std::sync::LazyLock;
@@ -175,6 +176,7 @@ fn declaration_candidate(
 }
 
 #[test]
+#[cfg(not(feature = "advertise-claude-code-candidate"))]
 fn candidate_bundle_bytes_are_pinned_and_not_advertised() {
     let expected = include_bytes!("../../testdata/codec/claude-code-capability-candidate.json");
     assert_eq!(
@@ -186,7 +188,7 @@ fn candidate_bundle_bytes_are_pinned_and_not_advertised() {
         Ok(()),
         "shape validation is not implementation readiness"
     );
-    let HandlerOutcome::Response(discovery) = describe() else {
+    let HandlerOutcome::Response(discovery) = describe_for_discovery() else {
         panic!("discovery response")
     };
     let discovery: Value = serde_json::from_slice(&discovery).unwrap();
@@ -201,6 +203,36 @@ fn candidate_bundle_bytes_are_pinned_and_not_advertised() {
     assert!(
         declaration.claude_code.is_none(),
         "candidate must not activate a plan"
+    );
+}
+
+#[test]
+#[cfg(feature = "advertise-claude-code-candidate")]
+fn candidate_bundle_is_advertised_and_echoed_as_the_pinned_bytes() {
+    let expected = include_bytes!("../../testdata/codec/claude-code-capability-candidate.json");
+    let expected = expected.strip_suffix(b"\n").unwrap_or(expected);
+    assert_eq!(canonical_bytes(), expected);
+
+    let HandlerOutcome::Response(discovery) = describe_for_discovery() else {
+        panic!("discovery response")
+    };
+    let discovery: Value = serde_json::from_slice(&discovery).unwrap();
+    assert_eq!(
+        serde_jcs::to_vec(&discovery["claude_code"]).unwrap(),
+        expected
+    );
+
+    let declaration = declaration(&json!({
+        "params": {
+            "serializer_profile": CANDIDATE.profile,
+            "observation": "answer"
+        },
+        "claude_code": &*CANDIDATE
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_jcs::to_vec(declaration.claude_code.as_ref().unwrap()).unwrap(),
+        expected
     );
 }
 
@@ -231,6 +263,7 @@ fn candidate_discovery_and_declaration_echo_identical_frozen_bytes() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "advertise-claude-code-candidate"))]
 async fn live_capability_selection_is_named_refusal_while_publication_is_held() {
     let dir = tempfile::tempdir().unwrap();
     let h = super::claude_code_tests::handler(dir.path(), super::claude_code_tests::thalamus());
@@ -246,6 +279,33 @@ async fn live_capability_selection_is_named_refusal_while_publication_is_held() 
             "{method}"
         );
     }
+}
+
+#[tokio::test]
+#[cfg(feature = "advertise-claude-code-candidate")]
+async fn live_capability_selection_is_accepted_when_candidate_is_advertised() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = super::claude_code_tests::handler(dir.path(), super::claude_code_tests::thalamus());
+    let result = super::claude_code_tests::call(
+        &h,
+        "transform.declare",
+        json!({
+            "params": {
+                "serializer_profile": CANDIDATE.profile,
+                "observation": "answer"
+            },
+            "claude_code": &*CANDIDATE
+        }),
+    )
+    .await;
+    let HandlerOutcome::Response(bytes) = result else {
+        panic!("advertised capability selection was refused: {result:?}");
+    };
+    let declaration: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        serde_jcs::to_vec(&declaration["claude_code"]).unwrap(),
+        canonical_bytes()
+    );
 }
 
 #[test]
