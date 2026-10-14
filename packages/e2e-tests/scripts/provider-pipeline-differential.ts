@@ -179,10 +179,10 @@ fn provider_pipeline_driver() {
                                     &format!("Fixture memory {i}: independently preserve memory ordering."), 50).unwrap();
                             }
                         },
-                        "realistic_delta" => {
+                        "realistic_delta" | "realistic_visible_delta" => {
                             let mut rows = rig.store.load_compartments(namespace).unwrap();
                             let sample = cmd["sample"].as_u64().unwrap();
-                            let at = sample as usize % rows.len();
+                            let at = if cmd["event"]=="realistic_visible_delta" {rows.len()-1-(sample as usize % 20)} else {sample as usize % rows.len()};
                             rows[at].content.push_str(&format!(" Delta {sample}."));
                             if let Some(p1) = &mut rows[at].p1 { p1.push_str(&format!(" Delta {sample}.")); }
                             rig.store.replace_compartments(namespace, &rows).unwrap();

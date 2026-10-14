@@ -849,7 +849,7 @@ fn replay_measured(
         .flatten()
         .filter_map(|part| part.arc_id.clone())
         .collect();
-    views.add(index.parts_with_arcs(&touched)?);
+    views.add(index.tail_parts_with_arcs(&touched, settings.coverage)?);
     let old_ranks = arc_ranks(views.old_parts(), settings);
     let new_ranks = arc_ranks(views.new_parts(), settings);
     let mut protected = summary.protected.clone();
@@ -908,7 +908,7 @@ fn replay_measured(
     views.add(index.parts_with_tag_numbers(&window_moved)?);
     let mut loaded_arcs = touched.clone();
     loaded_arcs.extend(arcs_moved.iter().cloned());
-    views.add(index.parts_with_arcs(&arcs_moved)?);
+    views.add(index.tail_parts_with_arcs(&arcs_moved, settings.coverage)?);
     if summary.cutoff != cutoff {
         let (Some(old), Some(new)) = (summary.cutoff, cutoff) else {
             return Ok(None);
@@ -937,7 +937,7 @@ fn replay_measured(
         if arcs.is_empty() && numbers.is_empty() {
             break;
         }
-        views.add(index.parts_with_arcs(&arcs)?);
+        views.add(index.tail_parts_with_arcs(&arcs, settings.coverage)?);
         views.add(index.parts_with_tag_numbers(&numbers)?);
         loaded_arcs.extend(arcs);
         loaded_numbers.extend(numbers);

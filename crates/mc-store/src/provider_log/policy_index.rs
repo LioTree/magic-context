@@ -208,6 +208,9 @@ impl<'c> ProviderPolicyIndex<'c> {
                 parts.entry(part.block_id.clone()).or_insert(part);
             }
         }
+        for part in self.frozen_parts(None, |_| true)? {
+            parts.entry(part.block_id.clone()).or_insert(part);
+        }
         let mut parts = parts.into_values().collect::<Vec<_>>();
         parts.sort_by(|a, b| {
             a.ordinal
@@ -215,6 +218,112 @@ impl<'c> ProviderPolicyIndex<'c> {
                 .then_with(|| a.block_index.cmp(&b.block_index))
         });
         Ok(parts)
+    }
+
+    /// Resolve frozen facts only while their immutable native source row exists.
+    /// Covered-tier conversion must retire both together, not leave a detached
+    /// policy archive that pretends a missing message can still be served.
+    fn frozen_parts(
+        &self,
+        mids: Option<&BTreeSet<String>>,
+        keep: impl Fn(&ProviderPolicyPart) -> bool,
+    ) -> Result<Vec<ProviderPolicyPart>, ProviderError> {
+        let resolver =
+            crate::provider_policy_overlay::FrozenPolicyResolver::new(self.conn, &self.conv)?;
+        let mut consumed = std::collections::HashSet::new();
+        let mut tags = self.conn.prepare_cached(
+            "SELECT tag_number FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1",
+        )?;
+        if mids.is_none() {
+            for number in tags.query_map([&self.namespace], |r| r.get::<_, i64>(0))? {
+                consumed.insert(number?);
+            }
+        }
+        let mut held = std::collections::BTreeMap::new();
+        for (lineage, cut) in &self.ancestry {
+            let rows = if let Some(mids) = mids {
+                let mut rows = Vec::new();
+                let mut q=self.conn.prepare_cached("SELECT ordinal,frozen_policy_bytes,frozen_policy_raw_bytes,frozen_policy_parts FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND mid=?3 AND ordinal<=?4 AND frozen_policy_format=1")?;
+                for mid in mids {
+                    rows.extend(
+                        q.query_map(
+                            params![self.conv, lineage, mid, cut.min(&(i64::MAX as u64))],
+                            |r| {
+                                Ok((
+                                    r.get::<_, u64>(0)?,
+                                    r.get::<_, Vec<u8>>(1)?,
+                                    r.get::<_, usize>(2)?,
+                                    r.get::<_, usize>(3)?,
+                                ))
+                            },
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                    );
+                }
+                rows
+            } else {
+                let mut q=self.conn.prepare_cached("SELECT ordinal,frozen_policy_bytes,frozen_policy_raw_bytes,frozen_policy_parts FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 AND frozen_policy_format=1 ORDER BY ordinal")?;
+                let rows = q
+                    .query_map(
+                        params![self.conv, lineage, cut.min(&(i64::MAX as u64))],
+                        |r| {
+                            Ok((
+                                r.get::<_, u64>(0)?,
+                                r.get::<_, Vec<u8>>(1)?,
+                                r.get::<_, usize>(2)?,
+                                r.get::<_, usize>(3)?,
+                            ))
+                        },
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            self.count(rows.len());
+            for (ordinal, blob, bytes, count) in rows {
+                for part in crate::provider_policy_overlay::decode_facts(&blob, bytes, count)? {
+                    if part.ordinal != ordinal {
+                        return Err(ProviderError::Transient(
+                            "frozen policy source ordinal mismatch".into(),
+                        ));
+                    }
+                    let mut part = resolver.resolve(lineage, part)?;
+                    let consumed = if let Some(number) = part.tag_number {
+                        if mids.is_none() {
+                            consumed.contains(&number)
+                        } else {
+                            self.conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1 AND tag_number=?2)",params![self.namespace,number],|r|r.get::<_,bool>(0))?
+                        }
+                    } else {
+                        false
+                    };
+                    if consumed {
+                        part.active = false;
+                    }
+                    held.entry(part.block_id.clone()).or_insert(part);
+                }
+            }
+        }
+        Ok(held.into_values().filter(keep).collect())
+    }
+
+    fn mids_for_numbers(&self, numbers: &BTreeSet<i64>) -> rusqlite::Result<BTreeSet<String>> {
+        let mut mids = BTreeSet::new();
+        for number in numbers {
+            if let Some(block) = self
+                .conn
+                .query_row(
+                    "SELECT block_id FROM mc_tags WHERE session_id=?1 AND tag_number=?2",
+                    params![self.namespace, number],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if let Some((mid, _)) = block.rsplit_once('#') {
+                    mids.insert(mid.into());
+                }
+            }
+        }
+        Ok(mids)
     }
 
     /// The stored summary, if any.
@@ -314,6 +423,10 @@ impl<'c> ProviderPolicyIndex<'c> {
                 .unwrap_or_default(),
             );
         }
+        let mids = self.mids_for_numbers(numbers)?;
+        parts.extend(self.frozen_parts(Some(&mids), |part| {
+            part.tag_number.is_some_and(|n| numbers.contains(&n))
+        })?);
         Ok(parts)
     }
 
@@ -328,11 +441,28 @@ impl<'c> ProviderPolicyIndex<'c> {
         if from >= before {
             return Ok(Some(Vec::new()));
         }
-        Ok(self.select(
+        let Some(mut parts)=self.select(
             "json_extract(p.policy_json,'$.tag_number')>=?2 AND json_extract(p.policy_json,'$.tag_number')<?3 ORDER BY json_extract(p.policy_json,'$.tag_number'),p.block_id",
             params![self.conv, from, before],
             Some(cap),
-        )?)
+        )? else {return Ok(None)};
+        let mut numbers = BTreeSet::new();
+        let mut q=self.conn.prepare_cached("SELECT tag_number FROM mc_tags WHERE session_id=?1 AND tag_number>=?2 AND tag_number<?3 LIMIT ?4")?;
+        for n in q.query_map(
+            params![self.namespace, from, before, cap.saturating_add(1)],
+            |r| r.get::<_, i64>(0),
+        )? {
+            numbers.insert(n?);
+        }
+        if numbers.len() > cap {
+            return Ok(None);
+        };
+        let mids = self.mids_for_numbers(&numbers)?;
+        parts.extend(self.frozen_parts(Some(&mids), |p| {
+            p.tag_number.is_some_and(|n| n >= from && n < before)
+        })?);
+        parts.sort_by_key(|p| (p.tag_number, p.block_id.clone()));
+        Ok((parts.len() <= cap).then_some(parts))
     }
 
     /// Effective parts belonging to any of these tool arcs.
@@ -346,6 +476,36 @@ impl<'c> ProviderPolicyIndex<'c> {
                 self.select(
                     "json_extract(p.policy_json,'$.arc_id')=?2",
                     params![self.conv, arc],
+                    None,
+                )?
+                .unwrap_or_default(),
+            );
+        }
+        if !arcs.is_empty() {
+            parts.extend(self.frozen_parts(None, |p| {
+                p.arc_id.as_ref().is_some_and(|arc| arcs.contains(arc))
+            })?);
+        }
+        Ok(parts)
+    }
+
+    /// Complete folded tool arcs cannot straddle the covered/native-tail cut.
+    /// Policy propagation over live arcs therefore needs only the tail index;
+    /// unrestricted readers still use parts_with_arcs and the effective resolver.
+    pub fn tail_parts_with_arcs(
+        &self,
+        arcs: &BTreeSet<String>,
+        coverage: Option<u64>,
+    ) -> Result<Vec<ProviderPolicyPart>, ProviderError> {
+        if crate::provider_policy_overlay::current_cut_tx(self.conn, &self.conv)?.is_none() {
+            return self.parts_with_arcs(arcs);
+        };
+        let mut parts = Vec::new();
+        for arc in arcs {
+            parts.extend(
+                self.select(
+                    "json_extract(p.policy_json,'$.arc_id')=?2 AND (?3 IS NULL OR p.ordinal>?3)",
+                    params![self.conv, arc, coverage],
                     None,
                 )?
                 .unwrap_or_default(),
@@ -371,6 +531,7 @@ impl<'c> ProviderPolicyIndex<'c> {
                 .unwrap_or_default(),
             );
         }
+        parts.extend(self.frozen_parts(Some(mids), |_| true)?);
         Ok(parts)
     }
 
@@ -404,6 +565,23 @@ impl<'c> ProviderPolicyIndex<'c> {
                     best = Some(part);
                 }
                 break;
+            }
+        }
+        let resolver =
+            crate::provider_policy_overlay::FrozenPolicyResolver::new(self.conn, &self.conv)?;
+        for (lineage, cut) in &self.ancestry {
+            let below = ordinal.min(cut.saturating_add(1));
+            let row:Option<(Vec<u8>,usize,usize)>=self.conn.query_row("SELECT frozen_policy_bytes,frozen_policy_raw_bytes,frozen_policy_parts FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<?3 AND frozen_policy_format=1 ORDER BY ordinal DESC LIMIT 1",params![self.conv,lineage,below.min(i64::MAX as u64)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            if let Some((blob, bytes, count)) = row {
+                for part in crate::provider_policy_overlay::decode_facts(&blob, bytes, count)?
+                    .into_iter()
+                    .filter(|p| p.kind == "header")
+                {
+                    let part = resolver.resolve(lineage, part)?;
+                    if best.as_ref().is_none_or(|b| part.ordinal > b.ordinal) {
+                        best = Some(part);
+                    }
+                }
             }
         }
         Ok(best)

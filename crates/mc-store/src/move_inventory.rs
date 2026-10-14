@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// Section-inventory protocol version serialized in move manifests.
 pub const INVENTORY_VERSION: u32 = 6;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 100;
-pub const STORE_SCHEMA_VERSION: u32 = 71;
+pub const STORE_SCHEMA_VERSION: u32 = 72;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2859,7 +2859,11 @@ pub const TABLES: &[TableInventory] = &[
             "ordinal",
             "mid",
             "message_bytes",
-            "session"
+            "session",
+            "frozen_policy_format",
+            "frozen_policy_raw_bytes",
+            "frozen_policy_parts",
+            "frozen_policy_bytes"
         ],
         &[],
         Some(KeyPolicy::PreserveOrRefuseCollision),
@@ -2913,6 +2917,34 @@ pub const TABLES: &[TableInventory] = &[
         &[],
         Some(KeyPolicy::PreserveOrRefuseCollision),
         None
+    ),
+    table!(
+        Module, "mc_provider_policy_cuts_v1", Ship,
+        RowSelector::Predicate("conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["conv_key", "cut_id"],
+        &["conv_key", "cut_id", "lineage_id", "frozen_through_ordinal", "frozen_part_count", "baseline_json", "defaults_json", "prefix_totals_json", "policy_key", "session"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None
+    ),
+    table!(
+        Module, "mc_provider_policy_overrides_v1", Ship,
+        RowSelector::Predicate("conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["conv_key", "source_lineage_id", "block_id"],
+        &["conv_key", "source_lineage_id", "block_id", "ordinal", "cut_id", "override_json", "session"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None
+    ),
+    table!(
+        Module, "mc_provider_views_v2", Ship,
+        RowSelector::Predicate("conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["conv_key", "version"],
+        &["conv_key", "version", "lineage_id", "range_from", "range_to", "base_version", "policy_cut_id", "view_meta_json", "sequence_json", "new_head_history_bytes", "head_history_format", "serializer_profile", "render_key", "tokenizer_key", "state", "session"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None
+    ),
+    table!(
+        Module, "mc_provider_view_overrides_v1", Ship,
+        RowSelector::Predicate("conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["conv_key", "version", "source_lineage_id", "mid", "block_index"],
+        &["conv_key", "version", "source_lineage_id", "mid", "ordinal", "block_index", "block_id", "action", "patch_json", "session"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None
     ),
     // Derived from mc_provider_policy_parts_v1: an absent summary makes the next
     // hook rebuild it from those rows, and its change log only describes changes

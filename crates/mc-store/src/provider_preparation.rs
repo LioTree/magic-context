@@ -171,7 +171,7 @@ mod tests {
         let statements = [
             "INSERT INTO mc_provider_lineages_v1 VALUES (?1,'L',1,NULL,NULL,'session')",
             "UPDATE mc_provider_lineages_v1 SET first_ordinal=2 WHERE conv_key=?1",
-            "INSERT INTO mc_provider_messages_v1 VALUES (?1,'L',2,'m',x'7b7d','session')",
+            "INSERT INTO mc_provider_messages_v1(conv_key,lineage_id,ordinal,mid,message_bytes,session) VALUES (?1,'L',2,'m',x'7b7d','session')",
             "UPDATE mc_provider_messages_v1 SET message_bytes=x'7b20207d' WHERE conv_key=?1",
             "DELETE FROM mc_provider_messages_v1 WHERE conv_key=?1",
             "INSERT INTO mc_provider_hook_answers_v1 (conv_key,answer_seq,lineage_id,subject_mid,hook,subject_part,ordinal,ops_json,tags_json,state,session) VALUES (?1,1,'L','m','post_tool','p',2,'[]','[]','pending','session')",

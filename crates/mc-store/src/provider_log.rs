@@ -180,7 +180,7 @@ pub(crate) fn save_engine_policy_tx(
     namespace: &str,
     policy: &ProviderEnginePolicy,
 ) -> rusqlite::Result<()> {
-    let mut q=conn.prepare("SELECT conv_key,lineage_id,hook_counters_json FROM mc_provider_conversations_v2 WHERE engine_namespace=?1")?;
+    let mut q=conn.prepare("SELECT conv_key,lineage_id,hook_counters_json,harness FROM mc_provider_conversations_v2 WHERE engine_namespace=?1")?;
     let conversations = q
         .query_map([namespace], |r| {
             crate::provider_meters::read_row(|| {
@@ -188,18 +188,30 @@ pub(crate) fn save_engine_policy_tx(
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (conv, lineage, raw) in conversations {
+    for (conv, lineage, raw, harness) in conversations {
+        let policy_started=std::time::Instant::now();
+        let mut policy_written=0usize;
         // Every policy part is rewritten below. Dropping the summary first means
         // the change triggers log nothing, and the next hook rebuilds it.
         drop_policy_summary_tx(conn, &conv)?;
+        let native_v2=matches!(harness.as_str(),"opencode"|"opencode2") && conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",params![conv,lineage],|r|r.get::<_,bool>(0))?;
+        let old_frozen = if native_v2 {
+            conn.query_row("SELECT frozen_through_ordinal FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 ORDER BY cut_id DESC LIMIT 1",[&conv],|r|r.get::<_,Option<u64>>(0)).optional()?.flatten()
+        } else {
+            None
+        };
         // One prepared statement for the whole lineage, and an unchanged row is
         // left alone so its indexes need no maintenance.
         let mut upsert = conn.prepare_cached("INSERT INTO mc_provider_policy_parts_v1 VALUES (?1,?2,?3,?4,?5,json_extract(?1,'$[1]')) ON CONFLICT(conv_key,lineage_id,block_id) DO UPDATE SET policy_json=excluded.policy_json WHERE mc_provider_policy_parts_v1.policy_json IS NOT excluded.policy_json")?;
         for part in &policy.parts {
+            if old_frozen.is_some_and(|n| part.ordinal <= n) {
+                continue;
+            }
             upsert.execute(params![
                 conv,
                 lineage,
@@ -207,13 +219,41 @@ pub(crate) fn save_engine_policy_tx(
                 part.block_id,
                 serde_json::to_string(part).map_err(sql_json)?
             ])?;
+            policy_written+=1;
         }
         let mut counters = parse(&raw)?;
         counters["engine_policy"] = policy.settings.clone();
+        if native_v2 {
+            let coverage = policy.settings.get("coverage").and_then(Value::as_u64);
+            let mut parts = Vec::new();
+            if let Some(coverage) = coverage {
+                let mut q=conn.prepare_cached("SELECT policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 ORDER BY ordinal,block_id")?;
+                for raw in
+                    q.query_map(params![conv, lineage, coverage], |r| r.get::<_, String>(0))?
+                {
+                    parts.push(serde_json::from_str(&raw?).map_err(sql_json)?);
+                }
+            }
+            let cut = crate::provider_policy_overlay::freeze_cut_tx(
+                conn,
+                &conv,
+                &lineage,
+                coverage,
+                &policy.settings,
+                &parts,
+            )
+            .map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                    e.to_string(),
+                )))
+            })?;
+            counters["engine_policy"]["baseline_cut_id"] = json!(cut);
+        }
         conn.execute(
             "UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1",
             params![conv, counters.to_string()],
         )?;
+        tracing::info!(namespace=%namespace,parts_supplied=policy.parts.len(),parts_written=policy_written,policy_store_ms=policy_started.elapsed().as_secs_f64()*1000.0,"provider engine policy store stages");
     }
     Ok(())
 }
@@ -720,7 +760,7 @@ fn ensure_lineage_tx(
         }
         (None, None) => {
             let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND (lineage_id<>'' OR EXISTS(SELECT 1 FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id='')))",
                 [conv],
                 |r| crate::provider_meters::read_row(|| r.get(0)),
             )?;
@@ -805,7 +845,7 @@ pub(crate) fn insert_message_tx(
     serde_json::from_slice::<Value>(&m.message_bytes)
         .map_err(|e| ProviderError::Transient(e.to_string()))?;
     conn.execute(
-        "INSERT INTO mc_provider_messages_v1 VALUES (?1,?2,?3,?4,?5,json_extract(?1,'$[1]'))",
+        "INSERT INTO mc_provider_messages_v1 (conv_key,lineage_id,ordinal,mid,message_bytes,session) VALUES (?1,?2,?3,?4,?5,json_extract(?1,'$[1]'))",
         params![conv, lineage, as_i64(m.ordinal)?, m.mid, m.message_bytes],
     )?;
     crate::provider_meters::payload(m.message_bytes.len());
@@ -1075,21 +1115,21 @@ impl McStore {
         }
         let refusal = self.inner.with_conn_fenced(|conn| {
             let conv = key.conversation_key();
-            let held: Option<String> = conn
+            let held: Option<(String,bool)> = conn
                 .query_row(
-                    "SELECT state FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2",
+                    "SELECT state,1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2 UNION ALL SELECT state,0 FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2 LIMIT 1",
                     params![conv, as_i64(version)?],
-                    |r| crate::provider_meters::read_row(|| r.get(0)),
+                    |r| crate::provider_meters::read_row(|| Ok((r.get(0)?,r.get(1)?))),
                 )
                 .optional()?;
-            let Some(held) = held else {
+            let Some((held,v2)) = held else {
                 return Ok(Some("version"));
             };
             if held == "not_applied" && state == "applied" {
                 return Ok(Some("state"));
             }
             conn.execute(
-                "UPDATE mc_provider_views_v1 SET state=?3 WHERE conv_key=?1 AND version=?2",
+                if v2 {"UPDATE mc_provider_views_v2 SET state=?3 WHERE conv_key=?1 AND version=?2"} else {"UPDATE mc_provider_views_v1 SET state=?3 WHERE conv_key=?1 AND version=?2"},
                 params![conv, as_i64(version)?, state],
             )?;
             Ok(None)
@@ -1407,14 +1447,81 @@ impl McStore {
             .inner
             .with_conn(|conn| messages_tx(conn, &key.conversation_key(), lineage))?)
     }
+    /// Native range reads never decode the covered prefix before discarding it.
+    pub fn load_provider_messages_since(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+        first: u64,
+    ) -> Result<Vec<ProviderMessage>, McStoreError> {
+        Ok(self
+            .load_provider_message_sources_since(key, lineage, first)?
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect())
+    }
+
+    pub fn load_provider_message_sources_since(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+        first: u64,
+    ) -> Result<Vec<(String, ProviderMessage)>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+        let conv=key.conversation_key();
+        let mut messages=BTreeMap::new();
+        for (lineage,cut) in ancestry_tx(conn,&conv,lineage)? {
+            let mut q=conn.prepare_cached("SELECT ordinal,mid,message_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal>=?3 AND ordinal<=?4 ORDER BY ordinal")?;
+            for message in q.query_map(params![conv,lineage.lineage_id,first.min(i64::MAX as u64),cut.min(i64::MAX as u64)],|r|Ok(ProviderMessage {ordinal:r.get(0)?,mid:r.get(1)?,message_bytes:r.get(2)?}))? {
+                let message=message?; messages.entry(message.ordinal).or_insert((lineage.lineage_id.clone(),message));
+            }
+        }
+        Ok(messages.into_values().collect())
+    })?)
+    }
+
+    pub fn provider_range_start(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+    ) -> Result<u64, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let conv=key.conversation_key();
+            let mut first=None;
+            for (lineage,cut) in ancestry_tx(conn,&conv,lineage)? {
+                let ordinal:Option<u64>=conn.query_row("SELECT ordinal FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 ORDER BY ordinal LIMIT 1",params![conv,lineage.lineage_id,cut.min(i64::MAX as u64)],|r|r.get(0)).optional()?;
+                if let Some(ordinal)=ordinal {first=Some(first.map_or(ordinal,|old:u64|old.min(ordinal)));}
+            }
+            Ok(first.unwrap_or(0))
+        })?)
+    }
+
+    pub fn load_provider_hook_answers_since(
+        &self,
+        key: &ProviderSessionKey,
+        first: u64,
+    ) -> Result<Vec<ProviderStoredAnswer>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut q=conn.prepare_cached("SELECT lineage_id,ordinal,subject_mid,hook,subject_part,ops_json,tags_json,state FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND ordinal>=?2 AND legacy_json IS NULL ORDER BY answer_seq")?;
+            let rows=q.query_map(params![key.conversation_key(),first.min(i64::MAX as u64)],|r|Ok(ProviderStoredAnswer {lineage_id:r.get(0)?,state:r.get(7)?,answer:ProviderHookAnswer {ordinal:r.get(1)?,subject:ProviderSubject {subject_mid:r.get(2)?,hook:r.get(3)?,subject_part:r.get(4)?},ops_json:r.get(5)?,tags:serde_json::from_str(&r.get::<_,String>(6)?).map_err(sql_json)?}}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?)
+    }
+
     pub fn provider_frontier(
         &self,
         key: &ProviderSessionKey,
         lineage: &str,
     ) -> Result<u64, McStoreError> {
-        Ok(self
-            .inner
-            .with_conn(|conn| frontier_tx(conn, &key.conversation_key(), lineage))?)
+        Ok(self.inner.with_conn(|conn| {
+            let conv = key.conversation_key();
+            if let Some(c) = conversation_tx(conn, key)? {
+                if c.lineage_id == lineage && c.cursor_frontier > 0 {
+                    return extend_frontier_tx(conn, &conv, lineage, c.cursor_frontier);
+                }
+            }
+            frontier_tx(conn, &conv, lineage)
+        })?)
     }
     pub fn load_provider_hook_answers(
         &self,
@@ -1588,7 +1695,7 @@ mod lineage_metadata_tests {
             conn.execute("INSERT INTO mc_provider_lineages_v1 VALUES (?1,'child',4001,'root',4000,'session')", [&conv])?;
             // Deliberately unreadable JSON proves this query cannot be satisfied
             // by decoding a compatibility record or a message payload.
-            conn.execute("INSERT INTO mc_provider_messages_v1 VALUES (?1,'root',4000,'m4000',x'ff','session')", [&conv])?;
+            conn.execute("INSERT INTO mc_provider_messages_v1(conv_key,lineage_id,ordinal,mid,message_bytes,session) VALUES (?1,'root',4000,'m4000',x'ff','session')", [&conv])?;
             Ok(())
         }).unwrap();
         assert_eq!(

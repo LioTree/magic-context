@@ -36,6 +36,14 @@ pub mod parity_schema_manifest;
 pub mod private_permissions;
 mod provider_legacy;
 mod provider_log;
+mod provider_policy_overlay;
+#[cfg(test)]
+mod provider_v2_tests;
+mod provider_view_recipe;
+pub use provider_view_recipe::{
+    ProviderResolvedView, ProviderViewRecipe, ProviderViewSegment, ProviderViewTreatment,
+    MAX_VIEW_ANCESTOR_BYTES, MAX_VIEW_BASE_DEPTH,
+};
 pub mod provider_meters;
 mod provider_preparation;
 mod provider_resident_read;
@@ -3291,6 +3299,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 71,
         statements: include_str!("migrations/store_071_provider_policy_revision.sql"),
+    },
+    Migration {
+        version: 72,
+        statements: include_str!("migrations/store_072_provider_policy_baselines_views.sql"),
     },
 ];
 

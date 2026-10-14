@@ -388,7 +388,9 @@ mod generation_migration_tests {
         let legacy = ProviderSessionKey {
             project_root: "/project".into(),
             session: "s".into(),
-            harness: "opencode".into(),
+            // Native-host development rows are reset by migration 72; the
+            // generation migration still preserves the generic observation lane.
+            harness: "broca".into(),
             generation: None,
         };
         let key = legacy.conversation_key();
@@ -407,7 +409,7 @@ mod generation_migration_tests {
             )
             .unwrap();
         inner.with_conn(|conn| {
-            conn.execute("INSERT INTO mc_provider_conversations_v2(conv_key,project_root,session,harness,engine_namespace) VALUES(?1,'/project','s','opencode','legacy-engine')",[&key])?;
+            conn.execute("INSERT INTO mc_provider_conversations_v2(conv_key,project_root,session,harness,engine_namespace) VALUES(?1,'/project','s','broca','legacy-engine')",[&key])?;
             conn.execute("INSERT INTO mc_provider_lineages_v1(conv_key,lineage_id,first_ordinal,session) VALUES(?1,'L',0,'s')",[&key])?;
             conn.execute("INSERT INTO mc_provider_messages_v1 VALUES(?1,'L',0,'m',?2,'s')",params![key,raw.as_slice()])?;
             conn.execute("INSERT INTO mc_provider_views_v1 VALUES(?1,1,'L',0,1,' [ ] ','applied','{}','s')",[&key])?;
@@ -416,7 +418,7 @@ mod generation_migration_tests {
         }).unwrap();
         drop(inner);
         let store = McStore::open_for_test(&descriptor).unwrap();
-        assert_eq!(store.module_store_schema_version().unwrap(), 71);
+        assert_eq!(store.module_store_schema_version().unwrap(), 72);
         let conversation = store.load_provider_conversation(&legacy).unwrap().unwrap();
         assert_eq!(conversation.engine_namespace, "legacy-engine");
         assert!(conversation.native_pins_json.is_none());

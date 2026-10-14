@@ -132,7 +132,7 @@ fn populate_v67(store: &McStore) {
         tx.execute("INSERT INTO mc_provider_lineages_v1(conv_key,lineage_id,first_ordinal,session) VALUES(?1,'L',1,?2)", params![conv,key.session])?;
         for ordinal in 1..=3u64 {
             let mid = format!("m{ordinal}");
-            tx.execute("INSERT INTO mc_provider_messages_v1 VALUES(?1,'L',?2,?3,?4,?5)", params![conv,ordinal,mid,b"{}".as_slice(),key.session])?;
+            tx.execute("INSERT INTO mc_provider_messages_v1(conv_key,lineage_id,ordinal,mid,message_bytes,session) VALUES(?1,'L',?2,?3,?4,?5)", params![conv,ordinal,mid,b"{}".as_slice(),key.session])?;
             for policy in [part(&mid,ordinal,0,None),part(&mid,ordinal,1,Some(ordinal as i64))] {
                 tx.execute("INSERT INTO mc_provider_policy_parts_v1 VALUES(?1,'L',?2,?3,?4,?5)", params![conv,ordinal,policy.block_id,serde_json::to_string(&policy).unwrap(),key.session])?;
             }

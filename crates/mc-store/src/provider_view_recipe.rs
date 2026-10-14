@@ -1,0 +1,401 @@
+//! View recipes retain native identities, not another copy of model-visible
+//! history. Resolution checks source lifetime and bounded ancestor dependencies.
+use crate::provider_log::{ProviderError, ProviderMessage};
+use crate::{McStore, ProviderSessionKey};
+use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub const MAX_VIEW_BASE_DEPTH: usize = 16;
+pub const MAX_VIEW_ANCESTOR_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderViewSegment {
+    Synthetic {
+        slot: String,
+    },
+    NativeRange {
+        source_lineage_id: String,
+        from: u64,
+        to: u64,
+        first_mid: String,
+        last_mid: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProviderViewTreatment {
+    pub source_lineage_id: String,
+    pub mid: String,
+    pub ordinal: u64,
+    pub block_index: i64,
+    pub block_id: String,
+    pub patch: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderViewRecipe {
+    pub version: u64,
+    pub lineage_id: String,
+    pub range_from: u64,
+    pub range_to: u64,
+    pub base_version: Option<u64>,
+    pub policy_cut_id: Option<u64>,
+    pub metadata: Value,
+    pub segments: Vec<ProviderViewSegment>,
+    pub synthetic: BTreeMap<String, Value>,
+    pub treatments: Vec<ProviderViewTreatment>,
+    pub serializer_profile: String,
+    pub render_key: String,
+    pub tokenizer_key: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderResolvedView {
+    pub recipe: ProviderViewRecipe,
+    pub messages: Vec<(String, ProviderMessage)>,
+    pub depth: usize,
+    pub ancestor_bytes: usize,
+}
+
+fn invalid(message: impl ToString) -> ProviderError {
+    ProviderError::Transient(message.to_string())
+}
+
+fn load_recipe_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+    version: u64,
+) -> Result<Option<ProviderViewRecipe>, ProviderError> {
+    let row=conn.query_row("SELECT lineage_id,range_from,range_to,base_version,policy_cut_id,view_meta_json,sequence_json,new_head_history_bytes,serializer_profile,render_key,tokenizer_key,state FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2",params![conv,version],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,u64>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<Vec<u8>>>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?))).optional()?;
+    let Some((
+        lineage_id,
+        range_from,
+        range_to,
+        base_version,
+        cut,
+        metadata,
+        segments,
+        synthetic,
+        serializer_profile,
+        render_key,
+        tokenizer_key,
+        state,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let mut q=conn.prepare_cached("SELECT source_lineage_id,mid,ordinal,block_index,block_id,patch_json FROM mc_provider_view_overrides_v1 WHERE conv_key=?1 AND version=?2 ORDER BY source_lineage_id,mid,block_index")?;
+    let mut treatments = Vec::new();
+    for row in q.query_map(params![conv, version], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, u64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, Option<String>>(5)?,
+        ))
+    })? {
+        let (source_lineage_id, mid, ordinal, block_index, block_id, patch) = row?;
+        treatments.push(ProviderViewTreatment {
+            source_lineage_id,
+            mid,
+            ordinal,
+            block_index,
+            block_id,
+            patch: patch
+                .map(|raw| serde_json::from_str(&raw).map_err(invalid))
+                .transpose()?,
+        });
+    }
+    Ok(Some(ProviderViewRecipe {
+        version,
+        lineage_id,
+        range_from,
+        range_to,
+        base_version,
+        policy_cut_id: Some(cut),
+        metadata: serde_json::from_str(&metadata).map_err(invalid)?,
+        segments: serde_json::from_str(&segments).map_err(invalid)?,
+        synthetic: synthetic
+            .map(|raw| serde_json::from_slice(&raw).map_err(invalid))
+            .transpose()?
+            .unwrap_or_default(),
+        treatments,
+        serializer_profile,
+        render_key,
+        tokenizer_key,
+        state,
+    }))
+}
+
+fn resolve_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+    version: u64,
+    load_messages: bool,
+) -> Result<Option<ProviderResolvedView>, ProviderError> {
+    let Some(mut recipe) = load_recipe_tx(conn, conv, version)? else {
+        return Ok(None);
+    };
+    let mut synthetic = recipe.synthetic.clone();
+    let mut treatments = BTreeMap::new();
+    for treatment in &recipe.treatments {
+        treatments.insert(
+            (
+                treatment.source_lineage_id.clone(),
+                treatment.mid.clone(),
+                treatment.block_index,
+            ),
+            treatment.clone(),
+        );
+    }
+    let mut next = recipe.base_version;
+    let mut depth = 0;
+    let mut ancestor_bytes = 0;
+    while let Some(version) = next {
+        depth += 1;
+        if depth > MAX_VIEW_BASE_DEPTH {
+            return Err(invalid("provider view inheritance depth exceeds bound"));
+        }
+        let base = load_recipe_tx(conn, conv, version)?
+            .ok_or_else(|| invalid("provider view base is missing"))?;
+        ancestor_bytes += serde_json::to_vec(&base.synthetic).map_err(invalid)?.len()
+            + serde_json::to_vec(&base.treatments).map_err(invalid)?.len()
+            + serde_json::to_vec(&base.segments).map_err(invalid)?.len()
+            + base.metadata.to_string().len();
+        if ancestor_bytes > MAX_VIEW_ANCESTOR_BYTES {
+            return Err(invalid("provider view inheritance bytes exceed bound"));
+        }
+        for (slot, value) in base.synthetic {
+            synthetic.entry(slot).or_insert(value);
+        }
+        for treatment in base.treatments {
+            treatments
+                .entry((
+                    treatment.source_lineage_id.clone(),
+                    treatment.mid.clone(),
+                    treatment.block_index,
+                ))
+                .or_insert(treatment);
+        }
+        next = base.base_version;
+    }
+    recipe.synthetic = synthetic
+        .into_iter()
+        .filter(|(slot, _)| {
+            recipe
+                .segments
+                .iter()
+                .any(|s| matches!(s,ProviderViewSegment::Synthetic {slot:needed} if slot==needed))
+        })
+        .collect();
+    recipe.treatments=treatments.into_values().filter(|t|t.patch.is_some() && recipe.segments.iter().any(|s|matches!(s,ProviderViewSegment::NativeRange {source_lineage_id,from,to,..} if &t.source_lineage_id==source_lineage_id && t.ordinal>=*from && t.ordinal<*to))).collect();
+    let mut messages = Vec::new();
+    if load_messages {
+        for segment in &recipe.segments {
+            if let ProviderViewSegment::NativeRange {
+                source_lineage_id,
+                from,
+                to,
+                first_mid,
+                last_mid,
+            } = segment
+            {
+                let mut q=conn.prepare_cached("SELECT ordinal,mid,message_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal>=?3 AND ordinal<?4 ORDER BY ordinal")?;
+                let rows = q
+                    .query_map(params![conv, source_lineage_id, from, to], |r| {
+                        Ok(ProviderMessage {
+                            ordinal: r.get(0)?,
+                            mid: r.get(1)?,
+                            message_bytes: r.get(2)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if rows.first().map(|m| m.mid.as_str()) != Some(first_mid)
+                    || rows.last().map(|m| m.mid.as_str()) != Some(last_mid)
+                    || rows.len() as u64 != to.saturating_sub(*from)
+                {
+                    return Err(invalid("provider view native source is missing or changed"));
+                }
+                messages.extend(rows.into_iter().map(|row| (source_lineage_id.clone(), row)));
+            }
+        }
+    }
+    Ok(Some(ProviderResolvedView {
+        recipe,
+        messages,
+        depth,
+        ancestor_bytes,
+    }))
+}
+
+impl McStore {
+    pub fn prune_provider_views_from_conversation(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<usize, ProviderError> {
+        let Some(c) = self
+            .load_provider_conversation(key)
+            .map_err(ProviderError::Storage)?
+        else {
+            return Ok(0);
+        };
+        let mut roots = BTreeSet::new();
+        if let Some(raw) = c.setup_json {
+            let setup: Value = serde_json::from_str(&raw).map_err(invalid)?;
+            for path in ["/applied/version", "/produced/version"] {
+                if let Some(version) = setup.pointer(path).and_then(Value::as_u64) {
+                    roots.insert(version);
+                }
+            }
+        }
+        if let Some(raw) = c.last_answer_json {
+            let receipt: Value = serde_json::from_str(&raw).map_err(invalid)?;
+            for path in ["/compaction/version", "/initial/version"] {
+                if let Some(version) = receipt.pointer(path).and_then(Value::as_u64) {
+                    roots.insert(version);
+                }
+            }
+        }
+        let counters: Value = serde_json::from_str(&c.hook_counters_json).map_err(invalid)?;
+        if let Some(lkg) = counters.get("lkg_view_versions").and_then(Value::as_array) {
+            roots.extend(lkg.iter().filter_map(Value::as_u64));
+        }
+        // One previous applied version protects the host's last-good slot while
+        // an acknowledged new view is being published to its outgoing request.
+        roots.extend(self.inner.with_conn(|conn| {
+            let mut q=conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 AND state='applied' ORDER BY version DESC LIMIT 2")?;
+            let rows=q.query_map([key.conversation_key()],|r|r.get::<_,u64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        }).map_err(|e|ProviderError::Storage(e.into()))?);
+        if roots.is_empty() {
+            return Ok(0);
+        };
+        self.prune_provider_view_recipes(key, &roots)
+    }
+
+    pub fn resolve_provider_view(
+        &self,
+        key: &ProviderSessionKey,
+        version: u64,
+    ) -> Result<Option<ProviderResolvedView>, ProviderError> {
+        let mut refusal = None;
+        self.inner
+            .with_conn(|conn| {
+                resolve_tx(conn, &key.conversation_key(), version, true).map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
+    }
+
+    /// Resolve bounded recipe dependencies without loading native message bodies.
+    /// Fold writers use this catalog; serving readers validate/materialize sources.
+    pub fn resolve_provider_view_catalog(
+        &self,
+        key: &ProviderSessionKey,
+        version: u64,
+    ) -> Result<Option<ProviderResolvedView>, ProviderError> {
+        let mut refusal = None;
+        self.inner
+            .with_conn(|conn| {
+                resolve_tx(conn, &key.conversation_key(), version, false).map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
+    }
+
+    pub fn save_provider_view_recipe(
+        &self,
+        key: &ProviderSessionKey,
+        recipe: &ProviderViewRecipe,
+    ) -> Result<usize, ProviderError> {
+        let mut refusal = None;
+        self.inner.with_conn_fenced(|conn| {
+            let save=||->Result<usize,ProviderError> {
+                let conv=key.conversation_key();
+                let mut recipe=recipe.clone();
+                if let Some(base)=recipe.base_version {
+                    let resolved=resolve_tx(conn,&conv,base,false)?.ok_or_else(||invalid("provider view base is missing"))?;
+                    let new_bytes=serde_json::to_vec(&recipe.synthetic).map_err(invalid)?.len()+serde_json::to_vec(&recipe.treatments).map_err(invalid)?.len();
+                    let base_bytes=serde_json::to_vec(&resolved.recipe.synthetic).map_err(invalid)?.len()+serde_json::to_vec(&resolved.recipe.treatments).map_err(invalid)?.len()+serde_json::to_vec(&resolved.recipe.segments).map_err(invalid)?.len()+resolved.recipe.metadata.to_string().len();
+                    let old_native:u64=resolved.recipe.segments.iter().map(|s|match s {ProviderViewSegment::NativeRange {from,to,..}=>to-from,_=>0}).sum();
+                    let new_native:u64=recipe.segments.iter().map(|s|match s {ProviderViewSegment::NativeRange {from,to,..}=>to-from,_=>0}).sum();
+                    if resolved.depth+1>MAX_VIEW_BASE_DEPTH || resolved.ancestor_bytes+base_bytes+new_bytes>MAX_VIEW_ANCESTOR_BYTES || old_native>new_native.saturating_mul(2).max(1) {
+                        for (slot,value) in resolved.recipe.synthetic {recipe.synthetic.entry(slot).or_insert(value);}
+                        let mut treatments=BTreeMap::new();
+                        for t in recipe.treatments {treatments.insert((t.source_lineage_id.clone(),t.mid.clone(),t.block_index),t);}
+                        for t in resolved.recipe.treatments {treatments.entry((t.source_lineage_id.clone(),t.mid.clone(),t.block_index)).or_insert(t);}
+                        recipe.treatments=treatments.into_values().filter(|t|t.patch.is_some() && recipe.segments.iter().any(|s|matches!(s,ProviderViewSegment::NativeRange {source_lineage_id,from,to,..} if &t.source_lineage_id==source_lineage_id && t.ordinal>=*from && t.ordinal<*to))).collect();
+                        recipe.synthetic.retain(|slot,_|recipe.segments.iter().any(|s|matches!(s,ProviderViewSegment::Synthetic {slot:needed} if slot==needed)));
+                        recipe.base_version=None;
+                    }
+                }
+                let cut=if let Some(cut)=recipe.policy_cut_id {cut} else {
+                    // Setup's zero-range synthetic view has no native lineage yet.
+                    // The empty lineage is unreachable as a host ingest lineage.
+                    conn.execute("INSERT INTO mc_provider_lineages_v1 SELECT ?1,'',0,NULL,NULL,json_extract(?1,'$[1]') WHERE NOT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id='')",[&conv])?;
+                    let cut:u64=conn.query_row("SELECT coalesce(max(cut_id),-1)+1 FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1",[&conv],|r|r.get(0))?;
+                    conn.execute("INSERT INTO mc_provider_policy_cuts_v1 VALUES (?1,?2,'',NULL,0,'{}','{}','{}','setup',json_extract(?1,'$[1]'))",params![conv,cut])?;
+                    recipe.lineage_id=String::new(); cut
+                };
+                let metadata=recipe.metadata.to_string();
+                let sequence=serde_json::to_string(&recipe.segments).map_err(invalid)?;
+                let synthetic=(!recipe.synthetic.is_empty()).then(||serde_json::to_vec(&recipe.synthetic)).transpose().map_err(invalid)?;
+                let mut bytes=metadata.len()+sequence.len()+synthetic.as_ref().map_or(0,Vec::len);
+                conn.execute("INSERT INTO mc_provider_views_v2 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,json_extract(?1,'$[1]'))",params![conv,recipe.version,recipe.lineage_id,recipe.range_from,recipe.range_to,recipe.base_version,cut,metadata,sequence,synthetic,recipe.serializer_profile,recipe.render_key,recipe.tokenizer_key,recipe.state])?;
+                for treatment in recipe.treatments {
+                    let patch=treatment.patch.map(|v|v.to_string()); bytes+=patch.as_ref().map_or(0,String::len);
+                    conn.execute("INSERT INTO mc_provider_view_overrides_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,json_extract(?1,'$[1]'))",params![conv,recipe.version,treatment.source_lineage_id,treatment.mid,treatment.ordinal,treatment.block_index,treatment.block_id,if patch.is_some(){"set"}else{"reset"},patch])?;
+                }
+                Ok(bytes)
+            };
+            save().map_err(|e|{refusal=Some(e);rusqlite::Error::InvalidQuery})
+        }).map_err(|e|refusal.unwrap_or_else(||ProviderError::Storage(e.into())))
+    }
+
+    /// Reachability, not age, controls retention. Callers pass applied, produced
+    /// and LKG/receipt versions; ancestor recipes and current policy exceptions
+    /// remain live until those roots no longer refer to them.
+    pub fn prune_provider_view_recipes(
+        &self,
+        key: &ProviderSessionKey,
+        roots: &BTreeSet<u64>,
+    ) -> Result<usize, ProviderError> {
+        let mut refusal = None;
+        self.inner.with_conn_fenced(|conn| {
+            let prune=||->Result<usize,ProviderError> {
+                let conv=key.conversation_key();
+                let mut keep=roots.clone();
+                for root in roots {
+                    let mut current=Some(*root);
+                    let mut depth=0;
+                    while let Some(version)=current {
+                        if depth>MAX_VIEW_BASE_DEPTH {return Err(invalid("provider view retention inheritance exceeds bound"));}
+                        let recipe=load_recipe_tx(conn,&conv,version)?.ok_or_else(||invalid("still-referenced provider view is missing"))?;
+                        keep.insert(version); current=recipe.base_version; depth+=1;
+                    }
+                }
+                let mut q=conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 ORDER BY version DESC")?;
+                let versions=q.query_map([&conv],|r|r.get::<_,u64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut removed=0;
+                for version in versions.into_iter().filter(|v|!keep.contains(v)) {
+                    conn.execute("DELETE FROM mc_provider_view_overrides_v1 WHERE conv_key=?1 AND version=?2",params![conv,version])?;
+                    removed+=conn.execute("DELETE FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2",params![conv,version])?;
+                }
+                let current=crate::provider_policy_overlay::current_cut_tx(conn,&conv)?;
+                conn.execute("DELETE FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 AND (?2 IS NULL OR cut_id<>?2) AND NOT EXISTS(SELECT 1 FROM mc_provider_views_v2 v WHERE v.conv_key=?1 AND v.policy_cut_id=mc_provider_policy_cuts_v1.cut_id) AND NOT EXISTS(SELECT 1 FROM mc_provider_policy_overrides_v1 o WHERE o.conv_key=?1 AND o.cut_id=mc_provider_policy_cuts_v1.cut_id)",params![conv,current])?;
+                Ok(removed)
+            };
+            prune().map_err(|e|{refusal=Some(e);rusqlite::Error::InvalidQuery})
+        }).map_err(|e|refusal.unwrap_or_else(||ProviderError::Storage(e.into())))
+    }
+}

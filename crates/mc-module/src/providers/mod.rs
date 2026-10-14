@@ -30,6 +30,7 @@ pub(crate) mod resident_hooks;
 mod step_transform;
 #[cfg(test)]
 mod tests;
+mod view_recipe;
 
 use codec::{checked_view, decode_message};
 #[cfg(test)]

@@ -207,13 +207,14 @@ fn ancestor_cut(
     }
 }
 
-fn non_tag_messages(
+fn non_tag_messages_since(
     store: &McStore,
     key: &Key,
     lineage: &ProviderLineage,
+    first: u64,
 ) -> Result<Vec<compact::status::StatusMessage>, HandlerOutcome> {
     let mut messages = store
-        .load_provider_messages(&key.store_key(), &lineage.lineage_id)
+        .load_provider_messages_since(&key.store_key(), &lineage.lineage_id, first)
         .map_err(transient)?
         .into_iter()
         .map(|m| {
@@ -236,7 +237,7 @@ fn non_tag_messages(
     }
     let mut cuts: HashMap<String, Option<u64>> = HashMap::new();
     for stored in store
-        .load_provider_hook_answers(&key.store_key())
+        .load_provider_hook_answers_since(&key.store_key(), first)
         .map_err(transient)?
     {
         if stored.state != "live" {
@@ -360,7 +361,13 @@ fn save_host_setup(
     conversation.rebuild_epoch = setup.setup.state.rebuild_epoch;
     store
         .save_provider_conversation(&key.store_key(), conversation)
-        .map_err(transient)
+        .map_err(transient)?;
+    if matches!(key.harness.as_str(), "opencode" | "opencode2") {
+        store
+            .prune_provider_views_from_conversation(&key.store_key())
+            .map_err(transient)?;
+    }
+    Ok(())
 }
 
 fn save_host_view(
@@ -369,6 +376,9 @@ fn save_host_view(
     view: &HostView,
     state: &str,
 ) -> Result<(), HandlerOutcome> {
+    if matches!(key.harness.as_str(), "opencode" | "opencode2") {
+        return super::view_recipe::save(store, key, view, state);
+    }
     store
         .save_provider_view(
             &key.store_key(),
@@ -389,6 +399,12 @@ fn load_host_view(
     key: &Key,
     summary: &ViewSummary,
 ) -> Result<HostView, HandlerOutcome> {
+    if matches!(key.harness.as_str(), "opencode" | "opencode2") {
+        if let Some(mut view) = super::view_recipe::load(store, key, summary.version)? {
+            view.engine.range.lineage_id = summary.range.lineage_id.clone();
+            return Ok(view);
+        }
+    }
     let row = store
         .load_provider_view(&key.store_key(), summary.version)
         .map_err(|e| transient(format!("load provider views: {e}")))?
@@ -410,6 +426,7 @@ struct Work {
     project_path: String,
     project_directory: String,
     note_project_path: String,
+    resident_folds: bool,
 }
 
 /// Metadata-only skip check shared by the handler and real-state comparison
@@ -582,7 +599,18 @@ fn execute_host(
 ) -> Result<Option<HostView>, HandlerOutcome> {
     let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
     let started = Instant::now();
-    let messages = non_tag_messages(store, &work.key, lineage)?;
+    let native_tail = work.resident_folds && codec == Codec::OpencodeAiSdk;
+    let first = if native_tail {
+        store
+            .load_meta(&conversation.engine_namespace)
+            .map_err(transient)?
+            .meta
+            .coverage_ordinal
+            .map_or(0, |n| n.saturating_add(1))
+    } else {
+        0
+    };
+    let messages = non_tag_messages_since(store, &work.key, lineage, first)?;
     let replay_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut template: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
         "serializer_profile":codec.serializer_profile().wire_id(),"session_id":conversation.engine_namespace,
@@ -721,14 +749,27 @@ fn execute_host(
         .map_err(transient)?;
     let prepare_ms = started.elapsed().as_secs_f64() * 1000.0 - replay_ms;
     let engine_started = Instant::now();
-    let output =
-        host_engine_step(store, &template, &context, status, &mut state).map_err(|error| {
-            if codec == Codec::ClaudeCodeAnthropic {
-                claude_code_engine_failure(error, request_id)
-            } else {
-                transient(error)
-            }
-        })?;
+    let output = (if native_tail {
+        transform::compaction::step_with_range_start(
+            store,
+            &template,
+            &context,
+            status,
+            &mut state,
+            store
+                .provider_range_start(&work.key.store_key(), &lineage.lineage_id)
+                .map_err(transient)?,
+        )
+    } else {
+        host_engine_step(store, &template, &context, status, &mut state)
+    })
+    .map_err(|error| {
+        if codec == Codec::ClaudeCodeAnthropic {
+            claude_code_engine_failure(error, request_id)
+        } else {
+            transient(error)
+        }
+    })?;
     let engine_ms = engine_started.elapsed().as_secs_f64() * 1000.0;
     // Keep only scalars in Setup. Engine and native bytes are committed together
     // in one immutable view row below, before publishing their reference.
@@ -776,7 +817,7 @@ fn execute_host(
                 None,
             )
         };
-        let coverage = output.engine.response.coverage_ordinal.and_then(|ordinal| {
+        let mut coverage = output.engine.response.coverage_ordinal.and_then(|ordinal| {
             messages
                 .iter()
                 .find(|m| m.ordinal == ordinal)
@@ -786,6 +827,26 @@ fn execute_host(
                     endpoint: None,
                 })
         });
+        if native_tail && coverage.is_none() {
+            if let Some(ordinal) = output.engine.response.coverage_ordinal {
+                if let Some(message) = store
+                    .load_provider_messages_since(
+                        &work.key.store_key(),
+                        &lineage.lineage_id,
+                        ordinal,
+                    )
+                    .map_err(transient)?
+                    .into_iter()
+                    .find(|m| m.ordinal == ordinal)
+                {
+                    coverage = Some(HostCoverage {
+                        end_mid: message.mid,
+                        ordinal,
+                        endpoint: None,
+                    });
+                }
+            }
+        }
         let head_slots = raw_replacement
             .as_ref()
             .map(|raw| super::cache_policy::head_slots(&engine, raw, setup.setup.state.preset));
@@ -1673,6 +1734,7 @@ impl McHandler {
     ) -> Result<Work, HandlerOutcome> {
         let route = self.route_project(store, &binding)?;
         Ok(Work {
+            resident_folds: self.provider_resident.is_enabled(),
             project_directory: binding.project_root.to_string_lossy().into_owned(),
             note_project_path: route.key.clone(),
             project_path: route.key,
