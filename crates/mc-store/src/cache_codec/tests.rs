@@ -1213,7 +1213,11 @@ fn rewind_to_62(store: &McStore) {
          DROP TABLE mc_pass_trace_history;
          DROP TABLE mc_cache_frozen_chunks;
          DROP TABLE mc_cache_sections;
-          DROP TABLE mc_provider_conversations_v2;
+          DROP TABLE mc_provider_view_overrides_v1;
+          DROP TABLE mc_provider_views_v2;
+          DROP TABLE mc_provider_policy_overrides_v1;
+          DROP TABLE mc_provider_policy_cuts_v1;
+           DROP TABLE mc_provider_conversations_v2;
           DROP TABLE mc_provider_policy_preparations_v1;
           DROP TABLE mc_provider_policy_revisions_v1;
           DROP TABLE mc_provider_lineages_v1;

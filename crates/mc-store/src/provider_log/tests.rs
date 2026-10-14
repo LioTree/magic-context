@@ -107,6 +107,13 @@ fn hook(
 
 #[test]
 fn v65_blob_round_trips_messages_answers_views_pending_drops_and_empty_lineages() {
+    // The undeployed OpenCode projection is reset at the recipe cutover; generic
+    // runner observations must still migrate losslessly through every version.
+    let native_key = key();
+    let key = || ProviderSessionKey {
+        harness: "broca".into(),
+        ..native_key.clone()
+    };
     let dir = tempfile::tempdir().unwrap();
     let descriptor = descriptor(dir.path());
     let inner = open_sqlite(&descriptor).unwrap();
@@ -136,11 +143,25 @@ fn v65_blob_round_trips_messages_answers_views_pending_drops_and_empty_lineages(
                     record.to_string()
                 ],
             )?;
+            conn.execute(
+                "INSERT INTO mc_provider_sessions_v1 VALUES (?1,?2,?3,?4)",
+                params![
+                    native_key.project_root,
+                    native_key.session,
+                    native_key.harness,
+                    record.to_string()
+                ],
+            )?;
             Ok(())
         })
         .unwrap();
     drop(inner);
     let store = McStore::open_for_test(&descriptor).unwrap();
+    assert!(store.load_provider_record(&native_key).unwrap().is_none());
+    assert!(store
+        .load_provider_conversation(&native_key)
+        .unwrap()
+        .is_none());
     assert_eq!(
         serde_json::from_str::<Value>(&store.load_provider_record(&key()).unwrap().unwrap())
             .unwrap(),

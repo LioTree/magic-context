@@ -1,6 +1,7 @@
-//! Frozen policy facts share the lifetime of their immutable native message.
-//! Retiring a native row retires its facts; missing source facts are an error,
-//! never permission to invent measurements for a view or a policy reader.
+//! Policy identities and per-part measurements are frozen on their immutable
+//! native message row when it becomes covered by a summary. Deleting or archiving
+//! that row must also retire these facts: readers must not fabricate measurements
+//! after the source message is gone.
 use crate::provider_log::{ProviderError, ProviderPolicyPart};
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use rusqlite::{params, Connection};
@@ -103,7 +104,8 @@ impl FrozenPolicyResolver {
         })
     }
 
-    /// The only projection of a frozen source into the public policy representation.
+    /// Apply the current baseline defaults and point overrides to one message's
+    /// saved policy part. All public frozen-part reads use this conversion.
     pub(crate) fn resolve(
         &self,
         lineage: &str,
@@ -186,8 +188,9 @@ fn merge_policy_patch(value: &mut Value, patch: &Value) -> Result<(), ProviderEr
     Ok(())
 }
 
-/// Freeze only newly covered messages. Existing frozen vectors are never
-/// rewritten by a later cut; uniform measurement changes live in cut defaults.
+/// Save policy facts once for messages newly covered by the summary boundary.
+/// Later boundaries change uniform measurement defaults rather than rewriting
+/// the identities and measurements saved on every older message row.
 pub(crate) fn freeze_cut_tx(
     conn: &Connection,
     conv: &str,
@@ -210,20 +213,31 @@ pub(crate) fn freeze_cut_tx(
     }
     let mut frozen_parts = 0u64;
     let mut frozen_users = 0u64;
+    let ancestry = crate::provider_log::ancestry_tx(conn, conv, lineage)?;
     for (ordinal, parts) in grouped {
         use rusqlite::OptionalExtension;
-        let format: Option<u32>=conn.query_row("SELECT frozen_policy_format FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal=?3",params![conv,lineage,ordinal],|r|r.get(0)).optional()?;
-        match format {
-            Some(0) => {
+        let mut source = None;
+        for (ancestor, through) in &ancestry {
+            if ordinal > *through {
+                continue;
+            }
+            let format: Option<u32> = conn.query_row("SELECT frozen_policy_format FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal=?3",params![conv,ancestor.lineage_id,ordinal],|r|r.get(0)).optional()?;
+            if let Some(format) = format {
+                source = Some((&ancestor.lineage_id, format));
+                break;
+            }
+        }
+        match source {
+            Some((source_lineage, 0)) => {
                 let (blob, bytes) = encode_facts(&parts)?;
-                conn.execute("UPDATE mc_provider_messages_v1 SET frozen_policy_format=1,frozen_policy_raw_bytes=?4,frozen_policy_parts=?5,frozen_policy_bytes=?6 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal=?3 AND frozen_policy_format=0",params![conv,lineage,ordinal,bytes,parts.len(),blob])?;
+                conn.execute("UPDATE mc_provider_messages_v1 SET frozen_policy_format=1,frozen_policy_raw_bytes=?4,frozen_policy_parts=?5,frozen_policy_bytes=?6 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal=?3 AND frozen_policy_format=0",params![conv,source_lineage,ordinal,bytes,parts.len(),blob])?;
                 frozen_parts += parts.len() as u64;
                 frozen_users += parts
                     .iter()
                     .filter(|p| p.kind == "header" && p.real_user)
                     .count() as u64;
             }
-            Some(1) => {}
+            Some((_, 1)) => {}
             _ => {
                 return Err(ProviderError::Transient(
                     "frozen policy source message is missing".into(),
@@ -242,8 +256,8 @@ pub(crate) fn freeze_cut_tx(
         (0, serde_json::json!({}))
     };
     conn.execute("INSERT INTO mc_provider_policy_cuts_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,json_extract(?1,'$[1]'))",params![conv,cut,lineage,coverage,old_count+frozen_parts,settings.get("baseline").unwrap_or(&Value::Null).to_string(),serde_json::json!({"format":1,"covered_measurements":true}).to_string(),serde_json::json!({"users":old_totals.get("users").and_then(Value::as_u64).unwrap_or(0)+frozen_users}).to_string(),settings.to_string()])?;
-    // Sparse exceptions are relative to the current cut, not an ever-growing
-    // stack of historical before-images.
+    // Keep the current per-part exceptions attached to the new baseline; do not
+    // copy a complete set of old measurement values for each prior boundary.
     conn.execute(
         "UPDATE mc_provider_policy_overrides_v1 SET cut_id=?2 WHERE conv_key=?1",
         params![conv, cut],

@@ -426,7 +426,6 @@ struct Work {
     project_path: String,
     project_directory: String,
     note_project_path: String,
-    resident_folds: bool,
 }
 
 /// Metadata-only skip check shared by the handler and real-state comparison
@@ -599,18 +598,7 @@ fn execute_host(
 ) -> Result<Option<HostView>, HandlerOutcome> {
     let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
     let started = Instant::now();
-    let native_tail = work.resident_folds && codec == Codec::OpencodeAiSdk;
-    let first = if native_tail {
-        store
-            .load_meta(&conversation.engine_namespace)
-            .map_err(transient)?
-            .meta
-            .coverage_ordinal
-            .map_or(0, |n| n.saturating_add(1))
-    } else {
-        0
-    };
-    let messages = non_tag_messages_since(store, &work.key, lineage, first)?;
+    let messages = non_tag_messages_since(store, &work.key, lineage, 0)?;
     let replay_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut template: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
         "serializer_profile":codec.serializer_profile().wire_id(),"session_id":conversation.engine_namespace,
@@ -749,27 +737,14 @@ fn execute_host(
         .map_err(transient)?;
     let prepare_ms = started.elapsed().as_secs_f64() * 1000.0 - replay_ms;
     let engine_started = Instant::now();
-    let output = (if native_tail {
-        transform::compaction::step_with_range_start(
-            store,
-            &template,
-            &context,
-            status,
-            &mut state,
-            store
-                .provider_range_start(&work.key.store_key(), &lineage.lineage_id)
-                .map_err(transient)?,
-        )
-    } else {
-        host_engine_step(store, &template, &context, status, &mut state)
-    })
-    .map_err(|error| {
-        if codec == Codec::ClaudeCodeAnthropic {
-            claude_code_engine_failure(error, request_id)
-        } else {
-            transient(error)
-        }
-    })?;
+    let output =
+        host_engine_step(store, &template, &context, status, &mut state).map_err(|error| {
+            if codec == Codec::ClaudeCodeAnthropic {
+                claude_code_engine_failure(error, request_id)
+            } else {
+                transient(error)
+            }
+        })?;
     let engine_ms = engine_started.elapsed().as_secs_f64() * 1000.0;
     // Keep only scalars in Setup. Engine and native bytes are committed together
     // in one immutable view row below, before publishing their reference.
@@ -817,7 +792,7 @@ fn execute_host(
                 None,
             )
         };
-        let mut coverage = output.engine.response.coverage_ordinal.and_then(|ordinal| {
+        let coverage = output.engine.response.coverage_ordinal.and_then(|ordinal| {
             messages
                 .iter()
                 .find(|m| m.ordinal == ordinal)
@@ -827,26 +802,6 @@ fn execute_host(
                     endpoint: None,
                 })
         });
-        if native_tail && coverage.is_none() {
-            if let Some(ordinal) = output.engine.response.coverage_ordinal {
-                if let Some(message) = store
-                    .load_provider_messages_since(
-                        &work.key.store_key(),
-                        &lineage.lineage_id,
-                        ordinal,
-                    )
-                    .map_err(transient)?
-                    .into_iter()
-                    .find(|m| m.ordinal == ordinal)
-                {
-                    coverage = Some(HostCoverage {
-                        end_mid: message.mid,
-                        ordinal,
-                        endpoint: None,
-                    });
-                }
-            }
-        }
         let head_slots = raw_replacement
             .as_ref()
             .map(|raw| super::cache_policy::head_slots(&engine, raw, setup.setup.state.preset));
@@ -1734,7 +1689,6 @@ impl McHandler {
     ) -> Result<Work, HandlerOutcome> {
         let route = self.route_project(store, &binding)?;
         Ok(Work {
-            resident_folds: self.provider_resident.is_enabled(),
             project_directory: binding.project_root.to_string_lossy().into_owned(),
             note_project_path: route.key.clone(),
             project_path: route.key,

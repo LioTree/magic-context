@@ -22,18 +22,22 @@ fn rig() -> (tempfile::TempDir, McStore, ProviderSessionKey) {
         harness: "opencode".into(),
         generation: None,
     };
+    seed(&store, &key);
+    (dir, store, key)
+}
+
+fn seed(store: &McStore, key: &ProviderSessionKey) {
     store
         .save_provider_conversation(
-            &key,
+            key,
             &ProviderConversation {
                 lineage_id: "L".into(),
-                engine_namespace: "engine".into(),
+                engine_namespace: format!("engine-{}", key.session),
                 ..Default::default()
             },
         )
         .unwrap();
-    store.commit_provider_status_page(&key,ProviderStatusPage {lineage:&ProviderLineage {lineage_id:"L".into(),first_ordinal:0,descends_from:None,through_ordinal:None},messages:&[ProviderMessage {ordinal:0,mid:"m".into(),message_bytes:br#"{"info":{"id":"m","role":"user"},"parts":[{"type":"text","text":"immutable native text"}]}"#.to_vec()}],served:Some(0),unserved:&[],newest:Some(0),more:false}).unwrap();
-    (dir, store, key)
+    store.commit_provider_status_page(key,ProviderStatusPage {lineage:&ProviderLineage {lineage_id:"L".into(),first_ordinal:0,descends_from:None,through_ordinal:None},messages:&[ProviderMessage {ordinal:0,mid:"m".into(),message_bytes:br#"{"info":{"id":"m","role":"user"},"parts":[{"type":"text","text":"immutable native text"}]}"#.to_vec()}],served:Some(0),unserved:&[],newest:Some(0),more:false}).unwrap();
 }
 
 fn recipe(version: u64, base: Option<u64>) -> ProviderViewRecipe {
@@ -257,4 +261,107 @@ fn v2_effective_policy_resolves_frozen_facts_defaults_and_point_overrides() {
     );
     assert_eq!(effective[0].measurement.tokens, 13);
     assert!(effective[0].queued && effective[0].measurement.queued_for_drop);
+}
+
+#[test]
+fn v2_session_deletion_removes_recipe_dependencies_and_keeps_other_sessions() {
+    let (_dir, store, key) = rig();
+    let mut other = key.clone();
+    other.session = "other".into();
+    seed(&store, &other);
+    for session in [&key, &other] {
+        let namespace = format!("engine-{}", session.session);
+        store
+            .commit(
+                &namespace,
+                None,
+                &cortexkit_cache_core::CoreState::default(),
+                &ModuleMeta {
+                    initialized: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.inner.with_conn_fenced(|conn| {
+            let cut = provider_policy_overlay::freeze_cut_tx(
+                conn, &session.conversation_key(), "L", Some(0),
+                &json!({"baseline":{}}), &[part()],
+            ).unwrap();
+            conn.execute("UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1", params![session.conversation_key(),json!({"engine_policy":{"baseline_cut_id":cut}}).to_string()])?;
+            conn.execute("INSERT INTO mc_provider_policy_overrides_v1 VALUES(?1,'L','m#0',0,?2,'{}',?3)", params![session.conversation_key(),cut,session.session])?;
+            Ok(())
+        }).unwrap();
+        for version in 1..=2 {
+            let mut view = recipe(version, (version > 1).then_some(version - 1));
+            view.policy_cut_id = Some(0);
+            view.treatments = vec![ProviderViewTreatment {
+                source_lineage_id: "L".into(),
+                mid: "m".into(),
+                ordinal: 0,
+                block_index: 0,
+                block_id: "m#0".into(),
+                patch: Some(json!({"wire":{}})),
+            }];
+            store.save_provider_view_recipe(session, &view).unwrap();
+        }
+    }
+    assert!(
+        store
+            .delete_session(&key.session, &key.project_root)
+            .unwrap()
+            > 0
+    );
+    store.inner.with_conn(|conn| {
+        for table in ["mc_provider_view_overrides_v1", "mc_provider_views_v2",
+            "mc_provider_policy_overrides_v1", "mc_provider_policy_cuts_v1",
+            "mc_provider_messages_v1", "mc_provider_lineages_v1", "mc_provider_conversations_v2"] {
+            let counts: (u64,u64) = conn.query_row(
+                &format!("SELECT count(*) FILTER(WHERE session=?1),count(*) FILTER(WHERE session=?2) FROM {table}"),
+                params![key.session,other.session], |row| Ok((row.get(0)?,row.get(1)?)),
+            )?;
+            assert_eq!(counts.0, 0, "target session survives in {table}");
+            assert!(counts.1 > 0, "other session was removed from {table}");
+        }
+        Ok(())
+    }).unwrap();
+    assert!(!store.load("engine-s").unwrap().meta.initialized);
+    assert!(store.load("engine-other").unwrap().meta.initialized);
+    assert_eq!(
+        store
+            .delete_session(&key.session, &key.project_root)
+            .unwrap(),
+        0
+    );
+    assert!(store.resolve_provider_view(&other, 2).unwrap().is_some());
+}
+
+#[test]
+fn v2_rebuild_caps_include_frozen_source_facts_before_decoding() {
+    let (_dir, store, key) = rig();
+    store
+        .inner
+        .with_conn_fenced(|conn| {
+            provider_policy_overlay::freeze_cut_tx(
+                conn,
+                &key.conversation_key(),
+                "L",
+                Some(0),
+                &json!({}),
+                &[part()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE mc_provider_messages_v1 SET frozen_policy_parts=100001 WHERE conv_key=?1",
+                [key.conversation_key()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let result: Result<(), _> = store.read_provider_resident_policy(&key, |_, _| {
+        panic!("oversize input must be refused before the rebuild callback");
+    });
+    assert!(
+        matches!(result, Err(provider_log::ProviderError::Transient(message))
+        if message.starts_with("resident_not_ready:") && message.contains("cap"))
+    );
 }

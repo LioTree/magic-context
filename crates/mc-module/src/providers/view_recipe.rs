@@ -169,18 +169,23 @@ pub(super) fn save(
     let mut metadata = serde_json::to_value(view).map_err(transient)?;
     metadata["engine"]["replacement"] = json!([]);
     metadata["wire"]["replacement"] = json!([]);
+    let conversation = store
+        .load_provider_conversation(&key.store_key())
+        .map_err(transient)?;
+    let counters: Value = conversation
+        .as_ref()
+        .map(|row| serde_json::from_str(&row.hook_counters_json).map_err(transient))
+        .transpose()?
+        .unwrap_or(Value::Null);
     let mut recipe = ProviderViewRecipe {
         version: view.engine.version,
         lineage_id: view.engine.range.lineage_id.clone(),
         range_from: view.engine.range.from,
         range_to: view.engine.range.to,
         base_version: None,
-        policy_cut_id: store
-            .read_provider_resident_policy(&key.store_key(), |_, c| {
-                Ok(c.pointer("/engine_policy/baseline_cut_id")
-                    .and_then(Value::as_u64))
-            })
-            .map_err(transient)?,
+        policy_cut_id: counters
+            .pointer("/engine_policy/baseline_cut_id")
+            .and_then(Value::as_u64),
         metadata,
         segments: Vec::new(),
         synthetic: BTreeMap::new(),
@@ -239,11 +244,10 @@ pub(super) fn save(
             recipe.segments.push(ProviderViewSegment::NativeRange {source_lineage_id:lineage.clone(),from:ordinal,to:ordinal+1,first_mid:mid.into(),last_mid:mid.into()});
         }
     }
-    // A view baseline stores only changed synthetic slots/treatments. The store
-    // re-roots at its fixed inheritance bound and never copies native bodies.
-    let base = store
-        .load_provider_conversation(&key.store_key())
-        .map_err(transient)?
+    // Store only changed synthetic slots and treatments relative to the base view.
+    // After 16 ancestors or 8 MiB of inherited recipes, the store merges their
+    // entries into one standalone recipe without copying native message bodies.
+    let base = conversation
         .and_then(|c| c.setup_json)
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|s| s.pointer("/produced/version").and_then(Value::as_u64));

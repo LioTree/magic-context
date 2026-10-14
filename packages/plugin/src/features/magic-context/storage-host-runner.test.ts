@@ -23,7 +23,7 @@ import {
     installHostRunnerSchema,
     loadHostRunnerRecord,
 } from "./storage-host-runner";
-import { clearSession } from "./storage-meta-session";
+import { clearSession, retryPendingRustSessionCleanupsForProject } from "./storage-meta-session";
 
 const key = { session_id: "runner", harness: "opencode" };
 const directories: string[] = [];
@@ -343,7 +343,7 @@ describe("durable host runner", () => {
         }
     });
 
-    test("session deletion and the real orphan sweep remove runner-only rows, scoped by harness", () => {
+    test("orphan runner rows survive until module cleanup then retire only their harness", async () => {
         const db = new Database(":memory:");
         initializeDatabase(db);
         runMigrations(db);
@@ -362,6 +362,10 @@ describe("durable host runner", () => {
             expect(loadHostRunnerRecord(db, other)).toBeNull();
             seed(key);
             seed(other);
+            db.prepare("INSERT INTO session_projects VALUES (?, 'opencode', 'git:runner', ?)").run(
+                key.session_id,
+                1,
+            );
             const result = sweepOrphanedOpenCodeMessageIndexes(
                 db,
                 () => {
@@ -371,7 +375,21 @@ describe("durable host runner", () => {
                 },
                 { now: 1700000000000, safetyAgeMs: 0, cooldownMs: 0 },
             );
-            expect(result.deleted).toBe(1);
+            expect(result.deleted).toBe(0);
+            expect(loadHostRunnerRecord(db, key)).not.toBeNull();
+            expect(loadHostRunnerRecord(db, other)).not.toBeNull();
+            expect(
+                db
+                    .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                    .get(key.session_id),
+            ).toEqual({ harness: "opencode:rust" });
+            const cleanups: string[] = [];
+            expect(
+                await retryPendingRustSessionCleanupsForProject(db, "git:runner", async (id) => {
+                    cleanups.push(id);
+                }),
+            ).toEqual({ attempted: 1, cleared: 1, failedSessionIds: [] });
+            expect(cleanups).toEqual([key.session_id]);
             expect(loadHostRunnerRecord(db, key)).toBeNull();
             expect(loadHostRunnerRecord(db, other)).not.toBeNull();
             for (const table of [

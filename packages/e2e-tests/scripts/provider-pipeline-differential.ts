@@ -70,7 +70,8 @@ export const declaredDifferences = [
 const DRIVER = String.raw`
 #[test]
 fn provider_pipeline_driver() {
-    use std::io::{BufRead, Write};
+    use std::io::{BufRead, Read, Write};
+    use rusqlite::OptionalExtension;
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).try_init();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
@@ -259,9 +260,9 @@ fn provider_pipeline_driver() {
                     let snapshot = resident.snapshot();
                     assert_eq!(snapshot["domains"], domains);
                     let conv = key.conversation_key();
-                    // The oracle reads physical rows independently of the new
-                    // capture/index packing; effective ancestry and consumption
-                    // are resolved before comparing every field, not just totals.
+                    // The oracle decodes physical facts without calling the new
+                    // policy resolver, then applies the cut, overrides, ancestry
+                    // and consumption independently before comparing every field.
                     let consumed = rig.sql.prepare("SELECT tag_number FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1").unwrap()
                         .query_map([namespace], |r|r.get::<_,i64>(0)).unwrap().map(Result::unwrap).collect::<BTreeSet<_>>();
                     let mut expected = BTreeMap::<String,(usize,Value)>::new();
@@ -273,6 +274,40 @@ fn provider_pipeline_driver() {
                             if part["tag_number"].as_i64().is_some_and(|n|consumed.contains(&n)) {part["active"]=json!(false);}
                             let id=part["block_id"].as_str().unwrap().to_string();
                             if expected.get(&id).is_none_or(|(held,_)|depth<*held) {expected.insert(id,(depth,part));}
+                        }
+                    }
+                    let defaults: Option<String> = rig.sql.query_row("SELECT defaults_json FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 AND cut_id=(SELECT json_extract(hook_counters_json,'$.engine_policy.baseline_cut_id') FROM mc_provider_conversations_v2 WHERE conv_key=?1)",[&conv],|r|r.get(0)).optional().unwrap();
+                    if let Some(defaults) = defaults {
+                        let defaults: Value = serde_json::from_str(&defaults).unwrap();
+                        let mut overrides = BTreeMap::<(String,String),Value>::new();
+                        let mut q = rig.sql.prepare("SELECT source_lineage_id,block_id,override_json FROM mc_provider_policy_overrides_v1 WHERE conv_key=?1").unwrap();
+                        for row in q.query_map([&conv], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap() {
+                            let (lineage,block,raw) = row.unwrap();
+                            overrides.insert((lineage,block),serde_json::from_str(&raw).unwrap());
+                        }
+                        let mut q = rig.sql.prepare("SELECT lineage_id,ordinal,frozen_policy_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND frozen_policy_format=1").unwrap();
+                        for row in q.query_map([&conv], |r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,Vec<u8>>(2)?))).unwrap() {
+                            let (lineage,ordinal,blob) = row.unwrap();
+                            let Some(depth) = authority.ancestry.iter().position(|(id,cut)|*id==lineage && ordinal<=*cut) else {continue};
+                            let mut raw=Vec::new();
+                            flate2::read::ZlibDecoder::new(blob.as_slice()).read_to_end(&mut raw).unwrap();
+                            for mut part in serde_json::from_slice::<Vec<Value>>(&raw).unwrap() {
+                                assert_eq!(part["ordinal"],json!(ordinal));
+                                if defaults["covered_measurements"]==json!(true) && part["kind"]!=json!("header") {
+                                    part["measurement"]["kind"]=json!("excluded");
+                                    part["measurement"]["tokens"]=json!(0);
+                                    part["measurement"]["u_tokens"]=json!(0);
+                                }
+                                let id=part["block_id"].as_str().unwrap().to_string();
+                                if let Some(patch)=overrides.get(&(lineage.clone(),id.clone())) {
+                                    for (key,value) in patch.as_object().unwrap() {
+                                        if key=="measurement" {for (field,value) in value.as_object().unwrap() {part[key][field]=value.clone();}}
+                                        else {part[key]=value.clone();}
+                                    }
+                                }
+                                if part["tag_number"].as_i64().is_some_and(|n|consumed.contains(&n)) {part["active"]=json!(false);}
+                                if expected.get(&id).is_none_or(|(held,_)|depth<*held) {expected.insert(id,(depth,part));}
+                            }
                         }
                     }
                     let mut expected = expected.into_values().map(|(_,part)|part).collect::<Vec<_>>();

@@ -741,6 +741,7 @@ dependencies = [
  "cortexkit-store-types",
  "cpu-time",
  "filetime",
+ "flate2",
  "mc-core",
  "mc-store",
  "mc-tokenizer",

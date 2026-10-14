@@ -388,8 +388,8 @@ mod generation_migration_tests {
         let legacy = ProviderSessionKey {
             project_root: "/project".into(),
             session: "s".into(),
-            // Native-host development rows are reset by migration 72; the
-            // generation migration still preserves the generic observation lane.
+            // OpenCode projection rows are discarded during the recipe cutover.
+            // Broca's generic observation rows must still survive generation migration.
             harness: "broca".into(),
             generation: None,
         };

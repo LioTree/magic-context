@@ -2538,7 +2538,7 @@ pub mod compaction {
         status: &Status,
         state: &mut State,
     ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, true, None)
+        run(store, template, ctx, status, state, true)
     }
 
     pub fn step(
@@ -2548,18 +2548,7 @@ pub mod compaction {
         status: &Status,
         state: &mut State,
     ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, false, None)
-    }
-
-    pub(crate) fn step_with_range_start(
-        store: &McStore,
-        template: &TransformRequest,
-        ctx: &ProducerContext<'_>,
-        status: &Status,
-        state: &mut State,
-        from: u64,
-    ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, false, Some(from))
+        run(store, template, ctx, status, state, false)
     }
 
     fn run(
@@ -2569,7 +2558,6 @@ pub mod compaction {
         status: &Status,
         state: &mut State,
         initial: bool,
-        range_start: Option<u64>,
     ) -> Result<Output, TransformError> {
         if !ctx.compaction_enabled || status.context_window == 0 {
             return Err(TransformError::LineageProtocol(
@@ -2581,10 +2569,7 @@ pub mod compaction {
                 "compaction setup missing".to_string(),
             ));
         }
-        let mut range = working_range(status, &template.messages)?;
-        if let Some(from) = range_start {
-            range.from = from;
-        }
+        let range = working_range(status, &template.messages)?;
         if state
             .last_applied
             .as_ref()

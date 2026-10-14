@@ -36,7 +36,7 @@ impl McStore {
             let conversation = conversation_tx(&tx, key)?.ok_or(rusqlite::Error::InvalidQuery)?;
             let result = (|| {
                 let (rows, bytes): (u64, u64) = tx.query_row(
-                    "SELECT COUNT(*),COALESCE(SUM(length(CAST(policy_json AS BLOB))),0) FROM mc_provider_policy_parts_v1 WHERE conv_key=?1",
+                    "SELECT COALESCE(SUM(parts),0),COALESCE(SUM(bytes),0) FROM (SELECT COUNT(*) AS parts,COALESCE(SUM(length(CAST(policy_json AS BLOB))),0) AS bytes FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 UNION ALL SELECT COALESCE(SUM(frozen_policy_parts),0),COALESCE(SUM(frozen_policy_raw_bytes),0) FROM mc_provider_messages_v1 WHERE conv_key=?1 AND frozen_policy_format=1)",
                     [key.conversation_key()], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 if rows > 100_000 || bytes > 128 * 1024 * 1024 {
                     return Err(ProviderError::Transient("resident_not_ready: policy input exceeds rebuild cap".into()));
@@ -71,7 +71,7 @@ impl McStore {
                 let conv = key.conversation_key();
                 // Count before allocating. Counting shadowed rows is deliberately
                 // conservative; an oversize experiment must not truncate policy.
-                let (rows, bytes): (u64, u64) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(policy_json AS BLOB))),0) FROM mc_provider_policy_parts_v1 WHERE conv_key=?1", [&conv], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                let (rows, bytes): (u64, u64) = tx.query_row("SELECT COALESCE(SUM(parts),0),COALESCE(SUM(bytes),0) FROM (SELECT COUNT(*) AS parts,COALESCE(SUM(length(CAST(policy_json AS BLOB))),0) AS bytes FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 UNION ALL SELECT COALESCE(SUM(frozen_policy_parts),0),COALESCE(SUM(frozen_policy_raw_bytes),0) FROM mc_provider_messages_v1 WHERE conv_key=?1 AND frozen_policy_format=1)", [&conv], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 if rows > max_parts as u64 || bytes > max_bytes as u64 {
                     return Err(ProviderError::Transient("resident policy input exceeds cap".into()));
                 }

@@ -1,5 +1,6 @@
-//! View recipes retain native identities, not another copy of model-visible
-//! history. Resolution checks source lifetime and bounded ancestor dependencies.
+//! View recipes retain source lineage, ordinal and message IDs rather than
+//! duplicate native history bodies. Resolution checks source lifetime and
+//! bounds the number and size of ancestor recipes.
 use crate::provider_log::{ProviderError, ProviderMessage};
 use crate::{McStore, ProviderSessionKey};
 use rusqlite::{params, OptionalExtension};
@@ -235,6 +236,24 @@ fn resolve_tx(
 }
 
 impl McStore {
+    /// List stored model-view recipe versions without decoding native message bodies.
+    pub fn load_provider_view_recipe_versions(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<Vec<u64>, ProviderError> {
+        self.inner
+            .with_conn(|conn| {
+                let mut query = conn.prepare_cached(
+                    "SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 ORDER BY version",
+                )?;
+                let versions = query
+                    .query_map([key.conversation_key()], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(versions)
+            })
+            .map_err(|error| ProviderError::Storage(error.into()))
+    }
+
     pub fn prune_provider_views_from_conversation(
         &self,
         key: &ProviderSessionKey,
@@ -266,8 +285,8 @@ impl McStore {
         if let Some(lkg) = counters.get("lkg_view_versions").and_then(Value::as_array) {
             roots.extend(lkg.iter().filter_map(Value::as_u64));
         }
-        // One previous applied version protects the host's last-good slot while
-        // an acknowledged new view is being published to its outgoing request.
+        // Keep the previous applied version while the host replaces its saved
+        // last-good request with the newly acknowledged outgoing view.
         roots.extend(self.inner.with_conn(|conn| {
             let mut q=conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 AND state='applied' ORDER BY version DESC LIMIT 2")?;
             let rows=q.query_map([key.conversation_key()],|r|r.get::<_,u64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -340,8 +359,8 @@ impl McStore {
                     }
                 }
                 let cut=if let Some(cut)=recipe.policy_cut_id {cut} else {
-                    // Setup's zero-range synthetic view has no native lineage yet.
-                    // The empty lineage is unreachable as a host ingest lineage.
+                    // Setup creates a synthetic head before receiving native messages.
+                    // Its empty lineage ID cannot be supplied by host ingest.
                     conn.execute("INSERT INTO mc_provider_lineages_v1 SELECT ?1,'',0,NULL,NULL,json_extract(?1,'$[1]') WHERE NOT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id='')",[&conv])?;
                     let cut:u64=conn.query_row("SELECT coalesce(max(cut_id),-1)+1 FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1",[&conv],|r|r.get(0))?;
                     conn.execute("INSERT INTO mc_provider_policy_cuts_v1 VALUES (?1,?2,'',NULL,0,'{}','{}','{}','setup',json_extract(?1,'$[1]'))",params![conv,cut])?;
@@ -362,9 +381,9 @@ impl McStore {
         }).map_err(|e|refusal.unwrap_or_else(||ProviderError::Storage(e.into())))
     }
 
-    /// Reachability, not age, controls retention. Callers pass applied, produced
-    /// and LKG/receipt versions; ancestor recipes and current policy exceptions
-    /// remain live until those roots no longer refer to them.
+    /// Reachability, not age, controls retention. Callers pass applied, produced,
+    /// last-known-good request and receipt versions; ancestor recipes and current
+    /// policy exceptions remain live until those roots no longer refer to them.
     pub fn prune_provider_view_recipes(
         &self,
         key: &ProviderSessionKey,

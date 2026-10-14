@@ -8743,10 +8743,11 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Delete every row whose ownership is expressed by an exact `session_id` column.
-    /// Project memories and smart notes survive because their ownership is project-scoped.
-    /// The session's `context.db` history rows and session notes go in one transaction, then
-    /// every `store.db` cache, overlay and producer ledger row in another.
+    /// Delete rows owned by the exact session, including native provider messages,
+    /// measurements and rendered views. Project memories and smart notes survive.
+    /// History and notes in `context.db` are deleted first, followed by the cache
+    /// and provider state in `store.db`. These are separate SQLite connections,
+    /// so callers may safely retry deletion after either transaction completes.
     pub fn delete_session(
         &self,
         session_id: &str,
@@ -8794,24 +8795,51 @@ impl McStore {
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
+            let mut namespaces = vec![session_id.to_owned()];
+            let mut query = tx.prepare_cached(
+                "SELECT DISTINCT c.engine_namespace FROM mc_provider_conversations_v2 c WHERE c.session=?1 AND c.harness IN ('opencode','opencode2') AND c.engine_namespace<>?1 AND NOT EXISTS (SELECT 1 FROM mc_provider_conversations_v2 other WHERE other.engine_namespace=c.engine_namespace AND other.session<>?1)",
+            )?;
+            namespaces.extend(query.query_map([session_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?);
             let mut deleted = 0usize;
+            // Recipes reference other recipes, cuts and native messages. Remove all
+            // recipe rows for the session before deleting any of those sources.
+            for table in ["mc_provider_view_overrides_v1", "mc_provider_views_v2"] {
+                deleted = deleted.saturating_add(tx.execute(
+                    &format!("DELETE FROM {table} WHERE session = ?1"),
+                    params![session_id],
+                )?);
+            }
             for table in tables {
                 if ["mc_move_fences", "mc_move_cuts", "mc_move_installs", "mc_move_key_map", "mc_move_tag_epochs"].contains(&table.as_str()) {
                     continue;
                 }
                 let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-                let has_session_id = {
+                let session_column = {
                     let mut stmt = tx.prepare(&format!("PRAGMA table_info({quoted})"))?;
                     let columns = stmt
                         .query_map([], |row| row.get::<_, String>(1))?
                         .collect::<Result<Vec<_>, _>>()?;
-                    columns.into_iter().any(|column| column == "session_id")
+                    if columns.iter().any(|column| column == "session_id") {
+                        Some("session_id")
+                    } else if table.starts_with("mc_provider_")
+                        && columns.iter().any(|column| column == "session")
+                    {
+                        Some("session")
+                    } else {
+                        None
+                    }
                 };
-                if has_session_id {
-                    deleted = deleted.saturating_add(tx.execute(
-                        &format!("DELETE FROM {quoted} WHERE session_id = ?1"),
-                        params![session_id],
-                    )?);
+                if let Some(column) = session_column {
+                    // Native provider cache/tag rows use the conversation's engine
+                    // namespace; their session ID is not the host's session ID.
+                    let keys = if column == "session_id" { &namespaces[..] } else { &namespaces[..1] };
+                    for key in keys {
+                        deleted = deleted.saturating_add(tx.execute(
+                            &format!("DELETE FROM {quoted} WHERE {column} = ?1"),
+                            params![key],
+                        )?);
+                    }
                 }
             }
             Ok(deleted)

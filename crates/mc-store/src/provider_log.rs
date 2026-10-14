@@ -194,8 +194,8 @@ pub(crate) fn save_engine_policy_tx(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (conv, lineage, raw, harness) in conversations {
-        let policy_started=std::time::Instant::now();
-        let mut policy_written=0usize;
+        let policy_started = std::time::Instant::now();
+        let mut policy_written = 0usize;
         // Every policy part is rewritten below. Dropping the summary first means
         // the change triggers log nothing, and the next hook rebuilds it.
         drop_policy_summary_tx(conn, &conv)?;
@@ -219,7 +219,7 @@ pub(crate) fn save_engine_policy_tx(
                 part.block_id,
                 serde_json::to_string(part).map_err(sql_json)?
             ])?;
-            policy_written+=1;
+            policy_written += 1;
         }
         let mut counters = parse(&raw)?;
         counters["engine_policy"] = policy.settings.clone();
@@ -584,7 +584,7 @@ fn lineage_tx(
     conn.query_row("SELECT lineage_id,first_ordinal,descends_from,through_ordinal FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2", params![conv,lineage], |r| crate::provider_meters::read_row(|| Ok(ProviderLineage {lineage_id:r.get(0)?,first_ordinal:r.get(1)?,descends_from:r.get(2)?,through_ordinal:r.get(3)?}))).optional()
 }
 /// Leaf first, with each ancestor bounded by all intervening cuts.
-fn ancestry_tx(
+pub(crate) fn ancestry_tx(
     conn: &Connection,
     conv: &str,
     lineage: &str,

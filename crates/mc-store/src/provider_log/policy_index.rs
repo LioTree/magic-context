@@ -228,6 +228,9 @@ impl<'c> ProviderPolicyIndex<'c> {
         mids: Option<&BTreeSet<String>>,
         keep: impl Fn(&ProviderPolicyPart) -> bool,
     ) -> Result<Vec<ProviderPolicyPart>, ProviderError> {
+        if crate::provider_policy_overlay::current_cut_tx(self.conn, &self.conv)?.is_none() {
+            return Ok(Vec::new());
+        }
         let resolver =
             crate::provider_policy_overlay::FrozenPolicyResolver::new(self.conn, &self.conv)?;
         let mut consumed = std::collections::HashSet::new();
@@ -566,6 +569,9 @@ impl<'c> ProviderPolicyIndex<'c> {
                 }
                 break;
             }
+        }
+        if crate::provider_policy_overlay::current_cut_tx(self.conn, &self.conv)?.is_none() {
+            return Ok(best);
         }
         let resolver =
             crate::provider_policy_overlay::FrozenPolicyResolver::new(self.conn, &self.conv)?;

@@ -317,7 +317,7 @@ export async function retryPendingRustSessionCleanupsForProject(
                 ),
             );
             await deleteSession(row.session_id);
-            clearSession(db, row.session_id, true, true);
+            clearSession(db, row.session_id, true, true, harness);
             cleared += 1;
         } catch {
             failedSessionIds.push(row.session_id);
@@ -333,6 +333,8 @@ export function clearSession(
     // A deleted host session cannot resume; its retained tag-change counters can
     // be removed. Administrative reset/reimport keeps them to invalidate live caches.
     permanentlyDeleted = false,
+    // A cleanup retry names one harness; explicit session deletion remains session-wide.
+    harness?: HarnessId,
 ): void {
     cancelAutoSearchWork(sessionId);
     let transactionStartedAt = 0;
@@ -341,10 +343,17 @@ export function clearSession(
             db
                 .transaction(() => {
                     transactionStartedAt = performance.now();
-                    deleteSessionScopedRows(db, [sessionId], undefined, {
+                    deleteSessionScopedRows(db, [sessionId], harness, {
                         rustModuleCleanupAcknowledged,
                         preserveTagRevisionTombstones: !permanentlyDeleted,
                     });
+                    if (harness !== undefined && rustModuleCleanupAcknowledged) {
+                        // The marker records module ownership with a :rust suffix,
+                        // unlike the host tables' plain harness coordinate.
+                        db.prepare(
+                            "DELETE FROM pending_session_cleanup WHERE session_id = ? AND harness = ?",
+                        ).run(sessionId, `${harness}:rust`);
+                    }
                 })
                 .immediate(),
         ),

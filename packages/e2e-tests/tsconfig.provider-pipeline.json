@@ -6,6 +6,7 @@
         "scripts/provider-pipeline-synthetic.ts",
         "scripts/provider-preparation-differential.ts",
         "scripts/provider-preparation-timing.ts",
+        "scripts/provider-fold-storage-timing.ts",
         "scripts/provider-resident-snapshot-differential.ts",
         "scripts/provider-resident-hook-timing.ts",
         "tests/rust-provider-pipeline-opencode1.test.ts",
