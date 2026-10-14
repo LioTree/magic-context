@@ -1372,9 +1372,19 @@ impl McHandler {
         } else {
             None
         };
+        let switching_lineage = setup_lineage
+            .as_ref()
+            .is_some_and(|lineage| conversation.lineage_id != lineage.lineage_id);
         if let Some(lineage) = &setup_lineage {
             conversation.lineage_id.clone_from(&lineage.lineage_id);
             if let Some(parent) = &lineage.descends_from {
+                if store
+                    .load_provider_lineage(&key.store_key(), parent)
+                    .map_err(transient)?
+                    .is_none()
+                {
+                    return Err(invalid_field("lineage_id"));
+                }
                 let frontier = store
                     .provider_frontier(&key.store_key(), parent)
                     .map_err(transient)?;
@@ -1432,6 +1442,27 @@ impl McHandler {
                         .start_provider_root_lineage(&key.store_key(), lineage)
                         .map_err(transient)?;
                 }
+            }
+        }
+        if let Some(lineage) = setup_lineage.as_ref().filter(|l| l.descends_from.is_some()) {
+            // MC also accepts descends_from on setup. Save its parent ID and last
+            // retained ordinal so later calls do not have to repeat those fields.
+            store
+                .start_provider_descendant_lineage(&key.store_key(), lineage)
+                .map_err(|error| match error {
+                    ProviderError::InvalidParams { field } => invalid_field(field),
+                    other => transient(other),
+                })?;
+            if switching_lineage {
+                // The child discards parent messages after through_ordinal. Do not
+                // carry read/served positions beyond the child's retained history.
+                conversation.cursor_frontier = store
+                    .provider_frontier(&key.store_key(), &lineage.lineage_id)
+                    .map_err(transient)?;
+                conversation.served_through_ordinal = conversation
+                    .served_through_ordinal
+                    .map(|n| n.min(lineage.through_ordinal.expect("paired descent")));
+                conversation.wait_request = None;
             }
         }
         // Setup does not run the engine or seed a head. A transport switch

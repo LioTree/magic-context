@@ -1075,6 +1075,31 @@ impl McStore {
         })?;
         Ok(())
     }
+    /// Save the parent ID and last retained ordinal supplied by setup.
+    /// Hook answers for later parent messages are no longer eligible to be applied.
+    pub fn start_provider_descendant_lineage(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &ProviderLineage,
+    ) -> Result<(), ProviderError> {
+        let mut refusal = None;
+        let result = self.inner.with_conn_fenced(|conn| {
+            let operation = || {
+                if lineage.descends_from.is_none() || lineage.through_ordinal.is_none() {
+                    return Err(ProviderError::InvalidParams {
+                        field: "lineage_id",
+                    });
+                }
+                ensure_lineage_tx(conn, &key.conversation_key(), lineage)
+            };
+            operation().map_err(|error| {
+                refusal = Some(error);
+                rusqlite::Error::InvalidQuery
+            })
+        });
+        result.map_err(|error| refusal.unwrap_or_else(|| ProviderError::Storage(error.into())))
+    }
+
     /// Advance a frozen view's application state without reading or rewriting
     /// replacement bytes. An invalidated/rejected view cannot become applied.
     pub fn set_provider_view_state(

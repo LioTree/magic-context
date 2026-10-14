@@ -1093,7 +1093,7 @@ async fn native_setup_for_lineage(h: &McHandler, lineage: &str, descent: Option<
     )
     .await
     .unwrap();
-    let mut request = json!({"session":"cc","harness":"claude-code","request_id":format!("setup-{lineage}"),"preset":"head","params":plan(),"composition":{},"claude_code":pins,"model":"fixture","context_window":100000,"lineage_id":lineage,"now":1});
+    let mut request = json!({"session":h.facade_binding(7).unwrap().session,"harness":"claude-code","request_id":format!("setup-{lineage}"),"preset":"head","params":plan(),"composition":{},"claude_code":pins,"model":"fixture","context_window":100000,"lineage_id":lineage,"now":1});
     if let Some(descent) = descent {
         request["descends_from"] = descent;
     }
@@ -1244,7 +1244,7 @@ async fn cc_setup_unrelated_lineage_starts_fresh_but_descendant_keeps_applied_vi
         next["newest"] = json!({"mid":"new-mid","ordinal":if descendant {1} else {0}});
         next["last_applied"] = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
         if let Some(descent) = descent {
-            next["descends_from"] = descent;
+            assert_eq!(descent["lineage_id"], "L");
             let flipped =
                 r#"{ "role":"user", "content":[{"type":"text","text":"old lineage original"}] }"#;
             next["messages"].as_array_mut().unwrap().insert(0, json!({"mid":"m","ordinal":0,"message":serde_json::from_str::<Value>(flipped).unwrap(),"raw_message":flipped}));
@@ -1296,5 +1296,296 @@ async fn cc_setup_new_root_next_step_proceeds_without_old_view() {
     let answer = native_step(&h, &next).await;
     assert_eq!(answer["answer"], "compaction_message");
     assert!(answer.to_string().contains("new root"));
+    assert!(!answer.to_string().contains("old root"));
+}
+
+#[tokio::test]
+async fn cc_setup_unknown_or_mismatched_parent_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    identity_parent_after_empty_fork(&h).await;
+    let pins = h.native_pins();
+    let request = json!({"session":"fresh-provider-session","harness":"claude-code","request_id":"unknown-parent","preset":"head","params":plan(),"composition":{},"claude_code":pins,"model":"fixture","context_window":100000,"lineage_id":"child","descends_from":{"lineage_id":"unknown","through_ordinal":0},"now":1});
+    let result = h
+        .provider_setup(h.facade_binding(7).unwrap(), &request)
+        .await;
+    assert!(
+        matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "lineage_id")
+    );
+    let ready = native_setup_for_lineage(
+        &h,
+        "child",
+        Some(json!({"lineage_id":"parent","through_ordinal":0})),
+    )
+    .await;
+    assert_eq!(ready["answer"], "ready");
+    let mut changed = request.clone();
+    changed["descends_from"] = json!({"lineage_id":"parent","through_ordinal":1});
+    let result = h
+        .provider_setup(h.facade_binding(7).unwrap(), &changed)
+        .await;
+    assert!(
+        matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "lineage_id")
+    );
+    let mut status = step(r#"{"role":"user","content":"bad descent"}"#);
+    status["session"] = json!("fresh-provider-session");
+    status["lineage_id"] = json!("child");
+    status["descends_from"] = json!({"lineage_id":"unknown","through_ordinal":0});
+    let result = h.provider_step(h.facade_binding(7).unwrap(), &status).await;
+    assert!(
+        matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "lineage_id")
+    );
+}
+
+#[tokio::test]
+async fn cc_identity_parent_retained_n_continuation_keeps_history_and_hook_ancestry() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    let parent = identity_parent_after_empty_fork(&h).await;
+    let mut page = step(r#"{"role":"user","content":"retained one"}"#);
+    page["session"] = json!("fresh-provider-session");
+    page["lineage_id"] = json!("parent");
+    page["messages"][0]["mid"] = json!("retained-1");
+    page["messages"][0]["ordinal"] = json!(1);
+    let raw = r#"{ "role":"assistant", "content":"retained two" }"#;
+    page["messages"].as_array_mut().unwrap().push(json!({"mid":"retained-2","ordinal":2,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw}));
+    let dropped = r#"{"role":"user","content":"discarded parent tail"}"#;
+    page["messages"].as_array_mut().unwrap().push(json!({"mid":"discarded-3","ordinal":3,"message":serde_json::from_str::<Value>(dropped).unwrap(),"raw_message":dropped}));
+    page["newest"] = json!({"mid":"discarded-3","ordinal":3});
+    page["more"] = json!(true);
+    assert_eq!(native_step(&h, &page).await["answer"], "wait");
+    let hook = json!({"session":"fresh-provider-session","harness":"claude-code","lineage_id":"parent","step_id":"parent-served","params":plan(),"subject_mid":"discarded-3","subject_ordinal":3,"message":serde_json::from_str::<Value>(dropped).unwrap(),"raw_message":dropped,"hook":"pre_user","blocks":["discarded parent tail"],"served_through_ordinal":3});
+    assert_eq!(
+        response(call(&h, "transform.hook", hook).await)["answer"],
+        "pass"
+    );
+    let ready = native_setup_for_lineage(
+        &h,
+        "child-n",
+        Some(json!({"lineage_id":"parent","through_ordinal":2})),
+    )
+    .await;
+    assert!(
+        ready["initial"]["version"].as_u64().unwrap()
+            > parent["initial"]["version"].as_u64().unwrap()
+    );
+    let key = Key::new(
+        &h.facade_binding(7).unwrap(),
+        "fresh-provider-session",
+        "claude-code",
+    )
+    .unwrap();
+    let store = h.store.get().unwrap();
+    let parent_messages = store
+        .load_provider_messages(&key.store_key(), "parent")
+        .unwrap();
+    assert_eq!(parent_messages.len(), 4);
+    assert_eq!(
+        store
+            .load_provider_messages(&key.store_key(), "child-n")
+            .unwrap(),
+        parent_messages[..3]
+    );
+    let lineage = store
+        .load_provider_lineage(&key.store_key(), "child-n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(lineage.first_ordinal, 3);
+    assert_eq!(lineage.descends_from.as_deref(), Some("parent"));
+    let conversation = store
+        .load_provider_conversation(&key.store_key())
+        .unwrap()
+        .unwrap();
+    assert_eq!(conversation.cursor_frontier, 3);
+    assert_eq!(conversation.served_through_ordinal, Some(2));
+    let raw = r#"{"role":"user","content":"child hook"}"#;
+    let hook = json!({"session":"fresh-provider-session","harness":"claude-code","lineage_id":"child-n","step_id":"child-hook","params":plan(),"subject_mid":"child-3","subject_ordinal":3,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw,"hook":"pre_user","blocks":["child hook"]});
+    assert_eq!(
+        response(call(&h, "transform.hook", hook).await)["answer"],
+        "pass"
+    );
+    let mut status = step(raw);
+    status["session"] = json!("fresh-provider-session");
+    status["lineage_id"] = json!("child-n");
+    status["messages"][0]["mid"] = json!("child-3");
+    status["messages"][0]["ordinal"] = json!(3);
+    status["newest"] = json!({"mid":"child-3","ordinal":3});
+    status["served_through_ordinal"] = json!(2);
+    status["last_applied"] = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    let answer = native_step(&h, &status).await;
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+    status["served_through_ordinal"] = json!(3);
+    status["request_id"] = json!("child-n-served");
+    native_step(&h, &status).await;
+    native_setup_for_lineage(&h, "child-n", None).await;
+    assert_eq!(
+        store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap()
+            .served_through_ordinal,
+        Some(3)
+    );
+}
+
+#[tokio::test]
+async fn cc_legacy_identity_child_setup_refuses_missing_ancestry_then_repairs_on_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    identity_parent_after_empty_fork(&h).await;
+    let key = Key::new(
+        &h.facade_binding(7).unwrap(),
+        "fresh-provider-session",
+        "claude-code",
+    )
+    .unwrap();
+    let store = h.store.get().unwrap();
+    let original = store
+        .load_provider_view(&key.store_key(), 1)
+        .unwrap()
+        .unwrap();
+    let mut legacy_view: Value = serde_json::from_str(&original.replacement_json).unwrap();
+    legacy_view["engine"]["version"] = json!(4);
+    legacy_view["engine"]["range"]["lineage_id"] = json!("legacy-child");
+    legacy_view["wire"]["version"] = json!(4);
+    let old_row = mc_store::provider_records::ProviderView {
+        version: 4,
+        lineage_id: "legacy-child".into(),
+        replacement_json: legacy_view.to_string(),
+        ..original.clone()
+    };
+    store
+        .save_provider_view(&key.store_key(), &old_row)
+        .unwrap();
+    let mut conversation = store
+        .load_provider_conversation(&key.store_key())
+        .unwrap()
+        .unwrap();
+    let mut setup: Value =
+        serde_json::from_str(conversation.setup_json.as_deref().unwrap()).unwrap();
+    setup["setup"]["state"]["version_high_water"] = json!(4);
+    for field in ["applied", "produced"] {
+        setup[field]["version"] = json!(4);
+        setup[field]["range"]["lineage_id"] = json!("legacy-child");
+    }
+    conversation.setup_json = Some(setup.to_string());
+    conversation.lineage_id = "legacy-child".into();
+    conversation.version_high_water = 4;
+    store
+        .save_provider_conversation(&key.store_key(), &conversation)
+        .unwrap();
+    // Simulate a persisted setup that published an identity [0,0) view for the
+    // new lineage ID without saving its parent link.
+    assert!(store
+        .load_provider_lineage(&key.store_key(), "legacy-child")
+        .unwrap()
+        .is_none());
+    let raw = r#"{"role":"user","content":"legacy child tail"}"#;
+    let mut status = step(raw);
+    status["session"] = json!("fresh-provider-session");
+    status["lineage_id"] = json!("legacy-child");
+    status["messages"][0]["mid"] = json!("legacy-tail");
+    status["messages"][0]["ordinal"] = json!(1);
+    status["newest"] = json!({"mid":"legacy-tail","ordinal":1});
+    let result = h.provider_step(h.facade_binding(7).unwrap(), &status).await;
+    assert!(
+        matches!(result, Err(HandlerOutcome::ErrorWithDetail { ref code, ref detail, .. }) if code == "invalid_params" && detail["field"] == "lineage_id")
+    );
+    let ready = native_setup_for_lineage(
+        &h,
+        "legacy-child",
+        Some(json!({"lineage_id":"parent","through_ordinal":0})),
+    )
+    .await;
+    assert_eq!(ready["initial"]["version"], 5);
+    assert_eq!(ready["initial"]["range"], json!({"from":0,"to":0}));
+    assert_eq!(ready["initial"]["replacement"], json!([]));
+    assert!(ready["initial"].get("raw_view").is_none());
+    assert_eq!(
+        store
+            .load_provider_view(&key.store_key(), 4)
+            .unwrap()
+            .unwrap()
+            .replacement_json,
+        old_row.replacement_json
+    );
+    assert_eq!(
+        store
+            .load_provider_view(&key.store_key(), 1)
+            .unwrap()
+            .unwrap()
+            .replacement_json,
+        original.replacement_json
+    );
+    status["last_applied"] = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    let answer = native_step(&h, &status).await;
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+}
+
+async fn identity_parent_after_empty_fork(h: &McHandler) -> Value {
+    native_setup_for_lineage(h, "L", None).await;
+    let old = native_step(h, &step(r#"{"role":"user","content":"old root"}"#)).await;
+    assert_eq!(old["answer"], "compaction_message");
+    let mut fresh = h.facade_binding(7).unwrap();
+    fresh.session = "fresh-provider-session".into();
+    h.bind_route(7, fresh);
+    let parent = native_setup_for_lineage(h, "parent", None).await;
+    assert_eq!(parent["initial"]["version"], 1);
+    assert_eq!(parent["initial"]["range"], json!({"from":0,"to":0}));
+    let mut status = step(
+        r#"{"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"s"},{"type":"text","text":"answer"}]}"#,
+    );
+    status["session"] = json!("fresh-provider-session");
+    status["lineage_id"] = json!("parent");
+    status["geometry"] = json!({"usable_soft":50000,"usable_hard":60000,"absolute_wall":100000,"derivation":"gateway"});
+    status["prefix_rebuilding"] = json!({"reason":"expired_cache"});
+    status["request_id"] = json!("parent-step");
+    assert_eq!(native_step(h, &status).await["answer"], "noop");
+    parent
+}
+
+#[tokio::test]
+async fn cc_identity_parent_continuation_advances_version_and_step_proceeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    let parent = identity_parent_after_empty_fork(&h).await;
+    let ready = native_setup_for_lineage(
+        &h,
+        "child",
+        Some(json!({"lineage_id":"parent","through_ordinal":0})),
+    )
+    .await;
+    let mut next = step(r#"{"role":"user","content":"child text"}"#);
+    next["session"] = json!("fresh-provider-session");
+    next["lineage_id"] = json!("child");
+    next["messages"][0]["mid"] = json!("child-mid");
+    next["messages"][0]["ordinal"] = json!(1);
+    next["newest"] = json!({"mid":"child-mid","ordinal":1});
+    next["last_applied"] = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    // MC's setup extension saves the parent link; omit descends_from here to
+    // exercise calls that send only lineage_id.
+    let result = h.provider_step(h.facade_binding(7).unwrap(), &next).await;
+    assert!(
+        ready["initial"]["version"] == 4 && result.is_ok(),
+        "identity parent version={}, descendant version={}, first step={result:?}",
+        parent["initial"]["version"],
+        ready["initial"]["version"]
+    );
+    let answer: Value = serde_json::from_slice(&result.unwrap()).unwrap();
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+    assert_eq!(ready["initial"]["replacement"], json!([]));
+    assert!(ready["initial"].get("raw_view").is_none());
+    if answer["answer"] == "compaction_message" {
+        assert!(answer.to_string().contains("child text"));
+    }
     assert!(!answer.to_string().contains("old root"));
 }
