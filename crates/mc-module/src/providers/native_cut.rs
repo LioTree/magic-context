@@ -62,16 +62,15 @@ pub(super) fn attach(
     {
         return Err(unrepresentable());
     }
-    // An unfolded head covers the first user message by carrying it verbatim.
-    // That copy belongs to the installed cut prefix, not the retained tail.
+    // The hook replaces every original message through its inclusive endpoint
+    // with these frozen bytes. Include edited originals in that replacement;
+    // later messages stay untouched and are addressed by original part handles.
     let mut cut_count = head_count;
-    if let Some(message) = host.engine.replacement.get(cut_count) {
-        if native_identity(message) == Some((endpoint.message_id.as_str(), coverage.ordinal)) {
-            if message.role != "user" || raw[cut_count] != codec_claude_code::render(&boundary.ck)?
-            {
-                return Err(unrepresentable());
-            }
+    while let Some(message) = host.engine.replacement.get(cut_count) {
+        if native_identity(message).is_some_and(|(_, ordinal)| ordinal <= coverage.ordinal) {
             cut_count += 1;
+        } else {
+            break;
         }
     }
     let originals = request
@@ -153,18 +152,24 @@ pub(super) fn validate(key: &Key, host: &compaction::HostView) -> Result<(), Han
     if host.engine.replacement.len() != raw.len()
         || host.engine.replacement[..count]
             .iter()
-            .enumerate()
-            .any(|(index, message)| match native_identity(message) {
+            .any(|message| match native_identity(message) {
                 None => !message.meta.synthetic,
                 Some((mid, ordinal)) => {
-                    index + 1 != count
-                        || message.role != "user"
-                        || host.coverage.as_ref().is_none_or(|coverage| {
-                            coverage.ordinal != ordinal || coverage.end_mid != mid
-                        })
-                        || frozen.endpoint.message_id != mid
-                        || message.content.len().checked_sub(1).map(|part| part as u64)
-                            != Some(frozen.endpoint.part_index)
+                    host.coverage
+                        .as_ref()
+                        .is_none_or(|coverage| ordinal > coverage.ordinal)
+                        || (host
+                            .coverage
+                            .as_ref()
+                            .is_some_and(|coverage| ordinal == coverage.ordinal)
+                            && (frozen.endpoint.message_id != mid
+                                || (!codec_claude_code::strips_signed_turn(message)
+                                    && message
+                                        .content
+                                        .len()
+                                        .checked_sub(1)
+                                        .map(|part| part as u64)
+                                        != Some(frozen.endpoint.part_index))))
                 }
             })
     {

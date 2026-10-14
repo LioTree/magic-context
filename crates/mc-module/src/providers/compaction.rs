@@ -697,6 +697,16 @@ fn execute_host(
     store
         .append_pending_agent_drops(&conversation.engine_namespace, &targets, now_ms())
         .map_err(transient)?;
+    let native_pending = if codec == Codec::ClaudeCodeAnthropic {
+        store
+            .load_pending_agent_drops(&conversation.engine_namespace)
+            .map_err(transient)?
+            .into_iter()
+            .map(|d| d.target_id)
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
     let output =
         host_engine_step(store, &template, &context, status, &mut state).map_err(|error| {
             if codec == Codec::ClaudeCodeAnthropic {
@@ -712,6 +722,121 @@ fn execute_host(
     let transform::compaction::Answer::Replacement(mut engine) = output.answer else {
         return Ok(None);
     };
+    let mut native_coverage = output.engine.response.coverage_ordinal;
+    if codec == Codec::ClaudeCodeAnthropic {
+        let rebuild = meta.initialized && output.prefix_bust_permitted;
+        if !rebuild
+            && template.messages.iter().any(|m| {
+                m.ck.content
+                    .iter()
+                    .any(super::codec_claude_code::is_thinking_block)
+            })
+        {
+            tracing::debug!(
+                "native head publication held: non-rebuilding pass precedes kept signed thinking"
+            );
+            return Ok(None);
+        }
+        let tag_rows = output
+            .engine
+            .historian_tags
+            .as_ref()
+            .map(|tags| tags.as_slice())
+            .unwrap_or_default();
+        let current = store
+            .load_meta(&conversation.engine_namespace)
+            .map_err(transient)?
+            .meta;
+        let mut protected_blocks =
+            crate::protection_window::ProtectionWindow::from_persisted_rows_calibrated(
+                tag_rows,
+                current
+                    .protected_tokens_effective
+                    .unwrap_or(context.protected_tokens_floor),
+                current
+                    .decision_calibration
+                    .as_ref()
+                    .map_or(1.0, |c| c.tools_ratio),
+            )
+            .row_identities
+            .block_ids;
+        let live_blocks = output.engine.projection.blocks.iter().collect::<Vec<_>>();
+        let selection_items = transform::tail_sel_items(
+            &live_blocks,
+            output.engine.response.coverage_ordinal,
+            &HashMap::new(),
+        );
+        protected_blocks.extend(crate::selection::protected_blocks_for_policy(
+            &selection_items,
+            &Default::default(),
+            &context.protected_tools,
+        ));
+        let mut pending_blocks = native_pending
+            .into_iter()
+            .filter(|id| output.engine.historian_tags.is_some() && !protected_blocks.contains(id))
+            .collect::<BTreeSet<_>>();
+        let mut tags = store
+            .load_tag_numbers_for_session(&conversation.engine_namespace)
+            .map_err(transient)?
+            .into_iter()
+            .map(|tag| (tag.block_id, tag.tag_number))
+            .collect::<BTreeMap<_, _>>();
+        for tag in live
+            .iter()
+            .filter(|a| a.state == "live")
+            .flat_map(|a| &a.answer.tags)
+        {
+            tags.insert(tag.block_id.clone(), tag.number);
+        }
+        // Never restore a published dropped-result placeholder on a later
+        // rebuild. The engine may have held the drop while thinking was still
+        // present, so the saved native replacement supplies that decision.
+        if let Some(previous) = &previous {
+            for message in &previous.engine.replacement {
+                let Some(mid) = message
+                    .provider_extras
+                    .get(super::codec_claude_code::EXTRAS)
+                    .and_then(|e| e.get("mid"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(source) = template.messages.iter().find(|m| m.mid == mid) else {
+                    continue;
+                };
+                for block in &message.content {
+                    let ck_wire::CkKind::ToolResult { id, output, .. } = &block.kind else {
+                        continue;
+                    };
+                    let (ck_wire::CkOutputKind::Text { text }
+                    | ck_wire::CkOutputKind::ErrorText { text }) = &output.kind
+                    else {
+                        continue;
+                    };
+                    for (part, original) in source.ck.content.iter().enumerate() {
+                        let block_id = format!("{mid}#{part}");
+                        if original.kind != block.kind
+                            && matches!(&original.kind, ck_wire::CkKind::ToolResult { id: original_id, .. } if original_id == id)
+                            && tags
+                                .get(&block_id)
+                                .is_some_and(|n| text == &format!("[dropped §{n}§]"))
+                        {
+                            pending_blocks.insert(block_id);
+                        }
+                    }
+                }
+            }
+        }
+        native_coverage = super::native_reductions::apply(
+            &mut engine,
+            &template,
+            native_coverage,
+            rebuild,
+            &output.engine.response.native_reasoning_keep_mids,
+            &tags,
+            &pending_blocks,
+        );
+    }
     let (mut wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) = previous
         .filter(|p| {
             status
@@ -722,7 +847,7 @@ fn execute_host(
                 && coverage_replay_matches(
                     codec,
                     p.coverage.as_ref().map(|coverage| coverage.ordinal),
-                    output.engine.response.coverage_ordinal,
+                    native_coverage,
                 )
         }) {
         let mut wire = previous.wire;
@@ -735,12 +860,9 @@ fn execute_host(
         )
     } else {
         let (wire, raw_replacement, initial_coverage) = if codec == Codec::ClaudeCodeAnthropic {
-            let (mut wire, mut raw) = super::codec_claude_code::encode_view(
-                &engine,
-                &template,
-                output.engine.response.coverage_ordinal,
-            )?;
-            let coverage = if output.engine.response.coverage_ordinal.is_none()
+            let (mut wire, mut raw) =
+                super::codec_claude_code::encode_view(&engine, &template, native_coverage)?;
+            let coverage = if native_coverage.is_none()
                 && super::native_view::has_selected_bundle(conversation)?
             {
                 native_uncovered_prefix(&mut engine, &mut wire, &mut raw, &template, &messages)?
@@ -760,7 +882,7 @@ fn execute_host(
             )
         };
         let coverage = initial_coverage.or_else(|| {
-            output.engine.response.coverage_ordinal.and_then(|ordinal| {
+            native_coverage.and_then(|ordinal| {
                 messages
                     .iter()
                     .find(|m| m.ordinal == ordinal)
@@ -777,7 +899,7 @@ fn execute_host(
         (wire, coverage, raw_replacement, head_slots)
     };
     if codec == Codec::ClaudeCodeAnthropic {
-        if output.engine.response.coverage_ordinal.is_some() && coverage.is_none() {
+        if native_coverage.is_some() && coverage.is_none() {
             return Err(error(
                 "native_endpoint_unrepresentable",
                 "covered native message is missing",
@@ -796,11 +918,19 @@ fn execute_host(
                         "covered native message is missing",
                     )
                 })?;
-            let boundary = store
+            let mut boundary = store
                 .load(&conversation.engine_namespace)
                 .map_err(transient)?
                 .core
                 .boundary_id;
+            if native_coverage != output.engine.response.coverage_ordinal {
+                let source = template
+                    .messages
+                    .iter()
+                    .find(|m| m.ordinal == coverage.ordinal)
+                    .ok_or_else(|| invalid_field("coverage"))?;
+                boundary = format!("{}#{}", source.mid, source.ck.content.len() - 1);
+            }
             coverage.endpoint = Some(super::codec_claude_code::whole_message_endpoint(
                 message, &boundary,
             )?);

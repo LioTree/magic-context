@@ -11052,7 +11052,7 @@ fn attach_edit_input_key_orders(items: &mut [SelItem], key_orders: &BTreeMap<Str
     }
 }
 
-fn tail_sel_items(
+pub(crate) fn tail_sel_items(
     live: &[&FlatBlock],
     coverage: Option<u64>,
     tag_tokens_by_block: &HashMap<&str, usize>,

@@ -57,6 +57,7 @@ fn build_candidate() -> ClaudeCodeCapabilities {
                 "plan":sha256_hex(include_bytes!("native_plan.rs")),
                 "view":sha256_hex(include_bytes!("native_view.rs")),
                 "cut":sha256_hex(include_bytes!("native_cut.rs")),
+                "reductions":sha256_hex(include_bytes!("native_reductions.rs")),
             }))
             .expect("native format fingerprints")
         )

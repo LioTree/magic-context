@@ -21,6 +21,9 @@ mod compaction;
 mod historian;
 mod native_cut;
 mod native_plan;
+#[cfg(test)]
+mod native_reduction_tests;
+mod native_reductions;
 mod native_view;
 mod policy_summary;
 mod records;

@@ -335,8 +335,9 @@ fn field(raw: &str, key: &str, value: &str) -> Result<String, HandlerOutcome> {
     Ok(replace(raw, range, value))
 }
 
-/// Changed text is spliced into its original shell. Signed, redacted and opaque
-/// blocks can only be replayed unchanged; the engine cannot author their bytes.
+/// Changed text is spliced into its original shell. Verified thinking bytes and
+/// opaque blocks cannot be authored; a covered whole-turn strip may remove all
+/// thinking while replaying every remaining block from the original raw JSON.
 pub(super) fn render(message: &CkWireMessage) -> Result<String, HandlerOutcome> {
     let raw = message
         .provider_extras
@@ -357,6 +358,13 @@ pub(super) fn render(message: &CkWireMessage) -> Result<String, HandlerOutcome> 
             .collect::<Result<Vec<_>, _>>()?;
         return serde_json::to_string(&json!({"role":message.role,"content":blocks}))
             .map_err(transient);
+    };
+    let stripped;
+    let raw = if strips_signed_turn(message) {
+        stripped = stripped_turn_shell(raw)?;
+        stripped.as_str()
+    } else {
+        raw
     };
     let original = parse_unique_json(raw)?;
     if original["role"].as_str() != Some(&message.role) {
@@ -421,6 +429,48 @@ pub(super) fn render(message: &CkWireMessage) -> Result<String, HandlerOutcome> 
         output = replace(&output, span, &updated);
     }
     Ok(replace(raw, content_range, &output))
+}
+
+pub(super) fn strips_signed_turn(message: &CkWireMessage) -> bool {
+    message
+        .provider_extras
+        .get(EXTRAS)
+        .and_then(|e| e.get("strip_signed_turn"))
+        == Some(&Value::Bool(true))
+}
+
+pub(super) fn is_thinking_block(block: &CkWireBlock) -> bool {
+    matches!(
+        block.kind,
+        CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
+    ) || matches!(&block.kind, CkKind::Opaque(opaque) if matches!(opaque.kind.as_str(), "thinking" | "redacted_thinking"))
+}
+
+fn stripped_turn_shell(raw: &str) -> Result<String, HandlerOutcome> {
+    let original = parse_unique_json(raw)?;
+    let content = members(raw)
+        .into_iter()
+        .find(|m| m.0 == "content")
+        .expect("validated content")
+        .1;
+    let spans = array(&raw[content.clone()]);
+    let blocks = original["content"]
+        .as_array()
+        .ok_or_else(|| error("signed_prefix_edit", "thinking strip requires an array"))?;
+    // A permitted whole-turn strip removes all thinking, not a signed subset.
+    // Every surviving block is copied from its original raw JSON span.
+    let kept = spans
+        .iter()
+        .zip(blocks)
+        .filter(|(_, block)| {
+            !matches!(
+                block["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            )
+        })
+        .map(|(span, _)| &raw[content.start + span.start..content.start + span.end])
+        .collect::<Vec<_>>();
+    Ok(replace(raw, content, &format!("[{}]", kept.join(","))))
 }
 
 fn signed_prefix(raw: &str) -> Option<&str> {
@@ -552,6 +602,20 @@ pub(super) fn encode_view(
             .iter()
             .position(|id| id.as_ref() == Some(&input_ids[index]))
         {
+            if strips_signed_turn(&view.replacement[position]) {
+                if covered.is_none_or(|c| entry.ordinal > c)
+                    || view.replacement[position]
+                        .content
+                        .iter()
+                        .any(is_thinking_block)
+                {
+                    return Err(error(
+                        "signed_prefix_edit",
+                        "thinking strip requires complete coverage and no kept thinking",
+                    ));
+                }
+                continue;
+            }
             if !same_identity_prefix(&input_ids, &output_ids, index, position)
                 || raw[..position] != original[..index]
                 || signed_prefix(&raw[position]) != signed_prefix(&original[index])

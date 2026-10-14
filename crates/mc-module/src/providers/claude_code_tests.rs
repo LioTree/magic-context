@@ -218,7 +218,7 @@ async fn cc_frozen_plan_session_harness_and_raw_mid_are_fenced() {
 }
 
 #[tokio::test]
-async fn cc_required_head_edit_before_kept_thinking_is_terminal_not_hook_pass() {
+async fn cc_required_head_edit_before_kept_thinking_is_held_on_non_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     let h = handler(dir.path(), thalamus());
     setup(&h).await;
@@ -226,9 +226,7 @@ async fn cc_required_head_edit_before_kept_thinking_is_terminal_not_hook_pass() 
     let mut status = step(raw);
     status["prefix_rebuilding"] = json!({"reason":"expired_cache"});
     let answer = response(call(&h, "compaction.step", status).await);
-    assert_eq!(answer["answer"], "refuse");
-    assert_eq!(answer["code"], "misconfigured");
-    assert_eq!(answer["provider_code"], "signed_prefix_edit");
+    assert_eq!(answer["answer"], "noop");
 }
 
 #[tokio::test]
