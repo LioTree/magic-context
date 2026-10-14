@@ -58,7 +58,8 @@ export async function foldStorageTiming(samples=50) {
     } finally {await driver.close();}
     const lanes=["OpenCode1","OpenCode2"].map(host=>{const rows=results.filter(r=>r.host===host&&!r.retention);return {host,samples:rows.length,fold_p50_ms:percentile(rows.map(r=>r.module_ms),.5),fold_p99_ms:percentile(rows.map(r=>r.module_ms),.99),over_100_ms:rows.filter(r=>r.module_ms>=100).length};});
     const result={bun:Bun.version,cpus:availableParallelism(),work,lanes,results};
-    console.log("FOLD_STORAGE_TIMING_RESULT="+JSON.stringify(result));
+    const printed=process.env.MC_TIMING_BRIEF==="1"?{...result,results:results.map(row=>row.retention?row:{host:row.host,sample:row.sample,module_ms:row.module_ms,cpu_ms:row.cpu_ms,scheduler_wait_ms:row.scheduler_wait_ms,response_bytes:row.response_bytes,view_bytes:row.view_bytes,psi:row.psi,pressure_before:row.before.host_cpu_pressure,pressure_after:row.after.host_cpu_pressure})}:result;
+    console.log("FOLD_STORAGE_TIMING_RESULT="+JSON.stringify(printed));
     if(process.env.MC_TIMING_RESULT_OUT)writeFileSync(process.env.MC_TIMING_RESULT_OUT,JSON.stringify(result,null,2)+"\n");
     return result;
 }

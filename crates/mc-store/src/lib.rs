@@ -4751,6 +4751,32 @@ pub struct TailHygieneBaseline {
     pub channel1_post_reduce_grace_pre_level: String,
 }
 
+impl TailHygieneBaseline {
+    /// Copy baseline scalars for policy decisions without copying the historical
+    /// measurement vector, which is stored or resolved separately.
+    pub fn clone_without_parts(&self) -> Self {
+        Self {
+            protected_tools_policy: self.protected_tools_policy.clone(),
+            baseline_u: self.baseline_u,
+            baseline_t: self.baseline_t,
+            turn_delta_u: self.turn_delta_u,
+            turn_delta_t: self.turn_delta_t,
+            hygiene_units_version: self.hygiene_units_version,
+            hygiene_tools_ratio: self.hygiene_tools_ratio,
+            hygiene_prose_ratio: self.hygiene_prose_ratio,
+            effective_token_buckets: self.effective_token_buckets.clone(),
+            baseline_generation: self.baseline_generation,
+            computed_at_ms: self.computed_at_ms,
+            evaluable: self.evaluable,
+            generation_invalidated: self.generation_invalidated,
+            baseline_parts: Vec::new(),
+            content_signature: self.content_signature.clone(),
+            channel1_post_reduce_grace_baseline_u: self.channel1_post_reduce_grace_baseline_u,
+            channel1_post_reduce_grace_pre_level: self.channel1_post_reduce_grace_pre_level.clone(),
+        }
+    }
+}
+
 /// Compartment coverage composed into one frozen prefix unit. Empty fields mean the unit
 /// contained no compartments; an absent proof on ModuleMeta means the old bytes are unproven.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -8995,6 +9021,18 @@ impl McStore {
             .map_err(|error| McStoreError::Serde(error.to_string()))?;
         let outcome = self.inner.with_conn_fenced(|tx| {
             move_store::check_writer(tx, session_id)?;
+            let old: Option<String> = tx
+                .query_row(
+                    "SELECT meta FROM mc_cache_state WHERE session_id=?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let meta_json = if let Some(old) = old {
+                cache_codec::preserve_native_marker(meta_json, &old)?
+            } else {
+                meta_json
+            };
             let current: Option<(i64, bool)> = tx
                 .query_row(
                     "SELECT row_version, meta = ?2 FROM mc_cache_state WHERE session_id = ?1",
@@ -11080,8 +11118,13 @@ impl McStore {
                 });
             }
         }
-        let encoded = cache_codec::encode_row(core, meta)
-            .map_err(|error| McStoreError::Serde(error.to_string()))?;
+        let native_requested = provider_policy.is_some_and(|policy| policy.native_tail_section);
+        let mut encoded = if native_requested {
+            cache_codec::encode_row_parts(core, meta, None)
+        } else {
+            cache_codec::encode_row(core, meta)
+        }
+        .map_err(|error| McStoreError::Serde(error.to_string()))?;
         let fingerprint = row_state_fingerprint(meta);
         let scheduler_observation_json = scheduler_observation
             .map(serialize_scheduler_observation)
@@ -11207,6 +11250,16 @@ impl McStore {
                 || overlays.channel1_append.is_some()
                 || !consumed_drop_ids.is_empty()
                 || !first_applied_command_ids.is_empty();
+
+            if let Some(policy) = provider_policy {
+                provider_log::save_engine_policy_tx(tx, session_id, policy)?;
+                if native_requested {
+                    encoded = match cache_codec::encode_native_row(tx, session_id, core, meta, policy)? {
+                        Some(native) => native,
+                        None => cache_codec::encode_row(core, meta)?,
+                    };
+                }
+            }
 
             // The chunk and section rows. A bootstrap starts from nothing: rows a previous
             // life of the session left behind are deleted, not diffed against. A commit with
@@ -11476,9 +11529,7 @@ impl McStore {
                     params![session_id, drop_id],
                 )?;
             }
-            if let Some(policy)=provider_policy {
-                provider_log::save_engine_policy_tx(tx,session_id,policy)?;
-            }
+
             Ok(CommitOutcome::Committed(accepted_version))
         })?;
 

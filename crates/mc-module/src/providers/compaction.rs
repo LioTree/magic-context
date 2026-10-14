@@ -426,6 +426,7 @@ struct Work {
     project_path: String,
     project_directory: String,
     note_project_path: String,
+    resident_folds: bool,
 }
 
 /// Metadata-only skip check shared by the handler and real-state comparison
@@ -605,6 +606,7 @@ fn execute_host(
         "render_config":serde_json::to_string(&setup.setup.request.params).map_err(transient)?,
         "model_key":setup.setup.request.model,"messages":[],"tool_present":true,"auto_search_enabled":false}))?;
     codec.prepare_request(&mut template, &messages)?;
+    template.native_tail_section = work.resident_folds && codec == Codec::OpencodeAiSdk;
     if codec == Codec::ClaudeCodeAnthropic {
         if let Some(native_status) = native_status {
             template.geometry =
@@ -1689,6 +1691,7 @@ impl McHandler {
     ) -> Result<Work, HandlerOutcome> {
         let route = self.route_project(store, &binding)?;
         Ok(Work {
+            resident_folds: self.provider_resident.is_enabled(),
             project_directory: binding.project_root.to_string_lossy().into_owned(),
             note_project_path: route.key.clone(),
             project_path: route.key,

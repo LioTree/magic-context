@@ -111,7 +111,13 @@ impl FrozenPolicyResolver {
         lineage: &str,
         mut part: ProviderPolicyPart,
     ) -> Result<ProviderPolicyPart, ProviderError> {
-        if self.defaults.get("covered_measurements") == Some(&Value::Bool(true))
+        let covered = self.defaults.get("through_ordinal").is_none_or(|value| {
+            value
+                .as_u64()
+                .is_some_and(|through| part.ordinal <= through)
+        });
+        if covered
+            && self.defaults.get("covered_measurements") == Some(&Value::Bool(true))
             && part.kind != "header"
         {
             part.measurement.kind = crate::TailHygienePartKind::Excluded;
@@ -255,7 +261,7 @@ pub(crate) fn freeze_cut_tx(
     } else {
         (0, serde_json::json!({}))
     };
-    conn.execute("INSERT INTO mc_provider_policy_cuts_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,json_extract(?1,'$[1]'))",params![conv,cut,lineage,coverage,old_count+frozen_parts,settings.get("baseline").unwrap_or(&Value::Null).to_string(),serde_json::json!({"format":1,"covered_measurements":true}).to_string(),serde_json::json!({"users":old_totals.get("users").and_then(Value::as_u64).unwrap_or(0)+frozen_users}).to_string(),settings.to_string()])?;
+    conn.execute("INSERT INTO mc_provider_policy_cuts_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,json_extract(?1,'$[1]'))",params![conv,cut,lineage,coverage,old_count+frozen_parts,settings.get("baseline").unwrap_or(&Value::Null).to_string(),serde_json::json!({"format":1,"covered_measurements":true,"through_ordinal":coverage}).to_string(),serde_json::json!({"users":old_totals.get("users").and_then(Value::as_u64).unwrap_or(0)+frozen_users}).to_string(),settings.to_string()])?;
     // Keep the current per-part exceptions attached to the new baseline; do not
     // copy a complete set of old measurement values for each prior boundary.
     conn.execute(
@@ -266,4 +272,70 @@ pub(crate) fn freeze_cut_tx(
         conn.execute("DELETE FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3",params![conv,lineage,coverage])?;
     }
     Ok(cut)
+}
+
+/// Reconstruct the frozen portion of a cache baseline, not the current hook policy.
+/// Later consumed tags or policy overrides must not rewrite the baseline snapshot.
+pub(crate) fn baseline_prefix_tx(
+    conn: &Connection,
+    conv: &str,
+    cut_id: u64,
+) -> Result<Vec<crate::TailHygienePartMeasurement>, ProviderError> {
+    use rusqlite::OptionalExtension;
+    let cut: Option<(String, Option<u64>)> = conn.query_row(
+        "SELECT lineage_id,frozen_through_ordinal FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 AND cut_id=?2",
+        params![conv,cut_id], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional()?;
+    let (lineage, coverage) =
+        cut.ok_or_else(|| ProviderError::Transient("native baseline cut is missing".into()))?;
+    let Some(coverage) = coverage else {
+        return Ok(Vec::new());
+    };
+    let mut parts = std::collections::BTreeMap::new();
+    let mut total_bytes = 0usize;
+    for (source, through) in crate::provider_log::ancestry_tx(conn, conv, &lineage)? {
+        let mut query = conn.prepare_cached("SELECT ordinal,frozen_policy_bytes,frozen_policy_raw_bytes,frozen_policy_parts FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 AND frozen_policy_format=1 ORDER BY ordinal")?;
+        let mut rows = query.query(params![
+            conv,
+            source.lineage_id,
+            coverage.min(through).min(i64::MAX as u64)
+        ])?;
+        while let Some(row) = rows.next()? {
+            let ordinal: u64 = row.get(0)?;
+            let bytes: usize = row.get(2)?;
+            total_bytes = total_bytes.saturating_add(bytes);
+            if total_bytes > 128 * 1024 * 1024 || parts.len() > 100_000 {
+                return Err(ProviderError::Transient(
+                    "native baseline input exceeds cap".into(),
+                ));
+            }
+            for part in decode_facts(&row.get::<_, Vec<u8>>(1)?, bytes, row.get(3)?)? {
+                if part.ordinal != ordinal {
+                    return Err(ProviderError::Transient(
+                        "native baseline source ordinal mismatch".into(),
+                    ));
+                }
+                if part.kind == "header" {
+                    continue;
+                }
+                let mut measurement = part.measurement;
+                measurement.kind = crate::TailHygienePartKind::Excluded;
+                measurement.tokens = 0;
+                measurement.u_tokens = 0;
+                measurement.tag_number = None;
+                measurement.tag_status = None;
+                measurement.protected = false;
+                measurement.queued_for_drop = false;
+                parts
+                    .entry((ordinal, part.block_index))
+                    .or_insert(measurement);
+            }
+        }
+    }
+    if parts.len() > 100_000 {
+        return Err(ProviderError::Transient(
+            "native baseline input exceeds cap".into(),
+        ));
+    }
+    Ok(parts.into_values().collect())
 }

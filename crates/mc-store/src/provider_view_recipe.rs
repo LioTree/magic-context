@@ -411,7 +411,9 @@ impl McStore {
                     removed+=conn.execute("DELETE FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2",params![conv,version])?;
                 }
                 let current=crate::provider_policy_overlay::current_cut_tx(conn,&conv)?;
-                conn.execute("DELETE FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 AND (?2 IS NULL OR cut_id<>?2) AND NOT EXISTS(SELECT 1 FROM mc_provider_views_v2 v WHERE v.conv_key=?1 AND v.policy_cut_id=mc_provider_policy_cuts_v1.cut_id) AND NOT EXISTS(SELECT 1 FROM mc_provider_policy_overrides_v1 o WHERE o.conv_key=?1 AND o.cut_id=mc_provider_policy_cuts_v1.cut_id)",params![conv,current])?;
+                let namespace: String = conn.query_row("SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE conv_key=?1", [&conv], |row| row.get(0))?;
+                let cache_cut = crate::cache_codec::native_tail_cut(conn, &namespace)?;
+                conn.execute("DELETE FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 AND (?2 IS NULL OR cut_id<>?2) AND NOT EXISTS(SELECT 1 FROM mc_provider_views_v2 v WHERE v.conv_key=?1 AND v.policy_cut_id=mc_provider_policy_cuts_v1.cut_id) AND NOT EXISTS(SELECT 1 FROM mc_provider_policy_overrides_v1 o WHERE o.conv_key=?1 AND o.cut_id=mc_provider_policy_cuts_v1.cut_id) AND (?3 IS NULL OR cut_id<>?3)",params![conv,current,cache_cut])?;
                 Ok(removed)
             };
             prune().map_err(|e|{refusal=Some(e);rusqlite::Error::InvalidQuery})

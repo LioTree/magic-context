@@ -144,6 +144,7 @@ pub(super) fn save(
     view: &HostView,
     state: &str,
 ) -> Result<(), HandlerOutcome> {
+    let started = std::time::Instant::now();
     let first = view
         .engine
         .replacement
@@ -166,6 +167,7 @@ pub(super) fn save(
     } else {
         BTreeMap::new()
     };
+    let source_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut metadata = serde_json::to_value(view).map_err(transient)?;
     metadata["engine"]["replacement"] = json!([]);
     metadata["wire"]["replacement"] = json!([]);
@@ -244,6 +246,7 @@ pub(super) fn save(
             recipe.segments.push(ProviderViewSegment::NativeRange {source_lineage_id:lineage.clone(),from:ordinal,to:ordinal+1,first_mid:mid.into(),last_mid:mid.into()});
         }
     }
+    let diff_ms = started.elapsed().as_secs_f64() * 1000.0 - source_ms;
     // Store only changed synthetic slots and treatments relative to the base view.
     // After 16 ancestors or 8 MiB of inherited recipes, the store merges their
     // entries into one standalone recipe without copying native message bodies.
@@ -282,10 +285,11 @@ pub(super) fn save(
             }
         }
     }
+    let catalog_ms = started.elapsed().as_secs_f64() * 1000.0 - source_ms - diff_ms;
     let bytes = store
         .save_provider_view_recipe(&key.store_key(), &recipe)
         .map_err(transient)?;
-    tracing::info!(session_id=%key.session,view_version=view.engine.version,stored_view_bytes=bytes,"provider view recipe stored");
+    tracing::info!(session_id=%key.session,view_version=view.engine.version,stored_view_bytes=bytes,source_ms,diff_ms,catalog_ms,persist_ms=started.elapsed().as_secs_f64()*1000.0-source_ms-diff_ms-catalog_ms,"provider view recipe stored");
     Ok(())
 }
 
@@ -294,12 +298,14 @@ pub(super) fn load(
     key: &Key,
     version: u64,
 ) -> Result<Option<HostView>, HandlerOutcome> {
+    let started = std::time::Instant::now();
     let Some(resolved) = store
         .resolve_provider_view(&key.store_key(), version)
         .map_err(transient)?
     else {
         return Ok(None);
     };
+    let resolve_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut metadata = resolved.recipe.metadata;
     let mut engines = Vec::new();
     let mut wires = Vec::new();
@@ -362,5 +368,7 @@ pub(super) fn load(
     }
     metadata["engine"]["replacement"] = json!(engines);
     metadata["wire"]["replacement"] = json!(wires);
-    Ok(Some(serde_json::from_value(metadata).map_err(transient)?))
+    let view = serde_json::from_value(metadata).map_err(transient)?;
+    tracing::info!(session_id=%key.session,view_version=version,resolve_ms,reconstruct_ms=started.elapsed().as_secs_f64()*1000.0-resolve_ms,"provider view recipe loaded");
+    Ok(Some(view))
 }

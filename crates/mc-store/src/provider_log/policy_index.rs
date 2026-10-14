@@ -37,6 +37,18 @@ pub struct ProviderPolicyIndex<'c> {
 
 const PART_COLUMNS: &str = "p.lineage_id,p.ordinal,p.policy_json,EXISTS(SELECT 1 FROM mc_provider_consumed_tags_v1 t JOIN mc_provider_conversations_v2 c ON c.engine_namespace=t.engine_namespace WHERE c.conv_key=p.conv_key AND t.tag_number=json_extract(p.policy_json,'$.tag_number'))";
 
+fn append_distinct(parts: &mut Vec<ProviderPolicyPart>, additional: Vec<ProviderPolicyPart>) {
+    let held = parts
+        .iter()
+        .map(|part| part.block_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let fresh = additional
+        .into_iter()
+        .filter(|part| !held.contains(part.block_id.as_str()))
+        .collect::<Vec<_>>();
+    parts.extend(fresh);
+}
+
 impl<'c> ProviderPolicyIndex<'c> {
     pub(crate) fn new(conn: &'c Connection, conv: &str, lineage: &str) -> rusqlite::Result<Self> {
         let rows = ancestry_tx(conn, conv, lineage)?;
@@ -427,9 +439,12 @@ impl<'c> ProviderPolicyIndex<'c> {
             );
         }
         let mids = self.mids_for_numbers(numbers)?;
-        parts.extend(self.frozen_parts(Some(&mids), |part| {
-            part.tag_number.is_some_and(|n| numbers.contains(&n))
-        })?);
+        append_distinct(
+            &mut parts,
+            self.frozen_parts(Some(&mids), |part| {
+                part.tag_number.is_some_and(|n| numbers.contains(&n))
+            })?,
+        );
         Ok(parts)
     }
 
@@ -461,9 +476,12 @@ impl<'c> ProviderPolicyIndex<'c> {
             return Ok(None);
         };
         let mids = self.mids_for_numbers(&numbers)?;
-        parts.extend(self.frozen_parts(Some(&mids), |p| {
-            p.tag_number.is_some_and(|n| n >= from && n < before)
-        })?);
+        append_distinct(
+            &mut parts,
+            self.frozen_parts(Some(&mids), |p| {
+                p.tag_number.is_some_and(|n| n >= from && n < before)
+            })?,
+        );
         parts.sort_by_key(|p| (p.tag_number, p.block_id.clone()));
         Ok((parts.len() <= cap).then_some(parts))
     }
@@ -485,9 +503,12 @@ impl<'c> ProviderPolicyIndex<'c> {
             );
         }
         if !arcs.is_empty() {
-            parts.extend(self.frozen_parts(None, |p| {
-                p.arc_id.as_ref().is_some_and(|arc| arcs.contains(arc))
-            })?);
+            append_distinct(
+                &mut parts,
+                self.frozen_parts(None, |p| {
+                    p.arc_id.as_ref().is_some_and(|arc| arcs.contains(arc))
+                })?,
+            );
         }
         Ok(parts)
     }
@@ -534,7 +555,7 @@ impl<'c> ProviderPolicyIndex<'c> {
                 .unwrap_or_default(),
             );
         }
-        parts.extend(self.frozen_parts(Some(mids), |_| true)?);
+        append_distinct(&mut parts, self.frozen_parts(Some(mids), |_| true)?);
         Ok(parts)
     }
 

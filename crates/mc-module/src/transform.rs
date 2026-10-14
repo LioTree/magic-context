@@ -703,6 +703,9 @@ impl BoundaryState {
 /// back to CK messages at egress.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransformRequest {
+    /// Set only by the native provider handler, never by a wire request.
+    #[serde(skip)]
+    pub native_tail_section: bool,
     #[serde(default)]
     pub kind: String,
     #[serde(default = "default_wire_version")]
@@ -1181,6 +1184,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or_else(default_protected_tags);
         Ok(Self {
+            native_tail_section: false,
             kind: wire.kind,
             v: wire.v,
             serializer_profile: wire.serializer_profile.unwrap_or_default(),
@@ -8337,6 +8341,7 @@ fn apply_once(
                     &tag_rows,
                     true,
                 ),
+                native_tail_section: req.native_tail_section,
                 settings: provider_engine_settings(&meta),
             }
         });
@@ -12283,6 +12288,10 @@ pub(crate) fn capture_provider_parts(
 ) -> Vec<mc_store::provider_records::ProviderPolicyPart> {
     use mc_store::provider_records::ProviderPolicyPart;
     let reduced = frozen_red_targets(core);
+    let mut tags_by_block = HashMap::with_capacity(tags.len());
+    for tag in tags {
+        tags_by_block.entry(tag.block_id.as_str()).or_insert(tag);
+    }
     let mut parts = Vec::new();
     for message in &req.messages {
         parts.push(ProviderPolicyPart {
@@ -12319,7 +12328,7 @@ pub(crate) fn capture_provider_parts(
         });
     }
     for (block, measurement) in projection.blocks.iter().zip(measured) {
-        let tag = tags.iter().find(|tag| tag.block_id == block.id);
+        let tag = tags_by_block.get(block.id.as_str()).copied();
         let tag_kind = taggable_source(block).map(|(kind, _)| kind.as_store_kind().to_owned());
         let source_tokens = tag.map_or_else(
             || {
@@ -12365,11 +12374,14 @@ pub(crate) fn capture_provider_parts(
 }
 
 pub(crate) fn provider_engine_settings(meta: &ModuleMeta) -> Value {
-    let mut baseline = meta.tail_hygiene_baseline.clone();
-    let baseline_len = baseline.as_ref().map_or(0, |b| b.baseline_parts.len());
-    if let Some(baseline) = baseline.as_mut() {
-        baseline.baseline_parts.clear();
-    }
+    let baseline = meta
+        .tail_hygiene_baseline
+        .as_ref()
+        .map(TailHygieneBaseline::clone_without_parts);
+    let baseline_len = meta
+        .tail_hygiene_baseline
+        .as_ref()
+        .map_or(0, |b| b.baseline_parts.len());
     serde_json::json!({"coverage":meta.coverage_ordinal,"protected_tokens":meta.protected_tokens_effective,
         "protected_tools":meta.tail_hygiene_baseline.as_ref().and_then(|b|b.protected_tools_policy.as_ref()),
         "protected_blocks":meta.protected_tool_block_ids,"calibration":meta.decision_calibration,
@@ -22267,6 +22279,7 @@ pub(crate) mod tests {
         messages: Vec<CkIngressMessage>,
     ) -> TransformRequest {
         TransformRequest {
+            native_tail_section: false,
             cache_ttl: None,
             effective_execute_threshold: None,
             auto_search_enabled: true,

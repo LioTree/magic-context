@@ -228,6 +228,11 @@ fn provider_pipeline_driver() {
                         tx.execute("INSERT INTO mc_provider_lineages_v1 SELECT ?1,lineage_id,first_ordinal,descends_from,through_ordinal,?2 FROM mc_provider_lineages_v1 WHERE conv_key=?3", rusqlite::params![conv,key.session,original.conversation_key()]).unwrap();
                         tx.execute("INSERT INTO mc_provider_policy_parts_v1 SELECT ?1,lineage_id,ordinal,block_id,policy_json,?2 FROM mc_provider_policy_parts_v1 WHERE conv_key=?3", rusqlite::params![conv,key.session,original.conversation_key()]).unwrap();
                         tx.execute("INSERT INTO mc_provider_policy_summaries_v1 SELECT ?1,summary_json,?2 FROM mc_provider_policy_summaries_v1 WHERE conv_key=?3", rusqlite::params![conv,key.session,original.conversation_key()]).unwrap();
+                        // Policy-only clones retain facts and their source identities;
+                        // no native history body or materialized view is copied.
+                        tx.execute("INSERT INTO mc_provider_messages_v1(conv_key,lineage_id,ordinal,mid,message_bytes,session,frozen_policy_format,frozen_policy_raw_bytes,frozen_policy_parts,frozen_policy_bytes) SELECT ?1,lineage_id,ordinal,mid,x'7b7d',?2,frozen_policy_format,frozen_policy_raw_bytes,frozen_policy_parts,frozen_policy_bytes FROM mc_provider_messages_v1 WHERE conv_key=?3 AND frozen_policy_format=1",rusqlite::params![conv,key.session,original.conversation_key()]).unwrap();
+                        tx.execute("INSERT INTO mc_provider_policy_cuts_v1 SELECT ?1,cut_id,lineage_id,frozen_through_ordinal,frozen_part_count,baseline_json,defaults_json,prefix_totals_json,policy_key,?2 FROM mc_provider_policy_cuts_v1 WHERE conv_key=?3",rusqlite::params![conv,key.session,original.conversation_key()]).unwrap();
+                        tx.execute("INSERT INTO mc_provider_policy_overrides_v1 SELECT ?1,source_lineage_id,block_id,ordinal,cut_id,override_json,?2 FROM mc_provider_policy_overrides_v1 WHERE conv_key=?3",rusqlite::params![conv,key.session,original.conversation_key()]).unwrap();
                         tx.commit().unwrap();
                         mc_tokenizer::estimate_tokens("resident tokenizer warmup");
                         rig.handler.provider_resident.load_for_test(&rig.store, &key);

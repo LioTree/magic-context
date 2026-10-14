@@ -173,6 +173,7 @@ pub struct ProviderPolicyPart {
 pub struct ProviderEnginePolicy {
     pub parts: Vec<ProviderPolicyPart>,
     pub settings: Value,
+    pub native_tail_section: bool,
 }
 
 pub(crate) fn save_engine_policy_tx(
@@ -208,8 +209,11 @@ pub(crate) fn save_engine_policy_tx(
         // One prepared statement for the whole lineage, and an unchanged row is
         // left alone so its indexes need no maintenance.
         let mut upsert = conn.prepare_cached("INSERT INTO mc_provider_policy_parts_v1 VALUES (?1,?2,?3,?4,?5,json_extract(?1,'$[1]')) ON CONFLICT(conv_key,lineage_id,block_id) DO UPDATE SET policy_json=excluded.policy_json WHERE mc_provider_policy_parts_v1.policy_json IS NOT excluded.policy_json")?;
+        let coverage = policy.settings.get("coverage").and_then(Value::as_u64);
         for part in &policy.parts {
-            if old_frozen.is_some_and(|n| part.ordinal <= n) {
+            if old_frozen.is_some_and(|n| part.ordinal <= n)
+                && coverage.is_some_and(|n| part.ordinal <= n)
+            {
                 continue;
             }
             upsert.execute(params![
@@ -224,7 +228,6 @@ pub(crate) fn save_engine_policy_tx(
         let mut counters = parse(&raw)?;
         counters["engine_policy"] = policy.settings.clone();
         if native_v2 {
-            let coverage = policy.settings.get("coverage").and_then(Value::as_u64);
             let mut parts = Vec::new();
             if let Some(coverage) = coverage {
                 let mut q=conn.prepare_cached("SELECT policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 ORDER BY ordinal,block_id")?;
