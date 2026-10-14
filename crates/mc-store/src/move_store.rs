@@ -1048,7 +1048,13 @@ fn discard_tables() -> Vec<&'static move_inventory::TableInventory> {
     let mut tables = move_inventory::tables(Store::Module)
         .filter(|t| t.class != Class::NotSession && matches!(t.rows, RowSelector::Predicate(_)))
         .collect::<Vec<_>>();
-    tables.sort_by_key(|t| t.table == "mc_tag_cache_generations");
+    // Export/install order places revision fences first, but discard must keep
+    // the old namespace token while trigger-bearing conversation rows are removed.
+    tables.sort_by_key(|t| match t.table {
+        "mc_provider_policy_revisions_v1" => 1,
+        "mc_tag_cache_generations" => 2,
+        _ => 0,
+    });
     tables
 }
 fn remove_file(path: Option<&str>) -> Result<(), MoveError> {

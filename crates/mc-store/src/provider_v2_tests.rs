@@ -572,3 +572,215 @@ fn native_tail_cut_survives_view_pruning_while_cache_still_references_it() {
         meta.tail_hygiene_baseline
     );
 }
+
+fn native_move_descriptor(dir: &std::path::Path) -> StorageDescriptor {
+    StorageDescriptor {
+        module_id: "magic-context".into(),
+        storage_namespace: NS.into(),
+        isolation: Isolation::Module,
+        backend: StorageBackend::Sqlite {
+            path: dir.join("store.db").to_string_lossy().into(),
+        },
+    }
+}
+fn native_move_rows(conn: &rusqlite::Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut query = conn
+        .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+        .unwrap();
+    let columns = query.column_count();
+    query
+        .query_map([], |row| {
+            (0..columns)
+                .map(|i| row.get(i))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn review_native_fact_agent_move_round_trip_preserves_cache_policy_and_recipe() {
+    let (_source_dir, source, key) = rig();
+    let mut conversation = source.load_provider_conversation(&key).unwrap().unwrap();
+    conversation.engine_namespace = key.session.clone();
+    source
+        .save_provider_conversation(&key, &conversation)
+        .unwrap();
+    let (meta, policy) = native_cache_inputs();
+    cache_policy_commit(&source, &key.session, &meta, &policy).unwrap();
+    source
+        .save_provider_view_recipe(&key, &recipe(1, None))
+        .unwrap();
+    let expected_policy = source
+        .read_provider_resident_policy(&key, |index, _| index.all_parts())
+        .unwrap();
+    let expected_view = source.resolve_provider_view(&key, 1).unwrap().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let staging = destination.path().join("staging");
+    let binding = crate::move_store::CutBinding {
+        cut_id: "review-cut".into(),
+        session_ref: "0123456789abcdef".into(),
+        host_session_id: key.session.clone(),
+        host_end_offset: 42,
+        host_cut: json!({"review":"native-facts"}),
+        mc_start_offset: 100,
+    };
+    let mut export = source.move_store().unwrap();
+    export.acquire_fence(&binding).unwrap();
+    export.freeze(&binding.cut_id).unwrap();
+    export.capture(&binding.cut_id, &staging).unwrap();
+    let source_revision = source.provider_policy_revision(&key.session).unwrap();
+    let target = McStore::open_for_test(&native_move_descriptor(destination.path())).unwrap();
+    let mut import = target.move_store().unwrap();
+    import
+        .reserve_install(&binding, "review-digest", &staging)
+        .unwrap();
+    while !import.install_batch(&binding.cut_id).unwrap().complete {}
+    import
+        .finish_install(&binding.cut_id, "review-result")
+        .unwrap();
+    import.activate_for_test(&binding.cut_id).unwrap();
+    assert!(
+        target.provider_policy_revision(&key.session).unwrap() > source_revision,
+        "destination revision must advance past the source fence"
+    );
+    assert_eq!(
+        target
+            .load(&key.session)
+            .unwrap()
+            .meta
+            .tail_hygiene_baseline,
+        meta.tail_hygiene_baseline
+    );
+    assert_eq!(
+        json!(target
+            .read_provider_resident_policy(&key, |index, _| index.all_parts())
+            .unwrap()),
+        json!(expected_policy)
+    );
+    let view = target.resolve_provider_view(&key, 1).unwrap().unwrap();
+    let message_values = |messages: &Vec<(String, ProviderMessage)>| {
+        messages
+            .iter()
+            .map(|(lineage, message)| {
+                json!([lineage, message.ordinal, message.mid, message.message_bytes])
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        message_values(&view.messages),
+        message_values(&expected_view.messages)
+    );
+    assert_eq!(view.recipe.segments, expected_view.recipe.segments);
+    assert_eq!(view.recipe.metadata, expected_view.recipe.metadata);
+    assert_eq!(view.recipe.synthetic, expected_view.recipe.synthetic);
+    assert_eq!(view.recipe.treatments, expected_view.recipe.treatments);
+    for table in [
+        "mc_provider_messages_v1",
+        "mc_provider_policy_cuts_v1",
+        "mc_provider_views_v2",
+        "mc_cache_state",
+        "mc_cache_sections",
+    ] {
+        let from = source
+            .inner
+            .with_conn(|conn| Ok(native_move_rows(conn, table)))
+            .unwrap();
+        let to = target
+            .inner
+            .with_conn(|conn| Ok(native_move_rows(conn, table)))
+            .unwrap();
+        assert!(!from.is_empty(), "{table} must actually be populated");
+        assert_eq!(to, from, "{table}");
+    }
+}
+
+#[test]
+fn native_move_foreign_revision_collisions_refuse_before_install_and_after_reservation() {
+    for race in [false, true] {
+        let (_source_dir, source, key) = rig();
+        let mut conversation = source.load_provider_conversation(&key).unwrap().unwrap();
+        conversation.engine_namespace = key.session.clone();
+        source
+            .save_provider_conversation(&key, &conversation)
+            .unwrap();
+        let (meta, policy) = native_cache_inputs();
+        cache_policy_commit(&source, &key.session, &meta, &policy).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("snapshot");
+        let binding = crate::move_store::CutBinding {
+            cut_id: "foreign-revision-cut".into(),
+            session_ref: "0123456789abcdef".into(),
+            host_session_id: key.session.clone(),
+            host_end_offset: 42,
+            host_cut: json!({}),
+            mc_start_offset: 100,
+        };
+        let mut export = source.move_store().unwrap();
+        export.acquire_fence(&binding).unwrap();
+        export.freeze(&binding.cut_id).unwrap();
+        export.capture(&binding.cut_id, &staging).unwrap();
+        let target = McStore::open_for_test(&native_move_descriptor(directory.path())).unwrap();
+        let mut import = target.move_store().unwrap();
+        if race {
+            import
+                .reserve_install(&binding, "digest", &staging)
+                .unwrap();
+        }
+        target
+            .inner
+            .with_conn_fenced(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_provider_policy_revisions_v1 VALUES(?1,9001,'foreign-session')",
+                    [&key.session],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let before = target
+            .inner
+            .with_conn(|conn| Ok(native_move_rows(conn, "mc_provider_policy_revisions_v1")))
+            .unwrap();
+        let result = if race {
+            import.install_batch(&binding.cut_id).map(|_| ())
+        } else {
+            import.reserve_install(&binding, "digest", &staging)
+        };
+        assert!(
+            matches!(result, Err(crate::move_store::MoveError::Refused { code:"key_collision",table:Some(ref table) })
+            if table=="mc_provider_policy_revisions_v1"),
+            "foreign revision must not be merged (race={race}): {result:?}"
+        );
+        assert_eq!(
+            target
+                .inner
+                .with_conn(|conn| Ok(native_move_rows(conn, "mc_provider_policy_revisions_v1")))
+                .unwrap(),
+            before
+        );
+        assert!(target.load_provider_conversation(&key).unwrap().is_none());
+        assert!(target.load(&key.session).unwrap().row_version.is_none());
+        if !race {
+            target
+                .inner
+                .with_conn(|conn| {
+                    for table in [
+                        "mc_move_cuts",
+                        "mc_move_installs",
+                        "mc_move_key_map",
+                        "mc_move_fences",
+                    ] {
+                        assert_eq!(
+                            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                                row.get::<_, u64>(0)
+                            })?,
+                            0
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+}

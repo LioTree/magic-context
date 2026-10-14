@@ -35,7 +35,7 @@ for (const crate of selected === "all" ? ["mc-store", "mc-module"] : [selected])
         encoding: "utf8", maxBuffer: 32 * 1024 * 1024,
     });
     process.stdout.write(run.stdout); process.stderr.write(run.stderr);
-    assert.match(run.stdout, /running [1-9]\d* tests/, "Rust review filter must execute tests");
+    assert.match(run.stdout, /running [1-9]\d* tests?/, "Rust review filter must execute tests");
     failed ||= run.status !== 0;
 }
 if (failed) process.exitCode = 1;

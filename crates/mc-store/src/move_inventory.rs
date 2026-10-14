@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Section-inventory protocol version serialized in move manifests.
-pub const INVENTORY_VERSION: u32 = 6;
+pub const INVENTORY_VERSION: u32 = 7;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 100;
 pub const STORE_SCHEMA_VERSION: u32 = 72;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
@@ -120,6 +120,20 @@ macro_rules! table {
 /// Stable table order for the v1 stream; each store half is filtered from this
 /// explicit list. Schema discovery is validation only and never grants shipping.
 pub const TABLES: &[TableInventory] = &[
+    // Install the namespace fence before any conversation or policy input.
+    // Enabled revision triggers then advance the imported token instead of
+    // creating a row that collides with its later insertion.
+    table!(
+        Module,
+        "mc_provider_policy_revisions_v1",
+        Ship,
+        RowSelector::Predicate("engine_namespace IN (SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE session = ?1)"),
+        &["engine_namespace"],
+        &["engine_namespace", "revision", "session"],
+        &[],
+        Some(KeyPolicy::PreserveOrRefuseCollision),
+        None
+    ),
     table!(
         Module,
         "mc_move_tag_epochs",
@@ -2982,19 +2996,7 @@ pub const TABLES: &[TableInventory] = &[
         None,
         None
     ),
-    // Must move: a consumed-number fence cannot be reconstructed from replayed
-    // answers. All conversations sharing the number space share this history.
-    table!(
-        Module,
-        "mc_provider_policy_revisions_v1",
-        Ship,
-        RowSelector::Predicate("engine_namespace IN (SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE session = ?1)"),
-        &["engine_namespace"],
-        &["engine_namespace", "revision", "session"],
-        &[],
-        Some(KeyPolicy::PreserveOrRefuseCollision),
-        None
-    ),
+
     table!(
         Module,
         "mc_provider_policy_preparations_v1",
