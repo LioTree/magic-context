@@ -1,7 +1,6 @@
-import { join } from "node:path";
 import { connectionFileExists, SubcClient } from "@cortexkit/subc-client";
 
-import { getDataDir } from "../../../shared/data-path";
+import { getDefaultSubcConnectionFile } from "../../../shared/subc-connection-file";
 
 /** The sole wire-level coupling between standalone smart notes and scheduled wakes. */
 export const WAKE_PLANE_CAPABILITY = "wake.create";
@@ -24,12 +23,8 @@ let inFlightProbe: Promise<WakePlaneStatus> | null = null;
 let catalogProbe: CatalogProbe = probeWakePlaneCatalog;
 let now = () => Date.now();
 
-function connectionFile(): string {
-    return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
-}
-
 async function probeWakePlaneCatalog(): Promise<readonly CatalogEntry[]> {
-    const file = connectionFile();
+    const file = getDefaultSubcConnectionFile();
     if (!(await connectionFileExists(file))) {
         throw new Error("subc connection is not configured");
     }

@@ -1,9 +1,9 @@
 import { accessSync, constants, existsSync, statSync } from "node:fs";
 import path from "node:path";
-import { getDataDir } from "../../../shared/data-path";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
+import { getDefaultSubcConnectionFile } from "../../../shared/subc-connection-file";
 import { type EntorhinalResolveOptions, resolveEntorhinalProject } from "./entorhinal-resolve";
 import { readGitCheckoutMetadata } from "./git-common-dir";
 import {
@@ -89,9 +89,7 @@ async function decide(
     }
     const pinned = pin(directory);
     if (pinned) return { directory, identity: pinned };
-    const connectionFile =
-        options.connectionFile ??
-        path.join(getDataDir(), "cortexkit", "run", "subc-connection.json");
+    const connectionFile = options.connectionFile ?? getDefaultSubcConnectionFile();
     // Standalone hosts with no connection file need neither transport setup nor a deadline timer.
     const answer = existsSync(connectionFile)
         ? await resolveEntorhinalProject(directory, {

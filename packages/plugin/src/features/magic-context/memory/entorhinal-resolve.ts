@@ -1,13 +1,12 @@
-import { join } from "node:path";
 import {
     type BindIdentity,
     connectionFileExists,
     SubcCallError,
     SubcClient,
 } from "@cortexkit/subc-client";
-import { getDataDir } from "../../../shared/data-path";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
+import { getDefaultSubcConnectionFile } from "../../../shared/subc-connection-file";
 
 export const ENTORHINAL_RESOLVE_DEADLINE_MS = 500;
 
@@ -136,9 +135,7 @@ export async function resolveEntorhinalProject(
     });
     const attempt = async (): Promise<EntorhinalResolveResult> => {
         try {
-            const connectionFile =
-                options.connectionFile ??
-                join(getDataDir(), "cortexkit", "run", "subc-connection.json");
+            const connectionFile = options.connectionFile ?? getDefaultSubcConnectionFile();
             const exists = await connectionFileExists(connectionFile);
             if (pastDeadline()) return deadlineResult;
             if (!exists) return { status: "absent", reason: "no_connection_file" };

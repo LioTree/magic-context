@@ -516,6 +516,61 @@ describe("doctor project-ids plan", () => {
         expect(result.pairs).toEqual([]);
         expect(result.unchanged).toEqual([{ identity: "dir:source", reason: "not_answering" }]);
     }, 30_000);
+
+    it("uses the configured subc connection file in the CLI plan", async () => {
+        const directory = folder("configured-project");
+        source("dir:configured", [directory]);
+        const fake = await fakeProjectEndpoint(root);
+        cleanups.push(fake.close);
+        const configHome = folder("config/cortexkit");
+        writeFileSync(
+            join(configHome, "magic-context.jsonc"),
+            JSON.stringify({
+                subc: { connection_file: fake.connectionFile },
+            }),
+        );
+        const child = Bun.spawn(
+            [
+                process.execPath,
+                join(import.meta.dir, "../index.ts"),
+                "doctor",
+                "project-ids",
+                "plan",
+                "--db",
+                dbPath,
+            ],
+            {
+                cwd: root,
+                env: {
+                    PATH: process.env.PATH ?? "",
+                    HOME: root,
+                    XDG_DATA_HOME: join(root, "data"),
+                    XDG_CONFIG_HOME: join(root, "config"),
+                    XDG_STATE_HOME: join(root, "state"),
+                    MAGIC_CONTEXT_STORAGE_DIR: root,
+                },
+                windowsHide: true,
+                stdin: "ignore",
+                stdout: "pipe",
+                stderr: "pipe",
+            },
+        );
+        const [stdout, stderr, code] = await Promise.all([
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+            child.exited,
+        ]);
+        expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+        expect(stdout).toContain("1 pair(s)");
+        const file = readdirSync(root).find((name) => name.startsWith("project-id-plan-"));
+        expect(file).toBeDefined();
+        const result = JSON.parse(readFileSync(join(root, file!), "utf8")) as ProjectIdPlan;
+        expect(result.pairs.map(({ from, to }) => [from, to])).toEqual([
+            ["dir:configured", fake.projectId],
+        ]);
+        expect(fake.calls).toEqual([directory]);
+        expect(fake.failures).toEqual([]);
+    }, 30_000);
 });
 
 it("parses only the online plan command and its path overrides", () => {

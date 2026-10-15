@@ -67,6 +67,30 @@ pub fn cache() -> &'static ProjectNameCache {
 }
 
 pub fn connection_file() -> PathBuf {
+    let config_path = crate::config::resolve_user_config_path(&crate::config::config_home());
+    // Daemon routing is trusted user configuration, never project configuration.
+    if let Some(file) = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(&text)).ok()
+        })
+        .and_then(|config| {
+            config
+                .get("subc")?
+                .get("connection_file")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .map(|file| file.trim().to_owned())
+        .filter(|file| !file.is_empty())
+    {
+        if file == "~" || file.starts_with("~/") {
+            return dirs::home_dir()
+                .unwrap_or_default()
+                .join(file.strip_prefix("~/").unwrap_or(""));
+        }
+        return PathBuf::from(file);
+    }
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));

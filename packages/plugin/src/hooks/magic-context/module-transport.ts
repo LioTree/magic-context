@@ -1,5 +1,4 @@
 import { realpathSync } from "node:fs";
-import { join } from "node:path";
 import {
     AdmissionClass,
     type BindIdentity,
@@ -13,10 +12,9 @@ import {
     StaleRouteHandleError,
     SubcClient,
 } from "@cortexkit/subc-client";
-
-import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { isRecord } from "../../shared/record-type-guard";
+import { getDefaultSubcConnectionFile } from "../../shared/subc-connection-file";
 import { assembleReplyPages } from "./reply-pages";
 import { singleStoreMigrationRequiredFailure } from "./single-store-refusal";
 import { storeAheadOfBinaryFailure } from "./store-ahead-refusal";
@@ -68,10 +66,7 @@ const SERIAL_LANE_MAX_WAITERS_PER_SESSION = 8;
 const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
-/** Platform connection file used when resolved configuration has no subc block. */
-export function getDefaultSubcConnectionFile(): string {
-    return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
-}
+export { getDefaultSubcConnectionFile };
 
 function errorChainSome(
     error: unknown,
