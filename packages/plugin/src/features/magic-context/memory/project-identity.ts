@@ -26,6 +26,7 @@ import {
     readRememberedGitIdentity,
     readRememberedProjectIdentity,
     rememberGitIdentity,
+    rememberPinnedProjectIdentity,
 } from "./project-identity-cache";
 
 // execFileSync is intentional here (audit #19): this runs once per unique directory per process
@@ -553,6 +554,49 @@ function pinForUsableDirectory(canonical: string, directory: string): string | u
     }
     const pinned = readRememberedProjectIdentity(canonical)?.identity;
     return isPinnedProjectIdentity(pinned) ? pinned : undefined;
+}
+
+export interface LiveProjectIdentityAnswer {
+    projectId: string;
+    via: string;
+    canonicalRoot: string | null;
+}
+
+/** Call only for a live answer received before the session's resolution deadline, never for a cache match. */
+export function rememberResolvedProjectIdentity(
+    directory: string,
+    answer: LiveProjectIdentityAnswer,
+    allowHomeProject = homeProjectPermission,
+): void {
+    if (
+        !["root", "walk", "containment", "worktree"].includes(answer.via) ||
+        !isPinnedProjectIdentity(answer.projectId)
+    )
+        return;
+    try {
+        assertProjectAllowed(directory, allowHomeProject);
+        const canonical = path.resolve(directory);
+        assertDirectoryUsable(canonical, directory);
+        const metadata = readGitCheckoutMetadata(canonical);
+        // Use fresh topology: a cached non-worktree result must not authorize a pin after a checkout changes.
+        const linked =
+            metadata?.gitCommonDir === undefined ? hasGitDir(canonical) : metadata.linkedWorktree;
+        if (linked) return;
+        rememberPinnedProjectIdentity(canonical, answer.projectId, metadata?.gitCommonDir);
+        if (metadata && answer.canonicalRoot !== null) {
+            // A separately registered subfolder must not claim its containing checkout.
+            const answerRoot = projectDirectoryKey(realpathSync.native(answer.canonicalRoot));
+            const checkoutRoot = projectDirectoryKey(realpathSync.native(metadata.checkoutRoot));
+            if (answerRoot === checkoutRoot && projectDirectoryKey(canonical) !== checkoutRoot)
+                rememberPinnedProjectIdentity(
+                    checkoutRoot,
+                    answer.projectId,
+                    metadata.gitCommonDir,
+                );
+        }
+    } catch {
+        // Missing folders or unverifiable roots cannot authorize additional pins.
+    }
 }
 
 export function resolveProjectIdentity(
