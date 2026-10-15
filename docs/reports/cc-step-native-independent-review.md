@@ -142,7 +142,7 @@ The broad run's capture test reported its documented environment-variable skip;
 the separate actual-capture gate above is the capture evidence. A first witness
 compile had an unqualified `CkKind` test import; it was fixed before passing runs.
 The editor's code-health inspection was partial: rust-analyzer could not resolve
-the existing test module at `../../../../docs/reports/cc-step-lane-witnesses.rs`;
+the existing test module, now at `crates/mc-module/src/providers/cc_step_lane_witnesses.rs`;
 the Linux all-target check is the authoritative type/diagnostic gate.
 
 ## Mutation controls

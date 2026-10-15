@@ -13,7 +13,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "crates/mc-module/src/providers/mod.rs"
-REGISTRATION = '\n#[cfg(test)]\n#[path = "../../../../docs/reports/cc-step-lane-witnesses.rs"]\nmod cc_step_lane_review;\n'
+REGISTRATION = '\n#[cfg(test)]\n#[path = "cc_step_lane_witnesses.rs"]\nmod cc_step_lane_review;\n'
 CODEC = "crates/mc-module/src/providers/codec_claude_code.rs"
 COMPACTION = "crates/mc-module/src/providers/compaction.rs"
 CONTROLS = {

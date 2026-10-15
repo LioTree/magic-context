@@ -16,7 +16,7 @@ The three tests below are deliberately `#[ignore]` in the normal review suite. R
 
 `codec_claude_code.rs:283-293` and `:344-352` select the **first** raw `content` span with `.find`; decoding at `:74-78` uses serde's **last** duplicate member. The signed-prefix span is therefore not necessarily the span containing the effective signed block.
 
-Witness: `duplicate_content_cannot_edit_bytes_before_effective_kept_thinking` in `cc-step-lane-witnesses.rs`.
+Witness: `duplicate_content_cannot_edit_bytes_before_effective_kept_thinking` in `crates/mc-module/src/providers/cc_step_lane_witnesses.rs`.
 
 ```json
 {"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"s"},{"type":"text","text":"before-second-content"}],"content":[{"type":"thinking","thinking":"private","signature":"s"},{"type":"text","text":"after-effective-thinking"}]}
@@ -141,7 +141,7 @@ python3 -I docs/reports/cc-step-lane-review-runner.py remove
 For each mutation, install the witnesses, stage **only** the specific live provider files and witness file, confirm the unstaged diff is empty, then run the selected action and its command:
 
 ```sh
-git add crates/mc-module/src/providers/mod.rs crates/mc-module/src/providers/codec_claude_code.rs crates/mc-module/src/providers/compaction.rs docs/reports/cc-step-lane-witnesses.rs
+git add crates/mc-module/src/providers/mod.rs crates/mc-module/src/providers/codec_claude_code.rs crates/mc-module/src/providers/compaction.rs crates/mc-module/src/providers/cc_step_lane_witnesses.rs
 git diff --stat
 python3 -I docs/reports/cc-step-lane-review-runner.py author-signed-prefix
 cargo test -p mc-module -j 4 --lib providers::codec_claude_code::tests:: -- --skip opaque_native_thinking_shapes_still_fence_their_signed_prefix --skip real_claude_code_capture_roundtrips_actual_raw_replacement_bytes
