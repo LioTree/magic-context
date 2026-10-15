@@ -8,8 +8,8 @@ mod compaction_review_tests;
 #[path = "setup_descent_tests.rs"]
 mod setup_descent_tests;
 use mc_store::provider_records::{
-    ProviderConversation, ProviderError, ProviderLineage, ProviderMessage, ProviderSubject,
-    ProviderView,
+    ProviderAnswerTag, ProviderConversation, ProviderError, ProviderHookAnswer, ProviderLineage,
+    ProviderMessage, ProviderSubject, ProviderView, ProviderViewHealing,
 };
 use serde::Deserialize;
 
@@ -467,9 +467,17 @@ fn claude_code_baseline_tags(
 ) -> Result<BTreeMap<String, u64>, HandlerOutcome> {
     let mut cuts = HashMap::new();
     let mut subjects = BTreeMap::new();
+    let applied = store
+        .load_provider_applied_view_versions(&key.store_key())
+        .map_err(transient)?;
     for stored in answers {
         if !matches!(stored.state.as_str(), "pending" | "live") {
             continue;
+        }
+        if let Some(version) = stored.policy["heal_view_version"].as_u64() {
+            if !applied.contains(&version) {
+                continue;
+            }
         }
         let cut = match cuts.get(&stored.lineage_id) {
             Some(cut) => *cut,
@@ -498,6 +506,241 @@ fn claude_code_baseline_tags(
         }
     }
     Ok(tags)
+}
+
+/// Plan only unchanged, pending native parts. Proposed prefixes are not written
+/// into the engine's messages or the served baseline.
+#[allow(clippy::too_many_arguments)] // replacement identity and its answer/baseline snapshot
+fn claude_code_healing(
+    store: &McStore,
+    key: &Key,
+    binding: &SessionBinding,
+    conversation: &ProviderConversation,
+    view: &transform::compaction::View,
+    request: &TransformRequest,
+    baseline: &BTreeMap<String, u64>,
+    answers: &[mc_store::provider_records::ProviderStoredAnswer],
+) -> Result<ProviderViewHealing, HandlerOutcome> {
+    let counters: Value =
+        serde_json::from_str(&conversation.hook_counters_json).map_err(transient)?;
+    let plan: Value = conversation
+        .native_plan_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(transient)?
+        .unwrap_or(Value::Null);
+    let owns_reduction = plan.get("composition").is_none_or(Value::is_null)
+        || plan
+            .pointer("/composition/compaction/provider")
+            .and_then(Value::as_str)
+            == Some(DEFAULT_MODULE_ID);
+    // Only the THALAMUS-authenticated Claude Code route can execute the frozen
+    // MC plan. It permits one step provider; opaque composition cannot name
+    // another one here. Like admission tags, heals require MC to own compaction
+    // so ctx_reduce can resolve their numbers.
+    let authorized = counters["auto_tag"] == true
+        && attested_claude_code(binding)
+        && conversation.native_plan_json.is_some()
+        && owns_reduction;
+    let signed = super::codec_claude_code::keeps_signed_prefix(view)?;
+    let mut healing = ProviderViewHealing::default();
+    let mut targets = BTreeMap::new();
+    let applied = store
+        .load_provider_applied_view_versions(&key.store_key())
+        .map_err(transient)?;
+    let lineage = store
+        .load_provider_lineage(&key.store_key(), &view.range.lineage_id)
+        .map_err(transient)?;
+    let mut covered_subjects = BTreeSet::new();
+    for answer in answers
+        .iter()
+        .filter(|a| matches!(a.state.as_str(), "pending" | "live"))
+    {
+        if answer.policy["heal_view_version"]
+            .as_u64()
+            .is_some_and(|v| !applied.contains(&v))
+        {
+            continue;
+        }
+        let Some(lineage) = &lineage else {
+            continue;
+        };
+        if ancestor_cut(store, key, lineage, &answer.lineage_id)?
+            .is_some_and(|cut| answer.answer.ordinal <= cut)
+        {
+            let subject = &answer.answer.subject;
+            covered_subjects.insert((
+                subject.subject_mid.as_str(),
+                subject.hook.as_str(),
+                subject.subject_part.as_str(),
+            ));
+        }
+    }
+    for message in &view.replacement {
+        let Some(mid) = message
+            .provider_extras
+            .get(super::codec_claude_code::EXTRAS)
+            .and_then(|e| e["mid"].as_str())
+        else {
+            continue;
+        };
+        let Some(original) = request.messages.iter().find(|m| m.mid == mid) else {
+            continue;
+        };
+        if original.ck.meta.synthetic || original.ck.role == "system" {
+            continue;
+        }
+        let mixed = original.ck.role == "user"
+            && original
+                .ck
+                .content
+                .iter()
+                .any(|b| matches!(b.kind, ck_wire::CkKind::ToolResult { .. }));
+        let stripped = super::codec_claude_code::strips_signed_turn(message);
+        let mut position = 0;
+        let mut text_index = 0;
+        for (index, block) in original.ck.content.iter().enumerate() {
+            if stripped && super::codec_claude_code::is_thinking_block(block) {
+                continue;
+            }
+            let kept = message
+                .content
+                .get(position)
+                .is_some_and(|b| b.kind == block.kind);
+            position += 1;
+            let hook_index = text_index;
+            if matches!(block.kind, ck_wire::CkKind::Text { .. }) {
+                text_index += 1;
+            }
+            if !kept {
+                continue;
+            }
+            let block_id = ck_wire::block_id(mid, index);
+            healing.kept_blocks.insert(block_id.clone());
+            if !authorized || baseline.contains_key(&block_id) {
+                continue;
+            }
+            let (hook, part, hook_index) = match &block.kind {
+                ck_wire::CkKind::Text { .. } if original.ck.role == "user" && !mixed => {
+                    ("pre_user", "", hook_index)
+                }
+                ck_wire::CkKind::Text { text }
+                    if original.ck.role == "assistant"
+                        && !text.trim().is_empty()
+                        && owns_reduction =>
+                {
+                    ("post_assistant", "", hook_index)
+                }
+                ck_wire::CkKind::ToolResult { id, .. } => ("post_tool", id.as_str(), 0),
+                _ => continue,
+            };
+            if !covered_subjects.contains(&(mid, hook, part)) {
+                targets.insert(block_id, (hook.to_string(), part.to_string(), hook_index));
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Ok(healing);
+    }
+    let projection = ck_wire::project_messages(&request.messages).map_err(transient)?;
+    let tags = projection
+        .blocks
+        .iter()
+        .filter_map(|b| {
+            transform::taggable_source(b).map(|(kind, source)| McTagRow {
+                tag_number: b.block_index as i64 + 1,
+                block_id: b.id.clone(),
+                kind: kind.as_store_kind().into(),
+                token_count: mc_tokenizer::estimate_tokens(&source) as i64,
+                created_at_ms: 0,
+                source_bytes: Arc::from([]),
+            })
+        })
+        .collect::<Vec<_>>();
+    let empty = crate::protection_window::ProtectionWindow::from_persisted_rows(&[], 0);
+    let measured = crate::tail_hygiene::measure_tail_hygiene_with_pending_drops(
+        &projection,
+        &Default::default(),
+        None,
+        &tags,
+        &empty.tag_numbers,
+        &Default::default(),
+        &Default::default(),
+    );
+    let mut parts = transform::capture_provider_parts(
+        request,
+        &projection,
+        &Default::default(),
+        &measured.parts,
+        &tags,
+        false,
+    );
+    parts.retain(|p| targets.contains_key(&p.block_id) && p.tag_kind.is_some());
+    if signed {
+        healing
+            .signed_holds
+            .extend(parts.into_iter().map(|p| p.block_id));
+        return Ok(healing);
+    }
+    for part in &mut parts {
+        part.subject_part = targets[&part.block_id].1.clone();
+    }
+    healing.parts = store
+        .plan_provider_healing(&key.store_key(), &view.range.lineage_id, &parts)
+        .map_err(transient)?;
+    let mut subjects = BTreeMap::<
+        (String, String, String),
+        (ProviderHookAnswer, Vec<hooks::answer::Operation>),
+    >::new();
+    for part in &healing.parts {
+        let (hook, subject_part, hook_index) = &targets[&part.block_id];
+        let number = part
+            .tag_number
+            .ok_or_else(|| transient("heal reservation missing"))?;
+        let block = projection
+            .blocks
+            .iter()
+            .find(|b| b.id == part.block_id)
+            .ok_or_else(|| transient("heal source missing"))?;
+        let (kind, source) = transform::taggable_source(block)
+            .ok_or_else(|| transient("heal source is not taggable"))?;
+        let (answer, ops) = subjects
+            .entry((part.mid.clone(), hook.clone(), subject_part.clone()))
+            .or_insert_with(|| {
+                (
+                    ProviderHookAnswer {
+                        subject: ProviderSubject {
+                            subject_mid: part.mid.clone(),
+                            hook: hook.clone(),
+                            subject_part: subject_part.clone(),
+                        },
+                        ordinal: part.ordinal,
+                        ops_json: String::new(),
+                        tags: Vec::new(),
+                    },
+                    Vec::new(),
+                )
+            });
+        answer.tags.push(ProviderAnswerTag {
+            number,
+            block_id: part.block_id.clone(),
+            kind: kind.as_store_kind().into(),
+            token_count: mc_tokenizer::estimate_tokens(&source) as i64,
+            source: source.into_owned(),
+            created_at_ms: now_ms(),
+        });
+        ops.push(hooks::answer::Operation::Prepend {
+            block: *hook_index as u32,
+            text: transform::tag_prefix(number),
+            note: None,
+        });
+    }
+    for (mut answer, ops) in subjects.into_values() {
+        answer.ops_json = serde_json::to_string(&ops).map_err(transient)?;
+        healing.answers.push(answer);
+    }
+    Ok(healing)
 }
 
 /// The conversation row is rewritten by every hook, so it keeps a receipt of
@@ -534,20 +777,21 @@ fn save_host_view(
     key: &Key,
     view: &HostView,
     state: &str,
+    healing: Option<&ProviderViewHealing>,
 ) -> Result<(), HandlerOutcome> {
-    store
-        .save_provider_view(
-            &key.store_key(),
-            &ProviderView {
-                version: view.engine.version,
-                lineage_id: view.engine.range.lineage_id.clone(),
-                range_from: view.engine.range.from,
-                range_to: view.engine.range.to,
-                replacement_json: serde_json::to_string(view).map_err(transient)?,
-                state: state.into(),
-            },
-        )
-        .map_err(|e| transient(format!("save provider view: {e}")))
+    let stored = ProviderView {
+        version: view.engine.version,
+        lineage_id: view.engine.range.lineage_id.clone(),
+        range_from: view.engine.range.from,
+        range_to: view.engine.range.to,
+        replacement_json: serde_json::to_string(view).map_err(transient)?,
+        state: state.into(),
+    };
+    match healing {
+        Some(healing) => store.save_provider_view_with_healing(&key.store_key(), &stored, healing),
+        None => store.save_provider_view(&key.store_key(), &stored),
+    }
+    .map_err(|e| transient(format!("save provider view: {e}")))
 }
 
 fn load_host_view(
@@ -736,7 +980,7 @@ fn host_engine_step(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_host(
+fn execute_host_with_healing(
     store: &McStore,
     work: &Work,
     conversation: &ProviderConversation,
@@ -745,7 +989,7 @@ fn execute_host(
     lineage: &ProviderLineage,
     request_id: &str,
     native_status: Option<&compact::status::StepStatus>,
-) -> Result<Option<HostView>, HandlerOutcome> {
+) -> Result<Option<(HostView, ProviderViewHealing)>, HandlerOutcome> {
     let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
     let messages = non_tag_messages(store, &work.key, lineage)?;
     let mut template: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
@@ -1090,13 +1334,17 @@ fn execute_host(
             return Ok(None);
         }
     }
-    let (mut wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) = previous
-        .filter(|p| {
+    let (mut wire, mut coverage, mut raw_replacement, mut head_slots) = if let Some(previous) =
+        previous.filter(|p| {
+            let proposed_healing = live
+                .iter()
+                .any(|a| a.policy["heal_view_version"].as_u64() == Some(p.engine.version));
             status
                 .last_not_applied
                 .is_some_and(|n| !n.structural && n.version == p.engine.version)
                 && p.engine.replacement == engine.replacement
                 && p.engine.range == engine.range
+                && !proposed_healing
                 && coverage_replay_matches(
                     codec,
                     p.coverage.as_ref().map(|coverage| coverage.ordinal),
@@ -1168,6 +1416,7 @@ fn execute_host(
             .map(|raw| super::cache_policy::head_slots(&engine, raw, setup.setup.state.preset));
         (wire, coverage, raw_replacement, head_slots)
     };
+    let mut healing = ProviderViewHealing::default();
     if codec == Codec::ClaudeCodeAnthropic {
         // A summary ending inside an original message cannot remove that whole
         // message: its unsummarized parts would be lost. Preserve that refusal
@@ -1211,6 +1460,32 @@ fn execute_host(
         // The raw bytes replace the entire range, even when its tail is
         // re-rendered verbatim or only the earlier prefix was summarized.
         coverage = native_range_coverage(&engine, &template, &messages)?;
+        healing = claude_code_healing(
+            store,
+            &work.key,
+            &work.binding,
+            conversation,
+            &engine,
+            &template,
+            &admission_tags,
+            &live,
+        )?;
+        let heal_tags = healing
+            .parts
+            .iter()
+            .map(|p| (p.block_id.clone(), p.tag_number.unwrap() as u64))
+            .collect();
+        super::codec_claude_code::splice_view_healing(
+            &engine,
+            &mut wire,
+            raw_replacement
+                .as_mut()
+                .ok_or_else(|| invalid_field("raw_view"))?,
+            &heal_tags,
+        )?;
+        head_slots = raw_replacement
+            .as_ref()
+            .map(|raw| super::cache_policy::head_slots(&engine, raw, setup.setup.state.preset));
         wire.raw_view = super::native_view::frozen_for_plan(
             &work.key,
             &engine,
@@ -1232,7 +1507,32 @@ fn execute_host(
     if codec == Codec::ClaudeCodeAnthropic && view.wire.raw_view.is_some() {
         super::native_cut::attach(&work.key, &mut view, &template)?;
     }
-    Ok(Some(view))
+    Ok(Some((view, healing)))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn execute_host(
+    store: &McStore,
+    work: &Work,
+    conversation: &ProviderConversation,
+    setup: &mut HostSetup,
+    status: &transform::compaction::Status,
+    lineage: &ProviderLineage,
+    request_id: &str,
+    native_status: Option<&compact::status::StepStatus>,
+) -> Result<Option<HostView>, HandlerOutcome> {
+    execute_host_with_healing(
+        store,
+        work,
+        conversation,
+        setup,
+        status,
+        lineage,
+        request_id,
+        native_status,
+    )
+    .map(|produced| produced.map(|(view, _)| view))
 }
 
 fn native_range_coverage(
@@ -1853,7 +2153,7 @@ impl McHandler {
             )?));
             super::native_cut::refresh(key, &mut view, retained)?;
         }
-        save_host_view(store, key, &view, "applied")?;
+        save_host_view(store, key, &view, "applied", None)?;
         setup.setup.state.version_high_water = high;
         setup.applied = Some(ViewSummary::from(&view.engine));
         setup.produced = setup.applied.clone();
@@ -2125,7 +2425,10 @@ impl McHandler {
                 .map_err(transient)?;
             normalized.prefix_rebuilding = false;
         }
-        if let Some(rejected) = normalized.last_not_applied.filter(|v| v.structural) {
+        if let Some(rejected) = normalized
+            .last_not_applied
+            .filter(|v| v.structural || codec == Codec::ClaudeCodeAnthropic)
+        {
             store
                 .set_provider_view_state(&work.key.store_key(), rejected.version, "not_applied")
                 .map_err(transient)?;
@@ -2235,7 +2538,7 @@ impl McHandler {
                     .checked_add(1)
                     .ok_or_else(|| transient("version exhausted"))?;
                 save_host_setup(store, &work.key, &mut conversation, &setup)?;
-                let view = match execute_host(
+                let view = match execute_host_with_healing(
                     store,
                     work,
                     &conversation,
@@ -2270,9 +2573,25 @@ impl McHandler {
                     serde_json::from_str(&current.hook_counters_json).map_err(transient)?;
                 counters["channel1_hook_append_pending"] = json!(false);
                 conversation.hook_counters_json = counters.to_string();
-                if let Some(view) = view {
+                if let Some((view, healing)) = view {
                     raw_replacement = view.raw_replacement.clone();
-                    save_host_view(store, &work.key, &view, "produced")?;
+                    save_host_view(
+                        store,
+                        &work.key,
+                        &view,
+                        "produced",
+                        (codec == Codec::ClaudeCodeAnthropic).then_some(&healing),
+                    )?;
+                    conversation.hook_counters_json = store
+                        .load_provider_conversation(&work.key.store_key())
+                        .map_err(transient)?
+                        .ok_or_else(|| transient("provider conversation disappeared"))?
+                        .hook_counters_json;
+                    let mut counters: Value =
+                        serde_json::from_str(&conversation.hook_counters_json)
+                            .map_err(transient)?;
+                    counters["channel1_hook_append_pending"] = json!(false);
+                    conversation.hook_counters_json = counters.to_string();
                     setup.produced = Some(ViewSummary::from(&view.engine));
                     let mut answer = json!({"answer":"compaction_message","request_id":request.request_id,"compaction":view.wire});
                     if let Some(slots) = view.head_slots {
@@ -4675,7 +4994,7 @@ mod served_baseline_tests {
                 &key,
                 &answer,
                 if burned {
-                    raw
+                    r#"{ "role":"user", "content":"§2§ a\u0062" }"#
                 } else {
                     r#"{ "role":"user", "content":"§1§ a\u0062" }"#
                 },
@@ -4687,6 +5006,15 @@ mod served_baseline_tests {
                 .load_provider_hook_answers(&key.store_key())
                 .unwrap();
             assert_eq!(answers[0].state, if burned { "burned" } else { "live" });
+            if burned {
+                assert_eq!(answers.len(), 2);
+                assert_eq!(answers[1].state, "pending");
+                assert_eq!(answers[1].answer.tags[0].number, 2);
+                assert_eq!(
+                    answers[1].policy["heal_view_version"],
+                    answer["compaction"]["version"]
+                );
+            }
         }
     }
 }
@@ -4760,5 +5088,806 @@ mod native_empty_tests {
         let answer = json!({"answer":"compaction_message","request_id":"empty","compaction":wire});
         let pins = McHandler::new().native_pins();
         super::super::claude_code_tests::validate_native_answer(&answer, &pins);
+    }
+}
+
+#[cfg(test)]
+mod healing_tests {
+    use super::super::claude_code_tests::{call, handler as cc_handler, setup, step, thalamus};
+    use super::*;
+    use mc_store::provider_records::{ProviderHookRequest, ProviderHookWrite};
+
+    const TWO: &str = r#"{ "role":"user", "content":[{"type":"text","text":"a\u0062"},{"type":"text","text":"§999§ authored"}] }"#;
+    const TWO_SERVED: &str = r#"{ "role":"user", "content":[{"type":"text","text":"§7§ a\u0062"},{"type":"text","text":"§8§ §999§ authored"}] }"#;
+
+    struct LocalSessionResolver;
+    #[async_trait::async_trait]
+    impl crate::session_resolver::SessionResolver for LocalSessionResolver {
+        async fn resolve_session(
+            &self,
+            _: &Path,
+            _: &str,
+            _: &str,
+        ) -> Result<
+            Option<crate::session_resolver::ResolvedSession>,
+            crate::session_resolver::SessionResolveError,
+        > {
+            Ok(Some(crate::session_resolver::ResolvedSession {
+                session_id: "cc".into(),
+                last_traffic_ms: 1,
+            }))
+        }
+    }
+    fn handler(root: &Path, principal: Option<subc_protocol::Principal>) -> McHandler {
+        let mut h = cc_handler(root, principal);
+        h.session_resolver = Arc::new(LocalSessionResolver);
+        h
+    }
+
+    fn response(outcome: HandlerOutcome) -> Value {
+        let HandlerOutcome::Response(bytes) = outcome else {
+            panic!("{outcome:?}")
+        };
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn fixture(
+        h: &McHandler,
+        raws: &[&str],
+    ) -> (Key, TransformRequest, transform::compaction::View) {
+        setup(h).await;
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        store
+            .update_provider_hook_counters(&key.store_key(), |c| {
+                c["auto_tag"] = json!(true);
+            })
+            .unwrap();
+        let entries = raws
+            .iter()
+            .enumerate()
+            .map(|(ordinal, raw)| compact::status::StatusMessage {
+                mid: format!("m{ordinal}"),
+                ordinal: ordinal as u64,
+                raw_message: None,
+                message: super::super::codec_claude_code::from_wire(
+                    &serde_json::from_str::<Value>(raw).unwrap(),
+                    Some(raw),
+                )
+                .unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let messages = entries
+            .iter()
+            .map(|m| ProviderMessage {
+                mid: m.mid.clone(),
+                ordinal: m.ordinal,
+                message_bytes: serde_json::to_vec(&m.message).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let lineage = ProviderLineage {
+            lineage_id: "L".into(),
+            first_ordinal: 0,
+            descends_from: None,
+            through_ordinal: None,
+        };
+        store
+            .commit_provider_status(&key.store_key(), &lineage, &messages, None, &[])
+            .unwrap();
+        let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step","serializer_profile":"claude-code-anthropic","session_id":key.engine_key(),"render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false})).unwrap();
+        Codec::ClaudeCodeAnthropic
+            .prepare_request(&mut request, &entries)
+            .unwrap();
+        let view = transform::compaction::View {
+            compaction_id: "healing".into(),
+            version: 2,
+            range: transform::compaction::Range {
+                lineage_id: "L".into(),
+                from: 0,
+                to: raws.len() as u64,
+            },
+            replacement: request.messages.iter().map(|m| m.ck.clone()).collect(),
+        };
+        (key, request, view)
+    }
+
+    fn proposal(
+        h: &McHandler,
+        key: &Key,
+        request: &TransformRequest,
+        engine: &transform::compaction::View,
+    ) -> (HostView, ProviderViewHealing) {
+        let store = h.store.get().unwrap();
+        let conversation = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        let lineage = store
+            .load_provider_lineage(&key.store_key(), "L")
+            .unwrap()
+            .unwrap();
+        let answers = store.load_provider_hook_answers(&key.store_key()).unwrap();
+        let baseline = claude_code_baseline_tags(store, key, &lineage, &answers).unwrap();
+        let healing = claude_code_healing(
+            store,
+            key,
+            &h.facade_binding(7).unwrap(),
+            &conversation,
+            engine,
+            request,
+            &baseline,
+            &answers,
+        )
+        .unwrap();
+        let (mut wire, mut raw) = super::super::codec_claude_code::encode_view_with_baseline(
+            engine,
+            request,
+            engine.range.to.checked_sub(1),
+            &baseline,
+        )
+        .unwrap();
+        let tags = healing
+            .parts
+            .iter()
+            .map(|p| (p.block_id.clone(), p.tag_number.unwrap() as u64))
+            .collect();
+        super::super::codec_claude_code::splice_view_healing(engine, &mut wire, &mut raw, &tags)
+            .unwrap();
+        (
+            HostView {
+                engine: engine.clone(),
+                wire,
+                coverage: None,
+                raw_replacement: Some(raw),
+                head_slots: None,
+                cut_replacement: None,
+            },
+            healing,
+        )
+    }
+
+    fn save(h: &McHandler, key: &Key, proposal: &(HostView, ProviderViewHealing)) {
+        save_host_view(
+            h.store.get().unwrap(),
+            key,
+            &proposal.0,
+            "produced",
+            Some(&proposal.1),
+        )
+        .unwrap();
+    }
+
+    fn parts(h: &McHandler, key: &Key) -> Vec<mc_store::provider_records::ProviderPolicyPart> {
+        let store = h.store.get().unwrap();
+        let lineage = store
+            .load_provider_lineage(&key.store_key(), "L")
+            .unwrap()
+            .unwrap();
+        store
+            .commit_provider_hook(
+                &key.store_key(),
+                ProviderHookRequest {
+                    lineage: &lineage,
+                    message: None,
+                    served_through_ordinal: None,
+                    unserved_subjects: &[],
+                    repeat_subject: None,
+                },
+                |ctx| {
+                    Ok((
+                        ProviderHookWrite {
+                            answer: None,
+                            counters: ctx.counters.clone(),
+                            policy_summary: None,
+                        },
+                        ctx.policy_index.all_parts()?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    fn watermark(h: &McHandler, key: &Key, served: u64) {
+        let store = h.store.get().unwrap();
+        let lineage = store
+            .load_provider_lineage(&key.store_key(), "L")
+            .unwrap()
+            .unwrap();
+        let frontier = store.provider_frontier(&key.store_key(), "L").unwrap();
+        let messages = (frontier..=served)
+            .map(|ordinal| ProviderMessage {
+                ordinal,
+                mid: format!("watermark-{ordinal}"),
+                message_bytes: serde_json::to_vec(
+                    &super::super::codec_claude_code::from_wire(
+                        &json!({"role":"user","content":"later"}),
+                        Some(r#"{"role":"user","content":"later"}"#),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            })
+            .collect::<Vec<_>>();
+        store
+            .commit_provider_status(&key.store_key(), &lineage, &messages, Some(served), &[])
+            .unwrap();
+    }
+
+    fn seed_held_seven(
+        h: &McHandler,
+        key: &Key,
+        request: &TransformRequest,
+        engine: &transform::compaction::View,
+    ) {
+        let store = h.store.get().unwrap();
+        let planned = proposal(h, key, request, engine).1;
+        let mut held = planned.parts[0].clone();
+        held.tag_number = None;
+        store
+            .update_provider_hook_counters(&key.store_key(), |c| {
+                c["reserved_tag_high_water"] = json!(6);
+            })
+            .unwrap();
+        let lineage = store
+            .load_provider_lineage(&key.store_key(), "L")
+            .unwrap()
+            .unwrap();
+        store
+            .commit_provider_hook_with_parts(
+                &key.store_key(),
+                ProviderHookRequest {
+                    lineage: &lineage,
+                    message: None,
+                    served_through_ordinal: None,
+                    unserved_subjects: &[],
+                    repeat_subject: None,
+                },
+                &[held],
+                |ctx| {
+                    Ok((
+                        ProviderHookWrite {
+                            answer: None,
+                            counters: ctx.counters.clone(),
+                            policy_summary: None,
+                        },
+                        (),
+                    ))
+                },
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn healing_two_blocks_one_subject_reuses_held_number_and_restart_keeps_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        let (key, request, engine) = fixture(&h, &[TWO]).await;
+        seed_held_seven(&h, &key, &request, &engine);
+        let proposed = proposal(&h, &key, &request, &engine);
+        assert_eq!(proposed.0.raw_replacement.as_ref().unwrap(), &[TWO_SERVED]);
+        assert_eq!(proposed.1.answers.len(), 1);
+        assert_eq!(
+            proposed.1.answers[0].subject,
+            ProviderSubject {
+                subject_mid: "m0".into(),
+                hook: "pre_user".into(),
+                subject_part: "".into()
+            }
+        );
+        assert_eq!(
+            proposed.1.answers[0]
+                .tags
+                .iter()
+                .map(|t| t.number)
+                .collect::<Vec<_>>(),
+            [7, 8]
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&proposed.1.answers[0].ops_json).unwrap()[1]["block"],
+            1
+        );
+        save(&h, &key, &proposed);
+        drop(h);
+        let h = handler(dir.path(), thalamus());
+        let store = h.store.get().unwrap();
+        let answers = store.load_provider_hook_answers(&key.store_key()).unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].policy["heal_view_version"], 2);
+        assert_eq!(answers[0].state, "pending");
+        let lineage = store
+            .load_provider_lineage(&key.store_key(), "L")
+            .unwrap()
+            .unwrap();
+        let baseline = claude_code_baseline_tags(store, &key, &lineage, &answers).unwrap();
+        assert!(baseline.is_empty());
+        assert_eq!(
+            super::super::codec_claude_code::admission_served_bytes(
+                TWO.into(),
+                &request.messages[0].ck,
+                &baseline
+            )
+            .unwrap(),
+            TWO
+        );
+        let stored: HostView = serde_json::from_str(
+            &store
+                .load_provider_view(&key.store_key(), 2)
+                .unwrap()
+                .unwrap()
+                .replacement_json,
+        )
+        .unwrap();
+        assert_eq!(stored.raw_replacement.unwrap(), [TWO_SERVED]);
+        let replay = proposal(&h, &key, &request, &engine);
+        assert_eq!(replay.0.raw_replacement.unwrap(), [TWO_SERVED]);
+        save(&h, &key, &proposed);
+        assert_eq!(
+            store
+                .load_provider_hook_answers(&key.store_key())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn healing_promotion_waits_for_applied_and_strictly_new_watermark_then_reduce_resolves_reused_tag(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        let (key, request, mut engine) = fixture(&h, &[TWO]).await;
+        seed_held_seven(&h, &key, &request, &engine);
+        save(&h, &key, &proposal(&h, &key, &request, &engine));
+        watermark(&h, &key, 1);
+        let store = h.store.get().unwrap();
+        assert_eq!(
+            store.load_provider_hook_answers(&key.store_key()).unwrap()[0].state,
+            "pending"
+        );
+        engine.version = 3;
+        let superseding = proposal(&h, &key, &request, &engine);
+        assert_eq!(superseding.1.parts[0].tag_number, Some(7));
+        save(&h, &key, &superseding);
+        assert_eq!(
+            store
+                .load_provider_hook_answers(&key.store_key())
+                .unwrap()
+                .iter()
+                .map(|a| a.state.as_str())
+                .collect::<Vec<_>>(),
+            ["burned", "pending"]
+        );
+        assert!(parts(&h, &key).iter().all(|p| p.active && !p.retired));
+        store
+            .set_provider_view_state(&key.store_key(), 3, "applied")
+            .unwrap();
+        watermark(&h, &key, 1);
+        store
+            .set_provider_view_state(&key.store_key(), 3, "applied")
+            .unwrap();
+        assert_eq!(
+            store.load_provider_hook_answers(&key.store_key()).unwrap()[1].state,
+            "pending"
+        );
+        let baseline = proposal(&h, &key, &request, &engine);
+        assert!(baseline.1.answers.is_empty());
+        assert_eq!(baseline.0.raw_replacement.unwrap(), [TWO_SERVED]);
+        let replay = response(call(&h, "transform.hook", json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"replay","subject_mid":"m0","subject_ordinal":0,"hook":"pre_user","blocks":["ab","§999§ authored"],"message":serde_json::from_str::<Value>(TWO).unwrap(),"raw_message":TWO,"served_through_ordinal":1})).await);
+        assert_eq!(replay["ops"][0]["text"], "§7§ ");
+        let replayed = store.load_provider_hook_answers(&key.store_key()).unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[1].policy["heal_view_version"], 3);
+        assert_eq!(replayed[1].state, "pending");
+        watermark(&h, &key, 2);
+        assert_eq!(
+            store.load_provider_hook_answers(&key.store_key()).unwrap()[1].state,
+            "live"
+        );
+        let promoted_parts = parts(&h, &key);
+        assert!(
+            promoted_parts
+                .iter()
+                .filter(|p| p.tag_number.is_some())
+                .all(|p| p.active && p.served && !p.retired),
+            "{promoted_parts:?}"
+        );
+        let reduced = response(
+            h.dispatch_value(7, json!({"name":"ctx_reduce","arguments":{"drop":"7"}}))
+                .await,
+        );
+        assert_eq!(reduced["isError"], false, "{reduced}");
+        assert_eq!(
+            store.load_provider_pending_drops(&key.store_key()).unwrap(),
+            [7]
+        );
+        assert_eq!(
+            parts(&h, &key)
+                .iter()
+                .find(|p| p.tag_number == Some(7))
+                .unwrap()
+                .block_id,
+            "m0#0"
+        );
+        let refused = response(
+            h.dispatch_value(7, json!({"name":"ctx_reduce","arguments":{"drop":"999"}}))
+                .await,
+        );
+        assert_eq!(refused["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn healing_unauthorized_auto_tag_off_adds_no_answer_or_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        let (key, request, engine) = fixture(&h, &[TWO]).await;
+        let store = h.store.get().unwrap();
+        store
+            .update_provider_hook_counters(&key.store_key(), |c| {
+                c["auto_tag"] = json!(false);
+            })
+            .unwrap();
+        let proposed = proposal(&h, &key, &request, &engine);
+        assert!(proposed.1.answers.is_empty());
+        assert_eq!(proposed.0.raw_replacement.as_ref().unwrap(), &[TWO]);
+        save(&h, &key, &proposed);
+        assert!(store
+            .load_provider_hook_answers(&key.store_key())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn healing_unauthorized_foreign_routes_add_no_answer_or_prefix() {
+        for foreign_harness in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = handler(dir.path(), thalamus());
+            let (key, request, engine) = fixture(&h, &[TWO]).await;
+            let mut binding = h.facade_binding(7).unwrap();
+            if foreign_harness {
+                binding.harness = "opencode".into();
+            } else {
+                binding.principal = None;
+            }
+            h.bind_route(7, binding);
+            let routed = call(&h, "compaction.step", step(TWO)).await;
+            assert!(
+                matches!(
+                    routed,
+                    HandlerOutcome::Error { .. } | HandlerOutcome::ErrorWithDetail { .. }
+                ),
+                "{routed:?}"
+            );
+            let proposed = proposal(&h, &key, &request, &engine);
+            assert!(proposed.1.answers.is_empty());
+            assert_eq!(proposed.0.raw_replacement.as_ref().unwrap(), &[TWO]);
+            assert!(h
+                .store
+                .get()
+                .unwrap()
+                .load_provider_hook_answers(&key.store_key())
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn healing_signed_hold_reports_cross_message_reason_and_supersedes_without_reusing_retired_parts(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        let signed = r#"{"role":"assistant","content":[{"type":"thinking","thinking":"secret","signature":"s"}]}"#;
+        let (key, request, mut engine) = fixture(&h, &[TWO, signed]).await;
+        let original = engine.replacement.clone();
+        engine.replacement.pop();
+        let first = proposal(&h, &key, &request, &engine);
+        save(&h, &key, &first);
+        engine.version = 3;
+        engine.replacement = original;
+        let held = proposal(&h, &key, &request, &engine);
+        assert!(held.1.answers.is_empty());
+        assert_eq!(held.0.raw_replacement.as_ref().unwrap(), &[TWO, signed]);
+        assert_eq!(
+            held.1.signed_holds,
+            BTreeSet::from(["m0#0".into(), "m0#1".into()])
+        );
+        save(&h, &key, &held);
+        let status = h
+            .claude_code_pending_status(&h.facade_binding(7).unwrap())
+            .unwrap();
+        assert_eq!(
+            status,
+            json!({"count":2,"reasons":{"signed_prefix_hold":2}})
+        );
+        assert!(parts(&h, &key)
+            .iter()
+            .filter(|p| p.mid == "m0")
+            .all(|p| p.retired && !p.active));
+        assert_eq!(
+            h.store
+                .get()
+                .unwrap()
+                .load_provider_hook_answers(&key.store_key())
+                .unwrap()[0]
+                .state,
+            "burned"
+        );
+        engine.version = 4;
+        engine.replacement.pop();
+        let fresh = proposal(&h, &key, &request, &engine);
+        assert_eq!(
+            fresh.1.answers[0]
+                .tags
+                .iter()
+                .map(|t| t.number)
+                .collect::<Vec<_>>(),
+            [3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn healing_not_applied_retires_numbers_but_dropped_supersession_does_not() {
+        for rejected in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = handler(dir.path(), thalamus());
+            let (key, request, mut engine) = fixture(&h, &[TWO]).await;
+            save(&h, &key, &proposal(&h, &key, &request, &engine));
+            let store = h.store.get().unwrap();
+            if rejected {
+                store
+                    .set_provider_view_state(&key.store_key(), 2, "not_applied")
+                    .unwrap();
+            } else {
+                engine.version = 3;
+                engine.replacement.clear();
+                save(&h, &key, &proposal(&h, &key, &request, &engine));
+            }
+            let old = parts(&h, &key);
+            assert_eq!(old.len(), 2);
+            assert!(old.iter().all(|p| !p.active && p.retired == rejected));
+            assert_eq!(
+                store.load_provider_hook_answers(&key.store_key()).unwrap()[0].state,
+                "burned"
+            );
+            let refused = response(
+                h.dispatch_value(7, json!({"name":"ctx_reduce","arguments":{"drop":"1"}}))
+                    .await,
+            );
+            assert_eq!(refused["isError"], true);
+            engine.version = 4;
+            engine.replacement = request.messages.iter().map(|m| m.ck.clone()).collect();
+            let fresh = proposal(&h, &key, &request, &engine);
+            assert_eq!(
+                fresh.1.parts[0].tag_number,
+                Some(if rejected { 3 } else { 1 })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn healing_view_and_answers_roll_back_together_on_invalid_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        let (key, request, engine) = fixture(&h, &[TWO]).await;
+        let mut proposed = proposal(&h, &key, &request, &engine);
+        proposed.1.answers[0].tags[0].block_id = "unknown#0".into();
+        assert!(save_host_view(
+            h.store.get().unwrap(),
+            &key,
+            &proposed.0,
+            "produced",
+            Some(&proposed.1)
+        )
+        .is_err());
+        let store = h.store.get().unwrap();
+        assert!(store
+            .load_provider_view(&key.store_key(), 2)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_provider_hook_answers(&key.store_key())
+            .unwrap()
+            .is_empty());
+        assert!(parts(&h, &key).is_empty());
+        assert_eq!(
+            proposal(&h, &key, &request, &engine).1.parts[0].tag_number,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn healing_promotion_also_waits_for_view_range_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        let (key, request, engine) = fixture(
+            &h,
+            &[
+                TWO,
+                r#"{"role":"user","content":"next"}"#,
+                r#"{"role":"user","content":"last"}"#,
+            ],
+        )
+        .await;
+        save(&h, &key, &proposal(&h, &key, &request, &engine));
+        let store = h.store.get().unwrap();
+        store
+            .set_provider_view_state(&key.store_key(), 2, "applied")
+            .unwrap();
+        watermark(&h, &key, 1);
+        assert!(store
+            .load_provider_hook_answers(&key.store_key())
+            .unwrap()
+            .iter()
+            .all(|a| a.state == "pending"));
+        watermark(&h, &key, 3);
+        assert!(store
+            .load_provider_hook_answers(&key.store_key())
+            .unwrap()
+            .iter()
+            .all(|a| a.state == "live"));
+    }
+
+    #[tokio::test]
+    async fn healing_unauthorized_other_reduction_owner_adds_no_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        let (key, request, engine) = fixture(
+            &h,
+            &[
+                TWO,
+                r#"{"role":"assistant","content":[{"type":"text","text":"reply"}]}"#,
+            ],
+        )
+        .await;
+        let store = h.store.get().unwrap();
+        let mut c = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        let allowed = claude_code_healing(
+            store,
+            &key,
+            &h.facade_binding(7).unwrap(),
+            &c,
+            &engine,
+            &request,
+            &BTreeMap::new(),
+            &[],
+        )
+        .unwrap();
+        assert!(allowed
+            .answers
+            .iter()
+            .any(|a| a.subject.hook == "post_assistant"));
+        let mut plan: Value = serde_json::from_str(c.native_plan_json.as_ref().unwrap()).unwrap();
+        plan["composition"] = json!({"compaction":{"provider":"another-module"}});
+        c.native_plan_json = Some(plan.to_string());
+        let held = claude_code_healing(
+            store,
+            &key,
+            &h.facade_binding(7).unwrap(),
+            &c,
+            &engine,
+            &request,
+            &BTreeMap::new(),
+            &[],
+        )
+        .unwrap();
+        assert!(held.answers.is_empty());
+        assert!(held.parts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn healing_nested_tool_result_resolves_own_native_part_and_excludes_mixed_user_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        let tool = r#"{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Read","input":{}}]}"#;
+        let result = r#"{ "role":"user", "content":[{"type":"text","text":"mixed"},{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aA=="}},{"type":"text","text":"a\u0062"},{"type":"text","text":"tail"}]}] }"#;
+        let (key, request, engine) = fixture(&h, &[tool, result]).await;
+        let proposed = proposal(&h, &key, &request, &engine);
+        assert_eq!(proposed.1.answers.len(), 1);
+        assert_eq!(proposed.1.answers[0].subject.hook, "post_tool");
+        assert_eq!(proposed.1.answers[0].subject.subject_part, "t");
+        assert_eq!(proposed.1.answers[0].tags[0].block_id, "m1#1");
+        assert_eq!(
+            proposed.0.raw_replacement.as_ref().unwrap()[1],
+            result.replace(r#""text":"a\u0062""#, r#""text":"§1§ a\u0062""#)
+        );
+        save(&h, &key, &proposed);
+        let store = h.store.get().unwrap();
+        store
+            .set_provider_view_state(&key.store_key(), 2, "applied")
+            .unwrap();
+        watermark(&h, &key, 2);
+        let reduced = response(
+            h.dispatch_value(7, json!({"name":"ctx_reduce","arguments":{"drop":"1"}}))
+                .await,
+        );
+        assert_eq!(reduced["isError"], false, "{reduced}");
+        assert_eq!(
+            store.load_provider_pending_drops(&key.store_key()).unwrap(),
+            [1]
+        );
+        let policy = parts(&h, &key);
+        assert_eq!(
+            policy
+                .iter()
+                .find(|p| p.tag_number == Some(1))
+                .unwrap()
+                .block_id,
+            "m1#1"
+        );
+        assert!(!policy.iter().any(|p| p.block_id == "m1#0"));
+    }
+
+    #[tokio::test]
+    async fn healing_production_replacement_runs_through_splicer() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        setup(&h).await;
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        store
+            .update_provider_hook_counters(&key.store_key(), |c| {
+                c["auto_tag"] = json!(true);
+            })
+            .unwrap();
+        let raw = r#"{ "role":"user", "content":"a\u0062" }"#;
+        let answer = response(call(&h, "compaction.step", step(raw)).await);
+        assert_eq!(answer["answer"], "compaction_message", "{answer}");
+        let version = answer["compaction"]["version"].as_u64().unwrap();
+        let stored: HostView = serde_json::from_str(
+            &store
+                .load_provider_view(&key.store_key(), version)
+                .unwrap()
+                .unwrap()
+                .replacement_json,
+        )
+        .unwrap();
+        assert!(stored
+            .raw_replacement
+            .unwrap()
+            .contains(&r#"{ "role":"user", "content":"§1§ a\u0062" }"#.into()));
+        let answers = store.load_provider_hook_answers(&key.store_key()).unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].policy["heal_view_version"], version);
+    }
+
+    #[tokio::test]
+    async fn healing_refused_send_preserves_pending_number_and_bytes_until_clean_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        setup(&h).await;
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        store
+            .update_provider_hook_counters(&key.store_key(), |c| {
+                c["auto_tag"] = json!(true);
+            })
+            .unwrap();
+        let raw = r#"{"role":"user","content":"ab"}"#;
+        let hook = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"hook","subject_mid":"m","subject_ordinal":0,"hook":"pre_user","blocks":["ab"],"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw});
+        let first = response(call(&h, "transform.hook", hook.clone()).await);
+        // Represent a refused LLM send by retrying without unserved_subjects:
+        // the gateway already froze the tagged bytes, so retrying the hook must
+        // preserve their prefixes and numbers until a clean request completes.
+        let retry = response(call(&h, "transform.hook", hook.clone()).await);
+        assert_eq!(first, retry);
+        let answers = store.load_provider_hook_answers(&key.store_key()).unwrap();
+        assert_eq!(
+            answers.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
+            ["burned", "pending"]
+        );
+        assert_eq!(
+            answers[0].answer.tags[0].number,
+            answers[1].answer.tags[0].number
+        );
+        assert!(!parts(&h, &key)[0].retired);
+        let mut clean = hook;
+        clean["served_through_ordinal"] = json!(0);
+        assert_eq!(first, response(call(&h, "transform.hook", clean).await));
+        let promoted = store.load_provider_hook_answers(&key.store_key()).unwrap();
+        assert_eq!(promoted.len(), 2);
+        assert_eq!(promoted[1].state, "live");
+        assert_eq!(promoted[1].answer.ops_json, answers[1].answer.ops_json);
     }
 }

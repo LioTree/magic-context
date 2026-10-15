@@ -919,6 +919,44 @@ pub(super) fn encode_view_with_baseline(
     ))
 }
 
+pub(super) fn keeps_signed_prefix(
+    view: &transform::compaction::View,
+) -> Result<bool, HandlerOutcome> {
+    for message in &view.replacement {
+        if signed_prefix(&render(message)?).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Healing belongs only to the proposed replacement, not to the served baseline
+/// used by the identity and signed-prefix checks above.
+pub(super) fn splice_view_healing(
+    view: &transform::compaction::View,
+    wire: &mut compact::answer::CompactionMessage,
+    raw: &mut [String],
+    tags: &BTreeMap<String, u64>,
+) -> Result<(), HandlerOutcome> {
+    if tags.is_empty() {
+        return Ok(());
+    }
+    if keeps_signed_prefix(view)? {
+        return Err(error(
+            "signed_prefix_edit",
+            "healing cannot precede kept signed thinking",
+        ));
+    }
+    for (bytes, message) in raw.iter_mut().zip(&view.replacement) {
+        *bytes = admission_served_bytes(bytes.clone(), message, tags)?;
+    }
+    wire.replacement = raw
+        .iter()
+        .map(|bytes| serde_json::from_str(bytes).map_err(transient))
+        .collect::<Result<_, _>>()?;
+    Ok(())
+}
+
 /// Serialize the role answer while substituting committed raw replacement JSON.
 /// This is used only by the CC lane; other profiles keep the ordinary serializer.
 pub(super) fn answer_bytes(answer: &Value, raw: &[String]) -> Result<Vec<u8>, HandlerOutcome> {

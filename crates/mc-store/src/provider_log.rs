@@ -135,6 +135,17 @@ pub struct ProviderStoredAnswer {
     pub lineage_id: String,
     pub answer: ProviderHookAnswer,
     pub state: String,
+    pub policy: Value,
+}
+
+/// Proposed tags travel with the replacement that carries their bytes. These
+/// inputs are committed together, but are not part of the frozen wire view.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderViewHealing {
+    pub parts: Vec<ProviderPolicyPart>,
+    pub answers: Vec<ProviderHookAnswer>,
+    pub kept_blocks: BTreeSet<String>,
+    pub signed_holds: BTreeSet<String>,
 }
 /// Policy sees counters after burns and promotion, never a transcript snapshot.
 pub struct ProviderHookContext<'c> {
@@ -957,8 +968,8 @@ fn repeat_answer_tx(
     subject: &ProviderSubject,
 ) -> rusqlite::Result<Option<ProviderStoredAnswer>> {
     for (row, cut) in ancestry_tx(conn, conv, lineage)? {
-        let answer = conn.query_row("SELECT ordinal,ops_json,tags_json,state FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2 AND subject_mid=?3 AND hook=?4 AND subject_part=?5 AND ordinal<=?6 AND state IN ('pending','live') ORDER BY answer_seq DESC LIMIT 1",params![conv,row.lineage_id,subject.subject_mid,subject.hook,subject.subject_part,as_i64(cut)?],|r|Ok((r.get(0)?,r.get(1)?,r.get::<_,String>(2)?,r.get(3)?))).optional()?;
-        if let Some((ordinal, ops_json, tags, state)) = answer {
+        let answer = conn.query_row("SELECT ordinal,ops_json,tags_json,state,policy_json FROM mc_provider_hook_answers_v1 a WHERE conv_key=?1 AND lineage_id=?2 AND subject_mid=?3 AND hook=?4 AND subject_part=?5 AND ordinal<=?6 AND state IN ('pending','live') AND (json_extract(policy_json,'$.heal_view_version') IS NULL OR EXISTS(SELECT 1 FROM mc_provider_views_v1 v WHERE v.conv_key=a.conv_key AND v.version=json_extract(a.policy_json,'$.heal_view_version') AND v.state='applied')) ORDER BY answer_seq DESC LIMIT 1",params![conv,row.lineage_id,subject.subject_mid,subject.hook,subject.subject_part,as_i64(cut)?],|r|Ok((r.get(0)?,r.get(1)?,r.get::<_,String>(2)?,r.get(3)?,r.get::<_,String>(4)?))).optional()?;
+        if let Some((ordinal, ops_json, tags, state, policy)) = answer {
             return Ok(Some(ProviderStoredAnswer {
                 lineage_id: row.lineage_id,
                 answer: ProviderHookAnswer {
@@ -968,6 +979,7 @@ fn repeat_answer_tx(
                     tags: serde_json::from_str(&tags).map_err(sql_json)?,
                 },
                 state,
+                policy: parse(&policy)?,
             }));
         }
     }
@@ -1028,11 +1040,12 @@ fn promote_tx(
     let Some(served) = served else { return Ok(()) };
     for (row, cut) in ancestry_tx(conn, conv, lineage)? {
         let through = served.min(cut);
-        let mut q = conn.prepare("SELECT answer_seq,tags_json FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2 AND state='pending' AND ordinal<=?3 AND legacy_json IS NULL")?;
+        let mut q = conn.prepare("SELECT answer_seq,tags_json FROM mc_provider_hook_answers_v1 a WHERE conv_key=?1 AND lineage_id=?2 AND state='pending' AND ordinal<=?3 AND legacy_json IS NULL AND (json_extract(policy_json,'$.heal_view_version') IS NULL OR (json_extract(policy_json,'$.heal_applied_watermark') IS NOT NULL AND ?4>json_extract(policy_json,'$.heal_applied_watermark') AND EXISTS(SELECT 1 FROM mc_provider_views_v1 v WHERE v.conv_key=a.conv_key AND v.version=json_extract(a.policy_json,'$.heal_view_version') AND v.state='applied' AND v.range_to<=?4)))")?;
         let answers = q
-            .query_map(params![conv, row.lineage_id, as_i64(through)?], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?
+            .query_map(
+                params![conv, row.lineage_id, as_i64(through)?, as_i64(served)?],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (seq, tags) in answers {
             let tags: Vec<ProviderAnswerTag> = serde_json::from_str(&tags).map_err(sql_json)?;
@@ -1053,6 +1066,88 @@ fn promote_tx(
         }
     }
     Ok(())
+}
+
+fn burn_heal_tx(
+    conn: &Connection,
+    conv: &str,
+    seq: i64,
+    retired: &BTreeSet<String>,
+) -> rusqlite::Result<()> {
+    conn.execute("UPDATE mc_provider_policy_parts_v1 SET policy_json=json_set(policy_json,'$.retired',json('true')) WHERE conv_key=?1 AND block_id IN (SELECT value FROM json_each(?2)) AND json_extract(policy_json,'$.tag_number') IN (SELECT json_extract(value,'$.number') FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) WHERE a.conv_key=?1 AND a.answer_seq=?3)", params![conv, serde_json::to_string(retired).map_err(sql_json)?, seq])?;
+    remove_policy_tx(conn, conv, "answer_seq=?2", params![conv, seq])?;
+    burn_where_tx(conn, conv, "answer_seq=?2", params![conv, seq])?;
+    conn.execute(
+        "UPDATE mc_provider_hook_answers_v1 SET state='burned' WHERE conv_key=?1 AND answer_seq=?2",
+        params![conv, seq],
+    )?;
+    Ok(())
+}
+
+fn heal_parts_tx(
+    conn: &Connection,
+    key: &ProviderSessionKey,
+    lineage: &str,
+    candidates: &[ProviderPolicyPart],
+) -> rusqlite::Result<(Vec<ProviderPolicyPart>, i64)> {
+    let conv = key.conversation_key();
+    let c = conversation_tx(conn, key)?.ok_or(rusqlite::Error::InvalidQuery)?;
+    let counters = parse(&c.hook_counters_json)?;
+    let live: i64 = conn.query_row(
+        "SELECT coalesce(max(tag_number),0) FROM mc_tags WHERE session_id=?1",
+        [&c.engine_namespace],
+        |r| r.get(0),
+    )?;
+    let mut high = live
+        .max(counters["reserved_tag_high_water"].as_i64().unwrap_or(0))
+        .max(counters["tag_high_water"].as_i64().unwrap_or(0))
+        .max(counters["high_water"].as_i64().unwrap_or(0));
+    let ancestry = ancestry_tx(conn, &conv, lineage)?;
+    let mut parts = Vec::new();
+    for candidate in candidates {
+        let mut part = candidate.clone();
+        let mut held = None;
+        for (ancestor, cut) in &ancestry {
+            let raw: Option<String> = conn.query_row("SELECT policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND block_id=?3 AND ordinal<=?4", params![conv, ancestor.lineage_id, part.block_id, as_i64(*cut)?], |r| r.get(0)).optional()?;
+            if let Some(raw) = raw {
+                held = Some(serde_json::from_str::<ProviderPolicyPart>(&raw).map_err(sql_json)?);
+                break;
+            }
+        }
+        part.tag_number = held.filter(|p| !p.retired).and_then(|p| p.tag_number);
+        if let Some(number) = part.tag_number {
+            if tag_consumed_tx(conn, &c.engine_namespace, number)? {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            high = high.max(number);
+        } else {
+            high = high.checked_add(1).ok_or(rusqlite::Error::InvalidQuery)?;
+            part.tag_number = Some(high);
+        }
+        part.active = true;
+        part.retired = false;
+        part.served = false;
+        parts.push(part);
+    }
+    Ok((parts, high))
+}
+
+fn save_view_tx(conn: &Connection, conv: &str, view: &ProviderView) -> rusqlite::Result<bool> {
+    parse(&view.replacement_json)?;
+    let held=conn.query_row("SELECT lineage_id,range_from,range_to,replacement_json FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2",params![conv,as_i64(view.version)?],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,String>(3)?))).optional()?;
+    if held.as_ref().is_some_and(|h| {
+        h != &(
+            view.lineage_id.clone(),
+            view.range_from,
+            view.range_to,
+            view.replacement_json.clone(),
+        )
+    }) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let fresh = held.is_none();
+    conn.execute("INSERT INTO mc_provider_views_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,'{}',json_extract(?1,'$[1]')) ON CONFLICT(conv_key,version) DO UPDATE SET state=excluded.state",params![conv,as_i64(view.version)?,view.lineage_id,as_i64(view.range_from)?,as_i64(view.range_to)?,view.replacement_json,view.state])?;
+    Ok(fresh)
 }
 
 impl McStore {
@@ -1298,6 +1393,17 @@ impl McStore {
                 "UPDATE mc_provider_views_v1 SET state=?3 WHERE conv_key=?1 AND version=?2",
                 params![conv, as_i64(version)?, state],
             )?;
+            if state == "applied" && held != "applied" {
+                let watermark = conversation_tx(conn, key)?.ok_or(rusqlite::Error::InvalidQuery)?.served_through_ordinal.unwrap_or(0);
+                conn.execute("UPDATE mc_provider_hook_answers_v1 SET policy_json=json_set(policy_json,'$.heal_applied_watermark',?3) WHERE conv_key=?1 AND json_extract(policy_json,'$.heal_view_version')=?2 AND state='pending' AND json_extract(policy_json,'$.heal_applied_watermark') IS NULL", params![conv, as_i64(version)?, as_i64(watermark)?])?;
+            } else if state == "not_applied" {
+                let mut q = conn.prepare("SELECT answer_seq,tags_json FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND json_extract(policy_json,'$.heal_view_version')=?2 AND state IN ('pending','live')")?;
+                let answers = q.query_map(params![conv, as_i64(version)?], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                for (seq, tags) in answers {
+                    let tags: Vec<ProviderAnswerTag> = serde_json::from_str(&tags).map_err(sql_json)?;
+                    burn_heal_tx(conn, &conv, seq, &tags.into_iter().map(|t| t.block_id).collect())?;
+                }
+            }
             Ok(None)
         })?;
         if let Some(field) = refusal {
@@ -1591,7 +1697,12 @@ impl McStore {
                  let repeat_answer = if reuse_held {
                      request.repeat_subject.map(|s|repeat_answer_tx(conn,&conv,&request.lineage.lineage_id,s)).transpose()?.flatten()
                  } else {None};
-                 if let Some(s) = request.repeat_subject {burn_subject_tx(conn,&conv,&request.lineage.lineage_id,s,false)?;}
+                 // Selecting a replacement does not prove its tagged bytes
+                 // completed a clean model request. Keep heal metadata on hook
+                 // replay: these tags still wait for served_through_ordinal to
+                 // exceed the value recorded when the replacement was selected.
+                 let replay_heal = repeat_answer.as_ref().is_some_and(|a| a.policy["heal_view_version"].is_u64());
+                 if let Some(s) = request.repeat_subject.filter(|_| !replay_heal) {burn_subject_tx(conn,&conv,&request.lineage.lineage_id,s,false)?;}
                  if !reuse_held {promote_tx(conn,&conv,&c.engine_namespace,&request.lineage.lineage_id,request.served_through_ordinal)?;}
                 let current = conversation_tx(conn,key)?.ok_or(rusqlite::Error::InvalidQuery)?;
                 let mut counters = parse(&current.hook_counters_json)?;
@@ -1621,7 +1732,7 @@ impl McStore {
                 if let Some(summary)=&write.policy_summary {save_policy_summary_tx(conn,&conv,summary)?;}
                 let answer_policy = write.counters.as_object_mut().and_then(|c|c.remove("answer_policy")).unwrap_or_else(||json!({}));
                 let mut high = tag_high_water;
-                if let Some(a) = write.answer {
+                if let Some(a) = write.answer.filter(|_| !replay_heal) {
                     if a.subject.subject_mid != request.message.map_or(a.subject.subject_mid.as_str(),|m|m.mid.as_str()) || request.message.is_some_and(|m|m.ordinal!=a.ordinal) {return Err(ProviderError::InvalidParams {field:"subject_mid"})}
                     parse(&a.ops_json)?;
                     for t in &a.tags {
@@ -1696,10 +1807,10 @@ impl McStore {
         key: &ProviderSessionKey,
     ) -> Result<Vec<ProviderStoredAnswer>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut q=conn.prepare("SELECT lineage_id,subject_mid,hook,subject_part,ordinal,ops_json,tags_json,state FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND legacy_json IS NULL ORDER BY answer_seq")?;
+            let mut q=conn.prepare("SELECT lineage_id,subject_mid,hook,subject_part,ordinal,ops_json,tags_json,state,policy_json FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND legacy_json IS NULL ORDER BY answer_seq")?;
             let rows = q.query_map([key.conversation_key()],|r| {
                 let tags:String=r.get(6)?;
-                Ok(ProviderStoredAnswer {lineage_id:r.get(0)?,answer:ProviderHookAnswer {subject:ProviderSubject {subject_mid:r.get(1)?,hook:r.get(2)?,subject_part:r.get(3)?},ordinal:r.get(4)?,ops_json:r.get(5)?,tags:serde_json::from_str(&tags).map_err(sql_json)?},state:r.get(7)?})
+                Ok(ProviderStoredAnswer {lineage_id:r.get(0)?,answer:ProviderHookAnswer {subject:ProviderSubject {subject_mid:r.get(1)?,hook:r.get(2)?,subject_part:r.get(3)?},ordinal:r.get(4)?,ops_json:r.get(5)?,tags:serde_json::from_str(&tags).map_err(sql_json)?},state:r.get(7)?,policy:parse(&r.get::<_,String>(8)?)?})
             })?.collect();
             rows
         })?)
@@ -1722,17 +1833,97 @@ impl McStore {
         key: &ProviderSessionKey,
         view: &ProviderView,
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|conn| {
-            let conv=key.conversation_key();
+        self.inner
+            .with_conn_fenced(|conn| save_view_tx(conn, &key.conversation_key(), view))?;
+        Ok(())
+    }
+    /// Preview numbers without reserving them. The fenced write recomputes this
+    /// plan before saving any bytes, rejecting a stale allocation atomically.
+    pub fn plan_provider_healing(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+        parts: &[ProviderPolicyPart],
+    ) -> Result<Vec<ProviderPolicyPart>, McStoreError> {
+        Ok(self
+            .inner
+            .with_conn(|conn| heal_parts_tx(conn, key, lineage, parts).map(|p| p.0))?)
+    }
 
-            parse(&view.replacement_json)?;
-            let held=conn.query_row("SELECT lineage_id,range_from,range_to,replacement_json FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2",params![conv,as_i64(view.version)?],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,String>(3)?))).optional()?;
-            if held.is_some_and(|h|h!=(view.lineage_id.clone(),view.range_from,view.range_to,view.replacement_json.clone())) {return Err(rusqlite::Error::InvalidQuery)}
-            conn.execute("INSERT INTO mc_provider_views_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,'{}',json_extract(?1,'$[1]')) ON CONFLICT(conv_key,version) DO UPDATE SET state=excluded.state",params![conv,as_i64(view.version)?,view.lineage_id,as_i64(view.range_from)?,as_i64(view.range_to)?,view.replacement_json,view.state])?;
+    /// Save exact replacement bytes together with the pending hook answers that
+    /// name their new prefixes and policy rows that reserve those tag numbers.
+    /// No partial proposal may become replay's source of served message bytes.
+    pub fn save_provider_view_with_healing(
+        &self,
+        key: &ProviderSessionKey,
+        view: &ProviderView,
+        healing: &ProviderViewHealing,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|conn| {
+            let conv = key.conversation_key();
+            let (parts, high) = heal_parts_tx(conn, key, &view.lineage_id, &healing.parts)?;
+            if parts.iter().zip(&healing.parts).any(|(planned, proposed)| planned.tag_number != proposed.tag_number) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            if !save_view_tx(conn, &conv, view)? { return Ok(()); }
+            let healed: BTreeSet<_> = parts.iter().map(|p| p.block_id.clone()).collect();
+            let mut q = conn.prepare("SELECT answer_seq,tags_json FROM mc_provider_hook_answers_v1 a WHERE conv_key=?1 AND state='pending' AND json_extract(policy_json,'$.heal_view_version') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM mc_provider_views_v1 v WHERE v.conv_key=a.conv_key AND v.version=json_extract(a.policy_json,'$.heal_view_version') AND v.state='applied')")?;
+            let older = q.query_map([&conv], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            for (seq, tags) in older {
+                let tags: Vec<ProviderAnswerTag> = serde_json::from_str(&tags).map_err(sql_json)?;
+                let retired = tags.into_iter().map(|t| t.block_id).filter(|id| healing.kept_blocks.contains(id) && !healed.contains(id)).collect();
+                burn_heal_tx(conn, &conv, seq, &retired)?;
+            }
+            // burn_heal_tx deactivates the old answer's reserved block rows even
+            // if the new answer reuses their numbers. Activate new rows explicitly;
+            // promote_tx only marks them served and would leave reused tags inactive.
+            for part in &parts {
+                conn.execute("INSERT INTO mc_provider_policy_parts_v1 VALUES (?1,?2,?3,?4,?5,json_extract(?1,'$[1]')) ON CONFLICT(conv_key,lineage_id,block_id) DO UPDATE SET policy_json=excluded.policy_json", params![conv,view.lineage_id,as_i64(part.ordinal)?,part.block_id,serde_json::to_string(part).map_err(sql_json)?])?;
+            }
+            let mut subjects = BTreeSet::new();
+            for answer in &healing.answers {
+                let subject = &answer.subject;
+                if !subjects.insert((&subject.subject_mid, &subject.hook, &subject.subject_part)) || answer.tags.is_empty() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                for tag in &answer.tags {
+                    if !parts.iter().any(|p| p.block_id == tag.block_id && p.tag_number == Some(tag.number) && p.mid == subject.subject_mid && p.subject_part == subject.subject_part) {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                }
+                parse(&answer.ops_json)?;
+                conn.execute("INSERT INTO mc_provider_hook_answers_v1 (conv_key,answer_seq,lineage_id,subject_mid,hook,subject_part,ordinal,ops_json,tags_json,state,policy_json,session) VALUES (?1,(SELECT coalesce(max(answer_seq),-1)+1 FROM mc_provider_hook_answers_v1 WHERE conv_key=?1),?2,?3,?4,?5,?6,?7,?8,'pending',?9,json_extract(?1,'$[1]'))", params![conv,view.lineage_id,subject.subject_mid,subject.hook,subject.subject_part,as_i64(answer.ordinal)?,answer.ops_json,serde_json::to_string(&answer.tags).map_err(sql_json)?,json!({"heal_view_version":view.version}).to_string()])?;
+            }
+            let c = conversation_tx(conn, key)?.ok_or(rusqlite::Error::InvalidQuery)?;
+            let mut counters = parse(&c.hook_counters_json)?;
+            counters["reserved_tag_high_water"] = json!(high);
+            counters["signed_prefix_holds"] = json!(healing.signed_holds);
+            if let Some(failed) = counters.get_mut("failed_subjects").and_then(Value::as_array_mut) {
+                failed.retain(|s| !healing.answers.iter().any(|a| serde_json::to_value(&a.subject).ok().as_ref() == Some(s)));
+            }
+            conn.execute("UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1", params![conv,counters.to_string()])?;
             Ok(())
         })?;
         Ok(())
     }
+
+    /// Read the version numbers of applied provider views without loading the
+    /// replacement message bytes stored with those views.
+    pub fn load_provider_applied_view_versions(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<BTreeSet<u64>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut q = conn.prepare(
+                "SELECT version FROM mc_provider_views_v1 WHERE conv_key=?1 AND state='applied'",
+            )?;
+            let rows = q
+                .query_map([key.conversation_key()], |r| r.get(0))?
+                .collect();
+            rows
+        })?)
+    }
+
     pub fn load_provider_views(
         &self,
         key: &ProviderSessionKey,

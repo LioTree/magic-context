@@ -381,7 +381,13 @@ impl McHandler {
                     .is_some_and(|failed| failed.contains(&subject));
                 let reason = if mixed_user && user_text {
                     "mixed_user_text"
-                } else if assistant_text && last_signed.is_some_and(|last| last > index) {
+                } else if (assistant_text && last_signed.is_some_and(|last| last > index))
+                    || counters["signed_prefix_holds"]
+                        .as_array()
+                        .is_some_and(|held| {
+                            held.contains(&json!(ck_wire::block_id(&entry.mid, index)))
+                        })
+                {
                     "signed_prefix_hold"
                 } else if failed {
                     "hook_failed"
@@ -3741,40 +3747,98 @@ mod admission_hook_tests {
 
     #[tokio::test]
     async fn admission_hook_bootstrap_and_batch_attachment_never_answer_or_tag() {
-        let dir = tempfile::tempdir().unwrap();
-        let h = handler(dir.path(), thalamus());
-        setup(&h).await;
-        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
-        let store = h.store.get().unwrap();
-        let mut held = store
-            .load_provider_conversation(&key.store_key())
-            .unwrap()
-            .unwrap();
-        held.hook_counters_json = json!({"auto_tag":true}).to_string();
-        store
-            .save_provider_conversation(&key.store_key(), &held)
-            .unwrap();
-        let raw = r#"{"role":"user","content":"bootstrap"}"#;
-        let mut status = step(raw);
-        response(call(&h, "compaction.step", status.clone()).await);
-        status["messages"] = json!([{"mid":"batch","ordinal":1,"message":{"role":"user","content":"attached"},"raw_message":r#"{"role":"user","content":"attached"}"#}]);
-        status["newest"] = json!({"mid":"batch","ordinal":1});
-        status["after_ordinal"] = json!(0);
-        status["step_id"] = json!("2");
-        response(call(&h, "compaction.step", status).await);
-        assert!(store
-            .load_provider_hook_answers(&key.store_key())
-            .unwrap()
-            .is_empty());
-        let messages = store.load_provider_messages(&key.store_key(), "L").unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&messages[0].message_bytes).unwrap()["raw_message"],
-            raw
-        );
-        assert_eq!(
-            serde_json::from_slice::<Value>(&messages[1].message_bytes).unwrap()["raw_message"],
-            r#"{"role":"user","content":"attached"}"#
-        );
+        let mut control_ranges = Vec::new();
+        for auto_tag in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = handler(dir.path(), thalamus());
+            setup(&h).await;
+            let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+            let store = h.store.get().unwrap();
+            store
+                .update_provider_hook_counters(&key.store_key(), |c| {
+                    c["auto_tag"] = json!(auto_tag);
+                })
+                .unwrap();
+            let raw = r#"{"role":"user","content":"bootstrap"}"#;
+            let mut status = step(raw);
+            let mut versions = Vec::new();
+            for batch in [false, true] {
+                status["request_id"] = json!(if batch { "batch" } else { "bootstrap" });
+                status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+                if batch {
+                    status["messages"] = json!([{"mid":"batch","ordinal":1,"message":{"role":"user","content":"attached"},"raw_message":r#"{"role":"user","content":"attached"}"#}]);
+                    status["newest"] = json!({"mid":"batch","ordinal":1});
+                    status["after_ordinal"] = json!(0);
+                    status["step_id"] = json!("2");
+                }
+                let before = store.load_provider_hook_answers(&key.store_key()).unwrap();
+                status["more"] = json!(true);
+                let ingested = response(call(&h, "compaction.step", status.clone()).await);
+                assert_eq!(ingested["answer"], "wait");
+                // The incomplete page stores original bytes without recording
+                // hook answers or proposing prefixes. Only the completed,
+                // independently requested rebuild below can propose healing.
+                assert_eq!(
+                    store
+                        .load_provider_hook_answers(&key.store_key())
+                        .unwrap()
+                        .len(),
+                    before.len()
+                );
+                status["more"] = json!(false);
+                let replaced = response(call(&h, "compaction.step", status.clone()).await);
+                assert_eq!(replaced["answer"], "compaction_message", "{replaced}");
+                if auto_tag {
+                    assert_eq!(
+                        replaced["compaction"]["range"],
+                        control_ranges[usize::from(batch)]
+                    );
+                } else {
+                    control_ranges.push(replaced["compaction"]["range"].clone());
+                }
+                let version = replaced["compaction"]["version"].as_u64().unwrap();
+                versions.push(version);
+                let answers = store.load_provider_hook_answers(&key.store_key()).unwrap();
+                if auto_tag {
+                    assert!(answers.len() > before.len());
+                    for answer in &answers[before.len()..] {
+                        assert_eq!(answer.policy["heal_view_version"], version);
+                        assert!(!answer.answer.tags.is_empty());
+                    }
+                } else {
+                    assert!(answers.is_empty());
+                }
+            }
+            for answer in store.load_provider_hook_answers(&key.store_key()).unwrap() {
+                let version = answer.policy["heal_view_version"].as_u64().unwrap();
+                assert!(versions.contains(&version));
+                let stored: super::super::compaction::HostView = serde_json::from_str(
+                    &store
+                        .load_provider_view(&key.store_key(), version)
+                        .unwrap()
+                        .unwrap()
+                        .replacement_json,
+                )
+                .unwrap();
+                for tag in answer.answer.tags {
+                    assert!(stored
+                        .raw_replacement
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .any(|raw| raw.contains(&transform::tag_prefix(tag.number))));
+                }
+            }
+            let messages = store.load_provider_messages(&key.store_key(), "L").unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&messages[0].message_bytes).unwrap()["raw_message"],
+                raw
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&messages[1].message_bytes).unwrap()["raw_message"],
+                r#"{"role":"user","content":"attached"}"#
+            );
+        }
     }
 }
