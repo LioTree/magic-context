@@ -47,6 +47,7 @@ pub mod decay_render;
 pub mod decision_calibration;
 mod digest;
 pub mod divergence;
+pub mod entorhinal_resolve;
 pub mod healing;
 pub mod historian;
 pub mod historian_chunk;
@@ -19281,7 +19282,11 @@ mod tests {
         assert_eq!(
             custom.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "custom-runner".to_string()],
+                of: vec![
+                    "thalamus".to_string(),
+                    "custom-runner".to_string(),
+                    "entorhinal".to_string()
+                ],
             }]
         );
 
@@ -19290,7 +19295,11 @@ mod tests {
         assert_eq!(
             hosted.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "broca".to_string()],
+                of: vec![
+                    "thalamus".to_string(),
+                    "broca".to_string(),
+                    "entorhinal".to_string()
+                ],
             }]
         );
         // Self-signals drop out with the background-completion target, but the field stays declared
@@ -20854,7 +20863,11 @@ mod tests {
         assert_eq!(
             m.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "broca".to_string()]
+                of: vec![
+                    "thalamus".to_string(),
+                    "broca".to_string(),
+                    "entorhinal".to_string()
+                ]
             }]
         );
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
