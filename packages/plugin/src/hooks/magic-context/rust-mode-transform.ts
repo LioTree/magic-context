@@ -1,9 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
-import {
+import type {
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
 } from "../../features/magic-context/memory/project-identity";
+import {
+    awaitSessionIdentityDecision,
+    readSessionIdentityDecision,
+} from "../../features/magic-context/memory/session-identity-decision";
 import { drainSingleStoreEmbeddingWatermarks } from "../../features/magic-context/memory/single-store-embedding-drain";
 import {
     modelKeyAcceptsImages,
@@ -1826,7 +1830,11 @@ export function createRustModeTransform(
                     options.moduleClient.call({
                         method: args.method,
                         sessionId: args.sessionId,
-                        projectRoot: options.projectRoot ?? deps.directory ?? process.cwd(),
+                        projectRoot:
+                            deps.sessionDirectoryBySession?.get(args.sessionId) ??
+                            options.projectRoot ??
+                            deps.directory ??
+                            process.cwd(),
                         // Keep the dispatch field explicit for alternate clients;
                         // the subc transport also derives it from the call method.
                         body: { ...args.body, method: args.method },
@@ -2644,6 +2652,26 @@ export function createRustModeTransform(
         bindSystemDateRequest(output, dateRequest);
         const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
+        const observedDirectory = await getSessionDirectory(deps, sessionId);
+        const initialDecision = await awaitSessionIdentityDecision(
+            sessionId,
+            observedDirectory.directory,
+            {
+                db: deps.db,
+                allowHomeProject: deps.allowHomeProject,
+                connectionFile: deps.subcConnectionFile,
+            },
+        );
+        // Store the session's project identity before any module request opens a
+        // route: the module reads this host row when choosing the route's project.
+        if (
+            observedDirectory.resolvedFromHost &&
+            initialDecision.identity &&
+            (state.recordedSessionProjectIdentity !== initialDecision.identity ||
+                state.recordedSessionDirectory !== observedDirectory.directory)
+        ) {
+            recordSessionProjectIdentity(deps.db, sessionId, initialDecision.identity);
+        }
         let entrySlot = getSlot(sessionId);
         try {
             entrySlot = loadPersistedLkgSlot(deps.db, sessionId, true) ?? entrySlot;
@@ -2722,7 +2750,7 @@ export function createRustModeTransform(
         let appliedAt: number | undefined;
         let emergencyFailClosed = false;
         let providerProvenEmergency = false;
-        let recoveryProjectRoot = options.projectRoot ?? deps.directory ?? "";
+        let recoveryProjectRoot = observedDirectory.directory;
         // Parking must not hide pressure from the recovery policy. Usage is cheap to read
         // and is the same value copied onto the module request when this pass runs.
         const passUsageSnapshot = loadContextUsage(deps.contextUsageMap, deps.db, sessionId);
@@ -3225,7 +3253,7 @@ export function createRustModeTransform(
             if (preflightError) throw preflightError;
             if (!overflowState) throw new Error("rust overflow state unavailable");
             const directoryStartedAt = performance.now();
-            const { directory, resolvedFromHost } = await getSessionDirectory(deps, sessionId);
+            const { directory, resolvedFromHost } = observedDirectory;
             timings.sessionDirectory += performance.now() - directoryStartedAt;
             const identityResolveStartedAt = performance.now();
             if (
@@ -3233,10 +3261,14 @@ export function createRustModeTransform(
                 (options.disableHotPathIoCachesForTests === true ||
                     state.recordedSessionDirectory !== directory)
             ) {
-                const sessionProjectIdentity = (
-                    options.sessionProjectIdentityResolverForTests ??
-                    resolveProjectIdentityForSession
-                )(directory, deps.allowHomeProject);
+                const sessionProjectIdentity = options.sessionProjectIdentityResolverForTests
+                    ? options.sessionProjectIdentityResolverForTests(
+                          directory,
+                          deps.allowHomeProject,
+                      )
+                    : readSessionIdentityDecision(sessionId, directory, {
+                          allowHomeProject: deps.allowHomeProject,
+                      })?.identity;
                 if (sessionProjectIdentity) {
                     if (state.recordedSessionProjectIdentity !== sessionProjectIdentity) {
                         // Missing chunk embeddings are restored through the session's
@@ -3255,9 +3287,11 @@ export function createRustModeTransform(
                 ) {
                     memoryProjectPath = state.resolvedMemoryProjectPath ?? undefined;
                 } else {
-                    const resolvedProject = (
-                        options.memoryProjectIdentityResolverForTests ?? resolveProjectIdentity
-                    )(directory);
+                    const resolvedProject = options.memoryProjectIdentityResolverForTests
+                        ? options.memoryProjectIdentityResolverForTests(directory)
+                        : readSessionIdentityDecision(sessionId, directory, {
+                              allowHomeProject: deps.allowHomeProject,
+                          })?.identity;
                     if (resolvedProject) {
                         state.resolvedMemoryProjectDirectory = directory;
                         state.resolvedMemoryProjectPath = resolvedProject;
@@ -3579,7 +3613,7 @@ export function createRustModeTransform(
                 projectPath: memoryProjectPath,
                 nowMs: Date.now(),
             };
-            const projectRoot = options.projectRoot ?? directory;
+            const projectRoot = directory;
             recoveryProjectRoot = projectRoot;
             const authoritySeqAdoption = { used: false };
             const memorySyncRequested =

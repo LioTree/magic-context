@@ -15,7 +15,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { log } from "../../../shared/logger";
@@ -548,6 +548,7 @@ function assertProjectAllowed(directory: string, allowHomeProject: boolean): voi
 function pinForUsableDirectory(canonical: string, directory: string): string | undefined {
     try {
         assertDirectoryUsable(canonical, directory);
+        accessSync(canonical, constants.R_OK | constants.X_OK);
     } catch {
         // Preserve legacy fallback handling for missing paths, but never use their pins.
         return undefined;
