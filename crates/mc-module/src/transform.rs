@@ -2551,6 +2551,20 @@ pub mod compaction {
         run(store, template, ctx, status, state, false)
     }
 
+    pub(crate) fn native_force_replacement(
+        output: &Output,
+        template: &TransformRequest,
+        status: &Status,
+        state: &mut State,
+    ) -> Result<View, TransformError> {
+        state.allocate(View {
+            compaction_id: state.compaction_id.clone(),
+            version: 0,
+            range: working_range(status, &template.messages)?,
+            replacement: replacement(&output.engine.response, template, state.preset)?,
+        })
+    }
+
     fn run(
         store: &McStore,
         template: &TransformRequest,

@@ -856,12 +856,35 @@ fn execute_host(
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
     setup.setup.state.rebuild_epoch = state.rebuild_epoch;
-    let transform::compaction::Answer::Replacement(mut engine) = output.answer else {
+    // At the force threshold (at least 85% of the soft budget), queued drops
+    // may start a replacement even if the engine returned noop. Below it they
+    // still need a pass that already rewrites history, such as a fold or flush.
+    let force_native = codec == Codec::ClaudeCodeAnthropic
+        && !native_pending.is_empty()
+        && status.usage().current_total_input_tokens as f64 * 100.0
+            >= template
+                .geometry
+                .as_ref()
+                .map_or(status.context_window, |geometry| geometry.usable_soft)
+                as f64
+                * crate::scheduler::escalation_bands(context.execute_threshold_percentage)
+                    .force_materialize_percentage;
+    let promoted = force_native && matches!(output.answer, transform::compaction::Answer::Noop);
+    let answer = if promoted {
+        transform::compaction::Answer::Replacement(
+            transform::compaction::native_force_replacement(&output, &template, status, &mut state)
+                .map_err(transient)?,
+        )
+    } else {
+        output.answer
+    };
+    let transform::compaction::Answer::Replacement(mut engine) = answer else {
         return Ok(None);
     };
+    setup.setup.state.version_high_water = state.version_high_water;
     let mut native_coverage = output.engine.response.coverage_ordinal;
     if codec == Codec::ClaudeCodeAnthropic {
-        let rebuild = meta.initialized && output.prefix_bust_permitted;
+        let rebuild = meta.initialized && (output.prefix_bust_permitted || promoted);
         if !rebuild
             && template.messages.iter().any(|m| {
                 m.ck.content
@@ -973,6 +996,24 @@ fn execute_host(
             &tags,
             &pending_blocks,
         );
+        // Publish a pressure-only replacement only if it actually applied a
+        // queued drop. A surviving thinking signature binds the preceding bytes,
+        // so inserting summary-head messages before it must remain a noop.
+        if promoted
+            && (!super::native_reductions::pending_applied(
+                &engine,
+                &template,
+                &tags,
+                &pending_blocks,
+            ) || engine.replacement.iter().any(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(super::codec_claude_code::is_thinking_block)
+            }))
+        {
+            return Ok(None);
+        }
     }
     let (mut wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) = previous
         .filter(|p| {

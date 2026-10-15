@@ -587,12 +587,25 @@ async fn cc_without_fill_uses_request_estimate_and_soft_geometry_and_folds() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn cc_force_and_low_execute_threshold_need_rewrite_before_ctx_reduce_drop_without_broca() {
+async fn cc_force_band_applies_queued_native_drop_without_broca() {
+    queued_native_drop_without_broca(Some(22000)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_emergency_band_applies_queued_native_drop_without_broca() {
+    queued_native_drop_without_broca(Some(21000)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_below_force_execute_holds_pending_native_drop_without_broca() {
+    queued_native_drop_without_broca(None).await;
+}
+
+async fn queued_native_drop_without_broca(force_soft: Option<u64>) {
     let dir = tempfile::tempdir().unwrap();
     let mut h = handler(dir.path(), thalamus());
-    // A 10% threshold starts compaction sooner than the supported config range.
-    // This checks whether an earlier pass alone can replace a tool result the
-    // model asked to delete; it cannot.
+    // A 10% execute threshold admits the roughly 18%-full request below, well
+    // before the 85% force band can authorize replacing queued tool output.
     let user_config = dir.path().join("magic-context.jsonc");
     std::fs::write(&user_config, r#"{"execute_threshold_percentage":10}"#).unwrap();
     let low_threshold_config =
@@ -719,7 +732,7 @@ async fn cc_force_and_low_execute_threshold_need_rewrite_before_ctx_reduce_drop_
     turn_two["request_id"] = json!("turn-two");
     turn_two["context_window"] = json!(200000);
     turn_two["estimate"]["request_tokens"] = json!(20000);
-    turn_two["geometry"] = json!({"usable_soft":22000,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
+    turn_two["geometry"] = json!({"usable_soft":force_soft.unwrap_or(22000),"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
     turn_two["last_applied"] =
         json!({"compaction_id":applied_view["compaction_id"],"version":applied_view["version"]});
     turn_two["messages"].as_array_mut().unwrap().extend([
@@ -735,24 +748,6 @@ async fn cc_force_and_low_execute_threshold_need_rewrite_before_ctx_reduce_drop_
         json!({"mid":"followup","ordinal":10,"message":serde_json::from_str::<Value>(followup).unwrap(),"raw_message":followup}),
     ]);
     turn_two["newest"] = json!({"mid":"followup","ordinal":10});
-    let second = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        call(&h, "compaction.step", turn_two.clone()),
-    )
-    .await
-    .expect("a force-band step must not wait for unavailable Broca");
-    let second = response(second);
-    let pressure = transform::compaction::LAST_NATIVE_PRESSURE
-        .with(|slot| slot.borrow_mut().take())
-        .expect("the CC engine measured the request against usable_soft");
-    assert!((pressure.0 - (20_000.0 / 22_000.0 * 100.0)).abs() < 0.001);
-    assert_eq!(second["answer"], "noop", "{second}");
-    assert!(store
-        .load_pending_agent_drops(&key.engine_key())
-        .unwrap()
-        .iter()
-        .any(|drop| drop.target_id == "result#0"));
-
     let mut normal_geometry = turn_two.clone();
     normal_geometry["request_id"] = json!("normal-geometry");
     normal_geometry["estimate"]["request_tokens"] = json!(30000);
@@ -768,56 +763,84 @@ async fn cc_force_and_low_execute_threshold_need_rewrite_before_ctx_reduce_drop_
         .unwrap()
         .iter()
         .any(|drop| drop.target_id == "result#0"));
+    let Some(force_soft) = force_soft else {
+        return;
+    };
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        call(&h, "compaction.step", turn_two.clone()),
+    )
+    .await
+    .expect("a force-band step must not wait for unavailable Broca");
+    let second = response(second);
+    let pressure = transform::compaction::LAST_NATIVE_PRESSURE
+        .with(|slot| slot.borrow_mut().take())
+        .expect("the CC engine measured the request against usable_soft");
+    assert!((pressure.0 - (20_000.0 / force_soft as f64 * 100.0)).abs() < 0.001);
+    assert_eq!(second["answer"], "compaction_message", "{second}");
 
     let mut turn_three = turn_two;
     turn_three["request_id"] = json!("turn-three");
     turn_three["prefix_rebuilding"] = json!({"reason":"expired_cache"});
+    turn_three["last_applied"] = json!({"compaction_id":second["compaction"]["compaction_id"],"version":second["compaction"]["version"]});
     let third = response(call(&h, "compaction.step", turn_three).await);
     assert_eq!(third["answer"], "compaction_message", "{third}");
 
-    let version = third["compaction"]["version"].as_u64().unwrap();
-    let view = store
-        .load_provider_view(&key.store_key(), version)
-        .unwrap()
-        .unwrap();
-    let committed: Value = serde_json::from_str(&view.replacement_json).unwrap();
-    let raw_replacement = committed["raw_replacement"].as_array().unwrap();
-    let rendered = raw_replacement
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    let dropped_result = rendered
-        .iter()
-        .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
-        .find(|message| {
-            message["content"]
-                .as_array()
-                .is_some_and(|blocks| blocks.iter().any(|block| block["tool_use_id"] == "read-1"))
-        })
-        .expect("the replacement keeps the first tool result paired");
-    assert!(
-        dropped_result.to_string().contains("[dropped §"),
-        "{dropped_result}"
-    );
-    let rendered_messages = rendered
-        .iter()
-        .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
-        .collect::<Vec<_>>();
-    let call_index = rendered_messages
-        .iter()
-        .position(|message| {
-            message["content"].as_array().is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|block| block["type"] == "tool_use" && block["id"] == "read-1")
-            })
-        })
-        .expect("the replacement keeps the first tool call");
-    assert!(rendered_messages[call_index + 1]["content"]
-        .as_array()
-        .is_some_and(|blocks| blocks
+    for answer in [&second, &third] {
+        validate_native_answer(answer, &h.native_pins());
+        let version = answer["compaction"]["version"].as_u64().unwrap();
+        let view = store
+            .load_provider_view(&key.store_key(), version)
+            .unwrap()
+            .unwrap();
+        let committed: Value = serde_json::from_str(&view.replacement_json).unwrap();
+        let raw_replacement = committed["raw_replacement"].as_array().unwrap();
+        let rendered = raw_replacement
             .iter()
-            .any(|block| { block["type"] == "tool_result" && block["tool_use_id"] == "read-1" })));
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let dropped_result = rendered
+            .iter()
+            .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+            .find(|message| {
+                message["content"].as_array().is_some_and(|blocks| {
+                    blocks.iter().any(|block| block["tool_use_id"] == "read-1")
+                })
+            })
+            .expect("the replacement keeps the first tool result paired");
+        assert!(
+            dropped_result
+                .to_string()
+                .contains(&format!("[dropped §{}§]", result_tag.tag_number)),
+            "{dropped_result}"
+        );
+        let rendered_messages = rendered
+            .iter()
+            .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+            .collect::<Vec<_>>();
+        assert!(rendered_messages.iter().all(|message| {
+            message["content"].as_array().is_none_or(|blocks| {
+                blocks.iter().all(|block| {
+                    block["type"] != "thinking" && block["type"] != "redacted_thinking"
+                })
+            })
+        }));
+        let call_index = rendered_messages
+            .iter()
+            .position(|message| {
+                message["content"].as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block["type"] == "tool_use" && block["id"] == "read-1")
+                })
+            })
+            .expect("the replacement keeps the first tool call");
+        assert!(rendered_messages[call_index + 1]["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| {
+                block["type"] == "tool_result" && block["tool_use_id"] == "read-1"
+            })));
+    }
 }
 
 async fn fold_with_catalog(db_root: &Path, route_root: &Path, window: Option<u64>) -> Vec<Value> {

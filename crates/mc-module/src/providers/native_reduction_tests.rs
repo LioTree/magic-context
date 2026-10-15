@@ -323,6 +323,115 @@ fn cc_native_identity_signed_turn_holds_preceding_reduction() {
 }
 
 #[test]
+fn cc_native_queued_drop_before_kept_thinking_is_held_on_rebuild() {
+    let signed_b = SIGNED.replace("\"a\"", "\"b\"");
+    let result_b = RESULT.replace("\"a\"", "\"b\"");
+    let (req, mut view) = fixture(&[USER, MIXED, RESULT, ASSISTANT, USER, &signed_b, &result_b]);
+    let pending = BTreeSet::from(["m2#0".into()]);
+    let coverage = native_reductions::apply(
+        &mut view,
+        &req,
+        None,
+        true,
+        &["m5".into()],
+        &tags(),
+        &pending,
+    );
+    assert_eq!(coverage, None);
+    assert!(!native_reductions::pending_applied(
+        &view,
+        &req,
+        &tags(),
+        &pending
+    ));
+    assert_eq!(
+        view.replacement,
+        req.messages
+            .iter()
+            .map(|m| m.ck.clone())
+            .collect::<Vec<_>>()
+    );
+    final_bytes(&req, &view, coverage);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_native_force_and_emergency_hold_drops_before_active_thinking() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = claude_code_tests::handler(dir.path(), claude_code_tests::thalamus());
+    claude_code_tests::setup(&h).await;
+    let entries = |raw: &[String]| {
+        raw.iter().enumerate().map(|(i, raw)| {
+        json!({"mid":format!("m{i}"),"ordinal":i,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw})
+    }).collect::<Vec<_>>()
+    };
+    let raw = [
+        USER.into(),
+        MIXED.into(),
+        RESULT.into(),
+        ASSISTANT.into(),
+        USER.into(),
+        CALL.replace("\"a\"", "\"b\""),
+        RESULT.replace("\"a\"", "\"b\""),
+        ASSISTANT.into(),
+        USER.into(),
+        CALL.replace("\"a\"", "\"c\""),
+        RESULT.replace("\"a\"", "\"c\""),
+        ASSISTANT.into(),
+        USER.into(),
+        SIGNED.replace("\"a\"", "\"d\""),
+        RESULT.replace("\"a\"", "\"d\""),
+    ];
+    let mut status = claude_code_tests::step(USER);
+    status["messages"] = json!(entries(&raw[..13]));
+    status["newest"] = json!({"mid":"m12","ordinal":12});
+    status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+    let pins = h.native_pins();
+    let first = step_answer(&h, &status, &pins).await;
+    assert_eq!(first["answer"], "compaction_message", "{first}");
+    let applied = &first["compaction"];
+    status["last_applied"] =
+        json!({"compaction_id":applied["compaction_id"],"version":applied["version"]});
+    status["messages"] = json!(entries(&raw));
+    status.as_object_mut().unwrap().remove("prefix_rebuilding");
+    status["newest"] = json!({"mid":"m14","ordinal":14});
+    status["mid_turn"] = json!(true);
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    let store = h.store.get().unwrap();
+    store
+        .seed_tags_for_test(
+            &key.engine_key(),
+            &[2, 6, 10, 14].map(|i| mc_store::TagMintInput {
+                block_id: format!("m{i}#0"),
+                kind: "tool_result".into(),
+                token_count: 8000,
+                source_bytes: raw[i].as_bytes().to_vec(),
+            }),
+            2,
+        )
+        .unwrap();
+    store
+        .append_pending_agent_drops(&key.engine_key(), &["m2#0".into()], 3)
+        .unwrap();
+    status["context_window"] = json!(200000);
+    status["geometry"] = json!({"usable_soft":22000,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
+    for tokens in [20000, 21000] {
+        status["request_id"] = json!(format!("held-pressure-{tokens}"));
+        status["estimate"]["request_tokens"] = json!(tokens);
+        let answer = step_answer(&h, &status, &pins).await;
+        assert_eq!(answer["answer"], "noop", "{answer}");
+        let pressure = transform::compaction::LAST_NATIVE_PRESSURE
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap();
+        assert!((pressure.0 - (tokens as f64 / 22_000.0 * 100.0)).abs() < 0.001);
+        assert!(store
+            .load_pending_agent_drops(&key.engine_key())
+            .unwrap()
+            .iter()
+            .any(|drop| drop.target_id == "m2#0"));
+    }
+}
+
+#[test]
 fn cc_native_opaque_removal_and_untagged_result_drop_are_held() {
     let opaque = r#"{"role":"assistant","content":[{"type":"text","text":"answer"},{"type":"future","data":"verbatim"}]}"#;
     let (req, mut view) = fixture(&[USER, MIXED, RESULT, opaque]);

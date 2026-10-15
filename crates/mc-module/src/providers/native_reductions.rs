@@ -47,11 +47,11 @@ fn restore_arc(index: usize, slots: &mut [Option<CkWireMessage>], request: &Tran
     }
 }
 
-/// Edits may accompany a step the engine already permits to rewrite history;
-/// queued reductions cannot authorize a rewrite themselves. The returned ordinal
-/// is the last original message installed by the native hook's replacement. It
-/// may cover edited originals, not just historian summaries, so the engine's
-/// separate summarization boundary must remain unchanged.
+/// Apply edits on an authorized rewrite, including pressure-only replacements
+/// for eligible queued drops at the force threshold. The returned ordinal is the
+/// last original message installed by the replacement, including edited messages
+/// that have not been summarized. Keep it separate from the engine's summary
+/// boundary so later passes do not mistake those messages for summarized history.
 pub(super) fn apply(
     view: &mut transform::compaction::View,
     request: &TransformRequest,
@@ -135,6 +135,12 @@ pub(super) fn apply(
                     part,
                     "native reduction held: indistinguishable block provenance"
                 );
+                continue;
+            }
+            if matches!(block.kind, CkKind::ToolResult { .. })
+                && pending.contains(&format!("{}#{part}", entry.mid))
+            {
+                mapped.content[part] = result_drop(block, placeholder(&entry.mid, part, tags));
                 continue;
             }
             let edited = remaining
@@ -359,4 +365,37 @@ pub(super) fn apply(
         .chain(slots.into_iter().flatten())
         .collect();
     coverage
+}
+
+pub(super) fn pending_applied(
+    view: &transform::compaction::View,
+    request: &TransformRequest,
+    tags: &BTreeMap<String, i64>,
+    pending: &BTreeSet<String>,
+) -> bool {
+    request.messages.iter().any(|entry| {
+        entry.ck.content.iter().enumerate().any(|(part, source)| {
+            let CkKind::ToolResult { id, .. } = &source.kind else {
+                return false;
+            };
+            if !pending.contains(&format!("{}#{part}", entry.mid)) {
+                return false;
+            }
+            let Some(text) = placeholder(&entry.mid, part, tags) else {
+                return false;
+            };
+            view.replacement
+                .iter()
+                .find(|message| identity(message) == Some((&entry.mid, entry.ordinal)))
+                .is_none_or(|message| {
+                    message.content.iter().any(|block| {
+                        block.kind != source.kind
+                            && matches!(&block.kind, CkKind::ToolResult { id: kept_id, output, .. }
+                                if kept_id == id && matches!(&output.kind,
+                                    ck_wire::CkOutputKind::Text { text: kept }
+                                    | ck_wire::CkOutputKind::ErrorText { text: kept } if kept == &text))
+                    })
+                })
+        })
+    })
 }
