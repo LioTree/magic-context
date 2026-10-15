@@ -24,6 +24,7 @@ describe("subcommandHelp", () => {
             [["doctor", "single-store", "migrate"], SINGLE_STORE_HELP],
             [["doctor", "merge-identity", "--from", "a"], MERGE_IDENTITY_HELP],
             [["doctor", "project-ids", "plan"], PROJECT_IDS_HELP],
+            [["doctor", "project-ids", "apply", "--check"], PROJECT_IDS_HELP],
             [["doctor", "list-hidden-sessions"], LIST_HIDDEN_SESSIONS_HELP],
         ];
         for (const [argv, expected] of cases) {
@@ -85,6 +86,10 @@ describe("CLI --help per subcommand", () => {
         [["doctor", "single-store", "migrate"], "Usage: magic-context doctor single-store migrate"],
         [["doctor", "merge-identities"], "Usage: magic-context doctor merge-identities"],
         [["doctor", "project-ids", "plan"], "Usage: magic-context doctor project-ids plan"],
+        [
+            ["doctor", "project-ids", "apply", "--check"],
+            "magic-context doctor project-ids apply --check <plan>",
+        ],
         [["doctor", "list-hidden-sessions"], "Usage: magic-context doctor list-hidden-sessions"],
         [["doctor", "migrate"], "Magic Context doctor migrate"],
         [["doctor", "migrate-session"], "doctor migrate-session"],
