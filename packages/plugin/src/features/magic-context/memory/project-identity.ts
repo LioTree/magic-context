@@ -848,7 +848,12 @@ export function isLinkedGitWorktree(directory: string): boolean {
     const cached = linkedGitWorktreeCache.get(resolvedDirectory);
     if (cached !== undefined) return cached;
 
-    const linked = readGitCheckoutMetadata(resolvedDirectory)?.linkedWorktree ?? false;
+    const metadata = readGitCheckoutMetadata(resolvedDirectory);
+    const resolvedLinked =
+        metadata?.gitCommonDir === undefined ? undefined : metadata.linkedWorktree;
+    // If Git metadata exists but its topology cannot be resolved, fail closed:
+    // the checkout may be linked and must not be allowed to drain shared authority.
+    const linked = resolvedLinked ?? hasGitDir(resolvedDirectory);
     linkedGitWorktreeCache.set(resolvedDirectory, linked);
     return linked;
 }

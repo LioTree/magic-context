@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -73,6 +74,65 @@ describe("linked Git worktree detection", () => {
         rmSync(join(gitDir, "commondir"));
         expect(isLinkedGitWorktree(linked)).toBe(true);
         expect(gitCalls).toBe(0);
+    });
+
+    test.each([
+        "unreadable .git file",
+        "malformed .git file",
+        "missing gitdir target",
+        "unreadable gitdir target",
+        "unreadable commondir file",
+    ])("fails closed for %s without running git", (shape) => {
+        const checkout = join(storageDir, "checkout");
+        const dotGit = join(checkout, ".git");
+        const gitDir = join(storageDir, "metadata");
+        const commonFile = join(gitDir, "commondir");
+        mkdirSync(checkout);
+        writeFileSync(dotGit, `gitdir: ${gitDir}\n`);
+        if (shape !== "missing gitdir target") mkdirSync(gitDir);
+        if (shape === "malformed .git file") writeFileSync(dotGit, "not a gitdir pointer\n");
+        if (shape === "unreadable commondir file") writeFileSync(commonFile, ".\n");
+        const permissionDenied = (): NodeJS.ErrnoException =>
+            Object.assign(new Error("permission denied"), { code: "EACCES" });
+        const originalRead = fs.readFileSync;
+        const originalStat = fs.lstatSync;
+        let deniedReads = 0;
+        const read = spyOn(fs, "readFileSync").mockImplementation(((...args) => {
+            if (
+                (shape === "unreadable .git file" && args[0] === dotGit) ||
+                (shape === "unreadable commondir file" && args[0] === commonFile)
+            ) {
+                deniedReads++;
+                throw permissionDenied();
+            }
+            return Reflect.apply(originalRead, fs, args);
+        }) as typeof fs.readFileSync);
+        const stat = spyOn(fs, "lstatSync").mockImplementation(((...args) => {
+            if (shape === "unreadable gitdir target" && args[0] === commonFile) {
+                deniedReads++;
+                throw permissionDenied();
+            }
+            return Reflect.apply(originalStat, fs, args);
+        }) as typeof fs.lstatSync);
+        let gitCalls = 0;
+        __setProjectIdentityTestHooks({
+            execFileSync: (() => {
+                gitCalls++;
+                return `${gitDir}\n${gitDir}\n`;
+            }) as unknown as typeof execFileSync,
+        });
+        try {
+            expect(isLinkedGitWorktree(checkout)).toBe(true);
+            expect(gitCalls).toBe(0);
+            if (shape.startsWith("unreadable")) expect(deniedReads).toBe(1);
+        } finally {
+            read.mockRestore();
+            stat.mockRestore();
+        }
+    });
+
+    test("a folder without git metadata is not treated as linked", () => {
+        expect(isLinkedGitWorktree(storageDir)).toBe(false);
     });
 });
 
