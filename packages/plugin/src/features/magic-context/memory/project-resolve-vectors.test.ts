@@ -32,13 +32,25 @@ interface ParityCase {
     name: string;
     fixture: string;
     directory: string;
-    answer: string | { file: string; caseIndex: number; replaceStrings: Record<string, string> };
+    answer:
+        | string
+        | {
+              file: string;
+              caseIndex: number;
+              replaceStrings: Record<string, string>;
+              mutations?: { path: string[]; value: string | number | boolean | null }[];
+          };
     sidecars: Sidecar[];
     expected: {
-        identity: string;
-        gitCommonDir: string;
+        identity: string | null;
+        gitCommonDir: string | null;
+        canonicalRoot?: string;
+        errorClass?: string;
         sidecarWrites: Sidecar[];
         resolveCalls?: number;
+        resolveLogs?: number;
+        gitProbeCalls?: number;
+        sidecarBytesUnchanged?: boolean;
         ignoredImplicitSidecarLogs?: number;
         commonDirConflictLogs?: number;
     };
@@ -80,7 +92,16 @@ function vectorFor(row: ParityCase): unknown {
     expect(row.answer.file).toBe("resolve.json");
     const source = resolveVectors[row.answer.caseIndex];
     expect(source).toBeDefined();
-    return replaceStrings(source, row.answer.replaceStrings);
+    const vector = replaceStrings(source, row.answer.replaceStrings);
+    for (const mutation of row.answer.mutations ?? []) {
+        expect(mutation.path.length).toBeGreaterThanOrEqual(2);
+        let target = object(vector);
+        for (const key of mutation.path.slice(0, -1)) target = object(target[key]);
+        const lastKey = mutation.path.at(-1);
+        if (!lastKey) throw new Error("Mutation path must name a field");
+        target[lastKey] = mutation.value;
+    }
+    return vector;
 }
 
 function namedCase(name: string): ParityCase {
@@ -161,7 +182,7 @@ describe("shared project identity parity table", () => {
             .update(content)
             .digest("hex");
         expect(hash).toBe(parity.gitRootCommit);
-        expect(cases.length).toBeGreaterThanOrEqual(20);
+        expect(cases.length).toBeGreaterThanOrEqual(30);
         expect(new Set(cases.map((row) => row.name)).size).toBe(cases.length);
     });
 
@@ -169,9 +190,16 @@ describe("shared project identity parity table", () => {
         test(`${row.name}: has a relocatable fixture, vector answer and explicit expectations`, () => {
             expect(parity.fixtures).toHaveProperty(row.fixture);
             expect(row.directory).toStartWith("<fixture>/");
-            expect(row.expected.gitCommonDir).toStartWith("<fixture>/");
-            expect(row.expected.identity).toMatch(/^(pj-[A-Za-z0-9_-]+|git:[a-f0-9]{40})$/);
-            expect(row.expected.identity).not.toStartWith("pj-implicit1-");
+            if (row.expected.errorClass) {
+                expect(row.expected.identity).toBeNull();
+                expect(row.expected.gitCommonDir).toBeNull();
+                expect(row.expected.resolveCalls).toBe(0);
+                expect(row.expected.sidecarWrites).toEqual([]);
+            } else {
+                expect(row.expected.gitCommonDir).toStartWith("<fixture>/");
+                expect(row.expected.identity).toMatch(/^(pj-[A-Za-z0-9_-]+|git:[a-f0-9]{40})$/);
+                expect(row.expected.identity).not.toStartWith("pj-implicit1-");
+            }
             expect(Array.isArray(row.sidecars)).toBe(true);
             expect(Array.isArray(row.expected.sidecarWrites)).toBe(true);
             for (const sidecar of [...row.sidecars, ...row.expected.sidecarWrites]) {
@@ -189,9 +217,14 @@ describe("shared project identity parity table", () => {
             } else {
                 const vector = object(vectorFor(row));
                 const request = object(vector.request);
-                const result = object(object(vector.reply).result);
-                expect(object(request.params).canonicalRoot).toBe(row.directory);
-                expect(result.canonicalRoot).toBe(row.directory);
+                const reply = object(vector.reply);
+                if (reply.result) {
+                    const result = object(reply.result);
+                    expect(object(request.params).canonicalRoot).toBe(row.directory);
+                    expect(result.canonicalRoot).toBe(row.expected.canonicalRoot ?? row.directory);
+                } else {
+                    expect(reply.code).toMatch(/^(invalid_params|storage_unavailable)$/);
+                }
                 visit(vector, (_key, value) => {
                     if (typeof value === "string" && value.startsWith("/")) {
                         expect(value).toStartWith("<fixture>/");
@@ -292,5 +325,148 @@ describe("shared project identity parity table", () => {
             expect(row.expected.resolveCalls).toBe(0);
             expect(row.expected.sidecarWrites).toEqual([]);
         }
+    });
+
+    test("includes every tolerant-reader, error, pin-writing and eligibility row by name", () => {
+        const names = cases.map((row) => row.name);
+        for (const name of [
+            "tolerant-reader-unknown-via",
+            "tolerant-reader-extra-field",
+            "tolerant-reader-decode-failure",
+            "error-invalid-params",
+            "error-storage-unavailable",
+            "legacy-git-record-replaced-by-live-project-pin",
+            "pj-pin-preserves-sidecar-bytes",
+            "walk-subfolder-canonical-root-equals-checkout",
+            "walk-subfolder-canonical-root-differs-from-checkout",
+            "home-directory-refused-before-resolve",
+        ]) {
+            expect(names).toContain(name);
+            expect(namedCase(name).expected.resolveCalls).toBeDefined();
+        }
+    });
+
+    test("tolerant-reader rows isolate unknown values from harmless extra fields", () => {
+        for (const name of ["tolerant-reader-unknown-via", "tolerant-reader-decode-failure"]) {
+            const row = namedCase(name);
+            expect(row.expected.identity).toBe(`git:${parity.gitRootCommit}`);
+            expect(row.expected.resolveCalls).toBe(1);
+            expect(row.expected.resolveLogs).toBe(1);
+            expect(row.expected.sidecarWrites).toHaveLength(1);
+            expect(row.expected.sidecarWrites[0].identity).toBe(`git:${parity.gitRootCommit}`);
+        }
+        const unknownVia = object(
+            object(object(vectorFor(namedCase("tolerant-reader-unknown-via"))).reply).result,
+        );
+        expect(unknownVia.via).toBe("orbit");
+        expect(unknownVia.futureField).toBe(true);
+        const undecodable = object(
+            object(object(vectorFor(namedCase("tolerant-reader-decode-failure"))).reply).result,
+        );
+        expect(undecodable.projectId).toBe(42);
+
+        const extra = namedCase("tolerant-reader-extra-field");
+        const result = object(object(object(vectorFor(extra)).reply).result);
+        expect(result.via).toBe("root");
+        expect(result.futureField).toBe(true);
+        expect(extra.expected.identity).toBe("pj-resolve-root");
+        expect(extra.expected.resolveCalls).toBe(1);
+        expect(extra.expected.resolveLogs).toBe(0);
+        expect(extra.expected.sidecarWrites).toHaveLength(1);
+        expect(extra.expected.sidecarWrites[0].identity).toBe("pj-resolve-root");
+    });
+
+    test("error rows reuse the vendored refusal and fall back without a project pin", () => {
+        for (const [name, code] of [
+            ["error-invalid-params", "invalid_params"],
+            ["error-storage-unavailable", "storage_unavailable"],
+        ]) {
+            const row = namedCase(name);
+            expect(typeof row.answer).not.toBe("string");
+            if (typeof row.answer === "string") throw new Error("Expected a vector answer");
+            expect(row.answer.caseIndex).toBe(5);
+            const reply = object(object(vectorFor(row)).reply);
+            expect(reply).not.toHaveProperty("result");
+            expect(reply.code).toBe(code);
+            expect(reply.message).toBe(resolveVectors[5].reply.message);
+            expect(reply.detail).toBe(resolveVectors[5].reply.detail);
+            expect(row.expected.identity).toBe(`git:${parity.gitRootCommit}`);
+            expect(row.expected.resolveCalls).toBe(1);
+            expect(row.expected.sidecarWrites).toHaveLength(1);
+            expect(row.expected.sidecarWrites[0].identity).toBe(`git:${parity.gitRootCommit}`);
+        }
+        expect(namedCase("error-invalid-params").expected.resolveLogs).toBe(1);
+    });
+
+    test("a legacy git record is replaced by the live project pin", () => {
+        const row = namedCase("legacy-git-record-replaced-by-live-project-pin");
+        expect(row.sidecars).toHaveLength(1);
+        expect(row.sidecars[0].directory).toBe(row.directory);
+        expect(row.sidecars[0].identity).toBe(`git:${parity.gitRootCommit}`);
+        expect(object(object(object(vectorFor(row)).reply).result).via).toBe("root");
+        expect(row.expected.identity).toBe("pj-resolve-root");
+        expect(row.expected.resolveCalls).toBe(1);
+        expect(row.expected.sidecarWrites).toHaveLength(1);
+        expect(row.expected.sidecarWrites[0].directory).toBe(row.directory);
+        expect(row.expected.sidecarWrites[0].identity).toBe("pj-resolve-root");
+    });
+
+    test("pj pins preserve sidecar bytes without a git probe or resolve", () => {
+        const row = namedCase("pj-pin-preserves-sidecar-bytes");
+        expect(row.sidecars).toHaveLength(1);
+        expect(row.sidecars[0].directory).toBe(row.directory);
+        expect(row.sidecars[0].identity).toBe("pj-A");
+        expect(row.expected.identity).toBe("pj-A");
+        expect(row.expected.resolveCalls).toBe(0);
+        expect(row.expected.gitProbeCalls).toBe(0);
+        expect(row.expected.sidecarWrites).toEqual([]);
+        expect(row.expected.sidecarBytesUnchanged).toBe(true);
+    });
+
+    test("a walk answer pins the checkout root only for an equal canonicalRoot spelling", () => {
+        // A registered subfolder must not pin its parent merely because via is walk:
+        // the pin-writing bullet in intent section 2 requires canonicalRoot to equal the checkout root.
+        for (const name of [
+            "walk-subfolder-canonical-root-equals-checkout",
+            "walk-subfolder-canonical-root-differs-from-checkout",
+        ]) {
+            const row = namedCase(name);
+            const result = object(object(object(vectorFor(row)).reply).result);
+            expect(row.directory).toBe("<fixture>/repo/sub");
+            expect(result.via).toBe("walk");
+            expect(row.expected.identity).toBe("pj-resolve-root");
+            expect(row.expected.resolveCalls).toBe(1);
+            const expectedDirectories =
+                result.canonicalRoot === "<fixture>/repo"
+                    ? ["<fixture>/repo/sub", "<fixture>/repo"]
+                    : ["<fixture>/repo/sub"];
+            expect(row.expected.sidecarWrites.map((write) => write.directory)).toEqual(
+                expectedDirectories,
+            );
+        }
+        expect(
+            namedCase("walk-subfolder-canonical-root-equals-checkout").expected.canonicalRoot,
+        ).toBe("<fixture>/repo");
+        expect(
+            namedCase("walk-subfolder-canonical-root-differs-from-checkout").expected.canonicalRoot,
+        ).toBe("<fixture>/repo/sub");
+    });
+
+    test("a disallowed home directory is refused before identity resolution", () => {
+        const row = namedCase("home-directory-refused-before-resolve");
+        const fixture = object(object(parity.fixtures)[row.fixture]);
+        expect(fixture.home).toBe(row.directory);
+        expect(row.expected.identity).toBeNull();
+        expect(row.expected.gitCommonDir).toBeNull();
+        expect(row.expected.errorClass).toBe("home_project_disabled");
+        expect(row.expected.resolveCalls).toBe(0);
+        expect(row.expected.gitProbeCalls).toBe(0);
+        expect(row.expected.sidecarWrites).toEqual([]);
+    });
+
+    test("record mutations never change the vendored source", () => {
+        const original = structuredClone(resolveVectors);
+        for (const row of cases) vectorFor(row);
+        expect(resolveVectors).toEqual(original);
     });
 });
