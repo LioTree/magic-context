@@ -4573,6 +4573,13 @@ fn get_project_identities(conn: &Connection) -> Result<Vec<ProjectInfo>, rusqlit
 }
 
 pub fn get_projects(conn: &Connection) -> Result<Vec<ProjectInfo>, rusqlite::Error> {
+    get_projects_with_names(conn, &crate::project_names::cache().snapshot())
+}
+
+fn get_projects_with_names(
+    conn: &Connection,
+    names: &crate::project_names::ProjectNames,
+) -> Result<Vec<ProjectInfo>, rusqlite::Error> {
     // Use the same enumeration as the project list shown to the user.
     let identity_to_row: HashMap<String, ProjectRow> = enumerate_projects_filtered(None)
         .into_iter()
@@ -4583,7 +4590,12 @@ pub fn get_projects(conn: &Connection) -> Result<Vec<ProjectInfo>, rusqlite::Err
         .into_iter()
         .map(|project| {
             let id = project.identity;
-            let (label, path) = if let Some(row) = identity_to_row.get(&id) {
+            let (label, path) = if let Some(label) = crate::project_names::pj_label(&id, names) {
+                (
+                    label,
+                    identity_to_row.get(&id).map(|row| row.primary_path.clone()),
+                )
+            } else if let Some(row) = identity_to_row.get(&id) {
                 (row.display_name.clone(), Some(row.primary_path.clone()))
             } else if id.starts_with("git:") {
                 let short = &id[4..std::cmp::min(id.len(), 14)];
@@ -4607,6 +4619,13 @@ pub fn enumerate_projects() -> Vec<ProjectRow> {
 }
 
 pub fn enumerate_memory_projects(conn: &Connection) -> Result<Vec<ProjectRow>, rusqlite::Error> {
+    enumerate_memory_projects_with_names(conn, &crate::project_names::cache().snapshot())
+}
+
+fn enumerate_memory_projects_with_names(
+    conn: &Connection,
+    names: &crate::project_names::ProjectNames,
+) -> Result<Vec<ProjectRow>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT project_path
          FROM memories
@@ -4617,8 +4636,8 @@ pub fn enumerate_memory_projects(conn: &Connection) -> Result<Vec<ProjectRow>, r
         .query_map([], |row| row.get(0))?
         .collect::<Result<HashSet<_>, _>>()?;
 
-    // Memory rows usually store a resolved project identity (`git:<hash>` or
-    // `dir:<md5-12>`). Some old rows may still store a raw filesystem path.
+    // Memory rows usually store a resolved project identity (`git:`, `dir:` or
+    // `pj-`). Some old rows may still store a raw filesystem path.
     // Normalize both shapes so the picker is keyed by identity rather than by
     // whatever path string happened to be written originally.
     let memory_identities: HashSet<String> = memory_project_values
@@ -4659,6 +4678,11 @@ pub fn enumerate_memory_projects(conn: &Connection) -> Result<Vec<ProjectRow>, r
                 harnesses: vec![],
                 session_count: 0,
             });
+        }
+    }
+    for row in &mut all {
+        if let Some(label) = crate::project_names::pj_label(&row.identity, names) {
+            row.display_name = label;
         }
     }
     all.sort_by(|a, b| a.display_name.cmp(&b.display_name));
@@ -4920,6 +4944,13 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
 /// `conn` is the context.db handle (memories + workspaces). Returns cards sorted
 /// by last activity, newest first.
 pub fn get_project_cards(conn: &Connection) -> Vec<ProjectCard> {
+    get_project_cards_with_names(conn, &crate::project_names::cache().snapshot())
+}
+
+fn get_project_cards_with_names(
+    conn: &Connection,
+    names: &crate::project_names::ProjectNames,
+) -> Vec<ProjectCard> {
     #[derive(Default)]
     struct Accum {
         display_name: String,
@@ -4964,11 +4995,14 @@ pub fn get_project_cards(conn: &Connection) -> Vec<ProjectCard> {
         .map(|(identity, accum)| {
             let memory_count = count_memories_matching_identity(conn, &identity).unwrap_or(0);
             let primary_path = dir_by_identity.get(&identity).cloned().unwrap_or_default();
-            // Prefer the representative directory's basename for the label: it's
-            // resolved to the MAIN checkout (not a worktree), so a project shows as
-            // e.g. `aft` rather than a recent worktree's `bg_<hash>` session label.
-            // Fall back to the session-derived label, then a short identity.
-            let display_name = if !primary_path.is_empty() {
+            // Registered identities use the cached name or a short pj- marker.
+            // Legacy identities prefer the representative directory's basename:
+            // it is the main checkout, not a recent worktree's bg_<hash> label.
+            // They fall back to the session-derived label, then a short identity.
+            let display_name = if let Some(label) = crate::project_names::pj_label(&identity, names)
+            {
+                label
+            } else if !primary_path.is_empty() {
                 basename(&primary_path)
             } else if !accum.display_name.is_empty() {
                 accum.display_name
@@ -5372,22 +5406,23 @@ pub fn get_memories(
             enrich_memories_workspace_source(conn, workspace_filter, &mut memories)?;
             Ok(memories)
         }
-        Ok(empty) if use_fts && !use_like_fallback && offset > 0 && {
-            // An empty page past the first one only falls back to LIKE when FTS
-            // matches nothing at all. Otherwise it is just the end of the FTS
-            // results, and a LIKE page at the same offset would splice a
-            // different result set onto the pages already shown.
-            let mut probe: Vec<&dyn rusqlite::types::ToSql> = params[..params.len() - 2]
-                .iter()
-                .map(|p| p.as_ref())
-                .collect();
-            probe.push(&1i64);
-            probe.push(&0i64);
-            conn.prepare(&sql)?
-                .query(probe.as_slice())?
-                .next()?
-                .is_some()
-        } =>
+        Ok(empty)
+            if use_fts && !use_like_fallback && offset > 0 && {
+                // An empty page past the first one only falls back to LIKE when FTS
+                // matches nothing at all. Otherwise it is just the end of the FTS
+                // results, and a LIKE page at the same offset would splice a
+                // different result set onto the pages already shown.
+                let mut probe: Vec<&dyn rusqlite::types::ToSql> = params[..params.len() - 2]
+                    .iter()
+                    .map(|p| p.as_ref())
+                    .collect();
+                probe.push(&1i64);
+                probe.push(&0i64);
+                conn.prepare(&sql)?
+                    .query(probe.as_slice())?
+                    .next()?
+                    .is_some()
+            } =>
         {
             Ok(empty)
         }
@@ -9548,6 +9583,96 @@ mod session_identity_map_tests {
         });
     }
 
+    fn assert_pj_labels_at_all_sites(
+        names: &crate::project_names::ProjectNames,
+        labels: [&str; 3],
+    ) {
+        with_temp_data_home(|data_home| {
+            let context = create_context_db(data_home, true);
+            let oc = create_opencode_db(data_home);
+            let identities = [
+                "pj-dashboard-editor",
+                "pj-dashboard-terminal",
+                "pj-0123456789ABCDEFGHIJ",
+            ];
+            for (index, identity) in identities.iter().enumerate() {
+                let id = format!("project-{index}");
+                let directory = data_home.join(&id);
+                std::fs::create_dir_all(&directory).unwrap();
+                insert_session_project(&context, &id, "opencode", identity);
+                context
+                    .execute(
+                        "INSERT INTO memories (project_path, status) VALUES (?1, 'active')",
+                        [identity],
+                    )
+                    .unwrap();
+                oc.execute(
+                    "INSERT INTO project (id, name, worktree) VALUES (?1, 'Directory label', ?2)",
+                    (&id, directory.to_string_lossy().as_ref()),
+                )
+                .unwrap();
+                oc.execute("INSERT INTO session (id, title, project_id, directory, time_updated) VALUES (?1, 'Session label', ?1, ?2, 100)",
+                    (&id, directory.to_string_lossy().as_ref())).unwrap();
+            }
+            drop(oc);
+            let projects = get_projects_with_names(&context, names).unwrap();
+            let picker = enumerate_memory_projects_with_names(&context, names).unwrap();
+            let cards = get_project_cards_with_names(&context, names);
+            assert_eq!(projects.len(), 3);
+            assert_eq!(picker.len(), 3);
+            assert_eq!(cards.len(), 3);
+            for (identity, label) in identities.iter().zip(labels) {
+                assert_eq!(
+                    projects
+                        .iter()
+                        .find(|row| row.identity == *identity)
+                        .unwrap()
+                        .label,
+                    label,
+                    "get_projects: {identity}"
+                );
+                assert_eq!(
+                    picker
+                        .iter()
+                        .find(|row| row.identity == *identity)
+                        .unwrap()
+                        .display_name,
+                    label,
+                    "enumerate_memory_projects: {identity}"
+                );
+                assert_eq!(
+                    cards
+                        .iter()
+                        .find(|row| row.identity == *identity)
+                        .unwrap()
+                        .display_name,
+                    label,
+                    "get_project_cards: {identity}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn enumerate_vector_names_and_unknown_pj_labels_at_all_three_sites() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../test-vectors/project-resolve-v1/enumerate.json"
+        ))
+        .unwrap();
+        let names =
+            crate::project_names::parse_names(&serde_json::to_vec(&vector[0]["reply"]).unwrap())
+                .unwrap();
+        assert_pj_labels_at_all_sites(&names, ["Editor", "Terminal", "pj-0123456789…"]);
+    }
+
+    #[test]
+    fn absent_entorhinal_uses_short_pj_labels_at_all_three_sites() {
+        assert_pj_labels_at_all_sites(
+            &HashMap::new(),
+            ["pj-dashboard-…", "pj-dashboard-…", "pj-0123456789…"],
+        );
+    }
+
     #[test]
     fn get_project_cards_lists_opencode2_sessions_from_session_v2_with_their_directory() {
         with_temp_data_home(|data_home| {
@@ -12033,8 +12158,8 @@ mod memory_project_filter_tests {
         insert_memory_with_content(&conn, "nothing special", 2000);
         insert_memory_with_content(&conn, r"the tree lives under C:\Users\dev", 3000);
 
-        let rows = get_memories(&conn, None, None, None, None, Some(r"\n"), 100, 0)
-            .expect("get_memories");
+        let rows =
+            get_memories(&conn, None, None, None, None, Some(r"\n"), 100, 0).expect("get_memories");
         assert_eq!(rows.iter().map(|m| m.id).collect::<Vec<_>>(), vec![literal]);
 
         // A Windows path whose FTS tokens match nothing exactly falls back to

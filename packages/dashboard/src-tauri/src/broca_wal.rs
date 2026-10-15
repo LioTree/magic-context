@@ -2129,7 +2129,10 @@ pub(crate) mod tests {
     fn decoded_archived_members_are_bounded() {
         let mut cache = WalCache::default();
         for i in 0..(MAX_REMEMBERED_ARCHIVED as u64 + 5) {
-            cache.remember_archived((PathBuf::from(format!("c{i}.ark")), 0, 100), Err("x".into()));
+            cache.remember_archived(
+                (PathBuf::from(format!("c{i}.ark")), 0, 100),
+                Err("x".into()),
+            );
         }
         assert!(cache.archived.len() <= MAX_REMEMBERED_ARCHIVED);
 
