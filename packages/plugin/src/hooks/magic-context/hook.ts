@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
     isCompactionEnabled,
     isDreamerRunnable,
@@ -32,6 +33,12 @@ import {
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
+import {
+    awaitSessionIdentityDecision,
+    forgetSessionIdentityDecision,
+    readSessionIdentityDecision,
+    type SessionIdentityDecision,
+} from "../../features/magic-context/memory/session-identity-decision";
 import {
     getAutoEmbeddingSessionCoverage,
     getEmbeddingCoverageStatus,
@@ -209,6 +216,7 @@ export interface MagicContextDeps {
     openDatabaseForHook?: () => Database | null;
     /** Plugin-factory diagnostics for the boot-time storage phases. */
     onStorageBootTimings?: (timings: DatabaseBootTimings) => void;
+    launchIdentityDecision?: SessionIdentityDecision;
 }
 
 function notifyMagicContextDisabled(client: PluginContext["client"], reason: string): void {
@@ -281,10 +289,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         return null;
     }
 
-    const projectPath = resolveProjectIdentityForSession(
-        deps.directory,
-        deps.config.allow_home_project,
-    );
+    const projectPath = deps.launchIdentityDecision
+        ? deps.launchIdentityDecision.identity
+        : resolveProjectIdentityForSession(deps.directory, deps.config.allow_home_project);
     if (!projectPath) {
         log("[magic-context] not binding a project identity for this directory");
         clearHookInitFailure();
@@ -568,10 +575,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const getEmbedStatusText = (sessionId: string): string => {
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentityForSession(
-            directory,
-            deps.config.allow_home_project,
-        );
+        const sessionProjectIdentity = readSessionIdentityDecision(sessionId, directory, {
+            allowHomeProject: deps.config.allow_home_project,
+        })?.identity;
         if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
         maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
@@ -587,10 +593,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const maybeAutoEmbedSession = (sessionId: string): void => {
         if (isEmbeddingHostBusy()) return;
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const identity = resolveProjectIdentityForSession(
-            directory,
-            deps.config.allow_home_project,
-        );
+        const identity = readSessionIdentityDecision(sessionId, directory, {
+            allowHomeProject: deps.config.allow_home_project,
+        })?.identity;
         const snapshot = identity ? getProjectEmbeddingSnapshot(identity) : undefined;
         const embedIdentity = snapshot
             ? JSON.stringify([
@@ -625,10 +630,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     return;
                 }
                 await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-                const sessionProjectIdentity = resolveProjectIdentityForSession(
-                    directory,
-                    deps.config.allow_home_project,
-                );
+                const sessionProjectIdentity = readSessionIdentityDecision(sessionId, directory, {
+                    allowHomeProject: deps.config.allow_home_project,
+                })?.identity;
                 if (!sessionProjectIdentity) {
                     invalidateAutoEmbedSession(sessionId);
                     return;
@@ -749,6 +753,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         client: deps.client,
         directory: deps.directory,
         allowHomeProject: deps.config.allow_home_project,
+        subcConnectionFile: deps.config.subc?.connection_file,
         injectDocs: deps.config.dreamer?.inject_docs !== false,
         memoryConfig: deps.config.memory
             ? {
@@ -848,6 +853,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         compactionHandler: deps.compactionHandler,
         config: deps.config,
         allowHomeProject: deps.config.allow_home_project,
+        subcConnectionFile: deps.config.subc?.connection_file,
         compactionOff,
         thinkingBindingRecoveryEnabled: deps.config.transform_mode !== "rust",
         tagger: deps.tagger,
@@ -1320,8 +1326,16 @@ export async function createMagicContextHookAsync(
         });
         return null;
     }
+    const launchKey = `launch:${randomUUID()}`;
+    const launchIdentityDecision = await awaitSessionIdentityDecision(launchKey, deps.directory, {
+        db: database,
+        allowHomeProject: deps.config.allow_home_project,
+        connectionFile: deps.config.subc?.connection_file,
+    });
+    forgetSessionIdentityDecision(launchKey);
     return createMagicContextHook({
         ...deps,
+        launchIdentityDecision,
         openDatabaseForHook: () => database,
     });
 }

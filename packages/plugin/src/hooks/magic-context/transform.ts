@@ -1,9 +1,10 @@
 import type { ProtectedTokensTierOverrides } from "../../config/project-security";
 import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
+import { takeDubiousOwnershipProjectIdentityWarning } from "../../features/magic-context/memory/project-identity";
 import {
-    resolveProjectIdentityForSession,
-    takeDubiousOwnershipProjectIdentityWarning,
-} from "../../features/magic-context/memory/project-identity";
+    awaitSessionIdentityDecision,
+    readSessionIdentityDecision,
+} from "../../features/magic-context/memory/session-identity-decision";
 import {
     type MessageReconciliationSource,
     scheduleReconciliation,
@@ -511,6 +512,7 @@ export interface TransformDeps {
     directory?: string;
     /** Whether user-level configuration lets this session use the canonical home directory as its project. */
     allowHomeProject?: boolean;
+    subcConnectionFile?: string;
     memoryConfig?: {
         enabled: boolean;
         injectionBudgetTokens: number;
@@ -1202,6 +1204,13 @@ export function createTransform(deps: TransformDeps) {
                 passOutcome.record("session-directory-fallback");
                 sessionDirectoryFellBack = true;
             }
+        }
+        if (sessionDirectory) {
+            await awaitSessionIdentityDecision(sessionId, sessionDirectory, {
+                db,
+                allowHomeProject: deps.allowHomeProject,
+                connectionFile: deps.subcConnectionFile,
+            });
         }
         // The launch directory can belong to a different project than the
         // session (`opencode -s <id>` started elsewhere). A pass that fell back
@@ -2054,15 +2063,14 @@ export function createTransform(deps: TransformDeps) {
 
         logTransformTiming(sessionId, "emergencyRecoveryBlock", tFirstPass);
 
-        // Resolve project identity ONCE per transform pass. Used by both
-        // prepareCompartmentInjection (memory filtering by project) and
-        // runCompartmentPhase (historian memory resolution). Computing it
-        // twice per turn is wasteful — resolveProjectIdentity caches by
-        // directory but still does a cache lookup on each call, and the
-        // first call per directory in a new process spawns `git rev-list`.
+        // Memory rendering and host persistence use the same session decision.
+        // The legacy resolveProjectIdentityForSession directory cache may still hold
+        // a git-root identity chosen before the registry became available.
         const memoryProjectDirectory = compartmentDirectory || process.cwd();
         const projectIdentity = deps.memoryConfig?.enabled
-            ? resolveProjectIdentityForSession(memoryProjectDirectory, deps.allowHomeProject)
+            ? readSessionIdentityDecision(sessionId, memoryProjectDirectory, {
+                  allowHomeProject: deps.allowHomeProject,
+              })?.identity
             : undefined;
         if (deps.memoryConfig?.enabled) {
             maybeSendProjectIdentityWarning(
@@ -2078,17 +2086,18 @@ export function createTransform(deps: TransformDeps) {
         // `opencode -s <id>` started from a different repo it points at the wrong
         // project, so note nudges and auto-search would query the launch project's
         // notes/memories. Reuse the memory identity when memory is enabled
-        // (identical value, no extra resolve); otherwise resolve from the session
-        // directory, falling back to the launch identity only when unavailable.
-        // resolveProjectIdentity is per-directory cached, so the common case
-        // (session dir == launch dir) costs nothing extra.
+        // (identical value); otherwise read the same session decision.
         const sessionProjectIdentity =
             projectIdentity ??
             (sessionDirectory
-                ? resolveProjectIdentityForSession(sessionDirectory, deps.allowHomeProject)
+                ? readSessionIdentityDecision(sessionId, sessionDirectory, {
+                      allowHomeProject: deps.allowHomeProject,
+                  })?.identity
                 : deps.projectPath);
         const sessionIdentityForBinding = sessionDirectory
-            ? resolveProjectIdentityForSession(sessionDirectory, deps.allowHomeProject)
+            ? readSessionIdentityDecision(sessionId, sessionDirectory, {
+                  allowHomeProject: deps.allowHomeProject,
+              })?.identity
             : undefined;
         if (sessionDirectory) {
             maybeSendProjectIdentityWarning(deps, sessionId, sessionDirectory, notificationParams);
@@ -2112,7 +2121,8 @@ export function createTransform(deps: TransformDeps) {
             sessionDirectoryResolvedFromHost &&
             recordedSessionProjectIdentity.get(sessionId) !== sessionIdentityForBinding
         ) {
-            recordSessionProjectIdentity(db, sessionId, sessionIdentityForBinding);
+            const change = recordSessionProjectIdentity(db, sessionId, sessionIdentityForBinding);
+            if (change?.previousProjectPath) deps.pendingMaterializationSessions?.add(sessionId);
             recordedSessionProjectIdentity.set(sessionId, sessionIdentityForBinding);
         }
 
