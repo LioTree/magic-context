@@ -340,16 +340,20 @@ function classifyGitError(error: unknown, rawDirectory: string): ProjectIdentity
  *
  * The cache is process-local, keyed by `path.resolve(directory)`, and stores only successful git
  * identities. Transient failures are never cached.
+ * Exact-directory `pj-` pins retain precedence. For an unpinned directory, set `cache: false`
+ * to bypass the git-identity cache and return a fresh result without updating caches or
+ * durable identity pins.
  */
 export function resolveProjectIdentityStrict(
     directory: string,
     allowHomeProject = homeProjectPermission,
+    options: { cache?: boolean } = {},
 ): string {
     assertProjectAllowed(directory, allowHomeProject);
     const canonical = path.resolve(directory);
     const pinned = pinForUsableDirectory(canonical, directory);
     if (pinned !== undefined) return pinned;
-    const cached = identityCache.get(canonical);
+    const cached = options.cache === false ? undefined : identityCache.get(canonical);
     if (cached !== undefined) {
         return cached;
     }
@@ -405,6 +409,7 @@ export function resolveProjectIdentityStrict(
     }
 
     const identity = `git:${rootCommit}`;
+    if (options.cache === false) return identity;
     identityCache.set(canonical, identity);
     lastKnownGitIdentityCache.set(canonical, identity);
     rememberGitIdentity(canonical, identity);

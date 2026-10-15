@@ -23,6 +23,15 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
         classification: "PUBLICATION",
         reason: "Records installation of the process-exit pin-writer drain, not a persistence outcome; failed and overflowed writes remain retryable.",
     },
+    "packages/plugin/src/features/magic-context/memory/project-pin-writer.ts:workerUnavailableReported":
+        {
+            classification: "DIAGNOSTIC",
+            reason: "Suppresses duplicate worker-unavailable log messages only; in-process pin writes still run on every fallback attempt.",
+        },
+    "packages/plugin/src/features/magic-context/compaction-marker-candidates.ts:exitRegistered": {
+        classification: "PUBLICATION",
+        reason: "Records that the process-exit handler stopping marker candidate workers is installed; it stores no candidate, absence or failure verdict.",
+    },
     "packages/pi-plugin/src/index.ts:databaseExitHookRegistered": {
         classification: "PUBLICATION",
         reason: "Correct: records that the one process-exit handler closing the shared database is installed, so /reload doesn't register a second one; it holds no failure or absence verdict.",
@@ -199,7 +208,8 @@ function sourceFiles(directory: string): string[] {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
         const path = join(directory, entry.name);
         if (entry.isDirectory()) {
-            files.push(...sourceFiles(path));
+            // Package fixture harnesses are excluded from production compilation.
+            if (entry.name !== "__tests__") files.push(...sourceFiles(path));
         } else if (entry.isFile() && path.endsWith(".ts") && !path.endsWith(".test.ts")) {
             files.push(path);
         }

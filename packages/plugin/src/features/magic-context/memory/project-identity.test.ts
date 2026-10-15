@@ -399,6 +399,7 @@ describe("project pin precedence", () => {
         });
         expect(resolveProjectIdentity(directory)).toBe("pj-A");
         expect(resolveProjectIdentityStrict(directory)).toBe("pj-A");
+        expect(resolveProjectIdentityStrict(directory, false, { cache: false })).toBe("pj-A");
         expect(resolveProjectIdentityForSession(directory)).toBe("pj-A");
         expect(gitCalls).toBe(0);
         expect(readFileSync(file, "utf8")).toBe(before);

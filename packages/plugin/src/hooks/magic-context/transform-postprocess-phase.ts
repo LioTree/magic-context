@@ -932,6 +932,12 @@ export function applyRustModeDeferredCompactionMarker(args: {
     );
     args.afterApply?.(outcome);
     switch (outcome.kind) {
+        case "deferred":
+            sessionLog(
+                args.sessionId,
+                "rust compaction-marker drain: candidate preparation deferred; pending target retained",
+            );
+            break;
         case "applied":
         case "already-current":
         case "stale-skip":
@@ -3683,9 +3689,18 @@ export async function runPostTransformPhase(
                 );
             } else {
                 const tMarkerDrain = performance.now();
-                const outcome = (
-                    args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy
-                ).applyDeferred(args.db, args.sessionId, pending, args.sessionDirectory);
+                const strategy = args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy;
+                const candidatesReady =
+                    strategy.applyDeferred !== applyDeferredCompactionMarker ||
+                    (await prepareCompactionMarkerCandidates(args.sessionId));
+                const outcome: MarkerUpdateOutcome = candidatesReady
+                    ? strategy.applyDeferred(
+                          args.db,
+                          args.sessionId,
+                          pending,
+                          args.sessionDirectory,
+                      )
+                    : { kind: "deferred", reason: "candidate-preparation" };
                 logTransformTiming(
                     args.sessionId,
                     "pp.markerDrain",
@@ -3693,6 +3708,16 @@ export async function runPostTransformPhase(
                     `outcome=${outcome.kind}`,
                 );
                 switch (outcome.kind) {
+                    case "deferred":
+                        // Summary discovery may observe a new summary or fail to load
+                        // its worker. Only marker replacement waits: serve the rebuilt
+                        // request now and retry replacement on a later history rebuild.
+                        suppressV12HistoryDrain = true;
+                        sessionLog(
+                            args.sessionId,
+                            "compaction-marker drain: candidate preparation deferred; preserving deferred history refresh signal",
+                        );
+                        break;
                     case "applied":
                     case "already-current":
                     case "stale-skip":
@@ -4698,6 +4723,7 @@ export function checkM0MutationDriftAndSignal(args: {
     return false;
 }
 
+import { prepareCompactionMarkerCandidates } from "../../features/magic-context/compaction-marker";
 import {
     clearPendingMaterialization,
     pendingMaterializationOrigin,

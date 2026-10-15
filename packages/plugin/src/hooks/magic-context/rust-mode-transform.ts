@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
+import { prepareCompactionMarkerCandidates } from "../../features/magic-context/compaction-marker";
 import type {
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
@@ -4548,7 +4549,12 @@ export function createRustModeTransform(
                 // LKG captures postprocessed output, so running postprocess again would stop the
                 // fallback artifact from being an exact replay.
                 if (!replayedFrozenRepresentation) {
-                    if (materializedBoundary && !deps.compactionOff) {
+                    if (
+                        (materializedBoundary ||
+                            getPendingCompactionMarkerState(deps.db, sessionId) !== null) &&
+                        !deps.compactionOff
+                    ) {
+                        await prepareCompactionMarkerCandidates(sessionId);
                         try {
                             await withAsyncPrivilegedWriter(deps.db, () => undefined);
                         } catch (error) {

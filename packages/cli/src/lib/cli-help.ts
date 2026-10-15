@@ -31,13 +31,16 @@ const HARNESS_LINES = [
 
 export const SETUP_HELP = [
     "",
-    "  Usage: magic-context setup [--harness opencode|pi|omp] [--dry-run]",
+    "  Usage: magic-context setup [--harness opencode|pi|omp] [--dry-run] [--dashboard|--no-dashboard]",
     "",
     "  Interactive setup wizard: registers the Magic Context plugin with the",
-    "  selected harness and writes its Magic Context config.",
+    "  selected harness and writes its Magic Context config. Afterwards it offers",
+    "  to install the Magic Context Dashboard desktop app (interactive runs only).",
     "",
     "  Options:",
     "    --dry-run             Preview the wizard without writing any files",
+    "    --dashboard           Install or update the dashboard without asking",
+    "    --no-dashboard        Skip the dashboard offer",
     ...HARNESS_LINES,
     "",
 ].join("\n");
@@ -92,7 +95,7 @@ export const SINGLE_STORE_HELP = [
 
 export const MERGE_IDENTITY_HELP = [
     "",
-    "  Usage: magic-context doctor merge-identities [--from <identity> --to <identity>] [--apply] [--force] [--db <path>]",
+    "  Usage: magic-context doctor merge-identities [--from <identity> --to <identity>] [--apply] [--force] [--verbose] [--db <path>] [--backup-root <dir>]",
     "",
     "  Merge every project-scoped row from one project identity into another.",
     "",
@@ -102,8 +105,10 @@ export const MERGE_IDENTITY_HELP = [
     "    (no flags)          List splits; --from/--to previews without writing",
     "    --apply             Confirm the reviewed preview; hosts must be closed",
     "    --force             Permit a target not resolving on this machine",
+    "    --verbose           List every missing source-only folder and orphaned sidecar",
     "    --db <path>         Use this context.db instead of the shared one",
     "    --host-db <path>    Read session directories from this host database",
+    "    --backup-root <dir> Store the backup under this directory",
     "    Legacy alias: doctor merge-identity; --dry-run previews, --yes applies",
     "",
 ].join("\n");
