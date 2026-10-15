@@ -407,6 +407,84 @@ fn field(raw: &str, key: &str, value: &str) -> Result<String, HandlerOutcome> {
     Ok(replace(raw, range, value))
 }
 
+/// Prefix a native content part without re-encoding its JSON string. Part indices
+/// are native content indices (zero for scalar content), not hook block indices.
+/// Array tool results use their first text child; eligibility is the caller's job.
+#[allow(dead_code)] // Hook answers and served-baseline rendering share this splicer.
+pub(super) fn splice_admission_tag(
+    raw: &str,
+    part_index: usize,
+    number: u64,
+) -> Result<String, HandlerOutcome> {
+    let message = parse_unique_json(raw)?;
+    if !message.is_object() {
+        return Err(invalid_raw(
+            "admission tag requires a native message object",
+        ));
+    }
+    let content_span = members(raw)
+        .into_iter()
+        .find(|m| m.0 == "content")
+        .ok_or_else(|| invalid_raw("admission tag requires native content"))?
+        .1;
+    let content_raw = &raw[content_span.clone()];
+    let offset = if message["content"].is_string() && part_index == 0 {
+        content_span.start
+    } else {
+        let blocks = message["content"]
+            .as_array()
+            .ok_or_else(|| invalid_raw("admission tag part is outside native content"))?;
+        let block = blocks
+            .get(part_index)
+            .ok_or_else(|| invalid_raw("admission tag part is outside native content"))?;
+        let span = array(content_raw)[part_index].clone();
+        let block_raw = &content_raw[span.clone()];
+        let (key, child) = match block["type"].as_str() {
+            Some("text") if block["text"].is_string() => ("text", None),
+            Some("tool_result") if block["content"].is_string() => ("content", None),
+            Some("tool_result") => {
+                let children = block["content"]
+                    .as_array()
+                    .ok_or_else(|| invalid_raw("admission tag requires tool result text"))?;
+                if !children.iter().all(|child| {
+                    child["type"] == "image"
+                        || (child["type"] == "text" && child["text"].is_string())
+                }) {
+                    return Err(invalid_raw(
+                        "admission tag requires text/image tool content",
+                    ));
+                }
+                let first_text = children
+                    .iter()
+                    .position(|child| child["type"] == "text")
+                    .ok_or_else(|| invalid_raw("admission tag requires tool result text"))?;
+                ("content", Some(first_text))
+            }
+            _ => return Err(invalid_raw("admission tag requires a native text part")),
+        };
+        let value_span = members(block_raw)
+            .into_iter()
+            .find(|m| m.0 == key)
+            .expect("validated text field")
+            .1;
+        let value_offset = content_span.start + span.start + value_span.start;
+        if let Some(child) = child {
+            let result_raw = &block_raw[value_span];
+            let child_span = array(result_raw)[child].clone();
+            let text_span = members(&result_raw[child_span.clone()])
+                .into_iter()
+                .find(|m| m.0 == "text")
+                .expect("validated text child")
+                .1;
+            value_offset + child_span.start + text_span.start
+        } else {
+            value_offset
+        }
+    };
+    let insert_at = offset + 1; // The opening quote belongs to the original JSON.
+    Ok(replace(raw, insert_at..insert_at, &format!("§{number}§ ")))
+}
+
 /// Changed text is spliced into its original shell. Verified thinking bytes and
 /// opaque blocks cannot be authored; a covered whole-turn strip may remove all
 /// thinking while replaying every remaining block from the original raw JSON.
@@ -793,6 +871,193 @@ pub(super) fn answer_bytes(answer: &Value, raw: &[String]) -> Result<Vec<u8>, Ha
 mod tests {
     use super::super::codec::Codec;
     use super::*;
+
+    const ADMISSION_VECTORS: &[u8] = include_bytes!("cc_admission_vectors/admission-tags.json");
+    const ADMISSION_SOURCE: &str = include_str!("cc_admission_vectors/SOURCE");
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AdmissionSource {
+        repository: String,
+        path: String,
+        commit: Option<String>,
+        sha256: Option<String>,
+    }
+
+    fn checked_admission_vectors<'a>(
+        source: &str,
+        bytes: &'a [u8],
+    ) -> Result<Option<&'a [u8]>, String> {
+        let source: AdmissionSource = serde_json::from_str(source).map_err(|e| e.to_string())?;
+        if source.repository != "thalamus"
+            || source.path != "crates/thalamus-module/src/cc_step_codec/vectors/admission-tags.json"
+        {
+            return Err("SOURCE must name the THALAMUS admission vector file".into());
+        }
+        match (source.commit, source.sha256) {
+            (None, None) => {
+                if serde_json::from_slice::<Value>(bytes).map_err(|e| e.to_string())? != json!([]) {
+                    return Err("unpinned admission vectors must be empty; do not author provisional vectors".into());
+                }
+                Ok(None)
+            }
+            (Some(commit), Some(digest)) => {
+                let hex = |value: &str, len| {
+                    value.len() == len
+                        && value
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                };
+                if !hex(&commit, 40) || !hex(&digest, 64) {
+                    return Err("SOURCE requires a full commit and lowercase sha256".into());
+                }
+                let actual = sha256_hex(bytes);
+                if actual != digest {
+                    return Err(format!(
+                        "admission-tags.json sha256 mismatch: SOURCE {digest}, actual {actual}"
+                    ));
+                }
+                Ok(Some(bytes))
+            }
+            _ => Err("SOURCE commit and sha256 must be pinned together".into()),
+        }
+    }
+
+    fn pinned_admission_vectors(gate: &str) -> Option<&'static [u8]> {
+        let vectors = checked_admission_vectors(ADMISSION_SOURCE, ADMISSION_VECTORS)
+            .unwrap_or_else(|reason| panic!("{gate}: {reason}"));
+        if vectors.is_none() {
+            eprintln!("SKIP {gate}: THALAMUS has not named a pinned commit for admission-tags.json; G1 cannot close");
+        }
+        vectors
+    }
+
+    #[test]
+    fn admission_vectors_digest_matches_source() {
+        let _ = pinned_admission_vectors("admission_vectors_digest_matches_source");
+    }
+
+    #[test]
+    fn admission_vectors_replay_byte_for_byte() {
+        let Some(bytes) = pinned_admission_vectors("admission_vectors_replay_byte_for_byte") else {
+            return;
+        };
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Vector {
+            name: String,
+            raw_message: String,
+            part_index: usize,
+            number: u64,
+            expected: String,
+        }
+        let vectors: Vec<Vector> = serde_json::from_slice(bytes).expect("THALAMUS splice vectors");
+        assert!(
+            !vectors.is_empty(),
+            "pinned admission vectors must not be empty"
+        );
+        for vector in vectors {
+            let actual =
+                splice_admission_tag(&vector.raw_message, vector.part_index, vector.number)
+                    .unwrap_or_else(|error| panic!("{}: {error:?}", vector.name));
+            assert_eq!(
+                actual.as_bytes(),
+                vector.expected.as_bytes(),
+                "{}",
+                vector.name
+            );
+        }
+    }
+
+    #[test]
+    fn admission_vector_digest_rejects_mismatch() {
+        let source = json!({
+            "repository": "thalamus",
+            "path": "crates/thalamus-module/src/cc_step_codec/vectors/admission-tags.json",
+            "commit": "1111111111111111111111111111111111111111",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        })
+        .to_string();
+        assert_eq!(
+            checked_admission_vectors(&source, b"").unwrap(),
+            Some(&b""[..])
+        );
+        assert!(checked_admission_vectors(&source, b"changed")
+            .unwrap_err()
+            .contains("sha256 mismatch"));
+    }
+
+    #[test]
+    fn admission_vectors_require_a_complete_pin_or_an_empty_placeholder() {
+        let mut source: Value = serde_json::from_str(ADMISSION_SOURCE).unwrap();
+        source["commit"] = Value::Null;
+        source["sha256"] = Value::Null;
+        assert_eq!(
+            checked_admission_vectors(&source.to_string(), b"[]").unwrap(),
+            None
+        );
+        assert!(checked_admission_vectors(&source.to_string(), b"[null]").is_err());
+        source["commit"] = json!("1111111111111111111111111111111111111111");
+        assert!(checked_admission_vectors(&source.to_string(), b"[]").is_err());
+    }
+
+    #[test]
+    fn admission_splice_preserves_scalar_escape_spelling() {
+        let raw = r#" { "role" : "user", "\u0063ontent" : " §9§ \u00e9\n\"\\\/𐐀" } "#;
+        let expected = r#" { "role" : "user", "\u0063ontent" : "§12§  §9§ \u00e9\n\"\\\/𐐀" } "#;
+        assert_eq!(
+            splice_admission_tag(raw, 0, 12).unwrap().as_bytes(),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn admission_splice_uses_native_part_indices_and_keeps_empty_text() {
+        let raw = r#"{"role":"user","content":[{"type":"image","source":{}},{"type":"text","text":""},{"type":"text","text":"\u0061"}]}"#;
+        let first = splice_admission_tag(raw, 1, 2).unwrap();
+        assert_eq!(
+            first,
+            r#"{"role":"user","content":[{"type":"image","source":{}},{"type":"text","text":"§2§ "},{"type":"text","text":"\u0061"}]}"#
+        );
+        assert_eq!(
+            splice_admission_tag(&first, 2, 3).unwrap(),
+            r#"{"role":"user","content":[{"type":"image","source":{}},{"type":"text","text":"§2§ "},{"type":"text","text":"§3§ \u0061"}]}"#
+        );
+    }
+
+    #[test]
+    fn admission_splice_targets_tool_result_string_or_first_text_child() {
+        let raw = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"\t done"}]}"#;
+        assert_eq!(
+            splice_admission_tag(raw, 0, 4).unwrap(),
+            r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"§4§ \t done"}]}"#
+        );
+        let raw = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","is_error":true,"content":[{"type":"image","source":{}},{"type":"text","te\u0078t":"\u0041"},{"type":"text","text":"second"}]}]}"#;
+        assert_eq!(
+            splice_admission_tag(raw, 0, 5).unwrap(),
+            r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","is_error":true,"content":[{"type":"image","source":{}},{"type":"text","te\u0078t":"§5§ \u0041"},{"type":"text","text":"second"}]}]}"#
+        );
+    }
+
+    #[test]
+    fn admission_splice_refuses_invalid_json_and_non_text_targets() {
+        for raw in [
+            "not json",
+            "[]",
+            r#"{"role":"user"}"#,
+            r#"{"content":"one","\u0063ontent":"two"}"#,
+            r#"{"content":[]}"#,
+            r#"{"content":[{"type":"thinking","thinking":"signed"}]}"#,
+            r#"{"content":[{"type":"tool_result","content":[{"type":"image"}]}]}"#,
+            r#"{"content":[{"type":"tool_result","content":[{"type":"text","text":"ok"},{"type":"other"}]}]}"#,
+        ] {
+            assert!(splice_admission_tag(raw, 0, 1).is_err(), "{raw}");
+        }
+        assert!(splice_admission_tag(r#"{"content":"scalar"}"#, 1, 1).is_err());
+        assert!(
+            splice_admission_tag(r#"{"content":[{"type":"text","text":"ok"}]}"#, 1, 1).is_err()
+        );
+    }
 
     fn entry(raw: &str, ordinal: u64) -> compact::status::StatusMessage {
         compact::status::StatusMessage {
