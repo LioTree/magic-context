@@ -856,24 +856,27 @@ fn execute_host(
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
     setup.setup.state.rebuild_epoch = state.rebuild_epoch;
-    // At the force threshold (at least 85% of the soft budget), queued drops
-    // may start a replacement even if the engine returned noop. Below it they
-    // still need a pass that already rewrites history, such as a fold or flush.
-    let force_native = codec == Codec::ClaudeCodeAnthropic
+    // The engine's "execute" decision permits queued drops to replace history.
+    // Ordinary execution can be deferred while a tool turn is unfinished; force
+    // pressure (at least 85% of the soft budget) still allows pressure relief.
+    let execute_ride = output.engine.response.scheduler_decision.as_deref() == Some("execute");
+    let force_due = status.usage().current_total_input_tokens as f64 * 100.0
+        >= template
+            .geometry
+            .as_ref()
+            .map_or(status.context_window, |geometry| geometry.usable_soft) as f64
+            * crate::scheduler::escalation_bands(context.execute_threshold_percentage)
+                .force_materialize_percentage;
+    let promoted = codec == Codec::ClaudeCodeAnthropic
         && !native_pending.is_empty()
-        && status.usage().current_total_input_tokens as f64 * 100.0
-            >= template
-                .geometry
-                .as_ref()
-                .map_or(status.context_window, |geometry| geometry.usable_soft)
-                as f64
-                * crate::scheduler::escalation_bands(context.execute_threshold_percentage)
-                    .force_materialize_percentage;
-    let promoted = force_native && matches!(output.answer, transform::compaction::Answer::Noop);
+        && (execute_ride || force_due)
+        && matches!(output.answer, transform::compaction::Answer::Noop);
     let answer = if promoted {
         transform::compaction::Answer::Replacement(
-            transform::compaction::native_force_replacement(&output, &template, status, &mut state)
-                .map_err(transient)?,
+            transform::compaction::native_queued_replacement(
+                &output, &template, status, &mut state,
+            )
+            .map_err(transient)?,
         )
     } else {
         output.answer
@@ -884,6 +887,35 @@ fn execute_host(
     setup.setup.state.version_high_water = state.version_high_water;
     let mut native_coverage = output.engine.response.coverage_ordinal;
     if codec == Codec::ClaudeCodeAnthropic {
+        if promoted
+            && template.messages.iter().any(|entry| {
+                entry
+                    .ck
+                    .content
+                    .iter()
+                    .any(super::codec_claude_code::is_thinking_block)
+            })
+        {
+            // Claude Code's signed thinking binds message order and preceding
+            // bytes. A queued-only replacement must preserve that input prefix,
+            // rather than inserting summary heads or stripping earlier thinking.
+            if state.last_applied.as_ref().is_some_and(|previous| {
+                previous
+                    .replacement
+                    .iter()
+                    .any(super::codec_claude_code::strips_signed_turn)
+            }) {
+                // The installed view removed thinking that template.messages
+                // still retains. Reconstructing those originals would resurrect
+                // deleted blocks, so wait for an engine-authorized rebuild.
+                return Ok(None);
+            }
+            engine.replacement = template
+                .messages
+                .iter()
+                .map(|entry| entry.ck.clone())
+                .collect();
+        }
         let rebuild = meta.initialized && (output.prefix_bust_permitted || promoted);
         if !rebuild
             && template.messages.iter().any(|m| {
@@ -996,21 +1028,17 @@ fn execute_host(
             &tags,
             &pending_blocks,
         );
-        // Publish a pressure-only replacement only if it actually applied a
-        // queued drop. A surviving thinking signature binds the preceding bytes,
-        // so inserting summary-head messages before it must remain a noop.
+        // Require a newly replaced tool result, not one already acknowledged.
+        // native_reductions restores input messages through the last surviving
+        // thinking block; encode_view also checks the bytes before its signature.
         if promoted
-            && (!super::native_reductions::pending_applied(
+            && !super::native_reductions::pending_applied(
                 &engine,
                 &template,
                 &tags,
                 &pending_blocks,
-            ) || engine.replacement.iter().any(|message| {
-                message
-                    .content
-                    .iter()
-                    .any(super::codec_claude_code::is_thinking_block)
-            }))
+                state.last_applied.as_ref(),
+            )
         {
             return Ok(None);
         }
@@ -1039,7 +1067,11 @@ fn execute_host(
     } else {
         let (wire, raw_replacement, initial_coverage) = if codec == Codec::ClaudeCodeAnthropic {
             let (mut wire, mut raw) =
-                super::codec_claude_code::encode_view(&engine, &template, native_coverage)?;
+                match super::codec_claude_code::encode_view(&engine, &template, native_coverage) {
+                    Ok(encoded) => encoded,
+                    Err(_) if promoted => return Ok(None),
+                    Err(error) => return Err(error),
+                };
             let coverage = if native_coverage.is_none()
                 && super::native_view::has_selected_bundle(conversation)?
             {

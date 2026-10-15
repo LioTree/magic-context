@@ -47,8 +47,8 @@ fn restore_arc(index: usize, slots: &mut [Option<CkWireMessage>], request: &Tran
     }
 }
 
-/// Apply edits on an authorized rewrite, including pressure-only replacements
-/// for eligible queued drops at the force threshold. The returned ordinal is the
+/// Apply edits alongside a fold/flush or an execute/force opportunity that can
+/// replace queued tool results. The returned ordinal is the
 /// last original message installed by the replacement, including edited messages
 /// that have not been summarized. Keep it separate from the engine's summary
 /// boundary so later passes do not mistake those messages for summarized history.
@@ -372,6 +372,7 @@ pub(super) fn pending_applied(
     request: &TransformRequest,
     tags: &BTreeMap<String, i64>,
     pending: &BTreeSet<String>,
+    previously_applied: Option<&transform::compaction::View>,
 ) -> bool {
     request.messages.iter().any(|entry| {
         entry.ck.content.iter().enumerate().any(|(part, source)| {
@@ -384,7 +385,11 @@ pub(super) fn pending_applied(
             let Some(text) = placeholder(&entry.mid, part, tags) else {
                 return false;
             };
-            view.replacement
+            let applied_in = |view: &transform::compaction::View| {
+                if entry.ordinal < view.range.from || entry.ordinal >= view.range.to {
+                    return false;
+                }
+                view.replacement
                 .iter()
                 .find(|message| identity(message) == Some((&entry.mid, entry.ordinal)))
                 .is_none_or(|message| {
@@ -396,6 +401,8 @@ pub(super) fn pending_applied(
                                     | ck_wire::CkOutputKind::ErrorText { text: kept } if kept == &text))
                     })
                 })
+            };
+            applied_in(view) && previously_applied.is_none_or(|previous| !applied_in(previous))
         })
     })
 }

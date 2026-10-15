@@ -2551,7 +2551,7 @@ pub mod compaction {
         run(store, template, ctx, status, state, false)
     }
 
-    pub(crate) fn native_force_replacement(
+    pub(crate) fn native_queued_replacement(
         output: &Output,
         template: &TransformRequest,
         status: &Status,

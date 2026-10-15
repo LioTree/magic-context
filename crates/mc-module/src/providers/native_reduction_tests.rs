@@ -342,7 +342,8 @@ fn cc_native_queued_drop_before_kept_thinking_is_held_on_rebuild() {
         &view,
         &req,
         &tags(),
-        &pending
+        &pending,
+        None
     ));
     assert_eq!(
         view.replacement,
@@ -352,6 +353,38 @@ fn cc_native_queued_drop_before_kept_thinking_is_held_on_rebuild() {
             .collect::<Vec<_>>()
     );
     final_bytes(&req, &view, coverage);
+}
+
+#[test]
+fn cc_native_pending_applied_excludes_acknowledged_but_not_unseen_results() {
+    let (req, original) = fixture(&[USER, MIXED, RESULT]);
+    let mut reduced = original.clone();
+    let pending = BTreeSet::from(["m2#0".into()]);
+    native_reductions::apply(&mut reduced, &req, None, true, &[], &tags(), &pending);
+    assert!(native_reductions::pending_applied(
+        &reduced,
+        &req,
+        &tags(),
+        &pending,
+        Some(&original)
+    ));
+    assert!(!native_reductions::pending_applied(
+        &reduced,
+        &req,
+        &tags(),
+        &pending,
+        Some(&reduced)
+    ));
+    let mut unseen = original;
+    unseen.range.to = 2;
+    unseen.replacement.pop();
+    assert!(native_reductions::pending_applied(
+        &reduced,
+        &req,
+        &tags(),
+        &pending,
+        Some(&unseen)
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -428,6 +461,106 @@ async fn cc_native_force_and_emergency_hold_drops_before_active_thinking() {
             .unwrap()
             .iter()
             .any(|drop| drop.target_id == "m2#0"));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_native_execute_drops_after_kept_thinking_preserve_prefix_bytes() {
+    drop_after_kept_thinking(30000, 167000).await;
+}
+
+async fn drop_after_kept_thinking(tokens: u64, soft: u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let h = claude_code_tests::handler(dir.path(), claude_code_tests::thalamus());
+    let mut binding = claude_code_tests::binding(dir.path(), claude_code_tests::thalamus());
+    binding.config.execute_threshold_percentage = 10.0;
+    h.bind_route(7, binding);
+    let ready = claude_code_tests::setup(&h).await;
+    let mut raw = vec![
+        USER.into(),
+        MIXED.into(),
+        RESULT.into(),
+        ASSISTANT.into(),
+        USER.into(),
+        CALL.replace("\"a\"", "\"b\""),
+        RESULT.replace("\"a\"", "\"b\""),
+        ASSISTANT.into(),
+        USER.into(),
+        CALL.replace("\"a\"", "\"c\""),
+        RESULT.replace("\"a\"", "\"c\""),
+        ASSISTANT.into(),
+        USER.into(),
+        SIGNED.replace("\"a\"", "\"d\""),
+        RESULT.replace("\"a\"", "\"d\""),
+    ];
+    for id in ["e", "f", "g"] {
+        raw.extend([
+            CALL.replace("\"a\"", &format!("\"{id}\"")),
+            RESULT.replace("\"a\"", &format!("\"{id}\"")),
+        ]);
+    }
+    let mut status = claude_code_tests::step(USER);
+    status["messages"] = json!(raw.iter().enumerate().map(|(i, raw)| {
+        json!({"mid":format!("m{i}"),"ordinal":i,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw})
+    }).collect::<Vec<_>>());
+    status["newest"] = json!({"mid":"m20","ordinal":20});
+    status["mid_turn"] = json!(true);
+    status["last_applied"] = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    let pins = h.native_pins();
+    assert_eq!(step_answer(&h, &status, &pins).await["answer"], "noop");
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    let store = h.store.get().unwrap();
+    let tags = store
+        .seed_tags_for_test(
+            &key.engine_key(),
+            &[2, 6, 10, 14, 16, 18, 20].map(|i| mc_store::TagMintInput {
+                block_id: format!("m{i}#0"),
+                kind: "tool_result".into(),
+                token_count: 8000,
+                source_bytes: raw[i].as_bytes().to_vec(),
+            }),
+            2,
+        )
+        .unwrap();
+    store
+        .append_pending_agent_drops(&key.engine_key(), &["m2#0".into(), "m14#0".into()], 3)
+        .unwrap();
+    status["request_id"] = json!("drop-after-kept-thinking");
+    status["mid_turn"] = json!(false);
+    status["context_window"] = json!(200000);
+    status["estimate"]["request_tokens"] = json!(tokens);
+    status["geometry"] = json!({"usable_soft":soft,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
+    let answer = step_answer(&h, &status, &pins).await;
+    assert_eq!(answer["answer"], "compaction_message", "{answer}");
+    assert_eq!(answer["coverage"]["ordinal"], 14);
+    let view = store
+        .load_provider_view(
+            &key.store_key(),
+            answer["compaction"]["version"].as_u64().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let committed: Value = serde_json::from_str(&view.replacement_json).unwrap();
+    let rendered = committed["raw_replacement"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|raw| raw.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(rendered.len(), raw.len());
+    assert_eq!(rendered[..=13], raw[..=13]);
+    assert_eq!(rendered[15..], raw[15..]);
+    let result_tag = tags
+        .iter()
+        .find(|tag| tag.block_id == "m14#0")
+        .unwrap()
+        .tag_number;
+    assert!(rendered[14].contains(&format!("[dropped §{result_tag}§]")));
+    assert!(rendered[13].contains("\"signature\":\"sig\""));
+    status["last_applied"] = json!({"compaction_id":answer["compaction"]["compaction_id"],"version":answer["compaction"]["version"]});
+    for pass in 0..2 {
+        status["request_id"] = json!(format!("same-execute-{pass}"));
+        assert_eq!(step_answer(&h, &status, &pins).await["answer"], "noop");
     }
 }
 
@@ -642,6 +775,7 @@ async fn fresh_sequence(queue: bool, mixed: bool) {
             .await;
         assert!(matches!(queued, HandlerOutcome::Response(_)), "{queued:?}");
     }
+    status["mid_turn"] = json!(true);
     for pass in 0..3 {
         let hook = json!({"session":"cc","harness":"claude-code","request_id":format!("hold-hook-{pass}"),"hook":"pre_user","phase":"before_write",
             "lineage_id":"fresh-after-native-summary","subject_mid":"m12","subject_ordinal":12,"blocks":["question"],"params":plan,"step_id":format!("hook-{pass}"),
@@ -659,6 +793,7 @@ async fn fresh_sequence(queue: bool, mixed: bool) {
         assert_eq!(answer["answer"], "noop");
     }
     status["request_id"] = json!("rebuild");
+    status["mid_turn"] = json!(false);
     status["prefix_rebuilding"] = json!({"reason":"expired_cache"});
     status["estimate"]["request_tokens"] = json!(95000);
     let rebuilt = step_answer(&h, &status, &pins).await;

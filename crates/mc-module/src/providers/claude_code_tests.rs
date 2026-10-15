@@ -588,24 +588,30 @@ async fn cc_without_fill_uses_request_estimate_and_soft_geometry_and_folds() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn cc_force_band_applies_queued_native_drop_without_broca() {
-    queued_native_drop_without_broca(Some(22000)).await;
+    queued_native_drop_without_broca(Some((20000, 22000))).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn cc_emergency_band_applies_queued_native_drop_without_broca() {
-    queued_native_drop_without_broca(Some(21000)).await;
+    queued_native_drop_without_broca(Some((20000, 21000))).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn cc_below_force_execute_holds_pending_native_drop_without_broca() {
+async fn cc_below_force_execute_applies_pending_native_drop_without_broca() {
+    queued_native_drop_without_broca(Some((30000, 167000))).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_defer_holds_pending_native_drop_without_broca() {
     queued_native_drop_without_broca(None).await;
 }
 
-async fn queued_native_drop_without_broca(force_soft: Option<u64>) {
+async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
     let dir = tempfile::tempdir().unwrap();
     let mut h = handler(dir.path(), thalamus());
-    // A 10% execute threshold admits the roughly 18%-full request below, well
-    // before the 85% force band can authorize replacing queued tool output.
+    // A 10% threshold admits the roughly 18%-full execute request, below the 85%
+    // force threshold. The lower-pressure request reports an unfinished tool
+    // turn, so the scheduler must defer ordinary execution until its boundary.
     let user_config = dir.path().join("magic-context.jsonc");
     std::fs::write(&user_config, r#"{"execute_threshold_percentage":10}"#).unwrap();
     let low_threshold_config =
@@ -646,7 +652,7 @@ async fn queued_native_drop_without_broca(force_soft: Option<u64>) {
 
     let mut turn_one = step(r#"{"role":"user","content":"Read the note."}"#);
     turn_one["context_window"] = json!(200000);
-    turn_one["estimate"]["request_tokens"] = json!(20000);
+    turn_one["estimate"]["request_tokens"] = json!(1);
     turn_one["geometry"] = json!({"usable_soft":167000,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
     turn_one["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
     turn_one["messages"].as_array_mut().unwrap().extend([
@@ -731,8 +737,8 @@ async fn queued_native_drop_without_broca(force_soft: Option<u64>) {
     let mut turn_two = step(r#"{"role":"user","content":"Read the note."}"#);
     turn_two["request_id"] = json!("turn-two");
     turn_two["context_window"] = json!(200000);
-    turn_two["estimate"]["request_tokens"] = json!(20000);
-    turn_two["geometry"] = json!({"usable_soft":force_soft.unwrap_or(22000),"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
+    turn_two["estimate"]["request_tokens"] = json!(pressure.map_or(20000, |(tokens, _)| tokens));
+    turn_two["geometry"] = json!({"usable_soft":pressure.map_or(22000, |(_, soft)| soft),"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
     turn_two["last_applied"] =
         json!({"compaction_id":applied_view["compaction_id"],"version":applied_view["version"]});
     turn_two["messages"].as_array_mut().unwrap().extend([
@@ -750,20 +756,21 @@ async fn queued_native_drop_without_broca(force_soft: Option<u64>) {
     turn_two["newest"] = json!({"mid":"followup","ordinal":10});
     let mut normal_geometry = turn_two.clone();
     normal_geometry["request_id"] = json!("normal-geometry");
-    normal_geometry["estimate"]["request_tokens"] = json!(30000);
+    normal_geometry["estimate"]["request_tokens"] = json!(1000);
+    normal_geometry["mid_turn"] = json!(true);
     normal_geometry["geometry"] = json!({"usable_soft":167000,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
     let normal = response(call(&h, "compaction.step", normal_geometry).await);
     let normal_pressure = transform::compaction::LAST_NATIVE_PRESSURE
         .with(|slot| slot.borrow_mut().take())
-        .expect("the low-threshold CC pass reaches the engine");
-    assert!((normal_pressure.0 - (30_000.0 / 167_000.0 * 100.0)).abs() < 0.001);
+        .expect("the defer CC pass reaches the engine");
+    assert!((normal_pressure.0 - (1_000.0 / 167_000.0 * 100.0)).abs() < 0.001);
     assert_eq!(normal["answer"], "noop", "{normal}");
     assert!(store
         .load_pending_agent_drops(&key.engine_key())
         .unwrap()
         .iter()
         .any(|drop| drop.target_id == "result#0"));
-    let Some(force_soft) = force_soft else {
+    let Some((tokens, soft)) = pressure else {
         return;
     };
     let second = tokio::time::timeout(
@@ -771,13 +778,21 @@ async fn queued_native_drop_without_broca(force_soft: Option<u64>) {
         call(&h, "compaction.step", turn_two.clone()),
     )
     .await
-    .expect("a force-band step must not wait for unavailable Broca");
+    .expect("an execute-class step must not wait for unavailable Broca");
     let second = response(second);
     let pressure = transform::compaction::LAST_NATIVE_PRESSURE
         .with(|slot| slot.borrow_mut().take())
         .expect("the CC engine measured the request against usable_soft");
-    assert!((pressure.0 - (20_000.0 / force_soft as f64 * 100.0)).abs() < 0.001);
+    assert!((pressure.0 - (tokens as f64 / soft as f64 * 100.0)).abs() < 0.001);
     assert_eq!(second["answer"], "compaction_message", "{second}");
+
+    let mut repeated = turn_two.clone();
+    repeated["request_id"] = json!("same-execute");
+    repeated["last_applied"] = json!({"compaction_id":second["compaction"]["compaction_id"],"version":second["compaction"]["version"]});
+    assert_eq!(
+        response(call(&h, "compaction.step", repeated).await)["answer"],
+        "noop"
+    );
 
     let mut turn_three = turn_two;
     turn_three["request_id"] = json!("turn-three");
@@ -818,13 +833,18 @@ async fn queued_native_drop_without_broca(force_soft: Option<u64>) {
             .iter()
             .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
             .collect::<Vec<_>>();
-        assert!(rendered_messages.iter().all(|message| {
-            message["content"].as_array().is_none_or(|blocks| {
-                blocks.iter().all(|block| {
-                    block["type"] != "thinking" && block["type"] != "redacted_thinking"
+        if answer["compaction"]["version"] == second["compaction"]["version"] {
+            assert!(rendered.contains(&thinking_and_call));
+            assert_eq!(rendered[0], r#"{"role":"user","content":"Read the note."}"#);
+        } else {
+            assert!(rendered_messages.iter().all(|message| {
+                message["content"].as_array().is_none_or(|blocks| {
+                    blocks.iter().all(|block| {
+                        block["type"] != "thinking" && block["type"] != "redacted_thinking"
+                    })
                 })
-            })
-        }));
+            }));
+        }
         let call_index = rendered_messages
             .iter()
             .position(|message| {
