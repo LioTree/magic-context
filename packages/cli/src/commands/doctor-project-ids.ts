@@ -214,6 +214,12 @@ export async function buildProjectIdPlan(
                         });
                     else staysOnLegacy.push({ directory: folder.directory, reason: "implicit" });
                 }
+                // Folder observations come back in database order, which varies between
+                // stores; sort so the same store always produces byte-identical plans.
+                const byDirectory = (a: { directory: string }, b: { directory: string }) =>
+                    a.directory < b.directory ? -1 : a.directory > b.directory ? 1 : 0;
+                inherited.sort(byDirectory);
+                staysOnLegacy.sort(byDirectory);
                 candidates.set(from, {
                     from,
                     to,
