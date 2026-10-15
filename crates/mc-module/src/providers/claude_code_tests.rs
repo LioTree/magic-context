@@ -48,6 +48,26 @@ pub(super) fn handler(root: &Path, principal: Option<subc_protocol::Principal>) 
     h.bind_route(7, binding(root, principal));
     h
 }
+struct LocalSessionResolver;
+
+#[async_trait::async_trait]
+impl crate::session_resolver::SessionResolver for LocalSessionResolver {
+    async fn resolve_session(
+        &self,
+        _project_root: &Path,
+        _harness: &str,
+        _instance_token: &str,
+    ) -> Result<
+        Option<crate::session_resolver::ResolvedSession>,
+        crate::session_resolver::SessionResolveError,
+    > {
+        Ok(Some(crate::session_resolver::ResolvedSession {
+            session_id: "cc".into(),
+            last_traffic_ms: 1,
+        }))
+    }
+}
+
 fn plan() -> Value {
     json!({"serializer_profile":"claude-code-anthropic","observation":"answer"})
 }
@@ -564,6 +584,240 @@ async fn cc_original_inbound_envelope_size_is_checked_before_normalized_params()
 async fn cc_without_fill_uses_request_estimate_and_soft_geometry_and_folds() {
     let dir = tempfile::tempdir().unwrap();
     fold_with_catalog(dir.path(), dir.path(), Some(100000)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cc_force_and_low_execute_threshold_need_rewrite_before_ctx_reduce_drop_without_broca() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = handler(dir.path(), thalamus());
+    // A 10% threshold starts compaction sooner than the supported config range.
+    // This checks whether an earlier pass alone can replace a tool result the
+    // model asked to delete; it cannot.
+    let user_config = dir.path().join("magic-context.jsonc");
+    std::fs::write(&user_config, r#"{"execute_threshold_percentage":10}"#).unwrap();
+    let low_threshold_config =
+        crate::config::ConfigCache::default().effective_for_paths(&user_config, dir.path());
+    assert_eq!(
+        low_threshold_config
+            .resolve_execute_threshold(Some("fixture"))
+            .percentage,
+        10.0
+    );
+    let mut low_threshold_binding = binding(dir.path(), thalamus());
+    low_threshold_binding.config = low_threshold_config;
+    h.bind_route(7, low_threshold_binding);
+    let initial = setup(&h).await;
+    // The local resolver supplies a session identity for the ctx_reduce tool
+    // call without starting the daemon. McHandler::new() has no Subc connection
+    // file, so it cannot reach Broca, the service that runs historian summaries.
+    h.session_resolver = Arc::new(LocalSessionResolver);
+    assert_eq!(
+        h.facade_binding(7)
+            .unwrap()
+            .config
+            .historian_runner_for("claude-code")
+            .kind,
+        crate::historian_runner::HistorianRunnerKind::Broca
+    );
+    let thinking_and_call = r#"{"role":"assistant","content":[{"type":"thinking","thinking":"private reasoning","signature":"sig-turn-1"},{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"notes.txt"}}]}"#;
+    let tool_result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"obsolete output from the first turn"}]}"#;
+    let next_call = r#"{"role":"assistant","content":[{"type":"text","text":"Checking another source."},{"type":"tool_use","id":"read-2","name":"Read","input":{"file_path":"next.txt"}}]}"#;
+    let next_result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-2","content":"additional output two"}]}"#;
+    let third_call = r#"{"role":"assistant","content":[{"type":"text","text":"Checking one more source."},{"type":"tool_use","id":"read-3","name":"Read","input":{"file_path":"third.txt"}}]}"#;
+    let third_result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-3","content":"additional output three"}]}"#;
+    let fourth_call = r#"{"role":"assistant","content":[{"type":"text","text":"Checking the final source."},{"type":"tool_use","id":"read-4","name":"Read","input":{"file_path":"fourth.txt"}}]}"#;
+    let fourth_result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-4","content":"additional output four"}]}"#;
+    let assistant_reply =
+        r#"{"role":"assistant","content":[{"type":"text","text":"I found the note."}]}"#;
+    let followup = r#"{"role":"user","content":"Now summarize the next detail."}"#;
+
+    let mut turn_one = step(r#"{"role":"user","content":"Read the note."}"#);
+    turn_one["context_window"] = json!(200000);
+    turn_one["estimate"]["request_tokens"] = json!(20000);
+    turn_one["geometry"] = json!({"usable_soft":167000,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
+    turn_one["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+    turn_one["messages"].as_array_mut().unwrap().extend([
+        json!({"mid":"call","ordinal":1,"message":serde_json::from_str::<Value>(thinking_and_call).unwrap(),"raw_message":thinking_and_call}),
+        json!({"mid":"result","ordinal":2,"message":serde_json::from_str::<Value>(tool_result).unwrap(),"raw_message":tool_result}),
+    ]);
+    turn_one["newest"] = json!({"mid":"result","ordinal":2});
+    let first = response(call(&h, "compaction.step", turn_one).await);
+    assert!(matches!(
+        first["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+    let applied_view = if first["answer"] == "compaction_message" {
+        &first["compaction"]
+    } else {
+        &initial["initial"]
+    };
+
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    let store = h.store.get().unwrap();
+    // Seed the numbered tag the main transform would have shown for the first
+    // tool result. This test starts at the compaction route, which consumes
+    // existing tags but does not create new ones, then calls ctx_reduce through
+    // the same facade the model uses.
+    store
+        .seed_tags_for_test(
+            &key.engine_key(),
+            &[
+                ("result#0", "obsolete output from the first turn"),
+                ("result-2#0", "additional output two"),
+                ("result-3#0", "additional output three"),
+                ("result-4#0", "additional output four"),
+            ]
+            .map(|(block_id, source)| mc_store::TagMintInput {
+                block_id: block_id.into(),
+                kind: "tool_result".into(),
+                token_count: 8000,
+                source_bytes: source.as_bytes().to_vec(),
+            }),
+            2,
+        )
+        .unwrap();
+    let result_tag = store
+        .load_tag_numbers_for_session(&key.engine_key())
+        .unwrap()
+        .into_iter()
+        .find(|tag| tag.block_id == "result#0")
+        .expect("the first turn exposes a ctx_reduce tag for its tool result");
+    let reduced = response(
+        h.dispatch_value(
+            7,
+            json!({"name":"ctx_reduce","arguments":{"drop":result_tag.tag_number.to_string()}}),
+        )
+        .await,
+    );
+    assert!(reduced.to_string().contains("tag stamped"), "{reduced}");
+    assert!(store
+        .load_pending_agent_drops(&key.engine_key())
+        .unwrap()
+        .iter()
+        .any(|drop| drop.target_id == "result#0"));
+    let broca_error = match h.producer_factory.connect(dir.path()).await {
+        Err(error @ HistorianProducerError::NoEndpoint { .. }) => error,
+        _ => panic!("expected the absent Broca route to refuse connection"),
+    };
+    record_historian_connect_failure(
+        store,
+        &key.engine_key(),
+        crate::now_ms(),
+        &format!("producer connect: {broca_error}"),
+        &h.connect_failure_commit_hook,
+    )
+    .unwrap();
+    assert!(store
+        .load_meta(&key.engine_key())
+        .unwrap()
+        .meta
+        .historian
+        .last_failure
+        .is_some());
+
+    let mut turn_two = step(r#"{"role":"user","content":"Read the note."}"#);
+    turn_two["request_id"] = json!("turn-two");
+    turn_two["context_window"] = json!(200000);
+    turn_two["estimate"]["request_tokens"] = json!(20000);
+    turn_two["geometry"] = json!({"usable_soft":22000,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
+    turn_two["last_applied"] =
+        json!({"compaction_id":applied_view["compaction_id"],"version":applied_view["version"]});
+    turn_two["messages"].as_array_mut().unwrap().extend([
+        json!({"mid":"call","ordinal":1,"message":serde_json::from_str::<Value>(thinking_and_call).unwrap(),"raw_message":thinking_and_call}),
+        json!({"mid":"result","ordinal":2,"message":serde_json::from_str::<Value>(tool_result).unwrap(),"raw_message":tool_result}),
+        json!({"mid":"call-2","ordinal":3,"message":serde_json::from_str::<Value>(next_call).unwrap(),"raw_message":next_call}),
+        json!({"mid":"result-2","ordinal":4,"message":serde_json::from_str::<Value>(next_result).unwrap(),"raw_message":next_result}),
+        json!({"mid":"call-3","ordinal":5,"message":serde_json::from_str::<Value>(third_call).unwrap(),"raw_message":third_call}),
+        json!({"mid":"result-3","ordinal":6,"message":serde_json::from_str::<Value>(third_result).unwrap(),"raw_message":third_result}),
+        json!({"mid":"call-4","ordinal":7,"message":serde_json::from_str::<Value>(fourth_call).unwrap(),"raw_message":fourth_call}),
+        json!({"mid":"result-4","ordinal":8,"message":serde_json::from_str::<Value>(fourth_result).unwrap(),"raw_message":fourth_result}),
+        json!({"mid":"reply","ordinal":9,"message":serde_json::from_str::<Value>(assistant_reply).unwrap(),"raw_message":assistant_reply}),
+        json!({"mid":"followup","ordinal":10,"message":serde_json::from_str::<Value>(followup).unwrap(),"raw_message":followup}),
+    ]);
+    turn_two["newest"] = json!({"mid":"followup","ordinal":10});
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        call(&h, "compaction.step", turn_two.clone()),
+    )
+    .await
+    .expect("a force-band step must not wait for unavailable Broca");
+    let second = response(second);
+    let pressure = transform::compaction::LAST_NATIVE_PRESSURE
+        .with(|slot| slot.borrow_mut().take())
+        .expect("the CC engine measured the request against usable_soft");
+    assert!((pressure.0 - (20_000.0 / 22_000.0 * 100.0)).abs() < 0.001);
+    assert_eq!(second["answer"], "noop", "{second}");
+    assert!(store
+        .load_pending_agent_drops(&key.engine_key())
+        .unwrap()
+        .iter()
+        .any(|drop| drop.target_id == "result#0"));
+
+    let mut normal_geometry = turn_two.clone();
+    normal_geometry["request_id"] = json!("normal-geometry");
+    normal_geometry["estimate"]["request_tokens"] = json!(30000);
+    normal_geometry["geometry"] = json!({"usable_soft":167000,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
+    let normal = response(call(&h, "compaction.step", normal_geometry).await);
+    let normal_pressure = transform::compaction::LAST_NATIVE_PRESSURE
+        .with(|slot| slot.borrow_mut().take())
+        .expect("the low-threshold CC pass reaches the engine");
+    assert!((normal_pressure.0 - (30_000.0 / 167_000.0 * 100.0)).abs() < 0.001);
+    assert_eq!(normal["answer"], "noop", "{normal}");
+    assert!(store
+        .load_pending_agent_drops(&key.engine_key())
+        .unwrap()
+        .iter()
+        .any(|drop| drop.target_id == "result#0"));
+
+    let mut turn_three = turn_two;
+    turn_three["request_id"] = json!("turn-three");
+    turn_three["prefix_rebuilding"] = json!({"reason":"expired_cache"});
+    let third = response(call(&h, "compaction.step", turn_three).await);
+    assert_eq!(third["answer"], "compaction_message", "{third}");
+
+    let version = third["compaction"]["version"].as_u64().unwrap();
+    let view = store
+        .load_provider_view(&key.store_key(), version)
+        .unwrap()
+        .unwrap();
+    let committed: Value = serde_json::from_str(&view.replacement_json).unwrap();
+    let raw_replacement = committed["raw_replacement"].as_array().unwrap();
+    let rendered = raw_replacement
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let dropped_result = rendered
+        .iter()
+        .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+        .find(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["tool_use_id"] == "read-1"))
+        })
+        .expect("the replacement keeps the first tool result paired");
+    assert!(
+        dropped_result.to_string().contains("[dropped §"),
+        "{dropped_result}"
+    );
+    let rendered_messages = rendered
+        .iter()
+        .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+        .collect::<Vec<_>>();
+    let call_index = rendered_messages
+        .iter()
+        .position(|message| {
+            message["content"].as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block["type"] == "tool_use" && block["id"] == "read-1")
+            })
+        })
+        .expect("the replacement keeps the first tool call");
+    assert!(rendered_messages[call_index + 1]["content"]
+        .as_array()
+        .is_some_and(|blocks| blocks
+            .iter()
+            .any(|block| { block["type"] == "tool_result" && block["tool_use_id"] == "read-1" })));
 }
 
 async fn fold_with_catalog(db_root: &Path, route_root: &Path, window: Option<u64>) -> Vec<Value> {
