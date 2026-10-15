@@ -447,6 +447,22 @@ fn the_guidance_get_assets_are_renderings_of_the_shared_definition() {
             "{text}"
         );
     }
+    for (asset, text) in [
+        (
+            include_str!("../../assets/guidance_primary_auto_tag.txt"),
+            "auto_tag/head/reduce/full",
+        ),
+        (
+            include_str!("../../assets/guidance_light_primary_auto_tag.txt"),
+            "auto_tag/head/reduce/light",
+        ),
+    ] {
+        assert_eq!(
+            tool_catalog::render_auto_tag_text(text, &flags, &values).unwrap(),
+            asset,
+            "{text}"
+        );
+    }
 }
 
 #[test]

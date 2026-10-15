@@ -288,6 +288,16 @@ pub fn compose_guidance(
     subagent: bool,
     reduce_callable: bool,
 ) -> String {
+    compose_guidance_for_tagging(selection, config, subagent, reduce_callable, false)
+}
+
+pub(crate) fn compose_guidance_for_tagging(
+    selection: &PromptSurfaceSelection,
+    config: &McModuleConfig,
+    subagent: bool,
+    reduce_callable: bool,
+    auto_tag: bool,
+) -> String {
     if subagent && !reduce_callable {
         return String::new();
     }
@@ -319,7 +329,12 @@ pub fn compose_guidance(
     } else {
         format!("head/no_reduce/{surface}")
     };
-    tool_catalog::render_text(&name, &flags, &values).expect("compiled guidance template")
+    if auto_tag && (subagent || (reduce_callable && selection.guidance_override.is_none())) {
+        tool_catalog::render_auto_tag_text(&format!("auto_tag/{name}"), &flags, &values)
+    } else {
+        tool_catalog::render_text(&name, &flags, &values)
+    }
+    .expect("compiled guidance template")
 }
 
 /// Return reply-language guidance, or an empty string for an unknown code.
@@ -434,6 +449,41 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_tag_guidance_preserves_configuration_and_never_self_tags_workers() {
+        let config = McModuleConfig {
+            language: Some("fr".into()),
+            memory_enabled: false,
+            smart_notes_enabled: false,
+            ..Default::default()
+        };
+        for preset in [PromptSurfacePreset::Full, PromptSurfacePreset::Light] {
+            let mut selection = PromptSurfaceSelection {
+                preset,
+                ..Default::default()
+            };
+            for subagent in [false, true] {
+                let text = compose_guidance_for_tagging(&selection, &config, subagent, true, true);
+                assert!(text.contains("Tags are added for you"));
+                assert!(!text.contains("Start the text of each reply"));
+                assert!(!text.contains("surface_condition"));
+                assert!(!text.contains("pinboard"));
+                if !subagent {
+                    assert!(text.contains(&primary_language_directive(Some("fr"))));
+                }
+                assert_eq!(
+                    compose_guidance_for_tagging(&selection, &config, subagent, false, true),
+                    compose_guidance(&selection, &config, subagent, false)
+                );
+            }
+            selection.guidance_override = Some("Trusted custom guidance.".into());
+            assert_eq!(
+                compose_guidance_for_tagging(&selection, &config, false, true, true),
+                compose_guidance(&selection, &config, false, true)
+            );
+        }
+    }
 
     fn without_descriptions(mut value: serde_json::Value) -> serde_json::Value {
         match &mut value {

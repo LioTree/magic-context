@@ -118,8 +118,13 @@ fn build_candidate() -> ClaudeCodeCapabilities {
         raw_view_read: true,
         digest: "sha256".into(),
         cache_policy_revision: cache_policy::REVISION.to_string(),
-        canonical_reduce: false,
-        guidance: false,
+        // Default builds must not add automatic §N§ prefixes until a real hook
+        // capture from the THALAMUS Claude Code gateway replays with the expected
+        // operations and no hook errors in cc_real_capture_hook_sequence.
+        // Only that capture is missing; the other functional gates pass.
+        // The default-off development feature enables capture builds, not releases.
+        canonical_reduce: cfg!(feature = "advertise-claude-code-candidate"),
+        guidance: cfg!(feature = "advertise-claude-code-candidate"),
         notice_dispatch_ack: false,
         bootstrap_complete: false,
         capabilities: vec![],
@@ -206,8 +211,15 @@ fn candidate_bundle_bytes_are_pinned_and_not_advertised() {
 #[test]
 #[cfg(feature = "advertise-claude-code-candidate")]
 fn candidate_bundle_is_advertised_and_echoed_as_the_pinned_bytes() {
-    let expected = include_bytes!("../../testdata/codec/claude-code-capability-candidate.json");
-    let expected = expected.strip_suffix(b"\n").unwrap_or(expected);
+    let mut expected: Value = serde_json::from_slice(include_bytes!(
+        "../../testdata/codec/claude-code-capability-candidate.json"
+    ))
+    .unwrap();
+    // Development bundles differ from claude-code-capability-candidate.json
+    // only in the canonical_reduce and guidance flags.
+    expected["canonical_reduce"] = json!(true);
+    expected["guidance"] = json!(true);
+    let expected = serde_jcs::to_vec(&expected).unwrap();
     assert_eq!(canonical_bytes(), expected);
 
     let HandlerOutcome::Response(discovery) = describe_for_discovery() else {
@@ -230,6 +242,18 @@ fn candidate_bundle_is_advertised_and_echoed_as_the_pinned_bytes() {
     assert_eq!(
         serde_jcs::to_vec(declaration.claude_code.as_ref().unwrap()).unwrap(),
         expected
+    );
+}
+
+#[test]
+fn candidate_tagging_flags_require_the_development_feature() {
+    assert_eq!(
+        CANDIDATE.canonical_reduce,
+        cfg!(feature = "advertise-claude-code-candidate")
+    );
+    assert_eq!(
+        CANDIDATE.guidance,
+        cfg!(feature = "advertise-claude-code-candidate")
     );
 }
 

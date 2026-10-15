@@ -828,9 +828,33 @@ pub(crate) fn render_text(
     flags: &TextFlags,
     values: &BTreeMap<&str, String>,
 ) -> Result<String, String> {
-    let template = definition()
-        .texts
-        .get(name)
+    render_text_with_templates(name, flags, values, None)
+}
+
+pub(crate) fn render_auto_tag_text(
+    name: &str,
+    flags: &TextFlags,
+    values: &BTreeMap<&str, String>,
+) -> Result<String, String> {
+    // Native-session guidance must not change the catalog's pinned text revision
+    // or the bytes served to legacy callers.
+    static TEMPLATES: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    let templates = TEMPLATES.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/guidance_auto_tag.json"))
+            .expect("compiled auto-tag guidance templates")
+    });
+    render_text_with_templates(name, flags, values, Some(templates))
+}
+
+fn render_text_with_templates(
+    name: &str,
+    flags: &TextFlags,
+    values: &BTreeMap<&str, String>,
+    templates: Option<&BTreeMap<String, String>>,
+) -> Result<String, String> {
+    let template = templates
+        .and_then(|templates| templates.get(name))
+        .or_else(|| definition().texts.get(name))
         .ok_or_else(|| format!("no text named {name}"))?;
     let mut out = String::new();
     // Each open section: its flag, and whether its body is kept.
@@ -884,7 +908,7 @@ pub(crate) fn render_text(
                     .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'/') =>
             {
                 if keeping {
-                    out.push_str(&render_text(tag, flags, values)?);
+                    out.push_str(&render_text_with_templates(tag, flags, values, templates)?);
                 }
             }
             _ => return Err(format!("{name}: malformed tag {{{{{tag}}}}}")),

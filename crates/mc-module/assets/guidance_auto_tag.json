@@ -1,0 +1,7 @@
+{
+  "auto_tag/head/reduce/full": "## Magic Context\n\n{{partner_frame}}\n{{partner_closer_reduce}}\n\n{{desk_reduce}}{{#caveman}}{{caveman_warning}}{{/caveman}}\n\n{{auto_tag}}{{#language}}\n\n{{$language_directive}}{{/language}}",
+  "auto_tag/head/reduce/light": "## Magic Context\n\n{{partner_frame}}\n{{partner_closer_reduce_light}}\n\n{{desk_reduce_light}}{{#caveman}}{{caveman_warning}}{{/caveman}}\n\n{{auto_tag}}{{#language}}\n\n{{$language_directive}}{{/language}}",
+  "auto_tag/worker/full": "## Magic Context\n\n{{subagent_desk}}\n\n{{auto_tag}}",
+  "auto_tag/worker/light": "## Magic Context\n\n{{subagent_desk_light}}\n\n{{auto_tag}}",
+  "auto_tag": "Magic Context adds a tag such as §12§ to many user messages, texts you write and tool results. Some items have no tag. Use only numbers you can see; never guess or infer a missing one. IMPORTANT: Tags are added for you. NEVER write tag notation in a reply or in tool arguments. To refer to an item in your prose, write \"tag 12\".\n\nExamples: if an output shows §12§, refer to it in prose as \"tag 12\" and stamp it with `ctx_reduce(drop=\"12\")` once used. If an item has no tag, leave it unstamped. Write replies normally, for example \"Reading both files in parallel.\", without adding a tag."
+}

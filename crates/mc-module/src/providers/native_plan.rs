@@ -3,6 +3,10 @@
 use super::*;
 use hooks::{claude_code::ClaudeCodeCapabilities, subscription::DeclareRequest};
 
+#[cfg(test)]
+#[path = "guidance_activation_tests.rs"]
+mod guidance_activation_tests;
+
 #[derive(Clone)]
 pub(crate) struct NativeConnectionPlan {
     incarnation: u64,
@@ -10,7 +14,79 @@ pub(crate) struct NativeConnectionPlan {
     request: DeclareRequest,
 }
 
+fn native_plan_reduction_owner(request: &DeclareRequest) -> bool {
+    request.composition.is_none()
+        || request
+            .composition
+            .as_ref()
+            .and_then(|c| c.get("compaction"))
+            .and_then(|c| c.get("provider"))
+            .and_then(Value::as_str)
+            == Some(DEFAULT_MODULE_ID)
+}
+
+fn native_plan_cc_answer(request: &DeclareRequest) -> bool {
+    request
+        .params
+        .get("serializer_profile")
+        .and_then(Value::as_str)
+        == Some("claude-code-anthropic")
+        && request.params.get("observation").and_then(Value::as_str) == Some("answer")
+}
+
 impl McHandler {
+    pub(crate) fn claude_code_admission_tag_status(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<Value, HandlerOutcome> {
+        let status = |reason: &str| json!({"enabled": reason == "enabled", "reason": reason});
+        if binding.harness != CLAUDE_CODE_HARNESS {
+            return Ok(status("lane_not_claude_code"));
+        }
+        if !attested_claude_code(binding) {
+            return Ok(status("not_attested"));
+        }
+        let pins = self.native_pins();
+        let mut scoped = binding.clone();
+        scoped.native_generation = Some(mc_store::provider_records::ProviderGeneration {
+            profile: pins.profile_generation,
+            provider: pins.provider_generation,
+        });
+        let key = Key::new(&scoped, &scoped.session, &scoped.harness)?;
+        let store = self.store.get().ok_or_else(|| self.store_refusal())?;
+        match store
+            .load_provider_conversation(&key.store_key())
+            .map_err(transient)?
+        {
+            Some(row) => {
+                let counters: Value =
+                    serde_json::from_str(&row.hook_counters_json).map_err(transient)?;
+                if counters["auto_tag"] == true {
+                    return Ok(status("enabled"));
+                }
+                if let Some(plan) = row.native_plan_json {
+                    let plan: DeclareRequest = serde_json::from_str(&plan).map_err(transient)?;
+                    if !native_plan_cc_answer(&plan) {
+                        return Ok(status("lane_not_claude_code"));
+                    }
+                    if !native_plan_reduction_owner(&plan) {
+                        return Ok(status("not_reduction_owner"));
+                    }
+                }
+                Ok(status(if pins.canonical_reduce && pins.guidance {
+                    "plan_predates_auto_tag"
+                } else {
+                    "candidate_inactive"
+                }))
+            }
+            None => Ok(status(if pins.canonical_reduce && pins.guidance {
+                "enabled"
+            } else {
+                "candidate_inactive"
+            })),
+        }
+    }
+
     pub(crate) fn native_route_lock(&self, channel: u16) -> Arc<Mutex<()>> {
         // Retain each channel's lock across rebinds so old and new incarnations
         // cannot acquire different locks for the same route. Channels are u16.
@@ -220,6 +296,16 @@ impl McHandler {
                         engine_namespace: key.engine_key(),
                         native_pins_json: Some(pins_json),
                         native_plan_json: Some(plan_json),
+                        hook_counters_json: if pins.canonical_reduce
+                            && pins.guidance
+                            && attested_claude_code(binding)
+                            && native_plan_cc_answer(&request)
+                            && native_plan_reduction_owner(&request)
+                        {
+                            json!({"auto_tag": true}).to_string()
+                        } else {
+                            "{}".into()
+                        },
                         ..Default::default()
                     },
                 )
@@ -260,21 +346,21 @@ impl McHandler {
 mod tests {
     use super::*;
     use crate::providers::claude_code_tests as cc;
-    fn pins(generation: &str) -> ClaudeCodeCapabilities {
+    pub(super) fn pins(generation: &str) -> ClaudeCodeCapabilities {
         let mut pins = capability_candidate::CANDIDATE.clone();
         pins.profile_generation = "native-format-v1".into();
         pins.provider_generation = generation.into();
         pins
     }
-    fn handler(root: &Path, pins: &ClaudeCodeCapabilities) -> McHandler {
+    pub(super) fn handler(root: &Path, pins: &ClaudeCodeCapabilities) -> McHandler {
         let h = cc::handler(root, cc::thalamus());
         *h.native_bundle_override.lock().unwrap() = Some(pins.clone());
         h
     }
-    fn key(h: &McHandler) -> Key {
+    pub(super) fn key(h: &McHandler) -> Key {
         Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap()
     }
-    fn value(outcome: HandlerOutcome) -> Value {
+    pub(super) fn value(outcome: HandlerOutcome) -> Value {
         let HandlerOutcome::Response(bytes) = outcome else {
             panic!("{outcome:?}")
         };

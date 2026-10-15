@@ -9025,10 +9025,15 @@ impl McHandler {
             Ok(pending) => pending,
             Err(outcome) => return outcome,
         };
+        let admission_tags = match self.claude_code_admission_tag_status(&binding) {
+            Ok(status) => status,
+            Err(outcome) => return outcome,
+        };
         let response = json!({
             "ok": true,
             "summary": summary,
             "cc_pending": cc_pending,
+            "admission_tags": admission_tags,
             "wrapup_active": wrapup_active.is_some(),
             "wrapup_rounds": wrapup_active,
             "coverage_ordinal": loaded.meta.coverage_ordinal,
@@ -10087,7 +10092,13 @@ impl McHandler {
             Some(Value::Bool(value)) => *value,
             Some(_) => return invalid_params_error("guidance.get subagent must be a boolean"),
         };
-        let text = prompt_surface::compose_guidance(&selection, &config, subagent, active);
+        let auto_tag = match self.claude_code_admission_tag_status(&binding) {
+            Ok(status) => status["enabled"] == true,
+            Err(error) => return error,
+        };
+        let text = prompt_surface::compose_guidance_for_tagging(
+            &selection, &config, subagent, active, auto_tag,
+        );
         let text_for_bytes = text.as_str();
         let bytes = guidance_bytes_for(text_for_bytes, &date_line);
         respond(json!({
