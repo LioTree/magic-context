@@ -20,6 +20,7 @@ import {
     openExistingContextDatabase,
 } from "../lib/database-access";
 import { observations } from "./doctor-merge-identity";
+import { type ProjectIdsApplyDeps, runProjectIdsApplyCheck } from "./doctor-project-ids-apply";
 
 export interface ProjectIdPlanFolder {
     directory: string;
@@ -234,8 +235,9 @@ export async function buildProjectIdPlan(
 
 export async function runProjectIdsCli(
     args: string[],
-    deps: Partial<ProjectIdsPlanDeps> = {},
+    deps: Partial<ProjectIdsPlanDeps & ProjectIdsApplyDeps> = {},
 ): Promise<number> {
+    if (args[0] === "apply") return runProjectIdsApplyCheck(args, deps);
     const options = parseProjectIdsPlanArgs(args);
     const requestedDbPath = options.dbPath ?? join(getMagicContextStorageDir(), "context.db");
     const db = openExistingContextDatabase(requestedDbPath, {
