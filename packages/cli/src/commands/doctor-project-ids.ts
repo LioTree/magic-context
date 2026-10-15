@@ -223,10 +223,14 @@ export async function buildProjectIdPlan(
                 candidates.set(from, {
                     from,
                     to,
-                    folders: folders.filter(
-                        (folder) =>
-                            !staysOnLegacy.some((legacy) => legacy.directory === folder.directory),
-                    ),
+                    folders: folders
+                        .filter(
+                            (folder) =>
+                                !staysOnLegacy.some(
+                                    (legacy) => legacy.directory === folder.directory,
+                                ),
+                        )
+                        .sort(byDirectory),
                     inherited,
                     staysOnLegacy,
                     rowsByTable: {},

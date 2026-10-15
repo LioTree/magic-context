@@ -241,10 +241,9 @@ describe("doctor project-ids plan", () => {
                 inherited: worktrees.map((directory) => ({ directory, gitCommonDir })),
                 staysOnLegacy: [{ directory: clone, reason: "implicit" }],
             });
-            expect(result.pairs[0].folders.map((folder) => folder.directory)).toEqual([
-                ...worktrees,
-                main,
-            ]);
+            expect(result.pairs[0].folders.map((folder) => folder.directory)).toEqual(
+                [...worktrees, main].sort(),
+            );
             const printed = output.mock.calls.flat().join("\n");
             for (const directory of worktrees)
                 expect(printed).toContain(
