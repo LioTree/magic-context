@@ -93,7 +93,9 @@ async fn cereb_full_sync_through_real_daemon() {
     let fixture =
         fs::read(std::env::var("MC_SYNC_PROBE_FIXTURE").expect("fixture required")).unwrap();
     let workspace = workspace_root();
-    let daemon_bin = ensure_daemon_binary(&workspace);
+    let Some(daemon_bin) = ensure_daemon_binary(&workspace) else {
+        return;
+    };
     let module_bin = ensure_module_binary();
     let temp_root = TempRoot(unique_temp_dir("mc-full-sync-probe"));
     let runtime = temp_root.0.join("runtime");
@@ -165,7 +167,9 @@ async fn mc_transform_spine_through_real_daemon() {
 
     let workspace = workspace_root();
     // Reuse the lock-pinned daemon and the module Cargo built for this test target.
-    let daemon_bin = ensure_daemon_binary(&workspace);
+    let Some(daemon_bin) = ensure_daemon_binary(&workspace) else {
+        return;
+    };
     let module_bin = ensure_module_binary();
 
     // Declared before the daemon and modules so it drops after them.
@@ -818,13 +822,15 @@ struct DaemonBinaries {
 
 static DAEMON_BUILD_COUNT: AtomicU64 = AtomicU64::new(0);
 
-fn ensure_daemon_build(workspace: &Path) -> &'static DaemonBinaries {
-    static BINARIES: OnceLock<DaemonBinaries> = OnceLock::new();
-    BINARIES.get_or_init(|| build_daemon_binaries(workspace))
+fn ensure_daemon_build(workspace: &Path) -> Option<&'static DaemonBinaries> {
+    static BINARIES: OnceLock<Option<DaemonBinaries>> = OnceLock::new();
+    BINARIES
+        .get_or_init(|| build_daemon_binaries(workspace))
+        .as_ref()
 }
 
-fn build_daemon_binaries(workspace: &Path) -> DaemonBinaries {
-    let source = locked_daemon_source(workspace);
+fn build_daemon_binaries(workspace: &Path) -> Option<DaemonBinaries> {
+    let source = locked_daemon_source(workspace)?;
     // One target for every scenario, durable across test processes. Runtime/config/data
     // directories remain private to each test; sharing immutable executables is safe.
     let target = workspace.join("target/real-daemon-subc");
@@ -856,14 +862,14 @@ fn build_daemon_binaries(workspace: &Path) -> DaemonBinaries {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    DaemonBinaries {
+    Some(DaemonBinaries {
         daemon: dev_named_binary(&daemon_binary_path(&source, &cargo_args)),
         cli: dev_named_binary(&target.join("debug/ck")),
-    }
+    })
 }
 
-fn ensure_daemon_binary(workspace: &Path) -> PathBuf {
-    static DAEMON: OnceLock<PathBuf> = OnceLock::new();
+fn ensure_daemon_binary(workspace: &Path) -> Option<PathBuf> {
+    static DAEMON: OnceLock<Option<PathBuf>> = OnceLock::new();
     DAEMON
         .get_or_init(|| {
             if let Some(binary) = std::env::var_os("MC_TEST_CK_SUBC_BIN") {
@@ -873,9 +879,9 @@ fn ensure_daemon_binary(workspace: &Path) -> PathBuf {
                     "test daemon binary is missing: {}",
                     path.display()
                 );
-                dev_named_binary_as(&path, "subc-prebuilt")
+                Some(dev_named_binary_as(&path, "subc-prebuilt"))
             } else {
-                ensure_daemon_build(workspace).daemon.clone()
+                ensure_daemon_build(workspace).map(|binaries| binaries.daemon.clone())
             }
         })
         .clone()
@@ -911,7 +917,7 @@ fn locked_subc_revision(lock: &str) -> String {
     revision.to_owned()
 }
 
-fn locked_daemon_source(workspace: &Path) -> PathBuf {
+fn locked_daemon_source(workspace: &Path) -> Option<PathBuf> {
     let revision = locked_subc_revision(&fs::read_to_string(workspace.join("Cargo.lock")).unwrap());
     // An exported source tree keeps isolated tests from inspecting a sibling checkout.
     // Its export marker must agree with the revision selected by this workspace's lockfile.
@@ -923,9 +929,9 @@ fn locked_daemon_source(workspace: &Path) -> PathBuf {
             revision,
             "daemon export must match Cargo.lock"
         );
-        return source;
+        return Some(source);
     }
-    let subconscious = subconscious_root(workspace);
+    let subconscious = subconscious_root(workspace)?;
     let compatible = Command::new("git")
         .current_dir(&subconscious)
         .args(["merge-base", "--is-ancestor", "2b0914f0", &revision])
@@ -938,7 +944,7 @@ fn locked_daemon_source(workspace: &Path) -> PathBuf {
     let parent = workspace.join("target/real-daemon-subc-source");
     let source = parent.join(&revision);
     if source.join("Cargo.toml").is_file() && source.join("Cargo.lock").is_file() {
-        return source;
+        return Some(source);
     }
     fs::create_dir_all(&parent).unwrap();
     let scratch = parent.join(format!("{revision}-{}", std::process::id()));
@@ -968,7 +974,7 @@ fn locked_daemon_source(workspace: &Path) -> PathBuf {
     );
     fs::remove_file(archive).unwrap();
     fs::rename(&scratch, &source).unwrap();
-    source
+    Some(source)
 }
 
 // A caller can isolate its daemon build with --target-dir. Resolve the output
@@ -999,10 +1005,12 @@ fn daemon_artifacts_are_built_and_copied_once() {
     use std::os::unix::fs::MetadataExt;
 
     let workspace = workspace_root();
-    let first = ensure_daemon_build(&workspace);
+    let Some(first) = ensure_daemon_build(&workspace) else {
+        return;
+    };
     let daemon_inode = fs::metadata(&first.daemon).unwrap().ino();
     let cli_inode = fs::metadata(&first.cli).unwrap().ino();
-    let second = ensure_daemon_build(&workspace);
+    let second = ensure_daemon_build(&workspace).unwrap();
     assert_eq!(first.daemon, second.daemon);
     assert_eq!(first.cli, second.cli);
     assert_eq!(
@@ -1097,8 +1105,39 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn subconscious_root(workspace: &Path) -> PathBuf {
-    fs::canonicalize(workspace.parent().unwrap().join("subconscious")).unwrap()
+fn subconscious_root(workspace: &Path) -> Option<PathBuf> {
+    let sibling = workspace.parent().unwrap().join("subconscious");
+    match fs::canonicalize(&sibling) {
+        Ok(source) => Some(source),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "skipping real-daemon tests: sibling subconscious checkout is missing at {}; provide MC_TEST_LOCKED_SUBC_SOURCE to run source-built daemon tests",
+                sibling.display()
+            );
+            None
+        }
+        Err(error) => panic!(
+            "cannot resolve daemon source {}: {error}",
+            sibling.display()
+        ),
+    }
+}
+
+#[test]
+fn missing_daemon_sibling_is_an_unavailable_prerequisite() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(subconscious_root(&root.path().join("workspace")).is_none());
+}
+
+#[test]
+fn present_daemon_sibling_is_resolved_instead_of_skipped() {
+    let root = tempfile::tempdir().unwrap();
+    let sibling = root.path().join("subconscious");
+    fs::create_dir(&sibling).unwrap();
+    assert_eq!(
+        subconscious_root(&root.path().join("workspace")),
+        Some(fs::canonicalize(sibling).unwrap())
+    );
 }
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -1120,9 +1159,14 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
     };
 
     let workspace = workspace_root();
-    let daemon_bin = ensure_daemon_binary(&workspace);
+    let Some(daemon_bin) = ensure_daemon_binary(&workspace) else {
+        return;
+    };
     let module_bin = ensure_module_binary();
-    let ck_bin = ensure_daemon_build(&workspace).cli.clone();
+    let Some(binaries) = ensure_daemon_build(&workspace) else {
+        return;
+    };
+    let ck_bin = binaries.cli.clone();
     let temp = TempRoot(unique_temp_dir("mc-pipe-only-daemon"));
     let runtime = temp.0.join("runtime");
     let config = temp.0.join("config");
@@ -1376,7 +1420,9 @@ impl Drop for StopSupervisedModule<'_> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hostless_store_init_first_transform_through_real_daemon() {
     let workspace = workspace_root();
-    let daemon_bin = ensure_daemon_binary(&workspace);
+    let Some(daemon_bin) = ensure_daemon_binary(&workspace) else {
+        return;
+    };
     let module_bin = ensure_module_binary();
     let parent = std::env::temp_dir().join("magic-context/store-init");
     fs::create_dir_all(&parent).unwrap();

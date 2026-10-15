@@ -155,6 +155,16 @@ async fn a_module_on_a_store_ahead_of_it_refuses_on_health_and_on_transform() {
 
     let workspace = workspace_root();
     let subconscious = workspace.parent().unwrap().join("subconscious");
+    if !subconscious.is_dir()
+        && (std::env::var_os("MC_TEST_CK_SUBC_BIN").is_none()
+            || std::env::var_os("MC_TEST_CK_BIN").is_none())
+    {
+        eprintln!(
+            "skipping real-daemon store-ahead test: sibling subconscious checkout is missing at {}; provide MC_TEST_CK_SUBC_BIN and MC_TEST_CK_BIN to use prebuilt executables",
+            subconscious.display()
+        );
+        return;
+    }
     let daemon_bin = ensure_binary(
         &subconscious,
         subconscious.join("target/debug/ck-subc"),
