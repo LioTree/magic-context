@@ -3347,6 +3347,10 @@ mod host_tests {
         let output = answer(h.provider_step(b.clone(), &page).await);
         assert_eq!(output["answer"], "compaction_message");
         let replacement = output["compaction"]["replacement"].as_array().unwrap();
+        super::super::admission_differential_tests::snapshot(
+            "opencode-compaction.json",
+            &serde_json::to_vec(replacement).unwrap(),
+        );
         let rendered_user = replacement
             .iter()
             .find(|m| m.pointer("/info/id") == Some(&json!("m4000")))

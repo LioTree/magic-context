@@ -1,0 +1,1 @@
+{"subscriptions":[{"hook":"pre_user","ops":["append"],"on_unavailable":"pass","budget_ms":1500},{"hook":"post_tool","ops":["prepend","append"],"on_unavailable":"pass","budget_ms":1500},{"hook":"post_assistant","ops":["replace"],"on_unavailable":"pass","budget_ms":1500}]}

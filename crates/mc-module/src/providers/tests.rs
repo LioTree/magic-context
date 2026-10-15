@@ -917,6 +917,10 @@ async fn allocated_unsent_work_is_retried_above_its_version_without_runner_rejec
         retried["compaction"]["replacement"],
         allocated["compaction"]["replacement"]
     );
+    super::admission_differential_tests::snapshot(
+        "broca-compaction.json",
+        &serde_json::to_vec(&retried["compaction"]["replacement"]).unwrap(),
+    );
     assert_eq!(
         handler.provider_store.load(&key).unwrap().messages["L"].len(),
         2

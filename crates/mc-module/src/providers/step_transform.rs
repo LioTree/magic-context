@@ -9,6 +9,10 @@ use serde::Deserialize;
 pub(super) const CHANNEL1_NOTE: &str = "mc:channel1";
 
 #[cfg(test)]
+#[path = "admission_latency_tests.rs"]
+mod admission_latency_tests;
+
+#[cfg(test)]
 #[path = "step_transform_parity_tests.rs"]
 mod parity_tests;
 #[cfg(test)]
@@ -2199,7 +2203,10 @@ mod host_tests {
             )
             .unwrap();
         let p = hook("u", 1, "pre_user", &["hello"], text("u", "user", "hello"));
-        let answer = response(dispatch(&h, 7, "transform.hook", p.clone()).await);
+        let answer = super::super::admission_differential_tests::hook_snapshot(
+            "opencode-pre-user.json",
+            dispatch(&h, 7, "transform.hook", p.clone()).await,
+        );
         assert_eq!(rendered(&p, answer), ["§41§ hello"]);
         assert!(store.load_tags_for_session("s").unwrap().is_empty());
         let mut p = hook(
@@ -2210,7 +2217,10 @@ mod host_tests {
             text("a", "assistant", "§7§ answer references §3§ inline"),
         );
         p["served_through_ordinal"] = json!(1);
-        let answer = response(dispatch(&h, 7, "transform.hook", p.clone()).await);
+        let answer = super::super::admission_differential_tests::hook_snapshot(
+            "opencode-post-assistant.json",
+            dispatch(&h, 7, "transform.hook", p.clone()).await,
+        );
         assert_eq!(rendered(&p, answer), ["§42§ answer references §3§ inline"]);
         let rows = store.load_tags_for_session("s").unwrap();
         assert_eq!(rows.len(), 1);
@@ -2693,6 +2703,7 @@ mod golden_tests {
             String::from_utf8_lossy(&declared),
             String::from_utf8_lossy(expected)
         );
+        super::super::admission_differential_tests::snapshot("broca-declaration.json", &declared);
         let corpus = [
             (
                 json!({"session":"s","harness":"broca","hook":"pre_user","blocks":[]}),
@@ -2707,12 +2718,16 @@ mod golden_tests {
                 r#"{"answer":"ops","ops":[{"op":"replace","block":0,"value":"alpha"}]}"#,
             ),
         ];
-        for (params, expected) in corpus {
+        for (index, (params, expected)) in corpus.into_iter().enumerate() {
             let HandlerOutcome::Response(actual) = dispatch(&h, 7, "transform.hook", params).await
             else {
                 panic!()
             };
             assert_eq!(String::from_utf8_lossy(&actual), expected);
+            super::super::admission_differential_tests::snapshot(
+                &format!("broca-hook-{index}.json"),
+                &actual,
+            );
         }
     }
 }

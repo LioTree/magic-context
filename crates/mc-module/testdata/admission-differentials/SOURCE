@@ -1,0 +1,3 @@
+revision fa1f68e428209cd1d52ccd7741d040d690bcd983
+command python3 crates/mc-module/scripts/admission-gates.py --record-goldens --report-dir <report-dir>
+Hook files are raw response bytes; compaction files are compact JSON replacement bytes.

@@ -5,6 +5,9 @@ use cortexkit_role_step_transform_provider as hooks;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+mod admission_differential_tests;
+
 mod cache_policy;
 mod capability_candidate;
 #[cfg(test)]
