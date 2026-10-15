@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, realpathSync, rmSync } from "node:fs";
+import * as fs from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
@@ -12,44 +13,208 @@ import {
     isLinkedGitWorktree,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
+    resolveProjectIdentityStrict,
 } from "./project-identity";
+import {
+    projectDirectoryKey,
+    readRememberedProjectIdentity,
+    rememberGitIdentity,
+} from "./project-identity-cache";
 
 function tempDir(): string {
     return createTestTempDirFromPath(join(tmpdir(), "mc-identity-"));
 }
 
 function returningRootCommit(rootCommit: string): typeof execFileSync {
-    return (() => `${rootCommit}\n`) as typeof execFileSync;
+    return (() => `${rootCommit}\n`) as unknown as typeof execFileSync;
 }
+
+const originalTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+const originalDataHome = process.env.XDG_DATA_HOME;
+let storageDir: string;
+let testRoot: string;
+
+beforeEach(() => {
+    testRoot = tempDir();
+    storageDir = join(testRoot, "cortexkit", "magic-context");
+    mkdirSync(storageDir, { recursive: true });
+    process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testRoot;
+    process.env.XDG_DATA_HOME = testRoot;
+});
 
 afterEach(() => {
     __resetProjectIdentityForTests();
+    if (originalTestDataDir === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+    else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = originalTestDataDir;
+    if (originalDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalDataHome;
+    rmSync(testRoot, { recursive: true, force: true });
 });
 
 describe("linked Git worktree detection", () => {
-    test("compares the per-checkout git dir with the shared common dir once per directory", () => {
-        const calls: string[] = [];
+    test("reads gitdir and commondir files without running git, including from a subfolder", () => {
+        const primary = join(storageDir, "primary");
+        const linked = join(storageDir, "linked");
+        const gitDir = join(primary, ".git", "worktrees", "linked");
+        mkdirSync(gitDir, { recursive: true });
+        mkdirSync(join(linked, "sub"), { recursive: true });
+        writeFileSync(join(linked, ".git"), `gitdir: ${gitDir}\n`);
+        writeFileSync(join(gitDir, "commondir"), "../..\n");
+        let gitCalls = 0;
         __setProjectIdentityTestHooks({
-            execFileSync: ((command: string, args: string[], options: { cwd?: string }) => {
-                expect(command).toBe("git");
-                expect(args).toEqual([
-                    "rev-parse",
-                    "--path-format=absolute",
-                    "--git-dir",
-                    "--git-common-dir",
-                ]);
-                const directory = String(options.cwd);
-                calls.push(directory);
-                return directory.endsWith("linked")
-                    ? "/repo/.git/worktrees/linked\n/repo/.git\n"
-                    : "/repo/.git\n/repo/.git\n";
+            execFileSync: (() => {
+                gitCalls++;
+                return `${gitDir}\n${join(primary, ".git")}\n`;
             }) as unknown as typeof execFileSync,
         });
 
-        expect(isLinkedGitWorktree("/repo/primary")).toBe(false);
-        expect(isLinkedGitWorktree("/repo/linked")).toBe(true);
-        expect(isLinkedGitWorktree("/repo/linked")).toBe(true);
-        expect(calls).toEqual(["/repo/primary", "/repo/linked"]);
+        expect(isLinkedGitWorktree(primary)).toBe(false);
+        expect(isLinkedGitWorktree(linked)).toBe(true);
+        expect(isLinkedGitWorktree(join(linked, "sub"))).toBe(true);
+        rmSync(join(gitDir, "commondir"));
+        expect(isLinkedGitWorktree(linked)).toBe(true);
+        expect(gitCalls).toBe(0);
+    });
+
+    test.each([
+        "unreadable .git file",
+        "malformed .git file",
+        "missing gitdir target",
+        "unreadable gitdir target",
+        "unreadable commondir file",
+    ])("fails closed for %s without running git", (shape) => {
+        const checkout = join(storageDir, "checkout");
+        const dotGit = join(checkout, ".git");
+        const gitDir = join(storageDir, "metadata");
+        const commonFile = join(gitDir, "commondir");
+        mkdirSync(checkout);
+        writeFileSync(dotGit, `gitdir: ${gitDir}\n`);
+        if (shape !== "missing gitdir target") mkdirSync(gitDir);
+        if (shape === "malformed .git file") writeFileSync(dotGit, "not a gitdir pointer\n");
+        if (shape === "unreadable commondir file") writeFileSync(commonFile, ".\n");
+        const permissionDenied = (): NodeJS.ErrnoException =>
+            Object.assign(new Error("permission denied"), { code: "EACCES" });
+        const originalRead = fs.readFileSync;
+        const originalStat = fs.lstatSync;
+        let deniedReads = 0;
+        const read = spyOn(fs, "readFileSync").mockImplementation(((...args) => {
+            if (
+                (shape === "unreadable .git file" && args[0] === dotGit) ||
+                (shape === "unreadable commondir file" && args[0] === commonFile)
+            ) {
+                deniedReads++;
+                throw permissionDenied();
+            }
+            return Reflect.apply(originalRead, fs, args);
+        }) as typeof fs.readFileSync);
+        const stat = spyOn(fs, "lstatSync").mockImplementation(((...args) => {
+            if (shape === "unreadable gitdir target" && args[0] === commonFile) {
+                deniedReads++;
+                throw permissionDenied();
+            }
+            return Reflect.apply(originalStat, fs, args);
+        }) as typeof fs.lstatSync);
+        let gitCalls = 0;
+        __setProjectIdentityTestHooks({
+            execFileSync: (() => {
+                gitCalls++;
+                return `${gitDir}\n${gitDir}\n`;
+            }) as unknown as typeof execFileSync,
+        });
+        try {
+            expect(isLinkedGitWorktree(checkout)).toBe(true);
+            expect(gitCalls).toBe(0);
+            if (shape.startsWith("unreadable")) expect(deniedReads).toBe(1);
+        } finally {
+            read.mockRestore();
+            stat.mockRestore();
+        }
+    });
+
+    test("a folder without git metadata is not treated as linked", () => {
+        expect(isLinkedGitWorktree(storageDir)).toBe(false);
+    });
+});
+
+function pin(directory: string, identity = "pj-A"): string {
+    const hash = createHash("sha256").update(projectDirectoryKey(directory)).digest("hex");
+    const file = join(storageDir, "project-identities", `${hash}.json`);
+    mkdirSync(join(storageDir, "project-identities"), { recursive: true });
+    writeFileSync(file, JSON.stringify({ directory: projectDirectoryKey(directory), identity }));
+    return file;
+}
+
+describe("project pin precedence", () => {
+    test("pj pin wins over a live git root without a git probe", () => {
+        const directory = join(storageDir, "repo");
+        mkdirSync(join(directory, ".git"), { recursive: true });
+        const file = pin(directory);
+        const before = readFileSync(file, "utf8");
+        let gitCalls = 0;
+        __setProjectIdentityTestHooks({
+            execFileSync: (() => {
+                gitCalls++;
+                return "abc1234\n";
+            }) as unknown as typeof execFileSync,
+        });
+        expect(resolveProjectIdentity(directory)).toBe("pj-A");
+        expect(resolveProjectIdentityStrict(directory)).toBe("pj-A");
+        expect(resolveProjectIdentityForSession(directory)).toBe("pj-A");
+        expect(gitCalls).toBe(0);
+        expect(readFileSync(file, "utf8")).toBe(before);
+    });
+
+    test("a pj pin wins over process-cached git and directory fallbacks", () => {
+        const repo = join(storageDir, "repo");
+        const plain = join(storageDir, "plain");
+        mkdirSync(join(repo, ".git"), { recursive: true });
+        mkdirSync(plain);
+        __setProjectIdentityTestHooks({ execFileSync: returningRootCommit("abc1234") });
+        expect(resolveProjectIdentity(repo)).toBe("git:abc1234");
+        expect(resolveProjectIdentity(plain)).toStartWith("dir:");
+        pin(repo);
+        pin(plain);
+        expect(resolveProjectIdentity(repo)).toBe("pj-A");
+        expect(resolveProjectIdentity(plain)).toBe("pj-A");
+    });
+
+    test("a legacy git sidecar still loses to a live git root", () => {
+        const directory = join(storageDir, "repo");
+        mkdirSync(join(directory, ".git"), { recursive: true });
+        rememberGitIdentity(directory, "git:def5678");
+        __setProjectIdentityTestHooks({ execFileSync: returningRootCommit("abc1234") });
+        expect(resolveProjectIdentity(directory)).toBe("git:abc1234");
+    });
+
+    test("a subfolder's legacy git write cannot replace its checkout root's pin", () => {
+        const root = join(storageDir, "repo");
+        const sub = join(root, "sub");
+        mkdirSync(join(root, ".git"), { recursive: true });
+        mkdirSync(sub);
+        const file = pin(root);
+        const before = readFileSync(file, "utf8");
+        __setProjectIdentityTestHooks({ execFileSync: returningRootCommit("abc1234") });
+        expect(resolveProjectIdentity(sub)).toBe("git:abc1234");
+        expect(readFileSync(file, "utf8")).toBe(before);
+        expect(readRememberedProjectIdentity(sub)?.identity).toBe("git:abc1234");
+    });
+
+    test("home and missing-directory eligibility run before a pin can be used", () => {
+        const fakeHome = join(storageDir, "home");
+        const missing = join(storageDir, "missing");
+        mkdirSync(join(fakeHome, ".git"), { recursive: true });
+        mkdirSync(join(fakeHome, "sub"));
+        pin(fakeHome);
+        pin(join(fakeHome, "sub"));
+        pin(missing);
+        __setProjectIdentityTestHooks({ homeDirectory: () => fakeHome });
+        expect(resolveProjectIdentityForSession(fakeHome)).toBeUndefined();
+        expect(resolveProjectIdentityForSession(join(fakeHome, "sub"))).toBeUndefined();
+        expect(() => resolveProjectIdentityStrict(missing)).toThrow(
+            "Unable to access project directory",
+        );
+        expect(resolveProjectIdentity(missing)).toStartWith("dir:");
+        expect(resolveProjectIdentityForSession(missing)).not.toBe("pj-A");
     });
 });
 
@@ -197,7 +362,8 @@ describe("resolveProjectIdentity directory fallback", () => {
             // commits, and git's enumeration order varies by traversal. The identity
             // must be the lexicographic minimum of the SET, not the first line.
             __setProjectIdentityTestHooks({
-                execFileSync: (() => "7e96b9e\n1e394c2\n4058752\n") as typeof execFileSync,
+                execFileSync: (() =>
+                    "7e96b9e\n1e394c2\n4058752\n") as unknown as typeof execFileSync,
             });
             expect(resolveProjectIdentity(dir)).toBe("git:1e394c2");
         } finally {
@@ -217,7 +383,7 @@ describe("resolveProjectIdentity directory fallback", () => {
             __setProjectIdentityTestHooks({
                 execFileSync: (() => {
                     throw new Error("temporary git failure");
-                }) as typeof execFileSync,
+                }) as unknown as typeof execFileSync,
             });
 
             expect(resolveProjectIdentity(subdir)).toBe(parentIdentity);
