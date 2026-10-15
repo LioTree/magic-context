@@ -749,6 +749,7 @@ describe("doctor project-ids apply pairs", () => {
                 ],
                 {
                     cwd: root,
+                    windowsHide: true,
                     env: {
                         PATH: process.env.PATH ?? "",
                         HOME: root,

@@ -35,7 +35,7 @@ export function linkedCheckoutFixture(root: string) {
                 "commit.gpgsign=false",
                 ...args,
             ],
-            { cwd, stdio: "pipe" },
+            { cwd, stdio: "pipe", windowsHide: true },
         );
     git(main, "init");
     git(main, "commit", "--allow-empty", "-m", "fixture");
