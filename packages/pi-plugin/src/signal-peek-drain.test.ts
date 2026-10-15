@@ -353,12 +353,12 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 	});
 
 	test("runtime project identity resolves from ctx.cwd and tracks prompt path sessions", () => {
-		expect(code).toContain("function resolveCurrentProject");
-		expect(code).toContain("const projectDir = ctx.cwd");
+		expect(code).toContain("function resolveCurrentProjectDeps");
+		expect(code).toContain("readSessionIdentityDecision(sessionId, ctx.cwd");
 		expect(code).toContain(
 			"trackSessionForProject(currentProject.projectIdentity, sessionId)",
 		);
-		expect(code).toContain("resolveProject: resolveCurrentProject");
+		expect(code).toContain("resolveProject: resolveCurrentProjectDeps");
 	});
 
 	test("todowrite capture only accepts the built-in tool name", () => {
