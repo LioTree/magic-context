@@ -346,6 +346,10 @@ export function runProjectIdsApplyCli(
     const options = parseProjectIdsApplyArgs(args);
     const plan = JSON.parse(readFileSync(options.planPath, "utf8")) as ProjectIdPlan;
     const result = preflightProjectIdApply(plan, options, deps);
+    if (result.hostDbPath === null)
+        console.log(
+            "Skipped host session observations: plan has no host database; re-plan with --host-db <path> to include them.",
+        );
     for (const { pair, liveRowsByTable } of result.pairs) {
         console.log(`${pair.from} → ${pair.to}: planned / live row counts`);
         for (const table of new Set([

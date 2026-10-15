@@ -415,6 +415,18 @@ describe("doctor project-ids plan", () => {
         ).rejects.toThrow("Host database does not exist");
     }, 30_000);
 
+    it("names skipped host session observations with --db and no host database", async () => {
+        const output = spyOn(console, "log").mockImplementation(() => {});
+        try {
+            expect(await runProjectIdsCli(["plan", "--db", dbPath], { now })).toBe(0);
+            expect(output.mock.calls.flat().join("\n")).toContain(
+                "Skipped host session observations: no host database; use --host-db <path> to include them.",
+            );
+        } finally {
+            output.mockRestore();
+        }
+    });
+
     it("enforces the schema fence before resolution without creating missing databases", async () => {
         const old = join(root, "old.db");
         const oldDb = new Database(old);

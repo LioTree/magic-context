@@ -256,6 +256,10 @@ export async function runProjectIdsCli(
         const hostDbPath = existsSync(requestedHostPath)
             ? realpathSync.native(requestedHostPath)
             : null;
+        if (hostDbPath === null)
+            console.log(
+                "Skipped host session observations: no host database; use --host-db <path> to include them.",
+            );
         const plan = await buildProjectIdPlan(db, dbPath, hostDbPath, deps);
         const path = join(
             storageDir,

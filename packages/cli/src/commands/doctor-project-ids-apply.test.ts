@@ -201,6 +201,30 @@ async function killedApply(plan: ProjectIdPlan, point: "committed" | "applied"):
 }
 
 describe("doctor project-ids apply preflight", () => {
+    for (const checkOnly of [true, false])
+        it(`names skipped host session observations during apply${checkOnly ? " --check" : ""}`, async () => {
+            const plan = await makePlan();
+            const output = spyOn(console, "log").mockImplementation(() => {});
+            try {
+                expect(
+                    await runProjectIdsCli(
+                        [
+                            "apply",
+                            ...(checkOnly ? ["--check"] : []),
+                            planFile(plan),
+                            "--db",
+                            dbPath,
+                        ],
+                        deps,
+                    ),
+                ).toBe(0);
+                expect(output.mock.calls.flat().join("\n")).toContain(
+                    "Skipped host session observations: plan has no host database; re-plan with --host-db <path> to include them.",
+                );
+            } finally {
+                output.mockRestore();
+            }
+        });
     it("checks offline using the planned host by default, with read-only handles and identical database bytes", async () => {
         const hostPath = hostDatabase();
         const plan = await makePlan(hostPath);
