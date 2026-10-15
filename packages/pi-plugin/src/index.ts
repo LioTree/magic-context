@@ -54,6 +54,11 @@ import {
 	resolveProjectIdentityForSession,
 	setHomeProjectPermission,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
+import {
+	awaitSessionIdentityDecision,
+	forgetSessionIdentityDecision,
+	readSessionIdentityDecision,
+} from "@magic-context/core/features/magic-context/memory/session-identity-decision";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
 import { resolveSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
@@ -340,19 +345,6 @@ function clearPiStartupMaintenanceClaim(): void {
 	delete (globalThis as Record<symbol, unknown>)[
 		PI_STARTUP_MAINTENANCE_SCHEDULED
 	];
-}
-
-function resolveCurrentProject(
-	ctx: { cwd: string },
-	allowHomeProject = false,
-): {
-	projectDir: string;
-	projectIdentity: string;
-} {
-	const projectDir = ctx.cwd;
-	const projectIdentity =
-		resolveProjectIdentityForSession(projectDir, allowHomeProject) ?? "";
-	return { projectDir, projectIdentity };
 }
 
 export function signalPiDeferredCompactionMarkerDrain(sessionId: string): void {
@@ -1441,9 +1433,8 @@ async function startPiMagicContextRuntime(
 		logNoProjectIdentityOnce(projectDir);
 	}
 
-	type ResolvedPiProjectDeps = {
+	type PiProjectConfigDeps = {
 		projectDir: string;
-		projectIdentity: string;
 		config: MagicContextConfig;
 		historianConfig: PiHistorianOptions | undefined;
 		autoSearchConfig: PiAutoSearchHandlerOptions;
@@ -1454,12 +1445,15 @@ async function startPiMagicContextRuntime(
 		cacheTtlConfigured: boolean;
 		hasDeprecatedProtectedTags: boolean;
 	};
+	type ResolvedPiProjectDeps = PiProjectConfigDeps & {
+		projectIdentity: string;
+	};
 
 	// Per-cwd runtime deps. Pi can switch projects mid-process (`/cd`,
 	// multi-root), while tools and slash commands are registered only once.
 	// Resolve all project-sensitive config through this memoized accessor so
 	// every invocation reads the active cwd's config instead of the launch cwd's.
-	const projectDepsByDir = new Map<string, ResolvedPiProjectDeps>();
+	const projectDepsByDir = new Map<string, PiProjectConfigDeps>();
 	const liveReaders = new Map<string, LiveConfigReader<MagicContextConfig>>();
 	function liveReaderFor(dir: string, boot: MagicContextConfig) {
 		let reader = liveReaders.get(dir);
@@ -1532,6 +1526,7 @@ async function startPiMagicContextRuntime(
 		todowriteEnabled: cfg.todowrite.enabled,
 		compactionOff,
 		allowHomeProject: cfg.allow_home_project,
+		subcConnectionFile: cfg.subc?.connection_file,
 		// Automatic history embedding: silent (no timeline messages) and not
 		// gated on `memory.enabled`; only the embedding provider decides.
 		maybeAutoEmbedSession: (sessionId, dir, identity) => {
@@ -1550,30 +1545,26 @@ async function startPiMagicContextRuntime(
 
 	function buildProjectDeps(
 		dir: string,
-		identity: string,
 		cfg: MagicContextConfig,
 		loadMetadata: {
 			configParseFailures: typeof configParseFailures;
 			cacheTtlConfigured: boolean;
 			hasDeprecatedProtectedTags?: boolean;
 		},
-	): ResolvedPiProjectDeps {
+	): PiProjectConfigDeps {
 		const hist = resolveHistorianFromConfig(cfg);
 		liveReaderFor(dir, cfg);
 		if (hist) {
 			hist.onStatusChange = (ctx) => {
 				updateStatusLine(ctx, {
 					db: database,
-					projectIdentity:
-						resolveCurrentProject(ctx, cfg.allow_home_project)
-							.projectIdentity ?? "",
+					projectIdentity: resolveCurrentProjectDeps(ctx).projectIdentity,
 				});
 			};
 		}
 		const auto = resolveAutoSearchFromConfig(cfg);
 		return {
 			projectDir: dir,
-			projectIdentity: identity,
 			config: cfg,
 			historianConfig: hist,
 			autoSearchConfig: auto,
@@ -1587,10 +1578,7 @@ async function startPiMagicContextRuntime(
 		};
 	}
 
-	function resolveProjectDepsForDir(
-		dir: string,
-		identityOverride?: string,
-	): ResolvedPiProjectDeps {
+	function resolveProjectDepsForDir(dir: string): PiProjectConfigDeps {
 		const cached = projectDepsByDir.get(dir);
 		if (cached) return cached;
 		ensureConfigLocationsMigrated(dir);
@@ -1604,14 +1592,7 @@ async function startPiMagicContextRuntime(
 		const switchedConfig = switchedLoad.config;
 		// A new cwd or session may reload config, but registered tool text belongs to this process's startup.
 		switchedConfig.smart_notes.enabled = config.smart_notes.enabled;
-		const switchedIdentity =
-			identityOverride ??
-			resolveProjectIdentityForSession(
-				dir,
-				switchedConfig.allow_home_project,
-			) ??
-			"";
-		const built = buildProjectDeps(dir, switchedIdentity, switchedConfig, {
+		const built = buildProjectDeps(dir, switchedConfig, {
 			configParseFailures: switchedLoad.configParseFailures,
 			cacheTtlConfigured: switchedLoad.cacheTtlConfigured,
 			hasDeprecatedProtectedTags: switchedLoad.hasDeprecatedProtectedTags,
@@ -1622,8 +1603,22 @@ async function startPiMagicContextRuntime(
 
 	function resolveCurrentProjectDeps(ctx: {
 		cwd: string;
+		sessionManager?: { getSessionId?: () => string | undefined };
 	}): ResolvedPiProjectDeps {
-		return resolveProjectDepsForDir(ctx.cwd);
+		const project = resolveProjectDepsForDir(ctx.cwd);
+		const sessionId = ctx.sessionManager?.getSessionId?.();
+		return {
+			...project,
+			// Config reloads are directory-scoped; identity belongs to the session.
+			projectIdentity: sessionId
+				? (readSessionIdentityDecision(sessionId, ctx.cwd, {
+						allowHomeProject: project.config.allow_home_project,
+					})?.identity ?? "")
+				: (resolveProjectIdentityForSession(
+						ctx.cwd,
+						project.config.allow_home_project,
+					) ?? ""),
+		};
 	}
 
 	let activeModelRegistry:
@@ -1667,7 +1662,7 @@ async function startPiMagicContextRuntime(
 	 */
 	function reportPiModelChains(
 		ctx: PiModelChainReportContext,
-		project: ResolvedPiProjectDeps,
+		project: PiProjectConfigDeps,
 	): void {
 		const registry = ctx.modelRegistry;
 		if (!registry) return;
@@ -1803,16 +1798,11 @@ async function startPiMagicContextRuntime(
 		};
 	}
 
-	const bootProjectDeps = buildProjectDeps(
-		projectDir,
-		projectIdentity,
-		config,
-		{
-			configParseFailures,
-			cacheTtlConfigured,
-			hasDeprecatedProtectedTags,
-		},
-	);
+	const bootProjectDeps = buildProjectDeps(projectDir, config, {
+		configParseFailures,
+		cacheTtlConfigured,
+		hasDeprecatedProtectedTags,
+	});
 	projectDepsByDir.set(projectDir, bootProjectDeps);
 
 	function syncDreamerProjectRegistration(
@@ -1932,6 +1922,15 @@ async function startPiMagicContextRuntime(
 		// this cwd's config before setting the active tools so a memory.enabled
 		// change takes effect at the next session without restarting Pi.
 		projectDepsByDir.delete(ctx.cwd);
+		const sessionId = resolveSessionId(ctx);
+		const project = resolveProjectDepsForDir(ctx.cwd);
+		if (sessionId) {
+			await awaitSessionIdentityDecision(sessionId, ctx.cwd, {
+				allowHomeProject: project.config.allow_home_project,
+				connectionFile: project.config.subc?.connection_file,
+				db,
+			});
+		}
 		const current = resolveCurrentProjectDeps(ctx);
 		activeModelRegistry = ctx.modelRegistry;
 		activeModelChainContext = ctx;
@@ -1954,7 +1953,6 @@ async function startPiMagicContextRuntime(
 			ctx.ui.notify(formatProtectedTagsDeprecationNotice(), "warning");
 		}
 
-		const sessionId = resolveSessionId(ctx);
 		const model = ctx.model;
 		if (sessionId && model?.provider && model.id) {
 			seedSessionCacheTtlIfUnsynced({
@@ -2031,7 +2029,7 @@ async function startPiMagicContextRuntime(
 		smartNotesEnabled: config.smart_notes.enabled,
 		db,
 		projectIdentity,
-		resolveProject: resolveCurrentProject,
+		resolveProject: resolveCurrentProjectDeps,
 		protectedTags: bootProjectDeps.config.protected_tags,
 		executeThresholdPercentage:
 			bootProjectDeps.config.execute_threshold_percentage,
@@ -3112,6 +3110,7 @@ async function startPiMagicContextRuntime(
 				// this, sessions accumulate state across `session_shutdown`
 				// in long-lived Pi processes that re-init the extension.
 				clearContextHandlerSession(sessionId);
+				forgetSessionIdentityDecision(sessionId);
 			}
 		} catch {
 			// best-effort cleanup

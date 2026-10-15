@@ -14,7 +14,10 @@
  * provider for the duration of an expand call.
  */
 
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionContext,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { getLastCompartmentEndMessage } from "@magic-context/core/features/magic-context/compartment-storage";
 import {
 	embedTextForProject,
@@ -111,14 +114,19 @@ export interface CtxSearchToolDeps {
 	gitCommitsEnabled?: boolean;
 	rerankConnectionFile?: string;
 	/** Resolve a directory's project identity, allowing home only when user-level configuration enables it. */
-	resolveProjectIdentity?: (directory: string) => string | undefined;
+	resolveProjectIdentity?: (
+		directory: string,
+		ctx: ExtensionContext,
+	) => string | undefined;
 }
 
 export function createCtxSearchTool(
 	deps: CtxSearchToolDeps,
 ): ToolDefinition<typeof ParamsSchema> {
-	const resolveProject =
-		deps.resolveProjectIdentity ?? resolveProjectIdentityForSession;
+	const resolveProject = (directory: string, ctx: ExtensionContext) =>
+		deps.resolveProjectIdentity
+			? deps.resolveProjectIdentity(directory, ctx)
+			: resolveProjectIdentityForSession(directory);
 	return {
 		name: "ctx_search",
 		label: "Magic Context: Search",
@@ -164,7 +172,7 @@ export function createCtxSearchTool(
 			}
 
 			const sessionId = ctx.sessionManager.getSessionId();
-			const projectIdentity = resolveProject(ctx.cwd);
+			const projectIdentity = resolveProject(ctx.cwd, ctx);
 			if (!projectIdentity) {
 				return {
 					content: [

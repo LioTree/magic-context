@@ -14,6 +14,7 @@
 
 import type {
 	ExtensionAPI,
+	ExtensionContext,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -66,7 +67,9 @@ export interface RegisterToolsOptions {
 	gitCommitsEnabled?: boolean;
 	rerankConnectionFile?: string;
 	/** Resolve the current directory's project identity using the user-level home-project setting. */
-	resolveProjectIdentity?: (ctx: { cwd: string }) => string | undefined;
+	resolveProjectIdentity?: (
+		ctx: Pick<ExtensionContext, "cwd" | "sessionManager">,
+	) => string | undefined;
 	/** When true, register the separate ctx_memory_list tool and enable Curate-only
 	 *  execution fields. Set only by the lean dreamer subagent extension. */
 	allowDreamerActions?: boolean;
@@ -110,7 +113,8 @@ export function registerMagicContextTools(
 	opts: RegisterToolsOptions,
 ): void {
 	const resolveProjectIdentity = opts.resolveProjectIdentity
-		? (directory: string) => opts.resolveProjectIdentity?.({ cwd: directory })
+		? (_directory: string, ctx: ExtensionContext) =>
+				opts.resolveProjectIdentity?.(ctx)
 		: undefined;
 	const promptSurfaceRuntime =
 		opts.promptSurfaceRuntime ??
