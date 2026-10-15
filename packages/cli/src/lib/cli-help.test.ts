@@ -9,6 +9,7 @@ import {
     DOCTOR_HELP,
     LIST_HIDDEN_SESSIONS_HELP,
     MERGE_IDENTITY_HELP,
+    PROJECT_IDS_HELP,
     SETUP_HELP,
     SINGLE_STORE_HELP,
     subcommandHelp,
@@ -22,6 +23,7 @@ describe("subcommandHelp", () => {
             [["doctor", "--fix"], DOCTOR_HELP],
             [["doctor", "single-store", "migrate"], SINGLE_STORE_HELP],
             [["doctor", "merge-identity", "--from", "a"], MERGE_IDENTITY_HELP],
+            [["doctor", "project-ids", "plan"], PROJECT_IDS_HELP],
             [["doctor", "list-hidden-sessions"], LIST_HIDDEN_SESSIONS_HELP],
         ];
         for (const [argv, expected] of cases) {
@@ -58,6 +60,7 @@ async function runCli(args: string[]): Promise<{ code: number; stdout: string; s
             XDG_DATA_HOME: join(root, "data"),
             XDG_CONFIG_HOME: join(root, "config"),
             XDG_STATE_HOME: join(root, "state"),
+            XDG_RUNTIME_DIR: join(root, "runtime"),
             XDG_CACHE_HOME: join(root, "cache"),
             OPENCODE_DB: join(root, "opencode.db"),
             MAGIC_CONTEXT_STORAGE_DIR: join(root, "magic-context"),
@@ -81,6 +84,7 @@ describe("CLI --help per subcommand", () => {
         [["doctor"], "Usage: magic-context doctor [options]"],
         [["doctor", "single-store", "migrate"], "Usage: magic-context doctor single-store migrate"],
         [["doctor", "merge-identities"], "Usage: magic-context doctor merge-identities"],
+        [["doctor", "project-ids", "plan"], "Usage: magic-context doctor project-ids plan"],
         [["doctor", "list-hidden-sessions"], "Usage: magic-context doctor list-hidden-sessions"],
         [["doctor", "migrate"], "Magic Context doctor migrate"],
         [["doctor", "migrate-session"], "doctor migrate-session"],
