@@ -6,33 +6,56 @@ import json
 import os
 import time
 import unittest
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+
+class TransientApiError(RuntimeError):
+    """An API failure that can clear on its own: a 5xx, a dropped connection or a timeout."""
 
 
 def wait_for_artifact(fetch, producer, artifact, timeout, clock=time.monotonic, pause=time.sleep):
     deadline = clock() + timeout
+    last_transient = None
     while True:
         if clock() >= deadline:
-            raise RuntimeError(f"{producer}: artifact wait timed out after {timeout:g}s")
-        jobs = fetch("jobs")["jobs"]
-        matches = [job for job in jobs if job["name"] == producer]
-        if len(matches) > 1:
-            raise RuntimeError(f"{producer}: ambiguous producer jobs")
-        job = matches[0] if matches else None
-        if job and job["status"] == "completed" and job["conclusion"] != "success":
-            raise RuntimeError(f"{producer}: producer ended {job['conclusion']} without a usable artifact")
-        artifacts = fetch("artifacts")["artifacts"]
-        ready = [item for item in artifacts if item["name"] == artifact and not item["expired"]]
-        if len(ready) == 1:
-            return ready[0]["id"]
-        if len(ready) > 1:
-            raise RuntimeError(f"{producer}: ambiguous artifact {artifact}")
-        if job and job["status"] == "completed":
-            raise RuntimeError(f"{producer}: producer succeeded without artifact {artifact}")
+            detail = f"; last API error: {last_transient}" if last_transient else ""
+            raise RuntimeError(f"{producer}: artifact wait timed out after {timeout:g}s{detail}")
+        try:
+            found = poll_once(fetch, producer, artifact)
+        except TransientApiError as error:
+            # GitHub's API returns the occasional 502 or drops a connection; one
+            # such blip must not fail a job whose producer is healthy. Keep polling
+            # until the deadline, and name the last error if the deadline passes.
+            last_transient = error
+            found = None
+        if found is not None:
+            return found
         remaining = deadline - clock()
         if remaining <= 0:
-            raise RuntimeError(f"{producer}: artifact wait timed out after {timeout:g}s")
+            detail = f"; last API error: {last_transient}" if last_transient else ""
+            raise RuntimeError(f"{producer}: artifact wait timed out after {timeout:g}s{detail}")
         pause(min(10, remaining))
+
+
+def poll_once(fetch, producer, artifact):
+    """One look at the producer job and the artifact list: the artifact id, or None to keep waiting."""
+    jobs = fetch("jobs")["jobs"]
+    matches = [job for job in jobs if job["name"] == producer]
+    if len(matches) > 1:
+        raise RuntimeError(f"{producer}: ambiguous producer jobs")
+    job = matches[0] if matches else None
+    if job and job["status"] == "completed" and job["conclusion"] != "success":
+        raise RuntimeError(f"{producer}: producer ended {job['conclusion']} without a usable artifact")
+    artifacts = fetch("artifacts")["artifacts"]
+    ready = [item for item in artifacts if item["name"] == artifact and not item["expired"]]
+    if len(ready) == 1:
+        return ready[0]["id"]
+    if len(ready) > 1:
+        raise RuntimeError(f"{producer}: ambiguous artifact {artifact}")
+    if job and job["status"] == "completed":
+        raise RuntimeError(f"{producer}: producer succeeded without artifact {artifact}")
+    return None
 
 
 def producer_for_attempt(current, history, producer):
@@ -108,6 +131,36 @@ class WaitTests(unittest.TestCase):
             wait_for_artifact(fetch, "producer", "artifact", 23, lambda: now[0], lambda seconds: now.__setitem__(0, now[0] + seconds))
         self.assertEqual(now[0], 23)
 
+    def test_transient_api_error_keeps_waiting(self):
+        now = [0]
+        failures = [TransientApiError("artifact API query failed: HTTP Error 502: Bad Gateway")]
+
+        def fetch(kind):
+            if failures:
+                raise failures.pop()
+            if kind == "jobs":
+                return {"jobs": [{"name": "producer", "status": "in_progress", "conclusion": None}]}
+            return {"artifacts": [{"name": "artifact", "expired": False, "id": 7}]}
+
+        found = wait_for_artifact(fetch, "producer", "artifact", 60, lambda: now[0], lambda s: now.__setitem__(0, now[0] + s))
+        self.assertEqual((found, now[0]), (7, 10))
+
+    def test_transient_api_errors_until_deadline_name_the_last_error(self):
+        now = [0]
+
+        def fetch(kind):
+            raise TransientApiError("artifact API query failed: HTTP Error 502: Bad Gateway")
+
+        with self.assertRaisesRegex(RuntimeError, "timed out after 25s; last API error: .*502"):
+            wait_for_artifact(fetch, "producer", "artifact", 25, lambda: now[0], lambda s: now.__setitem__(0, now[0] + s))
+
+    def test_permanent_api_error_fails_at_once(self):
+        def fetch(kind):
+            raise RuntimeError("artifact API query failed: HTTP Error 404: Not Found")
+
+        with self.assertRaisesRegex(RuntimeError, "404"):
+            wait_for_artifact(fetch, "producer", "artifact", 60, lambda: 0, lambda s: None)
+
     def test_failed_only_rerun_reuses_the_successful_producers_attempt(self):
         previous = {"id": 1, "name": "producer", "status": "completed", "conclusion": "success", "run_attempt": 1}
         self.assertEqual(producer_for_attempt([], [previous], "producer"), [previous])
@@ -150,6 +203,13 @@ def main():
         try:
             with urlopen(request, timeout=max(0.001, min(30, deadline - time.monotonic()))) as response:
                 result = json.load(response)
+        except HTTPError as error:
+            # A 5xx is GitHub's side and may clear; anything else (401, 403, 404)
+            # will not, so it still fails the job at once.
+            kind = TransientApiError if error.code >= 500 else RuntimeError
+            raise kind(f"{args.producer}: artifact API query failed: {error}") from error
+        except (URLError, TimeoutError, ConnectionError) as error:
+            raise TransientApiError(f"{args.producer}: artifact API query failed: {error}") from error
         except Exception as error:
             raise RuntimeError(f"{args.producer}: artifact API query failed: {error}") from error
         return result
