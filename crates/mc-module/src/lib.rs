@@ -9021,9 +9021,14 @@ impl McHandler {
                 ),
             )
         };
+        let cc_pending = match self.claude_code_pending_status(&binding) {
+            Ok(pending) => pending,
+            Err(outcome) => return outcome,
+        };
         let response = json!({
             "ok": true,
             "summary": summary,
+            "cc_pending": cc_pending,
             "wrapup_active": wrapup_active.is_some(),
             "wrapup_rounds": wrapup_active,
             "coverage_ordinal": loaded.meta.coverage_ordinal,

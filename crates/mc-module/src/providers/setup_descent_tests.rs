@@ -144,6 +144,16 @@ async fn check_case(name: &str) {
             };
             assert_eq!(code, refusal["code"], "{name} call {index}");
             assert_eq!(field, refusal["detail"]["field"], "{name} call {index}");
+            let mut before = before;
+            if name == "hook_conflicts_with_setup_descent" {
+                let conversation = before.as_mut().unwrap();
+                let mut counters: Value =
+                    serde_json::from_str(&conversation.hook_counters_json).unwrap();
+                assert!(counters.get("failed_subjects").is_none());
+                counters["failed_subjects"] =
+                    json!([{"subject_mid":"next","hook":"pre_user","subject_part":""}]);
+                conversation.hook_counters_json = counters.to_string();
+            }
             assert_eq!(
                 serde_json::to_value(store.load_provider_conversation(&key.store_key()).unwrap())
                     .unwrap(),
@@ -178,6 +188,36 @@ async fn check_case(name: &str) {
         assert_eq!(
             saved, expected["saved_descends_from"],
             "{name} call {index}"
+        );
+    }
+    if name == "hook_conflicts_with_setup_descent" {
+        let raw = r#"{"role":"user","content":"next"}"#;
+        let message = super::super::codec_claude_code::from_wire(
+            &serde_json::from_str(raw).unwrap(),
+            Some(raw),
+        )
+        .unwrap();
+        let lineage = store
+            .load_provider_lineage(&key.store_key(), "child")
+            .unwrap()
+            .unwrap();
+        store
+            .commit_provider_status(
+                &key.store_key(),
+                &lineage,
+                &[ProviderMessage {
+                    mid: "next".into(),
+                    ordinal: 3,
+                    message_bytes: serde_json::to_vec(&message).unwrap(),
+                }],
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            h.claude_code_pending_status(&h.facade_binding(7).unwrap())
+                .unwrap()["reasons"]["hook_failed"],
+            1
         );
     }
 }

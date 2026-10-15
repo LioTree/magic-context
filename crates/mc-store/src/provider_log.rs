@@ -68,6 +68,12 @@ pub struct ProviderConversation {
     pub served_through_ordinal: Option<u64>,
     pub historian_model_chain_json: String,
 }
+
+pub struct ProviderPendingSnapshot {
+    pub conversation: ProviderConversation,
+    pub messages: Vec<ProviderMessage>,
+    pub covered_blocks: BTreeSet<String>,
+}
 impl Default for ProviderConversation {
     fn default() -> Self {
         Self {
@@ -102,7 +108,7 @@ pub struct ProviderLineage {
     pub descends_from: Option<String>,
     pub through_ordinal: Option<u64>,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSubject {
     pub subject_mid: String,
     pub hook: String,
@@ -1308,6 +1314,90 @@ impl McStore {
             .with_conn_fenced(|conn| save_conversation_tx(conn, key, conversation))?;
         Ok(())
     }
+
+    /// Update only counters on an existing conversation, without admitting a
+    /// message, moving its lineage, or allocating an answer or tag number.
+    pub fn update_provider_hook_counters<T>(
+        &self,
+        key: &ProviderSessionKey,
+        update: impl FnOnce(&mut Value) -> T,
+    ) -> Result<Option<T>, McStoreError> {
+        Ok(self.inner.with_conn_fenced(|conn| {
+            let Some(held) = conversation_tx(conn, key)? else {
+                return Ok(None);
+            };
+            let mut counters = parse(&held.hook_counters_json)?;
+            if !counters.is_object() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let result = update(&mut counters);
+            conn.execute(
+                "UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1",
+                params![key.conversation_key(), counters.to_string()],
+            )?;
+            Ok(Some(result))
+        })?)
+    }
+
+    pub fn record_provider_hook_failure(
+        &self,
+        key: &ProviderSessionKey,
+        subject: &ProviderSubject,
+    ) -> Result<(), McStoreError> {
+        self.update_provider_hook_counters(key, |counters| {
+            let failed = counters
+                .as_object_mut()
+                .expect("checked counters")
+                .entry("failed_subjects")
+                .or_insert_with(|| json!([]));
+            if !failed.is_array() {
+                *failed = json!([]);
+            }
+            let failed = failed.as_array_mut().expect("failed subjects array");
+            let subject = serde_json::to_value(subject).expect("provider subject");
+            failed.retain(|held| held != &subject);
+            failed.push(subject);
+            if failed.len() > 256 {
+                failed.drain(..failed.len() - 256);
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Read stored messages and the parts covered by their newest pending/live
+    /// answers together. Parent history beyond a child's declared boundary is
+    /// excluded from both lists; unapplied healing proposals cover nothing yet.
+    pub fn load_provider_pending_snapshot(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<Option<ProviderPendingSnapshot>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let Some(conversation) = conversation_tx(conn, key)? else {
+                return Ok(None);
+            };
+            let conv = key.conversation_key();
+            let messages = messages_tx(conn, &conv, &conversation.lineage_id)?;
+            let mut subjects = BTreeSet::new();
+            let mut covered_blocks = BTreeSet::new();
+            for (lineage, cut) in ancestry_tx(conn, &conv, &conversation.lineage_id)? {
+                let mut q = conn.prepare("SELECT subject_mid,hook,subject_part,tags_json FROM mc_provider_hook_answers_v1 a WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 AND state IN ('pending','live') AND legacy_json IS NULL AND (json_extract(policy_json,'$.heal_view_version') IS NULL OR EXISTS(SELECT 1 FROM mc_provider_views_v1 v WHERE v.conv_key=a.conv_key AND v.version=json_extract(a.policy_json,'$.heal_view_version') AND v.state='applied')) ORDER BY answer_seq DESC")?;
+                let rows = q.query_map(params![conv, lineage.lineage_id, as_i64(cut)?], |r| {
+                    Ok((
+                        (r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+                        r.get::<_, String>(3)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (subject, tags) = row?;
+                    if subjects.insert(subject) {
+                        let tags: Vec<ProviderAnswerTag> = serde_json::from_str(&tags).map_err(sql_json)?;
+                        covered_blocks.extend(tags.into_iter().map(|tag| tag.block_id));
+                    }
+                }
+            }
+            Ok(Some(ProviderPendingSnapshot { conversation, messages, covered_blocks }))
+        })?)
+    }
     /// Message admission, burns, promotion, policy, answer allocation and counters
     /// either all commit or all roll back. The callback must not perform store IO.
     pub fn commit_provider_hook<T>(
@@ -1544,6 +1634,14 @@ impl McStore {
                     conn.execute("UPDATE mc_provider_hook_answers_v1 SET policy_json=?2 WHERE conv_key=?1 AND answer_seq=(SELECT max(answer_seq) FROM mc_provider_hook_answers_v1 WHERE conv_key=?1)",params![conv,answer_policy.to_string()])?;
                 }
                 if !write.counters.is_object() {return Err(ProviderError::Transient("hook counters must be an object".into()))}
+                if let Some(subject) = request.repeat_subject {
+                    if repeat_answer_tx(conn,&conv,&request.lineage.lineage_id,subject)?.is_some() {
+                        if let Some(failed) = write.counters.get_mut("failed_subjects").and_then(Value::as_array_mut) {
+                            let subject = serde_json::to_value(subject).map_err(sql_json)?;
+                            failed.retain(|held| held != &subject);
+                        }
+                    }
+                }
                 write.counters["tag_high_water"]=json!(high);
                 conn.execute("UPDATE mc_provider_conversations_v2 SET lineage_id=?2,served_through_ordinal=?3,hook_counters_json=?4,cursor_frontier=?5 WHERE conv_key=?1",params![conv,request.lineage.lineage_id,acknowledged.map(as_i64).transpose()?,write.counters.to_string(),as_i64(frontier)?])?;
                 if let Some(metrics) = answer_policy.get("metrics") {
@@ -1820,6 +1918,55 @@ mod policy_tests {
             },
         )
     }
+    #[test]
+    fn cc_pending_failed_subjects_are_capped_counters_only_and_require_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, key, _) = fixture(dir.path());
+        let before = store.load_provider_conversation(&key).unwrap().unwrap();
+        for n in 0..260 {
+            store
+                .record_provider_hook_failure(
+                    &key,
+                    &ProviderSubject {
+                        subject_mid: format!("m{n}"),
+                        hook: "pre_user".into(),
+                        subject_part: "".into(),
+                    },
+                )
+                .unwrap();
+        }
+        let after = store.load_provider_conversation(&key).unwrap().unwrap();
+        let counters: Value = serde_json::from_str(&after.hook_counters_json).unwrap();
+        assert_eq!(counters["failed_subjects"].as_array().unwrap().len(), 256);
+        assert_eq!(counters["failed_subjects"][0]["subject_mid"], "m4");
+        assert_eq!(counters["failed_subjects"][255]["subject_mid"], "m259");
+        let mut comparable = after.clone();
+        comparable.hook_counters_json = before.hook_counters_json.clone();
+        assert_eq!(
+            serde_json::to_value(comparable).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert!(store.load_provider_messages(&key, "L").unwrap().is_empty());
+        assert!(store.load_provider_hook_answers(&key).unwrap().is_empty());
+        assert_eq!(store.load_provider_lineage(&key, "L").unwrap(), None);
+        let mut missing = key.clone();
+        missing.session = "missing".into();
+        store
+            .record_provider_hook_failure(
+                &missing,
+                &ProviderSubject {
+                    subject_mid: "m".into(),
+                    hook: "pre_user".into(),
+                    subject_part: "".into(),
+                },
+            )
+            .unwrap();
+        assert!(store
+            .load_provider_conversation(&missing)
+            .unwrap()
+            .is_none());
+    }
+
     fn seed_engine_tag(store: &McStore, namespace: &str, number: i64, block: &str) {
         store.inner.with_conn(|conn| {
             conn.execute("INSERT INTO mc_tags (session_id,tag_number,block_id,kind,token_count,created_at_ms,source_bytes) VALUES (?1,?2,?3,'message',1,1,x'61')",params![namespace,number,block])?;

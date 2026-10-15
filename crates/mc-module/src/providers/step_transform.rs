@@ -289,6 +289,129 @@ pub fn declaration(params: &Value) -> Result<hooks::subscription::Declaration, H
 }
 
 impl McHandler {
+    pub(crate) fn claude_code_pending_status(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<Value, HandlerOutcome> {
+        if !attested_claude_code(binding) {
+            return Ok(Value::Null);
+        }
+        let mut scoped = binding.clone();
+        if scoped.native_generation.is_none() {
+            let pins = self.native_pins();
+            scoped.native_generation = Some(mc_store::provider_records::ProviderGeneration {
+                profile: pins.profile_generation,
+                provider: pins.provider_generation,
+            });
+        }
+        let key = Key::new(&scoped, &scoped.session, &scoped.harness)?;
+        let store = self.store.get().ok_or_else(|| self.store_refusal())?;
+        let Some(snapshot) = store
+            .load_provider_pending_snapshot(&key.store_key())
+            .map_err(transient)?
+        else {
+            return Ok(Value::Null);
+        };
+        let counters: Value =
+            serde_json::from_str(&snapshot.conversation.hook_counters_json).map_err(transient)?;
+        let mut reasons = BTreeMap::<&str, usize>::new();
+        for held in snapshot.messages {
+            let entry = compact::status::StatusMessage {
+                raw_message: None,
+                mid: held.mid,
+                ordinal: held.ordinal,
+                message: serde_json::from_slice(&held.message_bytes).map_err(transient)?,
+            };
+            let ingress = codec::Codec::ClaudeCodeAnthropic.decode_message(&entry)?;
+            if ingress.ck.meta.synthetic || ingress.ck.role == "system" {
+                continue;
+            }
+            let mixed_user = ingress.ck.role == "user"
+                && ingress
+                    .ck
+                    .content
+                    .iter()
+                    .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }));
+            let last_signed = ingress
+                .ck
+                .content
+                .iter()
+                .rposition(super::codec_claude_code::is_thinking_block);
+            for (index, block) in ingress.ck.content.iter().enumerate() {
+                if snapshot
+                    .covered_blocks
+                    .contains(&ck_wire::block_id(&entry.mid, index))
+                {
+                    continue;
+                }
+                // Use the text and tool-result shapes accepted by taggable_source.
+                // Counting must also work when a failed hook left a stored tool
+                // result without its matching tool call.
+                let (hook, part, user_text, assistant_text) = match &block.kind {
+                    ck_wire::CkKind::Text { .. } if ingress.ck.role == "user" => {
+                        ("pre_user", "", true, false)
+                    }
+                    ck_wire::CkKind::Text { text }
+                        if ingress.ck.role == "assistant" && !text.trim().is_empty() =>
+                    {
+                        ("post_assistant", "", false, true)
+                    }
+                    ck_wire::CkKind::ToolResult { id, output, .. } => {
+                        let taggable = match &output.kind {
+                            ck_wire::CkOutputKind::Text { .. }
+                            | ck_wire::CkOutputKind::ErrorText { .. } => true,
+                            ck_wire::CkOutputKind::Content { blocks }
+                            | ck_wire::CkOutputKind::ErrorContent { blocks } => {
+                                blocks.iter().any(|child| {
+                                    matches!(child.kind, ck_wire::ResultBlockKind::Text { .. })
+                                })
+                            }
+                            _ => false,
+                        };
+                        if !taggable {
+                            continue;
+                        }
+                        ("post_tool", id.as_str(), false, false)
+                    }
+                    _ => continue,
+                };
+                let subject = json!({"subject_mid":entry.mid,"hook":hook,"subject_part":part});
+                let failed = counters["failed_subjects"]
+                    .as_array()
+                    .is_some_and(|failed| failed.contains(&subject));
+                let reason = if mixed_user && user_text {
+                    "mixed_user_text"
+                } else if assistant_text && last_signed.is_some_and(|last| last > index) {
+                    "signed_prefix_hold"
+                } else if failed {
+                    "hook_failed"
+                } else {
+                    "freshness_unproven"
+                };
+                *reasons.entry(reason).or_default() += 1;
+            }
+        }
+        let count: usize = reasons.values().sum();
+        if count > 0 {
+            let first = store
+                .update_provider_hook_counters(&key.store_key(), |counters| {
+                    let first = counters["pending_logged"] != true;
+                    counters["pending_logged"] = json!(true);
+                    first
+                })
+                .map_err(transient)?;
+            if first == Some(true) {
+                tracing::info!(
+                    "mc-module: cc_pending session={} count={} reasons={:?}",
+                    key.session,
+                    count,
+                    reasons
+                );
+            }
+        }
+        Ok(json!({"count":count,"reasons":reasons}))
+    }
+
     async fn provider_claude_code_hook(
         &self,
         binding: SessionBinding,
@@ -437,239 +560,254 @@ impl McHandler {
         let _serial = self.provider_serial.lock_for(&key).await;
         let route = self.native_publication_lock(&binding)?;
         let _route = self.native_publication_fence(&binding, &route)?;
-        let held = store
-            .load_provider_conversation(&key.store_key())
-            .map_err(transient)?
-            .ok_or_else(|| invalid_field("params", "CC plan is not frozen"))?;
-        let plan: Value = serde_json::from_str(&held.params_json).map_err(transient)?;
-        let frozen: Value = serde_json::from_str(
-            held.native_plan_json
-                .as_deref()
-                .ok_or_else(|| invalid_field("params", "CC plan is not frozen"))?,
-        )
-        .map_err(transient)?;
-        let native_lane =
-            plan["serializer_profile"] == "claude-code-anthropic" && answer_observation(&plan);
-        let reduction_owner = frozen.get("composition").is_none_or(Value::is_null)
-            || frozen
-                .pointer("/composition/compaction/provider")
-                .and_then(Value::as_str)
-                == Some(DEFAULT_MODULE_ID);
-        let declared = declaration(&json!({"params":plan,"preset":held.preset}))?;
-        if !declared
-            .subscriptions
-            .iter()
-            .any(|s| s.hook == hook && s.phase == call.subject.phase())
-        {
-            return Err(error("not_subscribed", "CC hook is not declared"));
-        }
-        let descent = call.descends_from.as_ref().map(|parent| {
-            compact::status::DescendsFrom::new(&parent.lineage_id, parent.through_ordinal)
-        });
-        let lineage = super::compaction::claude_code_lineage_fields(
-            &store,
-            &key,
-            descent.as_ref(),
-            lineage_id,
-            ordinal,
-            None,
-        )?;
         let subject = ProviderSubject {
             subject_mid: mid.into(),
             hook: hook_name.into(),
             subject_part: part.into(),
         };
-        let unserved = fields
-            .unserved_subjects
-            .iter()
-            .map(|s| {
-                Ok(ProviderSubject {
-                    subject_mid: s.subject_mid.clone(),
-                    hook: s.hook.clone(),
-                    subject_part: checked_part(s.subject_part.as_deref())?.into(),
+        let result = (|| {
+            let held = store
+                .load_provider_conversation(&key.store_key())
+                .map_err(transient)?
+                .ok_or_else(|| invalid_field("params", "CC plan is not frozen"))?;
+            let plan: Value = serde_json::from_str(&held.params_json).map_err(transient)?;
+            let frozen: Value = serde_json::from_str(
+                held.native_plan_json
+                    .as_deref()
+                    .ok_or_else(|| invalid_field("params", "CC plan is not frozen"))?,
+            )
+            .map_err(transient)?;
+            let native_lane =
+                plan["serializer_profile"] == "claude-code-anthropic" && answer_observation(&plan);
+            let reduction_owner = frozen.get("composition").is_none_or(Value::is_null)
+                || frozen
+                    .pointer("/composition/compaction/provider")
+                    .and_then(Value::as_str)
+                    == Some(DEFAULT_MODULE_ID);
+            let declared = declaration(&json!({"params":plan,"preset":held.preset}))?;
+            if !declared
+                .subscriptions
+                .iter()
+                .any(|s| s.hook == hook && s.phase == call.subject.phase())
+            {
+                return Err(error("not_subscribed", "CC hook is not declared"));
+            }
+            let descent = call.descends_from.as_ref().map(|parent| {
+                compact::status::DescendsFrom::new(&parent.lineage_id, parent.through_ordinal)
+            });
+            let lineage = super::compaction::claude_code_lineage_fields(
+                &store,
+                &key,
+                descent.as_ref(),
+                lineage_id,
+                ordinal,
+                None,
+            )?;
+            let unserved = fields
+                .unserved_subjects
+                .iter()
+                .map(|s| {
+                    Ok(ProviderSubject {
+                        subject_mid: s.subject_mid.clone(),
+                        hook: s.hook.clone(),
+                        subject_part: checked_part(s.subject_part.as_deref())?.into(),
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, HandlerOutcome>>()?;
-        let mut request: TransformRequest = decode(
-            &json!({"v":2,"kind":"transform.hook","serializer_profile":"claude-code-anthropic","session_id":key.engine_key(),"render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}),
-        )?;
-        // Hook commits persist the immutable native ingest in the provider log,
-        // before step admission and independently of pending answer edits. Loading
-        // that log lets post_tool pair with an earlier post_assistant after restart;
-        // burning an unserved answer does not erase its tool-use ingest. Include
-        // the retained parent prefix when a hook first declares a descent.
-        let needs_pairing = ingress
-            .ck
-            .content
-            .iter()
-            .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }));
-        let mut prior = if !needs_pairing {
-            Vec::new()
-        } else if let Some(parent) = &lineage.descends_from {
-            let cut = lineage.through_ordinal.expect("paired descent");
-            let mut prior = store
-                .load_provider_messages(&key.store_key(), parent)
-                .map_err(transient)?;
-            prior.retain(|message| message.ordinal <= cut);
-            prior.extend(
+                .collect::<Result<Vec<_>, HandlerOutcome>>()?;
+            let mut request: TransformRequest = decode(
+                &json!({"v":2,"kind":"transform.hook","serializer_profile":"claude-code-anthropic","session_id":key.engine_key(),"render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}),
+            )?;
+            // Hook commits persist the immutable native ingest in the provider log,
+            // before step admission and independently of pending answer edits. Loading
+            // that log lets post_tool pair with an earlier post_assistant after restart;
+            // burning an unserved answer does not erase its tool-use ingest. Include
+            // the retained parent prefix when a hook first declares a descent.
+            let needs_pairing = ingress
+                .ck
+                .content
+                .iter()
+                .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }));
+            let mut prior = if !needs_pairing {
+                Vec::new()
+            } else if let Some(parent) = &lineage.descends_from {
+                let cut = lineage.through_ordinal.expect("paired descent");
+                let mut prior = store
+                    .load_provider_messages(&key.store_key(), parent)
+                    .map_err(transient)?;
+                prior.retain(|message| message.ordinal <= cut);
+                prior.extend(
+                    store
+                        .load_provider_messages(&key.store_key(), lineage_id)
+                        .map_err(transient)?
+                        .into_iter()
+                        .filter(|message| message.ordinal > cut),
+                );
+                prior
+            } else {
                 store
                     .load_provider_messages(&key.store_key(), lineage_id)
                     .map_err(transient)?
-                    .into_iter()
-                    .filter(|message| message.ordinal > cut),
-            );
-            prior
-        } else {
-            store
-                .load_provider_messages(&key.store_key(), lineage_id)
-                .map_err(transient)?
-        };
-        prior.retain(|message| message.ordinal < ordinal);
-        let mut entries = prior
-            .into_iter()
-            .map(|message| {
-                Ok(compact::status::StatusMessage {
-                    raw_message: None,
-                    mid: message.mid,
-                    ordinal: message.ordinal,
-                    message: serde_json::from_slice(&message.message_bytes).map_err(transient)?,
+            };
+            prior.retain(|message| message.ordinal < ordinal);
+            let mut entries = prior
+                .into_iter()
+                .map(|message| {
+                    Ok(compact::status::StatusMessage {
+                        raw_message: None,
+                        mid: message.mid,
+                        ordinal: message.ordinal,
+                        message: serde_json::from_slice(&message.message_bytes)
+                            .map_err(transient)?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, HandlerOutcome>>()?;
-        entries.push(entry);
-        codec::Codec::ClaudeCodeAnthropic.prepare_request(&mut request, &entries)?;
-        let projection = ck_wire::project_messages(&request.messages).map_err(|problem| {
-            if matches!(problem, ck_wire::CkWireError::UnpairedToolResult { .. }) {
-                error("unpaired_tool_result", problem.to_string())
-            } else {
-                transient(problem)
+                .collect::<Result<Vec<_>, HandlerOutcome>>()?;
+            entries.push(entry);
+            codec::Codec::ClaudeCodeAnthropic.prepare_request(&mut request, &entries)?;
+            let projection = ck_wire::project_messages(&request.messages).map_err(|problem| {
+                if matches!(problem, ck_wire::CkWireError::UnpairedToolResult { .. }) {
+                    error("unpaired_tool_result", problem.to_string())
+                } else {
+                    transient(problem)
+                }
+            })?;
+            let mut parts = admission_policy_parts(&request, &projection);
+            parts.retain(|part| part.mid == mid);
+            for p in &mut parts {
+                if let Some(ck_wire::CkKind::ToolResult { id, .. }) = ingress
+                    .ck
+                    .content
+                    .get(p.block_index as usize)
+                    .map(|b| &b.kind)
+                {
+                    p.subject_part = id.clone();
+                }
             }
-        })?;
-        let mut parts = admission_policy_parts(&request, &projection);
-        parts.retain(|part| part.mid == mid);
-        for p in &mut parts {
-            if let Some(ck_wire::CkKind::ToolResult { id, .. }) = ingress
-                .ck
-                .content
-                .get(p.block_index as usize)
-                .map(|b| &b.kind)
-            {
-                p.subject_part = id.clone();
-            }
-        }
-        let mut input = ProviderMessage {
-            mid: mid.into(),
-            ordinal,
-            message_bytes: serde_json::to_vec(&message).map_err(transient)?,
-        };
-        super::codec_claude_code::preserve_stored_forms(
-            &store,
-            &key,
-            &lineage,
-            std::slice::from_mut(&mut input),
-        )?;
-        let answer = store
-            .commit_provider_hook_with_parts(
-                &key.store_key(),
-                ProviderHookRequest {
-                    lineage: &lineage,
-                    message: Some(&input),
-                    served_through_ordinal: fields.served_through_ordinal,
-                    unserved_subjects: &unserved,
-                    repeat_subject: Some(&subject),
-                },
-                &parts,
-                |ctx| {
-                    if let Some(held) = &ctx.repeat_answer {
-                        let ops: Vec<Operation> = serde_json::from_str(&held.answer.ops_json)
-                            .map_err(|e| {
+            let mut input = ProviderMessage {
+                mid: mid.into(),
+                ordinal,
+                message_bytes: serde_json::to_vec(&message).map_err(transient)?,
+            };
+            super::codec_claude_code::preserve_stored_forms(
+                &store,
+                &key,
+                &lineage,
+                std::slice::from_mut(&mut input),
+            )?;
+            let answer = store
+                .commit_provider_hook_with_parts(
+                    &key.store_key(),
+                    ProviderHookRequest {
+                        lineage: &lineage,
+                        message: Some(&input),
+                        served_through_ordinal: fields.served_through_ordinal,
+                        unserved_subjects: &unserved,
+                        repeat_subject: Some(&subject),
+                    },
+                    &parts,
+                    |ctx| {
+                        if let Some(held) = &ctx.repeat_answer {
+                            let ops: Vec<Operation> = serde_json::from_str(&held.answer.ops_json)
+                                .map_err(|e| {
                                 mc_store::provider_records::ProviderError::Transient(e.to_string())
                             })?;
+                            let answer = if ops.is_empty() {
+                                HookAnswer::Pass
+                            } else {
+                                HookAnswer::Ops { ops }
+                            };
+                            return Ok((
+                                ProviderHookWrite {
+                                    answer: (held.state == "pending"
+                                        && held.lineage_id == lineage.lineage_id)
+                                        .then(|| held.answer.clone()),
+                                    counters: ctx.counters.clone(),
+                                    policy_summary: Default::default(),
+                                },
+                                answer,
+                            ));
+                        }
+                        let mut ops = Vec::new();
+                        let mut tags = Vec::new();
+                        // Only THALAMUS's Claude Code answer hooks may add automatic
+                        // tags, and only when MC owns compaction to resolve them later.
+                        // The gateway freezes a plan with MC as its single step provider;
+                        // composition is opaque and exposes no step-provider selector.
+                        if ctx.counters["auto_tag"] == true && native_lane && reduction_owner {
+                            for (hook_index, native_index) in targets.iter().enumerate() {
+                                let Some(native_index) = native_index else {
+                                    continue;
+                                };
+                                // Reservations use native content coordinates; hook ops
+                                // index only the text blocks offered by the gateway.
+                                let block_id = ck_wire::block_id(mid, *native_index);
+                                let Some(target) =
+                                    projection.blocks.iter().find(|b| b.id == block_id)
+                                else {
+                                    continue;
+                                };
+                                let Some((kind, source)) = transform::taggable_source(target)
+                                else {
+                                    continue;
+                                };
+                                let Some(number) = ctx
+                                    .parts
+                                    .iter()
+                                    .find(|p| p.block_id == block_id)
+                                    .and_then(|p| p.tag_number)
+                                else {
+                                    continue;
+                                };
+                                ops.push(Operation::Prepend {
+                                    block: hook_index as u32,
+                                    text: transform::tag_prefix(number),
+                                    note: None,
+                                });
+                                tags.push(ProviderAnswerTag {
+                                    number,
+                                    block_id,
+                                    kind: kind.as_store_kind().into(),
+                                    token_count: mc_tokenizer::estimate_tokens(&source) as i64,
+                                    source: source.into_owned(),
+                                    created_at_ms: now_ms(),
+                                });
+                            }
+                        }
+                        let ops_json = serde_json::to_string(&ops).map_err(|e| {
+                            mc_store::provider_records::ProviderError::Transient(e.to_string())
+                        })?;
                         let answer = if ops.is_empty() {
                             HookAnswer::Pass
                         } else {
                             HookAnswer::Ops { ops }
                         };
-                        return Ok((
+                        Ok((
                             ProviderHookWrite {
-                                answer: (held.state == "pending"
-                                    && held.lineage_id == lineage.lineage_id)
-                                    .then(|| held.answer.clone()),
+                                answer: Some(ProviderHookAnswer {
+                                    subject: subject.clone(),
+                                    ordinal,
+                                    ops_json,
+                                    tags,
+                                }),
                                 counters: ctx.counters.clone(),
                                 policy_summary: Default::default(),
                             },
                             answer,
-                        ));
-                    }
-                    let mut ops = Vec::new();
-                    let mut tags = Vec::new();
-                    // Only THALAMUS's Claude Code answer hooks may add automatic
-                    // tags, and only when MC owns compaction to resolve them later.
-                    // The gateway freezes a plan with MC as its single step provider;
-                    // composition is opaque and exposes no step-provider selector.
-                    if ctx.counters["auto_tag"] == true && native_lane && reduction_owner {
-                        for (hook_index, native_index) in targets.iter().enumerate() {
-                            let Some(native_index) = native_index else {
-                                continue;
-                            };
-                            // Reservations use native content coordinates; hook ops
-                            // index only the text blocks offered by the gateway.
-                            let block_id = ck_wire::block_id(mid, *native_index);
-                            let Some(target) = projection.blocks.iter().find(|b| b.id == block_id)
-                            else {
-                                continue;
-                            };
-                            let Some((kind, source)) = transform::taggable_source(target) else {
-                                continue;
-                            };
-                            let Some(number) = ctx
-                                .parts
-                                .iter()
-                                .find(|p| p.block_id == block_id)
-                                .and_then(|p| p.tag_number)
-                            else {
-                                continue;
-                            };
-                            ops.push(Operation::Prepend {
-                                block: hook_index as u32,
-                                text: transform::tag_prefix(number),
-                                note: None,
-                            });
-                            tags.push(ProviderAnswerTag {
-                                number,
-                                block_id,
-                                kind: kind.as_store_kind().into(),
-                                token_count: mc_tokenizer::estimate_tokens(&source) as i64,
-                                source: source.into_owned(),
-                                created_at_ms: now_ms(),
-                            });
-                        }
-                    }
-                    let ops_json = serde_json::to_string(&ops).map_err(|e| {
-                        mc_store::provider_records::ProviderError::Transient(e.to_string())
-                    })?;
-                    let answer = if ops.is_empty() {
-                        HookAnswer::Pass
-                    } else {
-                        HookAnswer::Ops { ops }
-                    };
-                    Ok((
-                        ProviderHookWrite {
-                            answer: Some(ProviderHookAnswer {
-                                subject: subject.clone(),
-                                ordinal,
-                                ops_json,
-                                tags,
-                            }),
-                            counters: ctx.counters.clone(),
-                            policy_summary: Default::default(),
-                        },
-                        answer,
-                    ))
-                },
-            )
-            .map_err(provider_policy_error)?;
-        bytes(&answer)
+                        ))
+                    },
+                )
+                .map_err(provider_policy_error)?;
+            bytes(&answer)
+        })();
+        drop(_route);
+        if result.is_err() {
+            // The bound connection or native generation may have changed after
+            // the hook ran. Recheck that identity before recording its failure,
+            // without replacing the error returned to the caller.
+            if let Ok(_route) = self.native_publication_fence(&binding, &route) {
+                let _ = store.record_provider_hook_failure(&key.store_key(), &subject);
+            }
+        }
+        result
     }
 
     pub(crate) fn host_provider_conversation(
@@ -2745,6 +2883,364 @@ mod admission_hook_tests {
         assert_eq!(
             run(h, hook(raw, "call", 0, "post_assistant", &[])).await,
             HookAnswer::Pass
+        );
+    }
+
+    fn pending(h: &McHandler) -> Value {
+        response(h.handle_session_status_value(7, &json!({"v":1,"session_id":"cc"})))["cc_pending"]
+            .clone()
+    }
+
+    fn counters(h: &McHandler, key: &Key) -> Value {
+        serde_json::from_str(
+            &h.store
+                .get()
+                .unwrap()
+                .load_provider_conversation(&key.store_key())
+                .unwrap()
+                .unwrap()
+                .hook_counters_json,
+        )
+        .unwrap()
+    }
+
+    fn hold(h: &McHandler, key: &Key, lineage: &ProviderLineage, raws: &[(&str, u64, &str)]) {
+        let messages = raws
+            .iter()
+            .map(|(mid, ordinal, raw)| ProviderMessage {
+                mid: (*mid).into(),
+                ordinal: *ordinal,
+                message_bytes: serde_json::to_vec(
+                    &super::super::codec_claude_code::from_wire(
+                        &serde_json::from_str::<Value>(raw).unwrap(),
+                        Some(raw),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            })
+            .collect::<Vec<_>>();
+        h.store
+            .get()
+            .unwrap()
+            .commit_provider_status(&key.store_key(), lineage, &messages, None, &[])
+            .unwrap();
+    }
+
+    fn root() -> ProviderLineage {
+        ProviderLineage {
+            lineage_id: "L".into(),
+            first_ordinal: 0,
+            descends_from: None,
+            through_ordinal: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cc_pending_reason_freshness_counts_unanswered_bootstrap_parts() {
+        let (_dir, h, key) = fixture(true, None).await;
+        setup(&h).await;
+        response(call(&h, "compaction.step", step(r#"{"role":"user","content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}"#)).await);
+        assert_eq!(
+            pending(&h),
+            json!({"count":2,"reasons":{"freshness_unproven":2}})
+        );
+        assert_eq!(counters(&h, &key)["pending_logged"], true);
+    }
+
+    #[tokio::test]
+    async fn cc_pending_reason_mixed_text_excludes_covered_results() {
+        let (_dir, h, key) = fixture(true, None).await;
+        pair_call(&h).await;
+        let raw = r#"{"role":"user","content":[{"type":"text","text":"mixed"},{"type":"tool_result","tool_use_id":"call-a","content":"result"}]}"#;
+        assert_eq!(
+            run(&h, hook(raw, "u", 1, "pre_user", &["mixed"])).await,
+            HookAnswer::Pass
+        );
+        run(&h, hook(raw, "u", 1, "post_tool", &["result"])).await;
+        h.store
+            .get()
+            .unwrap()
+            .record_provider_hook_failure(
+                &key.store_key(),
+                &ProviderSubject {
+                    subject_mid: "u".into(),
+                    hook: "pre_user".into(),
+                    subject_part: "".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            pending(&h),
+            json!({"count":1,"reasons":{"mixed_user_text":1}})
+        );
+    }
+
+    #[tokio::test]
+    async fn cc_pending_reason_signed_hold_precedes_failed_subject() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let raw = r#"{"role":"assistant","content":[{"type":"text","text":"held"},{"type":"redacted_thinking","data":"signed"},{"type":"text","text":"tagged"}]}"#;
+        run(&h, hook(raw, "a", 0, "post_assistant", &["held", "tagged"])).await;
+        h.store
+            .get()
+            .unwrap()
+            .record_provider_hook_failure(
+                &key.store_key(),
+                &ProviderSubject {
+                    subject_mid: "a".into(),
+                    hook: "post_assistant".into(),
+                    subject_part: "".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            pending(&h),
+            json!({"count":1,"reasons":{"signed_prefix_hold":1}})
+        );
+    }
+
+    #[tokio::test]
+    async fn cc_pending_failure_fence_records_only_counters_and_preserves_error() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let raw = r#"{"role":"user","content":"original"}"#;
+        hold(&h, &key, &root(), &[("u", 0, raw)]);
+        let store = h.store.get().unwrap();
+        let before = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        let outcome = call(
+            &h,
+            "transform.hook",
+            hook(
+                r#"{"role":"user","content":"changed"}"#,
+                "u",
+                0,
+                "pre_user",
+                &["changed"],
+            ),
+        )
+        .await;
+        assert_eq!(
+            format!("{outcome:?}"),
+            format!(
+                "{:?}",
+                invalid_field("message", "provider subject changed its admitted bytes")
+            )
+        );
+        let after = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.lineage_id, before.lineage_id);
+        assert_eq!(after.cursor_frontier, before.cursor_frontier);
+        assert_eq!(after.served_through_ordinal, before.served_through_ordinal);
+        assert_eq!(counters(&h, &key)["reserved_tag_high_water"], 40);
+        assert!(answers(&h, &key).is_empty());
+        assert_eq!(
+            counters(&h, &key)["failed_subjects"],
+            json!([{"subject_mid":"u","hook":"pre_user","subject_part":""}])
+        );
+        assert_eq!(pending(&h), json!({"count":1,"reasons":{"hook_failed":1}}));
+        run(&h, hook(raw, "u", 0, "pre_user", &["original"])).await;
+        assert_eq!(counters(&h, &key)["failed_subjects"], json!([]));
+        assert_eq!(pending(&h), json!({"count":0,"reasons":{}}));
+    }
+
+    #[tokio::test]
+    async fn cc_pending_failure_fence_rebind_before_publication_leaves_counters_unchanged() {
+        let (dir, h, key) = fixture(true, None).await;
+        let before = counters(&h, &key);
+        let serial = h.provider_serial.lock_for(&key).await;
+        let params = hook(
+            r#"{"role":"user","content":"hello"}"#,
+            "u",
+            0,
+            "pre_user",
+            &["hello"],
+        );
+        let wire: hooks::hook::HookCall = decode(&params).unwrap();
+        let mut call = Box::pin(h.provider_claude_code_hook(
+            h.facade_binding(7).unwrap(),
+            key.clone(),
+            &wire,
+            &params,
+        ));
+        tokio::select! {
+            biased;
+            outcome = &mut call => panic!("hook did not wait for provider serial: {outcome:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        h.bind_route(
+            7,
+            super::super::claude_code_tests::binding(dir.path(), thalamus()),
+        );
+        drop(serial);
+        let outcome = call.await.unwrap_err();
+        assert!(
+            format!("{outcome:?}").contains("native_route_stale"),
+            "{outcome:?}"
+        );
+        assert_eq!(counters(&h, &key), before);
+    }
+
+    #[tokio::test]
+    async fn cc_pending_exclusions_do_not_count_intrinsic_shapes() {
+        let (_dir, h, key) = fixture(true, None).await;
+        hold(
+            &h,
+            &key,
+            &root(),
+            &[
+                ("s", 0, r#"{"role":"system","content":"guidance"}"#),
+                (
+                    "a",
+                    1,
+                    r#"{"role":"assistant","content":[{"type":"thinking","thinking":"reason","signature":"s"},{"type":"redacted_thinking","data":"x"},{"type":"tool_use","id":"t","name":"Read","input":{}},{"type":"text","text":"  "}]}"#,
+                ),
+                (
+                    "u",
+                    2,
+                    r#"{"role":"user","content":[{"type":"image","source":{}},{"type":"tool_result","tool_use_id":"t","content":[{"type":"future","text":"not text"}]},{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{}}]}]}"#,
+                ),
+            ],
+        );
+        assert_eq!(pending(&h), json!({"count":0,"reasons":{}}));
+        assert!(counters(&h, &key).get("pending_logged").is_none());
+    }
+
+    #[tokio::test]
+    async fn cc_pending_log_line_is_once_across_events_and_restart() {
+        #[derive(Clone)]
+        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (dir, h, key) = fixture(true, None).await;
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Writer(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            hold(
+                &h,
+                &key,
+                &root(),
+                &[("u", 0, r#"{"role":"user","content":"first"}"#)],
+            );
+            assert_eq!(pending(&h)["count"], 1);
+            hold(
+                &h,
+                &key,
+                &root(),
+                &[("v", 1, r#"{"role":"user","content":"second"}"#)],
+            );
+            assert_eq!(pending(&h)["count"], 2);
+            assert_eq!(pending(&h)["count"], 2);
+            assert_eq!(counters(&h, &key)["pending_logged"], true);
+            drop(h);
+            let restarted = handler(dir.path(), thalamus());
+            assert_eq!(pending(&restarted)["count"], 2);
+        });
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches("mc-module: cc_pending").count(), 1, "{log}");
+    }
+
+    #[tokio::test]
+    async fn cc_pending_lineage_and_native_generation_do_not_leak_abandoned_parts() {
+        let (_dir, h, key) = fixture(true, None).await;
+        hold(
+            &h,
+            &key,
+            &root(),
+            &[("prefix", 0, r#"{"role":"user","content":"prefix"}"#)],
+        );
+        let first = pending(&h);
+        hold(
+            &h,
+            &key,
+            &root(),
+            &[(
+                "abandoned",
+                1,
+                r#"{"role":"assistant","content":[{"type":"text","text":"held"},{"type":"thinking","thinking":"signed","signature":"s"}]}"#,
+            )],
+        );
+        let child = ProviderLineage {
+            lineage_id: "B".into(),
+            first_ordinal: 1,
+            descends_from: Some("L".into()),
+            through_ordinal: Some(0),
+        };
+        hold(&h, &key, &child, &[]);
+        assert_eq!(pending(&h), first);
+        let mut foreign = key.store_key();
+        foreign.generation.as_mut().unwrap().profile = "other-native-generation".into();
+        let mut conversation = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        conversation.lineage_id.clear();
+        conversation.hook_counters_json = "{}".into();
+        let mut pins: Value =
+            serde_json::from_str(conversation.native_pins_json.as_deref().unwrap()).unwrap();
+        pins["profile_generation"] = json!("other-native-generation");
+        conversation.native_pins_json = Some(pins.to_string());
+        h.store
+            .get()
+            .unwrap()
+            .save_provider_conversation(&foreign, &conversation)
+            .unwrap();
+        h.store
+            .get()
+            .unwrap()
+            .commit_provider_status(
+                &foreign,
+                &root(),
+                &[ProviderMessage {
+                    mid: "foreign".into(),
+                    ordinal: 0,
+                    message_bytes: serde_json::to_vec(
+                        &super::super::codec_claude_code::from_wire(
+                            &json!({"role":"user","content":"foreign"}),
+                            Some(r#"{"role":"user","content":"foreign"}"#),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                }],
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(pending(&h), first);
+        assert_eq!(counters(&h, &key)["pending_logged"], true);
+        assert_eq!(
+            h.claude_code_pending_status(&super::super::claude_code_tests::binding(
+                std::path::Path::new("/unrelated"),
+                thalamus()
+            ))
+            .unwrap(),
+            Value::Null
+        );
+        let mut unattested = h.facade_binding(7).unwrap();
+        unattested.principal = None;
+        assert_eq!(
+            h.claude_code_pending_status(&unattested).unwrap(),
+            Value::Null
         );
     }
 
