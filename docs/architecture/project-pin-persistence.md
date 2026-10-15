@@ -50,12 +50,29 @@ pin. The cases in `test-vectors/project-identity-parity.json` verify precedence 
 existing sidecars, not survival of an unpersisted choice across crashes. Callers
 requiring cross-restart stability must not treat enqueueing as durability.
 
-## TypeScript hot path (unchanged)
+## TypeScript pin persistence
 
-The plugin has the same synchronous pin-write concern: `session.created` awaits
-the identity decision in `packages/plugin/src/hooks/magic-context/event-handler.ts:350`.
-`memory/session-identity-decision.ts:123` calls `rememberResolvedProjectIdentity`,
-and `memory/project-identity-cache.ts:90` calls `writeStorageFileAtomicSync`.
-These `memory/` paths are under `packages/plugin/src/features/magic-context/`.
-`packages/plugin/src/v2/hooks/context.ts:977` also awaits this decision when
-preparing resumed sessions. This change does not alter the TypeScript path.
+OpenCode, OpenCode 2 and Pi publish accepted pins to the process's identity cache
+before completing a session-start decision. Exact-directory and common-Git-directory
+reads consult this overlay before disk, including after failed or overflowed writes.
+The first accepted identity wins; coalescing persistence never authorizes changing it.
+
+`memory/project-pin-writer.ts` (under `packages/plugin/src/features/magic-context/`)
+keeps at most 256 queued destinations and one active write. Repeated publications
+for a destination coalesce. The separate identity cache can retain more folders
+than the queue limit. Overflow and write failure retain the in-memory pin;
+the next exact-directory decision/read retries enqueueing, without a busy retry loop.
+Standalone legacy git-sidecar writes are unchanged.
+
+One lazy `worker_threads` worker serializes and calls the unchanged
+`writeStorageFileAtomicSync` with the permission policy captured by the host. The
+atomic helper still creates a private sibling and renames it; unlike Rust's helper,
+it does not fsync. The worker is emitted beside the built plugin in OpenCode v1/v2
+and Pi/OMP packages. Worker failure never falls back to writing on the host thread;
+the next queued attempt starts a fresh worker.
+
+On natural process exit, `beforeExit` stops admission and allows a best-effort drain
+of at most 250 ms. The idle worker is unreferenced and does not keep the host alive.
+An explicit `process.exit`, signal termination or crash can bypass the drain.
+The crash and restart semantics above also apply to these best-effort TypeScript pins:
+session decisions and host rows do not wait for durability.

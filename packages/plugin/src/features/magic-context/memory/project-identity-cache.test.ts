@@ -14,6 +14,11 @@ import {
     rememberGitIdentity,
     rememberPinnedProjectIdentity,
 } from "./project-identity-cache";
+import {
+    __setProjectPinWriterForTests,
+    flushProjectPinWrites,
+    ProjectPinWriter,
+} from "./project-pin-writer";
 
 let storageDir: string;
 let testRoot: string;
@@ -28,7 +33,8 @@ beforeEach(() => {
     process.env.XDG_DATA_HOME = testRoot;
 });
 
-afterEach(() => {
+afterEach(async () => {
+    await __setProjectPinWriterForTests();
     if (originalTestDataDir === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
     else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = originalTestDataDir;
     if (originalDataHome === undefined) delete process.env.XDG_DATA_HOME;
@@ -121,10 +127,12 @@ describe("project identity sidecars", () => {
         expect(fs.readFileSync(file, "utf8")).toBe(before);
     });
 
-    test("a live pin replaces a legacy git record but never another pin", () => {
+    test("a live pin replaces a legacy git record but never another pin", async () => {
         const directory = join(storageDir, "project");
         const file = writeRecord(directory, "git:abc1234");
         rememberPinnedProjectIdentity(directory, "pj-A", "/metadata/repo.git");
+        expect(readRememberedProjectIdentity(directory)?.identity).toBe("pj-A");
+        expect(await flushProjectPinWrites(2_000)).toBe(true);
         expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({
             directory: projectDirectoryKey(directory),
             identity: "pj-A",
@@ -132,7 +140,32 @@ describe("project identity sidecars", () => {
         });
         const before = fs.readFileSync(file, "utf8");
         rememberPinnedProjectIdentity(directory, "pj-B", "/metadata/other.git");
+        expect(await flushProjectPinWrites(2_000)).toBe(true);
         expect(fs.readFileSync(file, "utf8")).toBe(before);
+    });
+
+    test("pending and completed process pins override stale disk records in exact and common-dir reads", async () => {
+        let finish!: () => void;
+        const writer = new ProjectPinWriter(
+            () =>
+                new Promise<void>((resolve) => {
+                    finish = resolve;
+                }),
+        );
+        await __setProjectPinWriterForTests(writer);
+        const directory = join(storageDir, "project");
+        writeRecord(directory, "git:abc1234", "/metadata/repo.git");
+        rememberPinnedProjectIdentity(directory, "pj-A", "/metadata/repo.git");
+        expect(readRememberedProjectIdentity(directory)?.identity).toBe("pj-A");
+        expect(findPinnedIdentityByGitCommonDir("/metadata/repo.git")).toBe("pj-A");
+        await Promise.resolve();
+        await Promise.resolve();
+        finish();
+        expect(await writer.flush(100)).toBe(true);
+        writeRecord(directory, "pj-STALE", "/metadata/repo.git");
+        rememberGitIdentity(directory, "git:fffffff");
+        expect(readRememberedProjectIdentity(directory)?.identity).toBe("pj-A");
+        expect(findPinnedIdentityByGitCommonDir("/metadata/repo.git")).toBe("pj-A");
     });
 
     test("neither sidecar writer persists an implicit id or an invalid identity", () => {

@@ -19,6 +19,10 @@ type KnownSlot = {
  * a negative cache cannot quietly become permanent.
  */
 const KNOWN_SLOTS: Record<string, KnownSlot> = {
+    "packages/plugin/src/features/magic-context/memory/project-pin-writer.ts:exitRegistered": {
+        classification: "PUBLICATION",
+        reason: "Records installation of the process-exit pin-writer drain, not a persistence outcome; failed and overflowed writes remain retryable.",
+    },
     "packages/pi-plugin/src/index.ts:databaseExitHookRegistered": {
         classification: "PUBLICATION",
         reason: "Correct: records that the one process-exit handler closing the shared database is installed, so /reload doesn't register a second one; it holds no failure or absence verdict.",

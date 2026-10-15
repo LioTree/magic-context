@@ -119,7 +119,7 @@ async function decide(
             return { directory, identity: fallback };
         }
         rememberResolvedProjectIdentity(directory, answer, options.allowHomeProject);
-        return { directory, identity: answer.projectId };
+        return { directory, identity: pin(directory) ?? answer.projectId };
     }
     return {
         directory,

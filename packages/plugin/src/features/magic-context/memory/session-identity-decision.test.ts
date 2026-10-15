@@ -41,6 +41,11 @@ import {
     rememberPinnedProjectIdentity,
 } from "./project-identity-cache";
 import {
+    __setProjectPinWriterForTests,
+    flushProjectPinWrites,
+    ProjectPinWriter,
+} from "./project-pin-writer";
+import {
     __resetSessionIdentityDecisionsForTests,
     awaitSessionIdentityDecision,
     readSessionIdentityDecision,
@@ -86,6 +91,7 @@ beforeEach(() => {
 
 afterEach(async () => {
     closeDatabase();
+    await __setProjectPinWriterForTests();
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
     __resetSessionIdentityDecisionsForTests();
     __resetProjectIdentityForTests();
@@ -270,6 +276,57 @@ function sidecars(): string[] {
 }
 
 describe("session identity decisions", () => {
+    test("session start does not await slow pin persistence", async () => {
+        const directory = folder("slow-pin");
+        const fake = await fakeEndpoint(directory);
+        let release!: () => void;
+        const pending = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        let writes = 0;
+        const writer = new ProjectPinWriter(async () => {
+            writes++;
+            await pending;
+        });
+        await __setProjectPinWriterForTests(writer);
+        const db = hostDatabase();
+        const handler = createEventHandler({
+            ...hostDeps(db, "slow-start", directory, fake.connectionFile),
+            config: { cache_ttl: "5m" },
+            compactionHandler: { onCompacted: () => {} },
+        });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            const decision = await Promise.race([
+                handler({
+                    event: {
+                        type: "session.created",
+                        properties: { info: { id: "slow-start", parentID: "", directory } },
+                    },
+                }).then(() => readSessionIdentityDecision("slow-start", directory)),
+                new Promise<"timed out">((resolve) => {
+                    timer = setTimeout(() => resolve("timed out"), 250);
+                }),
+            ]);
+            expect(decision).toEqual({ directory, identity: registeredProjectId });
+            expect(row(db, "slow-start")).toBe(registeredProjectId);
+            expect(writes).toBe(1);
+            expect(readRememberedProjectIdentity(directory)?.identity).toBe(registeredProjectId);
+            expect((await awaitSessionIdentityDecision("another-start", directory)).identity).toBe(
+                registeredProjectId,
+            );
+            expect(fake.calls).toHaveLength(1);
+            expect(sidecars()).toHaveLength(1);
+            expect(
+                JSON.parse(readFileSync(join(storage, "project-identities", sidecars()[0]), "utf8"))
+                    .identity,
+            ).toBe(`git:${"a".repeat(40)}`);
+        } finally {
+            clearTimeout(timer);
+            release();
+            await writer.flush(100);
+        }
+    });
     test("shares one promise and honours a configured non-default connection file", async () => {
         const directory = folder("project");
         const fake = await fakeEndpoint(directory);
@@ -308,6 +365,7 @@ describe("session identity decisions", () => {
     ])("pin is total against %s and never probes git", async (answer) => {
         const directory = folder("pinned");
         rememberPinnedProjectIdentity(directory, "pj-PIN");
+        await flushProjectPinWrites(2_000);
         const fake = await fakeEndpoint(directory);
         fake.reply.result.projectId = answer === "implicit" ? "pj-implicit1-fake" : answer;
         if (answer === "implicit") fake.reply.result.via = "implicit";
@@ -550,6 +608,7 @@ describe("offline registered identity continuity", () => {
         writeFileSync(join(gitdir, "commondir"), "../..\n");
         writeFileSync(join(linked, ".git"), `gitdir: ${gitdir}\n`);
         rememberPinnedProjectIdentity(root, "pj-ROOT", join(root, ".git"));
+        await flushProjectPinWrites(2_000);
         const before = sidecars().map((file) =>
             readFileSync(join(storage, "project-identities", file), "utf8"),
         );
@@ -575,6 +634,7 @@ describe("offline registered identity continuity", () => {
     test("a re-clone keeps its pin while offline and a never-pinned subfolder leaves the root pin intact", async () => {
         const root = folder("reclone");
         rememberPinnedProjectIdentity(root, "pj-RECLONE", join(root, ".git"));
+        await flushProjectPinWrites(2_000);
         const fake = await fakeEndpoint(root);
         fake.up = false;
         const file = join(storage, "project-identities", sidecars()[0]);
@@ -797,6 +857,7 @@ describe("local access before registered identity", () => {
             const fallback = resolveProjectIdentityForSession(directory);
             expect(fallback).toStartWith("dir:");
             rememberPinnedProjectIdentity(directory, "pj-UNREADABLE");
+            await flushProjectPinWrites(2_000);
             const file = join(storage, "project-identities", sidecars()[0]);
             const bytes = readFileSync(file, "utf8");
             __clearProjectIdentityResolutionCacheForTests();
