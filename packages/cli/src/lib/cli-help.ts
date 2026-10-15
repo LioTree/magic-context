@@ -68,6 +68,7 @@ export const DOCTOR_HELP = [
     "    migrate                     Migrate an OpenCode session to Pi or OMP JSONL",
     "    migrate-session             Re-home an OpenCode session to another directory",
     "    merge-identities            Preview or explicitly merge split identities",
+    "    project-ids plan            Plan registered project identity cutover online",
     "    repair-db                   Back up and salvage a corrupted shared database",
     "    git-fts-map                 Diagnose git FTS inventory; --repair backs up both stores offline",
     "    list-hidden-sessions        List Magic Context OpenCode 2 roots",
@@ -115,6 +116,18 @@ export const LIST_HIDDEN_SESSIONS_HELP = [
     "",
 ].join("\n");
 
+export const PROJECT_IDS_HELP = [
+    "",
+    "  Usage: magic-context doctor project-ids plan [--db <path>] [--host-db <path>]",
+    "",
+    "  Resolve recorded folders through Entorhinal without changing the database or pins.",
+    "  Hosts may remain running. Writes only <storageDir>/project-id-plan-<ISO>.json.",
+    "",
+    "  --db <path>         Use this context.db instead of the shared one",
+    "  --host-db <path>    Read session directories from this host database (read-only)",
+    "",
+].join("\n");
+
 /**
  * The help text for `argv` when it asks for help, or null when it does not or
  * when the named subcommand prints its own help.
@@ -128,6 +141,7 @@ export function subcommandHelp(argv: readonly string[]): string | null {
     if (subcommand === "store")
         return "Usage: magic-context doctor store init\n\nCreate context.db at the current schema fence. Existing stores are reported without changes.\nHonours XDG_DATA_HOME and MAGIC_CONTEXT_STORAGE_DIR; no harness is required.";
     if (subcommand === "single-store") return SINGLE_STORE_HELP;
+    if (subcommand === "project-ids") return PROJECT_IDS_HELP;
     if (subcommand === "merge-identity" || subcommand === "merge-identities")
         return MERGE_IDENTITY_HELP;
     if (subcommand === "list-hidden-sessions") return LIST_HIDDEN_SESSIONS_HELP;

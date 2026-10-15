@@ -165,6 +165,10 @@ async function runCommand(command: string | undefined, rest: string[]): Promise<
             const { runMergeIdentityCli } = await import("./commands/doctor-merge-identity");
             return runMergeIdentityCli(rest.slice(1));
         }
+        if (rest[0] === "project-ids") {
+            const { runProjectIdsCli } = await import("./commands/doctor-project-ids");
+            return runProjectIdsCli(rest.slice(1));
+        }
         if (rest[0] === "repair-db") {
             const { runRepairDbCli } = await import("./commands/doctor-repair-db");
             return runRepairDbCli(rest.slice(1));
