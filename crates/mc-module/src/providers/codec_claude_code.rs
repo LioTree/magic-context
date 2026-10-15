@@ -722,15 +722,76 @@ pub(super) fn encode_view(
     request: &TransformRequest,
     covered: Option<u64>,
 ) -> Result<(compact::answer::CompactionMessage, Vec<String>), HandlerOutcome> {
+    encode_view_with_baseline(view, request, covered, &BTreeMap::new())
+}
+
+/// Overlay only answer-owned parts, never tag-looking text authored by the model.
+/// Keep the original messages and their provenance unchanged for identity checks.
+pub(super) fn admission_served_bytes(
+    mut raw: String,
+    message: &CkWireMessage,
+    tags: &BTreeMap<String, u64>,
+) -> Result<String, HandlerOutcome> {
+    if tags.is_empty() {
+        return Ok(raw);
+    }
+    let Some(extras) = message.provider_extras.get(EXTRAS) else {
+        return Ok(raw);
+    };
+    let Some(mid) = extras.get("mid").and_then(Value::as_str) else {
+        return Ok(raw);
+    };
+    let original = parse_unique_json(
+        extras["raw_message"]
+            .as_str()
+            .ok_or_else(|| invalid_raw("admission baseline requires original native bytes"))?,
+    )?;
+    let indices = match original["content"].as_array() {
+        Some(blocks) => blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                !strips_signed_turn(message)
+                    || !matches!(
+                        block["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
+        None => vec![0],
+    };
+    // Removing thinking blocks changes rendered positions. Look up each tag by
+    // its reserved original native content index, not its new rendered position.
+    for (position, index) in indices.into_iter().enumerate() {
+        if let Some(number) = tags.get(&ck_wire::block_id(mid, index)) {
+            raw = splice_admission_tag(&raw, position, *number)?;
+        }
+    }
+    Ok(raw)
+}
+
+pub(super) fn encode_view_with_baseline(
+    view: &transform::compaction::View,
+    request: &TransformRequest,
+    covered: Option<u64>,
+    tags: &BTreeMap<String, u64>,
+) -> Result<(compact::answer::CompactionMessage, Vec<String>), HandlerOutcome> {
     let raw = view
         .replacement
         .iter()
-        .map(render)
+        .map(|message| admission_served_bytes(render(message)?, message, tags))
         .collect::<Result<Vec<_>, _>>()?;
     let original = request
         .messages
         .iter()
         .map(|m| render(&m.ck))
+        .collect::<Result<Vec<_>, _>>()?;
+    let served = request
+        .messages
+        .iter()
+        .zip(&original)
+        .map(|(entry, raw)| admission_served_bytes(raw.clone(), &entry.ck, tags))
         .collect::<Result<Vec<_>, _>>()?;
     let identity = |message: &CkWireMessage| {
         message.provider_extras.get(EXTRAS).and_then(|extras| {
@@ -778,7 +839,8 @@ pub(super) fn encode_view(
         }
     }
     // The prefix of every surviving signed block must remain identical, even
-    // across a later real user turn. Compare native bytes, not normalized text.
+    // across a later real user turn. Signatures bind the served tag prefixes too;
+    // the separate gateway identity check binds the original native bytes.
     for (index, entry) in request.messages.iter().enumerate() {
         if signed_prefix(&original[index]).is_none() {
             continue;
@@ -802,8 +864,8 @@ pub(super) fn encode_view(
                 continue;
             }
             if !same_identity_prefix(&input_ids, &output_ids, index, position)
-                || raw[..position] != original[..index]
-                || signed_prefix(&raw[position]) != signed_prefix(&original[index])
+                || raw[..position] != served[..index]
+                || signed_prefix(&raw[position]) != signed_prefix(&served[index])
             {
                 return Err(error(
                     "signed_prefix_edit",
@@ -1339,6 +1401,105 @@ mod tests {
         output.replacement.remove(1);
         assert!(encode_view(&output, &request, None).is_err());
     }
+
+    fn served_baseline_fixture() -> (TransformRequest, BTreeMap<String, u64>) {
+        let request = request(&[
+            entry(
+                r#"{ "role":"user", "content":[{"type":"text","text":"a\u0062"},{"type":"text","text":"§8§ authored"}] }"#,
+                0,
+            ),
+            entry(
+                r#"{"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"sig"},{"type":"text","text":"tail"}]}"#,
+                1,
+            ),
+        ]);
+        let tags = BTreeMap::from([
+            ("cc-0#0".into(), 7),
+            ("cc-0#1".into(), 8),
+            ("cc-1#1".into(), 9),
+        ]);
+        (request, tags)
+    }
+
+    #[test]
+    fn served_baseline_accepts_tags_before_signed_thinking_and_carries_exact_raw() {
+        let (request, tags) = served_baseline_fixture();
+        let (wire, raw) =
+            encode_view_with_baseline(&view(&request), &request, None, &tags).unwrap();
+        assert_eq!(
+            raw[0],
+            r#"{ "role":"user", "content":[{"type":"text","text":"§7§ a\u0062"},{"type":"text","text":"§8§ §8§ authored"}] }"#
+        );
+        assert_eq!(
+            raw[1],
+            r#"{"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"sig"},{"type":"text","text":"§9§ tail"}]}"#
+        );
+        let bytes = answer_bytes(&json!({"compaction":wire}), &raw).unwrap();
+        assert!(String::from_utf8(bytes).unwrap().contains(&raw.join(",")));
+        assert_eq!(
+            render(&request.messages[0].ck).unwrap(),
+            r#"{ "role":"user", "content":[{"type":"text","text":"a\u0062"},{"type":"text","text":"§8§ authored"}] }"#
+        );
+    }
+
+    #[test]
+    fn served_baseline_rejects_one_byte_edit_before_signed_thinking() {
+        let (request, tags) = served_baseline_fixture();
+        let mut output = view(&request);
+        output.replacement[0].content[0].kind = CkKind::Text { text: "ac".into() };
+        assert!(matches!(
+            encode_view_with_baseline(&output, &request, None, &tags),
+            Err(HandlerOutcome::Error { code, .. }) if code == "signed_prefix_edit"
+        ));
+    }
+
+    #[test]
+    fn served_baseline_identity_still_requires_original_provenance() {
+        let (request, tags) = served_baseline_fixture();
+        let mut output = view(&request);
+        let served = r#"{ "role":"user", "content":[{"type":"text","text":"§7§ a\u0062"},{"type":"text","text":"§8§ §8§ authored"}] }"#;
+        output.replacement[0]
+            .provider_extras
+            .get_mut(EXTRAS)
+            .unwrap()
+            .insert("raw_message".into(), json!(served));
+        assert!(matches!(
+            encode_view_with_baseline(&output, &request, None, &tags),
+            Err(HandlerOutcome::Error { code, message }) if code == "signed_prefix_edit"
+                && message == "native replacement changed or duplicated its gateway identity"
+        ));
+    }
+
+    #[test]
+    fn served_baseline_thinking_strip_keeps_original_tag_coordinates() {
+        let (request, tags) = served_baseline_fixture();
+        let mut output = view(&request);
+        output.replacement[1].content.remove(0);
+        output.replacement[1]
+            .provider_extras
+            .get_mut(EXTRAS)
+            .unwrap()
+            .insert("strip_signed_turn".into(), json!(true));
+        let (_, raw) = encode_view_with_baseline(&output, &request, Some(1), &tags).unwrap();
+        assert_eq!(
+            raw[1],
+            r#"{"role":"assistant","content":[{"type":"text","text":"§9§ tail"}]}"#
+        );
+    }
+    #[test]
+    fn served_baseline_array_result_prefixes_only_the_answer_owned_native_part() {
+        let request = request(&[entry(
+            r#"{ "role":"user", "content":[{"type":"text","text":"untagged"},{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{}},{"type":"text","text":"a\u0062"},{"type":"text","text":"tail"}]}] }"#,
+            0,
+        )]);
+        let tags = BTreeMap::from([("cc-0#1".into(), 4)]);
+        let (_, raw) = encode_view_with_baseline(&view(&request), &request, None, &tags).unwrap();
+        assert_eq!(
+            raw[0],
+            r#"{ "role":"user", "content":[{"type":"text","text":"untagged"},{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{}},{"type":"text","text":"§4§ a\u0062"},{"type":"text","text":"tail"}]}] }"#
+        );
+    }
+
     #[test]
     fn complete_signed_tool_run_can_be_covered_but_split_or_tail_removal_refuses() {
         let request = request(&[

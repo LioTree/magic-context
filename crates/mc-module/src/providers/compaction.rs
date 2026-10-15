@@ -389,17 +389,13 @@ fn non_tag_messages(
             continue;
         };
         let message = &mut messages[position];
-        let mut ops: Vec<hooks::answer::Operation> =
-            serde_json::from_str(&answer.ops_json).map_err(transient)?;
         if message.message.get("raw_message").is_some() {
-            // Claude Code hooks currently record unchanged messages. They do not
-            // authorize tool reductions or delivery notices, and OpenCode's part
-            // operations cannot be applied to Anthropic content blocks.
-            if !ops.is_empty() {
-                return Err(invalid_field("message"));
-            }
+            // Keep the original native message for source matching. Replay tag
+            // operations with the raw splicer only when encoding a replacement.
             continue;
         }
+        let mut ops: Vec<hooks::answer::Operation> =
+            serde_json::from_str(&answer.ops_json).map_err(transient)?;
         // The host record keeps its earlier hook answer unchanged when a step
         // does not replace history. Remove Channel 1 Appends from live post_tool
         // answers before engine ingestion: tagged CHANNEL1_NOTE operations and
@@ -459,6 +455,49 @@ fn non_tag_messages(
         }
     }
     Ok(messages)
+}
+
+/// Answers arrive in answer-sequence order. Select the newest baseline per
+/// subject before indexing its tags, so an empty newer answer also replaces it.
+fn claude_code_baseline_tags(
+    store: &McStore,
+    key: &Key,
+    lineage: &ProviderLineage,
+    answers: &[mc_store::provider_records::ProviderStoredAnswer],
+) -> Result<BTreeMap<String, u64>, HandlerOutcome> {
+    let mut cuts = HashMap::new();
+    let mut subjects = BTreeMap::new();
+    for stored in answers {
+        if !matches!(stored.state.as_str(), "pending" | "live") {
+            continue;
+        }
+        let cut = match cuts.get(&stored.lineage_id) {
+            Some(cut) => *cut,
+            None => {
+                let cut = ancestor_cut(store, key, lineage, &stored.lineage_id)?;
+                cuts.insert(stored.lineage_id.clone(), cut);
+                cut
+            }
+        };
+        if cut.is_none_or(|cut| stored.answer.ordinal > cut) {
+            continue;
+        }
+        let subject = &stored.answer.subject;
+        subjects.insert(
+            (&subject.subject_mid, &subject.hook, &subject.subject_part),
+            &stored.answer,
+        );
+    }
+    let mut tags = BTreeMap::new();
+    for answer in subjects.into_values() {
+        for tag in &answer.tags {
+            tags.insert(
+                tag.block_id.clone(),
+                u64::try_from(tag.number).map_err(transient)?,
+            );
+        }
+    }
+    Ok(tags)
 }
 
 /// The conversation row is rewritten by every hook, so it keeps a receipt of
@@ -821,6 +860,11 @@ fn execute_host(
     let live = store
         .load_provider_hook_answers(&work.key.store_key())
         .map_err(transient)?;
+    let admission_tags = if codec == Codec::ClaudeCodeAnthropic {
+        claude_code_baseline_tags(store, &work.key, lineage, &live)?
+    } else {
+        BTreeMap::new()
+    };
     let pending = store
         .load_provider_pending_drops(&work.key.store_key())
         .map_err(transient)?;
@@ -1069,10 +1113,13 @@ fn execute_host(
         )
     } else {
         let (wire, raw_replacement, initial_coverage) = if codec == Codec::ClaudeCodeAnthropic {
-            let (mut wire, mut raw) = match super::codec_claude_code::encode_view(
+            // The host engine does not add tags to Claude Code's message array.
+            // Add prefixes here only for parts named by stored hook answers.
+            let (mut wire, mut raw) = match super::codec_claude_code::encode_view_with_baseline(
                 &engine,
                 &template,
                 native_edit_through,
+                &admission_tags,
             ) {
                 Ok(encoded) => encoded,
                 Err(_) if promoted => return Ok(None),
@@ -1081,7 +1128,14 @@ fn execute_host(
             let coverage = if native_edit_through.is_none()
                 && super::native_view::has_selected_bundle(conversation)?
             {
-                native_uncovered_prefix(&mut engine, &mut wire, &mut raw, &template, &messages)?
+                native_uncovered_prefix(
+                    &mut engine,
+                    &mut wire,
+                    &mut raw,
+                    &template,
+                    &messages,
+                    &admission_tags,
+                )?
             } else {
                 None
             };
@@ -1226,6 +1280,7 @@ fn native_uncovered_prefix(
     raw: &mut Vec<String>,
     request: &TransformRequest,
     messages: &[compact::status::StatusMessage],
+    admission_tags: &BTreeMap<String, u64>,
 ) -> Result<Option<HostCoverage>, HandlerOutcome> {
     if raw.is_empty() {
         engine.range.to = engine.range.from;
@@ -1259,7 +1314,12 @@ fn native_uncovered_prefix(
         return Err(invalid());
     }
     for (bytes, source) in raw[head_count..].iter().zip(&request.messages) {
-        if bytes != &super::codec_claude_code::render(&source.ck)? {
+        let served = super::codec_claude_code::admission_served_bytes(
+            super::codec_claude_code::render(&source.ck)?,
+            &source.ck,
+            admission_tags,
+        )?;
+        if bytes != &served {
             return Err(invalid());
         }
     }
@@ -4435,6 +4495,203 @@ fn coverage_replay_matches(codec: Codec, previous: Option<u64>, current: Option<
 }
 
 #[cfg(test)]
+mod served_baseline_tests {
+    use super::super::claude_code_tests::{call, handler, setup, step, thalamus};
+    use super::*;
+
+    fn response(outcome: HandlerOutcome) -> Value {
+        let HandlerOutcome::Response(bytes) = outcome else {
+            panic!("{outcome:?}")
+        };
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn admit(h: &McHandler, raw: &str) -> Key {
+        setup(h).await;
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        let mut conversation = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        conversation.hook_counters_json = json!({"auto_tag":true}).to_string();
+        store
+            .save_provider_conversation(&key.store_key(), &conversation)
+            .unwrap();
+        let answer = response(
+            call(
+                h,
+                "transform.hook",
+                json!({
+                    "session":"cc","harness":"claude-code","lineage_id":"L","step_id":"hook",
+                    "subject_mid":"m","subject_ordinal":0,"hook":"pre_user","blocks":["ab"],
+                    "message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw
+                }),
+            )
+            .await,
+        );
+        assert_eq!(answer["answer"], "ops");
+        assert_eq!(answer["ops"][0]["text"], "§1§ ");
+        key
+    }
+
+    fn assert_raw(h: &McHandler, key: &Key, answer: &Value, expected: &str) {
+        assert_eq!(answer["answer"], "compaction_message", "{answer}");
+        let stored = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_view(
+                &key.store_key(),
+                answer["compaction"]["version"].as_u64().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let view: HostView = serde_json::from_str(&stored.replacement_json).unwrap();
+        let raw = view.raw_replacement.unwrap();
+        assert!(raw.iter().any(|raw| raw == expected), "{raw:?}");
+        assert_eq!(
+            raw.join("").matches("§1§").count(),
+            usize::from(expected.contains("§1§"))
+        );
+    }
+
+    #[test]
+    fn served_baseline_uncovered_head_accepts_served_tags_not_other_edits() {
+        let raw = r#"{ "role":"user", "content":"a\u0062" }"#;
+        let messages = vec![compact::status::StatusMessage {
+            mid: "m".into(),
+            ordinal: 0,
+            raw_message: None,
+            message: super::super::codec_claude_code::envelope(
+                &serde_json::from_str::<Value>(raw).unwrap(),
+                Some(&json!(raw)),
+            )
+            .unwrap(),
+        }];
+        let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
+            "session_id":"cc","messages":[],"render_config":"","tool_present":false,"auto_search_enabled":false})).unwrap();
+        Codec::ClaudeCodeAnthropic
+            .prepare_request(&mut request, &messages)
+            .unwrap();
+        let tags = BTreeMap::from([("m#0".into(), 1)]);
+        let mut engine = transform::compaction::View {
+            compaction_id: "head".into(),
+            version: 1,
+            range: transform::compaction::Range {
+                lineage_id: "L".into(),
+                from: 0,
+                to: 1,
+            },
+            replacement: vec![
+                ck_wire::CkWireMessage::synthetic_user_text("head"),
+                request.messages[0].ck.clone(),
+            ],
+        };
+        let (mut wire, mut rendered) = super::super::codec_claude_code::encode_view_with_baseline(
+            &engine, &request, None, &tags,
+        )
+        .unwrap();
+        let mut edited = rendered.clone();
+        edited[1] = edited[1].replace("a\\u0062", "c\\u0062");
+        assert!(native_uncovered_prefix(
+            &mut engine,
+            &mut wire,
+            &mut edited,
+            &request,
+            &messages,
+            &tags
+        )
+        .is_err());
+        let coverage = native_uncovered_prefix(
+            &mut engine,
+            &mut wire,
+            &mut rendered,
+            &request,
+            &messages,
+            &tags,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(coverage.ordinal, 0);
+        assert_eq!(rendered[1], r#"{ "role":"user", "content":"§1§ a\u0062" }"#);
+    }
+
+    #[tokio::test]
+    async fn served_baseline_descent_replacement_equals_first_hook_served_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        let raw = r#"{ "role":"user", "content":"a\u0062" }"#;
+        let key = admit(&h, raw).await;
+        let mut status = step(raw);
+        status["lineage_id"] = json!("child");
+        status["descends_from"] = json!({"lineage_id":"L","through_ordinal":0});
+        status["messages"] = json!([]);
+        status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+        let answer = response(call(&h, "compaction.step", status).await);
+        assert_raw(
+            &h,
+            &key,
+            &answer,
+            r#"{ "role":"user", "content":"§1§ a\u0062" }"#,
+        );
+        let answers = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_hook_answers(&key.store_key())
+            .unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].state, "pending");
+        assert_eq!(answers[0].lineage_id, "L");
+        let originals = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_messages(&key.store_key(), "child")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&originals[0].message_bytes).unwrap()["raw_message"],
+            raw
+        );
+    }
+
+    #[tokio::test]
+    async fn served_baseline_replacement_replays_live_but_not_burned_answers() {
+        for burned in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = handler(dir.path(), thalamus());
+            let raw = r#"{ "role":"user", "content":"a\u0062" }"#;
+            let key = admit(&h, raw).await;
+            let mut status = step(raw);
+            status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+            status["served_through_ordinal"] = json!(0);
+            if burned {
+                status["unserved_subjects"] = json!([{"subject_mid":"m","hook":"pre_user"}]);
+            }
+            let answer = response(call(&h, "compaction.step", status).await);
+            assert_raw(
+                &h,
+                &key,
+                &answer,
+                if burned {
+                    raw
+                } else {
+                    r#"{ "role":"user", "content":"§1§ a\u0062" }"#
+                },
+            );
+            let answers = h
+                .store
+                .get()
+                .unwrap()
+                .load_provider_hook_answers(&key.store_key())
+                .unwrap();
+            assert_eq!(answers[0].state, if burned { "burned" } else { "live" });
+        }
+    }
+}
+
+#[cfg(test)]
 mod native_replay_tests {
     use super::*;
     #[test]
@@ -4486,8 +4743,15 @@ mod native_empty_tests {
             vec![],
         );
         let template: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step","session_id":"cc","messages":[],"render_config":"","tool_present":false,"auto_search_enabled":false})).unwrap();
-        let coverage =
-            native_uncovered_prefix(&mut engine, &mut wire, &mut vec![], &template, &[]).unwrap();
+        let coverage = native_uncovered_prefix(
+            &mut engine,
+            &mut wire,
+            &mut vec![],
+            &template,
+            &[],
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert!(coverage.is_none());
         assert_eq!(engine.range.to, engine.range.from);
         assert_eq!(wire.range.to, wire.range.from);
