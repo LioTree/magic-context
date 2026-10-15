@@ -222,6 +222,7 @@ function requireBaselineCommit(): void {
         execFileSync("git", ["cat-file", "-e", `${BASE}^{commit}`], {
             cwd: repo,
             stdio: "ignore",
+            windowsHide: true,
         });
     } catch {
         throw new Error(
