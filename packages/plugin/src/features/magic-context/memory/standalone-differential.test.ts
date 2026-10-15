@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -19,8 +19,11 @@ import {
 import { cleanupTestTempDir, createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 
 // Release v0.49.2 supplies the standalone behavior from before registered-project lookup.
-const BASE = "cc654a68fd0441d245712be76eb23087e70b7ef0";
 const repo = resolve(import.meta.dir, "../../../../../..");
+const BASE = readFileSync(resolve(repo, ".github/standalone-differential-base"), "utf8")
+    .split(/\r?\n/)
+    .find((line) => line.trim().length > 0 && !line.trim().startsWith("#"))!
+    .trim();
 let scratch: string;
 let baseline: string;
 let host: string;
@@ -212,11 +215,25 @@ for (const scenario of ["outside", "resolved-outside", "revalidate", "move"]) {
 }
 closeDatabase();
 console.log("RESULT " + JSON.stringify({ transcript }));
-`;
+    `;
+
+function requireBaselineCommit(): void {
+    try {
+        execFileSync("git", ["cat-file", "-e", `${BASE}^{commit}`], {
+            cwd: repo,
+            stdio: "ignore",
+        });
+    } catch {
+        throw new Error(
+            `Standalone differential baseline ${BASE} is missing. Fetch it with: git fetch --no-tags --depth=1 origin ${BASE}`,
+        );
+    }
+}
 
 beforeAll(() => {
     mkdirSync(join(tmpdir(), "magic-context"), { recursive: true });
     scratch = createTestTempDirFromPath(join(tmpdir(), "magic-context", "standalone-"));
+    requireBaselineCommit();
     baseline = join(scratch, "base");
     mkdirSync(baseline);
     const archive = execFileSync(

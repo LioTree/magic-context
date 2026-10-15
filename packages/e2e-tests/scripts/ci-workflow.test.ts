@@ -4,6 +4,10 @@ import { failedRequiredJobs } from "./check-ci-results";
 
 const root = resolve(import.meta.dir, "../../..");
 const text = await Bun.file(resolve(root, ".github/workflows/ci.yml")).text();
+const differentialBase = (await Bun.file(resolve(root, ".github/standalone-differential-base")).text())
+    .split(/\r?\n/)
+    .find((line) => line.trim().length > 0 && !line.trim().startsWith("#"))
+    ?.trim();
 type Step = { name?: string; run?: string; if?: string; uses?: string; with?: Record<string, string>; env?: Record<string, string> };
 type Job = { name: string; needs?: string[]; if?: string; "timeout-minutes"?: number; steps: Step[]; strategy?: { "fail-fast": boolean; matrix: { shard: number[]; mode?: string[] } } };
 const workflow = Bun.YAML.parse(text) as { jobs: Record<string, Job> };
@@ -88,6 +92,20 @@ test("unit matrices preserve both modes, package wrappers and Pi assertion isola
     expect(plugin).toContain("bun run --cwd packages/plugin test");
     expect(plugin).toContain("export MAGIC_CONTEXT_DEBUG_ASSERTIONS=1");
     expect(pi).toContain("MAGIC_CONTEXT_DEBUG_ASSERTIONS=1 bun run --cwd packages/pi-plugin test --parallel=1 --timeout=60000");
+});
+
+test("standalone differential jobs fetch the shared pinned base before tests", () => {
+    expect(differentialBase).toMatch(/^[0-9a-f]{40}$/);
+    for (const id of ["unit-plugin", "rust-mc-module-integration"]) {
+        const steps = workflow.jobs[id]!.steps;
+        const fetch = steps.findIndex((step) => step.name === "Fetch pinned standalone differential base");
+        expect(fetch).toBeGreaterThan(0);
+        expect(steps[fetch]!.run).toBe(
+            'git fetch --no-tags --depth=1 origin "$(grep -v \'^#\' .github/standalone-differential-base)"',
+        );
+        const test = steps.findIndex((step) => step.run && (/bun run --cwd packages\/plugin test|cargo test --locked -p mc-module --test/.test(step.run)));
+        expect(test).toBeGreaterThan(fetch);
+    }
 });
 
 test("remaining Rust crates retain Bun migration oracles and hermetic archives retain executable variants", () => {

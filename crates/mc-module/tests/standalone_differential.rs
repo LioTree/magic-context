@@ -17,8 +17,6 @@ use subc_transport::{
     ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
 
-const BASE: &str = "cc654a68fd0441d245712be76eb23087e70b7ef0";
-
 fn checked(command: &mut Command) -> Vec<u8> {
     let output = command.output().expect("spawn fixture command");
     assert!(
@@ -487,13 +485,32 @@ fn transcript(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_identity_and_prefix_bytes_match_the_pre_campaign_base() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let base = std::fs::read_to_string(repo.join(".github/standalone-differential-base"))
+        .expect("read pinned standalone differential baseline");
+    let base = base
+        .lines()
+        .find(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('#')
+        })
+        .expect("pinned standalone differential baseline commit")
+        .trim();
+    let available = Command::new("git")
+        .args(["cat-file", "-e", &format!("{base}^{{commit}}")])
+        .current_dir(&repo)
+        .output()
+        .expect("run git to check the pinned standalone differential baseline");
+    assert!(
+        available.status.success(),
+        "Standalone differential baseline {base} is missing. Fetch it with: git fetch --no-tags --depth=1 origin {base}"
+    );
     let temporary_root = std::env::temp_dir().join("magic-context");
     std::fs::create_dir_all(&temporary_root).unwrap();
     let scratch = tempfile::Builder::new()
         .prefix("standalone-")
         .tempdir_in(temporary_root)
         .unwrap();
-    let base = compile_host(&repo, &scratch.path().join("base"), Some(BASE));
+    let base = compile_host(&repo, &scratch.path().join("base"), Some(base));
     let head = compile_host(&repo, &scratch.path().join("head"), None);
     for mode in ["no-connection", "daemon-down", "module-absent"] {
         let root = scratch.path().join(mode);
