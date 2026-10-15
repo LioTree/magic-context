@@ -364,6 +364,11 @@ impl McHandler {
             .content
             .iter()
             .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }));
+        let last_signed = ingress
+            .ck
+            .content
+            .iter()
+            .rposition(super::codec_claude_code::is_thinking_block);
         for (native_index, block) in ingress.ck.content.iter().enumerate() {
             match (&block.kind, hook) {
                 (ck_wire::CkKind::Text { text }, Hook::PreUser) if ingress.ck.role == "user" => {
@@ -374,9 +379,7 @@ impl McHandler {
                     if ingress.ck.role == "assistant" =>
                 {
                     source.push(text.clone());
-                    let signed_suffix = ingress.ck.content[native_index + 1..]
-                        .iter()
-                        .any(super::codec_claude_code::is_thinking_block);
+                    let signed_suffix = last_signed.is_some_and(|index| index > native_index);
                     targets.push((!text.is_empty() && !signed_suffix).then_some(native_index));
                 }
                 (ck_wire::CkKind::ToolResult { id, output, .. }, Hook::PostTool) if id == part => {
