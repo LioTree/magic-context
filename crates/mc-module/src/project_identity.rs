@@ -26,8 +26,13 @@ use std::path::{Component, Path, PathBuf};
 
 use mc_store::private_permissions::write_file_atomic as write_private_file_atomic;
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+#[path = "project_pin_writer.rs"]
+pub(crate) mod pin_writer;
+
+pub use pin_writer::shutdown as shutdown_pin_writes;
 
 /// How long `git rev-list` may take before the probe counts as a transient failure.
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -332,10 +337,18 @@ fn read_remembered_git_identity(sidecar_dir: &Path, directory: &Path) -> Option<
 /// gone) reuses it instead of starting a new pool. Written to a temporary file and renamed
 /// so a reader never sees half a record. Best effort: a read-only storage directory must
 /// not turn a successful probe into a failure.
-fn remember_git_identity(sidecar_dir: &Path, directory: &Path, identity: &str) {
+fn remember_git_identity(
+    writer: &pin_writer::PinWriter,
+    sidecar_dir: &Path,
+    directory: &Path,
+    identity: &str,
+) {
     let key = project_directory_key(directory);
     let destination = sidecar_path(sidecar_dir, directory);
-    if read_record(sidecar_dir, directory).is_some_and(|record| is_project_pin(&record.identity)) {
+    if writer.lookup(&destination).is_some()
+        || read_record(sidecar_dir, directory)
+            .is_some_and(|record| is_project_pin(&record.identity))
+    {
         return;
     }
     if read_remembered_git_identity(sidecar_dir, directory).as_deref() == Some(identity) {
@@ -431,7 +444,6 @@ struct Cached {
 }
 
 /// Resolves and remembers identities for the life of the process.
-#[derive(Default)]
 pub struct ProjectIdentityResolver {
     cache: Mutex<HashMap<PathBuf, Cached>>,
     /// The last `git:` identity seen per resolved path, reused when a later git probe
@@ -439,6 +451,18 @@ pub struct ProjectIdentityResolver {
     last_git: Mutex<HashMap<PathBuf, String>>,
     /// The host's remembered-identity sidecar directory. `None` reads no sidecars.
     sidecar_dir: Option<PathBuf>,
+    pin_writer: Arc<pin_writer::PinWriter>,
+}
+
+impl Default for ProjectIdentityResolver {
+    fn default() -> Self {
+        Self {
+            cache: Mutex::default(),
+            last_git: Mutex::default(),
+            sidecar_dir: None,
+            pin_writer: pin_writer::process_writer(),
+        }
+    }
 }
 
 impl ProjectIdentityResolver {
@@ -456,6 +480,23 @@ impl ProjectIdentityResolver {
             sidecar_dir: Some(sidecar_dir),
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pin_writer(
+        sidecar_dir: PathBuf,
+        pin_writer: Arc<pin_writer::PinWriter>,
+    ) -> Self {
+        Self {
+            sidecar_dir: Some(sidecar_dir),
+            pin_writer,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_pins(&self) {
+        assert!(self.pin_writer.flush(Duration::from_secs(10)));
     }
 
     fn remembered(&self, directory: &Path) -> Option<String> {
@@ -496,7 +537,11 @@ impl ProjectIdentityResolver {
     /// An exact pin is authoritative even when the process cached an older git answer.
     /// Callers must check local eligibility first.
     pub fn pinned_identity(&self, directory: &Path) -> Option<String> {
-        let record = read_record(self.sidecar_dir.as_deref()?, directory)?;
+        let sidecars = self.sidecar_dir.as_deref()?;
+        let record = self
+            .pin_writer
+            .lookup(&sidecar_path(sidecars, directory))
+            .or_else(|| read_record(sidecars, directory))?;
         is_project_pin(&record.identity).then_some(record.identity)
     }
 
@@ -504,9 +549,10 @@ impl ProjectIdentityResolver {
     /// it must not be saved as a pin for the queried directory.
     pub fn common_dir_pin(&self, directory: &Path) -> Option<String> {
         let common = git_checkout(directory)?.git_common_dir;
-        let entries = std::fs::read_dir(self.sidecar_dir.as_deref()?).ok()?;
+        let sidecars = self.sidecar_dir.as_deref()?;
+        let mut records = self.pin_writer.records(sidecars);
         let mut identities = HashSet::new();
-        for entry in entries.flatten() {
+        for entry in std::fs::read_dir(sidecars).into_iter().flatten().flatten() {
             if entry
                 .path()
                 .extension()
@@ -515,11 +561,13 @@ impl ProjectIdentityResolver {
                 continue;
             }
             if let Some(record) = read_record_file(&entry.path()) {
-                if record.git_common_dir.as_deref() == Some(&common)
-                    && is_project_pin(&record.identity)
-                {
-                    identities.insert(record.identity);
-                }
+                records.entry(record.directory.clone()).or_insert(record);
+            }
+        }
+        for record in records.into_values() {
+            if record.git_common_dir.as_deref() == Some(&common) && is_project_pin(&record.identity)
+            {
+                identities.insert(record.identity);
             }
         }
         if identities.len() == 1 {
@@ -565,13 +613,7 @@ impl ProjectIdentityResolver {
                     .map(|checkout| checkout.git_common_dir.clone()),
             };
             let private = crate::config::private_storage_permissions_enabled();
-            if let Ok(bytes) = serde_json::to_vec(&record) {
-                let _ = write_private_file_atomic(
-                    &sidecar_path(sidecar_dir, destination),
-                    &bytes,
-                    private,
-                );
-            }
+            self.pin_writer.publish(sidecar_dir, record, private);
         };
         write(directory);
         if let Some(checkout) = checkout.as_ref() {
@@ -691,9 +733,9 @@ impl ProjectIdentityResolver {
             // Remember it across restarts, as the host does, for this path and for the
             // checkout root it belongs to.
             if let Some(sidecar_dir) = self.sidecar_dir.as_deref() {
-                remember_git_identity(sidecar_dir, resolved, &identity);
+                remember_git_identity(&self.pin_writer, sidecar_dir, resolved, &identity);
                 if let Some(root) = git_root_directory(resolved).filter(|root| root != resolved) {
-                    remember_git_identity(sidecar_dir, &root, &identity);
+                    remember_git_identity(&self.pin_writer, sidecar_dir, &root, &identity);
                 }
             }
             return Ok(identity);
@@ -1221,6 +1263,7 @@ mod pin_tests {
         }
         let common = result_common_dir(&resolver, directory, expected["identity"].is_null());
         assert_eq!(common, expected["gitCommonDir"], "{name}: common dir");
+        resolver.flush_pins();
         let after = sidecar_bytes(&sidecars);
         let mut writes: Vec<Value> = after
             .iter()
@@ -1331,9 +1374,15 @@ mod pin_tests {
         let directory = temp.path().join("repo");
         std::fs::create_dir(&directory).unwrap();
         resolver.pin_live_answer(&directory, "pj-A", Some(&directory));
+        resolver.flush_pins();
         let sidecars = resolver.sidecar_dir.as_deref().unwrap();
         let before = sidecar_bytes(sidecars);
-        remember_git_identity(sidecars, &directory, "git:123456789abcdef");
+        remember_git_identity(
+            &resolver.pin_writer,
+            sidecars,
+            &directory,
+            "git:123456789abcdef",
+        );
         assert_eq!(sidecar_bytes(sidecars), before);
     }
 
@@ -1361,6 +1410,7 @@ mod pin_tests {
         git_input(&directory, &["init", "-q", "-b", "replacement"], b"");
         GIT_PROBES.with(|probes| probes.set(0));
         assert_eq!(resolver.resolve(&directory).unwrap(), "pj-stable");
+        resolver.flush_pins();
         let restarted = ProjectIdentityResolver::with_sidecar_dir(temp.path().join("sidecars"));
         assert_eq!(restarted.resolve(&directory).unwrap(), "pj-stable");
         assert_eq!(GIT_PROBES.with(|probes| probes.get()), 0);
@@ -1430,6 +1480,7 @@ mod pin_tests {
             resolver.pinned_identity(&directory).as_deref(),
             Some("pj-B")
         );
+        resolver.flush_pins();
         let before = std::fs::read(sidecar_path(&sidecars, &directory)).unwrap();
         resolver.pin_live_answer(&child, "pj-C", Some(&alias));
         assert_eq!(
