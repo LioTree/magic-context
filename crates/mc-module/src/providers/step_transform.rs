@@ -296,7 +296,13 @@ impl McHandler {
         call: &hooks::hook::HookCall,
         params: &Value,
     ) -> Result<Vec<u8>, HandlerOutcome> {
-        use hooks::{answer::HookAnswer, subscription::Hook};
+        use hooks::{
+            answer::{HookAnswer, Operation},
+            subscription::Hook,
+        };
+        if !attested_claude_code(&binding) {
+            return bytes(&HookAnswer::Pass);
+        }
         if serde_json::to_vec(&json!({"method":"transform.hook","params":params}))
             .map_err(invalid)?
             .len()
@@ -352,29 +358,56 @@ impl McHandler {
         };
         let ingress = codec::Codec::ClaudeCodeAnthropic.decode_message(&entry)?;
         let mut source = Vec::new();
-        for block in &ingress.ck.content {
+        let mut targets = Vec::new();
+        let mixed_user = ingress
+            .ck
+            .content
+            .iter()
+            .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }));
+        for (native_index, block) in ingress.ck.content.iter().enumerate() {
             match (&block.kind, hook) {
                 (ck_wire::CkKind::Text { text }, Hook::PreUser) if ingress.ck.role == "user" => {
-                    source.push(text.clone())
+                    source.push(text.clone());
+                    targets.push((!mixed_user).then_some(native_index));
                 }
                 (ck_wire::CkKind::Text { text }, Hook::PostAssistant)
                     if ingress.ck.role == "assistant" =>
                 {
-                    source.push(text.clone())
+                    source.push(text.clone());
+                    let signed_suffix = ingress.ck.content[native_index + 1..]
+                        .iter()
+                        .any(super::codec_claude_code::is_thinking_block);
+                    targets.push((!text.is_empty() && !signed_suffix).then_some(native_index));
                 }
                 (ck_wire::CkKind::ToolResult { id, output, .. }, Hook::PostTool) if id == part => {
                     match &output.kind {
                         ck_wire::CkOutputKind::Text { text }
-                        | ck_wire::CkOutputKind::ErrorText { text } => source.push(text.clone()),
+                        | ck_wire::CkOutputKind::ErrorText { text } => {
+                            source.push(text.clone());
+                            targets.push(Some(native_index));
+                        }
+                        ck_wire::CkOutputKind::Content { blocks }
+                        | ck_wire::CkOutputKind::ErrorContent { blocks } => {
+                            let mut first_text = true;
+                            for child in blocks {
+                                if let ck_wire::ResultBlockKind::Text { text } = &child.kind {
+                                    source.push(text.clone());
+                                    targets.push(first_text.then_some(native_index));
+                                    first_text = false;
+                                }
+                            }
+                        }
                         ck_wire::CkOutputKind::Json { value }
                         | ck_wire::CkOutputKind::ErrorJson { value } => {
                             if let Some(children) = value.as_array() {
-                                source.extend(
-                                    children
-                                        .iter()
-                                        .filter(|b| b["type"] == "text")
-                                        .filter_map(|b| b["text"].as_str().map(str::to_owned)),
-                                );
+                                for text in children
+                                    .iter()
+                                    .filter(|b| b["type"] == "text")
+                                    .filter_map(|b| b["text"].as_str())
+                                {
+                                    source.push(text.to_owned());
+                                    targets.push(None);
+                                }
                             }
                         }
                         _ => {}
@@ -406,6 +439,19 @@ impl McHandler {
             .map_err(transient)?
             .ok_or_else(|| invalid_field("params", "CC plan is not frozen"))?;
         let plan: Value = serde_json::from_str(&held.params_json).map_err(transient)?;
+        let frozen: Value = serde_json::from_str(
+            held.native_plan_json
+                .as_deref()
+                .ok_or_else(|| invalid_field("params", "CC plan is not frozen"))?,
+        )
+        .map_err(transient)?;
+        let native_lane =
+            plan["serializer_profile"] == "claude-code-anthropic" && answer_observation(&plan);
+        let reduction_owner = frozen.get("composition").is_none_or(Value::is_null)
+            || frozen
+                .pointer("/composition/compaction/provider")
+                .and_then(Value::as_str)
+                == Some(DEFAULT_MODULE_ID);
         let declared = declaration(&json!({"params":plan,"preset":held.preset}))?;
         if !declared
             .subscriptions
@@ -519,9 +565,6 @@ impl McHandler {
             &lineage,
             std::slice::from_mut(&mut input),
         )?;
-        // Claude Code does not yet authorize tool reductions or delivery notices
-        // through this plan. Record an unchanged hook result instead of proposing
-        // edits that could change the prefix bound to a thinking signature.
         let answer = store
             .commit_provider_hook_with_parts(
                 &key.store_key(),
@@ -534,18 +577,70 @@ impl McHandler {
                 },
                 &parts,
                 |ctx| {
+                    let mut ops = Vec::new();
+                    let mut tags = Vec::new();
+                    // Only THALAMUS's Claude Code answer hooks may add automatic
+                    // tags, and only when MC owns compaction to resolve them later.
+                    // The gateway freezes a plan with MC as its single step provider;
+                    // composition is opaque and exposes no step-provider selector.
+                    if ctx.counters["auto_tag"] == true && native_lane && reduction_owner {
+                        for (hook_index, native_index) in targets.iter().enumerate() {
+                            let Some(native_index) = native_index else {
+                                continue;
+                            };
+                            // Reservations use native content coordinates; hook ops
+                            // index only the text blocks offered by the gateway.
+                            let block_id = ck_wire::block_id(mid, *native_index);
+                            let Some(target) = projection.blocks.iter().find(|b| b.id == block_id)
+                            else {
+                                continue;
+                            };
+                            let Some((kind, source)) = transform::taggable_source(target) else {
+                                continue;
+                            };
+                            let Some(number) = ctx
+                                .parts
+                                .iter()
+                                .find(|p| p.block_id == block_id)
+                                .and_then(|p| p.tag_number)
+                            else {
+                                continue;
+                            };
+                            ops.push(Operation::Prepend {
+                                block: hook_index as u32,
+                                text: transform::tag_prefix(number),
+                                note: None,
+                            });
+                            tags.push(ProviderAnswerTag {
+                                number,
+                                block_id,
+                                kind: kind.as_store_kind().into(),
+                                token_count: mc_tokenizer::estimate_tokens(&source) as i64,
+                                source: source.into_owned(),
+                                created_at_ms: now_ms(),
+                            });
+                        }
+                    }
+                    let ops_json = serde_json::to_string(&ops).map_err(|e| {
+                        mc_store::provider_records::ProviderError::Transient(e.to_string())
+                    })?;
+                    let answer = if ops.is_empty() {
+                        HookAnswer::Pass
+                    } else {
+                        HookAnswer::Ops { ops }
+                    };
                     Ok((
                         ProviderHookWrite {
                             answer: Some(ProviderHookAnswer {
                                 subject: subject.clone(),
                                 ordinal,
-                                ops_json: "[]".into(),
-                                tags: vec![],
+                                ops_json,
+                                tags,
                             }),
                             counters: ctx.counters.clone(),
                             policy_summary: Default::default(),
                         },
-                        HookAnswer::Pass,
+                        answer,
                     ))
                 },
             )
@@ -2493,6 +2588,388 @@ mod overlay_parity_tests {
         assert_eq!(
             rendered,
             [format!("§2§ <!-- +5m -->\nrust ownership beta{hint}")]
+        );
+    }
+}
+
+#[cfg(test)]
+mod admission_hook_tests {
+    use super::super::claude_code_tests::{call, handler, setup, step, thalamus};
+    use super::*;
+    use hooks::answer::{HookAnswer, Operation};
+
+    fn response(outcome: HandlerOutcome) -> Value {
+        let HandlerOutcome::Response(bytes) = outcome else {
+            panic!("{outcome:?}")
+        };
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn fixture(
+        auto_tag: bool,
+        composition: Option<Value>,
+    ) -> (tempfile::TempDir, McHandler, Key) {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        let mut declare = json!({"session":"cc","harness":"claude-code","params":{"serializer_profile":"claude-code-anthropic","observation":"answer"},"preset":"head"});
+        if let Some(composition) = composition {
+            declare["composition"] = composition;
+        }
+        response(call(&h, "transform.declare", declare).await);
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        let mut held = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        let mut counters = json!({"reserved_tag_high_water":40});
+        if auto_tag {
+            counters["auto_tag"] = json!(true);
+        }
+        held.hook_counters_json = counters.to_string();
+        store
+            .save_provider_conversation(&key.store_key(), &held)
+            .unwrap();
+        (dir, h, key)
+    }
+
+    fn hook(raw: &str, mid: &str, ordinal: u64, kind: &str, blocks: &[&str]) -> Value {
+        let mut params = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"hook","params":{"serializer_profile":"claude-code-anthropic","observation":"answer"},
+            "subject_mid":mid,"subject_ordinal":ordinal,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw,"hook":kind,"blocks":blocks});
+        if kind == "post_tool" {
+            params["subject_part"] = json!("call-a");
+            params["tool_call_id"] = json!("call-a");
+            params["tool"] = json!("Read");
+            params["is_error"] = serde_json::from_str::<Value>(raw).unwrap()["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["type"] == "tool_result")
+                .and_then(|b| b["is_error"].as_bool())
+                .unwrap_or(false)
+                .into();
+        }
+        params
+    }
+
+    async fn run(h: &McHandler, params: Value) -> HookAnswer {
+        serde_json::from_value(response(call(h, "transform.hook", params).await)).unwrap()
+    }
+
+    fn assert_prepends(
+        h: &McHandler,
+        key: &Key,
+        answer: HookAnswer,
+        mid: &str,
+        expected: &[(u32, usize, i64)],
+    ) {
+        let ops = expected
+            .iter()
+            .map(|(hook_index, _, number)| Operation::Prepend {
+                block: *hook_index,
+                text: format!("§{number}§ "),
+                note: None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(answer, HookAnswer::Ops { ops: ops.clone() });
+        let answers = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_hook_answers(&key.store_key())
+            .unwrap();
+        let stored = &answers
+            .iter()
+            .find(|a| a.answer.subject.subject_mid == mid)
+            .unwrap()
+            .answer;
+        assert_eq!(stored.ops_json, serde_json::to_string(&ops).unwrap());
+        assert_eq!(stored.tags.len(), expected.len());
+        for (tag, (_, native_index, number)) in stored.tags.iter().zip(expected) {
+            assert_eq!(tag.block_id, format!("{mid}#{native_index}"));
+            assert_eq!(tag.number, *number);
+        }
+    }
+
+    async fn pair_call(h: &McHandler) {
+        let raw = r#"{"role":"assistant","content":[{"type":"tool_use","id":"call-a","name":"Read","input":{"path":"a"}}]}"#;
+        assert_eq!(
+            run(h, hook(raw, "call", 0, "post_assistant", &[])).await,
+            HookAnswer::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_hook_scalar_user_preserves_authored_tag_text() {
+        for composition in [
+            None,
+            Some(json!({"compaction":{"provider":DEFAULT_MODULE_ID}})),
+        ] {
+            let (_dir, h, key) = fixture(true, composition).await;
+            let raw = r#"{ "role":"user", "content":"§900§ authored" }"#;
+            let answer = run(&h, hook(raw, "user", 0, "pre_user", &["§900§ authored"])).await;
+            assert_prepends(&h, &key, answer, "user", &[(0, 0, 41)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_hook_each_top_level_user_text_uses_native_reservation() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let raw = r#"{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}},{"type":"text","text":"one"},{"type":"image","source":{}},{"type":"text","text":""}]}"#;
+        let answer = run(&h, hook(raw, "user", 0, "pre_user", &["one", ""])).await;
+        assert_prepends(&h, &key, answer, "user", &[(0, 1, 41), (1, 3, 42)]);
+    }
+
+    #[tokio::test]
+    async fn admission_hook_assistant_text_after_last_signed_block() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let raw = r#"{"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"sig"},{"type":"redacted_thinking","data":"redacted"},{"type":"text","text":"first"},{"type":"text","text":"second"}]}"#;
+        let answer = run(
+            &h,
+            hook(raw, "assistant", 0, "post_assistant", &["first", "second"]),
+        )
+        .await;
+        assert_prepends(&h, &key, answer, "assistant", &[(0, 2, 41), (1, 3, 42)]);
+    }
+
+    #[tokio::test]
+    async fn admission_hook_tool_result_string_and_error_string() {
+        for error in [false, true] {
+            let (_dir, h, key) = fixture(true, None).await;
+            pair_call(&h).await;
+            let raw = json!({"role":"user","content":[{"type":"text","text":"mixed"},{"type":"tool_result","tool_use_id":"call-a","is_error":error,"content":"result"}]}).to_string();
+            let answer = run(&h, hook(&raw, "result", 1, "post_tool", &["result"])).await;
+            assert_prepends(&h, &key, answer, "result", &[(0, 1, 42)]);
+        }
+    }
+
+    async fn array_result(error: bool) {
+        let (_dir, h, key) = fixture(true, None).await;
+        pair_call(&h).await;
+        let raw = json!({"role":"user","content":[{"type":"image","source":{}},{"type":"tool_result","tool_use_id":"call-a","is_error":error,"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}},{"type":"text","text":"first"},{"type":"text","text":"second"}]}]}).to_string();
+        let answer = run(
+            &h,
+            hook(&raw, "result", 1, "post_tool", &["first", "second"]),
+        )
+        .await;
+        assert_prepends(&h, &key, answer, "result", &[(0, 1, 41)]);
+    }
+
+    #[tokio::test]
+    async fn admission_hook_array_result_collects_all_text_and_prepends_only_first() {
+        array_result(false).await;
+    }
+
+    #[tokio::test]
+    async fn admission_hook_error_array_result_collects_all_text_and_prepends_only_first() {
+        array_result(true).await;
+    }
+
+    #[tokio::test]
+    async fn admission_hook_intrinsically_excluded_blocks_get_no_ops() {
+        for raw in [
+            r#"{"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"sig"},{"type":"redacted_thinking","data":"opaque"},{"type":"tool_use","id":"call-a","name":"Read","input":{}},{"type":"image","source":{}}]}"#,
+            r#"{"role":"user","content":[{"type":"image","source":{}}]}"#,
+            r#"{"role":"system","content":"system"}"#,
+        ] {
+            let (_dir, h, _key) = fixture(true, None).await;
+            let kind = if raw.contains("assistant") {
+                "post_assistant"
+            } else {
+                "pre_user"
+            };
+            assert_eq!(
+                run(&h, hook(raw, "excluded", 0, kind, &[])).await,
+                HookAnswer::Pass
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_hook_assistant_before_later_thinking_or_redacted_gets_no_op() {
+        for signed in [
+            json!({"type":"thinking","thinking":"private","signature":"sig"}),
+            json!({"type":"redacted_thinking","data":"opaque"}),
+        ] {
+            let (_dir, h, _key) = fixture(true, None).await;
+            let raw = json!({"role":"assistant","content":[{"type":"text","text":"held"},signed]})
+                .to_string();
+            let answer = run(&h, hook(&raw, "assistant", 0, "post_assistant", &["held"])).await;
+            assert_eq!(answer, HookAnswer::Pass);
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_hook_empty_assistant_text_gets_no_op() {
+        let (_dir, h, _key) = fixture(true, None).await;
+        let raw = r#"{"role":"assistant","content":[{"type":"text","text":""},{"type":"text","text":"   "}]}"#;
+        assert_eq!(
+            run(&h, hook(raw, "empty", 0, "post_assistant", &["", "   "])).await,
+            HookAnswer::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_hook_mixed_user_text_gets_no_op() {
+        let (_dir, h, _key) = fixture(true, None).await;
+        pair_call(&h).await;
+        let raw = r#"{"role":"user","content":[{"type":"text","text":"held"},{"type":"tool_result","tool_use_id":"call-a","content":"result"}]}"#;
+        assert_eq!(
+            run(&h, hook(raw, "mixed", 1, "pre_user", &["held"])).await,
+            HookAnswer::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_hook_non_text_or_image_array_result_is_excluded() {
+        for error in [false, true] {
+            let (_dir, h, _key) = fixture(true, None).await;
+            pair_call(&h).await;
+            let raw = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call-a","is_error":error,"content":[{"type":"text","text":"visible"},{"type":"future","data":7}]}]}).to_string();
+            assert_eq!(
+                run(&h, hook(&raw, "json", 1, "post_tool", &["visible"])).await,
+                HookAnswer::Pass
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_hook_subject_blocks_must_include_every_text_in_order() {
+        let (_dir, h, _key) = fixture(true, None).await;
+        pair_call(&h).await;
+        let raw = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-a","content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}]}"#;
+        for blocks in [&["one"][..], &["two", "one"][..]] {
+            let outcome = call(
+                &h,
+                "transform.hook",
+                hook(raw, "result", 1, "post_tool", blocks),
+            )
+            .await;
+            assert!(
+                matches!(outcome, HandlerOutcome::ErrorWithDetail { ref code, .. } | HandlerOutcome::Error { ref code, .. } if code == "invalid_params"),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_hook_without_auto_tag_passes() {
+        let (_dir, h, _key) = fixture(false, None).await;
+        let raw = r#"{"role":"user","content":"untagged"}"#;
+        assert_eq!(
+            run(&h, hook(raw, "user", 0, "pre_user", &["untagged"])).await,
+            HookAnswer::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_hook_non_cc_answer_lane_passes() {
+        for plan in [
+            json!({"serializer_profile":"opencode-v2","observation":"answer"}),
+            json!({"serializer_profile":"claude-code-anthropic"}),
+        ] {
+            let (_dir, h, key) = fixture(true, None).await;
+            let store = h.store.get().unwrap();
+            let mut held = store
+                .load_provider_conversation(&key.store_key())
+                .unwrap()
+                .unwrap();
+            held.params_json = plan.to_string();
+            store
+                .save_provider_conversation(&key.store_key(), &held)
+                .unwrap();
+            let raw = r#"{"role":"user","content":"legacy"}"#;
+            let params = hook(raw, "user", 0, "pre_user", &["legacy"]);
+            let call: hooks::hook::HookCall = decode(&params).unwrap();
+            let bytes = h
+                .provider_claude_code_hook(h.facade_binding(7).unwrap(), key, &call, &params)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<HookAnswer>(&bytes).unwrap(),
+                HookAnswer::Pass
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_hook_another_reduction_owner_passes() {
+        for composition in [json!({}), json!({"compaction":{"provider":"other"}})] {
+            let (_dir, h, _key) = fixture(true, Some(composition)).await;
+            for (ordinal, (kind, role)) in [("pre_user", "user"), ("post_assistant", "assistant")]
+                .into_iter()
+                .enumerate()
+            {
+                let raw = json!({"role":role,"content":"not owned"}).to_string();
+                assert_eq!(
+                    run(&h, hook(&raw, role, ordinal as u64, kind, &["not owned"])).await,
+                    HookAnswer::Pass
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_hook_unattested_caller_passes_without_writing() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let raw = r#"{"role":"user","content":"not attested"}"#;
+        let params = hook(raw, "user", 0, "pre_user", &["not attested"]);
+        let call: hooks::hook::HookCall = decode(&params).unwrap();
+        let mut binding = h.facade_binding(7).unwrap();
+        binding.principal = None;
+        let bytes = h
+            .provider_claude_code_hook(binding, key.clone(), &call, &params)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HookAnswer>(&bytes).unwrap(),
+            HookAnswer::Pass
+        );
+        assert!(h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_hook_answers(&key.store_key())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn admission_hook_bootstrap_and_batch_attachment_never_answer_or_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        setup(&h).await;
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        let mut held = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        held.hook_counters_json = json!({"auto_tag":true}).to_string();
+        store
+            .save_provider_conversation(&key.store_key(), &held)
+            .unwrap();
+        let raw = r#"{"role":"user","content":"bootstrap"}"#;
+        let mut status = step(raw);
+        response(call(&h, "compaction.step", status.clone()).await);
+        status["messages"] = json!([{"mid":"batch","ordinal":1,"message":{"role":"user","content":"attached"},"raw_message":r#"{"role":"user","content":"attached"}"#}]);
+        status["newest"] = json!({"mid":"batch","ordinal":1});
+        status["after_ordinal"] = json!(0);
+        status["step_id"] = json!("2");
+        response(call(&h, "compaction.step", status).await);
+        assert!(store
+            .load_provider_hook_answers(&key.store_key())
+            .unwrap()
+            .is_empty());
+        let messages = store.load_provider_messages(&key.store_key(), "L").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&messages[0].message_bytes).unwrap()["raw_message"],
+            raw
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&messages[1].message_bytes).unwrap()["raw_message"],
+            r#"{"role":"user","content":"attached"}"#
         );
     }
 }

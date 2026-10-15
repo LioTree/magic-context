@@ -1,7 +1,8 @@
 //! Native Anthropic messages with a validated, byte-preserving provenance sidecar.
 use super::*;
 use ck_wire::{
-    CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage, HarnessMeta, ProviderExtras,
+    CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage, HarnessMeta, MediaBlock,
+    MediaKind, ProviderExtras, ResultBlock, ResultBlockKind,
 };
 use std::ops::Range;
 
@@ -256,9 +257,43 @@ pub(super) fn decode_message(
                 }
                 Some("tool_result") if block["tool_use_id"].is_string() => {
                     let error = block["is_error"].as_bool().unwrap_or(false);
+                    let children = block["content"].as_array().and_then(|children| {
+                        children
+                            .iter()
+                            .map(|child| {
+                                let kind = match child["type"].as_str() {
+                                    Some("text") => ResultBlockKind::Text {
+                                        text: child["text"].as_str()?.into(),
+                                    },
+                                    Some("image") => ResultBlockKind::Media {
+                                        media: MediaBlock {
+                                            kind: MediaKind::Image,
+                                            media_type: child["source"]["media_type"]
+                                                .as_str()
+                                                .unwrap_or("image/*")
+                                                .into(),
+                                            filename: None,
+                                            source: child["source"].clone(),
+                                        },
+                                    },
+                                    _ => return None,
+                                };
+                                Some(ResultBlock {
+                                    kind,
+                                    provider_extras: ProviderExtras::new(),
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    });
                     let output = match block["content"].as_str() {
                         Some(text) if error => CkOutputKind::ErrorText { text: text.into() },
                         Some(text) => CkOutputKind::Text { text: text.into() },
+                        None if children.is_some() && error => CkOutputKind::ErrorContent {
+                            blocks: children.unwrap(),
+                        },
+                        None if children.is_some() => CkOutputKind::Content {
+                            blocks: children.unwrap(),
+                        },
                         None if error => CkOutputKind::ErrorJson {
                             value: block["content"].clone(),
                         },
@@ -1065,6 +1100,63 @@ mod tests {
             mid: format!("cc-{ordinal}"),
             ordinal,
             message: envelope(&serde_json::from_str(raw).unwrap(), Some(&json!(raw))).unwrap(),
+        }
+    }
+
+    #[test]
+    fn admission_result_arrays_preserve_decoded_kind_and_original_bytes() {
+        for error in [false, true] {
+            let raw = format!(
+                r#"{{ "role":"user", "content":[{{"type":"tool_result","tool_use_id":"call","is_error":{error},"content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"AA=="}}}},{{"type":"text","text":"a\u0062"}},{{"type":"text","text":"tail"}}]}}] }}"#
+            );
+            let message = decode_message(&entry(&raw, 0)).unwrap().ck;
+            let block = &message.content[0];
+            let CkKind::ToolResult { output, .. } = &block.kind else {
+                panic!("not a result")
+            };
+            let blocks = match (&output.kind, error) {
+                (CkOutputKind::Content { blocks }, false)
+                | (CkOutputKind::ErrorContent { blocks }, true) => blocks,
+                _ => panic!("incorrect output kind: {:?}", output.kind),
+            };
+            assert_eq!(blocks.len(), 3);
+            assert!(
+                matches!(&blocks[0].kind, ResultBlockKind::Media { media } if media.kind == MediaKind::Image)
+            );
+            assert_eq!(blocks[1].kind, ResultBlockKind::Text { text: "ab".into() });
+            assert_eq!(
+                blocks[2].kind,
+                ResultBlockKind::Text {
+                    text: "tail".into()
+                }
+            );
+            assert_eq!(
+                block.provider_extras[EXTRAS]["kind"],
+                serde_json::to_value(&block.kind).unwrap()
+            );
+            assert_eq!(render(&message).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn admission_result_arrays_with_other_children_stay_json() {
+        for error in [false, true] {
+            for other in [
+                json!({"type":"future","data":1}),
+                json!({"type":"text","text":7}),
+            ] {
+                let native = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call","is_error":error,"content":[{"type":"text","text":"visible"},other]}]});
+                let raw = native.to_string();
+                let message = decode_message(&entry(&raw, 0)).unwrap().ck;
+                let CkKind::ToolResult { output, .. } = &message.content[0].kind else {
+                    panic!("not a result")
+                };
+                assert!(matches!(
+                    (&output.kind, error),
+                    (CkOutputKind::Json { .. }, false) | (CkOutputKind::ErrorJson { .. }, true)
+                ));
+                assert_eq!(render(&message).unwrap(), raw);
+            }
         }
     }
     fn request(messages: &[compact::status::StatusMessage]) -> TransformRequest {
