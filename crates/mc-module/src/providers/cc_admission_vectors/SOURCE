@@ -1,6 +1,6 @@
 {
   "repository": "thalamus",
   "path": "crates/thalamus-module/src/cc_step_codec/vectors/admission-tags.json",
-  "commit": null,
-  "sha256": null
+  "commit": "1c2cc9f97588061edad465db982dcec27aeb381b",
+  "sha256": "261f86e5df4b23e1b9c6fc4a6dffeac2003d9a8498c36df96bcff8f1a3601f95"
 }

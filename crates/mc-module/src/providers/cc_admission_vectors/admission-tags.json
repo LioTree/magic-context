@@ -1,1 +1,103 @@
-[]
+[
+  {
+    "name": "scalar-user",
+    "raw_message": "{ \"content\" : \"hello\", \"role\" : \"user\", \"extra\":1e+2 }",
+    "part_index": 0,
+    "number": 1,
+    "expected": "{ \"content\" : \"§1§ hello\", \"role\" : \"user\", \"extra\":1e+2 }"
+  },
+  {
+    "name": "user-text-block-with-marker-strip",
+    "raw_input": "{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"eA==\"}},{\"type\":\"text\",\"cache_control\":{\"type\":\"ephemeral\"},\"text\":\"question\"}]}",
+    "raw_message": "{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"eA==\"}},{\"type\":\"text\",\"text\":\"question\"}]}",
+    "part_index": 1,
+    "number": 2,
+    "expected": "{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"eA==\"}},{\"type\":\"text\",\"text\":\"§2§ question\"}]}"
+  },
+  {
+    "name": "assistant-text-after-last-thinking-with-marker-strip",
+    "raw_input": "{\"role\":\"assistant\", \"content\":[{\"type\":\"text\",\"text\":\"earlier\"},{ \"type\":\"thinking\", \"thinking\":\"think\\u0069ng\", \"signature\":\"sig\\/a\\u0042\",\"cache_control\":{\"type\":\"ephemeral\"} },{\"type\":\"redacted_thinking\",\"data\":\"opaque\\/blob\"},{\"type\":\"text\",\"text\":\"answer\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]}",
+    "raw_message": "{\"role\":\"assistant\", \"content\":[{\"type\":\"text\",\"text\":\"earlier\"},{ \"type\":\"thinking\", \"thinking\":\"think\\u0069ng\", \"signature\":\"sig\\/a\\u0042\" },{\"type\":\"redacted_thinking\",\"data\":\"opaque\\/blob\"},{\"type\":\"text\",\"text\":\"answer\"}]}",
+    "part_index": 3,
+    "number": 3,
+    "expected": "{\"role\":\"assistant\", \"content\":[{\"type\":\"text\",\"text\":\"earlier\"},{ \"type\":\"thinking\", \"thinking\":\"think\\u0069ng\", \"signature\":\"sig\\/a\\u0042\" },{\"type\":\"redacted_thinking\",\"data\":\"opaque\\/blob\"},{\"type\":\"text\",\"text\":\"§3§ answer\"}]}"
+  },
+  {
+    "name": "tool-result-scalar-content",
+    "raw_message": "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"preamble\"},{\"type\":\"tool_result\",\"tool_use_id\":\"tool-1\",\"content\":\"result\",\"is_error\":false}]}",
+    "part_index": 1,
+    "number": 4,
+    "expected": "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"preamble\"},{\"type\":\"tool_result\",\"tool_use_id\":\"tool-1\",\"content\":\"§4§ result\",\"is_error\":false}]}"
+  },
+  {
+    "name": "tool-result-first-text-after-image-with-marker-strip",
+    "raw_input": "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-2\",\"content\":[{\"cache_control\":{\"type\":\"ephemeral\"},\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"eA==\"}},{\"text\":\"first text\",\"type\":\"text\",\"cache_control\":{\"type\":\"ephemeral\"}},{\"type\":\"text\",\"text\":\"later text\"}],\"cache_control\":{\"type\":\"ephemeral\"}}]}",
+    "raw_message": "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-2\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"eA==\"}},{\"text\":\"first text\",\"type\":\"text\"},{\"type\":\"text\",\"text\":\"later text\"}]}]}",
+    "part_index": 0,
+    "number": 5,
+    "expected": "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-2\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"eA==\"}},{\"text\":\"§5§ first text\",\"type\":\"text\"},{\"type\":\"text\",\"text\":\"later text\"}]}]}"
+  },
+  {
+    "name": "json-escaped-newline",
+    "raw_message": "{\"role\":\"user\",\"content\":\"line one\\nline two\"}",
+    "part_index": 0,
+    "number": 6,
+    "expected": "{\"role\":\"user\",\"content\":\"§6§ line one\\nline two\"}"
+  },
+  {
+    "name": "json-escaped-quote",
+    "raw_message": "{\"role\":\"user\",\"content\":\"say \\\"hello\\\"\"}",
+    "part_index": 0,
+    "number": 7,
+    "expected": "{\"role\":\"user\",\"content\":\"§7§ say \\\"hello\\\"\"}"
+  },
+  {
+    "name": "json-escaped-backslash",
+    "raw_message": "{\"role\":\"user\",\"content\":\"C:\\\\tmp\\\\file\"}",
+    "part_index": 0,
+    "number": 8,
+    "expected": "{\"role\":\"user\",\"content\":\"§8§ C:\\\\tmp\\\\file\"}"
+  },
+  {
+    "name": "json-escaped-u00e9-and-solidus",
+    "raw_message": "{\"role\":\"user\",\"content\":\"caf\\u00e9\\/menu\"}",
+    "part_index": 0,
+    "number": 9,
+    "expected": "{\"role\":\"user\",\"content\":\"§9§ caf\\u00e9\\/menu\"}"
+  },
+  {
+    "name": "json-escaped-surrogate-pair",
+    "raw_message": "{\"role\":\"user\",\"content\":\"launch \\uD83D\\uDE80\"}",
+    "part_index": 0,
+    "number": 10,
+    "expected": "{\"role\":\"user\",\"content\":\"§10§ launch \\uD83D\\uDE80\"}"
+  },
+  {
+    "name": "literal-non-ascii-utf8-before-and-inside-target",
+    "raw_message": "{\"role\":\"user\",\"note\":\"café 🚀\",\"content\":[{\"type\":\"text\",\"text\":\"日本語 café 🚀\"}]}",
+    "part_index": 0,
+    "number": 11,
+    "expected": "{\"role\":\"user\",\"note\":\"café 🚀\",\"content\":[{\"type\":\"text\",\"text\":\"§11§ 日本語 café 🚀\"}]}"
+  },
+  {
+    "name": "empty-text",
+    "raw_message": "{\"role\":\"user\",\"content\":\"\"}",
+    "part_index": 0,
+    "number": 12,
+    "expected": "{\"role\":\"user\",\"content\":\"§12§ \"}"
+  },
+  {
+    "name": "leading-spaces",
+    "raw_message": "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"   indented\"}]}",
+    "part_index": 0,
+    "number": 13,
+    "expected": "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"§13§    indented\"}]}"
+  },
+  {
+    "name": "existing-tag-look-alike",
+    "raw_message": "{\"role\":\"user\",\"content\":\"§14§ already looks tagged\"}",
+    "part_index": 0,
+    "number": 14,
+    "expected": "{\"role\":\"user\",\"content\":\"§14§ §14§ already looks tagged\"}"
+  }
+]

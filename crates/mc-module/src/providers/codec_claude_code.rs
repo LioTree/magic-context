@@ -950,6 +950,11 @@ mod tests {
             part_index: usize,
             number: u64,
             expected: String,
+            /// The message as Claude Code sent it, before the gateway strips
+            /// transport markers. Only the gateway's own test reads it.
+            #[serde(default)]
+            #[allow(dead_code)]
+            raw_input: Option<String>,
         }
         let vectors: Vec<Vector> = serde_json::from_slice(bytes).expect("THALAMUS splice vectors");
         assert!(
