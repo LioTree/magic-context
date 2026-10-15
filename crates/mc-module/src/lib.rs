@@ -21102,7 +21102,18 @@ mod tests {
 
         impl FakeEntorhinal {
             async fn start(reply: Option<Value>, reply_at: Option<tokio::time::Instant>) -> Self {
-                let temp = tempfile::tempdir().unwrap();
+                Self::start_mode(reply, reply_at, false, false).await
+            }
+
+            async fn start_mode(
+                reply: Option<Value>,
+                reply_at: Option<tokio::time::Instant>,
+                never_reply: bool,
+                sleep_for_reply: bool,
+            ) -> Self {
+                let base = std::env::temp_dir().join("magic-context");
+                std::fs::create_dir_all(&base).unwrap();
+                let temp = tempfile::tempdir_in(base).unwrap();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
                 let key = generate_key().unwrap();
@@ -21162,12 +21173,19 @@ mod tests {
                                 let request: Value = serde_json::from_slice(&frame.body).unwrap();
                                 assert_eq!(request["method"], "resolve");
                                 observed.fetch_add(1, Ordering::SeqCst);
+                                if never_reply {
+                                    std::future::pending::<()>().await;
+                                }
                                 let at = *pending_reply_at.lock().unwrap();
                                 if let Some(at) = at {
                                     // Use an absolute instant so connect and route-open
                                     // consume the same budget as the reply wait.
-                                    while tokio::time::Instant::now() < at {
-                                        tokio::task::yield_now().await;
+                                    if sleep_for_reply {
+                                        tokio::time::sleep_until(at).await;
+                                    } else {
+                                        while tokio::time::Instant::now() < at {
+                                            tokio::task::yield_now().await;
+                                        }
                                     }
                                 }
                                 match &reply {
@@ -21294,6 +21312,156 @@ mod tests {
             for changed in ["git:changed", "pj-changed"] {
                 row(&store, changed);
                 assert_eq!(served(&handler, &store, 7), expected);
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn on_bind_latency_distribution_isolated() {
+            let base = std::env::temp_dir().join("magic-context");
+            std::fs::create_dir_all(&base).unwrap();
+            let root = tempfile::tempdir_in(base).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::binding_projects::on_bind_latency_host",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("MC_BIND_LATENCY_ROOT", root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_DATA_HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
+                .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                .env("MAGIC_CONTEXT_STORAGE_DIR", root.path().join("storage"))
+                .env("MAGIC_CONTEXT_TEST_DATA_DIR", root.path())
+                .env("OPENCODE_DB", root.path().join("opencode.db"))
+                .output()
+                .unwrap();
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("BIND_LATENCY never n=50"));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[ignore = "spawned by on_bind_latency_distribution_isolated with a throwaway root"]
+        async fn on_bind_latency_host() {
+            let root = PathBuf::from(
+                std::env::var_os("MC_BIND_LATENCY_ROOT").expect("isolated host only"),
+            );
+            let store = Arc::new(
+                McStore::open_for_test(&dev_descriptor_at(root.to_str().unwrap())).unwrap(),
+            );
+            let descriptors = std::process::Command::new("lsof")
+                .args(["-p", &std::process::id().to_string(), "-Fn"])
+                .output()
+                .unwrap();
+            assert!(descriptors.status.success());
+            let descriptors = String::from_utf8(descriptors.stdout).unwrap();
+            let databases: Vec<_> = descriptors
+                .lines()
+                .filter(|line| line.starts_with('n') && line.contains(".db"))
+                .collect();
+            assert!(!databases.is_empty());
+            for database in &databases {
+                assert!(Path::new(&database[1..]).starts_with(&root), "{database}");
+            }
+            println!("lsof -p {}: {databases:?}", std::process::id());
+            for mode in ["immediate", "near-deadline", "never"] {
+                let mut samples = Vec::new();
+                for iteration in 0..50 {
+                    let project = root.join(format!("{mode}-{iteration}"));
+                    std::fs::create_dir(&project).unwrap();
+                    let project = std::fs::canonicalize(project).unwrap();
+                    let mut handler = McHandler::with_producer_factory_config_resolver(
+                        Arc::new(TestProducerFactory {
+                            state: Arc::new(ProducerState::default()),
+                        }),
+                        default_test_config(),
+                        Arc::new(MissingSessionResolver),
+                    );
+                    handler.store.set(store.clone()).ok().unwrap();
+                    handler.project_identities =
+                        Arc::new(project_identity::ProjectIdentityResolver::with_sidecar_dir(
+                            root.join(format!("sidecars-{mode}-{iteration}")),
+                        ));
+                    handler
+                        .resolve_project_identity_for_test
+                        .store(true, Ordering::Relaxed);
+                    let reply = root_reply(&project);
+                    let expected = reply["result"]["projectId"].as_str().unwrap().to_string();
+                    let fake =
+                        FakeEntorhinal::start_mode(Some(reply), None, mode == "never", true).await;
+                    handler.entorhinal = entorhinal_resolve::EntorhinalResolver::new(Some(
+                        fake.connection_file.clone(),
+                    ));
+                    assert!(store.session_project_identity("ses").unwrap().is_none());
+                    let started = tokio::time::Instant::now();
+                    let started_unix_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros();
+                    if mode == "near-deadline" {
+                        *fake.reply_at.lock().unwrap() = Some(started + Duration::from_millis(495));
+                    }
+                    let bind_future = bind(&handler, &project, 7);
+                    if mode == "never" {
+                        tokio::time::timeout(Duration::from_secs(1), bind_future)
+                            .await
+                            .expect("bind failed to return after resolve timeout");
+                    } else {
+                        bind_future.await;
+                    }
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    if elapsed > 600.0 {
+                        println!("BIND_LATENCY_SLOW {mode} iteration={iteration} started_unix_us={started_unix_us} elapsed_ms={elapsed:.3}");
+                    }
+                    if mode == "near-deadline" {
+                        assert!(
+                            elapsed >= 495.0,
+                            "near-deadline peer answered early: {elapsed}"
+                        );
+                    }
+                    samples.push(elapsed);
+                    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+                    // Entorhinal's 500ms timeout covers network resolution only.
+                    // A timely answer can still wait on a synchronous pin-sidecar
+                    // write; the samples include that work in the full bind latency.
+                    if mode == "never" {
+                        assert!(
+                            elapsed < 1_000.0,
+                            "bind failed to return after resolve timeout: {elapsed}"
+                        );
+                        assert!(handler
+                            .project_identities
+                            .pinned_identity(&project)
+                            .is_none());
+                        assert!(served(&handler, &store, 7).starts_with("dir:"));
+                    } else {
+                        assert_eq!(
+                            handler
+                                .project_identities
+                                .pinned_identity(&project)
+                                .as_deref(),
+                            Some(expected.as_str())
+                        );
+                        assert_eq!(served(&handler, &store, 7), expected);
+                        assert!(elapsed < 10_000.0, "bind failed to return: {elapsed}");
+                    }
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "BIND_LATENCY {mode} n=50 p50_ms={:.3} p99_ms={:.3} over_500ms={}",
+                    samples[24],
+                    samples[49],
+                    samples.iter().filter(|ms| **ms > 500.0).count()
+                );
             }
         }
 
