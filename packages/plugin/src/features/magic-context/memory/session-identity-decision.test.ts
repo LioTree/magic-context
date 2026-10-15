@@ -622,12 +622,106 @@ describe("offline registered identity continuity", () => {
         expect(readRememberedProjectIdentity(directory)?.identity).toBe(fallback);
         expect(logs).toHaveLength(1);
         await awaitSessionIdentityDecision("managed", directory, options);
+        for (let i = 0; i < 3; i++)
+            expect(readSessionIdentityDecision("managed", directory, options)?.identity).toBe(
+                fallback,
+            );
+        expect(logs).toHaveLength(1);
         db.exec("DELETE FROM authority_managed");
         expect((await awaitSessionIdentityDecision("migrated", directory, options)).identity).toBe(
             registeredProjectId,
         );
         expect(readRememberedProjectIdentity(directory)?.identity).toBe(registeredProjectId);
+        expect(readSessionIdentityDecision("managed", directory, options)?.identity).toBe(fallback);
         expect(fake.calls).toHaveLength(2);
+    });
+
+    test("a populated Rust-managed project keeps its identity and data in a fresh session", async () => {
+        const directory = folder("populated-managed");
+        const fake = await fakeEndpoint(directory);
+        const db = hostDatabase();
+        const fallback = resolveProjectIdentityForSession(directory)!;
+        insertMemory(db, {
+            projectPath: fallback,
+            category: "USER_DIRECTIVES",
+            content: "managed project fact",
+        });
+        db.prepare(
+            "INSERT INTO authority_managed (project_path, context_store_uuid, marked_at) VALUES (?, 'fixture', 1)",
+        ).run(fallback);
+        const logs: string[] = [];
+        const options = {
+            db,
+            connectionFile: fake.connectionFile,
+            log: (line: string) => logs.push(line),
+        };
+        const decision = await awaitSessionIdentityDecision(
+            "populated-managed",
+            directory,
+            options,
+        );
+        recordSessionProjectIdentity(db, "populated-managed", decision.identity);
+        expect(decision.identity).toBe(fallback);
+        expect(row(db, "populated-managed")).toBe(fallback);
+        expect(readRememberedProjectIdentity(directory)?.identity).toBe(fallback);
+        for (let i = 0; i < 3; i++)
+            expect(
+                (await awaitSessionIdentityDecision("populated-managed", directory, options))
+                    .identity,
+            ).toBe(fallback);
+        expect(logs).toHaveLength(1);
+        expect(logs[0]).toContain("single-store migration required");
+        expect(fake.calls).toHaveLength(1);
+        expect(
+            db
+                .prepare("SELECT COUNT(*) AS count FROM memories WHERE project_path = ?")
+                .get(fallback),
+        ).toEqual({ count: 1 });
+    });
+
+    test("an authority query failure keeps the fallback without pinning", async () => {
+        const directory = folder("unreadable-authority");
+        const fake = await fakeEndpoint(directory);
+        const db = database();
+        db.exec("CREATE TABLE authority_managed (wrong_column TEXT)");
+        const fallback = resolveProjectIdentityForSession(directory);
+        const logs: string[] = [];
+        const options = {
+            db,
+            connectionFile: fake.connectionFile,
+            log: (line: string) => logs.push(line),
+        };
+        const decision = await awaitSessionIdentityDecision("authority-error", directory, options);
+        expect(decision.identity).toBe(fallback);
+        expect(readRememberedProjectIdentity(directory)?.identity).toBe(fallback);
+        await awaitSessionIdentityDecision("authority-error", directory, options);
+        expect(logs).toHaveLength(1);
+        expect(logs[0]).toContain("authority check failed");
+        expect(fake.calls).toHaveLength(1);
+    });
+
+    test.each([
+        false,
+        true,
+    ])("a store with authority table=%s and no matching row accepts and pins pj", async (hasTable) => {
+        const directory = folder("unmanaged");
+        const fake = await fakeEndpoint(directory);
+        const db = database();
+        if (hasTable) {
+            db.exec(
+                "CREATE TABLE authority_managed (project_path TEXT PRIMARY KEY); INSERT INTO authority_managed VALUES ('git:other')",
+            );
+        }
+        const logs: string[] = [];
+        const decision = await awaitSessionIdentityDecision("unmanaged", directory, {
+            db,
+            connectionFile: fake.connectionFile,
+            log: (line: string) => logs.push(line),
+        });
+        expect(decision.identity).toBe(registeredProjectId);
+        expect(readRememberedProjectIdentity(directory)?.identity).toBe(registeredProjectId);
+        expect(logs).toHaveLength(0);
+        expect(fake.calls).toHaveLength(1);
     });
 });
 
