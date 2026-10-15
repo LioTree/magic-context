@@ -21111,7 +21111,7 @@ mod tests {
                 never_reply: bool,
                 sleep_for_reply: bool,
             ) -> Self {
-                let base = std::env::temp_dir().join("magic-context");
+                let base = std::env::temp_dir().join("magic-context/pj-pin-async");
                 std::fs::create_dir_all(&base).unwrap();
                 let temp = tempfile::tempdir_in(base).unwrap();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -21304,6 +21304,7 @@ mod tests {
             assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
             // Removing the pin distinguishes the stored decision from a fresh
             // directory lookup that would otherwise return the same identity.
+            handler.project_identities.flush_pins();
             std::fs::remove_dir_all(temp.path().join("sidecars")).unwrap();
             for _ in 0..3 {
                 assert_eq!(served(&handler, &store, 7), expected);
@@ -21318,7 +21319,7 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn on_bind_latency_distribution_isolated() {
-            let base = std::env::temp_dir().join("magic-context");
+            let base = std::env::temp_dir().join("magic-context/pj-pin-async");
             std::fs::create_dir_all(&base).unwrap();
             let root = tempfile::tempdir_in(base).unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -21346,6 +21347,81 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(String::from_utf8_lossy(&output.stdout).contains("BIND_LATENCY never n=50"));
+        }
+
+        #[tokio::test]
+        async fn on_bind_slow_pin_writer_latency_distribution() {
+            use mc_store::private_permissions::write_file_atomic;
+            use project_identity::pin_writer::PinWriter;
+
+            for delay_ms in [0, 1_000] {
+                let base = std::env::temp_dir().join("magic-context/pj-pin-async");
+                std::fs::create_dir_all(&base).unwrap();
+                let temp = tempfile::tempdir_in(base).unwrap();
+                let store = Arc::new(
+                    McStore::open_for_test(&dev_descriptor_at(temp.path().to_str().unwrap()))
+                        .unwrap(),
+                );
+                let mut handler = McHandler::with_producer_factory_config_resolver(
+                    Arc::new(TestProducerFactory {
+                        state: Arc::new(ProducerState::default()),
+                    }),
+                    default_test_config(),
+                    Arc::new(MissingSessionResolver),
+                );
+                handler.store.set(store.clone()).ok().unwrap();
+                handler
+                    .resolve_project_identity_for_test
+                    .store(true, Ordering::Relaxed);
+                let (started_send, started_recv) = std::sync::mpsc::channel();
+                let writes = Arc::new(AtomicUsize::new(0));
+                let observed = writes.clone();
+                let writer = PinWriter::new(Arc::new(move |path, bytes, private| {
+                    let _ = started_send.send(());
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    write_file_atomic(path, bytes, private)
+                }));
+                handler.project_identities =
+                    Arc::new(project_identity::ProjectIdentityResolver::with_pin_writer(
+                        temp.path().join("sidecars"),
+                        writer.clone(),
+                    ));
+                let mut samples = Vec::new();
+                for iteration in 0..50 {
+                    let project = temp.path().join(format!("pin-{delay_ms}-{iteration}"));
+                    std::fs::create_dir(&project).unwrap();
+                    let fake = FakeEntorhinal::start(Some(root_reply(&project)), None).await;
+                    handler.entorhinal = entorhinal_resolve::EntorhinalResolver::new(Some(
+                        fake.connection_file.clone(),
+                    ));
+                    assert!(store.session_project_identity("ses").unwrap().is_none());
+                    let started = std::time::Instant::now();
+                    bind(&handler, &project, 7).await;
+                    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+                    samples.push(elapsed);
+                    assert!(
+                        elapsed < 500.0,
+                        "bind waited for pin writer ({delay_ms} ms): {elapsed:.3} ms"
+                    );
+                    assert_eq!(served(&handler, &store, 7), "pj-resolve-root");
+                    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "PIN_BIND_LATENCY writer_delay_ms={delay_ms} n=50 p50_ms={:.3} p99_ms={:.3}",
+                    samples[24], samples[49]
+                );
+                started_recv.recv_timeout(Duration::from_secs(2)).unwrap();
+                // A bounded shutdown may abandon queued work, but cannot cancel
+                // the atomic write already running. Keep its temporary root alive.
+                writer.shutdown(Duration::from_millis(250));
+                assert!(writer.flush(Duration::from_secs(2)));
+                assert!(
+                    writes.load(Ordering::SeqCst) > 0,
+                    "injected writer never ran"
+                );
+            }
         }
 
         #[cfg(unix)]
@@ -21430,9 +21506,7 @@ mod tests {
                     }
                     samples.push(elapsed);
                     assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
-                    // Entorhinal's 500ms timeout covers network resolution only.
-                    // A timely answer can still wait on a synchronous pin-sidecar
-                    // write; the samples include that work in the full bind latency.
+                    // The network deadline does not include background persistence.
                     if mode == "never" {
                         assert!(
                             elapsed < 1_000.0,
@@ -21454,6 +21528,7 @@ mod tests {
                         assert_eq!(served(&handler, &store, 7), expected);
                         assert!(elapsed < 10_000.0, "bind failed to return: {elapsed}");
                     }
+                    handler.project_identities.flush_pins();
                 }
                 samples.sort_by(f64::total_cmp);
                 println!(
@@ -21551,6 +21626,7 @@ mod tests {
                     Some(expected)
                 );
                 assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+                handler.project_identities.flush_pins();
                 assert!(temp.path().join("sidecars").exists());
             }
         }

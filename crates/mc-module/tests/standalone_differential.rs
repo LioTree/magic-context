@@ -87,8 +87,13 @@ fn compile_host(repo: &Path, scratch: &Path, revision: Option<&str>) -> PathBuf 
         "decay_render",
         "entorhinal_resolve",
         "route_targets",
+        "project_pin_writer",
     ] {
-        if matches!(name, "entorhinal_resolve" | "route_targets") && revision.is_some() {
+        if matches!(
+            name,
+            "entorhinal_resolve" | "route_targets" | "project_pin_writer"
+        ) && revision.is_some()
+        {
             continue;
         }
         let path = format!("crates/mc-module/src/{name}.rs");
