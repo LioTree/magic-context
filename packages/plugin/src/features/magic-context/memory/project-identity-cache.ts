@@ -65,6 +65,7 @@ function cachePath(directory: string, storageDir = getMagicContextStorageDir()):
 
 /** A small atomic sidecar avoids opening or migrating the store during plugin boot. */
 export function rememberGitIdentity(directory: string, identity: string): void {
+    if (!/^git:[0-9a-f]{7,64}$/.test(identity)) return;
     try {
         if (isPinnedProjectIdentity(readRememberedProjectIdentity(directory)?.identity)) return;
         const destination = cachePath(directory);
@@ -74,6 +75,24 @@ export function rememberGitIdentity(directory: string, identity: string): void {
         );
     } catch {
         // Read-only storage must not turn a successful git probe into a failure.
+    }
+}
+
+/** Persist an accepted live resolution after the caller has checked folder eligibility and topology. */
+export function rememberPinnedProjectIdentity(
+    directory: string,
+    identity: string,
+    gitCommonDir?: string,
+): void {
+    if (!isPinnedProjectIdentity(identity)) return;
+    try {
+        if (isPinnedProjectIdentity(readRememberedProjectIdentity(directory)?.identity)) return;
+        writeStorageFileAtomicSync(
+            cachePath(directory),
+            JSON.stringify({ directory: projectDirectoryKey(directory), identity, gitCommonDir }),
+        );
+    } catch {
+        // A read-only sidecar store must not prevent use of the live identity for this session.
     }
 }
 

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import resolveVectors from "../../../../../../test-vectors/project-resolve-v1/resolve.json";
 import * as logger from "../../../shared/logger";
 import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
@@ -11,6 +12,7 @@ import {
     readRememberedGitIdentity,
     readRememberedProjectIdentity,
     rememberGitIdentity,
+    rememberPinnedProjectIdentity,
 } from "./project-identity-cache";
 
 let storageDir: string;
@@ -117,6 +119,31 @@ describe("project identity sidecars", () => {
         const before = fs.readFileSync(file, "utf8");
         rememberGitIdentity(directory, "git:abc1234");
         expect(fs.readFileSync(file, "utf8")).toBe(before);
+    });
+
+    test("a live pin replaces a legacy git record but never another pin", () => {
+        const directory = join(storageDir, "project");
+        const file = writeRecord(directory, "git:abc1234");
+        rememberPinnedProjectIdentity(directory, "pj-A", "/metadata/repo.git");
+        expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({
+            directory: projectDirectoryKey(directory),
+            identity: "pj-A",
+            gitCommonDir: "/metadata/repo.git",
+        });
+        const before = fs.readFileSync(file, "utf8");
+        rememberPinnedProjectIdentity(directory, "pj-B", "/metadata/other.git");
+        expect(fs.readFileSync(file, "utf8")).toBe(before);
+    });
+
+    test("neither sidecar writer persists an implicit id or an invalid identity", () => {
+        const directory = join(storageDir, "project");
+        const implicit = resolveVectors[3].reply.result;
+        if (!implicit) throw new Error("Missing implicit resolve vector");
+        for (const identity of [implicit.projectId, "pj-a/b", "dir:abc1234"]) {
+            rememberPinnedProjectIdentity(directory, identity);
+            rememberGitIdentity(directory, identity);
+        }
+        expect(fs.existsSync(join(storageDir, "project-identities"))).toBe(false);
     });
 });
 

@@ -5,12 +5,16 @@ import * as fs from "node:fs";
 import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import parity from "../../../../../../test-vectors/project-identity-parity.json";
+import resolveVectors from "../../../../../../test-vectors/project-resolve-v1/resolve.json";
 import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
     describeUnresolvedProjectIdentity,
     isLinkedGitWorktree,
+    type LiveProjectIdentityAnswer,
+    rememberResolvedProjectIdentity,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
     resolveProjectIdentityStrict,
@@ -143,6 +147,234 @@ function pin(directory: string, identity = "pj-A"): string {
     writeFileSync(file, JSON.stringify({ directory: projectDirectoryKey(directory), identity }));
     return file;
 }
+
+function liveAnswer(overrides: Partial<LiveProjectIdentityAnswer> = {}): LiveProjectIdentityAnswer {
+    const result = structuredClone(resolveVectors[0].reply.result);
+    if (!result) throw new Error("Missing root resolve vector");
+    return { ...result, ...overrides };
+}
+
+function replaceVectorStrings(value: unknown, replacements: Record<string, string>): unknown {
+    if (typeof value === "string") return replacements[value] ?? value;
+    if (Array.isArray(value)) return value.map((item) => replaceVectorStrings(item, replacements));
+    if (value !== null && typeof value === "object")
+        return Object.fromEntries(
+            Object.entries(value).map(([key, child]) => [
+                key,
+                replaceVectorStrings(child, replacements),
+            ]),
+        );
+    return value;
+}
+
+function sidecarBytes(): Map<string, string> {
+    const dir = join(storageDir, "project-identities");
+    if (!fs.existsSync(dir)) return new Map();
+    return new Map(
+        fs.readdirSync(dir).map((file) => [file, readFileSync(join(dir, file), "utf8")]),
+    );
+}
+
+describe("live project pin writes", () => {
+    const rowNames = [
+        "registered-root",
+        "registered-subfolder",
+        "registered-linked-worktree",
+        "unregistered-checkout",
+        "nested-registration-without-parent-pin",
+        "nested-registration-with-parent-pin",
+        "gone-registered-root-is-accepted",
+        "legacy-git-record-replaced-by-live-project-pin",
+        "pj-pin-preserves-sidecar-bytes",
+        "walk-subfolder-canonical-root-equals-checkout",
+        "walk-subfolder-canonical-root-differs-from-checkout",
+    ];
+    for (const name of rowNames) {
+        test(`parity writer: ${name}`, () => {
+            const row = parity.cases.find((candidate) => candidate.name === name);
+            if (!row || typeof row.answer === "string")
+                throw new Error(`Missing live row: ${name}`);
+            const expand = (value: string): string => value.replaceAll("<fixture>", testRoot);
+            const fixture = parity.fixtures[row.fixture as keyof typeof parity.fixtures];
+            for (const repo of fixture.repositories) {
+                mkdirSync(expand(repo.root), { recursive: true });
+                mkdirSync(expand(repo.gitDir), { recursive: true });
+                if (repo.kind !== "main")
+                    writeFileSync(
+                        join(expand(repo.root), ".git"),
+                        `gitdir: ${expand(repo.gitDir)}\n`,
+                    );
+                if (repo.kind === "worktree")
+                    writeFileSync(
+                        join(expand(repo.gitDir), "commondir"),
+                        `${expand(repo.commonDir)}\n`,
+                    );
+            }
+            for (const directory of fixture.directories)
+                mkdirSync(expand(directory), { recursive: true });
+            for (const record of row.sidecars) {
+                const file = pin(expand(record.directory), record.identity);
+                writeFileSync(
+                    file,
+                    `${JSON.stringify(
+                        replaceVectorStrings(
+                            record,
+                            Object.fromEntries(
+                                Object.values(record)
+                                    .filter((value): value is string => typeof value === "string")
+                                    .map((value) => [value, expand(value)]),
+                            ),
+                        ),
+                        null,
+                        2,
+                    )}\n`,
+                );
+            }
+            const replacements = Object.fromEntries(
+                Object.entries(row.answer.replaceStrings).map(([from, to]) => [from, expand(to)]),
+            );
+            const vector = replaceVectorStrings(
+                resolveVectors[row.answer.caseIndex],
+                replacements,
+            ) as {
+                reply: { result: LiveProjectIdentityAnswer };
+            };
+            if ("mutations" in row.answer) {
+                for (const mutation of row.answer.mutations ?? []) {
+                    let target = vector as unknown as Record<string, unknown>;
+                    for (const key of mutation.path.slice(0, -1))
+                        target = target[key] as Record<string, unknown>;
+                    const key = mutation.path.at(-1);
+                    if (!key) throw new Error("Mutation path must name a field");
+                    target[key] =
+                        typeof mutation.value === "string"
+                            ? expand(mutation.value)
+                            : mutation.value;
+                }
+            }
+            const before = sidecarBytes();
+            let gitCalls = 0;
+            __setProjectIdentityTestHooks({
+                execFileSync: (() => {
+                    gitCalls++;
+                    throw new Error("Pin writes must not run git");
+                }) as unknown as typeof execFileSync,
+            });
+            rememberResolvedProjectIdentity(expand(row.directory), vector.reply.result);
+            const after = sidecarBytes();
+            const writes = [...after]
+                .filter(([file, bytes]) => before.get(file) !== bytes)
+                .map(([, bytes]) => JSON.parse(bytes));
+            const expected = row.expected.sidecarWrites
+                .filter((record) => record.identity.startsWith("pj-"))
+                .map((record) => ({
+                    ...record,
+                    directory: expand(record.directory),
+                    ...("gitCommonDir" in record
+                        ? { gitCommonDir: expand(record.gitCommonDir) }
+                        : {}),
+                }));
+            expect(writes.sort((a, b) => a.directory.localeCompare(b.directory))).toEqual(
+                expected.sort((a, b) => a.directory.localeCompare(b.directory)),
+            );
+            for (const [file, bytes] of before) {
+                if (
+                    !writes.some(
+                        (record) =>
+                            projectDirectoryKey(record.directory) === JSON.parse(bytes).directory,
+                    )
+                )
+                    expect(after.get(file)).toBe(bytes);
+            }
+            expect(gitCalls).toBe(0);
+        });
+    }
+
+    test("rejects implicit and unknown vias even with a registered project id", () => {
+        const directory = join(testRoot, "plain");
+        mkdirSync(directory);
+        for (const via of ["implicit", "future-via"])
+            rememberResolvedProjectIdentity(
+                directory,
+                liveAnswer({ via, canonicalRoot: directory }),
+            );
+        expect(sidecarBytes().size).toBe(0);
+    });
+
+    test("does not pin a linked subfolder after a cached main-checkout probe", () => {
+        const root = join(testRoot, "checkout");
+        const sub = join(root, "sub");
+        const gitDir = join(testRoot, "metadata");
+        mkdirSync(sub, { recursive: true });
+        mkdirSync(gitDir);
+        expect(isLinkedGitWorktree(sub)).toBe(false);
+        writeFileSync(join(root, ".git"), `gitdir: ${gitDir}\n`);
+        writeFileSync(join(gitDir, "commondir"), ".\n");
+        rememberResolvedProjectIdentity(sub, liveAnswer({ canonicalRoot: root }));
+        expect(sidecarBytes().size).toBe(0);
+    });
+
+    test("rejects an implicit id even when the via is accepted", () => {
+        const directory = join(testRoot, "plain");
+        mkdirSync(directory);
+        const implicit = resolveVectors[3].reply.result;
+        if (!implicit) throw new Error("Missing implicit resolve vector");
+        rememberResolvedProjectIdentity(directory, {
+            ...implicit,
+            via: "root",
+            canonicalRoot: directory,
+        });
+        expect(sidecarBytes().size).toBe(0);
+    });
+
+    test("pins non-git folders for every accepted via without inventing a common dir", () => {
+        for (const via of ["root", "walk", "containment", "worktree"]) {
+            const directory = join(testRoot, via);
+            mkdirSync(directory);
+            rememberResolvedProjectIdentity(directory, liveAnswer({ via, canonicalRoot: null }));
+            expect(readRememberedProjectIdentity(directory)).toEqual({
+                directory,
+                identity: "pj-resolve-root",
+            });
+        }
+        expect(sidecarBytes().size).toBe(4);
+    });
+
+    test("compares realpath and directory-key spellings before pinning a checkout root", () => {
+        const root = join(testRoot, "repo");
+        const sub = join(root, "sub");
+        const alias = join(testRoot, "alias");
+        mkdirSync(join(root, ".git"), { recursive: true });
+        mkdirSync(sub);
+        fs.symlinkSync(root, alias);
+        rememberResolvedProjectIdentity(sub, liveAnswer({ canonicalRoot: `${alias}/` }));
+        expect(readRememberedProjectIdentity(root)?.identity).toBe("pj-resolve-root");
+        expect(readRememberedProjectIdentity(sub)?.identity).toBe("pj-resolve-root");
+    });
+
+    test("a missing canonical root does not prevent pinning the resolved folder", () => {
+        const root = join(testRoot, "repo");
+        const sub = join(root, "sub");
+        mkdirSync(join(root, ".git"), { recursive: true });
+        mkdirSync(sub);
+        rememberResolvedProjectIdentity(
+            sub,
+            liveAnswer({ canonicalRoot: join(testRoot, "missing") }),
+        );
+        expect(readRememberedProjectIdentity(sub)?.identity).toBe("pj-resolve-root");
+        expect(readRememberedProjectIdentity(root)).toBeUndefined();
+    });
+
+    test("home and missing folders cannot gain pins from live answers", () => {
+        const home = join(testRoot, "home");
+        mkdirSync(join(home, ".git"), { recursive: true });
+        mkdirSync(join(home, "sub"));
+        __setProjectIdentityTestHooks({ homeDirectory: () => home });
+        for (const directory of [home, join(home, "sub"), join(testRoot, "missing")])
+            rememberResolvedProjectIdentity(directory, liveAnswer({ canonicalRoot: directory }));
+        expect(sidecarBytes().size).toBe(0);
+    });
+});
 
 describe("project pin precedence", () => {
     test("pj pin wins over a live git root without a git probe", () => {
