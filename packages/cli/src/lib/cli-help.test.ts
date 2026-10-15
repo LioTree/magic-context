@@ -88,7 +88,7 @@ describe("CLI --help per subcommand", () => {
         [["doctor", "project-ids", "plan"], "Usage: magic-context doctor project-ids plan"],
         [
             ["doctor", "project-ids", "apply", "--check"],
-            "magic-context doctor project-ids apply --check <plan>",
+            "magic-context doctor project-ids apply [--check] <plan>",
         ],
         [["doctor", "list-hidden-sessions"], "Usage: magic-context doctor list-hidden-sessions"],
         [["doctor", "migrate"], "Magic Context doctor migrate"],

@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import {
     copyFileSync,
+    existsSync,
     mkdirSync,
+    readdirSync,
     readFileSync,
     realpathSync,
     rmSync,
@@ -18,8 +20,10 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { mergeProjectIdentities } from "@magic-context/core/features/magic-context/storage-identity-merge";
 import { Database } from "@magic-context/core/shared/sqlite";
+import * as storagePermissions from "@magic-context/core/shared/storage-permissions";
 import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import * as databaseAccess from "../lib/database-access";
+import { runMergeIdentityCli } from "./doctor-merge-identity";
 import { buildProjectIdPlan, type ProjectIdPlan, runProjectIdsCli } from "./doctor-project-ids";
 import {
     type ProjectIdsApplyDeps,
@@ -56,12 +60,17 @@ function folder(name: string): string {
     return path;
 }
 function sidecar(directory: string, identity = from): string {
-    const path = join(
-        folder("project-identities"),
-        `${createHash("sha256").update(directory).digest("hex")}.json`,
-    );
+    folder("project-identities");
+    const path = sidecarPath(directory);
     writeFileSync(path, JSON.stringify({ directory, identity }));
     return path;
+}
+function sidecarPath(directory: string): string {
+    return join(
+        root,
+        "project-identities",
+        `${createHash("sha256").update(directory).digest("hex")}.json`,
+    );
 }
 function hostDatabase(): string {
     const path = join(root, "planned-host.db");
@@ -97,6 +106,98 @@ function planFile(plan: ProjectIdPlan): string {
 }
 function bytes(path: string): string {
     return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+const second = "dir:second";
+async function orderedPlan(): Promise<ProjectIdPlan> {
+    db.prepare("INSERT INTO project_state(project_path) VALUES (?)").run(second);
+    sidecar(folder("second"), second);
+    const plan = await makePlan();
+    plan.pairs = [from, second].map((identity) => {
+        const pair = plan.pairs.find((candidate) => candidate.from === identity);
+        if (!pair) throw new Error(`Missing fixture pair: ${identity}`);
+        return pair;
+    });
+    return plan;
+}
+function backups(): string[] {
+    return readdirSync(root).filter((entry) => entry.startsWith("project-ids-backup-"));
+}
+function mappings(): unknown[] {
+    return db
+        .prepare(
+            "SELECT old_project_path, new_project_path FROM v22_identity_rekey_map ORDER BY old_project_path",
+        )
+        .all();
+}
+async function apply(plan: ProjectIdPlan): Promise<{ code: number; statuses: string[] }> {
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+        const code = await runProjectIdsCli(["apply", planFile(plan), "--db", dbPath], deps);
+        const statuses = log.mock.calls
+            .flat()
+            .map(String)
+            .filter((line) => /: (applied|pins repaired|already applied)$/.test(line));
+        return { code, statuses };
+    } finally {
+        log.mockRestore();
+    }
+}
+
+async function killedApply(plan: ProjectIdPlan, point: "committed" | "applied"): Promise<void> {
+    const path = planFile(plan);
+    const source = `
+        import { spyOn } from 'bun:test';
+        import { writeSync } from 'node:fs';
+        import * as permissions from ${JSON.stringify(join(import.meta.dir, "../../../plugin/src/shared/storage-permissions.ts"))};
+        import { runProjectIdsCli } from ${JSON.stringify(join(import.meta.dir, "doctor-project-ids.ts"))};
+        const kill = () => { writeSync(1, 'KILL CHECKPOINT\\n'); process.kill(process.pid, 'SIGKILL'); };
+        if (${JSON.stringify(point)} === 'committed') {
+            const write = permissions.writeStorageFileAtomicSync;
+            spyOn(permissions, 'writeStorageFileAtomicSync').mockImplementation((path, ...args) => {
+                if (path === ${JSON.stringify(sidecarPath(plan.pairs[0].folders[0].directory))}) kill();
+                return write(path, ...args);
+            });
+        } else {
+            const log = console.log;
+            spyOn(console, 'log').mockImplementation((...args) => {
+                log(...args);
+                if (args[0] === ${JSON.stringify(`${from} → ${to}: applied`)}) kill();
+            });
+        }
+        const code = await runProjectIdsCli(['apply', ${JSON.stringify(path)}, '--db', ${JSON.stringify(dbPath)}], {
+            inspectHolders: () => ({ safe: true, blockers: [] }),
+            probe: () => ({ status: 'free' }),
+            freeBytes: () => Number.MAX_SAFE_INTEGER,
+        });
+        process.exit(code);
+    `;
+    const child = Bun.spawn([process.execPath, "--eval", source], {
+        cwd: import.meta.dir,
+        env: {
+            ...process.env,
+            HOME: root,
+            XDG_DATA_HOME: join(root, "data"),
+            XDG_CONFIG_HOME: join(root, "config"),
+            XDG_STATE_HOME: join(root, "state"),
+            XDG_RUNTIME_DIR: join(root, "runtime"),
+            OPENCODE_DB: join(root, "host.db"),
+            MAGIC_CONTEXT_STORAGE_DIR: root,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+        windowsHide: true,
+    });
+    const [code, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+    ]);
+    expect({ checkpoint: stdout.includes("KILL CHECKPOINT"), stderr }).toEqual({
+        checkpoint: true,
+        stderr: "",
+    });
+    expect(code).not.toBe(0);
 }
 
 describe("doctor project-ids apply preflight", () => {
@@ -138,18 +239,6 @@ describe("doctor project-ids apply preflight", () => {
             db.prepare("SELECT 1 FROM project_state WHERE project_path = ?").get(from),
         ).toBeTruthy();
         expect(db.prepare("SELECT * FROM v22_identity_rekey_map").all()).toEqual([]);
-    });
-
-    it("bare apply refuses without reading databases or writing anything", async () => {
-        const host = hostDatabase();
-        const plan = await makePlan(host);
-        db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-        const paths = [dbPath, host, sidecar(folder("checkout"))];
-        const before = paths.map(bytes);
-        await expect(
-            runProjectIdsCli(["apply", planFile(plan), "--db", dbPath], deps),
-        ).rejects.toThrow("Nothing was changed. Use doctor project-ids apply --check");
-        expect(paths.map(bytes)).toEqual(before);
     });
 
     it("refuses another store before opening it", async () => {
@@ -366,7 +455,7 @@ describe("doctor project-ids apply preflight", () => {
         ).toThrow("Invalid project identity plan pair");
     });
 
-    it("parses only an explicit read-only check with one plan path", () => {
+    it("parses apply and an optional read-only check with one plan path", () => {
         expect(
             parseProjectIdsApplyArgs([
                 "apply",
@@ -377,7 +466,18 @@ describe("doctor project-ids apply preflight", () => {
                 "--host-db",
                 "host.db",
             ]),
-        ).toEqual({ planPath: "plan.json", dbPath: "context.db", hostPath: "host.db" });
+        ).toEqual({
+            planPath: "plan.json",
+            check: true,
+            dbPath: "context.db",
+            hostPath: "host.db",
+        });
+        expect(parseProjectIdsApplyArgs(["apply", "plan.json"])).toEqual({
+            planPath: "plan.json",
+            check: false,
+            dbPath: undefined,
+            hostPath: undefined,
+        });
         for (const args of [
             ["apply"],
             ["apply", "--check"],
@@ -414,5 +514,286 @@ describe("doctor project-ids apply preflight", () => {
         }
         expect(bytes(dbPath)).toBe(before);
         expect(db.prepare("SELECT * FROM v22_identity_rekey_map").all()).toEqual([]);
+    });
+});
+
+describe("doctor project-ids apply pairs", () => {
+    it("takes one backup for two merges, including legacy sidecars", async () => {
+        const plan = await orderedPlan();
+        const sidecars = plan.pairs.map((pair) => sidecar(pair.folders[0].directory, pair.from));
+        const originals = sidecars.map(bytes);
+        const nested = join(folder("project-identities/nested"), "extra.bin");
+        writeFileSync(nested, "also backed up");
+        expect(db.prepare("SELECT 1 FROM project_state WHERE project_path = ?").get(to)).toBeNull();
+        expect(await apply(plan)).toEqual({
+            code: 0,
+            statuses: [`${from} → ${to}: applied`, `${second} → ${to}: applied`],
+        });
+        expect(backups()).toHaveLength(1);
+        const backup = join(root, backups()[0]);
+        expect(
+            sidecars.map((path) =>
+                bytes(join(backup, "project-identities", path.split("/").pop()!)),
+            ),
+        ).toEqual(originals);
+        expect(readFileSync(join(backup, "project-identities/nested/extra.bin"), "utf8")).toBe(
+            "also backed up",
+        );
+        const savedDb = new Database(join(backup, "context.db"), { readonly: true });
+        try {
+            expect(
+                savedDb
+                    .prepare("SELECT project_path FROM project_state ORDER BY project_path")
+                    .all(),
+            ).toEqual([{ project_path: second }, { project_path: from }]);
+            expect(savedDb.prepare("SELECT * FROM v22_identity_rekey_map").all()).toEqual([]);
+        } finally {
+            savedDb.close();
+        }
+        expect(mappings()).toEqual([
+            { old_project_path: second, new_project_path: to },
+            { old_project_path: from, new_project_path: to },
+        ]);
+        expect(db.prepare("SELECT project_path FROM project_state").all()).toEqual([
+            { project_path: to },
+        ]);
+        for (const path of sidecars)
+            expect(JSON.parse(readFileSync(path, "utf8")).identity).toBe(to);
+    });
+
+    it("pins every existing non-worktree folder after commit using live file metadata", async () => {
+        const plan = await makePlan();
+        const main = folder("checkout");
+        const git = folder("checkout/.git");
+        const sub = folder("checkout/sub");
+        const worktree = folder("worktree");
+        const gitdir = folder("checkout/.git/worktrees/linked");
+        writeFileSync(join(gitdir, "commondir"), "../..");
+        writeFileSync(join(worktree, ".git"), `gitdir: ${gitdir}\n`);
+        const separate = folder("separate");
+        const separateGit = folder("separate-gitdir");
+        writeFileSync(join(separate, ".git"), `gitdir: ${separateGit}\n`);
+        const missing = join(root, "missing");
+        const paths = [main, sub, worktree, separate, missing].map((directory) =>
+            sidecar(directory),
+        );
+        const worktreeBytes = bytes(paths[2]);
+        plan.pairs[0].folders = [main, sub, worktree, separate, missing].map((directory) => ({
+            directory,
+            exists: true,
+            worktree: false,
+            gitCommonDir: "/stale/planned/gitdir",
+        }));
+        const write = storagePermissions.writeStorageFileAtomicSync;
+        const writes: string[] = [];
+        const spy = spyOn(storagePermissions, "writeStorageFileAtomicSync").mockImplementation(
+            (path, content, ...rest) => {
+                const reader = new Database(dbPath, { readonly: true });
+                try {
+                    expect(
+                        reader
+                            .prepare(
+                                "SELECT new_project_path FROM v22_identity_rekey_map WHERE old_project_path = ?",
+                            )
+                            .get(from),
+                    ).toEqual({ new_project_path: to });
+                    expect(
+                        reader
+                            .prepare("SELECT 1 FROM project_state WHERE project_path = ?")
+                            .get(from),
+                    ).toBeNull();
+                } finally {
+                    reader.close();
+                }
+                writes.push(path);
+                write(path, content, ...rest);
+            },
+        );
+        try {
+            expect((await apply(plan)).code).toBe(0);
+        } finally {
+            spy.mockRestore();
+        }
+        expect(writes).toEqual([paths[0], paths[1], paths[3]]);
+        expect(JSON.parse(readFileSync(paths[0], "utf8"))).toEqual({
+            directory: main,
+            identity: to,
+            gitCommonDir: git,
+        });
+        expect(JSON.parse(readFileSync(paths[1], "utf8"))).toEqual({
+            directory: sub,
+            identity: to,
+            gitCommonDir: git,
+        });
+        expect(JSON.parse(readFileSync(paths[3], "utf8"))).toEqual({
+            directory: separate,
+            identity: to,
+            gitCommonDir: separateGit,
+        });
+        expect(bytes(paths[2])).toBe(worktreeBytes);
+        expect(JSON.parse(readFileSync(paths[4], "utf8")).identity).toBe(from);
+    });
+
+    it("commits each pair separately and rolls back a failed pair's rekey map before any of its pins", async () => {
+        const plan = await orderedPlan();
+        db.exec(
+            `CREATE TRIGGER stop_second BEFORE DELETE ON project_state WHEN old.project_path = '${second}' BEGIN SELECT RAISE(ABORT, 'second pair interrupted'); END`,
+        );
+        const log = spyOn(console, "log").mockImplementation(() => {});
+        try {
+            await expect(
+                runProjectIdsCli(["apply", planFile(plan), "--db", dbPath], deps),
+            ).rejects.toThrow("second pair interrupted");
+            expect(log.mock.calls.flat()).toContain(`${from} → ${to}: applied`);
+            expect(log.mock.calls.flat()).not.toContain(`${second} → ${to}: applied`);
+        } finally {
+            log.mockRestore();
+        }
+        expect(mappings()).toEqual([{ old_project_path: from, new_project_path: to }]);
+        expect(
+            db.prepare("SELECT project_path FROM project_state ORDER BY project_path").all(),
+        ).toEqual([{ project_path: second }, { project_path: to }]);
+        const firstPin = sidecarPath(plan.pairs[0].folders[0].directory);
+        const secondPin = sidecarPath(plan.pairs[1].folders[0].directory);
+        expect(JSON.parse(readFileSync(firstPin, "utf8")).identity).toBe(to);
+        expect(JSON.parse(readFileSync(secondPin, "utf8")).identity).toBe(second);
+    });
+
+    for (const point of ["committed", "applied"] as const)
+        it(`resumes in plan order after SIGKILL with the first pair ${point}`, async () => {
+            const plan = await orderedPlan();
+            const zero = "git:zero-row";
+            const zeroDir = folder("zero-row");
+            const zeroPin = sidecar(zeroDir, zero);
+            plan.pairs.push({
+                from: zero,
+                to,
+                rowsByTable: {},
+                folders: [
+                    { directory: zeroDir, exists: true, worktree: false, gitCommonDir: null },
+                ],
+            });
+            const firstPin = sidecarPath(plan.pairs[0].folders[0].directory);
+            const secondPin = sidecarPath(plan.pairs[1].folders[0].directory);
+            const secondBytes = bytes(secondPin);
+            const zeroBytes = bytes(zeroPin);
+            await killedApply(plan, point);
+            expect(mappings()).toEqual([{ old_project_path: from, new_project_path: to }]);
+            expect(
+                db.prepare("SELECT 1 FROM project_state WHERE project_path = ?").get(second),
+            ).toBeTruthy();
+            expect(JSON.parse(readFileSync(firstPin, "utf8")).identity).toBe(
+                point === "committed" ? from : to,
+            );
+            expect(bytes(secondPin)).toBe(secondBytes);
+            expect(bytes(zeroPin)).toBe(zeroBytes);
+            expect(check(plan).refusals).toEqual([]);
+            const beforeMerge = db
+                .prepare("SELECT * FROM v22_identity_rekey_map WHERE old_project_path = ?")
+                .get(from);
+            const write = storagePermissions.writeStorageFileAtomicSync;
+            const pinsInOrder: string[] = [];
+            const spy = spyOn(storagePermissions, "writeStorageFileAtomicSync").mockImplementation(
+                (path, ...args) => {
+                    if (path === firstPin || path === secondPin)
+                        expect(bytes(zeroPin)).toBe(zeroBytes);
+                    if (path === zeroPin) {
+                        expect(JSON.parse(readFileSync(secondPin, "utf8")).identity).toBe(to);
+                        expect(mappings()).toHaveLength(2);
+                    }
+                    pinsInOrder.push(path);
+                    write(path, ...args);
+                },
+            );
+            let result: Awaited<ReturnType<typeof apply>>;
+            try {
+                result = await apply(plan);
+            } finally {
+                spy.mockRestore();
+            }
+            expect(result).toEqual({
+                code: 0,
+                statuses: [
+                    `${from} → ${to}: ${point === "committed" ? "pins repaired" : "already applied"}`,
+                    `${second} → ${to}: applied`,
+                    `${zero} → ${to}: pins repaired`,
+                ],
+            });
+            expect(pinsInOrder).toEqual(
+                point === "committed" ? [firstPin, secondPin, zeroPin] : [secondPin, zeroPin],
+            );
+            expect(
+                db
+                    .prepare("SELECT * FROM v22_identity_rekey_map WHERE old_project_path = ?")
+                    .get(from),
+            ).toEqual(beforeMerge);
+            expect(JSON.parse(readFileSync(zeroPin, "utf8")).identity).toBe(to);
+            expect(mappings()).toHaveLength(2);
+        });
+
+    it("rerunning a finished plan writes nothing and reports already applied for every pair", async () => {
+        const plan = await orderedPlan();
+        expect((await apply(plan)).code).toBe(0);
+        db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        const paths = [dbPath, ...plan.pairs.map((pair) => sidecarPath(pair.folders[0].directory))];
+        const before = paths.map(bytes);
+        const savedBackups = backups();
+        const map = db.prepare("SELECT * FROM v22_identity_rekey_map").all();
+        const write = spyOn(storagePermissions, "writeStorageFileAtomicSync");
+        const open = databaseAccess.openExistingDatabase;
+        const spy = spyOn(databaseAccess, "openExistingDatabase").mockImplementation(
+            (path, options) => {
+                expect(options.readonly).toBe(true);
+                return open(path, options);
+            },
+        );
+        try {
+            expect(await apply(plan)).toEqual({
+                code: 0,
+                statuses: [
+                    `${from} → ${to}: already applied`,
+                    `${second} → ${to}: already applied`,
+                ],
+            });
+            expect(write).not.toHaveBeenCalled();
+        } finally {
+            spy.mockRestore();
+            write.mockRestore();
+        }
+        expect(backups()).toEqual(savedBackups);
+        expect(paths.map(bytes)).toEqual(before);
+        expect(db.prepare("SELECT * FROM v22_identity_rekey_map").all()).toEqual(map);
+    });
+
+    it("refuses a later pair's new folder before backing up, merging or pinning earlier pairs", async () => {
+        const plan = await orderedPlan();
+        sidecar(folder("unplanned"), second);
+        db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        const paths = [dbPath, ...plan.pairs.map((pair) => sidecarPath(pair.folders[0].directory))];
+        const before = paths.map(bytes);
+        const error = spyOn(console, "error").mockImplementation(() => {});
+        try {
+            expect(await apply(plan)).toEqual({ code: 1, statuses: [] });
+        } finally {
+            error.mockRestore();
+        }
+        expect(backups()).toEqual([]);
+        expect(paths.map(bytes)).toEqual(before);
+        expect(mappings()).toEqual([]);
+        expect(existsSync(join(root, "project-identities"))).toBe(true);
+    });
+
+    it("keeps manual git-to-dir and git-to-pj refusals even with force", async () => {
+        await makePlan();
+        db.prepare("INSERT INTO project_state(project_path) VALUES ('dir:target')").run();
+        for (const target of ["dir:target", to])
+            expect(() =>
+                runMergeIdentityCli(
+                    ["--db", dbPath, "--from", from, "--to", target, "--apply", "--force"],
+                    deps,
+                ),
+            ).toThrow("repository-wide identity");
+        expect(mappings()).toEqual([]);
+        expect(backups()).toEqual([]);
     });
 });

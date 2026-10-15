@@ -1,11 +1,30 @@
-import { existsSync, readdirSync, readFileSync, realpathSync, statfsSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+    existsSync,
+    mkdtempSync,
+    readdirSync,
+    readFileSync,
+    realpathSync,
+    statfsSync,
+    statSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
-import { isPinnedProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity-cache";
+import { readGitCheckoutMetadata } from "@magic-context/core/features/magic-context/memory/git-common-dir";
+import {
+    isPinnedProjectIdentity,
+    projectDirectoryKey,
+} from "@magic-context/core/features/magic-context/memory/project-identity-cache";
 import {
     auditIdentityMerge,
     mergeProjectIdentities,
 } from "@magic-context/core/features/magic-context/storage-identity-merge";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
+import { configureContextDatabasePragmas } from "@magic-context/core/shared/sqlite-context-pragmas";
+import {
+    copyStorageTreeSync,
+    ensureStorageDirectorySync,
+    writeStorageFileAtomicSync,
+} from "@magic-context/core/shared/storage-permissions";
 import {
     CLI_SCHEMA_FLOOR_VERSION,
     getPersistedSchemaVersion,
@@ -15,7 +34,7 @@ import {
 import { type MergeIdentityDeps, observations } from "./doctor-merge-identity";
 import { probeHostProcessesUsing } from "./doctor-opencode2-cache";
 import type { ProjectIdPlan, ProjectIdPlanPair } from "./doctor-project-ids";
-import { defaultInspectHolders } from "./doctor-repair-db";
+import { copyDatabaseBundle, defaultInspectHolders } from "./doctor-repair-db";
 
 export interface ProjectIdsApplyDeps extends MergeIdentityDeps {
     freeBytes: (storageDir: string) => number;
@@ -42,11 +61,7 @@ export interface ProjectIdApplyPreflight {
 
 export function parseProjectIdsApplyArgs(
     args: string[],
-): ProjectIdsApplyOptions & { planPath: string } {
-    if (!args.includes("--check"))
-        throw new Error(
-            "Project identity apply is not available yet. Nothing was changed. Use doctor project-ids apply --check <plan>.",
-        );
+): ProjectIdsApplyOptions & { planPath: string; check: boolean } {
     const values = new Map<string, string>();
     let planPath: string | undefined;
     let checked = false;
@@ -63,9 +78,14 @@ export function parseProjectIdsApplyArgs(
     }
     if (!planPath)
         throw new Error(
-            "Usage: doctor project-ids apply --check <plan> [--db <path>] [--host-db <path>]",
+            "Usage: doctor project-ids apply [--check] <plan> [--db <path>] [--host-db <path>]",
         );
-    return { planPath, dbPath: values.get("--db"), hostPath: values.get("--host-db") };
+    return {
+        planPath,
+        check: checked,
+        dbPath: values.get("--db"),
+        hostPath: values.get("--host-db"),
+    };
 }
 
 function validatePlan(plan: ProjectIdPlan): void {
@@ -260,7 +280,66 @@ export function preflightProjectIdApply(
     return result;
 }
 
-export function runProjectIdsApplyCheck(
+function pinUpdates(
+    pair: ProjectIdPlanPair,
+    storageDir: string,
+): Array<{ path: string; content: string }> {
+    const updates: Array<{ path: string; content: string }> = [];
+    for (const folder of pair.folders) {
+        if (!existsSync(folder.directory) || !statSync(folder.directory).isDirectory()) continue;
+        const metadata = readGitCheckoutMetadata(folder.directory);
+        if (metadata?.linkedWorktree) continue;
+        const directory = projectDirectoryKey(folder.directory);
+        const pin = {
+            directory,
+            identity: pair.to,
+            ...(metadata?.gitCommonDir ? { gitCommonDir: metadata.gitCommonDir } : {}),
+        };
+        const path = join(
+            storageDir,
+            "project-identities",
+            `${createHash("sha256").update(directory).digest("hex")}.json`,
+        );
+        let existing: typeof pin | undefined;
+        try {
+            existing = JSON.parse(readFileSync(path, "utf8"));
+        } catch (error) {
+            if (
+                !(error instanceof SyntaxError) &&
+                (error as NodeJS.ErrnoException).code !== "ENOENT"
+            )
+                throw error;
+        }
+        if (
+            existing?.directory === directory &&
+            existing.identity === pair.to &&
+            existing.gitCommonDir === pin.gitCommonDir
+        )
+            continue;
+        updates.push({ path, content: JSON.stringify(pin) });
+    }
+    return updates;
+}
+
+function backupProjectIds(dbPath: string): void {
+    const storageDir = dirname(dbPath);
+    const backup = mkdtempSync(join(storageDir, "project-ids-backup-"));
+    const sidecars = join(storageDir, "project-identities");
+    const savedSidecars = join(backup, "project-identities");
+    if (existsSync(sidecars)) copyStorageTreeSync(sidecars, savedSidecars);
+    else ensureStorageDirectorySync(savedSidecars);
+    copyDatabaseBundle(dbPath, join(backup, "context.db"));
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    console.log(`Backup directory: ${backup}`);
+    console.log(
+        `Restore with hosts closed: rm -f ${quote(`${dbPath}-wal`)} ${quote(`${dbPath}-shm`)}; cp ${quote(join(backup, "context.db"))} ${quote(dbPath)}; for suffix in -wal -shm; do if test -f ${quote(join(backup, "context.db"))}"$suffix"; then cp ${quote(join(backup, "context.db"))}"$suffix" ${quote(dbPath)}"$suffix"; fi; done`,
+    );
+    console.log(
+        `Restore identity sidecars too: rm -rf ${quote(sidecars)}; cp -R ${quote(savedSidecars)} ${quote(sidecars)}`,
+    );
+}
+
+export function runProjectIdsApplyCli(
     args: string[],
     deps: Partial<ProjectIdsApplyDeps> = {},
 ): number {
@@ -283,8 +362,38 @@ export function runProjectIdsApplyCheck(
         );
     for (const refusal of result.refusals)
         console.error(`Refused [${refusal.code}]: ${refusal.message}`);
-    console.log(
-        `Apply check ${result.refusals.length ? "refused" : "passed"}. Nothing was changed. Apply is not available yet.`,
+    if (options.check || result.refusals.length) {
+        console.log(
+            `Apply ${options.check ? "check " : ""}${result.refusals.length ? "refused" : "passed"}. Nothing was changed.`,
+        );
+        return result.refusals.length ? 1 : 0;
+    }
+    const storageDir = dirname(result.dbPath);
+    const pendingWrites = result.pairs.some(
+        ({ pair, liveRows }) => liveRows > 0 || pinUpdates(pair, storageDir).length > 0,
     );
-    return result.refusals.length ? 1 : 0;
+    // A finished plan needs neither another backup nor a writable database handle.
+    if (pendingWrites) backupProjectIds(result.dbPath);
+    const db = openExistingDatabase(result.dbPath, { readonly: !pendingWrites });
+    if (!db) throw new Error(`Context database disappeared: ${result.dbPath}`);
+    try {
+        if (pendingWrites) configureContextDatabasePragmas(db);
+        for (const { pair } of result.pairs) {
+            // Only validated plan pairs bypass the manual CLI's pair checks. The shared
+            // merge keeps its safety fences and commits its rekey map with this pair.
+            const merged = mergeProjectIdentities(db, pair.from, pair.to);
+            const pins = pinUpdates(pair, storageDir);
+            for (const pin of pins) writeStorageFileAtomicSync(pin.path, pin.content);
+            const status =
+                merged.changedRows > 0
+                    ? "applied"
+                    : pins.length
+                      ? "pins repaired"
+                      : "already applied";
+            console.log(`${pair.from} → ${pair.to}: ${status}`);
+        }
+    } finally {
+        db.close();
+    }
+    return 0;
 }
