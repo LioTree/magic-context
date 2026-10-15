@@ -2525,10 +2525,20 @@ struct FacadeScope {
 }
 
 /// The project a route's history is keyed by. See [`McHandler::route_project`].
+#[derive(Clone)]
 struct RouteProject {
     key: String,
     /// The reason memory features are paused, when the route has no project identity.
     memory_paused: Option<String>,
+}
+
+/// Identity state belongs to a channel, not a session or directory: a fresh binding
+/// may adopt a newer host decision without changing an already-served prefix.
+#[derive(Default)]
+struct BindingProject {
+    initial: Option<Result<String, project_identity::ProjectIdentityError>>,
+    served: Option<RouteProject>,
+    mismatch_logged: bool,
 }
 
 impl RouteProject {
@@ -3838,6 +3848,9 @@ pub struct McHandler {
     runner_choices: Arc<Mutex<runner_choices::RunnerChoiceLog>>,
     /// Project identities of route roots whose session the host has not recorded.
     project_identities: Arc<project_identity::ProjectIdentityResolver>,
+    entorhinal: entorhinal_resolve::EntorhinalResolver,
+    binding_projects: Mutex<HashMap<u16, BindingProject>>,
+    active_project_roots: Mutex<HashMap<String, PathBuf>>,
     /// Route roots inside a git checkout whose identity git could not give, with the
     /// reason. Their history keeps being served, but every memory feature is paused until
     /// a later request resolves the identity (see [`McHandler::route_project`]).
@@ -4533,6 +4546,7 @@ impl McHandler {
             }),
             None => Arc::new(MissingProducerFactory),
         };
+        let entorhinal = entorhinal_resolve::EntorhinalResolver::new(connection_file.clone());
         let session_resolver: Arc<dyn SessionResolver> = match connection_file {
             Some(path) => Arc::new(RealSessionResolver::new_with_route_targets(
                 path,
@@ -4551,6 +4565,9 @@ impl McHandler {
             host_runs: Arc::new(HostRunLedger::new()),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
+            entorhinal,
+            binding_projects: Mutex::default(),
+            active_project_roots: Mutex::default(),
             memory_paused_routes: Arc::default(),
             #[cfg(test)]
             resolve_project_identity_for_test: AtomicBool::new(false),
@@ -4943,6 +4960,9 @@ impl McHandler {
             host_runs: Arc::new(HostRunLedger::new()),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
+            entorhinal: entorhinal_resolve::EntorhinalResolver::new(None),
+            binding_projects: Mutex::default(),
+            active_project_roots: Mutex::default(),
             memory_paused_routes: Arc::default(),
             #[cfg(test)]
             resolve_project_identity_for_test: AtomicBool::new(false),
@@ -5000,6 +5020,10 @@ impl McHandler {
     /// this only overwrites a stale entry that somehow survived (defensive).
     fn bind_route(&self, channel: u16, binding: SessionBinding) {
         DISPATCH_HEALTH.route_open(channel);
+        self.binding_projects
+            .lock()
+            .expect("binding project mutex")
+            .insert(channel, BindingProject::default());
         self.threshold_logged_routes
             .lock()
             .expect("threshold log mutex")
@@ -5023,6 +5047,10 @@ impl McHandler {
         }
         let replacement_session = replacement.map(|previous| previous.session);
         if let Some(session_id) = replacement_session {
+            self.active_project_roots
+                .lock()
+                .expect("active project roots mutex")
+                .remove(&session_id);
             self.frozen_tool_catalogs
                 .lock()
                 .expect("frozen catalog mutex")
@@ -5428,6 +5456,10 @@ impl McHandler {
 
     /// Remove a route and evict process-local session state after its final binding closes.
     fn unbind_route(&self, channel: u16) {
+        self.binding_projects
+            .lock()
+            .expect("binding project mutex")
+            .remove(&channel);
         self.threshold_logged_routes
             .lock()
             .expect("threshold log mutex")
@@ -5459,6 +5491,10 @@ impl McHandler {
             self.clear_note_evaluation_capability_if_unbound(&root);
         }
         if let Some(session) = last_session_route {
+            self.active_project_roots
+                .lock()
+                .expect("active project roots mutex")
+                .remove(&session);
             self.frozen_tool_catalogs
                 .lock()
                 .expect("frozen catalog mutex")
@@ -5652,10 +5688,11 @@ impl McHandler {
     /// `git_identity_unavailable`. Paths that serve history use [`Self::route_project`].
     fn route_project_identity(
         &self,
+        channel: u16,
         store: &McStore,
         binding: &SessionBinding,
     ) -> Result<String, HandlerOutcome> {
-        let route = self.route_project(store, binding)?;
+        let route = self.route_project(channel, store, binding)?;
         match route.memory_paused {
             None => Ok(route.key),
             Some(reason) => Err(HandlerOutcome::Error {
@@ -5674,23 +5711,79 @@ impl McHandler {
     /// its transform (compaction, m0/m1 history) under a key that names no project, with
     /// every memory feature paused: no memory block, no memory search, no fact promotion,
     /// no memory writes and no dreamer runs. The reason is logged once per route root, and
-    /// each request resolves again, so the route recovers as soon as git does. A home or
+    /// each fallback request retries git, so the route recovers as soon as git does. A home or
     /// unreadable directory still refuses outright.
     fn route_project(
         &self,
+        channel: u16,
         store: &McStore,
         binding: &SessionBinding,
     ) -> Result<RouteProject, HandlerOutcome> {
-        match store.session_project_identity(&binding.session) {
-            Ok(Some(identity)) => return Ok(RouteProject::resolved(identity)),
-            Ok(None) => {}
-            Err(error) => {
-                return Err(HandlerOutcome::Error {
-                    code: "store_load_failed".to_string(),
-                    message: error.to_string(),
-                })
+        let mut projects = self.binding_projects.lock().expect("binding project mutex");
+        let project = projects.entry(channel).or_default();
+        let moved = self
+            .active_project_roots
+            .lock()
+            .expect("active project roots mutex")
+            .insert(binding.session.clone(), binding.project_root.clone())
+            .is_some_and(|previous| previous != binding.project_root);
+        if moved {
+            // Hosts reuse an open channel when returning to a directory. A move
+            // starts a new prefix decision even though that channel stayed open.
+            project.served = None;
+            project.mismatch_logged = false;
+            if let Ok(directory) = self
+                .project_identities
+                .eligible_directory(&binding.project_root)
+            {
+                if let Some(pin) = self
+                    .project_identities
+                    .pinned_identity(&directory)
+                    .or_else(|| self.project_identities.common_dir_pin(&directory))
+                {
+                    project.initial = Some(Ok(pin));
+                }
+            }
+            tracing::info!(session = %binding.session, root = %binding.project_root.display(), "mc-module: project directory moved; refreshing route identity without resolve");
+        }
+        let row = store
+            .session_project_identity(&binding.session)
+            .map_err(|error| HandlerOutcome::Error {
+                code: "store_load_failed".to_string(),
+                message: error.to_string(),
+            })?;
+        let candidate = match row {
+            Some(identity) => RouteProject::resolved(identity),
+            None => self.binding_fallback_project(store, binding, project)?,
+        };
+        if let Some(served) = &project.served {
+            if served.key != candidate.key
+                && (project_identity::is_project_pin(&served.key)
+                    || project_identity::is_project_pin(&candidate.key))
+            {
+                if !project.mismatch_logged {
+                    tracing::warn!(
+                        session = %binding.session,
+                        channel,
+                        served = %served.key,
+                        observed = %candidate.key,
+                        "mc-module: ignoring changed project identity until a new route binding"
+                    );
+                    project.mismatch_logged = true;
+                }
+                return Ok(served.clone());
             }
         }
+        project.served = Some(candidate.clone());
+        Ok(candidate)
+    }
+
+    fn binding_fallback_project(
+        &self,
+        _store: &McStore,
+        binding: &SessionBinding,
+        project: &BindingProject,
+    ) -> Result<RouteProject, HandlerOutcome> {
         #[cfg(test)]
         if !self
             .resolve_project_identity_for_test
@@ -5698,10 +5791,36 @@ impl McHandler {
         {
             let root = binding.project_root.to_string_lossy().to_string();
             return Ok(RouteProject::resolved(
-                store.route_identity_for_test(&root).unwrap_or(root),
+                _store.route_identity_for_test(&root).unwrap_or(root),
             ));
         }
-        let outcome = self.project_identities.resolve(&binding.project_root);
+        let outcome = match &project.initial {
+            Some(Ok(identity)) if !identity.starts_with("dir:") => Ok(identity.clone()),
+            Some(Err(error))
+                if !matches!(
+                    error,
+                    project_identity::ProjectIdentityError::GitUnavailable { .. }
+                ) =>
+            {
+                Err(error.clone())
+            }
+            initial => {
+                let outcome = self.project_identities.resolve(&binding.project_root);
+                // Revalidation may discover git, but a pin gained after bind belongs to
+                // the next binding, never to this binding's fallback decision.
+                if outcome
+                    .as_ref()
+                    .is_ok_and(|id| project_identity::is_project_pin(id))
+                {
+                    if let Some(served) = &project.served {
+                        return Ok(served.clone());
+                    }
+                    initial.clone().unwrap_or(outcome)
+                } else {
+                    outcome
+                }
+            }
+        };
         let mut paused = self
             .memory_paused_routes
             .lock()
@@ -8277,11 +8396,13 @@ impl McHandler {
     /// the transform resolved when it queued them.
     fn historian_lane_project(
         &self,
+        channel: u16,
         binding: &SessionBinding,
         store: &McStore,
     ) -> Result<String, HandlerOutcome> {
         // The same key the transform queued the run under, also while memory is paused.
-        self.route_project(store, binding).map(|route| route.key)
+        self.route_project(channel, store, binding)
+            .map(|route| route.key)
     }
 
     /// `historian.pending {session_id?}` — runs waiting for a claimant.
@@ -8302,7 +8423,7 @@ impl McHandler {
             Some(store) => store,
             None => return self.store_refusal(),
         };
-        let project_path = match self.historian_lane_project(&binding, store) {
+        let project_path = match self.historian_lane_project(channel, &binding, store) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
@@ -8351,7 +8472,7 @@ impl McHandler {
             Some(store) => store,
             None => return self.store_refusal(),
         };
-        let project_path = match self.historian_lane_project(&binding, store) {
+        let project_path = match self.historian_lane_project(channel, &binding, store) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
@@ -8408,7 +8529,7 @@ impl McHandler {
             Some(store) => store,
             None => return self.store_refusal(),
         };
-        let project_path = match self.historian_lane_project(&binding, store) {
+        let project_path = match self.historian_lane_project(channel, &binding, store) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
@@ -8468,7 +8589,7 @@ impl McHandler {
             Some(store) => store,
             None => return self.store_refusal(),
         };
-        let project_path = match self.historian_lane_project(&binding, store) {
+        let project_path = match self.historian_lane_project(channel, &binding, store) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
@@ -9075,7 +9196,7 @@ impl McHandler {
             None => return self.store_refusal(),
         };
         // A wrapup compacts history, so it runs with memory paused rather than refusing.
-        let project_path = match self.route_project(&store, &binding) {
+        let project_path = match self.route_project(channel, &store, &binding) {
             Ok(route) => route.key,
             Err(outcome) => return outcome,
         };
@@ -10398,7 +10519,7 @@ impl McHandler {
         // Resolve the route root to the identity memories and notes are keyed by before any
         // store read. Keep the filesystem directory only for project documents and
         // configuration below.
-        let route = match self.route_project(&store, &binding) {
+        let route = match self.route_project(channel, &store, &binding) {
             Ok(route) => route,
             Err(outcome) => return outcome,
         };
@@ -12139,7 +12260,7 @@ impl McHandler {
         }
         // Classification writes land in context.db under the route's project identity.
         // An `authority_generation` sent by an older host is accepted and ignored.
-        let authority_project = match self.route_project_identity(&store, &binding) {
+        let authority_project = match self.route_project_identity(channel, &store, &binding) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
@@ -12488,7 +12609,7 @@ impl McHandler {
         let Some(store) = self.store.get() else {
             return self.store_refusal();
         };
-        let route_project = match self.route_project_identity(store, &binding) {
+        let route_project = match self.route_project_identity(channel, store, &binding) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
@@ -13042,7 +13163,7 @@ impl McHandler {
         let Some(store) = self.store.get() else {
             return Err(self.facade_store_refusal());
         };
-        let identity = self.route_project_identity(store, &binding)?;
+        let identity = self.route_project_identity(channel, store, &binding)?;
         if identity != requested_project {
             tracing::warn!(
                 "mc-module: {domain} write for {requested_project} on a route whose project is {identity}"
@@ -13110,7 +13231,7 @@ impl McHandler {
         // History tools (ctx_reduce, ctx_expand) keep working while the route's identity is
         // unavailable; memory tools read `memory_paused` and refuse by name.
         let route = match self.store.get() {
-            Some(store) => self.route_project(store, &binding)?,
+            Some(store) => self.route_project(channel, store, &binding)?,
             None => return Err(self.facade_store_refusal()),
         };
         let memory_paused = route.memory_paused;
@@ -14367,6 +14488,27 @@ impl ModuleHandler for McHandler {
     /// every route — project resolution, not authorization, is the concern here.
     async fn on_bind(&self, req: &RouteBindRequest) -> subc_client_rs::BindDecision {
         let config = self.effective_config(&req.identity.project_root);
+        // Hosts record their project identity before opening the route. Without
+        // that row, resolve the route root through Entorhinal within its deadline.
+        let host_identity = self.store.get().and_then(|store| {
+            store
+                .session_project_identity(&req.identity.session)
+                .ok()
+                .flatten()
+        });
+        let initial = match host_identity {
+            Some(identity) => Ok(identity),
+            None => {
+                self.entorhinal
+                    .resolve_for_session(
+                        &self.project_identities,
+                        &req.identity.project_root,
+                        &req.identity.harness,
+                        &req.identity.session,
+                    )
+                    .await
+            }
+        };
         self.bind_route(
             req.handle.channel,
             SessionBinding {
@@ -14380,6 +14522,12 @@ impl ModuleHandler for McHandler {
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
             },
         );
+        self.binding_projects
+            .lock()
+            .expect("binding project mutex")
+            .get_mut(&req.handle.channel)
+            .expect("newly bound route")
+            .initial = Some(initial);
         self.record_route_role_versions(req.handle.channel, req.role_versions.as_ref());
         subc_client_rs::BindDecision::accept()
     }
@@ -20915,6 +21063,450 @@ mod tests {
 
     fn binding(root: &str, session: &str) -> SessionBinding {
         binding_with_harness(root, "mc-module-test", session)
+    }
+
+    mod binding_projects {
+        use super::*;
+        use subc_control::{ClientControlRequest, ClientControlResponse};
+        use subc_protocol::{Flags, Frame, FrameType, Priority};
+        use subc_transport::{
+            authenticate_server, generate_daemon_id, generate_key, read_frame, write_atomic,
+            write_frame, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+        };
+
+        struct FakeEntorhinal {
+            connection_file: PathBuf,
+            calls: Arc<AtomicUsize>,
+            reply_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+            task: tokio::task::JoinHandle<()>,
+            _temp: tempfile::TempDir,
+        }
+
+        impl Drop for FakeEntorhinal {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        impl FakeEntorhinal {
+            async fn start(reply: Option<Value>, reply_at: Option<tokio::time::Instant>) -> Self {
+                let temp = tempfile::tempdir().unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let key = generate_key().unwrap();
+                let daemon_id = generate_daemon_id().unwrap();
+                let connection_file = temp.path().join("connection.json");
+                write_atomic(
+                    &connection_file,
+                    &ConnectionInfo {
+                        schema: SCHEMA_VERSION,
+                        wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+                        endpoints: vec![Endpoint {
+                            host: address.ip().to_string(),
+                            port: address.port(),
+                        }],
+                        key: key.clone(),
+                        daemon_id,
+                        pid: std::process::id(),
+                        daemon_ver: "fake".into(),
+                    },
+                )
+                .unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = calls.clone();
+                let reply_at = Arc::new(Mutex::new(reply_at));
+                let pending_reply_at = reply_at.clone();
+                let task = tokio::spawn(async move {
+                    while let Ok((mut stream, _)) = listener.accept().await {
+                        authenticate_server(
+                            &mut stream,
+                            &key,
+                            &daemon_id,
+                            "fake",
+                            Duration::from_secs(2),
+                        )
+                        .await
+                        .unwrap();
+                        while let Ok(Some(frame)) = read_frame(&mut stream).await {
+                            if frame.header.ty != FrameType::Request {
+                                continue;
+                            }
+                            let (ty, body) = if frame.header.channel == 0 {
+                                let control: ClientControlRequest =
+                                    serde_json::from_slice(&frame.body).unwrap();
+                                let ClientControlRequest::RouteOpen { target, .. } = control else {
+                                    continue;
+                                };
+                                assert_eq!(target, entorhinal_resolve::route_target());
+                                (
+                                    FrameType::Response,
+                                    serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                                        route_channel: 10,
+                                        route_epoch: 1,
+                                    })
+                                    .unwrap(),
+                                )
+                            } else {
+                                let request: Value = serde_json::from_slice(&frame.body).unwrap();
+                                assert_eq!(request["method"], "resolve");
+                                observed.fetch_add(1, Ordering::SeqCst);
+                                let at = *pending_reply_at.lock().unwrap();
+                                if let Some(at) = at {
+                                    // Use an absolute instant so connect and route-open
+                                    // consume the same budget as the reply wait.
+                                    while tokio::time::Instant::now() < at {
+                                        tokio::task::yield_now().await;
+                                    }
+                                }
+                                match &reply {
+                                    Some(reply) => (FrameType::Response, serde_json::to_vec(reply).unwrap()),
+                                    None => (FrameType::Error, serde_json::to_vec(&json!({"code":"unknown_module", "message":"absent", "detail":null})).unwrap()),
+                                }
+                            };
+                            let response = Frame::build(
+                                ty,
+                                Flags::new(false, Priority::Interactive, false),
+                                frame.header.channel,
+                                frame.header.epoch,
+                                frame.header.corr,
+                                body,
+                            )
+                            .unwrap();
+                            if write_frame(&mut stream, &response).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                Self {
+                    connection_file,
+                    calls,
+                    reply_at,
+                    task,
+                    _temp: temp,
+                }
+            }
+        }
+
+        fn fixture() -> (McHandler, Arc<McStore>, tempfile::TempDir, PathBuf) {
+            let (mut handler, store, temp, project) = handler_with_store_and_resolver(
+                Arc::new(ProducerState::default()),
+                default_test_config(),
+                Arc::new(MissingSessionResolver),
+            );
+            handler.project_identities =
+                Arc::new(project_identity::ProjectIdentityResolver::with_sidecar_dir(
+                    temp.path().join("sidecars"),
+                ));
+            handler
+                .resolve_project_identity_for_test
+                .store(true, Ordering::Relaxed);
+            (
+                handler,
+                store,
+                temp,
+                std::fs::canonicalize(project).unwrap(),
+            )
+        }
+
+        fn root_reply(project: &Path) -> Value {
+            let vectors: Value = serde_json::from_str(include_str!(
+                "../../../test-vectors/project-resolve-v1/resolve.json"
+            ))
+            .unwrap();
+            let mut reply = vectors[0]["reply"].clone();
+            reply["result"]["canonicalRoot"] = json!(project);
+            reply
+        }
+
+        async fn bind(handler: &McHandler, project: &Path, channel: u16) {
+            let identity = serde_json::from_value(json!({
+                "project_root": project, "harness": "opencode", "session": "ses"
+            }))
+            .unwrap();
+            let request = RouteBindRequest::new(
+                RouteHandle::detached(channel, 1),
+                RouteTargetConfig::runner_module("magic-context")
+                    .target(route_targets::RegisteredRoute::HistorianRunner)
+                    .unwrap(),
+                identity,
+            );
+            let _decision = handler.on_bind(&request).await;
+            assert!(handler.bindings.lock().unwrap().contains_key(&channel));
+        }
+
+        fn row(store: &McStore, identity: &str) {
+            store.with_context_conn_for_test(|db| {
+                db.execute("INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES ('ses', 'opencode', ?1, 1) ON CONFLICT(session_id, harness) DO UPDATE SET project_path = excluded.project_path, updated_at = updated_at + 1", [identity])
+            }).unwrap();
+        }
+
+        fn served(handler: &McHandler, store: &McStore, channel: u16) -> String {
+            let binding = handler.facade_binding(channel).unwrap();
+            handler
+                .route_project(channel, store, &binding)
+                .unwrap_or_else(|_| panic!("project resolution failed"))
+                .key
+        }
+
+        #[tokio::test]
+        async fn host_row_at_bind_skips_resolve_and_first_request_reads_latest_row() {
+            let (mut handler, store, _temp, project) = fixture();
+            let fake = FakeEntorhinal::start(Some(root_reply(&project)), None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            row(&store, "pj-A");
+            bind(&handler, &project, 7).await;
+            row(&store, "pj-B");
+            assert_eq!(served(&handler, &store, 7), "pj-B");
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn no_host_row_resolves_at_bind_and_requests_keep_the_decision() {
+            let (mut handler, store, temp, project) = fixture();
+            let reply = root_reply(&project);
+            let expected = reply["result"]["projectId"].as_str().unwrap().to_string();
+            let fake = FakeEntorhinal::start(Some(reply), None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            bind(&handler, &project, 7).await;
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            // Removing the pin distinguishes the stored decision from a fresh
+            // directory lookup that would otherwise return the same identity.
+            std::fs::remove_dir_all(temp.path().join("sidecars")).unwrap();
+            for _ in 0..3 {
+                assert_eq!(served(&handler, &store, 7), expected);
+            }
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            for changed in ["git:changed", "pj-changed"] {
+                row(&store, changed);
+                assert_eq!(served(&handler, &store, 7), expected);
+            }
+        }
+
+        #[tokio::test]
+        async fn reply_one_millisecond_before_bind_deadline_serves_pj() {
+            let (mut handler, store, _temp, project) = fixture();
+            let reply = root_reply(&project);
+            let expected = reply["result"]["projectId"].as_str().unwrap();
+            store
+                .seed_memory(1, expected, "CONSTRAINTS", "near-deadline project fact", 50)
+                .unwrap();
+            let fake = FakeEntorhinal::start(Some(reply), None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            let started = tokio::time::Instant::now();
+            *fake.reply_at.lock().unwrap() = Some(
+                started
+                    + Duration::from_millis(entorhinal_resolve::ENTORHINAL_RESOLVE_DEADLINE_MS - 1),
+            );
+            bind(&handler, &project, 7).await;
+            assert!(
+                started.elapsed()
+                    >= Duration::from_millis(
+                        entorhinal_resolve::ENTORHINAL_RESOLVE_DEADLINE_MS - 1
+                    )
+            );
+            let response =
+                call_transform_request(&handler, request(vec![ck("m1", 1, "hello")])).await;
+            assert_eq!(response["status"], "ok");
+            assert!(
+                response.to_string().contains("near-deadline project fact"),
+                "{response}"
+            );
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn served_pj_and_fallback_bindings_reject_pj_transitions_until_rebind() {
+            use tracing_subscriber::prelude::*;
+            for own_decision in [false, true] {
+                for (before, after) in [("pj-A", "git:B"), ("pj-A", "pj-B"), ("git:A", "pj-B")] {
+                    let (handler, store, _temp, project) = fixture();
+                    if !own_decision {
+                        row(&store, before);
+                    }
+                    bind(&handler, &project, 7).await;
+                    if own_decision {
+                        handler
+                            .binding_projects
+                            .lock()
+                            .unwrap()
+                            .get_mut(&7)
+                            .unwrap()
+                            .initial = Some(Ok(before.into()));
+                    }
+                    assert_eq!(served(&handler, &store, 7), before);
+                    row(&store, after);
+                    let logs = tempfile::tempdir().unwrap();
+                    let mut config = cortexkit_log::Config::in_dir("magic-context", logs.path());
+                    config.spec = Some("warn".into());
+                    let (layer, log) = cortexkit_log::layer(config).unwrap();
+                    tracing::subscriber::with_default(
+                        tracing_subscriber::registry().with(layer),
+                        || {
+                            for _ in 0..3 {
+                                assert_eq!(served(&handler, &store, 7), before);
+                            }
+                        },
+                    );
+                    let lines = std::fs::read_to_string(log.path()).unwrap();
+                    assert_eq!(
+                        lines.matches("ignoring changed project identity").count(),
+                        1
+                    );
+                    assert!(handler.binding_projects.lock().unwrap()[&7].mismatch_logged);
+                    bind(&handler, &project, 8).await;
+                    assert_eq!(served(&handler, &store, 8), after);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn absent_entorhinal_keeps_per_request_standalone_rows() {
+            let (mut handler, store, _temp, project) = fixture();
+            let fake = FakeEntorhinal::start(None, None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            bind(&handler, &project, 7).await;
+            assert!(served(&handler, &store, 7).starts_with("dir:"));
+            row(&store, "dir:A");
+            assert_eq!(served(&handler, &store, 7), "dir:A");
+            row(&store, "git:A");
+            assert_eq!(served(&handler, &store, 7), "git:A");
+            row(&store, "git:B");
+            assert_eq!(served(&handler, &store, 7), "git:B");
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            assert!(!handler.binding_projects.lock().unwrap()[&7].mismatch_logged);
+        }
+
+        fn git_commit(project: &Path) -> String {
+            for args in [
+                vec!["init", "-q"],
+                vec![
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "initial",
+                ],
+            ] {
+                assert!(std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(project)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(project)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            format!("git:{}", String::from_utf8(output.stdout).unwrap().trim())
+        }
+
+        #[tokio::test]
+        async fn own_fallback_does_not_adopt_a_later_pj_row() {
+            for git in [false, true] {
+                let (handler, store, _temp, project) = fixture();
+                let expected = if git {
+                    git_commit(&project)
+                } else {
+                    project_identity::directory_fallback(&project)
+                };
+                bind(&handler, &project, 7).await;
+                assert_eq!(served(&handler, &store, 7), expected);
+                row(&store, "pj-new");
+                assert_eq!(served(&handler, &store, 7), expected);
+                bind(&handler, &project, 8).await;
+                assert_eq!(served(&handler, &store, 8), "pj-new");
+            }
+        }
+
+        #[tokio::test]
+        async fn fallback_dir_revalidates_and_paused_git_retries_without_entorhinal() {
+            for broken_git in [false, true] {
+                let (mut handler, store, temp, project) = fixture();
+                if broken_git {
+                    std::fs::write(project.join(".git"), "gitdir: /nonexistent/bind-test\n")
+                        .unwrap();
+                }
+                bind(&handler, &project, 7).await;
+                let binding = handler.facade_binding(7).unwrap();
+                let before = handler
+                    .route_project(7, &store, &binding)
+                    .unwrap_or_else(|_| panic!("fallback failed"));
+                assert_eq!(before.memory_paused.is_some(), broken_git);
+                if broken_git {
+                    std::fs::remove_file(project.join(".git")).unwrap();
+                    // Replacing the resolver drops its cached git failure, simulating
+                    // expiry of the five-minute git retry window without a long wait.
+                    handler.project_identities =
+                        Arc::new(project_identity::ProjectIdentityResolver::with_sidecar_dir(
+                            temp.path().join("sidecars"),
+                        ));
+                } else {
+                    assert!(before.key.starts_with("dir:"));
+                }
+                let expected = git_commit(&project);
+                assert_eq!(served(&handler, &store, 7), expected);
+                assert!(!handler
+                    .memory_paused_routes
+                    .lock()
+                    .unwrap()
+                    .contains_key(&project));
+                handler
+                    .project_identities
+                    .pin_live_answer(&project, "pj-later", Some(&project));
+                assert_eq!(served(&handler, &store, 7), expected);
+            }
+        }
+
+        #[tokio::test]
+        async fn move_between_pins_uses_new_binding_and_return_refreshes_row() {
+            let (handler, store, temp, project) = fixture();
+            let other = temp.path().join("other");
+            std::fs::create_dir(&other).unwrap();
+            handler
+                .project_identities
+                .pin_live_answer(&project, "pj-A", Some(&project));
+            handler
+                .project_identities
+                .pin_live_answer(&other, "pj-B", Some(&other));
+            row(&store, "pj-A");
+            bind(&handler, &project, 7).await;
+            assert_eq!(served(&handler, &store, 7), "pj-A");
+            row(&store, "pj-B");
+            bind(&handler, &other, 8).await;
+            assert_eq!(served(&handler, &store, 8), "pj-B");
+            row(&store, "pj-A");
+            assert_eq!(served(&handler, &store, 7), "pj-A");
+            handler.unbind_route(7);
+            assert!(!handler.binding_projects.lock().unwrap().contains_key(&7));
+        }
+
+        #[tokio::test]
+        async fn returning_to_open_binding_adopts_a_pin_gained_while_away() {
+            let (handler, store, temp, project) = fixture();
+            bind(&handler, &project, 7).await;
+            assert!(served(&handler, &store, 7).starts_with("dir:"));
+            let other = temp.path().join("other");
+            std::fs::create_dir(&other).unwrap();
+            row(&store, "pj-B");
+            bind(&handler, &other, 8).await;
+            assert_eq!(served(&handler, &store, 8), "pj-B");
+            handler
+                .project_identities
+                .pin_live_answer(&project, "pj-A", Some(&project));
+            row(&store, "pj-A");
+            assert_eq!(served(&handler, &store, 7), "pj-A");
+        }
     }
 
     fn binding_with_harness(root: &str, harness: &str, session: &str) -> SessionBinding {
