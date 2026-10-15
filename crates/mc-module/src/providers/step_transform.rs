@@ -2865,7 +2865,7 @@ mod admission_hook_tests {
     #[tokio::test]
     async fn admission_hook_non_cc_answer_lane_passes() {
         for plan in [
-            json!({"serializer_profile":"opencode-v2","observation":"answer"}),
+            json!({"serializer_profile":"opencode-aisdk","observation":"answer"}),
             json!({"serializer_profile":"claude-code-anthropic"}),
         ] {
             let (_dir, h, key) = fixture(true, None).await;
