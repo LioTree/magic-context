@@ -14489,7 +14489,7 @@ impl ModuleHandler for McHandler {
     async fn on_bind(&self, req: &RouteBindRequest) -> subc_client_rs::BindDecision {
         let config = self.effective_config(&req.identity.project_root);
         // Hosts record their project identity before opening the route. Without
-        // that row, resolve the route root through Entorhinal within its deadline.
+        // that row, resolve through Entorhinal once the store can check managed projects.
         let host_identity = self.store.get().and_then(|store| {
             store
                 .session_project_identity(&req.identity.session)
@@ -14499,14 +14499,26 @@ impl ModuleHandler for McHandler {
         let initial = match host_identity {
             Some(identity) => Ok(identity),
             None => {
-                self.entorhinal
-                    .resolve_for_session(
-                        &self.project_identities,
-                        &req.identity.project_root,
-                        &req.identity.harness,
-                        &req.identity.session,
-                    )
-                    .await
+                if let Some(store) = self.store.get() {
+                    self.entorhinal
+                        .resolve_for_session(
+                            &self.project_identities,
+                            &req.identity.project_root,
+                            &req.identity.harness,
+                            &req.identity.session,
+                            Some(store.as_ref()),
+                        )
+                        .await
+                } else {
+                    // Without an open store we cannot read context.db's authority_managed
+                    // marker, which prevents identity merges until the single-store migration.
+                    // Keep the existing identity rather than authorizing a new pin.
+                    project_identity::log_once(
+                        format!("entorhinal-authority-unavailable:{}", req.identity.project_root.display()),
+                        "Keeping project identity; authority check unavailable until the store opens",
+                    );
+                    self.project_identities.resolve(&req.identity.project_root)
+                }
             }
         };
         self.bind_route(
@@ -21283,6 +21295,164 @@ mod tests {
                 row(&store, changed);
                 assert_eq!(served(&handler, &store, 7), expected);
             }
+        }
+
+        #[tokio::test]
+        async fn authority_managed_defers_populated_projects_until_row_removal() {
+            use tracing::instrument::WithSubscriber;
+            use tracing_subscriber::prelude::*;
+
+            for git in [false, true] {
+                let (mut handler, store, temp, project) = fixture();
+                if git {
+                    for args in [
+                        vec!["init", "--quiet"],
+                        vec![
+                            "-c",
+                            "user.name=Fixture",
+                            "-c",
+                            "user.email=fixture@example.test",
+                            "commit",
+                            "--quiet",
+                            "--allow-empty",
+                            "-m",
+                            "fixture",
+                        ],
+                    ] {
+                        let output = std::process::Command::new("git")
+                            .current_dir(&project)
+                            .args(args)
+                            .output()
+                            .unwrap();
+                        assert!(output.status.success(), "{output:?}");
+                    }
+                }
+                let fallback = handler.project_identities.resolve(&project).unwrap();
+                assert!(fallback.starts_with(if git { "git:" } else { "dir:" }));
+                store
+                    .seed_memory(1, &fallback, "CONSTRAINTS", "managed project fact", 50)
+                    .unwrap();
+                store.with_context_conn_for_test(|db| {
+                    db.execute_batch("CREATE TABLE IF NOT EXISTS authority_managed (project_path TEXT PRIMARY KEY, context_store_uuid TEXT NOT NULL, marked_at INTEGER NOT NULL)")?;
+                    db.execute("INSERT INTO authority_managed VALUES (?1, 'fixture', 1)", [&fallback])
+                }).unwrap();
+                let reply = root_reply(&project);
+                let expected = reply["result"]["projectId"].as_str().unwrap().to_string();
+                let fake = FakeEntorhinal::start(Some(reply), None).await;
+                handler.entorhinal =
+                    entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+                let logs = tempfile::tempdir().unwrap();
+                let mut config = cortexkit_log::Config::in_dir("magic-context", logs.path());
+                config.spec = Some("warn".into());
+                let (layer, log) = cortexkit_log::layer(config).unwrap();
+                bind(&handler, &project, 7)
+                    .with_subscriber(tracing_subscriber::registry().with(layer))
+                    .await;
+                for _ in 0..3 {
+                    assert_eq!(served(&handler, &store, 7), fallback);
+                }
+                assert!(handler
+                    .project_identities
+                    .pinned_identity(&project)
+                    .is_none());
+                let lines = std::fs::read_to_string(log.path()).unwrap();
+                assert_eq!(
+                    lines
+                        .matches("Keeping Rust-managed project identity")
+                        .count(),
+                    1
+                );
+                assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+                store
+                    .with_context_conn_for_test(|db| {
+                        let rows: i64 = db.query_row(
+                            "SELECT COUNT(*) FROM memories WHERE project_path = ?1",
+                            [&fallback],
+                            |row| row.get(0),
+                        )?;
+                        assert_eq!(rows, 1);
+                        // The offline single-store migration clears this marker, not session start.
+                        db.execute_batch("DELETE FROM authority_managed")
+                    })
+                    .unwrap();
+                bind(&handler, &project, 8).await;
+                assert_eq!(served(&handler, &store, 8), expected);
+                assert_eq!(served(&handler, &store, 7), fallback);
+                assert_eq!(
+                    handler.project_identities.pinned_identity(&project),
+                    Some(expected)
+                );
+                assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+                assert!(temp.path().join("sidecars").exists());
+            }
+        }
+
+        #[tokio::test]
+        async fn authority_missing_table_or_row_allows_registered_pins() {
+            for has_table in [false, true] {
+                let (mut handler, store, _temp, project) = fixture();
+                store.with_context_conn_for_test(|db| {
+                    db.execute_batch("DROP TABLE IF EXISTS authority_managed")?;
+                    if has_table {
+                        db.execute_batch("CREATE TABLE authority_managed (project_path TEXT PRIMARY KEY, context_store_uuid TEXT NOT NULL, marked_at INTEGER NOT NULL);
+                            INSERT INTO authority_managed VALUES ('git:other', 'fixture', 1)")?;
+                    }
+                    Ok(())
+                }).unwrap();
+                let reply = root_reply(&project);
+                let expected = reply["result"]["projectId"].as_str().unwrap().to_string();
+                let fake = FakeEntorhinal::start(Some(reply), None).await;
+                handler.entorhinal =
+                    entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+                bind(&handler, &project, 7).await;
+                assert_eq!(served(&handler, &store, 7), expected);
+                assert_eq!(
+                    handler.project_identities.pinned_identity(&project),
+                    Some(expected)
+                );
+                assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn authority_query_failure_keeps_fallback_without_pinning() {
+            let (mut handler, store, _temp, project) = fixture();
+            let fallback = handler.project_identities.resolve(&project).unwrap();
+            store
+                .with_context_conn_for_test(|db| {
+                    db.execute_batch(
+                        "DROP TABLE IF EXISTS authority_managed;
+                    CREATE TABLE authority_managed (wrong_column TEXT)",
+                    )
+                })
+                .unwrap();
+            let fake = FakeEntorhinal::start(Some(root_reply(&project)), None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            bind(&handler, &project, 7).await;
+            assert_eq!(served(&handler, &store, 7), fallback);
+            assert!(handler
+                .project_identities
+                .pinned_identity(&project)
+                .is_none());
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn authority_unavailable_store_keeps_fallback_without_pinning() {
+            let (mut handler, store, _temp, project) = fixture();
+            let fallback = handler.project_identities.resolve(&project).unwrap();
+            handler.store = Arc::new(OnceLock::new());
+            let fake = FakeEntorhinal::start(Some(root_reply(&project)), None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            bind(&handler, &project, 7).await;
+            assert_eq!(served(&handler, &store, 7), fallback);
+            assert!(handler
+                .project_identities
+                .pinned_identity(&project)
+                .is_none());
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]

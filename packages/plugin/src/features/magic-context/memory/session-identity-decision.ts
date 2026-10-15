@@ -106,9 +106,17 @@ async function decide(
         : { status: "absent" as const };
     if (answer.status === "resolved") {
         const fallback = resolveProjectIdentityForSession(directory, options.allowHomeProject);
-        if (rustManaged(options.db, fallback)) {
+        try {
+            if (rustManaged(options.db, fallback)) {
+                (options.log ?? log)(
+                    `[magic-context] keeping Rust-managed project identity ${fallback}; single-store migration required`,
+                );
+                return { directory, identity: fallback };
+            }
+        } catch (error) {
+            // A failed authority read cannot authorize moving a project's data key.
             (options.log ?? log)(
-                `[magic-context] keeping Rust-managed project identity ${fallback}; single-store migration required`,
+                `[magic-context] keeping project identity ${fallback}; authority check failed: ${error}`,
             );
             return { directory, identity: fallback };
         }

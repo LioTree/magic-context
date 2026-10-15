@@ -6,6 +6,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use mc_store::McStore;
 use serde::Deserialize;
 use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RetryBackoff, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
@@ -53,10 +54,12 @@ impl EntorhinalResolver {
         directory: &Path,
         harness: &str,
         instance_token: &str,
+        store: Option<&McStore>,
     ) -> Result<String, ProjectIdentityError> {
-        resolve_with_attempt(
+        resolve_with_store_attempt(
             identities,
             directory,
+            store,
             self.attempt(directory, harness, instance_token),
         )
         .await
@@ -194,11 +197,21 @@ pub(crate) fn decode_reply(bytes: &[u8]) -> ResolveAnswer {
     }
 }
 
-/// The timeout covers the entire attempt, including connect and lazy route binding.
-/// No writes occur inside the future: only a timely, accepted answer can authorize pins.
+#[cfg(test)]
 pub(crate) async fn resolve_with_attempt(
     identities: &ProjectIdentityResolver,
     directory: &Path,
+    attempt: impl Future<Output = ResolveAnswer>,
+) -> Result<String, ProjectIdentityError> {
+    resolve_with_store_attempt(identities, directory, None, attempt).await
+}
+
+/// The timeout covers the entire attempt, including connect and lazy route binding.
+/// No writes occur inside the future: only a timely, accepted answer can authorize pins.
+async fn resolve_with_store_attempt(
+    identities: &ProjectIdentityResolver,
+    directory: &Path,
+    store: Option<&McStore>,
     attempt: impl Future<Output = ResolveAnswer>,
 ) -> Result<String, ProjectIdentityError> {
     let directory = identities.eligible_directory(directory)?;
@@ -221,6 +234,27 @@ pub(crate) async fn resolve_with_attempt(
             project_id,
             canonical_root,
         } => {
+            if let Some(store) = store {
+                let fallback = identities.resolve(&directory)?;
+                match store.is_authority_managed(&fallback) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        log_once(
+                            format!("entorhinal-rust-managed:{fallback}"),
+                            &format!("Keeping Rust-managed project identity {fallback}; single-store migration required"),
+                        );
+                        return Ok(fallback);
+                    }
+                    Err(error) => {
+                        // A failed authority read cannot authorize moving a project's data key.
+                        log_once(
+                            format!("entorhinal-authority-read:{fallback}"),
+                            &format!("Keeping project identity {fallback}; authority check failed: {error}"),
+                        );
+                        return Ok(fallback);
+                    }
+                }
+            }
             identities.pin_live_answer(&directory, &project_id, canonical_root.as_deref());
             Ok(project_id)
         }
@@ -391,7 +425,7 @@ mod tests {
         let resolver = EntorhinalResolver::new(Some(fake.connection_file.clone()));
         assert_eq!(
             resolver
-                .resolve_for_session(&identities, &project, "test-harness", "instance")
+                .resolve_for_session(&identities, &project, "test-harness", "instance", None)
                 .await
                 .unwrap(),
             "pj-resolve-root"
@@ -409,7 +443,7 @@ mod tests {
         let resolver = EntorhinalResolver::new(Some(stalled.connection_file.clone()));
         assert_eq!(
             resolver
-                .resolve_for_session(&identities, &project, "test-harness", "instance")
+                .resolve_for_session(&identities, &project, "test-harness", "instance", None)
                 .await
                 .unwrap(),
             "pj-resolve-root"
@@ -445,7 +479,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert_eq!(
             resolver
-                .resolve_for_session(&identities, &project, "test-harness", "instance")
+                .resolve_for_session(&identities, &project, "test-harness", "instance", None)
                 .await
                 .unwrap(),
             crate::project_identity::directory_fallback(&project)
@@ -482,7 +516,7 @@ mod tests {
             let resolver = EntorhinalResolver::new(path);
             assert_eq!(
                 resolver
-                    .resolve_for_session(&identities, &project, "test-harness", "instance")
+                    .resolve_for_session(&identities, &project, "test-harness", "instance", None)
                     .await
                     .unwrap(),
                 fallback
@@ -493,7 +527,7 @@ mod tests {
             let resolver = EntorhinalResolver::new(Some(fake.connection_file.clone()));
             assert_eq!(
                 resolver
-                    .resolve_for_session(&identities, &project, "test-harness", "instance")
+                    .resolve_for_session(&identities, &project, "test-harness", "instance", None)
                     .await
                     .unwrap(),
                 fallback
@@ -505,7 +539,7 @@ mod tests {
         let resolver = EntorhinalResolver::new(Some(invalid_connection));
         assert_eq!(
             resolver
-                .resolve_for_session(&identities, &project, "test-harness", "instance")
+                .resolve_for_session(&identities, &project, "test-harness", "instance", None)
                 .await
                 .unwrap(),
             fallback
