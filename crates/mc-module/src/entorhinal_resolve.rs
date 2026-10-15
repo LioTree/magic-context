@@ -261,7 +261,12 @@ async fn resolve_with_store_attempt(
     store: Option<&McStore>,
     attempt: impl Future<Output = ResolveAnswer>,
 ) -> Result<String, ProjectIdentityError> {
-    let directory = identities.eligible_directory(directory)?;
+    let directory = match identities.eligible_directory(directory) {
+        Ok(directory) => directory,
+        // Inaccessible folders cannot authorize registered pins, but retain the
+        // standalone resolver's legacy behavior (including its missing-path refusal).
+        Err(_) => return identities.resolve(directory),
+    };
     if let Some(pin) = identities.pinned_identity(&directory) {
         return Ok(pin);
     }

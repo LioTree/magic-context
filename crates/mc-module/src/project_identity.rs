@@ -9,10 +9,10 @@
 //! as a Claude Code session. This is a port of that function; the golden vectors in the
 //! tests below were produced by running it.
 //!
-//! One deliberate difference: where the host would fall back to a `dir:` identity for a
-//! directory it cannot read at all (a path that no longer exists), this refuses. A route
-//! keyed on an identity nobody else computes would read an empty memory set and say
-//! nothing, so the caller gets an error naming the directory instead.
+//! Standalone compatibility: missing and non-directory paths retain the Rust refusal
+//! shipped in v0.49.2. Existing directories that cannot be listed retain legacy git/dir
+//! resolution, but cannot use registered pins or the registry. TypeScript's missing-path
+//! fallback is intentionally unchanged; adopting it here would change standalone Rust.
 //!
 //! Inside a checkout, only a repository with no commits yet gets a `dir:` identity. When
 //! git itself fails (no git binary, a timeout, an ownership refusal, broken metadata) the
@@ -514,6 +514,19 @@ impl ProjectIdentityResolver {
         directory: &Path,
         home: Option<&Path>,
     ) -> Result<PathBuf, ProjectIdentityError> {
+        let resolved = self.legacy_directory_with_home(directory, home)?;
+        std::fs::read_dir(&resolved).map_err(|error| ProjectIdentityError::Unreadable {
+            directory: resolved.display().to_string(),
+            reason: error.to_string(),
+        })?;
+        Ok(resolved)
+    }
+
+    fn legacy_directory_with_home(
+        &self,
+        directory: &Path,
+        home: Option<&Path>,
+    ) -> Result<PathBuf, ProjectIdentityError> {
         let resolved = node_path_resolve(directory);
         let display = resolved.display().to_string();
         let canonical_directory = realpath(&resolved).unwrap_or_else(|| resolved.clone());
@@ -525,8 +538,12 @@ impl ProjectIdentityResolver {
                 return Err(ProjectIdentityError::HomeDirectory { directory: display });
             }
         }
-        match std::fs::read_dir(&resolved) {
-            Ok(_) => Ok(resolved),
+        match std::fs::metadata(&resolved) {
+            Ok(metadata) if metadata.is_dir() => Ok(resolved),
+            Ok(_) => Err(ProjectIdentityError::Unreadable {
+                directory: display,
+                reason: "not a directory".to_string(),
+            }),
             Err(error) => Err(ProjectIdentityError::Unreadable {
                 directory: display,
                 reason: error.to_string(),
@@ -662,8 +679,12 @@ impl ProjectIdentityResolver {
     /// The identity of `directory`, as the host's `resolveProjectIdentityForSession`
     /// computes it.
     pub fn resolve(&self, directory: &Path) -> Result<String, ProjectIdentityError> {
-        let resolved = self.eligible_directory(directory)?;
-        if let Some(pin) = self.pinned_identity(&resolved) {
+        let resolved =
+            self.legacy_directory_with_home(directory, crate::config::user_home_dir().as_deref())?;
+        if let Some(pin) = std::fs::read_dir(&resolved)
+            .ok()
+            .and_then(|_| self.pinned_identity(&resolved))
+        {
             return Ok(pin);
         }
         if let Some(cached) = self
