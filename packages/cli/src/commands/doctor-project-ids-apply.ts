@@ -332,6 +332,9 @@ function backupProjectIds(dbPath: string): void {
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
     console.log(`Backup directory: ${backup}`);
     console.log(
+        "store.db was not changed. Restoring context.db and identity sidecars is safe only before further use; close all hosts first.",
+    );
+    console.log(
         `Restore with hosts closed: rm -f ${quote(`${dbPath}-wal`)} ${quote(`${dbPath}-shm`)}; cp ${quote(join(backup, "context.db"))} ${quote(dbPath)}; for suffix in -wal -shm; do if test -f ${quote(join(backup, "context.db"))}"$suffix"; then cp ${quote(join(backup, "context.db"))}"$suffix" ${quote(dbPath)}"$suffix"; fi; done`,
     );
     console.log(
