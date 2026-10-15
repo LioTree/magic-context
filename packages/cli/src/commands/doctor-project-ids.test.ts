@@ -28,7 +28,7 @@ import {
     parseProjectIdsPlanArgs,
     runProjectIdsCli,
 } from "./doctor-project-ids";
-import { fakeProjectEndpoint } from "./doctor-project-ids.test-support";
+import { fakeProjectEndpoint, linkedCheckoutFixture } from "./doctor-project-ids.test-support";
 
 let root: string;
 let dbPath: string;
@@ -172,6 +172,8 @@ describe("doctor project-ids plan", () => {
                     from,
                     to: target,
                     rowsByTable: expect.any(Object),
+                    inherited: [],
+                    staysOnLegacy: [],
                     folders: [first, missing, second, third].map((directory) => ({
                         directory,
                         exists: directory !== missing,
@@ -193,26 +195,89 @@ describe("doctor project-ids plan", () => {
         ).toBeNull();
     }, 30_000);
 
-    it("does not propose a source whose folders disagree or include implicit alongside pj-", async () => {
+    it("keeps conflicting targets ahead of implicit and unavailable answers", async () => {
         const a = folder("a");
         const b = folder("b");
         const c = folder("c");
         const d = folder("d");
-        source("git:conflict", [a, b]);
-        source("dir:mixed", [c, d]);
+        source("git:conflict", [a, b, c, d]);
         const result = await plan(async (directory) =>
             directory === b
                 ? resolved("pj-OTHER")
-                : directory === d
+                : directory === c
                   ? { status: "implicit" }
-                  : resolved(),
+                  : directory === d
+                    ? { status: "not_answering", reason: "transport" }
+                    : resolved(),
         );
         expect(result.pairs).toEqual([]);
         expect(result.unchanged).toContainEqual({
             identity: "git:conflict",
             reason: "conflicting_targets",
         });
-        expect(result.unchanged).toContainEqual({ identity: "dir:mixed", reason: "implicit" });
+    }, 30_000);
+
+    it("inherits implicit linked worktrees and lists an unrelated clone as staying on legacy", async () => {
+        const { main, worktrees, clone, gitCommonDir } = linkedCheckoutFixture(root);
+        const from = "git:linked";
+        source(from, [...worktrees, clone, main]);
+        const output = spyOn(console, "log").mockImplementation(() => {});
+        try {
+            expect(
+                await runProjectIdsCli(["plan", "--db", dbPath], {
+                    now,
+                    resolve: async (directory) =>
+                        directory === main ? resolved() : { status: "implicit" },
+                }),
+            ).toBe(0);
+            const result: ProjectIdPlan = JSON.parse(
+                readFileSync(join(root, "project-id-plan-2026-10-15T10-11-12.123Z.json"), "utf8"),
+            );
+            expect(result.unchanged).toEqual([]);
+            expect(result.pairs).toHaveLength(1);
+            expect(result.pairs[0]).toMatchObject({
+                from,
+                to: target,
+                inherited: worktrees.map((directory) => ({ directory, gitCommonDir })),
+                staysOnLegacy: [{ directory: clone, reason: "implicit" }],
+            });
+            expect(result.pairs[0].folders.map((folder) => folder.directory)).toEqual([
+                ...worktrees,
+                main,
+            ]);
+            const printed = output.mock.calls.flat().join("\n");
+            for (const directory of worktrees)
+                expect(printed).toContain(
+                    `Inherited ${target}: ${directory} (git common dir: ${gitCommonDir})`,
+                );
+            expect(printed).toContain(`Stays on legacy: ${clone} (implicit; fresh legacy identity`);
+        } finally {
+            output.mockRestore();
+        }
+    }, 30_000);
+
+    it("leaves an all-implicit source unchanged even when its folders share a git common dir", async () => {
+        const { main, worktrees, clone } = linkedCheckoutFixture(root);
+        source("git:implicit", [main, ...worktrees, clone]);
+        const result = await plan(async () => ({ status: "implicit" }));
+        expect(result.pairs).toEqual([]);
+        expect(result.unchanged).toEqual([{ identity: "git:implicit", reason: "implicit" }]);
+    }, 30_000);
+
+    it("keeps unavailable answers ahead of implicit even with a resolved target", async () => {
+        const main = folder("main");
+        const implicit = folder("implicit");
+        const down = folder("down");
+        source("git:down", [main, implicit, down]);
+        const result = await plan(async (directory) =>
+            directory === main
+                ? resolved()
+                : directory === implicit
+                  ? { status: "implicit" }
+                  : { status: "not_answering", reason: "transport" },
+        );
+        expect(result.pairs).toEqual([]);
+        expect(result.unchanged).toEqual([{ identity: "git:down", reason: "not_answering" }]);
     }, 30_000);
 
     it("lists missing-only and unobserved sources but missing folders do not block a resolved source", async () => {

@@ -1,4 +1,5 @@
-import { chmodSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import {
@@ -14,6 +15,34 @@ import {
     SERVER_PROOF_DOMAIN,
 } from "@cortexkit/subc-client";
 import vectors from "../../../../test-vectors/project-resolve-v1/resolve.json";
+
+export function linkedCheckoutFixture(root: string) {
+    const main = join(root, "registered", "main");
+    const scratch = join(root, "scratch");
+    const worktrees = [join(scratch, "lane-a"), join(scratch, "lane-b")];
+    const clone = join(scratch, "clone");
+    mkdirSync(main, { recursive: true });
+    mkdirSync(scratch, { recursive: true });
+    const git = (cwd: string, ...args: string[]) =>
+        execFileSync(
+            "git",
+            [
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                ...args,
+            ],
+            { cwd, stdio: "pipe" },
+        );
+    git(main, "init");
+    git(main, "commit", "--allow-empty", "-m", "fixture");
+    for (const directory of worktrees) git(main, "worktree", "add", "--detach", directory);
+    git(scratch, "clone", "--no-hardlinks", main, clone);
+    return { main, worktrees, clone, gitCommonDir: join(main, ".git") };
+}
 
 class PeerReader {
     private buffered = Buffer.alloc(0);
@@ -64,7 +93,10 @@ function reply(socket: Socket, request: EnvelopeHeader, body: unknown): void {
  * Fake daemon that authenticates the subc client and serves saved Entorhinal replies.
  * The unknown-via folder changes the reply's via field to simulate a newer protocol value.
  */
-export async function fakeProjectEndpoint(root: string) {
+export async function fakeProjectEndpoint(
+    root: string,
+    implicitDirectories: readonly string[] = [],
+) {
     const connectionFile = join(root, "connection.json");
     const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
     const daemonId = Uint8Array.from({ length: 16 }, (_, index) => index + 100);
@@ -109,7 +141,9 @@ export async function fakeProjectEndpoint(root: string) {
                 .canonicalRoot;
             calls.push(directory);
             const answer = structuredClone(
-                directory.endsWith("/implicit") ? implicitReply : rootReply,
+                directory.endsWith("/implicit") || implicitDirectories.includes(directory)
+                    ? implicitReply
+                    : rootReply,
             );
             if (directory.endsWith("/unknown-via") && answer.result)
                 Object.assign(answer.result, { via: "future-via", futureField: true });

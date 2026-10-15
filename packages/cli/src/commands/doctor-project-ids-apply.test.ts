@@ -25,6 +25,7 @@ import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-
 import * as databaseAccess from "../lib/database-access";
 import { runMergeIdentityCli } from "./doctor-merge-identity";
 import { buildProjectIdPlan, type ProjectIdPlan, runProjectIdsCli } from "./doctor-project-ids";
+import { fakeProjectEndpoint, linkedCheckoutFixture } from "./doctor-project-ids.test-support";
 import {
     type ProjectIdsApplyDeps,
     parseProjectIdsApplyArgs,
@@ -477,6 +478,25 @@ describe("doctor project-ids apply preflight", () => {
         expect(() =>
             check({ ...plan, pairs: [{ ...plan.pairs[0], to: "pj-implicit1-abc" }] }),
         ).toThrow("Invalid project identity plan pair");
+        for (const staysOnLegacy of [
+            null,
+            {},
+            [{ reason: "implicit" }],
+            [{ directory: "x", reason: "resolved" }],
+        ])
+            expect(() =>
+                check({
+                    ...plan,
+                    pairs: [{ ...plan.pairs[0], staysOnLegacy }],
+                } as unknown as ProjectIdPlan),
+            ).toThrow("Invalid project identity plan pair");
+    });
+
+    it("still accepts version 1 plans without inheritance or legacy-only fields", async () => {
+        const plan = JSON.parse(JSON.stringify(await makePlan()));
+        delete plan.pairs[0].inherited;
+        delete plan.pairs[0].staysOnLegacy;
+        expect(check(plan).refusals).toEqual([]);
     });
 
     it("parses apply and an optional read-only check with one plan path", () => {
@@ -676,6 +696,89 @@ describe("doctor project-ids apply pairs", () => {
         expect(bytes(paths[2])).toBe(worktreeBytes);
         expect(JSON.parse(readFileSync(paths[4], "utf8")).identity).toBe(from);
     });
+
+    it("applies a remap and implicit worktree sessions inherit only the main checkout pin", async () => {
+        const { main, worktrees, clone, gitCommonDir } = linkedCheckoutFixture(root);
+        db.prepare("INSERT INTO project_state(project_path) VALUES (?)").run(from);
+        for (const directory of [...worktrees, clone, main]) sidecar(directory);
+        const unpinnedPaths = [...worktrees, clone].map(sidecarPath);
+        const before = unpinnedPaths.map(bytes);
+        const fake = await fakeProjectEndpoint(root, [...worktrees, clone]);
+        try {
+            const plan = await buildProjectIdPlan(db, dbPath, null, {
+                resolve: async (directory) =>
+                    directory === main
+                        ? {
+                              status: "resolved",
+                              via: "root",
+                              projectId: fake.projectId,
+                              canonicalRoot: main,
+                          }
+                        : { status: "implicit" },
+            });
+            expect(plan.pairs).toHaveLength(1);
+            expect(plan.pairs[0].inherited).toHaveLength(worktrees.length);
+            expect(plan.pairs[0].staysOnLegacy).toEqual([{ directory: clone, reason: "implicit" }]);
+            expect((await apply(plan)).code).toBe(0);
+            expect(JSON.parse(readFileSync(sidecarPath(main), "utf8"))).toEqual({
+                directory: main,
+                identity: fake.projectId,
+                gitCommonDir,
+            });
+            expect(unpinnedPaths.map(bytes)).toEqual(before);
+            expect(mappings()).toEqual([
+                { old_project_path: from, new_project_path: fake.projectId },
+            ]);
+
+            // A fresh host process must find the apply-written main pin, not an in-memory cache.
+            const child = Bun.spawn(
+                [
+                    process.execPath,
+                    "--eval",
+                    `
+                    import { awaitSessionIdentityDecision } from ${JSON.stringify(join(import.meta.dir, "../../../plugin/src/features/magic-context/memory/session-identity-decision.ts"))};
+                    const decisions = [];
+                    for (const directory of ${JSON.stringify(worktrees)}) {
+                        decisions.push(await awaitSessionIdentityDecision(directory, directory, {
+                            connectionFile: ${JSON.stringify(fake.connectionFile)},
+                            allowHomeProject: true,
+                        }));
+                    }
+                    console.log(JSON.stringify(decisions));
+                    `,
+                ],
+                {
+                    cwd: root,
+                    env: {
+                        PATH: process.env.PATH ?? "",
+                        HOME: root,
+                        MAGIC_CONTEXT_STORAGE_DIR: root,
+                        XDG_DATA_HOME: join(root, "data"),
+                        XDG_CONFIG_HOME: join(root, "config"),
+                        XDG_STATE_HOME: join(root, "state"),
+                        XDG_RUNTIME_DIR: join(root, "runtime"),
+                    },
+                    stdin: "ignore",
+                    stdout: "pipe",
+                    stderr: "pipe",
+                },
+            );
+            const [stdout, stderr, code] = await Promise.all([
+                new Response(child.stdout).text(),
+                new Response(child.stderr).text(),
+                child.exited,
+            ]);
+            expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+            expect(JSON.parse(stdout)).toEqual(
+                worktrees.map((directory) => ({ directory, identity: fake.projectId })),
+            );
+            expect(fake.calls).toEqual(worktrees);
+            expect(fake.failures).toEqual([]);
+            expect(unpinnedPaths.map(bytes)).toEqual(before);
+        } finally {
+            await fake.close();
+        }
+    }, 30_000);
 
     it("commits each pair separately and rolls back a failed pair's rekey map before any of its pins", async () => {
         const plan = await orderedPlan();

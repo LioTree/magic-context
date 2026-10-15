@@ -34,7 +34,10 @@ export interface ProjectIdPlanPair {
     from: string;
     to: string;
     rowsByTable: Record<string, number>;
+    // Apply may pin these folders; unmatched implicit folders must stay on legacy instead.
     folders: ProjectIdPlanFolder[];
+    inherited: Array<{ directory: string; gitCommonDir: string }>;
+    staysOnLegacy: Array<{ directory: string; reason: "implicit" }>;
 }
 
 export type ProjectIdUnchangedReason =
@@ -168,7 +171,8 @@ export async function buildProjectIdPlan(
             continue;
         }
         const targets = new Set<string>();
-        let implicit = false;
+        const implicitFolders: ProjectIdPlanFolder[] = [];
+        const resolvedCommonDirs = new Set<string>();
         let notAnswering = false;
         for (const folder of existing) {
             try {
@@ -181,9 +185,10 @@ export async function buildProjectIdPlan(
                     answer.status === "resolved" &&
                     ["root", "walk", "containment", "worktree"].includes(answer.via) &&
                     isPinnedProjectIdentity(answer.projectId)
-                )
+                ) {
                     targets.add(answer.projectId);
-                else if (answer.status === "implicit") implicit = true;
+                    if (folder.gitCommonDir) resolvedCommonDirs.add(folder.gitCommonDir);
+                } else if (answer.status === "implicit") implicitFolders.push(folder);
                 else notAnswering = true;
             } catch {
                 // A folder or transport becoming unreadable online cannot authorize a merge.
@@ -192,12 +197,35 @@ export async function buildProjectIdPlan(
         }
         if (targets.size > 1) reasons.set(from, "conflicting_targets");
         else if (notAnswering) reasons.set(from, "not_answering");
-        else if (implicit) reasons.set(from, "implicit");
+        else if (!targets.size && implicitFolders.length) reasons.set(from, "implicit");
         else {
             const to = [...targets][0];
             if (!to) reasons.set(from, "not_answering");
             else if (rustManaged(db, to)) reasons.set(from, "rust_managed");
-            else candidates.set(from, { from, to, folders, rowsByTable: {} });
+            else {
+                const inherited: ProjectIdPlanPair["inherited"] = [];
+                const staysOnLegacy: ProjectIdPlanPair["staysOnLegacy"] = [];
+                for (const folder of implicitFolders) {
+                    // Runtime sessions inherit a main checkout's pin through their git common dir.
+                    if (folder.gitCommonDir && resolvedCommonDirs.has(folder.gitCommonDir))
+                        inherited.push({
+                            directory: folder.directory,
+                            gitCommonDir: folder.gitCommonDir,
+                        });
+                    else staysOnLegacy.push({ directory: folder.directory, reason: "implicit" });
+                }
+                candidates.set(from, {
+                    from,
+                    to,
+                    folders: folders.filter(
+                        (folder) =>
+                            !staysOnLegacy.some((legacy) => legacy.directory === folder.directory),
+                    ),
+                    inherited,
+                    staysOnLegacy,
+                    rowsByTable: {},
+                });
+            }
         }
     }
     const groups = new Map<string, ProjectIdPlanPair[]>();
@@ -276,6 +304,16 @@ export async function runProjectIdsCli(
         console.log(
             `  ${plan.pairs.length} pair(s); ${plan.unchanged.length} unchanged source(s). No database or pin changes.`,
         );
+        for (const pair of plan.pairs) {
+            for (const folder of pair.inherited)
+                console.log(
+                    `  Inherited ${pair.to}: ${folder.directory} (git common dir: ${folder.gitCommonDir})`,
+                );
+            for (const folder of pair.staysOnLegacy)
+                console.log(
+                    `  Stays on legacy: ${folder.directory} (${folder.reason}; fresh legacy identity after remap ${pair.from} -> ${pair.to})`,
+                );
+        }
         return 0;
     } finally {
         db.close();

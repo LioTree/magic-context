@@ -114,6 +114,14 @@ function validatePlan(plan: ProjectIdPlan): void {
                     typeof folder.worktree !== "boolean" ||
                     (folder.gitCommonDir !== null && typeof folder.gitCommonDir !== "string"),
             ) ||
+            (pair.staysOnLegacy !== undefined &&
+                (!Array.isArray(pair.staysOnLegacy) ||
+                    pair.staysOnLegacy.some(
+                        (folder) =>
+                            !folder ||
+                            typeof folder.directory !== "string" ||
+                            folder.reason !== "implicit",
+                    ))) ||
             !pair.rowsByTable ||
             typeof pair.rowsByTable !== "object" ||
             Array.isArray(pair.rowsByTable) ||
@@ -236,7 +244,10 @@ export function preflightProjectIdApply(
             result.pairs.push({ pair, liveRowsByTable, liveRows });
             // Only folders still attributed to a source with rows can expand the data being moved.
             if (liveRows === 0) continue;
-            const plannedFolders = new Set(pair.folders.map((folder) => folder.directory));
+            // Legacy-only folders were observed during planning but are not pin destinations.
+            const plannedFolders = new Set(
+                [...pair.folders, ...(pair.staysOnLegacy ?? [])].map((folder) => folder.directory),
+            );
             for (const row of observed) {
                 if (
                     row.identities.some((item) => item.identity === pair.from) &&
