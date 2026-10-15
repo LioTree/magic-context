@@ -9,6 +9,7 @@ pub mod log_parser;
 pub mod pi_sessions;
 pub mod process_ext;
 pub mod project_identity;
+pub mod project_names;
 pub mod serve;
 #[cfg(test)]
 pub mod test_bin;

@@ -57,17 +57,21 @@ fn directory_fallback(path: &Path) -> String {
 
 /// Normalize a value read from `memories.project_path` / related stored identity columns.
 ///
-/// Stored DB values may already be identities (`git:*`, `dir:*`). Those must be returned
+/// Stored DB values may already be identities (`git:*`, `dir:*`, `pj-*`). Those must be returned
 /// unchanged; hashing the identity text as a filesystem path would produce a wrong project
 /// key. Legacy raw paths degrade to the deterministic directory fallback so the dashboard
 /// never probes git while reading historical rows.
 pub fn normalize_stored_project_path(raw_or_stored: &str) -> String {
-    if raw_or_stored.starts_with("git:") || raw_or_stored.starts_with("dir:") {
+    if is_project_identity(raw_or_stored) {
         return raw_or_stored.to_string();
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let canonical = logical_absolute(Path::new(raw_or_stored), &cwd);
     directory_fallback(&canonical)
+}
+
+pub fn is_project_identity(value: &str) -> bool {
+    value.starts_with("git:") || value.starts_with("dir:") || value.starts_with("pj-")
 }
 
 pub fn basename(path: &str) -> String {
@@ -95,6 +99,20 @@ mod tests {
             normalize_stored_project_path("dir:deadbeef0000"),
             "dir:deadbeef0000"
         );
+        for value in ["pj-dashboard-editor", "pj-A_B-0123456789"] {
+            assert_eq!(
+                normalize_stored_project_path(value).as_bytes(),
+                value.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn identity_vs_path_classification_accepts_pj() {
+        assert!(is_project_identity("pj-dashboard-editor"));
+        assert!(is_project_identity("git:abc123"));
+        assert!(is_project_identity("dir:deadbeef0000"));
+        assert!(!is_project_identity("/tmp/pj-dashboard-editor"));
     }
 
     #[test]

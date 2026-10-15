@@ -165,6 +165,9 @@ pub fn build_router(app_state: Arc<AppState>, options: &ServeOptions, token: Str
 }
 
 async fn run_async(options: ServeOptions) -> Result<(), String> {
+    crate::project_names::cache()
+        .initialize(&crate::project_names::connection_file())
+        .await;
     let addr = SocketAddr::new(options.host, options.port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
