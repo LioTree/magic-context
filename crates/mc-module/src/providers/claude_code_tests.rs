@@ -6,6 +6,8 @@ use super::*;
 mod context_fixture_tests;
 #[path = "late_descent_tests.rs"]
 mod late_descent_tests;
+#[path = "native_endpoint_tests.rs"]
+mod native_endpoint_tests;
 #[path = "pending_hook_pairing_tests.rs"]
 mod pending_hook_pairing_tests;
 
@@ -72,8 +74,55 @@ fn plan() -> Value {
     json!({"serializer_profile":"claude-code-anthropic","observation":"answer"})
 }
 pub(super) async fn call(h: &McHandler, method: &str, params: Value) -> HandlerOutcome {
-    h.dispatch_value(7, json!({"method":method,"params":params}))
-        .await
+    let outcome = h
+        .dispatch_value(7, json!({"method":method,"params":params}))
+        .await;
+    if method == "compaction.step" {
+        if let HandlerOutcome::Response(bytes) = &outcome {
+            assert_native_range_endpoint(&serde_json::from_slice::<Value>(bytes).unwrap(), &params);
+        }
+    }
+    outcome
+}
+
+pub(super) fn assert_native_range_endpoint(answer: &Value, status: &Value) {
+    if answer["answer"] != "compaction_message" || answer["compaction"]["raw_view"].is_null() {
+        return;
+    }
+    let coverage = &answer["coverage"];
+    let endpoint = &coverage["endpoint"];
+    assert_eq!(
+        coverage["ordinal"].as_u64().unwrap().checked_add(1),
+        answer["compaction"]["range"]["to"].as_u64(),
+        "endpoint_range_to"
+    );
+    assert_eq!(coverage["end_mid"], endpoint["message_id"]);
+    assert_eq!(answer["compaction"]["raw_view"]["endpoint"], *endpoint);
+    let Some(source) = status["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["mid"] == endpoint["message_id"])
+    else {
+        // A descendant step can inherit originals already stored for its parent
+        // instead of resending them. Production admission checks their original
+        // content-block coordinates against the stored messages.
+        return;
+    };
+    assert_eq!(
+        source["ordinal"].as_u64().unwrap().checked_add(1),
+        answer["compaction"]["range"]["to"].as_u64(),
+        "endpoint_range_to"
+    );
+    assert_eq!(coverage["ordinal"], source["ordinal"]);
+    assert_eq!(coverage["end_mid"], source["mid"]);
+    let content = &source["message"]["content"];
+    let last_part = if content.is_string() {
+        0
+    } else {
+        content.as_array().unwrap().len() - 1
+    };
+    assert_eq!(endpoint["part_index"], json!(last_part));
 }
 fn response(outcome: HandlerOutcome) -> Value {
     let HandlerOutcome::Response(bytes) = outcome else {
@@ -370,7 +419,7 @@ async fn cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes
     assert_eq!(
         frozen.endpoint,
         compact::view::NativeEndpoint {
-            message_id: "m".into(),
+            message_id: "tail".into(),
             part_index: 0
         }
     );
@@ -389,18 +438,9 @@ async fn cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes
     let head = response(call(&h, "compaction.view.read", cut_read.clone()).await);
     assert_eq!(head["answer"], "page");
     let prefix: Vec<Value> = serde_json::from_str(head["bytes"].as_str().unwrap()).unwrap();
-    assert_eq!(prefix.len(), 2);
-    assert!(!head["bytes"].as_str().unwrap().contains("live tail"));
-    assert_eq!(
-        frozen.retained_tail.as_ref().unwrap(),
-        &vec![compact::view::RetainedPart {
-            endpoint: compact::view::NativeEndpoint {
-                message_id: "tail".into(),
-                part_index: 0
-            },
-            engine_handle: "tail#0".into()
-        }]
-    );
+    assert_eq!(prefix.len(), 3);
+    assert_eq!(head["bytes"], full);
+    assert_eq!(frozen.retained_tail, Some(vec![]));
     let mut applied = step(r#"{ "content":"unsigned live text", "role":"user" }"#);
     applied["newest"] = json!({"mid":"tail","ordinal":1});
     applied["last_applied"] = json!({"compaction_id":answer["compaction"]["compaction_id"],"version":answer["compaction"]["version"]});
@@ -560,7 +600,7 @@ async fn cc_partial_engine_boundary_refuses_instead_of_snapping_whole_message() 
         } else {
             assert_eq!(
                 answer["coverage"]["endpoint"],
-                json!({"message_id":"m","part_index":1})
+                json!({"message_id":"tail","part_index":0})
             );
         }
     }
@@ -785,6 +825,11 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
         .expect("the CC engine measured the request against usable_soft");
     assert!((pressure.0 - (tokens as f64 / soft as f64 * 100.0)).abs() < 0.001);
     assert_eq!(second["answer"], "compaction_message", "{second}");
+    assert_eq!(second["compaction"]["range"], json!({"from":0,"to":11}));
+    assert_eq!(
+        second["coverage"],
+        json!({"end_mid":"followup","ordinal":10,"endpoint":{"message_id":"followup","part_index":0}})
+    );
 
     let mut repeated = turn_two.clone();
     repeated["request_id"] = json!("same-execute");
@@ -1187,6 +1232,7 @@ async fn first_head_sequence(first_raw: &str, last_part: u64, cut_unfolded: bool
         .await
         .unwrap();
     let folded: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_native_range_endpoint(&folded, &status);
     validate_native_answer(&folded, &pins);
     assert_eq!(folded["answer"], "compaction_message");
     assert_eq!(folded["compaction"]["range"], json!({"from":0,"to":4}));
@@ -1198,14 +1244,14 @@ async fn first_head_sequence(first_raw: &str, last_part: u64, cut_unfolded: bool
     assert!(folded_raw.contains(tail_raw));
     let cut = native_read(&h, folded_view.cut_replacement_ref.as_ref().unwrap()).await;
     assert!(cut.contains("real-fold-evidence"));
-    assert!(!cut.contains("retained live tail"));
+    assert_eq!(cut, folded_raw);
     let retained = folded_view.retained_tail.as_ref().unwrap();
     assert_eq!(
         retained
             .iter()
             .map(|part| part.engine_handle.as_str())
             .collect::<Vec<_>>(),
-        vec!["tail#0", "later-2#0", "later-3#0"]
+        Vec::<&str>::new()
     );
     assert_eq!(
         store
@@ -1216,13 +1262,10 @@ async fn first_head_sequence(first_raw: &str, last_part: u64, cut_unfolded: bool
         Some(0)
     );
 
-    // Emulate the native hook removing message zero through its final part.
-    // Its replacement is the frozen cut prefix; the remaining originals stay raw.
-    status["messages"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|message| message["ordinal"] != 0);
-    status["after_ordinal"] = json!(1);
+    // The full-range cut installs the re-rendered tail as well as the summary.
+    // No original in the replaced range remains in the host transcript.
+    status["messages"].as_array_mut().unwrap().clear();
+    status["after_ordinal"] = json!(4);
     status["last_applied"] = json!({"compaction_id":folded["compaction"]["compaction_id"],"version":folded["compaction"]["version"]});
     status.as_object_mut().unwrap().remove("prefix_rebuilding");
     status["estimate"]["request_tokens"] = json!(1);

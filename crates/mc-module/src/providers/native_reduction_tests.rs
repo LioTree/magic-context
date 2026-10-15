@@ -532,7 +532,11 @@ async fn drop_after_kept_thinking(tokens: u64, soft: u64) {
     status["geometry"] = json!({"usable_soft":soft,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
     let answer = step_answer(&h, &status, &pins).await;
     assert_eq!(answer["answer"], "compaction_message", "{answer}");
-    assert_eq!(answer["coverage"]["ordinal"], 14);
+    assert_eq!(answer["coverage"]["ordinal"], 20);
+    assert_eq!(
+        answer["coverage"]["endpoint"],
+        json!({"message_id":"m20","part_index":0})
+    );
     let view = store
         .load_provider_view(
             &key.store_key(),
@@ -593,6 +597,7 @@ async fn step_answer(
         .await
         .unwrap();
     let answer: Value = serde_json::from_slice(&bytes).unwrap();
+    claude_code_tests::assert_native_range_endpoint(&answer, status);
     claude_code_tests::validate_native_answer(&answer, pins);
     answer
 }

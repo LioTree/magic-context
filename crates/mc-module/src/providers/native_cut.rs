@@ -283,8 +283,11 @@ mod tests {
     #[test]
     fn hook_cut_head_excludes_retained_parts_and_nested_children_keep_top_level_handles() {
         let (key, request, mut host) = fixture(true);
+        let head_endpoint = host.coverage.as_ref().unwrap().endpoint.clone().unwrap();
+        assert!(host.coverage.as_ref().unwrap().ordinal + 1 < host.engine.range.to);
         attach(&key, &mut host, &request).unwrap();
         let frozen = host.wire.raw_view.as_ref().unwrap();
+        assert_eq!(frozen.endpoint, head_endpoint);
         let cut = host.cut_replacement.as_ref().unwrap();
         assert_eq!(
             serde_json::from_str::<Vec<Value>>(&cut.bytes)
@@ -351,6 +354,14 @@ mod tests {
         attach(&key, &mut host, &request).unwrap();
         let full = host.wire.raw_view.as_ref().unwrap();
         assert_eq!(full.retained_tail, Some(vec![]));
+        assert_eq!(
+            host.coverage.as_ref().unwrap().ordinal + 1,
+            host.engine.range.to
+        );
+        assert_eq!(
+            host.cut_replacement.as_ref().unwrap().bytes,
+            format!("[{}]", host.raw_replacement.as_ref().unwrap().join(","))
+        );
         assert_ne!(
             full.view.view_id,
             host.cut_replacement.as_ref().unwrap().reference.view_id

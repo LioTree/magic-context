@@ -885,7 +885,10 @@ fn execute_host(
         return Ok(None);
     };
     setup.setup.state.version_high_water = state.version_high_water;
-    let mut native_coverage = output.engine.response.coverage_ordinal;
+    // Signed-thinking validation needs the last summarized or edited message.
+    // The wire replacement can also contain unchanged later messages, so its
+    // removal endpoint is computed separately from the replacement range.
+    let mut native_edit_through = output.engine.response.coverage_ordinal;
     if codec == Codec::ClaudeCodeAnthropic {
         if promoted
             && template.messages.iter().any(|entry| {
@@ -1019,10 +1022,10 @@ fn execute_host(
                 }
             }
         }
-        native_coverage = super::native_reductions::apply(
+        native_edit_through = super::native_reductions::apply(
             &mut engine,
             &template,
-            native_coverage,
+            native_edit_through,
             rebuild,
             &output.engine.response.native_reasoning_keep_mids,
             &tags,
@@ -1053,7 +1056,7 @@ fn execute_host(
                 && coverage_replay_matches(
                     codec,
                     p.coverage.as_ref().map(|coverage| coverage.ordinal),
-                    native_coverage,
+                    (engine.range.from < engine.range.to).then(|| engine.range.to - 1),
                 )
         }) {
         let mut wire = previous.wire;
@@ -1066,13 +1069,16 @@ fn execute_host(
         )
     } else {
         let (wire, raw_replacement, initial_coverage) = if codec == Codec::ClaudeCodeAnthropic {
-            let (mut wire, mut raw) =
-                match super::codec_claude_code::encode_view(&engine, &template, native_coverage) {
-                    Ok(encoded) => encoded,
-                    Err(_) if promoted => return Ok(None),
-                    Err(error) => return Err(error),
-                };
-            let coverage = if native_coverage.is_none()
+            let (mut wire, mut raw) = match super::codec_claude_code::encode_view(
+                &engine,
+                &template,
+                native_edit_through,
+            ) {
+                Ok(encoded) => encoded,
+                Err(_) if promoted => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let coverage = if native_edit_through.is_none()
                 && super::native_view::has_selected_bundle(conversation)?
             {
                 native_uncovered_prefix(&mut engine, &mut wire, &mut raw, &template, &messages)?
@@ -1092,7 +1098,7 @@ fn execute_host(
             )
         };
         let coverage = initial_coverage.or_else(|| {
-            native_coverage.and_then(|ordinal| {
+            native_edit_through.and_then(|ordinal| {
                 messages
                     .iter()
                     .find(|m| m.ordinal == ordinal)
@@ -1109,7 +1115,10 @@ fn execute_host(
         (wire, coverage, raw_replacement, head_slots)
     };
     if codec == Codec::ClaudeCodeAnthropic {
-        if native_coverage.is_some() && coverage.is_none() {
+        // A summary ending inside an original message cannot remove that whole
+        // message: its unsummarized parts would be lost. Preserve that refusal
+        // independently of the endpoint for the entire wire replacement.
+        if native_edit_through.is_some() && coverage.is_none() {
             return Err(error(
                 "native_endpoint_unrepresentable",
                 "covered native message is missing",
@@ -1133,7 +1142,7 @@ fn execute_host(
                 .map_err(transient)?
                 .core
                 .boundary_id;
-            if native_coverage != output.engine.response.coverage_ordinal {
+            if native_edit_through != output.engine.response.coverage_ordinal {
                 let source = template
                     .messages
                     .iter()
@@ -1145,13 +1154,14 @@ fn execute_host(
                 message, &boundary,
             )?);
         }
+        // The raw bytes replace the entire range, even when its tail is
+        // re-rendered verbatim or only the earlier prefix was summarized.
+        coverage = native_range_coverage(&engine, &template, &messages)?;
         wire.raw_view = super::native_view::frozen_for_plan(
             &work.key,
             &engine,
             conversation,
-            coverage
-                .as_ref()
-                .and_then(|coverage| coverage.endpoint.as_ref()),
+            coverage.as_ref(),
             raw_replacement
                 .as_deref()
                 .ok_or_else(|| invalid_field("raw_view"))?,
@@ -1169,6 +1179,45 @@ fn execute_host(
         super::native_cut::attach(&work.key, &mut view, &template)?;
     }
     Ok(Some(view))
+}
+
+fn native_range_coverage(
+    engine: &transform::compaction::View,
+    request: &TransformRequest,
+    messages: &[compact::status::StatusMessage],
+) -> Result<Option<HostCoverage>, HandlerOutcome> {
+    if engine.range.from == engine.range.to {
+        return Ok(None);
+    }
+    let ordinal = engine
+        .range
+        .to
+        .checked_sub(1)
+        .ok_or_else(|| invalid_field("range"))?;
+    let source = request
+        .messages
+        .iter()
+        .find(|entry| entry.ordinal == ordinal)
+        .ok_or_else(|| invalid_field("coverage"))?;
+    let message = messages
+        .iter()
+        .find(|message| message.mid == source.mid && message.ordinal == ordinal)
+        .ok_or_else(|| invalid_field("coverage"))?;
+    let part = source
+        .ck
+        .content
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| invalid_field("coverage"))?;
+    let endpoint = super::codec_claude_code::whole_message_endpoint(
+        message,
+        &format!("{}#{part}", source.mid),
+    )?;
+    Ok(Some(HostCoverage {
+        end_mid: source.mid.clone(),
+        ordinal,
+        endpoint: Some(endpoint),
+    }))
 }
 
 fn native_uncovered_prefix(

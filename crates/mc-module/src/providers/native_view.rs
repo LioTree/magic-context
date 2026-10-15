@@ -30,15 +30,25 @@ pub(super) fn frozen_for_plan(
     key: &Key,
     engine: &transform::compaction::View,
     conversation: &mc_store::provider_records::ProviderConversation,
-    endpoint: Option<&NativeEndpoint>,
+    coverage: Option<&compaction::HostCoverage>,
     raw: &[String],
 ) -> Result<Option<Box<FrozenView>>, HandlerOutcome> {
+    let endpoint = coverage.and_then(|coverage| coverage.endpoint.as_ref());
     // An empty insertion covers no original part and has no bytes to freeze.
     if endpoint.is_none() && raw.is_empty() {
         return Ok(None);
     }
     if endpoint.is_none() && !has_selected_bundle(conversation)? {
         return Ok(None);
+    }
+    // A step replaces every original message in its range. A hook can instead
+    // replace just a prefix and explicitly retain later original blocks; that
+    // separate path calls freeze directly without this full-range check.
+    let coverage = coverage.ok_or_else(invalid_view)?;
+    if coverage.ordinal.checked_add(1) != Some(engine.range.to)
+        || endpoint.is_none_or(|endpoint| endpoint.message_id != coverage.end_mid)
+    {
+        return Err(invalid_view());
     }
     freeze(key, engine, endpoint, raw).map(|view| Some(Box::new(view)))
 }
@@ -340,6 +350,38 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn step_freeze_rejects_summary_endpoint_before_range_end() {
+        use crate::providers::claude_code_tests as cc;
+        let dir = tempfile::tempdir().unwrap();
+        let h = cc::handler(dir.path(), cc::thalamus());
+        cc::setup(&h).await;
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let conversation = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        let (key, mut host) = fixture();
+        let freeze_step = |host: &compaction::HostView| {
+            frozen_for_plan(
+                &key,
+                &host.engine,
+                &conversation,
+                host.coverage.as_ref(),
+                host.raw_replacement.as_deref().unwrap(),
+            )
+        };
+        assert!(
+            matches!(freeze_step(&host), Err(HandlerOutcome::Error { code, .. }) if code == "native_view_invalid")
+        );
+        host.coverage.as_mut().unwrap().ordinal = 1;
+        let full = freeze_step(&host).unwrap().unwrap();
+        assert_eq!(full, host.wire.raw_view.unwrap());
     }
 
     fn fixture() -> (Key, compaction::HostView) {

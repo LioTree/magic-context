@@ -48,10 +48,10 @@ fn restore_arc(index: usize, slots: &mut [Option<CkWireMessage>], request: &Tran
 }
 
 /// Apply edits alongside a fold/flush or an execute/force opportunity that can
-/// replace queued tool results. The returned ordinal is the
-/// last original message installed by the replacement, including edited messages
-/// that have not been summarized. Keep it separate from the engine's summary
-/// boundary so later passes do not mistake those messages for summarized history.
+/// replace queued tool results. The returned ordinal is the last summarized or
+/// changed original message for validating signed-thinking edits, not the full replacement
+/// range. Keep it separate from both the wire removal endpoint and the engine's
+/// summary boundary so unsummarized messages never become summarized history.
 pub(super) fn apply(
     view: &mut transform::compaction::View,
     request: &TransformRequest,
