@@ -135,6 +135,8 @@ pub struct ProviderHookContext<'c> {
     pub counters: Value,
     pub policy: ProviderPolicyTotals,
     pub tag_high_water: i64,
+    /// The CC subject's newest pending or live answer within the retained lineage.
+    pub repeat_answer: Option<ProviderStoredAnswer>,
     /// Policy parts of the hooked message and of the messages appended by the
     /// synchronized pass. Lineage-wide policy goes through `policy_index`.
     pub parts: Vec<ProviderPolicyPart>,
@@ -161,6 +163,8 @@ pub struct ProviderPolicyPart {
     pub arc_id: Option<String>,
     pub subject_part: String,
     pub active: bool,
+    #[serde(default)]
+    pub retired: bool,
     pub served: bool,
     pub reduced: bool,
     pub queued: bool,
@@ -226,9 +230,12 @@ fn admit_policy_parts_tx(
     high: &mut i64,
     repeat: Option<&ProviderSubject>,
     rearm_all: bool,
+    reuse_held: bool,
 ) -> rusqlite::Result<()> {
     for part in parts {
+        let mut part = part.clone();
         let held:Option<String>=conn.query_row("SELECT policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND block_id=?3",params![conv,lineage,part.block_id],|r|r.get(0)).optional()?;
+        let mut retired = false;
         if let Some(held) = held {
             let held: ProviderPolicyPart = serde_json::from_str(&held).map_err(sql_json)?;
             if let Some(number) = held.tag_number {
@@ -236,23 +243,26 @@ fn admit_policy_parts_tx(
                     continue;
                 }
             };
-            if held.active
-                || (!rearm_all
-                    && !repeat.is_some_and(|s| {
-                        s.subject_mid == part.mid
-                            && s.subject_part == part.subject_part
-                            && match s.hook.as_str() {
-                                "post_tool" => part.tag_kind.as_deref() == Some("tool_result"),
-                                _ => part.tag_kind.as_deref() == Some("message"),
-                            }
-                    }))
-            {
+            let matches_repeat = repeat.is_some_and(|s| {
+                s.subject_mid == part.mid
+                    && s.subject_part == part.subject_part
+                    && match s.hook.as_str() {
+                        "post_tool" => part.tag_kind.as_deref() == Some("tool_result"),
+                        _ => part.tag_kind.as_deref() == Some("message"),
+                    }
+            });
+            if held.active || (!rearm_all && !matches_repeat) {
                 continue;
             }
+            retired = held.retired;
+            if reuse_held && matches_repeat && !held.retired && held.tag_kind == part.tag_kind {
+                part.tag_number = held.tag_number;
+            }
         }
-        let mut part = part.clone();
         if part.tag_kind.is_some() && part.tag_number.is_none() {
-            part.tag_number=conn.query_row("SELECT tag_number FROM mc_tags WHERE session_id=?1 AND block_id=?2 ORDER BY tag_number DESC LIMIT 1",params![namespace,part.block_id],|r|r.get(0)).optional()?;
+            if !reuse_held || !retired {
+                part.tag_number=conn.query_row("SELECT tag_number FROM mc_tags WHERE session_id=?1 AND block_id=?2 ORDER BY tag_number DESC LIMIT 1",params![namespace,part.block_id],|r|r.get(0)).optional()?;
+            }
             if let Some(number) = part.tag_number {
                 *high = (*high).max(number);
             } else {
@@ -794,6 +804,12 @@ fn ensure_lineage_tx(
                 conn.execute("DELETE FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3", params![conv, row.lineage_id, as_i64(cut)?])?;
             }
             for (ancestor, _) in ancestors {
+                retire_policy_tx(
+                    conn,
+                    conv,
+                    "lineage_id=?2 AND ordinal>?3",
+                    params![conv, ancestor.lineage_id, as_i64(cut)?],
+                )?;
                 remove_policy_tx(
                     conn,
                     conv,
@@ -918,13 +934,56 @@ fn burn_where_tx(
     // discarding their drops, within this transaction.
     Ok(())
 }
+fn retire_policy_tx(
+    conn: &Connection,
+    _conv: &str,
+    predicate: &str,
+    parameters: impl rusqlite::Params,
+) -> rusqlite::Result<()> {
+    conn.execute(&format!("UPDATE mc_provider_policy_parts_v1 SET policy_json=json_set(policy_json,'$.retired',json('true')) WHERE conv_key=?1 AND json_extract(policy_json,'$.tag_number') IN (SELECT json_extract(t.value,'$.number') FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) t WHERE a.conv_key=?1 AND a.state='pending' AND {predicate})"),parameters)?;
+    Ok(())
+}
+
+fn repeat_answer_tx(
+    conn: &Connection,
+    conv: &str,
+    lineage: &str,
+    subject: &ProviderSubject,
+) -> rusqlite::Result<Option<ProviderStoredAnswer>> {
+    for (row, cut) in ancestry_tx(conn, conv, lineage)? {
+        let answer = conn.query_row("SELECT ordinal,ops_json,tags_json,state FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2 AND subject_mid=?3 AND hook=?4 AND subject_part=?5 AND ordinal<=?6 AND state IN ('pending','live') ORDER BY answer_seq DESC LIMIT 1",params![conv,row.lineage_id,subject.subject_mid,subject.hook,subject.subject_part,as_i64(cut)?],|r|Ok((r.get(0)?,r.get(1)?,r.get::<_,String>(2)?,r.get(3)?))).optional()?;
+        if let Some((ordinal, ops_json, tags, state)) = answer {
+            return Ok(Some(ProviderStoredAnswer {
+                lineage_id: row.lineage_id,
+                answer: ProviderHookAnswer {
+                    subject: subject.clone(),
+                    ordinal,
+                    ops_json,
+                    tags: serde_json::from_str(&tags).map_err(sql_json)?,
+                },
+                state,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn burn_subject_tx(
     conn: &Connection,
     conv: &str,
     lineage: &str,
     s: &ProviderSubject,
+    retire: bool,
 ) -> rusqlite::Result<()> {
     let predicate = "lineage_id=?2 AND subject_mid=?3 AND hook=?4 AND subject_part=?5";
+    if retire {
+        retire_policy_tx(
+            conn,
+            conv,
+            predicate,
+            params![conv, lineage, s.subject_mid, s.hook, s.subject_part],
+        )?;
+    }
     remove_policy_tx(
         conn,
         conv,
@@ -1425,18 +1484,25 @@ impl McStore {
                         for m in messages {
                             let mut q=conn.prepare("SELECT subject_mid,hook,subject_part FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND lineage_id=?2 AND subject_mid=?3 AND state='pending'")?;
                             let subjects=q.query_map(params![conv,request.lineage.lineage_id,m.mid],|r|Ok(ProviderSubject {subject_mid:r.get(0)?,hook:r.get(1)?,subject_part:r.get(2)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                            for subject in subjects {burn_subject_tx(conn,&conv,&request.lineage.lineage_id,&subject)?;}
+                             for subject in subjects {burn_subject_tx(conn,&conv,&request.lineage.lineage_id,&subject,false)?;}
                         }
                     }
                 }
                 let acknowledged = acknowledged_through_tx(conn,&conv,&c,request.lineage,new_lineage,request.served_through_ordinal)?;
                 for s in request.unserved_subjects {
                     for (ancestor, _) in ancestry_tx(conn,&conv,&request.lineage.lineage_id)? {
-                        burn_subject_tx(conn,&conv,&ancestor.lineage_id,s)?;
+                         burn_subject_tx(conn,&conv,&ancestor.lineage_id,s,true)?;
                     }
                 }
-                if let Some(s) = request.repeat_subject {burn_subject_tx(conn,&conv,&request.lineage.lineage_id,s)?;}
-                promote_tx(conn,&conv,&c.engine_namespace,&request.lineage.lineage_id,request.served_through_ordinal)?;
+                 let reuse_held = key.generation.is_some() && key.harness == "claude-code" && parse(&c.params_json)?["serializer_profile"] == "claude-code-anthropic";
+                 // A CC watermark can settle this very subject. Observe promotion
+                 // before deciding whether the incoming hook is a retry or replay.
+                 if reuse_held {promote_tx(conn,&conv,&c.engine_namespace,&request.lineage.lineage_id,request.served_through_ordinal)?;}
+                 let repeat_answer = if reuse_held {
+                     request.repeat_subject.map(|s|repeat_answer_tx(conn,&conv,&request.lineage.lineage_id,s)).transpose()?.flatten()
+                 } else {None};
+                 if let Some(s) = request.repeat_subject {burn_subject_tx(conn,&conv,&request.lineage.lineage_id,s,false)?;}
+                 if !reuse_held {promote_tx(conn,&conv,&c.engine_namespace,&request.lineage.lineage_id,request.served_through_ordinal)?;}
                 let current = conversation_tx(conn,key)?.ok_or(rusqlite::Error::InvalidQuery)?;
                 let mut counters = parse(&current.hook_counters_json)?;
                 counters["policy_state"] = surviving_policy_state_tx(conn,&conv,&request.lineage.lineage_id)?;
@@ -1444,7 +1510,11 @@ impl McStore {
                 let live_max: i64 = conn.query_row("SELECT coalesce(max(tag_number),0) FROM mc_tags WHERE session_id=?1",[&c.engine_namespace],|r|r.get(0))?;
                 let tag_high_water = counters.get("tag_high_water").and_then(Value::as_i64).unwrap_or(0).max(counters.get("high_water").and_then(Value::as_i64).unwrap_or(0)).max(live_max);
                 let mut reserved_high=tag_high_water.max(counters.get("reserved_tag_high_water").and_then(Value::as_i64).unwrap_or(0));
-                admit_policy_parts_tx(conn,&conv,&request.lineage.lineage_id,&c.engine_namespace,parts,&mut reserved_high,request.repeat_subject,pass_context.is_some())?;
+                 // Replayed or inherited answers already own their policy rows.
+                 // Do not shadow an ancestor reservation in the child lineage.
+                 if !repeat_answer.as_ref().is_some_and(|a|a.state=="live" || a.lineage_id!=request.lineage.lineage_id) {
+                     admit_policy_parts_tx(conn,&conv,&request.lineage.lineage_id,&c.engine_namespace,parts,&mut reserved_high,request.repeat_subject,pass_context.is_some(),reuse_held)?;
+                 }
                 counters["reserved_tag_high_water"]=json!(reserved_high);
                 if let Some(context)=pass_context {counters["pass_context"]=context.clone();}
                 let policy_index=ProviderPolicyIndex::new(conn,&conv,&request.lineage.lineage_id)?;
@@ -1454,7 +1524,7 @@ impl McStore {
                     mids.extend(counters.pointer("/pass_context/appended_ids").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
                 }
                 let policy_parts=policy_index.parts_for_mids(&mids)?;
-                let (mut write,value) = decide(&ProviderHookContext {counters,policy,tag_high_water:reserved_high,parts:policy_parts.clone(),policy_index})?;
+                 let (mut write,value) = decide(&ProviderHookContext {counters,policy,tag_high_water:reserved_high,repeat_answer,parts:policy_parts.clone(),policy_index})?;
                 if let Some(updates)=write.counters.as_object_mut().and_then(|c|c.remove("policy_baseline_updates")).and_then(|v|v.as_array().cloned()) {
                     restate_baseline_measurements_tx(conn,&conv,&updates)?;
                 }
@@ -1469,7 +1539,7 @@ impl McStore {
                         if t.number<=high && !policy_parts.iter().any(|p|p.mid==a.subject.subject_mid && p.block_id==t.block_id && p.tag_number==Some(t.number) && (p.active || consumed)) {return Err(ProviderError::Transient("tag allocation must advance its high water".into()))}
                         high=high.max(t.number);
                     }
-                    burn_subject_tx(conn,&conv,&request.lineage.lineage_id,&a.subject)?;
+                     burn_subject_tx(conn,&conv,&request.lineage.lineage_id,&a.subject,false)?;
                     conn.execute("INSERT INTO mc_provider_hook_answers_v1 (conv_key,answer_seq,lineage_id,subject_mid,hook,subject_part,ordinal,ops_json,tags_json,state,session) VALUES (?1,(SELECT coalesce(max(answer_seq),-1)+1 FROM mc_provider_hook_answers_v1 WHERE conv_key=?1),?2,?3,?4,?5,?6,?7,?8,'pending',json_extract(?1,'$[1]'))",params![conv,request.lineage.lineage_id,a.subject.subject_mid,a.subject.hook,a.subject.subject_part,as_i64(a.ordinal)?,a.ops_json,serde_json::to_string(&a.tags).map_err(sql_json)?])?;
                     conn.execute("UPDATE mc_provider_hook_answers_v1 SET policy_json=?2 WHERE conv_key=?1 AND answer_seq=(SELECT max(answer_seq) FROM mc_provider_hook_answers_v1 WHERE conv_key=?1)",params![conv,answer_policy.to_string()])?;
                 }
@@ -1755,6 +1825,185 @@ mod policy_tests {
             conn.execute("INSERT INTO mc_tags (session_id,tag_number,block_id,kind,token_count,created_at_ms,source_bytes) VALUES (?1,?2,?3,'message',1,1,x'61')",params![namespace,number,block])?;
             Ok(())
         }).unwrap();
+    }
+
+    fn lifecycle_part(mid: &str, ordinal: u64, number: i64) -> ProviderPolicyPart {
+        ProviderPolicyPart {
+            mid: mid.into(),
+            ordinal,
+            block_id: format!("{mid}#0"),
+            block_index: 0,
+            kind: "tool_result".into(),
+            role: "user".into(),
+            measurement: crate::TailHygienePartMeasurement {
+                key: format!("{mid}#0\0tool_result"),
+                content_hash: "hash".into(),
+                kind: crate::TailHygienePartKind::Text,
+                tokens: 10,
+                u_tokens: 0,
+                tag_number: None,
+                tag_status: None,
+                protected: false,
+                queued_for_drop: false,
+            },
+            tag_kind: Some("tool_result".into()),
+            tag_number: Some(number),
+            tag_tokens: 10,
+            tool_name: "read".into(),
+            arc_id: None,
+            subject_part: "part".into(),
+            active: true,
+            retired: false,
+            served: false,
+            reduced: false,
+            queued: false,
+            real_user: false,
+            created_at_ms: None,
+            completed_at_ms: None,
+        }
+    }
+
+    fn seed_lifecycle_parts(store: &McStore, key: &ProviderSessionKey) {
+        store
+            .inner
+            .with_conn(|conn| {
+                for n in 1..=2 {
+                    conn.execute(
+                        "INSERT INTO mc_provider_policy_parts_v1 VALUES (?1,'L',?2,?3,?4,?5)",
+                        params![
+                            key.conversation_key(),
+                            n,
+                            format!("m{n}#0"),
+                            serde_json::to_string(&lifecycle_part(&format!("m{n}"), n, n as i64))
+                                .unwrap(),
+                            key.session
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn lifecycle_parts(store: &McStore, key: &ProviderSessionKey) -> Vec<ProviderPolicyPart> {
+        store.inner.with_conn(|conn| {
+            conn.prepare("SELECT policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 ORDER BY ordinal")?
+                .query_map([key.conversation_key()], |r| {
+                    serde_json::from_str(&r.get::<_,String>(0)?).map_err(sql_json)
+                })?.collect()
+        }).unwrap()
+    }
+
+    #[test]
+    fn retirement_defaults_for_old_policy_json_and_survives_serialization() {
+        let mut value = serde_json::to_value(lifecycle_part("m", 1, 1)).unwrap();
+        value.as_object_mut().unwrap().remove("retired");
+        let mut part: ProviderPolicyPart = serde_json::from_value(value).unwrap();
+        assert!(!part.retired);
+        part.retired = true;
+        let roundtrip: ProviderPolicyPart =
+            serde_json::from_str(&serde_json::to_string(&part).unwrap()).unwrap();
+        assert!(roundtrip.retired);
+    }
+
+    #[test]
+    fn lifecycle_burn_retirement_is_caller_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, key, lineage) = fixture(dir.path());
+        let first = allocate(
+            &store,
+            &key,
+            &lineage,
+            1,
+            Default::default(),
+            &[],
+            false,
+            Default::default(),
+        );
+        let second = allocate(
+            &store,
+            &key,
+            &lineage,
+            2,
+            Default::default(),
+            &[],
+            false,
+            Default::default(),
+        );
+        seed_lifecycle_parts(&store, &key);
+        store
+            .inner
+            .with_conn(|conn| {
+                burn_subject_tx(conn, &key.conversation_key(), "L", &first, false)?;
+                burn_subject_tx(conn, &key.conversation_key(), "L", &second, true)
+            })
+            .unwrap();
+        let parts = lifecycle_parts(&store, &key);
+        assert!(!parts[0].active && !parts[0].retired);
+        assert!(!parts[1].active && parts[1].retired);
+        assert!(store
+            .load_provider_hook_answers(&key)
+            .unwrap()
+            .iter()
+            .all(|a| a.state == "burned"));
+    }
+
+    #[test]
+    fn lifecycle_descent_retires_pending_suffix_in_same_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, key, lineage) = fixture(dir.path());
+        for n in 1..=2 {
+            allocate(
+                &store,
+                &key,
+                &lineage,
+                n,
+                Default::default(),
+                &[],
+                false,
+                Default::default(),
+            );
+        }
+        seed_lifecycle_parts(&store, &key);
+        let child = ProviderLineage {
+            lineage_id: "B".into(),
+            first_ordinal: 2,
+            descends_from: Some("L".into()),
+            through_ordinal: Some(1),
+        };
+        let result = store.commit_provider_hook(
+            &key,
+            ProviderHookRequest {
+                lineage: &child,
+                message: None,
+                served_through_ordinal: None,
+                unserved_subjects: &[],
+                repeat_subject: None,
+            },
+            |_| -> Result<(ProviderHookWrite, ()), ProviderError> {
+                Err(ProviderError::Transient("reject hook".into()))
+            },
+        );
+        assert!(result.is_err());
+        assert!(lifecycle_parts(&store, &key)
+            .iter()
+            .all(|p| p.active && !p.retired));
+        assert!(store
+            .load_provider_hook_answers(&key)
+            .unwrap()
+            .iter()
+            .all(|a| a.state == "pending"));
+        store
+            .start_provider_descendant_lineage(&key, &child)
+            .unwrap();
+        let parts = lifecycle_parts(&store, &key);
+        assert!(parts[0].active && !parts[0].retired);
+        assert!(!parts[1].active && parts[1].retired);
+        let rows = store.load_provider_hook_answers(&key).unwrap();
+        assert_eq!(
+            rows.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
+            ["pending", "burned"]
+        );
     }
 
     #[test]

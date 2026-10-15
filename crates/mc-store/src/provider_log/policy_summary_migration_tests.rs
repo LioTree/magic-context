@@ -62,6 +62,7 @@ fn part(mid: &str, ordinal: u64, index: i64, tag: Option<i64>) -> ProviderPolicy
         arc_id: tag.map(|n| format!("arc{n}")),
         subject_part: String::new(),
         active: true,
+        retired: false,
         served: false,
         reduced: false,
         queued: false,

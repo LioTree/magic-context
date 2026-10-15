@@ -580,6 +580,27 @@ impl McHandler {
                 },
                 &parts,
                 |ctx| {
+                    if let Some(held) = &ctx.repeat_answer {
+                        let ops: Vec<Operation> = serde_json::from_str(&held.answer.ops_json)
+                            .map_err(|e| {
+                                mc_store::provider_records::ProviderError::Transient(e.to_string())
+                            })?;
+                        let answer = if ops.is_empty() {
+                            HookAnswer::Pass
+                        } else {
+                            HookAnswer::Ops { ops }
+                        };
+                        return Ok((
+                            ProviderHookWrite {
+                                answer: (held.state == "pending"
+                                    && held.lineage_id == lineage.lineage_id)
+                                    .then(|| held.answer.clone()),
+                                counters: ctx.counters.clone(),
+                                policy_summary: Default::default(),
+                            },
+                            answer,
+                        ));
+                    }
                     let mut ops = Vec::new();
                     let mut tags = Vec::new();
                     // Only THALAMUS's Claude Code answer hooks may add automatic
@@ -2153,6 +2174,30 @@ mod host_tests {
     }
 
     #[tokio::test]
+    async fn opencode_exact_retry_keeps_new_reservation_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path());
+        admit(&h, 7).await;
+        let params = hook("u", 1, "pre_user", &["hello"], text("u", "user", "hello"));
+        let first = response(dispatch(&h, 7, "transform.hook", params.clone()).await);
+        assert_eq!(rendered(&params, first), ["§1§ hello"]);
+        let retry = response(dispatch(&h, 7, "transform.hook", params.clone()).await);
+        assert_eq!(rendered(&params, retry), ["§2§ hello"]);
+        let rows = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_hook_answers(&key(&h).store_key())
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
+            ["burned", "pending"]
+        );
+        assert_eq!(rows[0].answer.tags[0].number, 1);
+        assert_eq!(rows[1].answer.tags[0].number, 2);
+    }
+
+    #[tokio::test]
     async fn unserved_subjects_burn_before_promotion_and_descents_burn_only_discarded_suffix() {
         let dir = tempfile::tempdir().unwrap();
         let h = handler(dir.path());
@@ -2683,6 +2728,7 @@ mod admission_hook_tests {
             .unwrap();
         let stored = &answers
             .iter()
+            .rev()
             .find(|a| a.answer.subject.subject_mid == mid)
             .unwrap()
             .answer;
@@ -2713,6 +2759,266 @@ mod admission_hook_tests {
             let answer = run(&h, hook(raw, "user", 0, "pre_user", &["§900§ authored"])).await;
             assert_prepends(&h, &key, answer, "user", &[(0, 0, 41)]);
         }
+    }
+
+    fn answers(h: &McHandler, key: &Key) -> Vec<mc_store::provider_records::ProviderStoredAnswer> {
+        h.store
+            .get()
+            .unwrap()
+            .load_provider_hook_answers(&key.store_key())
+            .unwrap()
+    }
+
+    fn tags_json(answer: &mc_store::provider_records::ProviderStoredAnswer) -> String {
+        serde_json::to_string(&answer.answer.tags).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admission_lifecycle_exact_retry_keeps_ops_tags_and_pending_number() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let raw = r#"{"role":"user","content":"hello"}"#;
+        let params = hook(raw, "u", 1, "pre_user", &["hello"]);
+        let first = run(&h, params.clone()).await;
+        assert_prepends(&h, &key, first.clone(), "u", &[(0, 0, 41)]);
+        assert_eq!(
+            super::super::codec_claude_code::splice_admission_tag(raw, 0, 41)
+                .unwrap()
+                .as_bytes(),
+            r#"{"role":"user","content":"§41§ hello"}"#.as_bytes()
+        );
+        assert_eq!(run(&h, params).await, first);
+        let rows = answers(&h, &key);
+        assert_eq!(
+            rows.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
+            ["burned", "pending"]
+        );
+        assert_eq!(rows[0].answer.ops_json, rows[1].answer.ops_json);
+        assert_eq!(tags_json(&rows[0]), tags_json(&rows[1]));
+        let held = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&held.hook_counters_json).unwrap()
+                ["reserved_tag_high_water"],
+            41
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_lifecycle_watermark_promotes_replay_without_answer_or_reservation() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let mut params = hook(
+            r#"{"role":"user","content":"hello"}"#,
+            "u",
+            1,
+            "pre_user",
+            &["hello"],
+        );
+        let first = run(&h, params.clone()).await;
+        assert_eq!(answers(&h, &key)[0].state, "pending");
+        params["served_through_ordinal"] = json!(0);
+        assert_eq!(run(&h, params.clone()).await, first);
+        assert!(answers(&h, &key).iter().all(|a| a.state != "live"));
+        params["served_through_ordinal"] = json!(1);
+        assert_eq!(run(&h, params.clone()).await, first);
+        let before = answers(&h, &key);
+        assert_eq!(
+            before.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
+            ["burned", "live"]
+        );
+        assert_eq!(run(&h, params).await, first);
+        let after = answers(&h, &key);
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[1].answer.ops_json, before[1].answer.ops_json);
+        assert_eq!(tags_json(&after[1]), tags_json(&before[1]));
+        let held = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&held.hook_counters_json).unwrap()
+                ["reserved_tag_high_water"],
+            41
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_lifecycle_restart_repeats_live_replay_and_pending_retry() {
+        let (dir, h, key) = fixture(true, None).await;
+        let mut live = hook(
+            r#"{"role":"user","content":"served"}"#,
+            "u",
+            1,
+            "pre_user",
+            &["served"],
+        );
+        let live_answer = run(&h, live.clone()).await;
+        live["served_through_ordinal"] = json!(1);
+        assert_eq!(run(&h, live.clone()).await, live_answer);
+        let pending = hook(
+            r#"{"role":"assistant","content":[{"type":"text","text":"pending"}]}"#,
+            "a",
+            2,
+            "post_assistant",
+            &["pending"],
+        );
+        let pending_answer = run(&h, pending.clone()).await;
+        let before = answers(&h, &key);
+        drop(h);
+        let h = handler(dir.path(), thalamus());
+        response(call(&h, "transform.declare", json!({"session":"cc","harness":"claude-code","params":{"serializer_profile":"claude-code-anthropic","observation":"answer"},"preset":"head"})).await);
+        assert_eq!(run(&h, live).await, live_answer);
+        assert_eq!(answers(&h, &key).len(), before.len());
+        assert_eq!(run(&h, pending).await, pending_answer);
+        let after = answers(&h, &key);
+        assert_eq!(
+            after.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
+            ["live", "burned", "pending"]
+        );
+        assert_eq!(after[1].answer.ops_json, after[2].answer.ops_json);
+        assert_eq!(tags_json(&after[1]), tags_json(&after[2]));
+        assert_eq!(after[2].answer.tags[0].number, 42);
+    }
+
+    #[tokio::test]
+    async fn admission_lifecycle_text_form_flip_keeps_first_admission_bytes() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let raw = r#"{ "role":"user", "content":"a\\nline" }"#;
+        let first = run(&h, hook(raw, "u", 1, "pre_user", &[r"a\nline"])).await;
+        let admitted = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_messages(&key.store_key(), "L")
+            .unwrap();
+        let flipped = r#"{ "role":"user", "content":[{"type":"text","text":"a\\nline"}] }"#;
+        assert_eq!(
+            run(&h, hook(flipped, "u", 1, "pre_user", &[r"a\nline"])).await,
+            first
+        );
+        let rows = answers(&h, &key);
+        assert_eq!(rows[0].answer.ops_json, rows[1].answer.ops_json);
+        assert_eq!(tags_json(&rows[0]), tags_json(&rows[1]));
+        let messages = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_messages(&key.store_key(), "L")
+            .unwrap();
+        assert_eq!(messages, admitted);
+    }
+
+    #[tokio::test]
+    async fn admission_lifecycle_unserved_burn_retires_number_before_watermark() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let original = hook(
+            r#"{"role":"user","content":"hello"}"#,
+            "u",
+            1,
+            "pre_user",
+            &["hello"],
+        );
+        run(&h, original.clone()).await;
+        let mut later = hook(
+            r#"{"role":"user","content":"later"}"#,
+            "v",
+            2,
+            "pre_user",
+            &["later"],
+        );
+        later["served_through_ordinal"] = json!(1);
+        later["unserved_subjects"] = json!([{"subject_mid":"u","hook":"pre_user"}]);
+        run(&h, later).await;
+        assert_eq!(answers(&h, &key)[0].state, "burned");
+        assert_prepends(
+            &h,
+            &key,
+            run(&h, original.clone()).await,
+            "u",
+            &[(0, 0, 43)],
+        );
+        assert_eq!(run(&h, original.clone()).await, run(&h, original).await);
+        let rows = answers(&h, &key);
+        assert!(rows
+            .iter()
+            .skip(1)
+            .flat_map(|a| &a.answer.tags)
+            .all(|t| t.number != 41));
+        assert_eq!(rows.last().unwrap().answer.tags[0].number, 43);
+    }
+
+    #[tokio::test]
+    async fn admission_lifecycle_descent_keeps_prefix_and_retires_only_pending_suffix() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let prefix = hook(
+            r#"{"role":"user","content":"prefix"}"#,
+            "u",
+            1,
+            "pre_user",
+            &["prefix"],
+        );
+        let prefix_answer = run(&h, prefix.clone()).await;
+        let suffix = hook(
+            r#"{"role":"user","content":"suffix"}"#,
+            "v",
+            2,
+            "pre_user",
+            &["suffix"],
+        );
+        run(&h, suffix.clone()).await;
+        let mut child_prefix = prefix;
+        child_prefix["lineage_id"] = json!("B");
+        child_prefix["descends_from"] = json!({"lineage_id":"L","through_ordinal":1});
+        assert_eq!(run(&h, child_prefix.clone()).await, prefix_answer);
+        let rows = answers(&h, &key);
+        assert_eq!(
+            rows.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
+            ["pending", "burned"]
+        );
+        let mut child_suffix = suffix.clone();
+        child_suffix["lineage_id"] = json!("B");
+        assert_eq!(
+            run(&h, child_suffix).await,
+            HookAnswer::Ops {
+                ops: vec![Operation::Prepend {
+                    block: 0,
+                    text: "§43§ ".into(),
+                    note: None
+                }]
+            }
+        );
+        let rows = answers(&h, &key);
+        assert_eq!(rows.last().unwrap().answer.tags[0].number, 43);
+        // The abandoned parent's policy row must also be retired, not merely
+        // hidden by the child's cut, even if that parent receives another hook.
+        let parent_retry = run(&h, suffix).await;
+        assert_eq!(
+            parent_retry,
+            HookAnswer::Ops {
+                ops: vec![Operation::Prepend {
+                    block: 0,
+                    text: "§44§ ".into(),
+                    note: None
+                }]
+            }
+        );
+        child_prefix["served_through_ordinal"] = json!(1);
+        assert_eq!(run(&h, child_prefix).await, prefix_answer);
+        let rows = answers(&h, &key);
+        assert_eq!(rows[0].state, "live");
+        assert_eq!(rows[0].answer.tags[0].number, 41);
+        assert!(rows
+            .iter()
+            .skip(2)
+            .flat_map(|a| &a.answer.tags)
+            .all(|t| t.number != 42));
     }
 
     #[tokio::test]

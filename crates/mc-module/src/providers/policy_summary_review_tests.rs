@@ -267,6 +267,7 @@ fn policy_part(
         arc_id: arc,
         subject_part: String::new(),
         active: true,
+        retired: false,
         served,
         reduced: false,
         queued: false,
