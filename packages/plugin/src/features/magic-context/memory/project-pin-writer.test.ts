@@ -1,14 +1,27 @@
 import { afterEach, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { Worker } from "node:worker_threads";
+import {
+    setStoragePrivatePermissionEnforcement,
+    writeStorageFileAtomicSync,
+} from "../../../shared/storage-permissions";
 import { createTestTempDir } from "../../../shared/test-temp-dir";
 import type { PinWriteRequest } from "./project-pin-worker";
-import { __setProjectPinWriterForTests, ProjectPinWriter } from "./project-pin-writer";
+import {
+    __resetProjectPinWriterDiagnosticsForTests,
+    __setProjectPinWriterForTests,
+    PinWorker,
+    ProjectPinWriter,
+} from "./project-pin-writer";
 
 const temp = createTestTempDir("mc-project-pin-writer-");
 const writers: ProjectPinWriter[] = [];
 afterEach(async () => {
     for (const writer of writers.splice(0)) await writer.shutdown(100);
     await __setProjectPinWriterForTests();
+    __resetProjectPinWriterDiagnosticsForTests();
 });
 
 function controlled(capacity = 256) {
@@ -80,7 +93,7 @@ test("overflow remains visible and retries on the next folder lookup", async () 
     expect(await writer.flush(100)).toBe(true);
 });
 
-test("failed writes retain the pin and retry only on another decision", async () => {
+test("failed writes retain the pin and retry only after a later decision", async () => {
     const { writer, calls, completions } = controlled();
     const destination = publish(writer, "failed");
     await turn();
@@ -88,6 +101,9 @@ test("failed writes retain the pin and retry only on another decision", async ()
     expect(await writer.flush(100)).toBe(true);
     expect(calls).toHaveLength(1);
     expect(writer.lookup(destination)?.identity).toBe("pj-FIRST");
+    await turn();
+    expect(calls).toHaveLength(1);
+    publish(writer, "failed", "pj-LATER");
     await turn();
     expect(calls).toHaveLength(2);
     completions[1].resolve();
@@ -105,4 +121,108 @@ test("shutdown is bounded when a writer is stuck and stops admitting new work", 
     completions[0].resolve();
     await turn();
     expect(calls).toHaveLength(1);
+});
+
+function fakeWorker(handle: (request: PinWriteRequest, worker: EventEmitter) => void): Worker {
+    class FakeWorker extends EventEmitter {
+        postMessage(request: PinWriteRequest) {
+            handle(request, this);
+        }
+
+        unref() {}
+
+        terminate() {
+            return Promise.resolve(1);
+        }
+    }
+    return new FakeWorker() as unknown as Worker;
+}
+
+test("worker crash after one write falls back in process without restarting it", async () => {
+    let spawnAttempts = 0;
+    let workerWrites = 0;
+    const logs: string[] = [];
+    const pinWorker = new PinWorker(
+        new URL("./project-pin-worker.ts", import.meta.url),
+        () => {
+            spawnAttempts++;
+            return fakeWorker((request, worker) => {
+                workerWrites++;
+                if (workerWrites === 1) {
+                    setStoragePrivatePermissionEnforcement(request.privateStorage);
+                    writeStorageFileAtomicSync(request.destination, JSON.stringify(request.record));
+                    queueMicrotask(() => worker.emit("message", { ok: true }));
+                } else {
+                    queueMicrotask(() => worker.emit("exit", 1));
+                }
+            });
+        },
+        (message) => logs.push(message),
+    );
+    const writer = new ProjectPinWriter(pinWorker.write, 256, (message) => logs.push(message));
+    writers.push(writer);
+
+    const first = publish(writer, "worker-before-crash");
+    expect(await writer.flush(1_000)).toBe(true);
+    const second = publish(writer, "worker-after-crash");
+    expect(await writer.flush(1_000)).toBe(true);
+
+    expect(spawnAttempts).toBe(1);
+    expect(workerWrites).toBe(2);
+    expect(JSON.parse(readFileSync(first, "utf8")).identity).toBe("pj-FIRST");
+    expect(JSON.parse(readFileSync(second, "utf8")).identity).toBe("pj-FIRST");
+    expect(
+        logs.filter((line) => line.includes("pin worker unavailable; writing pins in process")),
+    ).toHaveLength(1);
+});
+
+test("50 lookups and later decisions do not flood failed pin logs or respawn the worker", async () => {
+    let spawnAttempts = 0;
+    let writeAttempts = 0;
+    let failCurrentWrite: (() => void) | undefined;
+    const logs: string[] = [];
+    const pinWorker = new PinWorker(
+        new URL("./project-pin-worker.ts", import.meta.url),
+        () => {
+            spawnAttempts++;
+            return fakeWorker((_request, worker) => {
+                writeAttempts++;
+                failCurrentWrite = () =>
+                    worker.emit("message", { ok: false, error: "injected filesystem failure" });
+            });
+        },
+        (message) => logs.push(message),
+    );
+    const writer = new ProjectPinWriter(pinWorker.write, 256, (message) => logs.push(message));
+    writers.push(writer);
+    const destination = publish(writer, "repeated-failure");
+    await turn();
+
+    for (let i = 0; i < 50; i++) writer.lookup(destination);
+    const firstDrain = writer.flush(1_000);
+    failCurrentWrite?.();
+    expect(await firstDrain).toBe(true);
+    expect(writeAttempts).toBe(1);
+
+    for (let i = 0; i < 50; i++) writer.lookup(destination);
+    await turn();
+    expect(writeAttempts).toBe(1);
+    expect(spawnAttempts).toBe(1);
+
+    for (let i = 0; i < 2; i++) {
+        writer.publish(destination, {
+            directory: "/repeated-failure",
+            identity: "pj-NEW",
+            gitCommonDir: "/repo.git",
+        });
+        await turn();
+        const drain = writer.flush(1_000);
+        failCurrentWrite?.();
+        expect(await drain).toBe(true);
+    }
+
+    expect(writeAttempts).toBe(3);
+    expect(spawnAttempts).toBe(1);
+    expect(logs.filter((line) => line.includes("project pin persistence failed"))).toHaveLength(1);
+    expect(writer.lookup(destination)?.identity).toBe("pj-FIRST");
 });

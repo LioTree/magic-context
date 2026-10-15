@@ -1,13 +1,27 @@
 import { dirname } from "node:path";
 import { Worker } from "node:worker_threads";
 import { log } from "../../../shared/logger";
-import { shouldEnforcePrivateStoragePermissions } from "../../../shared/storage-permissions";
+import {
+    setStoragePrivatePermissionEnforcement,
+    shouldEnforcePrivateStoragePermissions,
+    writeStorageFileAtomicSync,
+} from "../../../shared/storage-permissions";
 import type { ProjectIdentityRecord } from "./project-identity-cache";
 import type { PinWriteRequest } from "./project-pin-worker";
 
 type WritePin = (request: PinWriteRequest) => Promise<void>;
 interface Pin extends PinWriteRequest {
     persisted: boolean;
+    awaitingDecision: boolean;
+}
+
+const failedPinDestinations = new Set<string>();
+let workerUnavailableReported = false;
+
+class WorkerUnavailableError extends Error {
+    constructor(cause: unknown) {
+        super(`Pin worker unavailable: ${cause}`);
+    }
 }
 
 /** One active atomic write, with at most 256 distinct destinations waiting. */
@@ -29,12 +43,17 @@ export class ProjectPinWriter {
     publish(destination: string, record: ProjectIdentityRecord): void {
         // Keep the original record if later resolutions propose a different identity
         // for this destination, even while its first write is still pending.
-        const pin = this.pins.get(destination) ?? {
+        const existing = this.pins.get(destination);
+        const pin = existing ?? {
             destination,
             record: { ...record },
             privateStorage: shouldEnforcePrivateStoragePermissions(),
             persisted: false,
+            awaitingDecision: false,
         };
+        // A fresh publish follows a new identity decision; lookups during the same
+        // decision or later context passes must not retry a failed disk write.
+        pin.awaitingDecision = false;
         this.pins.set(destination, pin);
         this.schedule(pin);
     }
@@ -53,7 +72,7 @@ export class ProjectPinWriter {
     }
 
     private schedule(pin: Pin): void {
-        if (pin.persisted || this.closing || this.active === pin) return;
+        if (pin.persisted || pin.awaitingDecision || this.closing || this.active === pin) return;
         if (this.queued.has(pin.destination) || this.queued.size < this.capacity) {
             this.queued.set(pin.destination, pin);
             if (!this.pumpScheduled) {
@@ -85,9 +104,13 @@ export class ProjectPinWriter {
                     pin.persisted = true;
                 },
                 (error) => {
-                    this.report(
-                        `[magic-context] project pin persistence failed; retaining process pin: ${error}`,
-                    );
+                    pin.awaitingDecision = true;
+                    if (!failedPinDestinations.has(pin.destination)) {
+                        failedPinDestinations.add(pin.destination);
+                        this.report(
+                            `[magic-context] project pin persistence failed; retaining process pin: ${error}`,
+                        );
+                    }
                 },
             )
             .finally(() => {
@@ -122,22 +145,37 @@ export class ProjectPinWriter {
     }
 }
 
-class PinWorker {
+export class PinWorker {
     private worker: Worker | undefined;
     private pending: { resolve: () => void; reject: (error: unknown) => void } | undefined;
+    private unavailable = false;
 
-    write: WritePin = (request) =>
-        new Promise((resolve, reject) => {
+    constructor(
+        private readonly workerUrl = new URL(
+            import.meta.url.endsWith(".ts") ? "./project-pin-worker.ts" : "./project-pin-worker.js",
+            import.meta.url,
+        ),
+        private readonly createWorker: (url: URL) => Worker = (url) => new Worker(url),
+        private readonly report: (message: string) => void = log,
+    ) {}
+
+    write: WritePin = async (request) => {
+        if (!this.unavailable) {
+            try {
+                await this.writeWithWorker(request);
+                return;
+            } catch (error) {
+                if (!(error instanceof WorkerUnavailableError)) throw error;
+            }
+        }
+        this.writeInProcess(request);
+    };
+
+    private writeWithWorker(request: PinWriteRequest): Promise<void> {
+        return new Promise((resolve, reject) => {
             try {
                 if (!this.worker) {
-                    const worker = new Worker(
-                        new URL(
-                            import.meta.url.endsWith(".ts")
-                                ? "./project-pin-worker.ts"
-                                : "./project-pin-worker.js",
-                            import.meta.url,
-                        ),
-                    );
+                    const worker = this.createWorker(this.workerUrl);
                     this.worker = worker;
                     worker.on("message", (message: { ok: boolean; error?: string }) => {
                         if (this.worker !== worker) return;
@@ -156,14 +194,26 @@ class PinWorker {
                 this.worker.postMessage(request);
             } catch (error) {
                 if (this.worker) this.failed(this.worker, error);
-                reject(error);
+                else this.unavailable = true;
+                reject(new WorkerUnavailableError(error));
             }
         });
+    }
+
+    private writeInProcess(request: PinWriteRequest): void {
+        if (!workerUnavailableReported) {
+            workerUnavailableReported = true;
+            this.report("[magic-context] pin worker unavailable; writing pins in process");
+        }
+        setStoragePrivatePermissionEnforcement(request.privateStorage);
+        writeStorageFileAtomicSync(request.destination, JSON.stringify(request.record));
+    }
 
     private failed(worker: Worker, error: unknown): void {
         if (this.worker !== worker) return;
         this.worker = undefined;
-        this.pending?.reject(error);
+        this.unavailable = true;
+        this.pending?.reject(new WorkerUnavailableError(error));
         this.pending = undefined;
         void worker.terminate();
     }
@@ -204,4 +254,10 @@ export async function __setProjectPinWriterForTests(replacement?: ProjectPinWrit
     worker?.close();
     worker = undefined;
     writer = replacement;
+}
+
+/** Reset process-wide diagnostics between tests that share this module instance. */
+export function __resetProjectPinWriterDiagnosticsForTests(): void {
+    failedPinDestinations.clear();
+    workerUnavailableReported = false;
 }

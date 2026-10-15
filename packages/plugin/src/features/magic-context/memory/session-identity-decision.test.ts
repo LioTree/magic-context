@@ -3,6 +3,8 @@ import type { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { Worker } from "node:worker_threads";
 import {
     buildFlags,
     buildFrame,
@@ -41,8 +43,10 @@ import {
     rememberPinnedProjectIdentity,
 } from "./project-identity-cache";
 import {
+    __resetProjectPinWriterDiagnosticsForTests,
     __setProjectPinWriterForTests,
     flushProjectPinWrites,
+    PinWorker,
     ProjectPinWriter,
 } from "./project-pin-writer";
 import {
@@ -92,6 +96,7 @@ beforeEach(() => {
 afterEach(async () => {
     closeDatabase();
     await __setProjectPinWriterForTests();
+    __resetProjectPinWriterDiagnosticsForTests();
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
     __resetSessionIdentityDecisionsForTests();
     __resetProjectIdentityForTests();
@@ -893,4 +898,37 @@ describe("session-scoped registry attempts", () => {
             `git:${"a".repeat(40)}`,
         );
     });
+});
+
+test("session decision persists its pin in process when the worker file is missing", async () => {
+    const directory = folder("missing-pin-worker");
+    const fake = await fakeEndpoint(directory);
+    const logs: string[] = [];
+    let spawnAttempts = 0;
+    const pinWorker = new PinWorker(
+        pathToFileURL(join(temp.dir, "missing-project-pin-worker.js")),
+        (url) => {
+            spawnAttempts++;
+            return new Worker(url);
+        },
+        (message) => logs.push(message),
+    );
+    const writer = new ProjectPinWriter(pinWorker.write, 256, (message) => logs.push(message));
+    await __setProjectPinWriterForTests(writer);
+
+    const decision = await awaitSessionIdentityDecision("missing-worker", directory, {
+        connectionFile: fake.connectionFile,
+        log: (message) => logs.push(message),
+    });
+    expect(decision.identity).toBe(registeredProjectId);
+    expect(await flushProjectPinWrites(2_000)).toBe(true);
+
+    expect(spawnAttempts).toBe(1);
+    expect(readRememberedProjectIdentity(directory)?.identity).toBe(registeredProjectId);
+    expect(sidecars()).toHaveLength(1);
+    expect(
+        JSON.parse(readFileSync(join(storage, "project-identities", sidecars()[0]), "utf8"))
+            .identity,
+    ).toBe(registeredProjectId);
+    expect(logs).toEqual(["[magic-context] pin worker unavailable; writing pins in process"]);
 });
