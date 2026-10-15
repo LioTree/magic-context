@@ -1,3 +1,4 @@
+import { piAgentHistory } from "./pi-dispatch-agent-history";
 import {
 	type PiChatHistoryModel,
 	piChatHistoryPlan,
@@ -8,11 +9,14 @@ import {
 	piResponsesAssistantTexts,
 	piResponsesWireTexts,
 } from "./pi-dispatch-responses-history";
+import { piToolCallWireId } from "./pi-dispatch-tool-ids";
 
 interface MessageStructure {
 	role: "user" | "assistant" | "toolResult";
 	calls: string[];
 	results: string[];
+	wireCalls?: (string | undefined)[];
+	wireResults?: (string | undefined)[];
 	callNames?: string[];
 	resultNames?: string[];
 	timestamp?: number;
@@ -32,6 +36,8 @@ export interface PiPreparedStructure {
 	chatMessages?: readonly MessageStructure[];
 	responsesMessages?: readonly MessageStructure[];
 	api?: string;
+	googleFunctionIds?: boolean;
+	structuralSkipReason?: string;
 }
 
 const MAX_MESSAGES = 100_000;
@@ -77,16 +83,167 @@ function messageStructure(value: unknown): MessageStructure | undefined {
 	return row;
 }
 
+function projectMissingToolResults(messages: readonly unknown[]): unknown[] {
+	const responsesComponents = new Set<string>();
+	const opaqueIds = new Set<string>();
+	const component = (id: string) => {
+		const pipe = id.indexOf("|");
+		return pipe > 0 ? id.slice(0, pipe) : id;
+	};
+	for (const value of messages) {
+		const message = object(value);
+		if (message?.role !== "assistant" || !Array.isArray(message.content))
+			continue;
+		for (const value of message.content) {
+			const block = object(value);
+			if (block?.type !== "toolCall" || typeof block.id !== "string") continue;
+			if (
+				[
+					"openai-responses",
+					"azure-openai-responses",
+					"openai-codex-responses",
+				].includes(String(message.api))
+			)
+				responsesComponents.add(component(block.id));
+			else if (block.id.includes("|")) opaqueIds.add(block.id);
+		}
+	}
+	// Responses item suffixes are not part of the call identity; opaque Chat IDs
+	// containing a pipe remain whole (transform-messages.ts:56-59,94-143).
+	const pairingId = (id: string) =>
+		!opaqueIds.has(id) && responsesComponents.has(component(id))
+			? component(id)
+			: id;
+	const lastResult = new Map<string, number>();
+	messages.forEach((value, index) => {
+		const message = object(value);
+		if (
+			message?.role === "toolResult" &&
+			typeof message.toolCallId === "string"
+		)
+			lastResult.set(pairingId(message.toolCallId), index);
+	});
+	const projected: unknown[] = [];
+	const resolved = new Set<string>();
+	let pending: { id: string; name: string }[] = [];
+	let start = -1;
+	let aborted = false;
+	let timestamp: unknown;
+	const flush = (boundaryTimestamp?: unknown) => {
+		for (const call of pending) {
+			const key = pairingId(call.id);
+			if (resolved.has(key) || (lastResult.get(key) ?? -1) > start) continue;
+			projected.push({
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: [
+					{ type: "text", text: aborted ? "aborted" : "No result provided" },
+				],
+				isError: true,
+				timestamp: aborted ? timestamp : boundaryTimestamp,
+			});
+			resolved.add(key);
+		}
+		pending = [];
+	};
+	for (let index = 0; index < messages.length; index++) {
+		const value = messages[index];
+		const message = object(value);
+		if (
+			(message?.role === "bashExecution" ||
+				message?.role === "pythonExecution") &&
+			message.excludeFromContext === true
+		)
+			continue;
+		// OMP flushes unresolved calls at every non-result boundary and at EOF,
+		// not only on the latest turn. A later real result prevents synthesis;
+		// its reordering and all other history rewrites still fail comparison.
+		// @oh-my-pi/pi-ai transform-messages.ts:1256-1303,1305-1327,1457-1469 (18.10.4).
+		if (message?.role !== "toolResult") flush(message?.timestamp);
+		else if (
+			typeof message.toolCallId === "string" &&
+			pending.some(
+				(call) => pairingId(call.id) === pairingId(String(message.toolCallId)),
+			)
+		)
+			resolved.add(pairingId(message.toolCallId));
+		projected.push(value);
+		if (message?.role !== "assistant" || !Array.isArray(message.content))
+			continue;
+		start = index;
+		aborted =
+			message.stopReason === "aborted" || message.stopReason === "error";
+		timestamp = message.timestamp;
+		if (aborted && typeof timestamp !== "number") continue;
+		for (const value of message.content) {
+			const block = object(value);
+			if (block?.type === "toolCall" && typeof block.id === "string")
+				pending.push({
+					id: block.id,
+					name: typeof block.name === "string" ? block.name : "",
+				});
+		}
+	}
+	flush();
+	return projected;
+}
+
 export function piPreparedStructure(
 	messages: readonly unknown[],
 	model?: PiChatHistoryModel,
 ): PiPreparedStructure | undefined {
+	return buildPiPreparedStructure(messages, model);
+}
+
+/** Prepare the returned OMP messages and their dispatch receipt in one walk. */
+export function preparePiDispatch<T>(
+	messages: T[],
+	model: PiChatHistoryModel | undefined,
+	omp: boolean,
+): { messages: T[]; structure: PiPreparedStructure | undefined } {
+	let output = messages;
+	const structure = buildPiPreparedStructure(
+		messages,
+		model,
+		omp
+			? (index, source) => {
+					// OMP replays a user compaction carrier instead of its readable summary.
+					// Assistant payloads may be the only copy of encrypted reasoning.
+					if (object(source.providerPayload)?.type !== "openaiResponsesHistory")
+						return;
+					if (output === messages) output = messages.slice();
+					const { providerPayload: _payload, ...copy } = source;
+					output[index] = copy as T;
+				}
+			: undefined,
+	);
+	return { messages: output, structure };
+}
+
+function buildPiPreparedStructure(
+	messages: readonly unknown[],
+	model?: PiChatHistoryModel,
+	prepareUser?: (index: number, source: Record<string, unknown>) => void,
+): PiPreparedStructure | undefined {
 	if (!messages.length || messages.length > MAX_MESSAGES) return undefined;
+	for (let index = 0; index < messages.length; index++) {
+		const source = object(messages[index]);
+		if (source?.role === "user" || source?.role === "compactionSummary")
+			prepareUser?.(index, source);
+	}
+	const projectedMessages = projectMissingToolResults(
+		model?.api ? piAgentHistory(messages, model.api) : messages,
+	);
+	if (projectedMessages.length > MAX_MESSAGES) return undefined;
 	const rows: MessageStructure[] = [];
 	const toolNames = new Map<string, string>();
+	const toolIds = new Map<string, string | undefined>();
+	const responsesToolIds = new Map<string, string | undefined>();
 	const byIndex = new Map<number, MessageStructure>();
-	for (let index = 0; index < messages.length; index++) {
-		const message = messages[index];
+	let valid = true;
+	for (let index = 0; index < projectedMessages.length; index++) {
+		const message = projectedMessages[index];
 		const source = object(message);
 		// History injection and the provider renderer both put instructions before
 		// conversation turns. Ignore only that leading system/developer prefix on
@@ -103,20 +260,72 @@ export function piPreparedStructure(
 		)
 			continue;
 		const row = messageStructure(message);
-		if (!row) return undefined;
+		if (!row) {
+			if (!prepareUser) return undefined;
+			valid = false;
+			continue;
+		}
+		// These providers omit a user/developer row with no nonblank text or
+		// images. In particular, a compaction summary with blocks: [] has no wrapper.
+		if (
+			[
+				"openai-completions",
+				"openrouter",
+				"anthropic-messages",
+				"bedrock-converse-stream",
+				"google-generative-ai",
+				"google-gemini-cli",
+				"google-vertex",
+				"openai-responses",
+				"azure-openai-responses",
+				"openai-codex-responses",
+			].includes(model?.api ?? "") &&
+			(source?.role === "user" || source?.role === "developer") &&
+			(typeof source.content === "string"
+				? !source.content.trim()
+				: Array.isArray(source.content) &&
+					!source.content.some((value) => {
+						const block = object(value);
+						return (
+							block?.type === "image" ||
+							(block?.type === "text" &&
+								typeof block.text === "string" &&
+								block.text.trim())
+						);
+					}))
+		)
+			continue;
 		row.calls.forEach((id, index) => {
 			toolNames.set(id, row.callNames?.[index] ?? "");
+			if (model?.api) {
+				const normalized = piToolCallWireId(id, model, source);
+				row.wireCalls ??= [];
+				row.wireCalls.push(normalized);
+				toolIds.set(id, normalized);
+				if (
+					[
+						"openai-responses",
+						"azure-openai-responses",
+						"openai-codex-responses",
+					].includes(String(source?.api))
+				)
+					responsesToolIds.set(id.split("|", 1)[0], normalized);
+			}
 		});
-		if (row.results.length)
+		if (row.results.length) {
 			row.resultNames = row.results.map((id) => toolNames.get(id) ?? "");
+			if (model?.api)
+				row.wireResults = row.results.map((id) =>
+					toolIds.has(id)
+						? toolIds.get(id)
+						: responsesToolIds.get(id.split("|", 1)[0]),
+				);
+		}
 		rows.push(row);
 		byIndex.set(index, row);
 	}
-	const responsesApi = [
-		"openai-responses",
-		"azure-openai-responses",
-		"openai-codex-responses",
-	].includes(model?.api ?? "");
+	if (!valid) return undefined;
+	const responsesApi = responsesLane(model?.api);
 	let responsesMessages: MessageStructure[] | undefined = responsesApi
 		? []
 		: undefined;
@@ -126,7 +335,7 @@ export function piPreparedStructure(
 				responsesMessages.push(row);
 				continue;
 			}
-			const texts = piResponsesAssistantTexts(messages[index], model);
+			const texts = piResponsesAssistantTexts(projectedMessages[index], model);
 			if (!texts) {
 				responsesMessages = undefined;
 				break;
@@ -138,16 +347,18 @@ export function piPreparedStructure(
 			const previous = responsesMessages.at(-1);
 			if (previous?.role === "assistant") {
 				previous.calls.push(...row.calls);
+				previous.wireCalls?.push(...(row.wireCalls ?? []));
 				previous.responseTexts?.push(...texts);
 			} else
 				responsesMessages.push({
 					...row,
 					calls: [...row.calls],
+					...(row.wireCalls ? { wireCalls: [...row.wireCalls] } : {}),
 					responseTexts: [...texts],
 				});
 		}
 	}
-	const plan = piChatHistoryPlan(messages, model);
+	const plan = piChatHistoryPlan(projectedMessages, model);
 	const chatMessages = plan?.flatMap((step): MessageStructure[] => {
 		if (step.kind === "source") {
 			const row = byIndex.get(step.index);
@@ -166,10 +377,29 @@ export function piPreparedStructure(
 	});
 	return {
 		messages: rows,
+		...(responsesApi && !responsesMessages
+			? { structuralSkipReason: "Responses history transform is not modeled" }
+			: model?.api === "openai-completions" && !chatMessages
+				? { structuralSkipReason: "Chat history transform is not modeled" }
+				: {}),
 		...(chatMessages ? { chatMessages } : {}),
 		...(responsesMessages ? { responsesMessages } : {}),
 		...(model?.api ? { api: model.api } : {}),
+		...(model?.api?.startsWith("google-")
+			? {
+					googleFunctionIds:
+						object(model.compat)?.supportsFunctionPartId === true,
+				}
+			: {}),
 	};
+}
+
+function responsesLane(api: string | undefined): boolean {
+	return [
+		"openai-responses",
+		"azure-openai-responses",
+		"openai-codex-responses",
+	].includes(api ?? "");
 }
 
 function payloadStructure(
@@ -284,7 +514,11 @@ function payloadStructure(
 				continue;
 			}
 		}
-		const row = messageStructure(message);
+		const row = messageStructure(
+			ollama && message.role === "system"
+				? { ...message, role: "user" }
+				: message,
+		);
 		if (!row) return undefined;
 		row.wireContent = message.content;
 		if (responses && responsesItems && row.role === "assistant") {
@@ -450,6 +684,7 @@ export function piPreparedStructureMismatch(
 	prepared: PiPreparedStructure | undefined,
 ): string | undefined {
 	try {
+		if (prepared?.structuralSkipReason) return undefined;
 		const body = object(payload);
 		const ollama =
 			prepared?.api === "ollama-chat" &&
@@ -468,7 +703,7 @@ export function piPreparedStructureMismatch(
 		const chat =
 			!!body &&
 			Array.isArray(body.messages) &&
-			body.system === undefined &&
+			(prepared?.api === "openai-completions" || body.system === undefined) &&
 			body.input === undefined &&
 			body.inferenceConfig === undefined;
 		const expectedRows =
@@ -484,8 +719,10 @@ export function piPreparedStructureMismatch(
 		const anthropic =
 			google ||
 			body.inferenceConfig !== undefined ||
-			typeof body.system === "string" ||
-			Array.isArray(body.system);
+			prepared?.api === "anthropic-messages" ||
+			(!prepared?.api &&
+				body.max_tokens !== undefined &&
+				Array.isArray(body.system));
 		for (let i = 0; i < Math.min(rows.length, expectedRows.length); i++) {
 			const expected = expectedRows[i];
 			const actual = rows[i];
@@ -525,12 +762,17 @@ export function piPreparedStructureMismatch(
 				return structureDetail(i, expectedRows, rows, "timestamp");
 			for (let j = 0; j < actual.calls.length; j++)
 				if (
-					(google && actual.calls[j] === "") ||
+					(google &&
+						actual.calls[j] === "" &&
+						prepared?.googleFunctionIds !== true) ||
 					(ollama && actual.idlessCalls?.[j] === true)
 						? !expected.callNames?.[j] ||
 							actual.callNames?.[j] !== expected.callNames[j]
-						: actual.calls[j] !==
-							wireId(expected.calls[j], anthropic, responses)
+						: (google && prepared?.googleFunctionIds === false) ||
+							actual.calls[j] !==
+								(expected.wireCalls
+									? expected.wireCalls[j]
+									: wireId(expected.calls[j], anthropic, responses))
 				)
 					return structureDetail(
 						i,
@@ -543,12 +785,17 @@ export function piPreparedStructureMismatch(
 					);
 			for (let j = 0; j < actual.results.length; j++)
 				if (
-					(google && actual.results[j] === "") ||
+					(google &&
+						actual.results[j] === "" &&
+						prepared?.googleFunctionIds !== true) ||
 					(ollama && actual.idlessResults?.[j] === true)
 						? !expected.resultNames?.[j] ||
 							actual.resultNames?.[j] !== expected.resultNames[j]
-						: actual.results[j] !==
-							wireId(expected.results[j], anthropic, responses)
+						: (google && prepared?.googleFunctionIds === false) ||
+							actual.results[j] !==
+								(expected.wireResults
+									? expected.wireResults[j]
+									: wireId(expected.results[j], anthropic, responses))
 				)
 					return structureDetail(
 						i,

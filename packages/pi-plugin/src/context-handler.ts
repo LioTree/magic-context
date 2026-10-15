@@ -114,9 +114,11 @@ import {
 	clearHistorianFailureState,
 	clearPersistedReasoningWatermark,
 	clearThinkingBindingRecoveryIf,
+	EMERGENCY_DRAIN_FAILURE_BACKOFF_MS,
 	flushAutoSearchHintDecisionRetirement,
 	getAutoSearchHintDecisions,
 	getEmergencyInputSample,
+	getHistorianFailureState,
 	getNoteNudgeAnchors,
 	getPersistedTodoSyntheticAnchor,
 	isProviderOverflowFailClosedProven,
@@ -277,6 +279,9 @@ import { sendCtxStatusMessage } from "./commands/pi-command-utils";
 import {
 	type ApplyDeferredPiCompactionMarkerDeps,
 	applyDeferredPiCompactionMarker,
+	clearPiCompactionMarkerDrainLogState,
+	getPiCompactionMarkerDrainErrorFields,
+	logPiCompactionMarkerDrainGateOnce,
 } from "./compaction-marker-manager-pi";
 import {
 	commitPiCompactionModeRecord,
@@ -300,6 +305,10 @@ import {
 	type PiHeuristicCleanupResult,
 } from "./heuristic-cleanup-pi";
 import { readPiHistorianTail } from "./historian-tail-pi";
+import {
+	clearPiHistoryBoundaryRepairSession,
+	repairPiHistoryBoundary,
+} from "./history-boundary-repair-pi";
 import {
 	clearM0M1PiCache,
 	clearPiInjectionTokenCountCache,
@@ -335,7 +344,19 @@ import {
 	registerPiGuardedContext,
 } from "./pi-context-refusal";
 import { createPiFallbackIndex } from "./pi-fallback-index";
+import {
+	clearPiFitReclaimInput,
+	clearPiUpperReclaimSession,
+	piFitOverflowPossible,
+	piUpperReclaimCursor,
+	recordPiUpperEstimateReclaim,
+	releasePiUpperEstimateReclaim,
+	requestPiFitReclaimInput,
+	reservePiUpperEstimateReclaim,
+	shouldReclaimPiUpperEstimate,
+} from "./pi-fit-reclaim";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
+import { readPiHistoryRetirement } from "./pi-history-retirement";
 import {
 	clearPiLkgSessionState,
 	createPiLkgCoordinator,
@@ -346,6 +367,7 @@ import {
 	piStorageErrorReason,
 	reconcilePiLkgEntryIds,
 	resolvePiLkgOutputEntryIds,
+	restorePiLkgInputForFit,
 } from "./pi-lkg";
 import { readPiLkgFitEnvelope } from "./pi-lkg-fit-envelope";
 import {
@@ -373,6 +395,7 @@ import {
 import { resolvePiProvenInputFloor } from "./pi-proven-floor";
 import {
 	assertPiRawFallbackFits,
+	classifyPiOutgoingFit,
 	estimatePiOutgoingInputTokens,
 	PiDegradedPassError,
 	PiStorageBusyError,
@@ -525,6 +548,7 @@ function isPiHardCacheExpired(
 }
 
 let injectM0M1PiForRun = injectM0M1Pi;
+let resolvePiEffectiveSystemStateForRun = resolvePiEffectiveSystemState;
 let persistReasoningWatermarkForRun = updateSessionMeta;
 let persistStableIdSchemeForRun = updateSessionMeta;
 let afterFallbackAdoptionForTests:
@@ -591,6 +615,14 @@ export const __test = {
 		injectM0M1PiForRun = fn;
 		return () => {
 			injectM0M1PiForRun = injectM0M1Pi;
+		};
+	},
+	setPiEffectiveSystemStateResolverForTests(
+		fn: typeof resolvePiEffectiveSystemState,
+	): () => void {
+		resolvePiEffectiveSystemStateForRun = fn;
+		return () => {
+			resolvePiEffectiveSystemStateForRun = resolvePiEffectiveSystemState;
 		};
 	},
 	setReasoningWatermarkPersistenceForTests(
@@ -4300,6 +4332,8 @@ export function registerPiContextHandler(
 			const tEntryBranch = performance.now();
 			const branchEntries = readPiBranchEntriesForContext(ctx, sessionId);
 			assertCurrentPass();
+			if (!budget.sideTurn)
+				repairPiHistoryBoundary(options.db, sessionId, ctx, branchEntries);
 			// Pi's live usage figure is a whole-raw-branch estimate while a context
 			// edit or compaction follows the last recorded usage (e.g. after a
 			// retried request); such a figure is never used as pressure.
@@ -4887,8 +4921,9 @@ export function registerPiContextHandler(
 				}
 				emergencyRecoveryArmed = overflowState.needsEmergencyRecovery;
 				lkgEmergencyRecoveryArmed = emergencyRecoveryArmed;
-				needsEmergencyBump =
-					overflowState.needsEmergencyRecovery && usagePercentage < 95;
+				// Pi's estimate of its entire unmodified history may be discarded below.
+				// Keep the persisted overflow flag so pressure still reaches 95% afterward.
+				needsEmergencyBump = overflowState.needsEmergencyRecovery;
 			} catch (err) {
 				sessionLog(
 					sessionId,
@@ -5347,12 +5382,49 @@ export function registerPiContextHandler(
 			if (beforePipelineForTests)
 				await budget.waitMandatory(beforePipelineForTests());
 			assertCurrentPass();
-			const inputForThinkingFit = isPrefixBoundThinkingModel(
-				ctx.model?.provider,
-				ctx.model?.id,
-			)
-				? structuredClone(event.messages)
-				: null;
+			const fitInputStart = hasPiTransformTimingObserver()
+				? performance.now()
+				: undefined;
+			const nativeFitPossible =
+				getHarness() === "pi" &&
+				!options.compactionOff &&
+				piFitOverflowPossible({
+					hasUI: ctx.hasUI,
+					inputTokens: usageInputTokens,
+					// Reuse the saved-request rebuild signal; do not scan the old prefix here.
+					recoveryArmed: emergencyRecoveryArmed || !!recovery.rebuildReason,
+					forceMaterialization,
+					imported:
+						looksLikeImportedSession ||
+						(usageInputTokens <= 0 &&
+							(isFirstContextPassForSession ||
+								lkgPassSnapshot?.replayFailure !== null)),
+					coldInjection: !!options.injection && !sessionMeta.cachedM0Bytes,
+					cacheBusting: isCacheBusting,
+					sessionId,
+					appendedMessages:
+						lkgPassSnapshot?.pristineTail ?? event.messages.slice(-1),
+					contextLimit: rawFallbackLimit,
+					forcePercentage: forceMaterializationPercentage,
+				});
+			let inputForThinkingFit: unknown[] | null =
+				(getHarness() !== "pi" || nativeFitPossible) &&
+				isPrefixBoundThinkingModel(ctx.model?.provider, ctx.model?.id)
+					? structuredClone(event.messages)
+					: null;
+			// Renderers can mutate parts, and JSONL lacks context added by extensions.
+			// Preserve the original only for recovery, missing usage, near-capacity
+			// input, a large new tail, or an invalidated cache; not steady low-pressure turns.
+			let inputForFitReclaim: unknown[] | undefined = nativeFitPossible
+				? (inputForThinkingFit ?? structuredClone(event.messages))
+				: undefined;
+			if (fitInputStart !== undefined)
+				recordPiTransformTiming({
+					sessionId,
+					stage: "fitInputPreparation",
+					elapsedMs: performance.now() - fitInputStart,
+					extra: inputForFitReclaim ? "snapshot" : "no-snapshot",
+				});
 			const pipelineArgs: RunPipelineArgs = {
 				recoveryPrefix: recovery.prefix,
 				recoveryRebuildReason: recovery.rebuildReason,
@@ -5436,6 +5508,7 @@ export function registerPiContextHandler(
 				},
 				resolvedProviderID: ctx.model?.provider,
 				resolvedModelID: ctx.model?.id,
+				providerApi: ctx.model?.api,
 				canUseEmptySentinels,
 				temporalAwareness: options.injection?.temporalAwareness === true,
 				appendCompaction: guardedPiAppendCompaction(ctx, assertCurrentPass),
@@ -5560,10 +5633,9 @@ export function registerPiContextHandler(
 				tTransformDecision,
 			);
 
-			// After tagging+drops have committed, check whether historian
-			// should fire. Historian config is optional — tagging-only
-			// behavior is the Step 4b.2 contract, and historian is
-			// fire-and-forget so we never block the LLM call on it.
+			// After tagging and drops commit, an optional historian can start in
+			// the background. A headless request proven too large joins it below
+			// before deciding whether the rebuilt request can be sent.
 			const tHistorianScheduling = performance.now();
 			const historian = options.historian;
 			budget.stage = "historian scheduling";
@@ -5752,33 +5824,36 @@ export function registerPiContextHandler(
 			// Subagents do not receive these synthetic todo reminders, matching
 			// OpenCode's primary-session-only policy.
 			const tTodoCapture = performance.now();
-			try {
-				const sessionMetaForTodo = sessionMeta;
-				if (
-					options.todowriteEnabled === true &&
-					!options.compactionOff &&
-					!sessionMetaForTodo.isSubagent &&
-					sessionMetaForTodo.lastTodoState !== ""
-				) {
-					const isCacheBustingForTodo =
-						result.prefixBustPermitted && !result.strictThinkingKept;
-					outputMessages = injectSyntheticTodowriteForPi({
-						db: options.db,
+			const injectTodo = () => {
+				try {
+					const sessionMetaForTodo = sessionMeta;
+					if (
+						options.todowriteEnabled === true &&
+						!options.compactionOff &&
+						!sessionMetaForTodo.isSubagent &&
+						sessionMetaForTodo.lastTodoState !== ""
+					) {
+						const isCacheBustingForTodo =
+							result.prefixBustPermitted && !result.strictThinkingKept;
+						outputMessages = injectSyntheticTodowriteForPi({
+							db: options.db,
+							sessionId,
+							isSubagent: sessionMetaForTodo.isSubagent,
+							isCacheBusting: isCacheBustingForTodo,
+							lastTodoState: sessionMetaForTodo.lastTodoState,
+							messages: outputMessages as unknown as Parameters<
+								typeof injectSyntheticTodowriteForPi
+							>[0]["messages"],
+						}) as unknown as typeof outputMessages;
+					}
+				} catch (err) {
+					sessionLog(
 						sessionId,
-						isSubagent: sessionMetaForTodo.isSubagent,
-						isCacheBusting: isCacheBustingForTodo,
-						lastTodoState: sessionMetaForTodo.lastTodoState,
-						messages: outputMessages as unknown as Parameters<
-							typeof injectSyntheticTodowriteForPi
-						>[0]["messages"],
-					}) as unknown as typeof outputMessages;
+						`synthetic todowrite injection failed: ${err instanceof Error ? err.message : String(err)}`,
+					);
 				}
-			} catch (err) {
-				sessionLog(
-					sessionId,
-					`synthetic todowrite injection failed: ${err instanceof Error ? err.message : String(err)}`,
-				);
-			}
+			};
+			injectTodo();
 			logTransformTiming(sessionId, "todoCapture", tTodoCapture);
 
 			// Thinking-binding strips run last, on the array this pass serves, so the
@@ -6130,12 +6205,28 @@ export function registerPiContextHandler(
 				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
 			);
 			runPiDebugAssertion(assertTailHygieneLastWriter);
-			if (
+			const fitSelectionStart = hasPiTransformTimingObserver()
+				? performance.now()
+				: undefined;
+			const checkOutgoingFit =
 				!options.compactionOff &&
-				(result.executedWorkThisPass ||
-					isCacheBusting ||
-					schedulerDecision === "execute")
-			) {
+				(getHarness() === "pi"
+					? nativeFitPossible ||
+						result.bustedThisPass ||
+						result.materialized ||
+						isCacheBusting ||
+						schedulerDecision === "execute"
+					: result.executedWorkThisPass ||
+						isCacheBusting ||
+						schedulerDecision === "execute");
+			if (fitSelectionStart !== undefined)
+				recordPiTransformTiming({
+					sessionId,
+					stage: "fitAdmissionSelection",
+					elapsedMs: performance.now() - fitSelectionStart,
+					extra: checkOutgoingFit ? "estimate" : "skip",
+				});
+			if (checkOutgoingFit) {
 				const envelope = readPiLkgFitEnvelope(
 					ctx,
 					pi,
@@ -6150,12 +6241,32 @@ export function registerPiContextHandler(
 							(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
 						)
 					: undefined;
+				// Exceeding Magic Context's earlier reclaim threshold or replay output
+				// reservation is not proof that the model's actual window is exceeded.
+				const outgoingFitLimit =
+					getHarness() === "pi" && baseWindowGeometry
+						? baseWindowGeometry.derivation.absoluteWall
+						: rawFallbackLimit;
 				let estimate = estimatePiOutgoingInputTokens(
 					outputMessages,
 					envelope,
 					measuredPrefix,
-					rawFallbackLimit,
+					outgoingFitLimit,
 				);
+				let fitReclaimedThisPass = false;
+				if (
+					!inputForThinkingFit &&
+					result.strictThinkingKept &&
+					rawFallbackLimit &&
+					estimate.refusalGrade &&
+					(estimate.refusalTokens ?? estimate.tokens) > rawFallbackLimit
+				) {
+					const restored = restorePiLkgInputForFit(
+						lkgPassSnapshot,
+						branchEntries,
+					);
+					if (restored) inputForThinkingFit = restored;
+				}
 				if (
 					inputForThinkingFit &&
 					result.strictThinkingKept &&
@@ -6175,6 +6286,9 @@ export function registerPiContextHandler(
 							},
 						}),
 					);
+					fitReclaimedThisPass = true;
+					// This input was consumed by the retry; it is no longer pristine.
+					inputForFitReclaim = undefined;
 					outputMessages = result.messages as PiAgentMessage[];
 					const retryIds = resolvePiLkgOutputEntryIds(
 						outputMessages,
@@ -6236,6 +6350,199 @@ export function registerPiContextHandler(
 					throw contextRefusalError(
 						"The request remains over the model window after stripping signed thinking and reclaiming context",
 					);
+				if (getHarness() === "pi") {
+					const fitCase = classifyPiOutgoingFit(estimate, outgoingFitLimit);
+					const currentUpperCursor = () =>
+						piUpperReclaimCursor({
+							sessionId,
+							modelKey: resolvePiContextModelKey(ctx) ?? null,
+							contextWindow: outgoingFitLimit,
+							head: getOrCreateSessionMeta(options.db, sessionId),
+							messageCount: fullWireMessageCount,
+							snapshot: lkgPassSnapshot,
+							input: inputForFitReclaim ?? event.messages,
+						});
+					const upperCursor =
+						fitCase === "upper-estimate-pressure"
+							? currentUpperCursor()
+							: undefined;
+					if (fitCase === "over-window-proof") {
+						requestPiFitReclaimInput(sessionId);
+					}
+					if (fitCase === "fits-or-unknown") clearPiFitReclaimInput(sessionId);
+					// Active thinking signatures bind earlier messages to the provider's
+					// reasoning. Uncertain metadata size cannot authorize rewriting them;
+					// provider overflow or proof that the request cannot fit can do so.
+					const upperPassEligible =
+						schedulerDecision === "execute" ||
+						result.bustedThisPass ||
+						result.prefixRebuildAlreadyPriced ||
+						isCacheBusting ||
+						forceMaterialization ||
+						isEmergency;
+					const reclaimHeld =
+						fitCase === "upper-estimate-pressure" &&
+						(result.strictThinkingKept ||
+							!upperPassEligible ||
+							!shouldReclaimPiUpperEstimate(options.db, upperCursor));
+					if (reclaimHeld)
+						sessionLog(
+							sessionId,
+							"outgoing fit: upper-estimate-pressure; reclaim held by signed prefix, deferred pass or used session latch",
+						);
+					if (
+						fitCase === "upper-estimate-pressure" &&
+						!reclaimHeld &&
+						!inputForFitReclaim
+					)
+						// An unexpected over-count can prepare a clean input next pass.
+						// Never copy an already-rendered prefix to retry its injection.
+						requestPiFitReclaimInput(sessionId);
+					if (
+						fitCase !== "fits-or-unknown" &&
+						!reclaimHeld &&
+						!fitReclaimedThisPass &&
+						!inputForFitReclaim
+					)
+						inputForFitReclaim = restorePiLkgInputForFit(
+							lkgPassSnapshot,
+							branchEntries,
+						);
+					if (
+						fitCase !== "fits-or-unknown" &&
+						!reclaimHeld &&
+						!fitReclaimedThisPass &&
+						inputForFitReclaim
+					) {
+						const reservation = upperCursor
+							? reservePiUpperEstimateReclaim(options.db, upperCursor)
+							: undefined;
+						if (!upperCursor || reservation) {
+							let reclaimCompleted = false;
+							try {
+								sessionLog(
+									sessionId,
+									`outgoing fit: ${fitCase}; attempting emergency reclaim`,
+								);
+								// Upper estimates may include metadata the provider never sees.
+								// They request reclaim; only a proven minimum above the window
+								// can block the outgoing request.
+								if (
+									fitCase === "over-window-proof" &&
+									!ctx.hasUI &&
+									historian
+								) {
+									maybeFireHistorian({
+										pi,
+										ctx,
+										sessionId,
+										db: options.db,
+										historian,
+										startGuard: budget.assert,
+										isFirstContextPassForSession: false,
+										activeTags: result.activeTags,
+										rawMessageProvider,
+										ordinalAlignment: ordinalAlignment(),
+										taggerFloor,
+										sessionMeta: getOrCreateSessionMeta(options.db, sessionId),
+										piUsage,
+										pressureSnapshot: {
+											percentage: Math.max(95, usagePercentage),
+											inputTokens: usageInputTokens,
+										},
+										minimumPercentage: 95,
+										publishedHistoryRide: false,
+										historianStateSnapshot: loadPiHistorianStateSnapshot(
+											options.db,
+											sessionId,
+										),
+									});
+									const pending = inFlightHistorian.get(sessionId);
+									if (pending) {
+										budget.stage = "headless fit historian";
+										await budget.wait(pending);
+									}
+								}
+								budget.stage = "outgoing fit reclaim";
+								const freshMeta = getOrCreateSessionMeta(options.db, sessionId);
+								result = await budget.waitMandatory(
+									runPipeline({
+										...pipelineArgs,
+										messages: inputForFitReclaim,
+										sessionMeta: freshMeta,
+										schedulerDecision: "execute",
+										schedulerDeferReason: null,
+										forceMaterialization: true,
+										upperEstimateOnly: fitCase === "upper-estimate-pressure",
+										forceSignedRebuildForFit: fitCase === "over-window-proof",
+										isCacheBusting:
+											historyRefreshSessions.has(sessionId) ||
+											deferredHistoryRefreshSessions.has(sessionId),
+										injectionPassSnapshot: options.injection
+											? createPiM0M1PassSnapshot({
+													db: options.db,
+													sessionId,
+													compactionOff: false,
+													sessionMeta: freshMeta,
+												})
+											: undefined,
+										contextUsage: {
+											percentage:
+												fitCase === "over-window-proof"
+													? Math.max(95, usagePercentage)
+													: usagePercentage,
+											inputTokens: usageInputTokens,
+										},
+									}),
+								);
+								outputMessages = result.messages as PiAgentMessage[];
+								// Reclaim replaces the postprocessed output with a pristine-input
+								// rebuild. Restore the todo pair before stripping and measuring it.
+								injectTodo();
+								if (upperCursor)
+									recordPiUpperEstimateReclaim(
+										options.db,
+										currentUpperCursor() ?? upperCursor,
+										reservation,
+									);
+								reclaimCompleted = true;
+								applyPiProactiveThinkingStrip({
+									db: options.db,
+									sessionId,
+									messages: outputMessages,
+									entryIds: resolvePiLkgOutputEntryIds(
+										outputMessages,
+										result.syntheticLeadingCount,
+										(message) =>
+											result.lkgEntryIdByRef.get(message) ??
+											result.postCommitEntryIdByRef.get(message),
+									).map((id) => id ?? undefined),
+									provider: ctx.model?.provider,
+									model: ctx.model?.id,
+									cacheBustingPass: result.bustedThisPass,
+									stripActiveTurn: result.signedPrefixRewritten,
+								});
+								estimate = estimatePiOutgoingInputTokens(
+									outputMessages,
+									envelope,
+									undefined,
+									outgoingFitLimit,
+								);
+							} finally {
+								if (!reclaimCompleted && upperCursor && reservation)
+									// Releasing this owner's claim is safe after cancellation or
+									// deadline expiry; it cannot publish a superseded request.
+									withoutSqliteTransformPass(() =>
+										releasePiUpperEstimateReclaim(
+											options.db,
+											upperCursor,
+											reservation,
+										),
+									);
+							}
+						}
+					}
+				}
 				const refusal = outgoingContextRefusal(
 					estimate,
 					rawFallbackLimit,
@@ -6246,6 +6553,12 @@ export function registerPiContextHandler(
 					),
 				);
 				if (refusal) throw contextRefusalError(refusal);
+				if (
+					getHarness() === "pi" &&
+					classifyPiOutgoingFit(estimate, outgoingFitLimit) ===
+						"over-window-proof"
+				)
+					throw new PiDegradedPassError("outgoing-over-window");
 			}
 			let serializedOutput: PiLkgSerializedOutput | undefined;
 			let numbersCommitted = false;
@@ -6575,6 +6888,13 @@ export function registerPiContextHandler(
 			// Keep refusal outside the replay try/catch: it must reach Pi, not be
 			// mistaken for another replay failure and swallowed into raw fallthrough.
 			if (transientStorageFailure) throw new PiStorageBusyError({ cause: err });
+			if (
+				err instanceof PiDegradedPassError &&
+				err.site === "outgoing-over-window"
+			)
+				throw contextRefusalError(
+					"The request exceeds the model's context window after reclaim, and no fitting saved request is available; this turn was not sent.",
+				);
 			// Fit is not enough: raw messages omit persisted decisions even when
 			// small. Only a validated last-good replay may serve a failed pass.
 			// Without a resolved session there are no persisted decisions to omit
@@ -6641,7 +6961,8 @@ export function registerPiContextHandler(
  *
  * We store the actual Promise (not just the session id) so the
  * `session_shutdown` handler can cancel and await outstanding runs.
- * Headless sessions do not launch background historians.
+ * Headless requests proven too large also join the tracked run within their
+ * foreground context deadline before retrying reclaim and the fit check.
  */
 const inFlightHistorian = new Map<string, Promise<unknown>>();
 const historianAbortControllers = new Map<string, AbortController>();
@@ -7418,19 +7739,52 @@ function maybeFireHistorian(args: {
 
 	let triggered = false;
 	try {
-		if (isFirstContextPassForSession) {
+		if (
+			isFirstContextPassForSession &&
+			sessionMeta.compartmentInProgress &&
+			!inFlightHistorian.has(sessionId)
+		) {
+			updateSessionMeta(db, sessionId, { compartmentInProgress: false });
+			sessionMeta.compartmentInProgress = false;
+			sessionLog(
+				sessionId,
+				"historian: cleared stale compartmentInProgress flag on first context pass after restart",
+			);
+		}
+		if (readPiHistoryRetirement(db, sessionId)) {
+			const failedAt =
+				getHistorianFailureState(db, sessionId).lastFailureAt ?? 0;
+			const now = Date.now();
 			if (
-				sessionMeta.compartmentInProgress &&
-				!inFlightHistorian.has(sessionId)
-			) {
-				updateSessionMeta(db, sessionId, { compartmentInProgress: false });
-				sessionMeta.compartmentInProgress = false;
-				sessionLog(
-					sessionId,
-					"historian: cleared stale compartmentInProgress flag on first context pass after restart",
-				);
-			}
-
+				sessionMeta.compartmentInProgress ||
+				(failedAt > 0 &&
+					failedAt <= now &&
+					now - failedAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS)
+			)
+				return;
+			const snapshot = resolveRunnablePiBoundarySnapshot();
+			if (!hasEligiblePiCompartmentHistory(db, sessionId, snapshot)) return;
+			// Retirement exposes a formerly summarized range even when it is too
+			// small for a normal tail-size trigger. All other admission, lease,
+			// protected-tail and producer checks remain on the ordinary path.
+			triggered = true;
+			spawnPiHistorianRun({
+				startGuard: args.startGuard,
+				pi: args.pi,
+				ctx,
+				sessionId,
+				db,
+				historian,
+				provider,
+				unregister,
+				boundarySnapshot: snapshot,
+				refreshBoundarySnapshot: resolveRunnablePiBoundarySnapshot,
+				currentContextLimit: boundaryContextLimit,
+				fallbackModelId: modelKey,
+			});
+			return;
+		}
+		if (isFirstContextPassForSession) {
 			const failureCount = historianStateSnapshot.historianFailureCount;
 			if (failureCount > 0) {
 				triggered = true;
@@ -7550,19 +7904,19 @@ function maybeFireHistorian(args: {
 			return;
 		}
 
-		// Headless Pi exits after agent_end without dispatching session_shutdown.
-		// Leave the eligible history in the store for the next interactive pass.
-		if (!ctx.hasUI) return;
+		// Archive summaries, drops and the checkpoint marker commit together.
+		// If a host without a UI exits, its publication lease can be reclaimed.
+		// Such hosts can run this background historian across turns; a request
+		// proven too large waits for its result before the final fit check.
 		triggered = true;
 		sessionLog(
 			sessionId,
 			`historian trigger fired (reason=${trigger.reason ?? "unknown"}) usage=${usage.percentage.toFixed(1)}% — spawning subagent`,
 		);
 
-		// Fire-and-forget for the user's LLM call: the parent agent
-		// turn never awaits this. But we DO track the Promise in
-		// inFlightHistorian so shutdown can cancel the child and wait for
-		// the run's finally block to release its compartment-state lease.
+		// Track the background promise so an oversized headless request can
+		// await it, and shutdown can cancel the child and wait for the run's
+		// finally block to release its compartment-state lease.
 		spawnPiHistorianRun({
 			startGuard: args.startGuard,
 			pi: args.pi,
@@ -7591,6 +7945,8 @@ function maybeFireHistorian(args: {
 	}
 }
 interface RunPipelineArgs {
+	/** Metadata estimates alone cannot rewrite messages bound to an active thinking signature. */
+	upperEstimateOnly?: boolean;
 	recoveryPrefix?: import("./pi-lkg").PiLkgRecoveryPrefix;
 	recoveryRebuildReason?: string;
 	tryReplayHeldIdentityRebuild?: () => void;
@@ -7598,6 +7954,7 @@ interface RunPipelineArgs {
 	forceSignedRebuildForFit?: boolean;
 	resolvedProviderID?: string;
 	resolvedModelID?: string;
+	providerApi?: string;
 	assertCurrentPass?: () => void;
 	db: ContextDatabase;
 	tagger: Tagger;
@@ -8042,12 +8399,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// Capture the provider-visible system state before transforming the served
 		// array. A pending compaction marker must compare this input state with the
 		// system state that Pi persists in its session.
-		foldingSystemState = resolvePiEffectiveSystemState(args.messages);
-	} catch (error) {
-		sessionLog(
-			args.sessionId,
-			`Pi folding-input system state could not be resolved; native marker drain will remain pending: ${error instanceof Error ? error.message : String(error)}`,
-		);
+		foldingSystemState = resolvePiEffectiveSystemStateForRun(args.messages);
+	} catch {
+		// If effective system state is unavailable, continue without it; a pending
+		// marker's gate below logs this failure using IDs and ordinals only.
 	}
 	const forceMaterializationPercentage =
 		args.forceMaterializationPercentage ??
@@ -8887,7 +9242,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			args.reasoningClearing?.prefixBound === true,
 		),
 	);
-	if (protectedSignedPrefix && args.contextUsage.percentage >= 95) {
+	if (
+		protectedSignedPrefix &&
+		args.contextUsage.percentage >= 95 &&
+		!args.upperEstimateOnly
+	) {
 		const candidates = getActiveTagsBySession(args.db, args.sessionId).filter(
 			(tag) => tag.type === "tool" && targets.get(tag.tagNumber)?.canDrop?.(),
 		);
@@ -10045,6 +10404,22 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// that already changes the served prefix, so the stored set never changes
 		// on a pass meant to replay the previous bytes.
 		canFirstApply: isCacheBustingPass,
+		onLegacyReplay: (previous, next) => {
+			const id = postCommitStableIdByRef.get(previous);
+			if (id) postCommitStableIdByRef.set(next, id);
+		},
+		// Oh My Pi converts a tool result whose call is absent into a
+		// <stale-tool-result> user message (pi-ai providers/transform-messages.ts,
+		// 18.10.4:1395-1449, 18.11.0:1391-1445). Responses/Anthropic request
+		// validation rejects that role change, so remove dropped results first.
+		// Chat validation accepts the exact placeholder note; defer its removal
+		// until another change already invalidates the provider's cached prefix.
+		retireOrphansBeforeRefusal: [
+			"openai-responses",
+			"openai-codex-responses",
+			"azure-openai-responses",
+			"anthropic-messages",
+		].includes(args.providerApi ?? ""),
 		onFirstApplication: (message, index) =>
 			recordFirstApplicationAt(message, index, 0, (item) =>
 				item && typeof item === "object"
@@ -10078,6 +10453,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		!suppressDeferredHistoryDrain &&
 		!casLost;
 	let preserveDeferredMaterializationForMarkerDrain = false;
+	let pendingForDrain: PendingPiCompactionMarker | null = null;
 	if (deferredHistoryDrainEligible) {
 		try {
 			args.assertCurrentPass?.();
@@ -10085,6 +10461,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.db,
 				args.sessionId,
 			);
+			pendingForDrain = pending;
 			if (!pending) {
 				if (injectionResult?.contentionExhausted === true) {
 					suppressDeferredHistoryDrain = true;
@@ -10103,9 +10480,16 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				preserveDeferredMaterializationForMarkerDrain = true;
 				const boundary = injectionResult?.renderedBoundary;
 				const m1Coverage = injectionResult?.m1RenderedCoverage;
-				sessionLog(
+				logPiCompactionMarkerDrainGateOnce(
 					args.sessionId,
-					`Pi compaction-marker drain skipped: pending ordinal ${pending.ordinal} is newer than rendered boundary ${boundary?.ordinal ?? "<none>"} endMessageId=${boundary?.endMessageId ?? "<none>"} (m[1] coverage ${m1Coverage?.ordinal ?? "<none>"} endMessageId=${m1Coverage?.endMessageId ?? "<none>"}); preserving deferred signals`,
+					pending,
+					"rendered-history-not-covering-marker",
+					{
+						renderedCoverageOrdinal: boundary?.ordinal,
+						renderedCoverageEndMessageId: boundary?.endMessageId,
+						m1CoverageOrdinal: m1Coverage?.ordinal,
+						m1CoverageEndMessageId: m1Coverage?.endMessageId,
+					},
 				);
 			} else if (
 				!args.appendCompaction ||
@@ -10114,10 +10498,24 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			) {
 				suppressDeferredHistoryDrain = true;
 				preserveDeferredMaterializationForMarkerDrain = true;
-				sessionLog(
-					args.sessionId,
-					"Pi compaction-marker drain skipped: sessionManager appendCompaction/getBranch or folding system state unavailable; preserving deferred signals",
-				);
+				if (!args.appendCompaction)
+					logPiCompactionMarkerDrainGateOnce(
+						args.sessionId,
+						pending,
+						"append-compaction-unavailable",
+					);
+				if (!args.readBranchEntries)
+					logPiCompactionMarkerDrainGateOnce(
+						args.sessionId,
+						pending,
+						"get-branch-unavailable",
+					);
+				if (!foldingSystemState)
+					logPiCompactionMarkerDrainGateOnce(
+						args.sessionId,
+						pending,
+						"folding-system-state-unavailable",
+					);
 			} else {
 				args.assertCurrentPass?.();
 				const outcome = applyDeferredPiCompactionMarker(
@@ -10159,21 +10557,33 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						suppressDeferredHistoryDrain = true;
 						preserveDeferredMaterializationForMarkerDrain = true;
 						if (adoption.kind === "divergent") {
-							const promptLengthDelta =
-								adoption.persistedPromptLength - adoption.foldingPromptLength;
 							// appendCompaction has already persisted this entry. Pi exposes no
 							// retraction API, and 0.86 session-manager.js:187-190 re-emits
 							// [systemMessage, summary]. Keep MC's fold for this pass and retain
 							// the pending marker so the next pass rechecks the then-current
 							// journal instead of trusting the persisted snapshot.
-							sessionLog(
+							logPiCompactionMarkerDrainGateOnce(
 								args.sessionId,
-								`Pi compaction-marker equivalence refused compactionId=${outcome.compactionId}: foldingOnlyTools=${JSON.stringify(adoption.foldingOnlyTools)} persistedOnlyTools=${JSON.stringify(adoption.persistedOnlyTools)} changedTools=${JSON.stringify(adoption.changedTools)} promptLengthDelta=${promptLengthDelta} (folding=${adoption.foldingPromptLength}, persisted=${adoption.persistedPromptLength}); persisted entry cannot be retracted, pending marker retained for next-pass journal recheck`,
+								pending,
+								"equivalence-refused",
+								{
+									firstKeptEntryId: outcome.firstKeptEntryId,
+									foldingOnlyTools: adoption.foldingOnlyTools,
+									persistedOnlyTools: adoption.persistedOnlyTools,
+									changedTools: adoption.changedTools,
+									promptLengthDelta:
+										adoption.persistedPromptLength -
+										adoption.foldingPromptLength,
+									foldingPromptLength: adoption.foldingPromptLength,
+									persistedPromptLength: adoption.persistedPromptLength,
+								},
 							);
 						} else {
-							sessionLog(
+							logPiCompactionMarkerDrainGateOnce(
 								args.sessionId,
-								`Pi compaction-marker equivalence unavailable for compactionId=${outcome.compactionId}: ${adoption.reason}; preserving deferred signals`,
+								pending,
+								"equivalence-unavailable",
+								{ firstKeptEntryId: outcome.firstKeptEntryId },
 							);
 						}
 					}
@@ -10182,10 +10592,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					suppressDeferredHistoryDrain = true;
 					preserveDeferredMaterializationForMarkerDrain = true;
 				} else if (outcome.kind === "retryable-failure") {
-					sessionLog(
-						args.sessionId,
-						`Pi compaction-marker drain retryable failure: ${outcome.error.message}`,
-					);
+					// The compaction marker manager logged the retryable failure's gate
+					// classification without error text.
 				} else if (
 					markerEquivalent &&
 					clearPendingPiCompactionMarkerStateIf(
@@ -10197,18 +10605,22 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					consumeDeferredHistoryRefresh(args.sessionId);
 				} else if (markerEquivalent) {
 					casLost = true;
-					sessionLog(
+					logPiCompactionMarkerDrainGateOnce(
 						args.sessionId,
-						"CAS-clear failed (newer blob written or another actor cleared); preserving deferred-history signal",
+						pending,
+						"cas-clear-lost",
 					);
 				}
 			}
 		} catch (err) {
 			args.assertCurrentPass?.();
-			sessionLog(
-				args.sessionId,
-				`Pi compaction-marker drain failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
-			);
+			if (pendingForDrain)
+				logPiCompactionMarkerDrainGateOnce(
+					args.sessionId,
+					pendingForDrain,
+					"drain-threw",
+					getPiCompactionMarkerDrainErrorFields(err),
+				);
 		}
 	}
 	if (
@@ -11022,6 +11434,8 @@ function clearPiCompactionOffInMemoryState(sessionId: string): void {
 // orphan-row cost for sessions that are genuinely abandoned and never resumed.
 // Do not add DB clearSession here.
 export function clearContextHandlerSession(sessionId: string): void {
+	clearPiHistoryBoundaryRepairSession(sessionId);
+	clearPiUpperReclaimSession(sessionId);
 	invalidateTrueRawTokenCache({ sessionId, reason: "pi.branch.changed" });
 	clearPiLiveUsageClassification(sessionId);
 	clearPiLkgSessionState(sessionId);
@@ -11055,6 +11469,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	piBranchProjectionBySession.delete(sessionId);
 	piAlignmentMismatchLoggedSessions.delete(sessionId);
 	clearPiOrdinalAlignmentSession(sessionId);
+	clearPiCompactionMarkerDrainLogState(sessionId);
 	clearPiInjectionTokenCountCache(sessionId);
 	clearPiMuralProcessCache(sessionId);
 	// The content memo is shared across sessions, not owned by one session id.

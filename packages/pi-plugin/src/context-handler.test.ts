@@ -73,6 +73,7 @@ import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudg
 import { withRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import * as readSessionFormatting from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { setBootQuietPeriodForTests } from "@magic-context/core/plugin/boot-quiet";
+import * as loggerModule from "@magic-context/core/shared/logger";
 import { clearModelsDevCache } from "@magic-context/core/shared/models-dev-cache";
 import { resolvePromptSurface } from "@magic-context/core/shared/prompt-surface";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
@@ -113,6 +114,10 @@ import {
 	mustMaterializePi,
 } from "./inject-compartments-pi";
 import * as piHistorian from "./pi-historian-runner";
+import {
+	classifyPiOutgoingFit,
+	estimatePiOutgoingInputTokens,
+} from "./pi-raw-fallback";
 import { observePiPublicationForTest } from "./publication-observer-fixture.test";
 import { capturePiServedArray } from "./served-array-ledger";
 import {
@@ -4335,77 +4340,79 @@ describe("registerPiContextHandler", () => {
 		).resolves.toBe(false);
 	});
 
-	it("uses live forward pressure when deciding whether to fire the historian", async () => {
-		const db = createTestDb();
-		const sessionId = "ses-forward-historian-floor";
-		try {
-			updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
-			const runner = {
-				harness: "pi",
-				run: mock(async () => ({
-					ok: true as const,
-					assistantText:
-						'<compartment start="1" end="2" title="Forward"><p1>Forward pressure history.</p1></compartment>',
-					durationMs: 1,
-				})),
-			} as unknown as SubagentRunner;
-			const fake = createFakePi();
-			registerPiContextHandler(fake.pi as never, {
-				db,
-				protectedTags: 0,
-				historian: {
-					runner,
-					model: "test/historian",
-					historianChunkTokens: 20_000,
-					executeThresholdPercentage: 80,
+	for (const hasUI of [true, false])
+		it(`uses live forward pressure when deciding whether to fire the historian (hasUI=${hasUI})`, async () => {
+			const db = createTestDb();
+			const sessionId = "ses-forward-historian-floor";
+			try {
+				updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+				const runner = {
+					harness: "pi",
+					run: mock(async () => ({
+						ok: true as const,
+						assistantText:
+							'<compartment start="1" end="2" title="Forward"><p1>Forward pressure history.</p1></compartment>',
+						durationMs: 1,
+					})),
+				} as unknown as SubagentRunner;
+				const fake = createFakePi();
+				registerPiContextHandler(fake.pi as never, {
+					db,
 					protectedTags: 0,
-				},
-			});
-			const handler = fake.handlers.get("context") as (
-				event: { messages: never[] },
-				ctx: never,
-			) => Promise<{ messages: never[] }>;
-			const prime = [userMessage("prime", 1)] as never[];
-			await handler({ messages: prime }, {
-				...fakeContext(sessionId, process.cwd(), ["entry-prime"], prime),
-				getContextUsage: () => ({
-					tokens: 1_000,
-					percent: 1,
-					contextWindow: 100_000,
-				}),
-			} as never);
-			updateSessionMeta(db, sessionId, {
-				lastResponseTime: Date.now(),
-				cacheTtl: "59m",
-				lastContextPercentage: 68,
-				lastInputTokens: 68_000,
-			});
-			const messages = Array.from({ length: 12 }, (_, index) =>
-				index % 2 === 0
-					? userMessage(`user ${index}`, index + 2)
-					: assistantMessage(`assistant ${index}`, index + 2),
-			) as never[];
-			await handler({ messages }, {
-				...fakeContext(
-					sessionId,
-					process.cwd(),
-					messages.map((_, index) => `entry-${index + 1}`),
-					messages,
-				),
-				getContextUsage: () => ({
-					tokens: 85_000,
-					percent: 10,
-					contextWindow: 100_000,
-				}),
-			} as never);
-			await awaitInFlightHistorians();
+					historian: {
+						runner,
+						model: "test/historian",
+						historianChunkTokens: 20_000,
+						executeThresholdPercentage: 80,
+						protectedTags: 0,
+					},
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				const prime = [userMessage("prime", 1)] as never[];
+				await handler({ messages: prime }, {
+					...fakeContext(sessionId, process.cwd(), ["entry-prime"], prime),
+					getContextUsage: () => ({
+						tokens: 1_000,
+						percent: 1,
+						contextWindow: 100_000,
+					}),
+				} as never);
+				updateSessionMeta(db, sessionId, {
+					lastResponseTime: Date.now(),
+					cacheTtl: "59m",
+					lastContextPercentage: 68,
+					lastInputTokens: 68_000,
+				});
+				const messages = Array.from({ length: 12 }, (_, index) =>
+					index % 2 === 0
+						? userMessage(`user ${index}`, index + 2)
+						: assistantMessage(`assistant ${index}`, index + 2),
+				) as never[];
+				await handler({ messages }, {
+					...fakeContext(
+						sessionId,
+						process.cwd(),
+						messages.map((_, index) => `entry-${index + 1}`),
+						messages,
+					),
+					hasUI,
+					getContextUsage: () => ({
+						tokens: 85_000,
+						percent: 10,
+						contextWindow: 100_000,
+					}),
+				} as never);
+				await awaitInFlightHistorians();
 
-			expect(runner.run).toHaveBeenCalledTimes(1);
-		} finally {
-			clearContextHandlerSession(sessionId);
-			closeQuietly(db);
-		}
-	});
+				expect(runner.run).toHaveBeenCalledTimes(1);
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
 
 	it("skips trigger-fired historian while /ctx-wrapup is active", async () => {
 		const db = createTestDb();
@@ -6283,6 +6290,11 @@ describe("registerPiContextHandler", () => {
 			db: ReturnType<typeof createTestDb>;
 			sessionId: string;
 			appendCompaction?: (...args: unknown[]) => string | undefined;
+			appendedEntryFields?: Record<string, unknown>;
+			messages?: unknown[];
+			entryIds?: string[];
+			branchAvailable?: boolean;
+			omitAppendedCompactionEntry?: boolean;
 			contextPercent?: number;
 		}): Promise<void> {
 			const fake = createFakePi();
@@ -6294,15 +6306,15 @@ describe("registerPiContextHandler", () => {
 				event: { messages: never[] },
 				ctx: never,
 			) => Promise<{ messages: never[] }>;
-			const messages = [
+			const messages = (args.messages ?? [
 				userMessage("first", 1),
 				assistantMessage("second", 2),
 				userMessage("third", 3),
-			] as never[];
+			]) as never[];
 			const ctx = fakeContext(
 				args.sessionId,
 				process.cwd(),
-				["entry-1", "entry-2", "entry-3"],
+				args.entryIds ?? ["entry-1", "entry-2", "entry-3"],
 				messages as never,
 			) as never as {
 				sessionManager: {
@@ -6310,16 +6322,26 @@ describe("registerPiContextHandler", () => {
 					appendCompaction?: (...args: unknown[]) => string | undefined;
 				};
 			};
-			const branchEntries = ctx.sessionManager.getBranch();
-			ctx.sessionManager.getBranch = () => branchEntries;
+			const branchEntries =
+				args.branchAvailable === false ? [] : ctx.sessionManager.getBranch();
+			if (args.branchAvailable === false) {
+				delete (ctx.sessionManager as { getBranch?: () => unknown[] })
+					.getBranch;
+			} else {
+				ctx.sessionManager.getBranch = () => branchEntries;
+			}
 			if (args.appendCompaction) {
 				ctx.sessionManager.appendCompaction = (...appendArgs) => {
 					const compactionId = args.appendCompaction?.(...appendArgs);
-					if (typeof compactionId === "string") {
+					if (
+						typeof compactionId === "string" &&
+						!args.omitAppendedCompactionEntry
+					) {
 						branchEntries.push({
 							type: "compaction",
 							id: compactionId,
 							firstKeptEntryId: appendArgs[1],
+							...args.appendedEntryFields,
 						});
 					}
 					return compactionId;
@@ -6843,6 +6865,408 @@ describe("registerPiContextHandler", () => {
 			} finally {
 				restoreInjection();
 				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("logs rendered-coverage refusal once across repeated materializing passes", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-coverage-log-once";
+			const logger = await import("@magic-context/core/shared/logger");
+			const logCalls = spyOn(logger, "sessionLog").mockImplementation(
+				() => undefined,
+			);
+			const restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
+				() => ({
+					injected: true,
+					compartmentCount: 1,
+					factCount: 0,
+					memoryCount: 0,
+					skippedVisibleMessages: 0,
+					m0Materialized: false,
+					m0Reason: null,
+					m0Bytes: 2,
+					m1Bytes: 2,
+					contentionExhausted: false,
+					renderedBoundary: { endMessageId: "entry-1", ordinal: 1 },
+					m1RenderedCoverage: null,
+					syntheticLeadingCount: 0,
+				}),
+			);
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "private summary text",
+					publishedAt: 1,
+				});
+				for (let pass = 0; pass < 2; pass++) {
+					signalPiDeferredHistoryRefresh(sessionId);
+					signalPiDeferredMaterialization(sessionId);
+					signalPiPendingMaterialization(sessionId);
+					await runDrainPass({
+						db,
+						sessionId,
+						appendCompaction: mock(() => "compact-1"),
+						contextPercent: 90,
+					});
+				}
+				const gateLines = logCalls.mock.calls
+					.filter(
+						([id, message]) =>
+							id === sessionId &&
+							String(message).includes(
+								"gate=rendered-history-not-covering-marker",
+							),
+					)
+					.map(([, message]) => String(message));
+				expect(gateLines).toHaveLength(1);
+				expect(gateLines[0]).toContain("ordinal=2");
+				expect(gateLines[0]).toContain("renderedCoverageOrdinal=1");
+				expect(gateLines[0]).not.toContain("private summary text");
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+			} finally {
+				restoreInjection();
+				clearContextHandlerSession(sessionId);
+				logCalls.mockRestore();
+				closeQuietly(db);
+			}
+		});
+
+		it("does not log a gate when the context drain succeeds", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-success-no-gate";
+			const logger = await import("@magic-context/core/shared/logger");
+			const logCalls = spyOn(logger, "sessionLog").mockImplementation(
+				() => undefined,
+			);
+			const appendCompaction = mock(() => "compact-success");
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "private summary text",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+				signalPiPendingMaterialization(sessionId);
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 90,
+				});
+
+				expect(appendCompaction).toHaveBeenCalledTimes(1);
+				expect(
+					logCalls.mock.calls.filter(
+						([id, message]) =>
+							id === sessionId && String(message).includes("gate="),
+					),
+				).toHaveLength(0);
+			} finally {
+				clearContextHandlerSession(sessionId);
+				logCalls.mockRestore();
+				closeQuietly(db);
+			}
+		});
+
+		it("logs each unavailable drain dependency once without error contents", async () => {
+			const db = createTestDb();
+			const logger = await import("@magic-context/core/shared/logger");
+			const logCalls = spyOn(logger, "sessionLog").mockImplementation(
+				() => undefined,
+			);
+			const restoreSystemState =
+				contextHandlerInternals.setPiEffectiveSystemStateResolverForTests(
+					() => {
+						throw new Error("private prompt content");
+					},
+				);
+			const cases = [
+				{
+					sessionId: "ses-pi-marker-no-append-api",
+					gate: "append-compaction-unavailable",
+					options: {},
+				},
+				{
+					sessionId: "ses-pi-marker-no-branch-api",
+					gate: "get-branch-unavailable",
+					options: {
+						appendCompaction: mock(() => "compact-1"),
+						branchAvailable: false,
+					},
+				},
+				{
+					sessionId: "ses-pi-marker-no-system-state",
+					gate: "folding-system-state-unavailable",
+					options: { appendCompaction: mock(() => "compact-1") },
+				},
+			];
+			try {
+				for (const scenario of cases) {
+					seedCompartment(db, scenario.sessionId);
+					setPendingPiCompactionMarkerState(db, scenario.sessionId, {
+						firstKeptEntryId: "entry-3",
+						endMessageId: "entry-2",
+						ordinal: 2,
+						tokensBefore: 10,
+						summary: "private summary text",
+						publishedAt: 1,
+					});
+					for (let pass = 0; pass < 2; pass++) {
+						signalPiDeferredHistoryRefresh(scenario.sessionId);
+						signalPiDeferredMaterialization(scenario.sessionId);
+						signalPiPendingMaterialization(scenario.sessionId);
+						await runDrainPass({
+							db,
+							sessionId: scenario.sessionId,
+							contextPercent: 90,
+							...scenario.options,
+						});
+					}
+					const gateLines = logCalls.mock.calls.filter(
+						([id, message]) =>
+							id === scenario.sessionId &&
+							String(message).includes(`gate=${scenario.gate}`),
+					);
+					expect(gateLines, scenario.gate).toHaveLength(1);
+				}
+				const markerGateLines = logCalls.mock.calls
+					.filter(([, message]) =>
+						String(message).startsWith("Pi compaction-marker drain gate="),
+					)
+					.map(([, message]) => String(message));
+				expect(markerGateLines.join("\n")).not.toContain(
+					"private prompt content",
+				);
+				expect(markerGateLines.join("\n")).not.toContain(
+					"private summary text",
+				);
+			} finally {
+				restoreSystemState();
+				for (const scenario of cases)
+					clearContextHandlerSession(scenario.sessionId);
+				logCalls.mockRestore();
+				closeQuietly(db);
+			}
+		});
+
+		it("logs equivalence refusal once and excludes persisted prompt text", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-equivalence-log-once";
+			const logger = await import("@magic-context/core/shared/logger");
+			const logCalls = spyOn(logger, "sessionLog").mockImplementation(
+				() => undefined,
+			);
+			const foldingPrompt = "private folding prompt";
+			const persistedPrompt = "private persisted prompt";
+			const makeMessages = () => [
+				{
+					role: "system",
+					content: foldingPrompt,
+					toolsAdded: [
+						{
+							name: "folding-only-tool",
+							description: "private folding tool description",
+							parameters: { type: "object", properties: {} },
+						},
+						{
+							name: "shared-tool",
+							description: "private folding version",
+							parameters: { type: "object", properties: {} },
+						},
+					],
+				},
+				userMessage("first", 1),
+				assistantMessage("second", 2),
+				userMessage("third", 3),
+			];
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "private summary text",
+					publishedAt: 1,
+				});
+				for (let pass = 0; pass < 2; pass++) {
+					signalPiDeferredHistoryRefresh(sessionId);
+					signalPiDeferredMaterialization(sessionId);
+					signalPiPendingMaterialization(sessionId);
+					await runDrainPass({
+						db,
+						sessionId,
+						messages: makeMessages(),
+						entryIds: ["system-entry", "entry-1", "entry-2", "entry-3"],
+						appendedEntryFields: {
+							systemMessage: {
+								role: "system",
+								content: persistedPrompt,
+								toolsAdded: [
+									{
+										name: "persisted-only-tool",
+										description: "private persisted tool description",
+										parameters: { type: "object", properties: {} },
+									},
+									{
+										name: "shared-tool",
+										description: "private persisted version",
+										parameters: { type: "object", properties: {} },
+									},
+								],
+							},
+						},
+						appendCompaction: mock(() => "compact-1"),
+						contextPercent: 90,
+					});
+				}
+				const gateLines = logCalls.mock.calls
+					.filter(
+						([id, message]) =>
+							id === sessionId &&
+							String(message).includes("gate=equivalence-refused"),
+					)
+					.map(([, message]) => String(message));
+				expect(gateLines).toHaveLength(1);
+				expect(gateLines.join("\n")).not.toContain(foldingPrompt);
+				expect(gateLines.join("\n")).not.toContain(persistedPrompt);
+				expect(gateLines.join("\n")).not.toContain("private summary text");
+				expect(gateLines[0]).toContain(
+					'foldingOnlyTools=["folding-only-tool"]',
+				);
+				expect(gateLines[0]).toContain(
+					'persistedOnlyTools=["persisted-only-tool"]',
+				);
+				expect(gateLines[0]).toContain('changedTools=["shared-tool"]');
+				expect(gateLines[0]).toContain(
+					`promptLengthDelta=${new TextEncoder().encode(persistedPrompt).byteLength - new TextEncoder().encode(foldingPrompt).byteLength}`,
+				);
+				expect(gateLines[0]).toContain(
+					`foldingPromptLength=${new TextEncoder().encode(foldingPrompt).byteLength}`,
+				);
+				expect(gateLines[0]).toContain(
+					`persistedPromptLength=${new TextEncoder().encode(persistedPrompt).byteLength}`,
+				);
+				expect(gateLines.join("\n")).not.toContain(
+					"private folding tool description",
+				);
+				expect(gateLines.join("\n")).not.toContain(
+					"private persisted tool description",
+				);
+			} finally {
+				clearContextHandlerSession(sessionId);
+				logCalls.mockRestore();
+				closeQuietly(db);
+			}
+		});
+
+		it("logs unavailable equivalence once when the appended entry cannot be read", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-equivalence-unavailable-log-once";
+			const logger = await import("@magic-context/core/shared/logger");
+			const logCalls = spyOn(logger, "sessionLog").mockImplementation(
+				() => undefined,
+			);
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "private summary text",
+					publishedAt: 1,
+				});
+				for (let pass = 0; pass < 2; pass++) {
+					signalPiDeferredHistoryRefresh(sessionId);
+					signalPiDeferredMaterialization(sessionId);
+					signalPiPendingMaterialization(sessionId);
+					await runDrainPass({
+						db,
+						sessionId,
+						appendCompaction: mock(() => "compact-unreadable"),
+						omitAppendedCompactionEntry: true,
+						contextPercent: 90,
+					});
+				}
+				const gateLines = logCalls.mock.calls.filter(
+					([id, message]) =>
+						id === sessionId &&
+						String(message).includes("gate=equivalence-unavailable"),
+				);
+				expect(gateLines).toHaveLength(1);
+				expect(String(gateLines[0]?.[1])).not.toContain("private summary text");
+			} finally {
+				clearContextHandlerSession(sessionId);
+				logCalls.mockRestore();
+				closeQuietly(db);
+			}
+		});
+
+		it("logs drain exceptions by class and code without their messages", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-drain-error-metadata";
+			const logger = await import("@magic-context/core/shared/logger");
+			const logCalls = spyOn(logger, "sessionLog").mockImplementation(
+				() => undefined,
+			);
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "private summary text",
+					publishedAt: 1,
+				});
+				db.exec(`
+					CREATE TRIGGER fail_pi_marker_clear
+					BEFORE UPDATE OF pending_pi_compaction_marker_state ON session_meta
+					WHEN OLD.session_id = '${sessionId}'
+						AND NEW.pending_pi_compaction_marker_state IS NULL
+					BEGIN
+						SELECT RAISE(ABORT, 'private drain failure message');
+					END;
+				`);
+				for (let pass = 0; pass < 2; pass++) {
+					signalPiDeferredHistoryRefresh(sessionId);
+					signalPiDeferredMaterialization(sessionId);
+					signalPiPendingMaterialization(sessionId);
+					await runDrainPass({
+						db,
+						sessionId,
+						appendCompaction: mock(() => "compact-1"),
+						contextPercent: 90,
+					});
+				}
+				const gateLines = logCalls.mock.calls
+					.filter(
+						([id, message]) =>
+							id === sessionId && String(message).includes("gate=drain-threw"),
+					)
+					.map(([, message]) => String(message));
+				expect(gateLines).toHaveLength(1);
+				expect(gateLines[0]).toMatch(/errorName="[^"]+"/);
+				expect(gateLines[0]).toContain('errorCode="SQLITE_CONSTRAINT_TRIGGER"');
+				expect(gateLines.join("\n")).not.toContain(
+					"private drain failure message",
+				);
+				expect(gateLines.join("\n")).not.toContain("private summary text");
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+			} finally {
+				clearContextHandlerSession(sessionId);
+				logCalls.mockRestore();
 				closeQuietly(db);
 			}
 		});
@@ -8864,12 +9288,15 @@ it("Pi healthy send admits an uncalibrated protected result above the fit upper-
 		model: {
 			provider: "unmeasured-provider",
 			id: "unmeasured-model",
-			contextWindow: 16000,
+			// Injected guidance plus visible tool text prove at least 16,386 tokens.
+			// A 20k window keeps this test about an inflated estimate, not input
+			// whose proven minimum already exceeds the model's window.
+			contextWindow: 20000,
 		},
 		getContextUsage: () => ({
 			tokens: 8000,
 			percent: 50,
-			contextWindow: 16000,
+			contextWindow: 20000,
 		}),
 	};
 	try {
@@ -8879,6 +9306,201 @@ it("Pi healthy send admits an uncalibrated protected result above the fit upper-
 		);
 		expect(JSON.stringify(result)).toContain("word word");
 	} finally {
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
+});
+
+it("native Pi final fence refuses proven prose overflow without protected tools", async () => {
+	const db = createTestDb();
+	const sessionId = "pi-prose-fit-fence";
+	const fake = createFakePi();
+	Object.assign(fake.pi, { getAllTools: () => [] });
+	registerPiContextHandler(fake.pi as never, {
+		db,
+		protectedTags: 0,
+		injection: { injectionBudgetTokens: 10000 },
+	});
+	const handler = fake.handlers.get("context") as Parameters<typeof runPass>[0];
+	try {
+		await expect(
+			handler(
+				{ messages: [userMessage("word ".repeat(100000), 1)] as never[] },
+				{
+					...fakeContext(sessionId),
+					getSystemPrompt: () => "You are helpful.",
+					model: { provider: "mock", id: "mock", contextWindow: 50000 },
+				} as never,
+			),
+		).rejects.toThrow("this turn was not sent");
+	} finally {
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
+});
+
+it("native Pi upper-only metadata pressure reclaims but serves fitting custom text", async () => {
+	const db = createTestDb();
+	const sessionId = "pi-metadata-fit-pressure";
+	const fake = createFakePi();
+	Object.assign(fake.pi, { getAllTools: () => [] });
+	registerPiContextHandler(fake.pi as never, {
+		db,
+		protectedTags: 0,
+		injection: { injectionBudgetTokens: 10000 },
+	});
+	const handler = fake.handlers.get("context") as Parameters<typeof runPass>[0];
+	const custom = {
+		role: "custom",
+		content: [
+			{ type: "text", text: "small visible notice" },
+			{ type: "extension-metadata", details: "x".repeat(1000000) },
+		],
+		customType: "notice",
+		timestamp: 1,
+	};
+	expect(
+		classifyPiOutgoingFit(
+			estimatePiOutgoingInputTokens(
+				[custom],
+				{
+					modelKey: "mock/mock",
+					systemTokens: 100,
+					toolDefinitionTokens: 0,
+				},
+				undefined,
+				50000,
+			),
+			50000,
+		),
+	).toBe("upper-estimate-pressure");
+	try {
+		const result = await handler(
+			{ messages: [custom, userMessage("continue", 2)] as never[] },
+			{
+				...fakeContext(sessionId),
+				getSystemPrompt: () => "You are helpful.",
+				model: { provider: "mock", id: "mock", contextWindow: 50000 },
+			} as never,
+		);
+		expect(result?.messages?.some((message) => message.role === "custom")).toBe(
+			true,
+		);
+	} finally {
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
+});
+
+it("unknown-limit overflow floors pressure after the raw-branch guard discards a reading above 95 percent", async () => {
+	const db = createTestDb();
+	const sessionId = "pi-raw-recovery-floor";
+	const fake = createFakePi();
+	const lines: string[] = [];
+	const log = spyOn(loggerModule, "sessionLog").mockImplementation(
+		(_id, ...parts) => {
+			lines.push(parts.join(" "));
+		},
+	);
+	registerPiContextHandler(fake.pi as never, { db });
+	const handler = fake.handlers.get("context") as Parameters<typeof runPass>[0];
+	const messages = [
+		userMessage("completed request", 1),
+		assistantMessage("completed answer", 2),
+		userMessage("resume", 3),
+	];
+	const base = fakeContext(
+		sessionId,
+		process.cwd(),
+		["u1", "a1", "u2"],
+		messages,
+	);
+	const ctx = {
+		...base,
+		model: { provider: "mock", id: "mock", contextWindow: 272000 },
+		getContextUsage: () => ({
+			tokens: 1748000,
+			percent: 642,
+			contextWindow: 272000,
+		}),
+		sessionManager: {
+			...base.sessionManager,
+			getBranch: () => [
+				...base.sessionManager.getBranch(),
+				{ type: "context_edit", id: "retry-edit" },
+			],
+		},
+	};
+	try {
+		recordOverflowDetected(db, sessionId, undefined, "mock/mock");
+		await handler({ messages: messages as never[] }, ctx as never);
+		expect(
+			lines.some((line) =>
+				line.includes("overflow recovery flag set — bumping percentage to 95%"),
+			),
+		).toBe(true);
+		expect(lines.some((line) => line.includes("EMERGENCY=true"))).toBe(true);
+	} finally {
+		log.mockRestore();
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
+});
+
+it("headless proven overflow joins its background historian before refusing", async () => {
+	const db = createTestDb();
+	const sessionId = "pi-headless-fit-join";
+	const fake = createFakePi();
+	Object.assign(fake.pi, { getAllTools: () => [] });
+	let settled = false;
+	const run = spyOn(piHistorian, "runPiHistorian").mockImplementation(
+		async () => {
+			await Bun.sleep(100);
+			settled = true;
+		},
+	);
+	registerPiContextHandler(fake.pi as never, {
+		db,
+		protectedTags: 0,
+		injection: { injectionBudgetTokens: 10000 },
+		historian: {
+			runner: {} as SubagentRunner,
+			model: "test/model",
+			historianChunkTokens: 20000,
+			executeThresholdPercentage: 65,
+			protectedTags: 0,
+		},
+	});
+	const handler = fake.handlers.get("context") as Parameters<typeof runPass>[0];
+	const messages = Array.from({ length: 12 }, (_, i) =>
+		i % 2
+			? assistantMessage("done", i + 1)
+			: userMessage(i === 0 ? "word ".repeat(100000) : "continue", i + 1),
+	);
+	try {
+		await expect(
+			handler({ messages: messages as never[] }, {
+				...fakeContext(
+					sessionId,
+					process.cwd(),
+					messages.map((_, i) => `m${i + 1}`),
+					messages,
+				),
+				hasUI: false,
+				getSystemPrompt: () => "You are helpful.",
+				model: { provider: "mock", id: "mock", contextWindow: 50000 },
+				getContextUsage: () => ({
+					tokens: 45000,
+					percent: 90,
+					contextWindow: 50000,
+				}),
+			} as never),
+		).rejects.toThrow("this turn was not sent");
+		expect(run).toHaveBeenCalledTimes(1);
+		expect(settled).toBe(true);
+	} finally {
+		await awaitInFlightHistorians(sessionId);
+		run.mockRestore();
 		clearContextHandlerSession(sessionId);
 		closeQuietly(db);
 	}

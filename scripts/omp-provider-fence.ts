@@ -37,8 +37,8 @@ const host = join(
 const version = JSON.parse(
 	readFileSync(join(host, "package.json"), "utf8"),
 ).version;
-if (version !== "18.10.4")
-	throw new Error(`expected OMP 18.10.4, got ${version}`);
+if (!["18.10.4", "18.11.0"].includes(version))
+	throw new Error(`expected OMP 18.10.4 or 18.11.0, got ${version}`);
 const selector = process.argv[2]!;
 const api = selector === "cline-pass" ? "openai-completions" : selector;
 const mode = process.argv[3] ?? "managed";
@@ -59,10 +59,15 @@ if (
 		"removed-tool",
 		"orphan-result",
 		"missing-result",
+		"interrupted-tool",
 		"summary",
 		"mixed",
 		"materialized",
 		"responses-history",
+		"cross-model-thinking",
+		"custom-summary",
+		"composite-cross",
+		"composite-same",
 	].includes(historyCase)
 )
 	throw new Error("unknown history case");
@@ -209,6 +214,7 @@ import magic from ${JSON.stringify(plugin)};
 import {appendFileSync} from 'node:fs';
 import {Database} from 'bun:sqlite';
 import {appendCompartments} from ${JSON.stringify(resolve(import.meta.dir, "../packages/plugin/src/features/magic-context/compartment-storage.ts"))};
+import {piPreparedStructure} from ${JSON.stringify(resolve(import.meta.dir, "../packages/pi-plugin/src/pi-dispatch-structure.ts"))};
 const log = value => appendFileSync(${JSON.stringify(join(root, "hooks.jsonl"))},JSON.stringify({at:Date.now(),...value})+'\\n');
 export default async pi => {
   let seeded=false;
@@ -237,7 +243,7 @@ export default async pi => {
       });
       const result=await handler(event,wrapped);
       if(name==='context') {
-        log({phase:'prepared',messages:result?.messages});
+        log({phase:'prepared',messages:result?.messages,structure:piPreparedStructure(result?.messages??[],ctx.model)});
         if(${JSON.stringify(historyCase)}==='materialized' && result?.messages) {
           const db=new Database(process.env.MAGIC_CONTEXT_STORAGE_DIR+'/context.db',{readonly:true});
           try {log({phase:'materialized-proof',leadingRoles:result.messages.map(message=>message.role),rows:db.query('SELECT cached_m0_bytes,cached_m1_bytes FROM session_meta WHERE session_id=?').all(ctx.sessionManager.getSessionId()).map(row=>({m0:new TextDecoder().decode(row.cached_m0_bytes),m1:new TextDecoder().decode(row.cached_m1_bytes)}))});}
@@ -279,7 +285,17 @@ const template =
 					model.provider === "cline-pass" &&
 					model.name === "Muse Spark 1.3 (C) (free)",
 			)
-		: templates.find((model: any) => model.api === api);
+		: templates.find(
+				(model: any) =>
+					model.api === api &&
+					(historyCase === "cross-model-thinking"
+						? model.provider === "opencode-zen" &&
+							model.id === "muse-spark-1.3-contributor-free"
+						: historyCase === "custom-summary" && api === "openai-completions"
+							? model.provider === "opencode-zen" &&
+								model.id === "deepseek-v4-flash-free"
+							: true),
+			);
 if (!template) throw new Error(`no bundled model for ${selector}`);
 const model = { ...template, baseUrl, preferWebsockets: false };
 const apiKey =
@@ -296,6 +312,7 @@ writeFileSync(
 );
 audit({ phase: "catalog-model", selector, model });
 let session: any;
+let interruptedCall: unknown;
 try {
 	const { SessionManager } = await import(
 		join(host, "src/session/session-manager.ts")
@@ -359,6 +376,88 @@ try {
 		);
 		let history: any[];
 		switch (historyCase) {
+			case "custom-summary":
+				history = [
+					user("HISTORY686 custom prompt", stamp),
+					...([true, false, undefined] as const).map((display, index) => ({
+						role: "custom",
+						customType: "history686",
+						display,
+						content: `HISTORY686 custom display=${display}`,
+						timestamp: stamp + index + 1,
+					})),
+					{
+						role: "compactionSummary",
+						summary: "HISTORY686 readable compaction summary",
+						timestamp: stamp + 4,
+					},
+					{
+						role: "compactionSummary",
+						summary: "",
+						blocks: [],
+						timestamp: stamp + 5,
+					},
+					call,
+					result,
+					reply,
+				];
+				break;
+			case "cross-model-thinking": {
+				const foreign = (provider: string, sourceApi: string, id: string) => ({
+					...call,
+					api: sourceApi,
+					provider,
+					model: "other-model",
+					content: [
+						{ type: "thinking", thinking: "HISTORY686 foreign reasoning" },
+						{ type: "text", text: "HISTORY686 foreign answer" },
+						{ type: "toolCall", id, name: toolName, arguments: {} },
+					],
+				});
+				history = [
+					user("HISTORY686 cross-model prompt", stamp),
+					foreign("deepseek", "openai-completions", "history_call_683"),
+					result,
+					reply,
+					foreign("google-antigravity", "google-gemini-cli", "gemini_call_686"),
+					{ ...result, toolCallId: "gemini_call_686" },
+					reply,
+				];
+				break;
+			}
+			case "composite-cross":
+			case "composite-same": {
+				const id = "call_686|fc_686";
+				const source =
+					historyCase === "composite-same"
+						? { api: model.api, provider: model.provider, model: model.id }
+						: {
+								api:
+									api === "openai-completions"
+										? "openai-responses"
+										: "openai-completions",
+								provider: "mock-history",
+								model: "mock-history-model",
+							};
+				history = [
+					user("HISTORY686 composite first user", stamp),
+					{
+						...call,
+						...source,
+						content: [
+							{
+								type: "toolCall",
+								id,
+								name: toolName,
+								arguments: { path: "seed.txt" },
+							},
+						],
+					},
+					{ ...result, toolCallId: id },
+					reply,
+				];
+				break;
+			}
 			case "responses-history": {
 				const signed = (text: string, id: string, timestamp: number) => ({
 					...assistant(
@@ -476,6 +575,12 @@ try {
 			case "missing-result":
 				history = [user("HISTORY683 first user", stamp), call, reply];
 				break;
+			case "interrupted-tool":
+				// A crash after the assistant's message_end persists the toolUse turn
+				// before tool execution can persist a toolResult (agent-session.ts:3939).
+				history = [user("HISTORY686 interrupted tool turn", stamp), call];
+				interruptedCall = call;
+				break;
 			case "mixed":
 				history = [
 					user("HISTORY683 first user", stamp),
@@ -561,11 +666,22 @@ try {
 		const file = historyManager.getSessionFile();
 		if (!file || !historyManager.isSessionOnDisk())
 			throw new Error("history was not persisted");
+		if (historyCase === "interrupted-tool")
+			audit({
+				phase: "interrupted-persisted",
+				entries: readFileSync(file, "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line)),
+			});
 		if (
 			historyCase === "resume" ||
 			historyCase === "summary" ||
 			historyCase === "mixed" ||
-			historyCase === "responses-history"
+			historyCase === "responses-history" ||
+			historyCase === "composite-cross" ||
+			historyCase === "composite-same" ||
+			historyCase === "interrupted-tool"
 		) {
 			await historyManager.close();
 			historyManager = await SessionManager.open(file, undefined, undefined, {
@@ -598,6 +714,18 @@ try {
 		reportSendError: (_: unknown, error: unknown) =>
 			audit({ phase: "send-error", error: String(error) }),
 	});
+	if (interruptedCall) {
+		// Session replay trims incomplete tail calls. Restore the persisted call
+		// to the active agent to model interruption before the tool result arrives.
+		session.agent.appendMessage(interruptedCall);
+		const messages = session.agent.state.messages;
+		if (
+			messages.at(-1) !== interruptedCall ||
+			messages.some((message: any) => message.role === "toolResult")
+		)
+			throw new Error("interrupted call must have no result before prompting");
+		audit({ phase: "interrupted-session", messages });
+	}
 	const isolation = (label: string) => {
 		const text = execFileSync("/usr/sbin/lsof", ["-p", String(process.pid)], {
 			encoding: "utf8",

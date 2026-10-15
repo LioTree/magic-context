@@ -130,7 +130,11 @@ import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shar
 import { registerStandalonePluginMarker } from "@magic-context/core/standalone-plugin-marker";
 import { startHostStallProfilerSwitch } from "../../plugin/src/shared/host-stall-profiler";
 import packageMetadata from "../package.json";
-import { handlePiCloneSessionStart } from "./clone-inheritance";
+import {
+	handlePiCloneSessionStart,
+	type PiCloneTransitionRegistrar,
+	registerPiCloneSessionTransitions,
+} from "./clone-inheritance";
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
 import {
 	maybeAutoEmbedPiSession,
@@ -619,8 +623,25 @@ export function registerConfiguredTodoLifecycle(
 		: undefined;
 }
 
+const PI_MARKER_REHYDRATION_SESSION_ID_LIMIT = 5;
+
+function formatPiMarkerRehydrationLine(
+	sessionIds: readonly string[],
+	activeSessionId: string,
+): string {
+	const shownIds = sessionIds.slice(0, PI_MARKER_REHYDRATION_SESSION_ID_LIMIT);
+	const omitted = sessionIds.length - shownIds.length;
+	const suffix = omitted > 0 ? ` +${omitted} more` : "";
+	return (
+		`${PREFIX} rehydrated ${sessionIds.length} Pi deferred compaction marker session(s)` +
+		`; sessionIds=${shownIds.join(",")}${suffix}` +
+		`; activeSessionIncluded=${sessionIds.includes(activeSessionId)}`
+	);
+}
+
 export const __test = {
 	logPiConfigLoad,
+	formatPiMarkerRehydrationLine,
 	resetLoggedPiConfigDirs(): void {
 		loggedPiConfigDirs.clear();
 	},
@@ -1375,16 +1396,13 @@ async function startPiMagicContextRuntime(
 	// boot-resolved rather than following later /cd project config changes.
 	const compactionOff = !isCompactionEnabled(config);
 	setCtxReduceRegisteredGlobally(!compactionOff);
+	let pendingPiMarkerSessions: string[] = [];
+	let piMarkerRehydrationLogged = false;
 	if (!compactionOff) {
 		try {
-			const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
+			pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
 			for (const sid of pendingPiMarkerSessions) {
 				signalPiDeferredCompactionMarkerDrain(sid);
-			}
-			if (pendingPiMarkerSessions.length > 0) {
-				log(
-					`${PREFIX} rehydrated ${pendingPiMarkerSessions.length} Pi deferred compaction marker session(s)`,
-				);
 			}
 		} catch (err) {
 			warn(
@@ -1916,6 +1934,16 @@ async function startPiMagicContextRuntime(
 				: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
 	);
 
+	// Stock Pi's types omit OMP's completed-copy events. OMP reuses the extension
+	// instance when copying sessions, so finish copying durable tag state before
+	// the destination's first context preparation can assign fresh tag numbers.
+	registerPiCloneSessionTransitions(
+		pi.on.bind(pi) as unknown as PiCloneTransitionRegistrar,
+		{
+			db,
+			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
+		},
+	);
 	pi.on("session_start", async (event, ctx) => {
 		bindStaleBuildNotice(ctx, import.meta.url);
 		// Pi emits session_start for new, resumed, and reloaded sessions. Re-read
@@ -1953,6 +1981,21 @@ async function startPiMagicContextRuntime(
 			ctx.ui.notify(formatProtectedTagsDeprecationNotice(), "warning");
 		}
 
+		// Inherit before saving cache-TTL preferences creates the child's metadata
+		// row: the clone guard uses that row to distinguish first open from resume.
+		// The project identity decision above writes only identity pins, not that row.
+		await handlePiCloneSessionStart(event, ctx, {
+			db,
+			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
+		});
+		if (
+			!piMarkerRehydrationLogged &&
+			pendingPiMarkerSessions.length > 0 &&
+			sessionId
+		) {
+			log(formatPiMarkerRehydrationLine(pendingPiMarkerSessions, sessionId));
+			piMarkerRehydrationLogged = true;
+		}
 		const model = ctx.model;
 		if (sessionId && model?.provider && model.id) {
 			seedSessionCacheTtlIfUnsynced({
@@ -1962,11 +2005,6 @@ async function startPiMagicContextRuntime(
 				modelKey: canonicalPiModelKey(model.provider, model.id),
 			});
 		}
-
-		await handlePiCloneSessionStart(event, ctx, {
-			db,
-			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
-		});
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
