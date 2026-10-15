@@ -201,6 +201,30 @@ async function killedApply(plan: ProjectIdPlan, point: "committed" | "applied"):
 }
 
 describe("doctor project-ids apply preflight", () => {
+    for (const checkOnly of [true, false])
+        it(`names skipped host session observations during apply${checkOnly ? " --check" : ""}`, async () => {
+            const plan = await makePlan();
+            const output = spyOn(console, "log").mockImplementation(() => {});
+            try {
+                expect(
+                    await runProjectIdsCli(
+                        [
+                            "apply",
+                            ...(checkOnly ? ["--check"] : []),
+                            planFile(plan),
+                            "--db",
+                            dbPath,
+                        ],
+                        deps,
+                    ),
+                ).toBe(0);
+                expect(output.mock.calls.flat().join("\n")).toContain(
+                    "Skipped host session observations: plan has no host database; re-plan with --host-db <path> to include them.",
+                );
+            } finally {
+                output.mockRestore();
+            }
+        });
     it("checks offline using the planned host by default, with read-only handles and identical database bytes", async () => {
         const hostPath = hostDatabase();
         const plan = await makePlan(hostPath);
@@ -518,6 +542,25 @@ describe("doctor project-ids apply preflight", () => {
 });
 
 describe("doctor project-ids apply pairs", () => {
+    it("limits restore advice to before further use and says store.db was not changed", async () => {
+        const plan = await makePlan();
+        const storePath = join(root, "store.db");
+        writeFileSync(storePath, "untouched host store fixture");
+        const before = bytes(storePath);
+        const output = spyOn(console, "log").mockImplementation(() => {});
+        try {
+            expect(await runProjectIdsCli(["apply", planFile(plan), "--db", dbPath], deps)).toBe(0);
+            const text = output.mock.calls.flat().join("\n");
+            expect(text).toContain(
+                "store.db was not changed. Restoring context.db and identity sidecars is safe only before further use; close all hosts first.",
+            );
+            expect(text).toContain("Restore with hosts closed:");
+            expect(text).toContain("Restore identity sidecars too:");
+            expect(bytes(storePath)).toBe(before);
+        } finally {
+            output.mockRestore();
+        }
+    });
     it("takes one backup for two merges, including legacy sidecars", async () => {
         const plan = await orderedPlan();
         const sidecars = plan.pairs.map((pair) => sidecar(pair.folders[0].directory, pair.from));

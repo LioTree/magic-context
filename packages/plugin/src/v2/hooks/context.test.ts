@@ -28,6 +28,7 @@ import {
     readRememberedProjectIdentity,
     rememberPinnedProjectIdentity,
 } from "../../features/magic-context/memory/project-identity-cache";
+import { __setProjectPinWriterForTests } from "../../features/magic-context/memory/project-pin-writer";
 import {
     __resetSessionIdentityDecisionsForTests,
     awaitSessionIdentityDecision,
@@ -75,6 +76,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+    await __setProjectPinWriterForTests();
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
     closeDatabase();
     mock.restore();

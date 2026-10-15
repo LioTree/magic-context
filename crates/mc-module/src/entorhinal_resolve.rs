@@ -2,13 +2,17 @@
 //! The caller retains that decision. Keeping it out of the process's git/directory cache
 //! lets later sessions retry the service without changing an earlier session's identity.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use mc_store::McStore;
 use serde::Deserialize;
-use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RetryBackoff, SubcConsumer};
+use subc_client_rs::{
+    CallError, CallOptions, CloseRouteOptions, ConsumerOptions, RetryBackoff, SubcConsumer,
+};
 use subc_protocol::{BindIdentity, RouteTarget};
 
 use crate::project_identity::{
@@ -43,6 +47,33 @@ pub struct EntorhinalResolver {
     connection_file: Option<PathBuf>,
 }
 
+type ConsumerSlot = tokio::sync::Mutex<Option<SubcConsumer>>;
+
+fn consumer_slot(path: &Path) -> Arc<ConsumerSlot> {
+    static CONSUMERS: OnceLock<Mutex<HashMap<PathBuf, Arc<ConsumerSlot>>>> = OnceLock::new();
+    CONSUMERS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap()
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
+}
+
+// A cancelled or failed attempt must not put a potentially broken consumer back
+// in the process cache. Closing asynchronously also covers the outer resolve deadline.
+struct ConsumerLease(Option<SubcConsumer>);
+
+impl Drop for ConsumerLease {
+    fn drop(&mut self) {
+        if let Some(consumer) = self.0.take() {
+            tokio::spawn(async move {
+                consumer.close().await;
+            });
+        }
+    }
+}
+
 impl EntorhinalResolver {
     pub fn new(connection_file: Option<PathBuf>) -> Self {
         Self { connection_file }
@@ -75,31 +106,40 @@ impl EntorhinalResolver {
         else {
             return ResolveAnswer::Absent;
         };
-        let consumer = match SubcConsumer::connect(
-            connection_file,
-            ConsumerOptions {
-                handshake_timeout: DEADLINE,
-                call_timeout: DEADLINE,
-                reconnect_backoff: retry_backoff(),
-                ..ConsumerOptions::default()
-            },
-        )
-        .await
-        {
-            Ok(consumer) => consumer,
-            Err(error) => {
-                log_once(
-                    format!("entorhinal-connect:{error}"),
-                    "Entorhinal is not answering",
-                );
-                return ResolveAnswer::NotAnswering;
+        let slot = consumer_slot(connection_file);
+        let mut cached = slot.lock().await;
+        let consumer = if let Some(consumer) = cached.take() {
+            consumer
+        } else {
+            match SubcConsumer::connect(
+                connection_file,
+                ConsumerOptions {
+                    handshake_timeout: DEADLINE,
+                    call_timeout: DEADLINE,
+                    reconnect_backoff: retry_backoff(),
+                    ..ConsumerOptions::default()
+                },
+            )
+            .await
+            {
+                Ok(consumer) => consumer,
+                Err(error) => {
+                    log_once(
+                        format!("entorhinal-connect:{error}"),
+                        "Entorhinal is not answering",
+                    );
+                    return ResolveAnswer::NotAnswering;
+                }
             }
         };
+        let mut lease = ConsumerLease(Some(consumer));
+        let consumer = lease.0.as_ref().unwrap();
         let root = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+        let identity = BindIdentity::new(root.clone(), harness, instance_token);
         let response = consumer
             .call(
                 route_target(),
-                BindIdentity::new(root.clone(), harness, instance_token),
+                identity.clone(),
                 serde_json::to_vec(&serde_json::json!({
                     "method": "resolve", "params": { "canonicalRoot": root }
                 }))
@@ -112,9 +152,16 @@ impl EntorhinalResolver {
                 },
             )
             .await;
-        // This consumer only returns an answer; it never writes identity sidecars.
-        // Cancellation at the outer deadline discards even a late reply before pinning.
-        consumer.close().await;
+        // Only the caller persists a selected identity, after checking the outer
+        // deadline. Cancelling this transport attempt cannot publish a late pin.
+        // Routes are session-scoped, but the transport is process-scoped. Retire
+        // each bind's route without closing the healthy shared connection.
+        if response.is_ok() || matches!(&response, Err(CallError::Module(_))) {
+            consumer
+                .close_route(route_target(), identity, CloseRouteOptions::default())
+                .await;
+            *cached = lease.0.take();
+        }
         match response {
             Ok(bytes) => decode_reply(&bytes),
             Err(error) => classify_call_error(error),
@@ -214,7 +261,12 @@ async fn resolve_with_store_attempt(
     store: Option<&McStore>,
     attempt: impl Future<Output = ResolveAnswer>,
 ) -> Result<String, ProjectIdentityError> {
-    let directory = identities.eligible_directory(directory)?;
+    let directory = match identities.eligible_directory(directory) {
+        Ok(directory) => directory,
+        // Inaccessible folders cannot authorize registered pins, but retain the
+        // standalone resolver's legacy behavior (including its missing-path refusal).
+        Err(_) => return identities.resolve(directory),
+    };
     if let Some(pin) = identities.pinned_identity(&directory) {
         return Ok(pin);
     }
@@ -272,6 +324,7 @@ async fn resolve_with_store_attempt(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use subc_control::{ClientControlRequest, ClientControlResponse};
     use subc_protocol::{ErrorBody, Flags, Frame, FrameType, Priority};
@@ -292,6 +345,8 @@ mod tests {
     struct FakeEndpoint {
         connection_file: PathBuf,
         calls: Arc<Mutex<Vec<Value>>>,
+        connections: Arc<AtomicUsize>,
+        disconnect: Arc<AtomicBool>,
         task: tokio::task::JoinHandle<()>,
         _temp: tempfile::TempDir,
     }
@@ -327,52 +382,63 @@ mod tests {
         .unwrap();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let log = calls.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let opened = connections.clone();
+        let disconnect = Arc::new(AtomicBool::new(false));
+        let disconnect_next = disconnect.clone();
         let project = project.to_path_buf();
         let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            if matches!(mode, Mode::NeverConnect) {
-                std::future::pending::<()>().await;
-            }
-            authenticate_server(
-                &mut stream,
-                &key,
-                &daemon_id,
-                "fake",
-                Duration::from_secs(2),
-            )
-            .await
-            .unwrap();
-            while let Ok(Some(frame)) = read_frame(&mut stream).await {
-                let (ty, body) = match frame.header.ty {
-                    FrameType::Request if frame.header.channel == 0 => {
-                        let control: ClientControlRequest =
-                            serde_json::from_slice(&frame.body).unwrap();
-                        if let ClientControlRequest::RouteOpen {
-                            target, identity, ..
-                        } = control
-                        {
-                            assert_eq!(target, route_target());
-                            assert_eq!(identity.session, "instance");
-                            let bind = serde_json::to_value(&identity).unwrap().to_string();
-                            assert!(bind.contains(project.to_str().unwrap()));
-                            assert!(bind.contains("test-harness"));
-                            (
-                                FrameType::Response,
-                                serde_json::to_vec(&ClientControlResponse::RouteOpen {
-                                    route_channel: 10,
-                                    route_epoch: 1,
-                                })
-                                .unwrap(),
-                            )
-                        } else {
-                            continue;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                if matches!(mode, Mode::NeverConnect) {
+                    std::future::pending::<()>().await;
+                }
+                if authenticate_server(
+                    &mut stream,
+                    &key,
+                    &daemon_id,
+                    "fake",
+                    Duration::from_secs(2),
+                )
+                .await
+                .is_err()
+                {
+                    continue;
+                }
+                opened.fetch_add(1, Ordering::SeqCst);
+                while let Ok(Some(frame)) = read_frame(&mut stream).await {
+                    let (ty, body) = match frame.header.ty {
+                        FrameType::Request if frame.header.channel == 0 => {
+                            let control: ClientControlRequest =
+                                serde_json::from_slice(&frame.body).unwrap();
+                            if let ClientControlRequest::RouteOpen {
+                                target, identity, ..
+                            } = control
+                            {
+                                assert_eq!(target, route_target());
+                                assert_eq!(identity.session, "instance");
+                                let bind = serde_json::to_value(&identity).unwrap().to_string();
+                                assert!(bind.contains(project.to_str().unwrap()));
+                                assert!(bind.contains("test-harness"));
+                                (
+                                    FrameType::Response,
+                                    serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                                        route_channel: 10,
+                                        route_epoch: 1,
+                                    })
+                                    .unwrap(),
+                                )
+                            } else {
+                                continue;
+                            }
                         }
-                    }
-                    FrameType::Request => {
-                        log.lock()
-                            .unwrap()
-                            .push(serde_json::from_slice(&frame.body).unwrap());
-                        match &mode {
+                        FrameType::Request => {
+                            if disconnect_next.swap(false, Ordering::SeqCst) {
+                                break;
+                            }
+                            log.lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&frame.body).unwrap());
+                            match &mode {
                             Mode::Reply(bytes) => (FrameType::Response, bytes.clone()),
                             Mode::ModuleError(code) => (FrameType::Error, serde_json::to_vec(&json!({ "code": code, "message": "fake error", "detail": null })).unwrap()),
                             Mode::NeverReply => { std::future::pending::<()>().await; unreachable!() }
@@ -382,29 +448,80 @@ mod tests {
                             }
                             Mode::NeverConnect => unreachable!(),
                         }
+                        }
+                        _ => continue,
+                    };
+                    let response = Frame::build(
+                        ty,
+                        Flags::new(false, Priority::Interactive, false),
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        body,
+                    )
+                    .unwrap();
+                    if write_frame(&mut stream, &response).await.is_err() {
+                        break;
                     }
-                    _ => continue,
-                };
-                let response = Frame::build(
-                    ty,
-                    Flags::new(false, Priority::Interactive, false),
-                    frame.header.channel,
-                    frame.header.epoch,
-                    frame.header.corr,
-                    body,
-                )
-                .unwrap();
-                if write_frame(&mut stream, &response).await.is_err() {
-                    break;
                 }
             }
         });
         FakeEndpoint {
             connection_file,
             calls,
+            connections,
+            disconnect,
             task,
             _temp: temp,
         }
+    }
+
+    #[tokio::test]
+    async fn binds_share_a_process_consumer_and_reconnect_after_disconnect() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(temp.path()).unwrap();
+        let fake = fake_endpoint(
+            Mode::Reply(
+                serde_json::to_vec(&json!({
+                    "result": {"via": "implicit", "projectId": "pj-implicit1-test"}
+                }))
+                .unwrap(),
+            ),
+            &project,
+        )
+        .await;
+        let identities = ProjectIdentityResolver::with_sidecar_dir(project.join("sidecars"));
+        let expected = crate::project_identity::directory_fallback(&project);
+        for _ in 0..8 {
+            let resolver = EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            assert_eq!(
+                resolver
+                    .resolve_for_session(&identities, &project, "test-harness", "instance", None)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(fake.calls.lock().unwrap().len(), 8);
+        assert_eq!(fake.connections.load(Ordering::SeqCst), 1);
+        fake.disconnect.store(true, Ordering::SeqCst);
+        let resolver = EntorhinalResolver::new(Some(fake.connection_file.clone()));
+        assert_eq!(
+            resolver
+                .resolve_for_session(&identities, &project, "test-harness", "instance", None)
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            resolver
+                .resolve_for_session(&identities, &project, "test-harness", "instance", None)
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(fake.calls.lock().unwrap().len(), 9);
+        assert_eq!(fake.connections.load(Ordering::SeqCst), 2);
     }
 
     fn root_reply(directory: &Path) -> Vec<u8> {

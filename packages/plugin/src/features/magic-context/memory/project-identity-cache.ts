@@ -5,6 +5,7 @@ import { getMagicContextStorageDir } from "../../../shared/data-path";
 import { log } from "../../../shared/logger";
 import { projectDirectoryKey } from "../../../shared/project-directory-key";
 import { writeStorageFileAtomicSync } from "../../../shared/storage-permissions";
+import { projectPinWriter } from "./project-pin-writer";
 
 // Lives in shared/ so the TUI (which ships without features/) can use the same
 // normalization; re-exported here for the existing importers.
@@ -78,7 +79,7 @@ export function rememberGitIdentity(directory: string, identity: string): void {
     }
 }
 
-/** Persist an accepted live resolution after the caller has checked folder eligibility and topology. */
+/** Called after rememberResolvedProjectIdentity checks folder access and checkout ownership; publishes before disk I/O. */
 export function rememberPinnedProjectIdentity(
     directory: string,
     identity: string,
@@ -87,10 +88,11 @@ export function rememberPinnedProjectIdentity(
     if (!isPinnedProjectIdentity(identity)) return;
     try {
         if (isPinnedProjectIdentity(readRememberedProjectIdentity(directory)?.identity)) return;
-        writeStorageFileAtomicSync(
-            cachePath(directory),
-            JSON.stringify({ directory: projectDirectoryKey(directory), identity, gitCommonDir }),
-        );
+        projectPinWriter().publish(cachePath(directory), {
+            directory: projectDirectoryKey(directory),
+            identity,
+            gitCommonDir,
+        });
     } catch {
         // A read-only sidecar store must not prevent use of the live identity for this session.
     }
@@ -101,7 +103,8 @@ export function readRememberedProjectIdentity(
     directory: string,
     storageDir?: string,
 ): ProjectIdentityRecord | undefined {
-    const record = readIdentityRecord(cachePath(directory, storageDir));
+    const destination = cachePath(directory, storageDir);
+    const record = projectPinWriter().lookup(destination) ?? readIdentityRecord(destination);
     return record?.directory === projectDirectoryKey(directory) ? record : undefined;
 }
 
@@ -124,13 +127,21 @@ export function findPinnedIdentityByGitCommonDir(
     try {
         files = readdirSync(sidecarDir);
     } catch {
-        return undefined;
+        files = [];
     }
+    const records = new Map(
+        projectPinWriter()
+            .records(sidecarDir)
+            .map((record) => [record.directory, record]),
+    );
     const identities = new Set<string>();
     for (const file of files) {
         if (!file.endsWith(".json")) continue;
         const record = readIdentityRecord(path.join(sidecarDir, file));
-        if (record?.gitCommonDir === gitCommonDir && isPinnedProjectIdentity(record.identity))
+        if (record && !records.has(record.directory)) records.set(record.directory, record);
+    }
+    for (const record of records.values()) {
+        if (record.gitCommonDir === gitCommonDir && isPinnedProjectIdentity(record.identity))
             identities.add(record.identity);
     }
     if (identities.size === 1) return identities.values().next().value;

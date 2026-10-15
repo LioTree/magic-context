@@ -1,5 +1,6 @@
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { loadPluginConfig } from "@magic-context/core/config";
 import {
     type EntorhinalResolveResult,
     resolveEntorhinalProject,
@@ -148,7 +149,12 @@ export async function buildProjectIdPlan(
                 sources.set(row.identity, []);
         }
     }
-    const resolve = deps.resolve ?? resolveEntorhinalProject;
+    const connectionFile = deps.resolve
+        ? undefined
+        : loadPluginConfig(process.cwd()).subc?.connection_file;
+    const resolve =
+        deps.resolve ??
+        ((directory: string) => resolveEntorhinalProject(directory, { connectionFile }));
     const candidates = new Map<string, ProjectIdPlanPair>();
     const reasons = new Map<string, ProjectIdUnchangedReason>();
     for (const [from, folders] of sources) {
@@ -256,6 +262,10 @@ export async function runProjectIdsCli(
         const hostDbPath = existsSync(requestedHostPath)
             ? realpathSync.native(requestedHostPath)
             : null;
+        if (hostDbPath === null)
+            console.log(
+                "Skipped host session observations: no host database; use --host-db <path> to include them.",
+            );
         const plan = await buildProjectIdPlan(db, dbPath, hostDbPath, deps);
         const path = join(
             storageDir,

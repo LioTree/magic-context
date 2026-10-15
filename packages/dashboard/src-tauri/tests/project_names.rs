@@ -3,8 +3,53 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use magic_context_dashboard_lib::project_names::{
-    pj_label, ProjectNameCache, ENTORHINAL_RESOLVE_DEADLINE_MS,
+    connection_file, pj_label, ProjectNameCache, ENTORHINAL_RESOLVE_DEADLINE_MS,
 };
+
+#[tokio::test]
+async fn configured_connection_file_is_used_for_startup_and_refresh() {
+    let server = fake(Behavior::Answer).await;
+    let root = tempfile::tempdir().unwrap();
+    let config_home = root.path().join("config");
+    std::fs::create_dir_all(config_home.join("cortexkit")).unwrap();
+    std::fs::write(
+        config_home.join("cortexkit/magic-context.jsonc"),
+        format!(
+            "{{ // user daemon routing\n\"subc\": {{\"connection_file\": {},}},}}",
+            serde_json::to_string(&server.path).unwrap(),
+        ),
+    )
+    .unwrap();
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+    let _restore = RestoreEnv(
+        ["XDG_CONFIG_HOME", "XDG_DATA_HOME"]
+            .map(|key| (key, std::env::var_os(key)))
+            .to_vec(),
+    );
+    std::env::set_var("XDG_CONFIG_HOME", config_home);
+    std::env::set_var("XDG_DATA_HOME", root.path().join("data"));
+    let selected = connection_file();
+    assert_eq!(selected, server.path);
+    let cache = ProjectNameCache::default();
+    cache.initialize(&selected).await;
+    assert_eq!(
+        pj_label("pj-dashboard-editor", &cache.snapshot()).as_deref(),
+        Some("Editor")
+    );
+    cache.refresh(&connection_file()).await;
+    assert!(!cache.snapshot().is_empty());
+}
 use serde_json::Value;
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget};

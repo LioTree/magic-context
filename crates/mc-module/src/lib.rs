@@ -5711,8 +5711,8 @@ impl McHandler {
     /// its transform (compaction, m0/m1 history) under a key that names no project, with
     /// every memory feature paused: no memory block, no memory search, no fact promotion,
     /// no memory writes and no dreamer runs. The reason is logged once per route root, and
-    /// each fallback request retries git, so the route recovers as soon as git does. A home or
-    /// unreadable directory still refuses outright.
+    /// each fallback request retries git, so the route recovers as soon as git does. Home,
+    /// missing and non-directory paths still refuse outright, as do failed metadata reads.
     fn route_project(
         &self,
         channel: u16,

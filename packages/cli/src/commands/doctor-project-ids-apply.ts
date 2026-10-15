@@ -332,6 +332,9 @@ function backupProjectIds(dbPath: string): void {
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
     console.log(`Backup directory: ${backup}`);
     console.log(
+        "store.db was not changed. Restoring context.db and identity sidecars is safe only before further use; close all hosts first.",
+    );
+    console.log(
         `Restore with hosts closed: rm -f ${quote(`${dbPath}-wal`)} ${quote(`${dbPath}-shm`)}; cp ${quote(join(backup, "context.db"))} ${quote(dbPath)}; for suffix in -wal -shm; do if test -f ${quote(join(backup, "context.db"))}"$suffix"; then cp ${quote(join(backup, "context.db"))}"$suffix" ${quote(dbPath)}"$suffix"; fi; done`,
     );
     console.log(
@@ -346,6 +349,10 @@ export function runProjectIdsApplyCli(
     const options = parseProjectIdsApplyArgs(args);
     const plan = JSON.parse(readFileSync(options.planPath, "utf8")) as ProjectIdPlan;
     const result = preflightProjectIdApply(plan, options, deps);
+    if (result.hostDbPath === null)
+        console.log(
+            "Skipped host session observations: plan has no host database; re-plan with --host-db <path> to include them.",
+        );
     for (const { pair, liveRowsByTable } of result.pairs) {
         console.log(`${pair.from} → ${pair.to}: planned / live row counts`);
         for (const table of new Set([

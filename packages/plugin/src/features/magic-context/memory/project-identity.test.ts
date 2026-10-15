@@ -24,6 +24,7 @@ import {
     readRememberedProjectIdentity,
     rememberGitIdentity,
 } from "./project-identity-cache";
+import { __setProjectPinWriterForTests, flushProjectPinWrites } from "./project-pin-writer";
 
 function tempDir(): string {
     return createTestTempDirFromPath(join(tmpdir(), "mc-identity-"));
@@ -46,7 +47,8 @@ beforeEach(() => {
     process.env.XDG_DATA_HOME = testRoot;
 });
 
-afterEach(() => {
+afterEach(async () => {
+    await __setProjectPinWriterForTests();
     __resetProjectIdentityForTests();
     if (originalTestDataDir === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
     else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = originalTestDataDir;
@@ -190,7 +192,7 @@ describe("live project pin writes", () => {
         "walk-subfolder-canonical-root-differs-from-checkout",
     ];
     for (const name of rowNames) {
-        test(`parity writer: ${name}`, () => {
+        test(`parity writer: ${name}`, async () => {
             const row = parity.cases.find((candidate) => candidate.name === name);
             if (!row || typeof row.answer === "string")
                 throw new Error(`Missing live row: ${name}`);
@@ -261,6 +263,7 @@ describe("live project pin writes", () => {
                 }) as unknown as typeof execFileSync,
             });
             rememberResolvedProjectIdentity(expand(row.directory), vector.reply.result);
+            expect(await flushProjectPinWrites(2_000)).toBe(true);
             const after = sidecarBytes();
             const writes = [...after]
                 .filter(([file, bytes]) => before.get(file) !== bytes)
@@ -290,7 +293,7 @@ describe("live project pin writes", () => {
         });
     }
 
-    test("rejects implicit and unknown vias even with a registered project id", () => {
+    test("rejects implicit and unknown vias even with a registered project id", async () => {
         const directory = join(testRoot, "plain");
         mkdirSync(directory);
         for (const via of ["implicit", "future-via"])
@@ -298,10 +301,11 @@ describe("live project pin writes", () => {
                 directory,
                 liveAnswer({ via, canonicalRoot: directory }),
             );
+        expect(await flushProjectPinWrites(2_000)).toBe(true);
         expect(sidecarBytes().size).toBe(0);
     });
 
-    test("does not pin a linked subfolder after a cached main-checkout probe", () => {
+    test("does not pin a linked subfolder after a cached main-checkout probe", async () => {
         const root = join(testRoot, "checkout");
         const sub = join(root, "sub");
         const gitDir = join(testRoot, "metadata");
@@ -311,10 +315,11 @@ describe("live project pin writes", () => {
         writeFileSync(join(root, ".git"), `gitdir: ${gitDir}\n`);
         writeFileSync(join(gitDir, "commondir"), ".\n");
         rememberResolvedProjectIdentity(sub, liveAnswer({ canonicalRoot: root }));
+        expect(await flushProjectPinWrites(2_000)).toBe(true);
         expect(sidecarBytes().size).toBe(0);
     });
 
-    test("rejects an implicit id even when the via is accepted", () => {
+    test("rejects an implicit id even when the via is accepted", async () => {
         const directory = join(testRoot, "plain");
         mkdirSync(directory);
         const implicit = resolveVectors[3].reply.result;
@@ -324,10 +329,11 @@ describe("live project pin writes", () => {
             via: "root",
             canonicalRoot: directory,
         });
+        expect(await flushProjectPinWrites(2_000)).toBe(true);
         expect(sidecarBytes().size).toBe(0);
     });
 
-    test("pins non-git folders for every accepted via without inventing a common dir", () => {
+    test("pins non-git folders for every accepted via without inventing a common dir", async () => {
         for (const via of ["root", "walk", "containment", "worktree"]) {
             const directory = join(testRoot, via);
             mkdirSync(directory);
@@ -337,6 +343,7 @@ describe("live project pin writes", () => {
                 identity: "pj-resolve-root",
             });
         }
+        expect(await flushProjectPinWrites(2_000)).toBe(true);
         expect(sidecarBytes().size).toBe(4);
     });
 
@@ -365,13 +372,14 @@ describe("live project pin writes", () => {
         expect(readRememberedProjectIdentity(root)).toBeUndefined();
     });
 
-    test("home and missing folders cannot gain pins from live answers", () => {
+    test("home and missing folders cannot gain pins from live answers", async () => {
         const home = join(testRoot, "home");
         mkdirSync(join(home, ".git"), { recursive: true });
         mkdirSync(join(home, "sub"));
         __setProjectIdentityTestHooks({ homeDirectory: () => home });
         for (const directory of [home, join(home, "sub"), join(testRoot, "missing")])
             rememberResolvedProjectIdentity(directory, liveAnswer({ canonicalRoot: directory }));
+        expect(await flushProjectPinWrites(2_000)).toBe(true);
         expect(sidecarBytes().size).toBe(0);
     });
 });

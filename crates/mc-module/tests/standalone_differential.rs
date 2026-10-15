@@ -445,6 +445,29 @@ fn transcript(
             .contains("standalone memory for"));
         transcript.extend([first, second]);
     }
+    // These refusals predate registered projects. A TypeScript-style fallback
+    // would change standalone Rust behavior even when no daemon is configured.
+    let missing = fixture_root.join("missing");
+    let not_directory = fixture_root.join("file");
+    std::fs::write(&not_directory, "not a directory").unwrap();
+    for (scenario, directory) in [("missing", missing), ("not-directory", not_directory)] {
+        let sample = host.sample(&directory, scenario, true, false);
+        assert_eq!(sample["error"], "project_identity_unreadable");
+        assert_eq!(sample["identity"], Value::Null);
+        transcript.push(sample);
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let unreadable = fixture_root.join("unreadable");
+    std::fs::create_dir_all(&unreadable).unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Privileged test runners can still read mode-000 directories.
+    if std::fs::read_dir(&unreadable).is_err() {
+        let sample = host.sample(&unreadable, "unreadable", true, false);
+        assert_eq!(sample["error"], Value::Null);
+        assert!(sample["identity"].as_str().unwrap().starts_with("dir:"));
+        transcript.push(sample);
+    }
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
     let sidecars = isolation.join("cortexkit/magic-context/project-identities");
     let entries: Vec<_> = std::fs::read_dir(sidecars)
         .expect("resolver's legacy git records")
@@ -497,7 +520,7 @@ async fn standalone_identity_and_prefix_bytes_match_the_pre_campaign_base() {
             actual, expected,
             "standalone form {mode}: identities and actual m0 bytes"
         );
-        assert_eq!(actual.len(), 8);
+        assert!(matches!(actual.len(), 10 | 11));
         if let Some(fake) = fake {
             assert_eq!(
                 fake.calls.load(Ordering::SeqCst),
