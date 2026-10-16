@@ -25698,13 +25698,17 @@ mod tests {
             ASTRO_BLOCK_COUNT,
             ASTRO_NATIVE_WIRE_BYTES,
         );
-        let first_started_at = Instant::now();
+        // Projection, hashing and prefix cloning all run synchronously on this
+        // thread. Exclude descheduling by parallel tests from the work budget.
+        let first_wall_started_at = Instant::now();
+        let first_started_at = cpu_time::ThreadTime::now();
         let projection = Arc::new(
             crate::ck_wire::project_messages(&request.messages).expect("ASTRO projection"),
         );
         let first_ms = first_started_at.elapsed().as_secs_f64() * 1000.0;
+        let first_wall_ms = first_wall_started_at.elapsed().as_secs_f64() * 1000.0;
         let retained = projection.retained_bytes();
-        eprintln!("astro-projection-cache retained_bytes={retained} first_ms={first_ms:.1}");
+        eprintln!("astro-projection-cache retained_bytes={retained} first_cpu_ms={first_ms:.1}");
         assert!(
             retained <= PROJECTION_CACHE_ENTRY_BUDGET_BYTES,
             "ASTRO projection must fit the dedicated cache: retained={retained} cap={PROJECTION_CACHE_ENTRY_BUDGET_BYTES}"
@@ -25734,7 +25738,8 @@ mod tests {
         .expect("second pass must hit the projection cache");
         assert_eq!(reused.replace_from, ASTRO_MESSAGE_COUNT);
 
-        let second_started_at = Instant::now();
+        let second_wall_started_at = Instant::now();
+        let second_started_at = cpu_time::ThreadTime::now();
         let incremental = crate::ck_wire::project_messages_incremental(
             &request.messages,
             &reused.projection,
@@ -25742,6 +25747,8 @@ mod tests {
         )
         .expect("full-prefix incremental projection");
         let second_ms = second_started_at.elapsed().as_secs_f64() * 1000.0;
+        let second_wall_ms = second_wall_started_at.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("astro-projection-cache first_cpu_ms={first_ms:.1} second_cpu_ms={second_ms:.1} first_wall_ms={first_wall_ms:.1} second_wall_ms={second_wall_ms:.1}");
         assert_eq!(incremental, *projection);
         assert!(
             second_ms < first_ms / 10.0 || second_ms < 5.0,
