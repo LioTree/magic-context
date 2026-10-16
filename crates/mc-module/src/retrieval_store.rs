@@ -123,6 +123,29 @@ impl RetrievalStore<'_> {
         })
     }
 
+    pub fn compartment_text(
+        &self,
+        scope: &StoreScope,
+        start: i64,
+        end: i64,
+    ) -> CapabilityResult<String> {
+        self.read(|conn| {
+            if !mc_store::archive_index::range_is_mapped(conn,&scope.session.0,start,end)? { return Ok(String::new()); }
+            let mut stmt=conn.prepare("SELECT m.message_ordinal,f.role,f.content FROM message_fts_rowid_map m JOIN message_history_fts f ON f.rowid=m.fts_rowid WHERE m.session_id=? AND m.message_ordinal BETWEEN ? AND ? ORDER BY m.message_ordinal")?;
+            let rows=stmt.query_map(params![scope.session.0,start,end],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut groups=Vec::<(i64,i64,&str,Vec<String>)>::new();
+            let whitespace=regex::Regex::new(r"[\s\u{feff}]+").expect("constant expression");
+            for (ordinal,role,content) in rows {
+                let prefix=match role.as_str() { "user"=>"U","assistant"=>"A",_=>continue };
+                let content=whitespace.replace_all(&content," "); let content=content.trim();
+                if content.is_empty() { continue; }
+                if let Some(group)=groups.last_mut().filter(|g|g.2==prefix) { group.1=ordinal;group.3.push(content.into()); }
+                else { groups.push((ordinal,ordinal,prefix,vec![content.into()])); }
+            }
+            Ok(groups.into_iter().map(|(start,end,role,parts)|format!("[{}] {role}: {}",if start==end { start.to_string() } else { format!("{start}-{end}") },parts.join(" / "))).collect::<Vec<_>>().join("\n"))
+        })
+    }
+
     pub fn probe_frequency(
         &self,
         scope: &StoreScope,
@@ -135,30 +158,49 @@ impl RetrievalStore<'_> {
 
     pub fn notes(
         &self,
-        _scope: &StoreScope,
-        _request: &RetrievalRequest,
-    ) -> CapabilityResult<Vec<RetrievalHit>> {
-        // Note search stays unavailable until a scorer can include readiness reasons
-        // and combine literal-symbol matches, rather than reuse the served scorer.
-        CapabilityResult::unavailable("retrieval_lane")
+        scope: &StoreScope,
+        request: &RetrievalRequest,
+        probes: &[String],
+        limit: usize,
+    ) -> CapabilityResult<(
+        Vec<crate::retrieval::note_ranking::NoteHit>,
+        Vec<crate::retrieval::note_ranking::NoteRow>,
+    )> {
+        use crate::retrieval::note_ranking::{rank_notes, NoteRow, NoteStatus, NoteType};
+        self.read(|conn| {
+            let mut stmt = conn.prepare("SELECT id,type,status,content,session_id,project_path,surface_condition,ready_reason,created_at,anchor_ordinal FROM notes WHERE ((type='session' AND session_id=?1) OR (type='smart' AND project_path=?2)) AND status IN ('active','pending','ready') ORDER BY created_at DESC,id ASC")?;
+            let rows = stmt.query_map(params![scope.session.0,scope.project.0],|r| Ok(NoteRow {
+                id:r.get(0)?, note_type: if r.get::<_,String>(1)? == "session" { NoteType::Session } else { NoteType::Smart },
+                status:match r.get::<_,String>(2)?.as_str() { "pending" => NoteStatus::Pending, "ready" => NoteStatus::Ready, _ => NoteStatus::Active },
+                content:r.get(3)?,session_id:r.get(4)?,project_path:r.get(5)?,surface_condition:r.get(6)?,ready_reason:r.get(7)?,created_at:r.get(8)?,anchor_ordinal:r.get(9)?,
+            }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let hits = rank_notes(&rows,&scope.session.0,&scope.project.0,&request.query,probes,DateBounds { from_ms:request.start_at_ms,to_ms:request.end_at_ms_inclusive },limit);
+            Ok((hits,rows))
+        })
     }
 
     pub fn git_commits(
         &self,
         scope: &StoreScope,
         request: &RetrievalRequest,
-    ) -> CapabilityResult<Vec<mc_store::parity_schema_manifest::GitCommitRecord>> {
-        use mc_store::parity_schema_manifest::{ArchiveQuery, GitArchiveStore};
-        // The unavailable producer has no database handle; replace it with a scoped
-        // database-backed adapter when git-commit search is available.
-        let producer: &dyn GitArchiveStore = &mc_store::git_archive::UNAVAILABLE;
-        producer.search(&ArchiveQuery {
-            scope: scope.clone(),
-            query: request.query.clone(),
-            limit: request.limit,
-            start_at_ms: request.start_at_ms,
-            end_at_ms_inclusive: request.end_at_ms_inclusive,
-            cutoff: request.ordinal_cutoff,
+        query: Option<(&EmbeddingIdentity, &[f32])>,
+        limit: usize,
+    ) -> CapabilityResult<mc_store::git_archive::SearchResults> {
+        let options = mc_store::git_archive::SearchOptions {
+            limit: limit as u32,
+            from: request.start_at_ms,
+            to: request.end_at_ms_inclusive,
+            query_embedding: query.map(|(_, v)| v.to_vec()),
+            query_model_id: query.map(|(id, _)| id.model.clone()),
+            ..Default::default()
+        };
+        self.read(|conn| {
+            mc_store::git_archive::search_with_lanes(
+                conn,
+                &scope.project.0,
+                &request.query,
+                &options,
+            )
         })
     }
 }

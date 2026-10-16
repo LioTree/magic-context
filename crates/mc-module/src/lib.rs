@@ -8497,7 +8497,7 @@ impl McHandler {
             .as_ref()
             .zip(vector.as_deref())
             .filter(|(id, v)| {
-                envelope["semantic_provider"] != "local"
+                !matches!(id.provider.as_str(), "local" | "transformers")
                     && id.model != "off"
                     && id.dimensions > 0
                     && v.len() == id.dimensions as usize
@@ -8567,13 +8567,43 @@ impl McHandler {
                         &memory.content,
                     ),
                 );
-                if fts.iter().any(|m| m.memory_id == hit.memory_id) {
-                    lanes.memory_fts.push(candidate.clone());
-                }
-                if vectors.iter().any(|m| m.memory_id == hit.memory_id) {
-                    lanes.memory_vector.push(candidate.clone());
-                }
                 memory_hits.push(candidate);
+            }
+            let convert = |hit: MemoryHit| {
+                retrieval_candidate(
+                    RetrievalSource::Memory,
+                    hit.memory_id.to_string(),
+                    None,
+                    hit.content,
+                    hit.score,
+                    &scope,
+                )
+            };
+            lanes.memory_fts = rank_memories(&memories, &fts, &[], None, &visible, dates, 25)
+                .0
+                .into_iter()
+                .map(convert)
+                .collect();
+            lanes.memory_vector =
+                rank_memories(&memories, &[], &vectors, query_vector, &visible, dates, 25)
+                    .0
+                    .into_iter()
+                    .map(convert)
+                    .collect();
+            for candidate in lanes.memory_fts.iter().chain(&lanes.memory_vector) {
+                if let Some(memory) = memories
+                    .iter()
+                    .find(|m| m.id.to_string() == candidate.hit.source_id)
+                {
+                    bodies.insert(
+                        retrieval_key(candidate),
+                        candidate_text(
+                            &format!("memory {} {}", memory.id, scope.project.0),
+                            memory.content.lines().next().unwrap_or_default(),
+                            &memory.content,
+                        ),
+                    );
+                }
             }
             memory_hits.truncate(tier_limit);
         }
@@ -8723,12 +8753,10 @@ impl McHandler {
                     );
                     candidate.compartment_range =
                         Some((hit.start_ordinal as u64, hit.end_ordinal as u64));
-                    let body = store.with_context_read(|conn| {
-                        let mut stmt = conn.prepare("SELECT f.message_ordinal,f.role,f.content FROM message_fts_rowid_map m JOIN message_history_fts f ON f.rowid=m.fts_rowid WHERE m.session_id=? AND m.message_ordinal BETWEEN ? AND ? ORDER BY m.message_ordinal")?;
-                        let rows = stmt.query_map(rusqlite::params![scope.session.0, hit.start_ordinal, hit.end_ordinal], |r| Ok(format!("[{}] {}: {}", r.get::<_, i64>(0)?, if r.get::<_, String>(1)? == "user" { "U" } else { "A" }, r.get::<_, String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                        Ok(rows.join("\n"))
-                    });
-                    if let Ok(body) = body {
+                    let body = adapter.compartment_text(&scope, hit.start_ordinal, hit.end_ordinal);
+                    if let CapabilityResult::Available { value: body }
+                    | CapabilityResult::Degraded { value: body, .. } = body
+                    {
                         bodies.insert(
                             retrieval_key(&candidate),
                             candidate_text(
@@ -8756,27 +8784,78 @@ impl McHandler {
             }
         }
         if has(RetrievalSource::GitCommit) {
-            for commit in retrieval_values(
-                adapter.git_commits(&scope, &request),
+            let result = retrieval_values(
+                adapter.git_commits(&scope, &request, query_vector, tier_limit),
                 "git_commit",
                 &mut availability,
-            ) {
-                other_hits.push(retrieval_candidate(
+            );
+            let convert = |hit: &mc_store::git_archive::GitCommitSearchHit| {
+                retrieval_candidate(
                     RetrievalSource::GitCommit,
-                    commit.sha,
+                    hit.commit.sha.clone(),
                     None,
-                    preview(&commit.message),
-                    0.0,
+                    preview(&hit.commit.message),
+                    hit.score,
                     &scope,
-                ));
+                )
+            };
+            for hit in result.hits.iter().chain(&result.fts).chain(&result.vector) {
+                let candidate = convert(hit);
+                bodies.insert(
+                    retrieval_key(&candidate),
+                    candidate_text(
+                        &format!("git_commit {} {}", hit.commit.sha, scope.project.0),
+                        &format!(
+                            "{} {}",
+                            hit.commit.short_sha,
+                            hit.commit.message.lines().next().unwrap_or_default()
+                        ),
+                        &hit.commit.message,
+                    ),
+                );
             }
+            lanes.git_fts = result.fts.iter().map(convert).collect();
+            lanes.git_vector = result.vector.iter().map(convert).collect();
+            other_hits.extend(result.hits.iter().map(convert));
         }
         if has(RetrievalSource::Note) {
-            let hits = retrieval_values(adapter.notes(&scope, &request), "note", &mut availability);
-            other_hits.extend(hits.into_iter().map(|hit| SearchCandidate {
-                hit,
-                compartment_range: None,
-            }));
+            let (hits, rows) = retrieval_values(
+                adapter.notes(&scope, &request, &probes, tier_limit.max(25)),
+                "note",
+                &mut availability,
+            );
+            for hit in hits {
+                let candidate = retrieval_candidate(
+                    RetrievalSource::Note,
+                    hit.note_id.to_string(),
+                    hit.anchor_ordinal.and_then(|o| u64::try_from(o).ok()),
+                    hit.content,
+                    hit.score,
+                    &scope,
+                );
+                if let Some(row) = rows.iter().find(|r| r.id == hit.note_id) {
+                    let body = format!(
+                        "{}{}",
+                        row.content,
+                        row.ready_reason
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!("\nReason: {s}"))
+                            .unwrap_or_default()
+                    );
+                    bodies.insert(
+                        retrieval_key(&candidate),
+                        candidate_text(
+                            &format!("note {} {}", hit.note_id, scope.project.0),
+                            body.lines().next().unwrap_or_default(),
+                            &body,
+                        ),
+                    );
+                }
+                lanes.notes.push(candidate.clone());
+                other_hits.push(candidate);
+            }
+            lanes.notes.truncate(25);
         }
         if has(RetrievalSource::Primer) {
             availability.insert(
@@ -8812,11 +8891,12 @@ impl McHandler {
                             .parse::<i64>()
                             .unwrap_or_default()
                             .cmp(&b.hit.source_id.parse::<i64>().unwrap_or_default()),
-                        _ => a
+                        RetrievalSource::RawMessage | RetrievalSource::Compartment => a
                             .hit
                             .ordinal
                             .map(|o| o.value)
                             .cmp(&b.hit.ordinal.map(|o| o.value)),
+                        _ => std::cmp::Ordering::Equal,
                     }
                 })
         });
@@ -8861,9 +8941,11 @@ impl McHandler {
         } else {
             baseline
         };
-        respond(
-            json!({"v":1,"hits":hits.into_iter().map(|c| c.hit).collect::<Vec<_>>(),"source_availability":availability,"literal_probes":probes}),
-        )
+        let mut body = json!({"v":1,"hits":hits.into_iter().map(|c| c.hit).collect::<Vec<_>>(),"source_availability":availability,"literal_probes":probes});
+        if envelope["capture_lanes"] == true {
+            body["lanes"] = json!({"git_fts":lanes.git_fts.iter().map(|c|&c.hit).collect::<Vec<_>>(),"git_vector":lanes.git_vector.iter().map(|c|&c.hit).collect::<Vec<_>>()});
+        }
+        respond(body)
     }
 
     fn handle_non_served_method(
@@ -20778,7 +20860,11 @@ mod tests {
         assert_eq!(
             custom.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "custom-runner".to_string()],
+                of: vec![
+                    "thalamus".to_string(),
+                    "custom-runner".to_string(),
+                    "synapse".to_string()
+                ],
             }]
         );
 
@@ -20787,7 +20873,11 @@ mod tests {
         assert_eq!(
             hosted.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "broca".to_string()],
+                of: vec![
+                    "thalamus".to_string(),
+                    "broca".to_string(),
+                    "synapse".to_string()
+                ],
             }]
         );
         // Self-signals drop out with the background-completion target, but the field stays declared
@@ -22351,7 +22441,11 @@ mod tests {
         assert_eq!(
             m.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "broca".to_string()]
+                of: vec![
+                    "thalamus".to_string(),
+                    "broca".to_string(),
+                    "synapse".to_string()
+                ]
             }]
         );
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {

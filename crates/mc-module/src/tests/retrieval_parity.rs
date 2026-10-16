@@ -44,11 +44,15 @@ fn fixture_handler(seed: bool) -> (McHandler, Arc<McStore>, tempfile::TempDir, P
 }
 
 fn search_request(case: &Value) -> Value {
-    json!({"method":"mc.retrieval","v":1,"session_id":"retrieval-session", "sources":case["sources"],
-      "request":{"query":case["query"],"intent":"explicit","limit":case["limit"],"start_at_ms":null,"end_at_ms_inclusive":null,
+    let mut request = json!({"method":"mc.retrieval","v":1,"session_id":"retrieval-session", "sources":case["sources"],"capture_lanes":true,
+      "request":{"query":case["query"],"intent":"explicit","limit":case["limit"],"start_at_ms":case["from"],"end_at_ms_inclusive":case["to"],
         "ordinal_cutoff":{"value":25,"base":"one"},"visible_memory_ids":[],
         "embedding":{"provider":"fixture","model":"fixture:model","dimensions":3,"query_recipe":"fixture-query","passage_recipe":"fixture-passage","fingerprint":"fixture-identity","epoch":1}},
-      "query_vector":[1,0,0]})
+      "query_vector":[1,0,0]});
+    if case["embedding_enabled"] == false {
+        request["query_vector"] = Value::Null;
+    }
+    request
 }
 
 fn identity_order(body: &Value) -> Value {
@@ -118,17 +122,27 @@ impl RerankClient for SynapseFixture {
 
 #[tokio::test]
 async fn rerank_ties_preserve_frozen_ts_pool_order_and_arguments() {
-    let (mut handler, _, _dir, project) = fixture_handler(true);
-    let client = Arc::new(SynapseFixture::default());
-    handler.retrieval_reranker = Some(client.clone());
-    let case = &vectors()["cases"][5];
-    run_case(&handler, case).await;
-    let mut expected = case["calls"].clone();
-    for call in expected.as_array_mut().unwrap() {
-        call[3]["identity"]["project_root"] = json!(project);
+    for case in vectors()["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case["name"] == "rerank_tie" || case["name"] == "rerank_all_tie")
+    {
+        let (mut handler, _, _dir, project) = fixture_handler(true);
+        let client = Arc::new(SynapseFixture::default());
+        handler.retrieval_reranker = Some(client.clone());
+        run_case(&handler, case).await;
+        let mut expected = case["calls"].clone();
+        for call in expected.as_array_mut().unwrap() {
+            call[3]["identity"]["project_root"] = json!(project);
+        }
+        assert_eq!(
+            json!(*client.calls.lock().unwrap()),
+            expected,
+            "{}",
+            case["name"]
+        );
     }
-    let actual = json!(*client.calls.lock().unwrap());
-    assert_eq!(actual, expected);
 }
 
 #[tokio::test]
@@ -180,17 +194,45 @@ async fn auto_hint_runs_no_rerank_or_literal_probe() {
 }
 
 #[tokio::test]
+async fn git_and_note_producers_match_frozen_ts_hits_and_git_lanes() {
+    let (handler, _, _dir, _) = fixture_handler(true);
+    for case in vectors()["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| {
+            let name = case["name"].as_str().unwrap();
+            name.starts_with("git_") || name.starts_with("note_") || name == "all_produced"
+        })
+    {
+        let body = run_case(&handler, case).await;
+        for source in case["sources"].as_array().unwrap() {
+            assert_eq!(
+                body["source_availability"][source.as_str().unwrap()],
+                json!({"status":"available"})
+            );
+        }
+        for lane in ["git_fts", "git_vector"] {
+            assert_eq!(
+                identity_order(&json!({"hits":body["lanes"][lane]})),
+                case["lanes"][lane],
+                "{} {lane}",
+                case["name"]
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn unproduced_sources_are_named_unavailable_not_empty_success() {
     let (handler, _, _dir, _) = fixture_handler(true);
     for (source, reason) in [
         ("primer", "retrieval_lane"),
-        ("note", "retrieval_lane"),
-        ("git_commit", "git_archive"),
         ("compartment", "retrieval_lane"),
     ] {
         let mut request = search_request(&vectors()["cases"][0]);
         request["sources"] = json!([source]);
-        request["semantic_provider"] = json!("local");
+        request["request"]["embedding"]["provider"] = json!("local");
         let body = call_dispatch_request(&handler, request).await;
         assert_eq!(
             body["source_availability"][source],
@@ -234,11 +276,15 @@ const FROZEN_SEARCH: &str = r####"{
       "literal-probes.ts": "cb38519de49197dea3609fa26d6ac936c27c6bdbfdf0239f723e21647e1d93e6",
       "message-index.ts": "ee9988a4c1da657723118c8da379e9a74baf1c884e4526fc5cf528ca5d5a16df",
       "compartment-chunk-embedding.ts": "7d2794cd9c729d19b08954cddf5e71c2d5d1c50b2eda1d1260df92a81fb0df46",
-      "memory/storage-memory-fts.ts": "41f54b8e2408571a05e9922932c0375c06cea1cc9b52d6a6b57ca17d385db192"
+      "memory/storage-memory-fts.ts": "41f54b8e2408571a05e9922932c0375c06cea1cc9b52d6a6b57ca17d385db192",
+      "git-commits/index.ts": "01badea05d12d50276e6ebaffba6bfec7d3434ffde45b79cd964a5d3ef5d22ba",
+      "git-commits/search-git-commits.ts": "e5bdcd560b256cc5ab57beb1f96d9396d092579081eae8ff1318d49ccb724abb",
+      "git-commits/storage-git-commits.ts": "1150103a399a1f894357d582393c05257df5380cb1f628157c2e793f75abc2ef",
+      "git-commits/storage-git-commit-embeddings.ts": "b72c7c0ea5dcf49368a7b54e48e95a26497484ec7de92d35d63accf357921bbd"
     },
     "fixture_db_sha256": "edd4e9a3104b299e6b5dda4b7f4f508054f5d4f7b59258c3176b72bc233931eb"
   },
-  "seed": "\nINSERT INTO message_history_fts(rowid,session_id,message_ordinal,message_id,role,content) VALUES\n(1002,'retrieval-session',2,'raw-two','user','queue queue bounded drains'),\n(1004,'retrieval-session',4,'raw-four','assistant','queue and saturation with more unrelated words'),\n(1008,'retrieval-session',8,'raw-eight','user','queue dispatch uses a slow worker and a long buffer'),\n(1015,'retrieval-session',15,'raw-fifteen','assistant','queue'),\n(1021,'retrieval-session',21,'raw-uncovered','user','queue queue queue uncovered'),\n(1024,'retrieval-session',24,'raw-literal','user','/ctx-status queue calls'),\n(1100,'foreign-session',2,'foreign-raw','user','queue queue queue');\nINSERT OR REPLACE INTO message_fts_rowid_map(session_id,fts_rowid,message_ordinal,message_time_ms) VALUES\n('retrieval-session',1002,2,1768003200000),('retrieval-session',1004,4,1768003200000),\n('retrieval-session',1008,8,1768003200000),('retrieval-session',1015,15,1768003200000),\n('retrieval-session',1021,21,1768003200000),\n('retrieval-session',1024,24,1768003200000),\n('foreign-session',1100,2,1768003200000);\nINSERT OR REPLACE INTO message_history_index(session_id,last_indexed_ordinal,updated_at) VALUES('retrieval-session',25,1768003200000);\nUPDATE compartment_chunk_embeddings SET vector=X'cdcccc3d6666663f00000000' WHERE compartment_id=2;\n",
+  "seed": "\nINSERT INTO message_history_fts(rowid,session_id,message_ordinal,message_id,role,content) VALUES\n(1002,'retrieval-session',2,'raw-two','user','queue queue bounded drains'),\n(1003,'retrieval-session',3,'raw-three','user','queue same-role grouping'),\n(1004,'retrieval-session',4,'raw-four','assistant','queue and saturation with more unrelated words'),\n(1008,'retrieval-session',8,'raw-eight','user','queue dispatch uses a slow worker and a long buffer'),\n(1015,'retrieval-session',15,'raw-fifteen','assistant','queue'),\n(1021,'retrieval-session',21,'raw-uncovered','user','queue queue queue uncovered'),\n(1024,'retrieval-session',24,'raw-literal','user','/ctx-status queue calls'),\n(1100,'foreign-session',2,'foreign-raw','user','queue queue queue');\nINSERT OR REPLACE INTO message_fts_rowid_map(session_id,fts_rowid,message_ordinal,message_time_ms) VALUES\n('retrieval-session',1002,2,1768003200000),('retrieval-session',1003,3,1768003200000),('retrieval-session',1004,4,1768003200000),\n('retrieval-session',1008,8,1768003200000),('retrieval-session',1015,15,1768003200000),\n('retrieval-session',1021,21,1768003200000),\n('retrieval-session',1024,24,1768003200000),\n('foreign-session',1100,2,1768003200000);\nINSERT OR REPLACE INTO message_history_index(session_id,last_indexed_ordinal,updated_at) VALUES('retrieval-session',25,1768003200000);\nUPDATE message_fts_rowid_map_backfill_state SET completed=1 WHERE id=1;\nUPDATE compartment_chunk_embeddings SET vector=X'cdcccc3d6666663f00000000' WHERE compartment_id=2;\nINSERT INTO git_commits(sha,project_path,short_sha,message,author,committed_at,indexed_at) VALUES\n('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','git:parity-own','aaaaaaa','queue queue drain retry','Ada',1768003200000,1768003200000),\n('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','git:parity-own','bbbbbbb','queue dispatch and buffer limits','Bo',1768003201000,1768003200000),\n('cccccccccccccccccccccccccccccccccccccccc','git:parity-own','ccccccc','semantic saturation repair',NULL,1768003202000,1768003200000),\n('dddddddddddddddddddddddddddddddddddddddd','git:unrelated','ddddddd','queue queue queue hidden',NULL,1768003203000,1768003200000);\nINSERT INTO git_commit_embeddings(sha,embedding,model_id,created_at) VALUES\n('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',X'9a99193fcdcc4c3f00000000','fixture:model',1768003200000),\n('cccccccccccccccccccccccccccccccccccccccc',X'0000803f0000000000000000','fixture:model',1768003200000);\nINSERT INTO notes(id,type,status,content,session_id,project_path,surface_condition,ready_reason,created_at,updated_at,anchor_ordinal) VALUES\n(1,'session','ready','queue drains quickly','retrieval-session','git:parity-own','only-condition','inspect /ctx-status readiness',1768003200000,1768003200000,4),\n(2,'smart','pending','queue dispatch buffer limits','other-session','git:parity-own',NULL,NULL,1768003201000,1768003201000,8),\n(3,'smart','active','queue hidden foreign project','other-session','git:unrelated',NULL,NULL,1768003202000,1768003202000,NULL),\n(4,'session','active','queue hidden foreign session','foreign-session','git:parity-own',NULL,NULL,1768003203000,1768003203000,NULL),\n(5,'session','dismissed','queue dismissed','retrieval-session','git:parity-own',NULL,NULL,1768003204000,1768003204000,NULL),\n(6,'session','active','/ctx-status recall','retrieval-session','git:parity-own',NULL,NULL,1768003205000,1768003205000,NULL),\n(7,'session','active','queue equal score','retrieval-session','git:parity-own',NULL,NULL,1768003206000,1768003206000,NULL),\n(8,'session','active','queue equal score','retrieval-session','git:parity-own',NULL,NULL,1768003206000,1768003206000,NULL);\n",
   "cases": [
     {
       "name": "raw_message",
@@ -249,11 +295,12 @@ const FROZEN_SEARCH: &str = r####"{
       "limit": 10,
       "effective_scores": [
         1.275,
-        1.0625,
-        0.8500000000000001,
-        0.6375,
-        0.42500000000000004,
-        0.21249999999999994
+        1.092857142857143,
+        0.9107142857142857,
+        0.7285714285714284,
+        0.5464285714285715,
+        0.3642857142857142,
+        0.1821428571428572
       ],
       "hits": [
         {
@@ -273,6 +320,12 @@ const FROZEN_SEARCH: &str = r####"{
           "source_id": "raw-fifteen",
           "ordinal": 15,
           "text": "queue"
+        },
+        {
+          "source": "raw_message",
+          "source_id": "raw-three",
+          "ordinal": 3,
+          "text": "queue same-role grouping"
         },
         {
           "source": "raw_message",
@@ -533,6 +586,12 @@ const FROZEN_SEARCH: &str = r####"{
         },
         {
           "source": "raw_message",
+          "source_id": "raw-three",
+          "ordinal": 3,
+          "text": "queue same-role grouping"
+        },
+        {
+          "source": "raw_message",
           "source_id": "raw-literal",
           "ordinal": 24,
           "text": "/ctx-status queue calls"
@@ -570,6 +629,7 @@ const FROZEN_SEARCH: &str = r####"{
               "message raw-uncovered retrieval-session @21\nuser: queue queue queue uncovered\nqueue queue queue uncovered",
               "message raw-two retrieval-session @2\nuser: queue queue bounded drains\nqueue queue bounded drains",
               "message raw-fifteen retrieval-session @15\nassistant: queue\nqueue",
+              "message raw-three retrieval-session @3\nuser: queue same-role grouping\nqueue same-role grouping",
               "message raw-literal retrieval-session @24\nuser: /ctx-status queue calls\n/ctx-status queue calls",
               "message raw-four retrieval-session @4\nassistant: queue and saturation with more unrelated words\nqueue and saturation with more unrelated words"
             ],
@@ -702,6 +762,528 @@ const FROZEN_SEARCH: &str = r####"{
       "limit": 10,
       "hits": [],
       "calls": []
+    },
+    {
+      "name": "git_lexical",
+      "sources": [
+        "git_commit"
+      ],
+      "query": "queue",
+      "embedding_enabled": false,
+      "limit": 10,
+      "hits": [
+        {
+          "source": "git_commit",
+          "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ordinal": null,
+          "text": "queue queue drain retry"
+        },
+        {
+          "source": "git_commit",
+          "source_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "ordinal": null,
+          "text": "queue dispatch and buffer limits"
+        }
+      ],
+      "lanes": {
+        "git_fts": [
+          {
+            "source": "git_commit",
+            "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ordinal": null,
+            "text": "queue queue drain retry"
+          },
+          {
+            "source": "git_commit",
+            "source_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "ordinal": null,
+            "text": "queue dispatch and buffer limits"
+          }
+        ],
+        "git_vector": []
+      }
+    },
+    {
+      "name": "git_hybrid",
+      "sources": [
+        "git_commit"
+      ],
+      "query": "queue",
+      "embedding_enabled": true,
+      "limit": 10,
+      "hits": [
+        {
+          "source": "git_commit",
+          "source_id": "cccccccccccccccccccccccccccccccccccccccc",
+          "ordinal": null,
+          "text": "semantic saturation repair"
+        },
+        {
+          "source": "git_commit",
+          "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ordinal": null,
+          "text": "queue queue drain retry"
+        },
+        {
+          "source": "git_commit",
+          "source_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "ordinal": null,
+          "text": "queue dispatch and buffer limits"
+        }
+      ],
+      "lanes": {
+        "git_fts": [
+          {
+            "source": "git_commit",
+            "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ordinal": null,
+            "text": "queue queue drain retry"
+          },
+          {
+            "source": "git_commit",
+            "source_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "ordinal": null,
+            "text": "queue dispatch and buffer limits"
+          }
+        ],
+        "git_vector": [
+          {
+            "source": "git_commit",
+            "source_id": "cccccccccccccccccccccccccccccccccccccccc",
+            "ordinal": null,
+            "text": "semantic saturation repair"
+          },
+          {
+            "source": "git_commit",
+            "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ordinal": null,
+            "text": "queue queue drain retry"
+          }
+        ]
+      }
+    },
+    {
+      "name": "git_semantic",
+      "sources": [
+        "git_commit"
+      ],
+      "query": "no lexical match",
+      "embedding_enabled": true,
+      "limit": 10,
+      "hits": [
+        {
+          "source": "git_commit",
+          "source_id": "cccccccccccccccccccccccccccccccccccccccc",
+          "ordinal": null,
+          "text": "semantic saturation repair"
+        },
+        {
+          "source": "git_commit",
+          "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ordinal": null,
+          "text": "queue queue drain retry"
+        }
+      ],
+      "lanes": {
+        "git_fts": [],
+        "git_vector": [
+          {
+            "source": "git_commit",
+            "source_id": "cccccccccccccccccccccccccccccccccccccccc",
+            "ordinal": null,
+            "text": "semantic saturation repair"
+          },
+          {
+            "source": "git_commit",
+            "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ordinal": null,
+            "text": "queue queue drain retry"
+          }
+        ]
+      }
+    },
+    {
+      "name": "git_dated",
+      "sources": [
+        "git_commit"
+      ],
+      "query": "queue",
+      "embedding_enabled": true,
+      "from": 1768003201000,
+      "to": 1768003202000,
+      "limit": 10,
+      "hits": [
+        {
+          "source": "git_commit",
+          "source_id": "cccccccccccccccccccccccccccccccccccccccc",
+          "ordinal": null,
+          "text": "semantic saturation repair"
+        },
+        {
+          "source": "git_commit",
+          "source_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "ordinal": null,
+          "text": "queue dispatch and buffer limits"
+        }
+      ],
+      "lanes": {
+        "git_fts": [
+          {
+            "source": "git_commit",
+            "source_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "ordinal": null,
+            "text": "queue dispatch and buffer limits"
+          }
+        ],
+        "git_vector": [
+          {
+            "source": "git_commit",
+            "source_id": "cccccccccccccccccccccccccccccccccccccccc",
+            "ordinal": null,
+            "text": "semantic saturation repair"
+          }
+        ]
+      }
+    },
+    {
+      "name": "note_keyword",
+      "sources": [
+        "note"
+      ],
+      "query": "queue",
+      "embedding_enabled": false,
+      "limit": 10,
+      "hits": [
+        {
+          "source": "note",
+          "source_id": "7",
+          "ordinal": null,
+          "text": "queue equal score"
+        },
+        {
+          "source": "note",
+          "source_id": "8",
+          "ordinal": null,
+          "text": "queue equal score"
+        },
+        {
+          "source": "note",
+          "source_id": "2",
+          "ordinal": 8,
+          "text": "queue dispatch buffer limits"
+        },
+        {
+          "source": "note",
+          "source_id": "1",
+          "ordinal": 4,
+          "text": "queue drains quickly Reason: inspect /ctx-status readiness"
+        }
+      ],
+      "lanes": {
+        "git_fts": [],
+        "git_vector": []
+      }
+    },
+    {
+      "name": "note_ready_reason",
+      "sources": [
+        "note"
+      ],
+      "query": "readiness",
+      "embedding_enabled": false,
+      "limit": 10,
+      "hits": [
+        {
+          "source": "note",
+          "source_id": "1",
+          "ordinal": 4,
+          "text": "queue drains quickly Reason: inspect /ctx-status readiness"
+        }
+      ],
+      "lanes": {
+        "git_fts": [],
+        "git_vector": []
+      }
+    },
+    {
+      "name": "note_literal",
+      "sources": [
+        "note"
+      ],
+      "query": "why did /ctx-status calls inflate",
+      "embedding_enabled": false,
+      "limit": 10,
+      "hits": [
+        {
+          "source": "note",
+          "source_id": "6",
+          "ordinal": null,
+          "text": "/ctx-status recall"
+        },
+        {
+          "source": "note",
+          "source_id": "1",
+          "ordinal": 4,
+          "text": "queue drains quickly Reason: inspect /ctx-status readiness"
+        }
+      ],
+      "lanes": {
+        "git_fts": [],
+        "git_vector": []
+      }
+    },
+    {
+      "name": "note_surface_condition_is_not_text",
+      "sources": [
+        "note"
+      ],
+      "query": "only-condition",
+      "embedding_enabled": false,
+      "limit": 10,
+      "hits": [],
+      "lanes": {
+        "git_fts": [],
+        "git_vector": []
+      }
+    },
+    {
+      "name": "all_produced",
+      "sources": [
+        "memory",
+        "raw_message",
+        "compartment",
+        "git_commit",
+        "note"
+      ],
+      "query": "queue",
+      "embedding_enabled": true,
+      "limit": 10,
+      "hits": [
+        {
+          "source": "memory",
+          "source_id": "13",
+          "ordinal": null,
+          "text": "queue dated inclusive upper"
+        },
+        {
+          "source": "compartment",
+          "source_id": "1",
+          "ordinal": 1,
+          "text": "Saturation and bounded drains"
+        },
+        {
+          "source": "memory",
+          "source_id": "5",
+          "ordinal": null,
+          "text": "bounded drains absorb saturation"
+        },
+        {
+          "source": "memory",
+          "source_id": "15",
+          "ordinal": null,
+          "text": "pkg::worker.retry() handles transient saturation"
+        },
+        {
+          "source": "compartment",
+          "source_id": "3",
+          "ordinal": 11,
+          "text": "Unrelated title semantic recall"
+        },
+        {
+          "source": "memory",
+          "source_id": "87",
+          "ordinal": null,
+          "text": "queue shared workspace constraint"
+        },
+        {
+          "source": "memory",
+          "source_id": "12",
+          "ordinal": null,
+          "text": "queue dated inclusive lower"
+        },
+        {
+          "source": "memory",
+          "source_id": "14",
+          "ordinal": null,
+          "text": "queue dated outside interval"
+        },
+        {
+          "source": "git_commit",
+          "source_id": "cccccccccccccccccccccccccccccccccccccccc",
+          "ordinal": null,
+          "text": "semantic saturation repair"
+        },
+        {
+          "source": "git_commit",
+          "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ordinal": null,
+          "text": "queue queue drain retry"
+        }
+      ],
+      "lanes": {
+        "git_fts": [
+          {
+            "source": "git_commit",
+            "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ordinal": null,
+            "text": "queue queue drain retry"
+          },
+          {
+            "source": "git_commit",
+            "source_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "ordinal": null,
+            "text": "queue dispatch and buffer limits"
+          }
+        ],
+        "git_vector": [
+          {
+            "source": "git_commit",
+            "source_id": "cccccccccccccccccccccccccccccccccccccccc",
+            "ordinal": null,
+            "text": "semantic saturation repair"
+          },
+          {
+            "source": "git_commit",
+            "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ordinal": null,
+            "text": "queue queue drain retry"
+          }
+        ]
+      }
+    },
+    {
+      "name": "rerank_all_tie",
+      "sources": [
+        "memory",
+        "raw_message",
+        "compartment",
+        "git_commit",
+        "note"
+      ],
+      "query": "how does queue dispatch work",
+      "limit": 10,
+      "hits": [
+        {
+          "source": "memory",
+          "source_id": "13",
+          "ordinal": null,
+          "text": "queue dated inclusive upper"
+        },
+        {
+          "source": "compartment",
+          "source_id": "2",
+          "ordinal": 6,
+          "text": "Same score later ordinal"
+        },
+        {
+          "source": "compartment",
+          "source_id": "1",
+          "ordinal": 1,
+          "text": "Saturation and bounded drains"
+        },
+        {
+          "source": "memory",
+          "source_id": "12",
+          "ordinal": null,
+          "text": "queue dated inclusive lower"
+        },
+        {
+          "source": "compartment",
+          "source_id": "3",
+          "ordinal": 11,
+          "text": "Unrelated title semantic recall"
+        },
+        {
+          "source": "memory",
+          "source_id": "87",
+          "ordinal": null,
+          "text": "queue shared workspace constraint"
+        },
+        {
+          "source": "memory",
+          "source_id": "14",
+          "ordinal": null,
+          "text": "queue dated outside interval"
+        },
+        {
+          "source": "memory",
+          "source_id": "4",
+          "ordinal": null,
+          "text": "queue pressure exact identifier"
+        },
+        {
+          "source": "memory",
+          "source_id": "2",
+          "ordinal": null,
+          "text": "queue corrected text remains searchable"
+        },
+        {
+          "source": "memory",
+          "source_id": "16",
+          "ordinal": null,
+          "text": "queue 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂 spaced 🙂…"
+        }
+      ],
+      "calls": [
+        [
+          "synapse",
+          "models.list",
+          {},
+          {
+            "timeoutMs": 1500,
+            "targetKind": "management_surface",
+            "identity": {
+              "project_root": "git:parity-own",
+              "harness": "magic-context",
+              "session": "retrieval-session"
+            }
+          }
+        ],
+        [
+          "synapse",
+          "rerank.score",
+          {
+            "model": "gte-reranker-modernbert-base-f32",
+            "query": "how does queue dispatch work",
+            "candidates": [
+              "memory 13 git:parity-own\nqueue dated inclusive upper\nqueue dated inclusive upper",
+              "compartment 2 retrieval-session @6-10\nSame score later ordinal\n[8] U: queue dispatch uses a slow worker and a long buffer",
+              "compartment 1 retrieval-session @1-5\nSaturation and bounded drains\n[2-3] U: queue queue bounded drains / queue same-role grouping\n[4] A: queue and saturation with more unrelated words",
+              "memory 12 git:parity-own\nqueue dated inclusive lower\nqueue dated inclusive lower",
+              "compartment 3 retrieval-session @11-20\nUnrelated title semantic recall\n[15] A: queue",
+              "memory 87 git:parity-own\nqueue shared workspace constraint\nqueue shared workspace constraint",
+              "memory 14 git:parity-own\nqueue dated outside interval\nqueue dated outside interval",
+              "memory 4 git:parity-own\nqueue pressure exact identifier\nqueue pressure exact identifier",
+              "memory 2 git:parity-own\nqueue corrected text remains searchable\nqueue corrected text remains searchable",
+              "memory 16 git:parity-own\nqueue 🙂 spaced\nqueue 🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n🙂 spaced\n",
+              "git_commit cccccccccccccccccccccccccccccccccccccccc git:parity-own\nccccccc semantic saturation repair\nsemantic saturation repair",
+              "note 2 git:parity-own\nqueue dispatch buffer limits\nqueue dispatch buffer limits",
+              "message raw-uncovered retrieval-session @21\nuser: queue queue queue uncovered\nqueue queue queue uncovered",
+              "git_commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa git:parity-own\naaaaaaa queue queue drain retry\nqueue queue drain retry",
+              "note 7 git:parity-own\nqueue equal score\nqueue equal score",
+              "memory 6 git:parity-own\nqueue fts only fallback\nqueue fts only fallback",
+              "note 8 git:parity-own\nqueue equal score\nqueue equal score",
+              "note 1 git:parity-own\nqueue drains quickly\nqueue drains quickly\nReason: inspect /ctx-status readiness",
+              "memory 5 git:parity-own\nbounded drains absorb saturation\nbounded drains absorb saturation",
+              "memory 15 git:parity-own\npkg::worker.retry() handles transient saturation\npkg::worker.retry() handles transient saturation"
+            ],
+            "required_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "allow_equivalent": false,
+            "accept_declared": false,
+            "max_queue_ms": 100,
+            "deadline_ms": 1500
+          },
+          {
+            "timeoutMs": 1500,
+            "targetKind": "management_surface",
+            "identity": {
+              "project_root": "git:parity-own",
+              "harness": "magic-context",
+              "session": "retrieval-session"
+            }
+          }
+        ]
+      ]
     }
   ]
 }
@@ -1369,4 +1951,100 @@ mod served_differential {
             assert_eq!(digest, expected, "{lane}");
         }
     }
+}
+
+struct SharedRetrievalHandler(Arc<McHandler>);
+#[async_trait]
+impl ModuleHandler for SharedRetrievalHandler {
+    async fn on_bind(&self, request: &RouteBindRequest) -> subc_client_rs::BindDecision {
+        self.0.on_bind(request).await
+    }
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        self.0.handle(ctx, body).await
+    }
+}
+struct AbortRoutes(Vec<tokio::task::AbortHandle>);
+impl Drop for AbortRoutes {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn module_registers_and_serves_ts_baseline_without_synapse_loaded() {
+    use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
+    use subc_daemon::{
+        serve_listener, ConnectedClients, ControlHandler, Registry, Router, ServerAuth,
+    };
+    use subc_transport::{
+        generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+    };
+    let (mut handler, _, dir, project) = fixture_handler(true);
+    mc_store::private_permissions::tighten_directory(dir.path(), true);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let connection_file = dir.path().join("subc-connection.json");
+    let connection = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+        }],
+        key: generate_key().unwrap(),
+        daemon_id: generate_daemon_id().unwrap(),
+        pid: std::process::id(),
+        daemon_ver: "retrieval-parity".into(),
+    };
+    write_atomic(&connection_file, &connection).unwrap();
+    let clients = ConnectedClients::new();
+    let control = Arc::new(
+        ControlHandler::new(Arc::new(Registry::default())).with_connected_clients(clients.clone()),
+    );
+    let router = Arc::new(Router::with_control_handler(control));
+    let auth = ServerAuth::new(connection.key, connection.daemon_id, connection.daemon_ver)
+        .with_connected_clients(clients);
+    let daemon = tokio::spawn(serve_listener(listener, router, auth));
+    handler.retrieval_reranker = Some(Arc::new(crate::retrieval_store::RerankTransport {
+        connection_file: connection_file.clone(),
+        target: RouteTargetConfig::default()
+            .target(route_targets::RegisteredRoute::SynapseRerank)
+            .unwrap(),
+    }));
+    let (_, serve) = subc_client_rs::serve_with_handle(
+        &connection_file,
+        manifest(DEFAULT_MODULE_ID),
+        SharedRetrievalHandler(Arc::new(handler)),
+    )
+    .await
+    .unwrap();
+    let module = tokio::spawn(serve);
+    let _abort = AbortRoutes(vec![daemon.abort_handle(), module.abort_handle()]);
+    let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
+        .await
+        .unwrap();
+    let case = &vectors()["cases"][6];
+    let bytes = consumer
+        .call(
+            route_targets::catalog_provider_target_for_test(),
+            subc_protocol::BindIdentity::new(
+                project,
+                session_resolver::RUNNER_BIND_HARNESS,
+                "retrieval-session",
+            ),
+            serde_json::to_vec(&search_request(case)).unwrap(),
+            CallOptions::default(),
+        )
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(identity_order(&body), case["hits"]);
+    assert_eq!(
+        body["source_availability"]["memory"],
+        json!({"status":"available"})
+    );
+    consumer.close().await;
 }
