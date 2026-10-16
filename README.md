@@ -368,6 +368,51 @@ bun run format      # Format (Biome)
 
 Dream execution requires a live OpenCode server (the dreamer creates ephemeral child sessions). Use `/ctx-dream` inside OpenCode for on-demand maintenance.
 
+### Upgrade rehearsal
+
+On Linux, rehearse the released **v0.49.0 context.db schema 95 / store.db schema 63** pair
+against the checked-out candidate with one command:
+
+```sh
+bun scripts/rehearse-upgrade.ts
+# Or use an operator-supplied, offline copy containing both databases:
+bun scripts/rehearse-upgrade.ts --snapshot /path/to/offline-store-pair
+```
+
+Requires Bun ≥1.4.0, Cargo/Rust, GNU `/usr/bin/time`, the local `v0.49.0` tag,
+and offline dependencies for both revisions. If a runner does not carry tags,
+export `git archive v0.49.0 -o /path/to/release.tar` first and pass
+`--release-archive /path/to/release.tar`. No download or live daemon is needed.
+The release plugin creates the synthetic fixture through its own writers:
+20 sessions, one with 150,000 indexed messages and 2,300 compartments,
+1,000 memories, commits and 384-dimensional embeddings, plus session/smart notes.
+The released Rust store writer creates companion cache-state rows, including
+79,750 frozen lineage decisions.
+
+All stores, source extraction, placed binaries and execution evidence stay under
+`$TMPDIR/magic-context/upgrade-rehearsal/run-*/`. Snapshot inputs are opened read-only
+and serialized into that root; supply an already quiescent pair because two
+independent database copies cannot establish a cross-file snapshot. Live
+Magic Context/OpenCode storage roots and database symlinks are refused.
+
+The harness measures wall time and peak RSS, compares old rows and both schema
+fingerprints against fresh bootstraps, compares the default context prefix blocks
+(m[0] history/memory baseline and m[1] updates/notes) for five
+sessions, probes old plugin/store/binary refusal without DB/WAL writes, kills
+uncommitted migrations at nine transaction barriers and reopens, and checks
+integrity, file size and WAL checkpoints. Prompt comparisons use the real prefix
+renderer with a frozen clock and empty project-docs directory, not a live
+provider request. New migration effects require explicit manifest review rather
+than an automatic data-loss allowance.
+
+Each run writes an **uncommitted** dated report to
+`.cortexkit/internal-docs/reports/upgrade-rehearsal-YYYY-MM-DD.md` (`--report`
+overrides the destination), recording measurements, table inventories, checks,
+refusals and differences before deleting the temporary execution root. Any
+unapproved difference, refusal failure or incomplete check returns exit 1;
+findings name the database/table, migration range and first differing row or
+schema entry. Product code is not repaired by the harness.
+
 ### Mutation catalogue
 
 A passing safety test proves little until it has been seen to fail. [`mutations.toml`](mutations.toml) is the checked-in catalogue: each row deliberately breaks one guard in production code and names the test that must fail because of it, so a guard cannot quietly stop guarding. A row earns its place by guarding a silent, costly failure: a prompt-cache bust, a refusal that must fail closed, a wire contract, crash safety, data loss, file permissions. Every exactly-once guard (a lease, a compare-and-set clear) has at least one row through the real production path. Style and cosmetics do not get rows.

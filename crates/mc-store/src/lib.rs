@@ -54,6 +54,9 @@ pub use provider_preparation::{
 pub use provider_resident_read::ProviderResidentAuthority;
 pub mod provider_records;
 pub mod retrieval_vectors;
+#[cfg(test)]
+#[path = "../tests/support/upgrade_rehearsal.rs"]
+mod upgrade_rehearsal;
 pub use provider_records::ProviderSessionKey;
 pub mod score_projection;
 pub mod single_store_domain;

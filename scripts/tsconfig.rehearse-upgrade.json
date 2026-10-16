@@ -1,0 +1,15 @@
+{
+	"extends": "../packages/pi-plugin/tsconfig.json",
+	"compilerOptions": {
+		"typeRoots": ["../packages/plugin/node_modules/@types"],
+		"types": ["node", "bun"]
+	},
+	"include": [
+		"rehearse-upgrade.ts",
+		"rehearse-upgrade.test.ts",
+		"lib/upgrade-audit.ts",
+		"lib/upgrade-host.ts"
+	],
+	"exclude": [],
+	"references": []
+}
