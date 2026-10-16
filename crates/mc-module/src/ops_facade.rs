@@ -867,4 +867,9 @@ mod tests {
         );
         assert!(store.load_meta("ops-a").unwrap().meta.soft_refresh_pending);
     }
+
+    mod review {
+        use super::*;
+        include!("tests/ops_facade_review.rs");
+    }
 }

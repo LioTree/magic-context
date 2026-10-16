@@ -346,4 +346,9 @@ mod tests {
         }
         assert_eq!(seen, (1..=8).collect::<Vec<_>>());
     }
+
+    mod review {
+        use super::*;
+        include!("command_ledger_review_tests.rs");
+    }
 }
