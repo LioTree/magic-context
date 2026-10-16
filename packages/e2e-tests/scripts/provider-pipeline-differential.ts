@@ -548,15 +548,32 @@ fn provider_pipeline_driver() {
                     // Commit probes below check direct-dispatch correctness only;
                     // end-to-end timings always use the shipping transport above.
                     let _commit_probe = (cmd["commit_probe"] == true).then(|| mc_store::commit_probe::Guard::install(rig.store.clone()));
-                    if _commit_probe.is_some() || rig.commit_probe.is_some() { mc_store::commit_probe::take(); }
+                    let correctness_probe = _commit_probe.is_some() || rig.commit_probe.is_some();
+                    let historian_before = rig.handler.provider_historian_budget.stats();
+                    if correctness_probe {
+                        mc_store::commit_probe::take();
+                        crate::providers::hook_probe::take();
+                    }
                     let module_started = std::time::Instant::now();
                     let cpu_started = cpu_time::ProcessTime::now();
                     match rig.handler.dispatch_value(channel, request).await {
                         HandlerOutcome::Response(bytes) => {
                             if cmd["settle_tasks"] == true { tokio::task::yield_now().await; }
-                            if _commit_probe.is_some() || rig.commit_probe.is_some() {
+                            if correctness_probe {
+                                let direct_dispatch_ms = module_started.elapsed().as_secs_f64()*1000.0;
+                                let historian_after = rig.handler.provider_historian_budget.stats();
+                                let historian_during = historian_before["active"] != 0 || historian_before["queued"] != 0
+                                    || historian_after["active"] != 0 || historian_after["queued"] != 0
+                                    || historian_after["completed"] != historian_before["completed"];
                                 let raw = String::from_utf8(bytes).unwrap();
-                                println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{},\"correctness_probe\":true,\"commit_probe\":{}}}", raw, serde_json::to_string(&raw).unwrap(),serde_json::to_string(&mc_store::commit_probe::take()).unwrap());
+                                // The legacy WAL assertions read module_ms; both duration
+                                // fields cover direct dispatch, never the shipping adapter.
+                                let result = json!({"ok":serde_json::from_str::<Value>(&raw).unwrap(),"raw":raw,
+                                    "correctness_probe":true,"measurement_kind":"direct_dispatch_wal_correctness",
+                                    "direct_dispatch_ms":direct_dispatch_ms,"module_ms":direct_dispatch_ms,
+                                    "historian_before":historian_before,"historian_after":historian_after,"historian_during":historian_during,
+                                    "hook_stages":crate::providers::hook_probe::take(),"commit_probe":mc_store::commit_probe::take()});
+                                println!("PROVIDER_DRIVER={}",result);
                                 std::io::stdout().flush().unwrap();
                                 continue;
                             }
@@ -691,6 +708,7 @@ export function buildDriver(directory: string): string {
 }
 
 export class Driver {
+    concurrentTimingFleetCalls = 0;
     private child;
     private lines;
     private stderr;
@@ -810,6 +828,7 @@ export class Driver {
     }
     async send(command: Record<string, unknown>): Promise<any> {
         if (this.killed) throw new Error(`Rust driver killed at ${this.killPoint}`);
+        if (command.op === "concurrent_calls") this.concurrentTimingFleetCalls++;
         this.child.stdin.write(`${JSON.stringify(command)}\n`);
         await this.child.stdin.flush();
         const reply = await this.lines.next();

@@ -15,7 +15,10 @@ const quantiles = (values: number[]) => values.length ? ({ samples: values.lengt
 /** One runner, one closed seed, three startup budgets. Never opens a live store. */
 export async function historianHookTiming(sessions = 75, samples = 600) {
     assert.equal(process.platform, "linux");
-    assert.ok(sessions >= 24, "16 hook sessions and eight fold sessions must be disjoint");
+    const warmWal = process.env.MC_WARM_WAL_PROBE === "1";
+    const coldOnly = warmWal || process.env.MC_COLD_HOOK_ONLY === "1";
+    if (coldOnly) assert.ok(Number.isInteger(sessions) && sessions > 0, "isolated WAL probes need fixture sessions");
+    else assert.ok(sessions >= 24, "16 hook sessions and eight fold sessions must be disjoint");
     process.env.MC_POLICY_SUMMARY_SKIP_FULL_CHECK = "1";
     process.env.MC_PROVIDER_DRIVER_QUIET = "1";
     process.env.MC_TEST_HISTORIAN_HOLD = "1";
@@ -51,6 +54,7 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
         db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); db.close();
     }
     const batches: unknown[] = [];
+    let concurrentTimingFleetCalls = 0;
     if (process.env.MC_COLD_HOOK_STRACE_OUT) process.env.MC_COMMIT_STRACE_OUT = process.env.MC_COLD_HOOK_STRACE_OUT;
     const warmPair = process.env.MC_WARM_WAL_PAIR === "1";
     const paired = process.env.MC_COLD_HOOK_PAIR === "1" || warmPair;
@@ -90,23 +94,23 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
                 mkdirSync(directory);
                 for (const name of ["store.db", "context.db"]) copyFileSync(join(seedDirectory, name), join(directory, name));
                 startup.push(await driver.send({ op: "create", rig, harness: "opencode", directory, project_root: join(seedDirectory, "project"),
-                    skip_wal_prime: skipPrime, commit_probe: process.env.MC_COLD_HOOK_ONLY === "1",
+                    skip_wal_prime: skipPrime, commit_probe: coldOnly,
                     wal_sync_delay_ms: Number(process.env.MC_COLD_HOOK_SYNC_DELAY_MS ?? 0),
                     memory_enabled: true, resident_enabled: true, resident_pool: "fleet", historian_concurrency: mode === "budget1" ? 1 : 2 }));
                 if (paired && mode !== "held") await driver.send({ op: "historian_requeue", rig: "load-0", prefix: "load-" });
-                const first = await driver.send({ op: "call", rig, timing: true,
-                    commit_probe: process.env.MC_COLD_HOOK_ONLY === "1",
+                const first = await driver.send({ op: "call", rig, timing: !coldOnly,
+                    commit_probe: coldOnly,
                     body: { method: "transform.hook", params: { ...hook, request_id: `cold-${index}` } } });
                 cold.push(first);
                 if (first.error) {
                     assert.ok(first.error.message.startsWith("resident_not_ready: rebuild completed;"), JSON.stringify(first));
-                    const retry = await driver.send({ op: "call", rig, timing: true,
+                    const retry = await driver.send({ op: "call", rig, timing: !coldOnly, commit_probe: coldOnly,
                         body: { method: "transform.hook", params: { ...hook, request_id: `retry-${index}` } } });
                     assert.ok(!retry.error, JSON.stringify(retry));
                 }
             }
             const coldAfter = systemSample();
-            if (process.env.MC_WARM_WAL_PROBE === "1") {
+            if (warmWal) {
                 for (let index = 0; index < sessions; index++) await driver.send({ op: "wal_prime_mode", rig: `fleet-${index}`, enabled: !lane.startsWith("before-") });
                 const foldApplied = new Map<string, typeof applied>();
                 for (let index = 1; samples > 0 && index <= 4; index++) {
@@ -122,7 +126,7 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
                 const before = systemSample();
                 const checkpoint = await driver.send({ op: "wal_restart", rig: "fleet-0" });
                 assert.ok(checkpoint.checkpoint[1] > 0 && checkpoint.checkpoint[1] === checkpoint.checkpoint[2], "maintenance must fully drain WAL");
-                const drained = await driver.send({ op: "call", rig: "fleet-0", timing: true,
+                const drained = await driver.send({ op: "call", rig: "fleet-0", commit_probe: true,
                     body: { method: "transform.hook", params: { ...hook, request_id: "after-drain" } } });
                 assert.ok(!drained.error && drained.hook_stages.cold_rebuild < 1, "after-drain hook must be warm");
                 const warm: any[] = [], folds: any[] = [];
@@ -131,7 +135,7 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
                     if (index % 10 === 0) {
                         const rig = `fleet-${index / 10 % 4 + 1}`;
                         await driver.send({ op: "event", rig, event: "realistic_visible_delta", sample: index });
-                        const fold = await driver.send({ op: "call", rig, timing: true, commit_probe: true,
+                        const fold = await driver.send({ op: "call", rig, commit_probe: true,
                             body: { method: "compaction.step", params: { ...base, messages: [], request_id: `wal-fold-${index}`,
                                 step_id: `wal-fold-${index}`, last_applied: foldApplied.get(rig) } } });
                         assert.ok(!fold.error, JSON.stringify(fold));
@@ -139,19 +143,20 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
                         folds.push(fold);
                     }
                     await driver.send({ op: "settle", rig: "fleet-0" });
-                    const row = await driver.send({ op: "call", rig: "fleet-0", timing: true,
+                    const row = await driver.send({ op: "call", rig: "fleet-0", commit_probe: true,
                         body: { method: "transform.hook", params: { ...hook, request_id: `wal-warm-${index}` } } });
                     assert.ok(!row.error && row.hook_stages.cold_rebuild < 1, "recurrence samples must remain warm");
                     warm.push(row);
                 }
                 const maintenance = await driver.send({ op: "wal_flush", rig: "fleet-0" });
                 const waits = warm.map(row => row.commit_probe.milliseconds.maintenance_writer_wait ?? 0).filter(ms => ms > 0);
-                const batch = { lane, mode, samples, checkpoint, drained: { ...drained, ok: undefined, raw: undefined },
+                const batch = { lane, mode, measurement_kind: "direct_dispatch_wal_correctness", samples, checkpoint, drained: { ...drained, ok: undefined, raw: undefined },
                     warm: quantiles(warm.map(row => row.module_ms)), fold: quantiles(folds.map(row => row.module_ms)),
                     maintenance_wait: quantiles(waits), maintenance_wait_total_ms: waits.reduce((a, b) => a + b, 0), maintenance_wait_max_ms: Math.max(0, ...waits),
                     header_syncs: warm.filter(row => row.commit_probe.calls.wal_sync_flags_2 > 0).map(({ ok, raw, ...row }) => row),
                     active: warm.filter(row => row.historian_before.active > 0 || row.historian_after.active > 0).length,
                     maintenance, before, after: systemSample() };
+                assert.equal(driver.concurrentTimingFleetCalls, 0, "WAL correctness probes must not launch the concurrent timing fleet");
                 batches.push(batch);
                 console.log(`WARM_WAL_BATCH=${JSON.stringify(batch)}`);
                 continue;
@@ -159,10 +164,11 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
             if (process.env.MC_COLD_HOOK_ONLY === "1") {
                 const active = cold.filter(row => row.historian_before?.active > 0 || row.historian_after?.active > 0);
                 if (paired && mode !== "held") assert.ok(active.length > 0, "cold batch must overlap admitted historians");
-                const batch = { lane, mode, sessions, cold: quantiles(cold.map(row => row.module_ms)),
+                const batch = { lane, mode, measurement_kind: "direct_dispatch_wal_correctness", sessions, cold: quantiles(cold.map(row => row.module_ms)),
                     active_cold: quantiles(active.map(row => row.module_ms)), startup,
                     before: coldBefore, after: coldAfter, psi: psiDelta(coldBefore, coldAfter),
                     rows: cold.map(({ ok, raw, ...row }) => row) };
+                assert.equal(driver.concurrentTimingFleetCalls, 0, "WAL correctness probes must not launch the concurrent timing fleet");
                 batches.push(batch);
                 console.log(`COLD_HOOK_BATCH=${JSON.stringify(batch)}`);
                 continue;
@@ -281,11 +287,16 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
             batches.push(batch);
             writeFileSync(join(work, `${mode}.json`), JSON.stringify({ batch, cold, warm }, null, 2));
             console.log(`HISTORIAN_HOOK_BATCH=${JSON.stringify(batch)}`);
-        } finally { await driver.close(); }
+        } finally {
+            concurrentTimingFleetCalls += driver.concurrentTimingFleetCalls;
+            await driver.close();
+        }
     }
-    const result = { bun: Bun.version, cpus: availableParallelism(), work, batches };
+    const result = { bun: Bun.version, cpus: availableParallelism(), work, batches,
+        concurrent_timing_fleet_calls: concurrentTimingFleetCalls,
+        measurement_kind: coldOnly ? "direct_dispatch_wal_correctness" : "shipping_adapter_timing" };
     if (process.env.MC_HOOK_TIMING_OUT) writeFileSync(process.env.MC_HOOK_TIMING_OUT, JSON.stringify(result, null, 2));
-    console.log(`HISTORIAN_HOOK_SUMMARY=${JSON.stringify(batches.map((batch: any) => ({ mode: batch.mode,
+    if (!coldOnly) console.log(`HISTORIAN_HOOK_SUMMARY=${JSON.stringify(batches.map((batch: any) => ({ mode: batch.mode,
         stress: batch.stress.map((block: any) => ({ width: block.width, hook: block.hook,
             e2e: block.submitted_to_response, warm_hook: block.warm_hook, warm_e2e: block.warm_submitted_to_response,
             cold_hook_calls: block.cold_hook_calls, unresident_hook_calls: block.unresident_hook_calls,

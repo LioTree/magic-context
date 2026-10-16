@@ -1,6 +1,23 @@
 import { test, expect } from "bun:test";
 import { historianHookTiming } from "./provider-historian-hook-timing";
 
+test.skipIf(process.platform !== "linux")("ordinary timing requires disjoint 16-hook and eight-fold sessions", async () => {
+    const cold = process.env.MC_COLD_HOOK_ONLY;
+    const warm = process.env.MC_WARM_WAL_PROBE;
+    delete process.env.MC_COLD_HOOK_ONLY;
+    delete process.env.MC_WARM_WAL_PROBE;
+    try {
+        await expect(historianHookTiming(23, 0)).rejects.toThrow(
+            "16 hook sessions and eight fold sessions must be disjoint",
+        );
+    } finally {
+        if (cold === undefined) delete process.env.MC_COLD_HOOK_ONLY;
+        else process.env.MC_COLD_HOOK_ONLY = cold;
+        if (warm === undefined) delete process.env.MC_WARM_WAL_PROBE;
+        else process.env.MC_WARM_WAL_PROBE = warm;
+    }
+});
+
 // Opt in because reproducing a realistic rebuild needs 17,000 messages and an
 // optimized Rust driver build, rather than a cheap unit-test fixture.
 const regression = process.env.MC_RUN_COLD_COMMIT_REGRESSION === "1" ? test : test.skip;
@@ -10,10 +27,13 @@ regression("restarted WAL sync delay is paid at startup, not by the first hook",
     process.env.MC_COLD_HOOK_SYNC_DELAY_MS = "1700";
     try {
         const result = await historianHookTiming(2, 0);
+        expect(result.concurrent_timing_fleet_calls).toBe(0);
+        expect(result.measurement_kind).toBe("direct_dispatch_wal_correctness");
         for (const batch of result.batches as any[]) {
             for (let index = 0; index < batch.rows.length; index++) {
                 const row = batch.rows[index];
                 const startup = batch.startup[index];
+                expect(row.correctness_probe).toBe(true);
                 expect(row.error).toBeUndefined();
                 if (batch.lane.startsWith("after-")) {
                     expect(startup.startup_io.calls.injected_wal_sync_delay).toBe(1);
@@ -38,7 +58,10 @@ restart("warm hook after drained maintenance checkpoint does not sync a WAL head
     process.env.MC_WARM_WAL_PAIR = "1";
     try {
         const result = await historianHookTiming(5, 0);
+        expect(result.concurrent_timing_fleet_calls).toBe(0);
+        expect(result.measurement_kind).toBe("direct_dispatch_wal_correctness");
         for (const batch of result.batches as any[]) {
+            expect(batch.drained.correctness_probe).toBe(true);
             expect(batch.checkpoint.checkpoint[1]).toBeGreaterThan(0);
             expect(batch.checkpoint.checkpoint[1]).toBe(batch.checkpoint.checkpoint[2]);
             const syncs = batch.drained.commit_probe.calls.wal_sync_flags_2 ?? 0;
