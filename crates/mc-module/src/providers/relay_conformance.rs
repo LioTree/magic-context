@@ -123,7 +123,7 @@ async fn pending_watermark_oracle() {
         return;
     };
     let root = PathBuf::from(root);
-    let allowed = std::env::temp_dir().join("magic-context/bridge-pending-watermark");
+    let allowed = std::env::temp_dir().join("magic-context/bridge-tag-reference");
     assert!(root.starts_with(&allowed), "probe stores must be synthetic");
     std::fs::create_dir_all(&root).unwrap();
     let mc = handler(&root);

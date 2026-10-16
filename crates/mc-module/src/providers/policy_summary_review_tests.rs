@@ -1292,3 +1292,50 @@ fn changing_the_moved_row_through_policy_json_replays_exactly() {
     assert_eq!(fixture.logged_changes(), 1);
     assert_clean(&fixture.hook(false).unwrap(), true);
 }
+
+#[test]
+fn bridge_reference_renderer_hints_exclude_unserved_tags_in_full_and_summary_paths() {
+    let mut part = policy_part(
+        "m1",
+        1,
+        0,
+        "tool_result",
+        "assistant",
+        "read",
+        Some("arc".into()),
+        Some(("tool_result", 42)),
+        1000,
+        false,
+    );
+    let policy = serde_json::json!({"protected_tokens":0,"protected_tools":{"read":0}});
+    let tools = BTreeMap::from([("read".into(), 0)]);
+    for served in [false, true] {
+        part.served = served;
+        let mut parts = vec![part.clone()];
+        for number in 43..=45 {
+            parts.push(policy_part(
+                &format!("m{number}"),
+                number as u64,
+                0,
+                "tool_result",
+                "assistant",
+                "read",
+                Some(format!("arc{number}")),
+                Some(("tool_result", number)),
+                1000,
+                true,
+            ));
+        }
+        let expected = if served {
+            vec![(42, "read".into())]
+        } else {
+            Vec::new()
+        };
+        let full =
+            transform::channel1_inputs_from_parts(&parts, &policy, 0, &tools, true, false, None);
+        assert_eq!(full.hint, expected);
+        let settings = Settings::resolve(&policy, 0, &tools, false, None);
+        let summary = build(&parts, &settings, "fixture".into(), None).unwrap();
+        assert_eq!(merged_hint(&summary.hint), expected);
+    }
+}

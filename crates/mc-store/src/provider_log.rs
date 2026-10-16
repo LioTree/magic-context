@@ -495,6 +495,50 @@ pub fn consume_provider_drops_tx(
     Ok(())
 }
 
+pub(crate) fn referenced_provider_drop_numbers_tx(
+    conn: &Connection,
+    key: &ProviderSessionKey,
+    drop_ids: &[i64],
+) -> rusqlite::Result<Vec<i64>> {
+    let Some(c) = conversation_tx(conn, key)? else {
+        return Ok(Vec::new());
+    };
+    let plan: Value = parse(&c.params_json)?;
+    if !matches!(key.harness.as_str(), "opencode" | "opencode2")
+        || plan["serializer_profile"] != "opencode-aisdk"
+    {
+        return Ok(Vec::new());
+    }
+    let mut numbers = Vec::new();
+    for (ancestor, cut) in ancestry_tx(conn, &key.conversation_key(), &c.lineage_id)? {
+        let mut query = conn.prepare_cached(
+            "SELECT p.tag_number FROM mc_provider_pending_drops_v1 p
+             JOIN mc_provider_hook_answers_v1 a ON a.conv_key=p.conv_key
+             JOIN json_each(a.tags_json) t ON json_extract(t.value,'$.number')=p.tag_number
+             JOIN pending_agent_drops d ON d.session_id=?1 AND d.target_id=json_extract(t.value,'$.block_id')
+             WHERE p.conv_key=?2 AND a.lineage_id=?3 AND a.ordinal<=?4
+             AND a.state IN ('pending','live') AND a.legacy_json IS NULL AND d.id=?5"
+        )?;
+        for id in drop_ids {
+            numbers.extend(
+                query
+                    .query_map(
+                        params![
+                            c.engine_namespace,
+                            key.conversation_key(),
+                            ancestor.lineage_id,
+                            as_i64(cut)?,
+                            id
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+    }
+    Ok(numbers)
+}
+
 /// When a hook refreezes the channel-1 tail-hygiene baseline, every part in
 /// the new frozen prefix stores the measurement it was frozen with. Rows whose
 /// stored measurement already has the same text are left unwritten. Each
@@ -1053,6 +1097,20 @@ impl McStore {
                 if known {return Ok(true)}
             }
             Ok(false)
+        })?)
+    }
+
+    /// Numbers reserved by hook answers are private until clean delivery. Tool
+    /// results must not disclose them: a bridge reduction reference is evidence
+    /// that the model received the tagged hook bytes, not a search/status leak.
+    pub fn unserved_provider_tag_numbers(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<std::collections::BTreeSet<i64>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut query = conn.prepare_cached("SELECT json_extract(t.value,'$.number') FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) t WHERE a.conv_key=?1 AND a.state<>'live' AND a.legacy_json IS NULL")?;
+            let rows = query.query_map([key.conversation_key()], |row| row.get(0))?.collect();
+            rows
         })?)
     }
 
@@ -1645,6 +1703,35 @@ impl McStore {
             let mut q=conn.prepare("SELECT tag_number FROM mc_provider_pending_drops_v1 WHERE conv_key=?1 ORDER BY tag_number")?;
             let rows=q.query_map([key.conversation_key()], |r| crate::provider_meters::read_row(|| r.get(0)))?.collect();rows
         })?)
+    }
+
+    /// A held rebuild can forward drops before a later fork or burn invalidates
+    /// their answers. Remove those forwarded targets before the engine can apply
+    /// them to a different message reusing the same block ID in the new branch.
+    pub fn reconcile_provider_drop_targets(
+        &self,
+        key: &ProviderSessionKey,
+        eligible: &[String],
+    ) -> Result<(), McStoreError> {
+        let eligible =
+            serde_json::to_string(eligible).map_err(|e| McStoreError::Serde(e.to_string()))?;
+        self.inner.with_conn_fenced(|conn| {
+            let Some(c) = conversation_tx(conn, key)? else { return Ok(()) };
+            conn.execute(
+                "DELETE FROM pending_agent_drops WHERE session_id=?1
+                 AND target_id NOT IN (SELECT value FROM json_each(?3))
+                 AND target_id IN (
+                   SELECT json_extract(t.value,'$.block_id')
+                   FROM mc_provider_hook_answers_v1 a,json_each(a.tags_json) t
+                   WHERE a.conv_key=?2 AND a.legacy_json IS NULL
+                   AND (a.state='burned' OR EXISTS (
+                     SELECT 1 FROM mc_provider_pending_drops_v1 p
+                     WHERE p.conv_key=a.conv_key AND p.tag_number=json_extract(t.value,'$.number'))))",
+                params![c.engine_namespace, key.conversation_key(), eligible],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
     }
 }
 

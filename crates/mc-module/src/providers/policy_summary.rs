@@ -229,6 +229,9 @@ impl Settings {
     /// numbers deactivate parts) and the resolved settings.
     fn key(&self, index: &ProviderPolicyIndex<'_>) -> String {
         serde_json::json!([
+            // Older summaries could retain unserved hint candidates. Rebuild
+            // them before any cached hint can disclose a pending number.
+            "served-hints-v1",
             index.ancestry(),
             index.engine_namespace(),
             self.coverage,
@@ -396,6 +399,7 @@ fn candidate(
 ) -> Option<(u8, HintEntry)> {
     let number = part.tag_number?;
     (part.tag_kind.as_deref() == Some("tool_result")
+        && part.served
         && part.active
         && !part.reduced
         && settings.tail(part)

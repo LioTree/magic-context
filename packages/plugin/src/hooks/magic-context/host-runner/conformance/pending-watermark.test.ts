@@ -13,7 +13,7 @@ import { ProviderClient } from "../provider-client";
 
 const SESSION = "relay-v1";
 const ORACLE = "providers::relay_conformance::pending_watermark_oracle";
-const base = join(tmpdir(), "magic-context/bridge-pending-watermark");
+const base = join(tmpdir(), "magic-context/bridge-tag-reference");
 
 function startOracle(root: string) {
     const child = Bun.spawn(
@@ -425,18 +425,26 @@ test("real bridge pending watermark versus clean control over 160 tool turns", a
             ).toBe("Force85");
             expect(run.intervals.at(-1).snapshot.counts.mc_provider_hook_answers_v1).toBe(477);
         }
-        expect(pending.progress.at(-1).state.queued).toEqual([
-            { tag_number: 53 },
-            { tag_number: 203 },
-            { tag_number: 383 },
-        ]);
-        expect(pending.progress.at(-1).state.consumed).toEqual([]);
-        expect(clean.progress.at(-1).state.queued).toEqual([]);
-        expect(clean.progress.at(-1).state.consumed).toEqual([
-            { tag_number: 53 },
-            { tag_number: 203 },
-            { tag_number: 383 },
-        ]);
+        for (const run of [pending, clean]) {
+            expect(run.progress.at(-1).state.queued).toEqual([]);
+            expect(run.progress.at(-1).state.consumed).toEqual([
+                { tag_number: 53 },
+                { tag_number: 203 },
+                { tag_number: 383 },
+            ]);
+            expect(
+                run.progress
+                    .filter(
+                        (row, i) =>
+                            row.state.consumed.length >
+                            (run.progress[i - 1]?.state.consumed.length ?? 0),
+                    )
+                    .map((row) => row.turn),
+            ).toEqual([60, 120, 150]);
+            expect(run.intervals.find((row) => row.turn === 30).status.pending_drop_count).toBe(1);
+            expect(run.intervals.at(-1).status.pending_drop_count).toBe(0);
+            expect(run.intervals.at(-1).status.provider_applied_drop_count).toBe(3);
+        }
         expect(pending.intervals.at(-1).snapshot.answers).toEqual([{ state: "pending", n: 477 }]);
         expect(clean.intervals.at(-1).snapshot.answers).toEqual([
             { state: "live", n: 474 },

@@ -442,7 +442,18 @@ async fn drive_overlay_corpus_with(queued: bool, calibrated: bool, run: &CorpusR
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                assert!(actual==expected[&message.mid],"seed={seed:x} pass={pass} mid={} actual prefixes={:?} expected prefixes={:?} actual suffixes={:?} expected suffixes={:?}",message.mid,actual.iter().map(|(_,s)|s.chars().take(100).collect::<String>()).collect::<Vec<_>>(),expected[&message.mid].iter().map(|(_,s)|s.chars().take(100).collect::<String>()).collect::<Vec<_>>(),actual.iter().map(|(_,s)|s.chars().rev().take(180).collect::<String>()).collect::<Vec<_>>(),expected[&message.mid].iter().map(|(_,s)|s.chars().rev().take(180).collect::<String>()).collect::<Vec<_>>());
+                let without_hints = |values: &[(usize, String)]| {
+                    values
+                        .iter()
+                        .map(|(index, text)| {
+                            (
+                                *index,
+                                super::host_tests::without_delivery_dependent_hint(text),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert!(without_hints(&actual)==without_hints(&expected[&message.mid]),"seed={seed:x} pass={pass} mid={} actual prefixes={:?} expected prefixes={:?} actual suffixes={:?} expected suffixes={:?}",message.mid,actual.iter().map(|(_,s)|s.chars().take(100).collect::<String>()).collect::<Vec<_>>(),expected[&message.mid].iter().map(|(_,s)|s.chars().take(100).collect::<String>()).collect::<Vec<_>>(),actual.iter().map(|(_,s)|s.chars().rev().take(180).collect::<String>()).collect::<Vec<_>>(),expected[&message.mid].iter().map(|(_,s)|s.chars().rev().take(180).collect::<String>()).collect::<Vec<_>>());
                 comparisons += 1;
             }
             if run.frozen_reference && !queued && !calibrated {
@@ -459,13 +470,14 @@ async fn drive_overlay_corpus_with(queued: bool, calibrated: bool, run: &CorpusR
 }
 
 #[tokio::test]
-async fn randomized_and_adversarial_host_overlay_bytes_equal_full_engine_and_pre_extraction_corpus()
-{
+async fn randomized_host_overlay_matches_full_engine_except_delivery_dependent_hints_and_keeps_frozen_corpus(
+) {
     drive_overlay_corpus(false, false).await;
 }
 
 #[tokio::test]
-async fn queued_tool_and_sibling_text_releases_match_full_engine_grace_and_oldest_hints() {
+async fn queued_tool_and_sibling_text_releases_match_full_engine_grace_except_delivery_dependent_hints(
+) {
     drive_overlay_corpus(true, false).await;
 }
 
@@ -1118,7 +1130,7 @@ async fn exact_hard_model_case(
         let actual = host_message(&host, m, i as u64 + 2, 1).await;
         let text = actual["parts"][0]["state"]["output"].as_str().unwrap();
         let want = &expected[m["info"]["id"].as_str().unwrap()][0].1;
-        assert!(text==want,"exact HARD {old:?}->{new:?}, tools={tools:?}, repeats={repeats}, index={i}; actual suffix {:?}, expected suffix {:?}",text.find("<system-reminder>").map(|n|&text[n..]),want.find("<system-reminder>").map(|n|&want[n..]));
+        assert!(super::host_tests::without_delivery_dependent_hint(text)==super::host_tests::without_delivery_dependent_hint(want),"exact HARD {old:?}->{new:?}, tools={tools:?}, repeats={repeats}, index={i}; actual suffix {:?}, expected suffix {:?}",text.find("<system-reminder>").map(|n|&text[n..]),want.find("<system-reminder>").map(|n|&want[n..]));
         reminders += usize::from(want.contains("<system-reminder>"));
     }
     (appended.len(), reminders)
