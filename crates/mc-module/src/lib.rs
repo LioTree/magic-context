@@ -43,6 +43,7 @@ pub mod classify;
 pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
+mod memory_actions;
 
 /// Names reserved for scoped, non-tool management requests. These are not facade
 /// tools: adding them to the model-visible catalog would invalidate cached prefixes.
