@@ -149,12 +149,48 @@ session. The bridge integration must also **keep OpenCode's native
 auto-compaction declined while Magic Context owns compaction**; the facade does
 not install the host's compaction-decline hook on the integration's behalf.
 
-Open follow-up: add bridge marker advancement as a separate step **after view
-publication**, outside the step budget and idempotent on retry. Commit
-`context.db` coverage first, then advance the `opencode.db` marker. A crash
-between these writes must leave an untrimmed host (safe), never a trimmed host
-whose coverage Magic Context has not recorded. The native in-tree marker path
-is unchanged.
+`run()` returns `{messages,kind,receipt}`. The receipt has `request_id`,
+`delivery: "pending" | "clean"`, `lineage_id`, `served_through_ordinal`,
+`unserved_subjects`, optional `last_applied:{compaction_id,version,range:{from,to}}`,
+optional `coverage:{end_mid,ordinal}`, and optional
+`last_not_applied:{compaction_id,version,reason}`. The replaced range is half-open
+in the relay's message positions; coverage is in native raw-history coordinates.
+Do not compare the two ordinals or use the served watermark as coverage.
+
+After the carrying provider request ends, call
+`completeRequest(sessionId, receipt.request_id, {status,cleanEnd,stop_reason?})`.
+Only a terminal 200 with a clean end of stream advances the watermark (including
+a refusal stop). Headers alone, truncated streams and non-200 responses do not.
+This persists the clean receipt before returning it. `receipt(sessionId)` reloads
+the current pending/clean receipt after restart. Unknown or superseded request IDs
+do not acknowledge anything.
+
+Then call `advanceNativeMarker(sessionId, cleanReceipt, fallbackInputs)` for
+OpenCode 1. Supply the complete canonical raw window and the **current** model,
+usable context window and complete system/tool envelope, just as for fallback
+admission. The exact delivered representation must pass both the token and byte
+fit checks, preserve uncovered parts, and retain paired tool calls/results. The
+existing OpenCode writer uses its separate host connection; its 5-second deletion
+timeout is unchanged. OpenCode 2 does not have this OpenCode 1 marker integration.
+The native in-tree marker paths are unchanged.
+
+For Pi, `createPiBridgeMarkerOwner({db,reloadSession}, sessionId)` exposes
+`publish`, `complete`, `current`, and `advance(receipt, record, fallbackInputs)`.
+The relay supplies the real applied runner record, not a scalar watermark.
+`reloadSession()` must reload the current host journal and return its
+`readBranchEntries`/`appendCompaction` methods together. It runs under the shared
+MC database writer lease, so different processes cannot append concurrently;
+retry rechecks the journal before appending. All mode-3 Pi native appends for that
+session must use this owner, not the standalone context-handler appender.
+
+Receipt/cut state uses JSON in the existing host-runner table; no schema change is
+needed. Marker admission failures return `deferred` and leave valid messages
+servable. Before entering either irreversible host writer, persist `unknown` in
+a separate transaction. A killed owner releases the SQLite lease but leaves
+`unknown`, not a false no-cut acknowledgement. Retry after restart revalidates
+fit/coverage and heals deterministic OpenCode upserts or adopts Pi's already
+appended journal entry. An unknown cut blocks pre-cut fallback replay until
+recovery; it does not refuse a fresh bridge representation.
 
 The store is an independently owned handle opened by the shared storage module,
 with the ordinary WAL/NORMAL policy, foreign keys, 5-second busy timeout, private

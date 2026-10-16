@@ -1,4 +1,5 @@
 import type { MessageLike } from "../../transform-operations";
+import type { BridgeReceipt, BridgeRequestCompletion } from "../bridge-receipt";
 import type { ProviderMethod } from "../provider-client";
 import type { HookName, Subject } from "../record";
 
@@ -18,13 +19,15 @@ export type Action =
           kind: "serve";
           messages: MessageLike[];
           fault?: { hook: HookName; mode: "transport" | "timeout" };
+          defer_delivery?: true;
       }
     | { kind: "retry"; mid: string }
     | { kind: "restart"; target: "relay" | "module" }
     | { kind: "status"; admission: "accept" | "structural" | "late" | "superseded"; rebuild?: true }
     | { kind: "pi"; entries: PiEntry[] }
     | { kind: "alias"; from: string; to: string }
-    | { kind: "publish"; end_mid: string; ordinal: number; content: string };
+    | { kind: "publish"; end_mid: string; ordinal: number; content: string }
+    | ({ kind: "delivery" } & BridgeRequestCompletion);
 
 export interface Exchange {
     method: ProviderMethod;
@@ -35,6 +38,7 @@ export interface Exchange {
 }
 
 export interface Snapshot {
+    receipt: BridgeReceipt;
     served_bytes: string;
     lineage_id: string;
     served_through_ordinal: number;

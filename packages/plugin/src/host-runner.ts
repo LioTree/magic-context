@@ -27,6 +27,15 @@ export * from "./hooks/magic-context/host-runner/record";
 export type { MessageLike } from "./hooks/magic-context/transform-operations";
 
 export type BridgeAdapter = Awaited<ReturnType<typeof createBridgeAdapter>>;
+export {
+    type BridgeMarkerOutcome,
+    type BridgeNativeTarget,
+    createBridgeReceiptStore,
+} from "./hooks/magic-context/host-runner/bridge-marker";
+export type {
+    BridgeReceipt,
+    BridgeRequestCompletion,
+} from "./hooks/magic-context/host-runner/bridge-receipt";
 
 /** Construct the provider bridge explicitly; no storage or transport opens during import. */
 export async function createBridgeAdapter(

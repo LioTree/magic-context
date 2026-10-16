@@ -2,6 +2,7 @@ import type { PluginContext } from "../../../plugin/types";
 import type { V2Context } from "../../../v2/hooks/types";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
 import type { MessageLike } from "../transform-operations";
+import type { BridgeReceipt } from "./bridge-receipt";
 import type { FallbackInputs } from "./fallback-admissibility";
 import type { OpenCodeProviderOptions } from "./opencode-adapter";
 
@@ -46,6 +47,7 @@ export type BridgeStepKind = "ordinary" | "bootstrap" | "rebuild";
 export interface BridgeView {
     messages: MessageLike[];
     kind: BridgeStepKind;
+    receipt: BridgeReceipt;
 }
 
 export class StepBudgetExceededError extends Error {

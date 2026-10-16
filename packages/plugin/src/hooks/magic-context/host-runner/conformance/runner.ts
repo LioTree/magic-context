@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
 import type { MessageLike } from "../../transform-operations";
+import {
+    type BridgeReceipt,
+    type BridgeRequestCompletion,
+    bridgeReceipt,
+    completeBridgeReceipt,
+} from "../bridge-receipt";
 import { providerIncoming, providerOpFunctions, providerSubjects } from "../opencode-adapter";
 import {
     type FrozenProviderPlan,
@@ -34,6 +40,8 @@ const params = { serializer_profile: "opencode-aisdk", observation: "answer" };
 /** A fake relay drives the production adapter's projection, client and record transitions. */
 class Relay {
     record!: RecordState;
+    receipt!: BridgeReceipt;
+    private carrying = 0;
     private clock = 1_000;
     private serial = 0;
     private aliases = new Map<string, string>();
@@ -111,6 +119,7 @@ class Relay {
     }
 
     private async serve(messages: MessageLike[]) {
+        const served = this.record.served_through_ordinal;
         const scan = scanWindow(this.record, messages.map(providerIncoming));
         assert.equal(scan.exit, undefined);
         commitScan(this.record, scan);
@@ -150,7 +159,17 @@ class Relay {
             commitEntries(this.record, [
                 finishEntry(candidate, admitted, outcomes, providerOpFunctions),
             ]);
+            this.record.served_through_ordinal = served;
         }
+    }
+
+    private publishReceipt() {
+        this.receipt = bridgeReceipt(this.record, `carrying-${++this.carrying}`);
+    }
+
+    private complete(response: BridgeRequestCompletion) {
+        this.receipt = completeBridgeReceipt(this.receipt, this.record.next_ordinal - 1, response);
+        this.record.served_through_ordinal = this.receipt.served_through_ordinal;
     }
 
     private async status(
@@ -210,6 +229,7 @@ class Relay {
     }
 
     private restartRelay() {
+        this.receipt = JSON.parse(JSON.stringify(this.receipt));
         const record = this.record;
         // Serialization deliberately discards served objects, as the durable store does.
         const saved = JSON.parse(JSON.stringify({ ...record, entries: [] })) as RecordState;
@@ -243,14 +263,18 @@ class Relay {
         switch (action.kind) {
             case "bootstrap":
                 await this.bootstrap();
+                this.publishReceipt();
                 break;
             case "serve":
                 this.fault = action.fault;
                 await this.serve(action.messages);
                 this.fault = undefined;
+                this.publishReceipt();
+                if (!action.defer_delivery) this.complete({ status: 200, cleanEnd: true });
                 break;
             case "status":
                 await this.status(action.admission, action.rebuild);
+                this.publishReceipt();
                 break;
             case "restart":
                 if (action.target === "relay") this.restartRelay();
@@ -258,6 +282,9 @@ class Relay {
                 break;
             case "publish":
                 await this.oracle({ control: "publish", ...action });
+                break;
+            case "delivery":
+                this.complete(action);
                 break;
             case "retry": {
                 const entry = this.record.entries.find((entry) => entry.id === action.mid);
@@ -292,6 +319,8 @@ class Relay {
                             }) as MessageLike,
                     ),
                 );
+                this.publishReceipt();
+                this.complete({ status: 200, cleanEnd: true });
                 break;
         }
         return { action, exchanges: this.trace, expected: this.snapshot() };
@@ -301,6 +330,7 @@ class Relay {
         const record = this.record;
         return JSON.parse(
             JSON.stringify({
+                receipt: this.receipt,
                 served_bytes: JSON.stringify(assemble(record)),
                 lineage_id: record.lineage_id,
                 served_through_ordinal: record.served_through_ordinal,

@@ -50,6 +50,33 @@ export function scenarios(): { id: string; actions: Action[] }[] {
     const serve: Action = { kind: "serve", messages: [user, assistant] };
     return [
         {
+            id: "receipt-clean-stream-not-headers-or-failure",
+            actions: [
+                bootstrap,
+                { ...serve, defer_delivery: true },
+                { kind: "delivery", status: 200, cleanEnd: false },
+                { kind: "delivery", status: 502, cleanEnd: true },
+                { kind: "restart", target: "relay" },
+                { kind: "delivery", status: 200, cleanEnd: true, stop_reason: "refusal" },
+            ],
+        },
+        {
+            id: "receipt-covering-applied-view-after-clean-delivery",
+            actions: [
+                bootstrap,
+                { kind: "serve", messages: [user, message("m2", "user", "retained tail")] },
+                {
+                    kind: "publish",
+                    end_mid: "m1",
+                    ordinal: 1,
+                    content: "Published covered first user.",
+                },
+                { kind: "status", admission: "accept", rebuild: true },
+                { kind: "delivery", status: 200, cleanEnd: true },
+                { kind: "restart", target: "relay" },
+            ],
+        },
+        {
             id: "applied-once-retry-restart",
             actions: [
                 bootstrap,

@@ -36,6 +36,7 @@ import type { createRustModeTransform, HistorianHostRunnerSeam } from "../rust-m
 import { storeAheadOfBinaryFailure } from "../store-ahead-refusal";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
+import { bridgeReceipt } from "./bridge-receipt";
 import type { BridgeStep } from "./bridge-step";
 import type { BridgeStepKind } from "./bridge-types";
 import {
@@ -360,6 +361,9 @@ interface Session {
     replaceRecord?: string;
 }
 export interface OpenCodeProviderOptions {
+    /** A bridge acknowledges messages after their request finishes cleanly, not before sending it. */
+    deferServed?: boolean;
+    servedThrough?: (sessionId: string, lineageId: string) => number;
     emitMeters?: (meters: ProviderPassMeters) => void;
     now?: () => number;
     /** Await newly saved hook ops/unavailability before serving messages; context.db owns their replay. */
@@ -397,6 +401,11 @@ export function createOpenCodeProviderTransform(
     const projectionTokens = new Map<string, { generation: number; token: object }>();
     const busy = new Set<string>();
     const now = options.now ?? Date.now;
+    const commitProviderEntries: typeof commitEntries = (record, admissions) => {
+        const served = record.served_through_ordinal;
+        commitEntries(record, admissions);
+        if (options.deferServed) record.served_through_ordinal = served;
+    };
     const harness = deps.storeGeneration === "v2" ? "opencode2" : "opencode";
     const projectRoot = deps.rustModeProjectRoot ?? deps.directory ?? process.cwd();
     const configuredModule = deps.rustModeModuleClient;
@@ -587,6 +596,8 @@ export function createOpenCodeProviderTransform(
                 ? JSON.parse(stored.state.last_not_applied_json)
                 : undefined,
         });
+        if (options.deferServed)
+            record.served_through_ordinal = options.servedThrough?.(id, record.lineage_id) ?? 0;
         record.descends_from = record.ancestry.at(-1);
         if (stored.views[0]) {
             const v = stored.views[0];
@@ -1172,6 +1183,7 @@ export function createOpenCodeProviderTransform(
                 ),
                 initial,
             });
+            if (options.deferServed) r.served_through_ordinal = 0;
             if (reentry && !reentry.record.pipeline_exit?.reseed_full_request) {
                 // Setup re-entry does not authorize a new lineage by itself. Share
                 // only the covered prefix before this canonical bootstrap window;
@@ -1248,7 +1260,7 @@ export function createOpenCodeProviderTransform(
                     finishEntry(candidate, admitted, [], providerOpFunctions) as Admitted,
                 );
             }
-            commitEntries(r, admissions);
+            commitProviderEntries(r, admissions);
             save(id, s, admissions);
             sessions.set(id, s);
             registerProjection(id);
@@ -1290,7 +1302,7 @@ export function createOpenCodeProviderTransform(
                         finishEntry(candidate, admitted, [], providerOpFunctions) as Admitted,
                     );
                 }
-                commitEntries(s.record, staged);
+                commitProviderEntries(s.record, staged);
                 save(id, s, staged);
             }
         }
@@ -1581,7 +1593,7 @@ export function createOpenCodeProviderTransform(
             }
             // Burns are already carried between hooks in this pass. Do not re-add
             // subjects a later successful hook has acknowledged.
-            commitEntries(
+            commitProviderEntries(
                 s.record,
                 admissions.map((a) => ({ ...a, unserved_subjects: [] })),
             );
@@ -1721,6 +1733,25 @@ export function createOpenCodeProviderTransform(
     return {
         run,
         classifyStep,
+        receipt(id: string) {
+            const s = hydrate(id);
+            if (!s?.metadata.active || s.record.pipeline_exit)
+                throw new Error("No published bridge record for this session");
+            return bridgeReceipt(s.record);
+        },
+        acknowledgeDelivery(id: string, receipt: import("./bridge-receipt").BridgeReceipt) {
+            const s = hydrate(id);
+            if (!s || s.record.lineage_id !== receipt.lineage_id || receipt.delivery !== "clean")
+                return;
+            s.record.served_through_ordinal = Math.max(
+                s.record.served_through_ordinal,
+                receipt.served_through_ordinal,
+            );
+            save(id, s);
+        },
+        throughOrdinal(id: string): number {
+            return (hydrate(id)?.record.next_ordinal ?? 1) - 1;
+        },
         async runBudgeted(
             id: string,
             messages: MessageLike[],

@@ -355,6 +355,8 @@ function resolveCurrentProject(
 	return { projectDir, projectIdentity };
 }
 
+export { createPiBridgeMarkerOwner } from "./bridge-marker-pi";
+
 export function signalPiDeferredCompactionMarkerDrain(sessionId: string): void {
 	signalPiDeferredHistoryRefresh(sessionId);
 	signalPiDeferredMaterialization(sessionId);

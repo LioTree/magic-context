@@ -21,7 +21,7 @@ and Cargo.lock pins the Rust provider/role encoders. Use Bun 1.4.2, the reposito
 pinned version. Run the generator/regeneration test on the Linux build runner.
 No `--write` is used by tests.
 
-`mc-oracle.rs` is compiled into the mc-module library test target by the
+`crates/mc-module/src/providers/relay_conformance.rs` is compiled into the mc-module library test target by the
 `relay_conformance` test-only module in `crates/mc-module/src/providers/mod.rs`.
 `oracle.ts` invokes exactly:
 

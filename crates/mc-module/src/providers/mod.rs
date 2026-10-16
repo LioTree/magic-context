@@ -27,14 +27,13 @@ mod native_view;
 mod policy_summary;
 mod records;
 #[cfg(test)]
+mod relay_conformance;
+#[cfg(test)]
 pub(crate) mod resident;
 pub(crate) mod resident_hooks;
 mod step_transform;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-#[path = "../../../../packages/plugin/src/hooks/magic-context/host-runner/conformance/mc-oracle.rs"]
-mod relay_conformance;
 mod view_recipe;
 
 use codec::{checked_view, decode_message};

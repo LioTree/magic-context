@@ -38,7 +38,10 @@ fn handler(dir: &Path) -> McHandler {
         SessionBinding {
             connection_incarnation: 0,
             native_generation: None,
-            principal: None,
+            principal: Some(subc_protocol::Principal::Reserved {
+                module_id: "thalamus-harness".into(),
+            }),
+            scope: Some(super::host_lane_tests::scope()),
             // Compaction IDs hash the project identity; a temporary directory would change them.
             project_root: "/relay-conformance/project".into(),
             harness: "opencode".into(),
