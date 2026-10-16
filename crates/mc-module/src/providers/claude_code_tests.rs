@@ -7,6 +7,7 @@ pub(super) fn binding(root: &Path, principal: Option<subc_protocol::Principal>) 
         connection_incarnation: 0,
         native_generation: None,
         principal,
+        scope: None,
         project_root: root.into(),
         harness: "claude-code".into(),
         session: "cc".into(),
@@ -136,7 +137,7 @@ async fn cc_principal_and_profile_pair_are_both_required_and_body_cannot_spoof()
             )
             .await
         ),
-        "claude_code_lane_requires_attested_host"
+        "host_lane_requires_harness_module"
     );
     let answer = setup(&h).await;
     assert_eq!(answer["answer"], "ready");

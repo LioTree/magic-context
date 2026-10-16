@@ -69,6 +69,7 @@ mod tests {
             connection_incarnation: 0,
             native_generation: None,
             principal: None,
+            scope: None,
             project_root: PathBuf::from("/fixture"),
             harness: "claude-code".into(),
             session: "cc".into(),

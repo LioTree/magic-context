@@ -1027,7 +1027,10 @@ mod tests {
             SessionBinding {
                 connection_incarnation: 0,
                 native_generation: None,
-                principal: None,
+                principal: Some(subc_protocol::Principal::Reserved {
+                    module_id: "thalamus-harness".into(),
+                }),
+                scope: Some(crate::providers::host_lane_tests::scope()),
                 project_root: path.into(),
                 harness: "opencode".into(),
                 session: "s".into(),

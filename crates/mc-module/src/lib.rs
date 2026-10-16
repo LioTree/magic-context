@@ -293,6 +293,8 @@ pub struct SessionBinding {
     pub native_generation: Option<mc_store::provider_records::ProviderGeneration>,
     /// Identity stamped by the daemon at bind, never supplied by an RPC body.
     pub principal: Option<subc_protocol::Principal>,
+    /// Daemon-stamped scope owner and authorization, copied from the owner's scope.sync record at bind.
+    pub scope: Option<subc_protocol::scope::ScopeStamp>,
     pub project_root: PathBuf,
     pub harness: String,
     pub session: String,
@@ -15042,6 +15044,7 @@ impl ModuleHandler for McHandler {
                 connection_incarnation: 0,
                 native_generation: None,
                 principal: req.principal.clone(),
+                scope: req.scope.clone(),
                 project_root: req.identity.project_root.clone(),
                 harness: req.identity.harness.clone(),
                 session: req.identity.session.clone(),
@@ -19930,6 +19933,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         store.set_route_identity_for_test(project.to_str().unwrap(), "git:bound-project");
+        ops_facade::attest_ui_fixture(&handler, Some(&store), "git:bound-project");
         store
             .replace_compartments("ses", &[stored_comp(1, 1, 1, "m1", "owned")])
             .unwrap();
@@ -20034,6 +20038,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         store.set_route_identity_for_test(project.to_str().unwrap(), "git:bound-project");
+        ops_facade::attest_ui_fixture(&handler, Some(&store), "git:bound-project");
         let before = store.load("ses").unwrap().row_version;
         for method in ops_facade::UNPORTED.iter().copied().chain([
             non_served_contract::RETRIEVAL_METHOD,
@@ -20070,6 +20075,7 @@ mod tests {
         let handler = McHandler::new();
         let dir = tempfile::tempdir().unwrap();
         handler.bind_route(7, binding(dir.path().to_str().unwrap(), "ses"));
+        ops_facade::attest_ui_fixture(&handler, None, "git:bound-project");
         for method in non_served_contract::UI_READ_METHODS {
             let request = json!({"method":method,"v":1,"session_id":"ses"});
             assert_eq!(
@@ -20092,6 +20098,7 @@ mod tests {
     async fn owner_prep_project_scope_uses_bound_identity_not_request_fields() {
         let (handler, _store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        ops_facade::attest_ui_fixture(&handler, None, "git:bound-project");
         std::fs::write(project.join(".git"), "gitdir: /nonexistent/for/this/test\n").unwrap();
         handler
             .resolve_project_identity_for_test
@@ -21771,6 +21778,7 @@ mod tests {
             connection_incarnation: 0,
             native_generation: None,
             principal: None,
+            scope: None,
             project_root: PathBuf::from(root),
             harness: harness.to_string(),
             session: session.to_string(),

@@ -113,6 +113,15 @@ fn error(code: &str) -> HandlerOutcome {
 fn unknown() -> Value {
     json!({"value":null,"authority":"unknown","source":"not_ingested"})
 }
+
+fn respond_ui(body: Value) -> HandlerOutcome {
+    let bytes = serde_json::to_vec(&body).expect("JSON value");
+    if bytes.len() > 1024 * 1024 {
+        error("ui_reply_too_large")
+    } else {
+        HandlerOutcome::Response(bytes)
+    }
+}
 fn known(value: Value, source: &str) -> Value {
     json!({"value":value,"authority":"mc","source":source})
 }
@@ -220,6 +229,38 @@ fn capabilities() -> Value {
 }
 
 impl McHandler {
+    fn ops_binding_project(
+        &self,
+        store: &mc_store::McStore,
+        binding: &crate::SessionBinding,
+    ) -> Result<String, HandlerOutcome> {
+        // Session history can keep its previously recorded project after a
+        // directory change. Do not expose that project's saved UI jobs to a
+        // caller whose current bound checkout belongs to a different project.
+        #[cfg(test)]
+        let root = if !self
+            .resolve_project_identity_for_test
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            Ok(store
+                .route_identity_for_test(&binding.project_root.to_string_lossy())
+                .unwrap_or_else(|| binding.project_root.to_string_lossy().into_owned()))
+        } else {
+            self.project_identities.resolve(&binding.project_root)
+        };
+        #[cfg(not(test))]
+        let root = self.project_identities.resolve(&binding.project_root);
+        let root = root.map_err(|e| HandlerOutcome::Error {
+            code: e.code().into(),
+            message: e.to_string(),
+        })?;
+        let recorded = self.route_project_identity(store, binding)?;
+        if root != recorded {
+            return Err(error("project_scope_mismatch"));
+        }
+        Ok(root)
+    }
+
     pub(super) fn handle_ops_facade(
         &self,
         channel: u16,
@@ -230,6 +271,9 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
+        if let Err(outcome) = crate::providers::admit_harness_module(&binding) {
+            return outcome;
+        }
         let Some(store) = self.store.get() else {
             return if non_served_contract::UI_READ_METHODS.contains(&method)
                 || IMPLEMENTED.contains(&method)
@@ -239,20 +283,22 @@ impl McHandler {
                 non_served_route_refusal(method)
             };
         };
-        let project = if non_served_contract::PROJECT_METHODS.contains(&method) {
-            match self.route_project_identity(store, &binding) {
-                Ok(project) => Some(project),
-                Err(HandlerOutcome::Error { code, .. })
-                    if code == "store_load_failed"
-                        && non_served_contract::UI_READ_METHODS.contains(&method) =>
-                {
-                    return respond(non_served_contract::partial_state_body());
-                }
-                Err(outcome) => return outcome,
+        let project = match self.ops_binding_project(store, &binding) {
+            Ok(project) => Some(project),
+            Err(HandlerOutcome::Error { code, .. })
+                if code == "store_load_failed"
+                    && non_served_contract::UI_READ_METHODS.contains(&method) =>
+            {
+                return respond(non_served_contract::partial_state_body());
             }
-        } else {
-            None
+            Err(outcome) => return outcome,
         };
+        let project = project.expect("admitted project");
+        match store.ops_check_project(&project, &session) {
+            Ok(true) => {}
+            Ok(false) => return error("project_scope_mismatch"),
+            Err(_) => return respond(non_served_contract::partial_state_body()),
+        }
         if method == "mc.dream" {
             return self.dream_control_entry(&binding, request);
         }
@@ -260,23 +306,45 @@ impl McHandler {
             return non_served_route_refusal(method);
         }
         let result = match method {
-            "mc.ui_capabilities" => store.ops_snapshot(&session).map(|_| capabilities()),
-            "mc.read_sidebar" | "mc.read_status" | "mc.read_embed" | "mc.read_compartment_count" | "mc.read_todos" => {
-                store.ops_snapshot(&session).and_then(|snapshot| {
+            "mc.ui_capabilities" => {
+                store
+                    .ops_snapshot_in_project(&project, &session)
+                    .map(|snapshot| {
+                        if snapshot.get("error").is_some() {
+                            snapshot
+                        } else {
+                            capabilities()
+                        }
+                    })
+            }
+            "mc.read_sidebar"
+            | "mc.read_status"
+            | "mc.read_embed"
+            | "mc.read_compartment_count"
+            | "mc.read_todos" => {
+                store.ops_snapshot_in_project(&project,&session).and_then(|snapshot| {
+                    if snapshot.get("error").is_some() { return Ok(snapshot); }
                     let config = self.effective_config(&binding.project_root);
                     let mut sidebar = fields(SIDEBAR_FIELDS);
-                    sidebar["jobs"] = known(json!(store.ops_jobs(&session)?),"mc_ops_commands");
+                    sidebar["jobs"] = known(json!(store.ops_jobs_in_project(&project,&session)?),"mc_ops_commands");
                     sidebar["compaction_enabled"] = known(json!(config.compaction_enabled),"mc_config");
-                    if let Some(project) = &project { sidebar["project_identity"] = known(json!(project),"admitted_binding"); }
+                    sidebar["project_identity"] = known(json!(project),"admitted_binding");
                     let meta = &snapshot["meta"];
                     if !snapshot["row_version"].is_null() {
                         put(&mut sidebar,"compartment_count",&snapshot["compartment_count"],"context_compartments");
                         put(&mut sidebar,"boundary_present",&snapshot["boundary_present"],"mc_cache_state");
                         put(&mut sidebar,"coverage_ordinal",&meta["coverage_ordinal"],"mc_cache_state");
-                        put(&mut sidebar,"input_tokens",&meta["last_usage"]["current_total_input_tokens"],"admitted_usage");
-                        put(&mut sidebar,"context_limit",&meta["last_usage"]["context_limit_tokens"],"admitted_usage");
+                        // Older records encode an omitted token count as zero and
+                        // do not retain whether zero was measured. Publish input
+                        // and percentages only when positive input was recorded.
+                        if meta["last_usage"]["current_total_input_tokens"].as_u64().is_some_and(|v| v > 0) {
+                            put(&mut sidebar,"input_tokens",&meta["last_usage"]["current_total_input_tokens"],"admitted_usage");
+                        }
+                        if meta["last_usage"]["context_limit_tokens"].as_u64().is_some_and(|v| v > 0) {
+                            put(&mut sidebar,"context_limit",&meta["last_usage"]["context_limit_tokens"],"admitted_usage");
+                        }
                         if let (Some(input),Some(limit)) = (meta["last_usage"]["current_total_input_tokens"].as_f64(),meta["last_usage"]["context_limit_tokens"].as_f64()) {
-                            if limit > 0.0 && input >= 0.0 && input <= limit {
+                            if limit > 0.0 && input > 0.0 && input <= limit {
                                 let percent = json!(input / limit * 100.0);
                                 sidebar["usage_percentage"] = known(percent.clone(),"admitted_usage");
                                 sidebar["native_context_usage_percentage"] = known(percent,"admitted_usage");
@@ -320,40 +388,110 @@ impl McHandler {
                 })
             }
             "mc.flush" => {
-                let Some(command) = request.get("command_id").and_then(Value::as_str).filter(|id| !id.trim().is_empty() && id.len() <= 256) else { return error("bad_request"); };
+                let Some(command) = request
+                    .get("command_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty() && id.len() <= 256)
+                else {
+                    return error("bad_request");
+                };
                 let config = self.effective_config(&binding.project_root);
-                store.ops_flush(&session,command,config.compaction_enabled,crate::now_ms())
+                store.ops_flush_in_project(
+                    &project,
+                    &session,
+                    command,
+                    config.compaction_enabled,
+                    crate::now_ms(),
+                )
             }
             "mc.job_read" | "mc.job_cancel" => {
                 let command = request.get("command_id").and_then(Value::as_str);
                 let job = request.get("job_id").and_then(Value::as_str);
-                if command.is_none() && job.is_none() { return error("bad_request"); }
-                store.ops_job(&session,command,job).map(|job| match job {
-                    Some(job) if method == "mc.job_cancel" && job["state"] == "armed" => json!({"error":"cancel_unsupported"}),
-                    Some(job) if method == "mc.job_cancel" => json!({"v":1,"state":"too_late","job":job}),
-                    Some(job) => json!({"v":1,"job":job}),
-                    None => json!({"error":"job_not_found"}),
-                })
+                if command.is_none() && job.is_none() {
+                    return error("bad_request");
+                }
+                store
+                    .ops_job_in_project(&project, &session, command, job)
+                    .map(|job| match job {
+                        Some(job) if method == "mc.job_cancel" && job["state"] == "armed" => {
+                            json!({"error":"cancel_unsupported"})
+                        }
+                        Some(job) if method == "mc.job_cancel" => {
+                            json!({"v":1,"state":"too_late","job":job})
+                        }
+                        Some(job) => json!({"v":1,"job":job}),
+                        None => json!({"error":"job_not_found"}),
+                    })
             }
             "mc.ui_events" => {
-                let Some(ack) = request.get("acked_position").and_then(Value::as_i64).filter(|v| *v >= 0) else { return error("bad_request"); };
-                let limit = match request.get("limit") { None => EVENT_PAGE_LIMIT, Some(v) => match v.as_u64().filter(|v| *v > 0 && *v <= EVENT_PAGE_LIMIT as u64) { Some(v) => v as usize, None => return error("bad_request") } };
-                store.ops_events(&session,ack,limit)
+                let Some(ack) = request
+                    .get("acked_position")
+                    .and_then(Value::as_i64)
+                    .filter(|v| *v >= 0)
+                else {
+                    return error("bad_request");
+                };
+                let limit = match request.get("limit") {
+                    None => EVENT_PAGE_LIMIT,
+                    Some(v) => match v
+                        .as_u64()
+                        .filter(|v| *v > 0 && *v <= EVENT_PAGE_LIMIT as u64)
+                    {
+                        Some(v) => v as usize,
+                        None => return error("bad_request"),
+                    },
+                };
+                store.ops_events_in_project(&project, &session, ack, limit)
             }
             "mc.notice_currentness" => {
-                let Some(id) = request.get("event_id").and_then(Value::as_str) else { return error("bad_request"); };
-                store.ops_currentness(&session,id).map(|current| json!({"v":1,"policy":"current_until_withdrawn","current":current}))
+                let Some(id) = request.get("event_id").and_then(Value::as_str) else {
+                    return error("bad_request");
+                };
+                store.ops_currentness_in_project(&project,&session,id).map(|current| json!({"v":1,"policy":"current_until_withdrawn","current":current}))
             }
             _ => return non_served_route_refusal(method),
         };
         match result {
             Ok(body) => match body.get("error").and_then(Value::as_str) {
                 Some(code) => error(code),
-                None => respond(body),
+                None => respond_ui(body),
             },
             Err(_) => respond(non_served_contract::partial_state_body()),
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn attest_ui_fixture(
+    handler: &McHandler,
+    store: Option<&mc_store::McStore>,
+    project: &str,
+) {
+    let mut binding = handler.bindings.lock().unwrap().get(&7).unwrap().clone();
+    binding.principal = Some(subc_protocol::Principal::Reserved {
+        module_id: "thalamus-harness".into(),
+    });
+    binding.scope = Some(subc_protocol::scope::ScopeStamp {
+        owner: subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        scope_ref: "ui-session".into(),
+        scope_epoch: 1,
+        kind: subc_protocol::scope::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
+        attributes: Default::default(),
+        owner_authorized: true,
+    });
+    if let Some(store) = store {
+        store.with_context_conn_for_test(|conn| {
+            for session in [&binding.session,"ops-b"] {
+                conn.execute("INSERT OR REPLACE INTO session_projects(session_id,harness,project_path,updated_at) VALUES(?1,'opencode',?2,1)",rusqlite::params![session,project])?;
+            }
+            Ok(())
+        }).unwrap();
+    }
+    handler.bind_route(7, binding);
 }
 
 #[cfg(test)]
@@ -366,7 +504,7 @@ mod tests {
     fn vectors() -> Value {
         serde_json::from_str(OPS_VECTORS).unwrap()
     }
-    fn fixture() -> (McHandler, Arc<McStore>, tempfile::TempDir) {
+    pub(super) fn fixture() -> (McHandler, Arc<McStore>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
             McStore::open_for_test(&crate::dev_descriptor_at(dir.path().to_str().unwrap()))
@@ -385,6 +523,7 @@ mod tests {
                 connection_incarnation: 0,
                 native_generation: None,
                 principal: None,
+                scope: None,
                 project_root: dir.path().to_path_buf(),
                 harness: "mc-module-test".into(),
                 session: "ops-a".into(),
@@ -394,6 +533,7 @@ mod tests {
             },
         );
         store.set_route_identity_for_test(dir.path().to_str().unwrap(), "project-a");
+        attest_ui_fixture(&handler, Some(&store), "project-a");
         store
             .commit(
                 "ops-a",
@@ -839,6 +979,7 @@ mod tests {
             McStore::open_for_test(&crate::dev_descriptor_at(dir.path().to_str().unwrap()))
                 .unwrap(),
         );
+        store.with_context_conn_for_test(|conn| conn.execute("INSERT INTO session_projects(session_id,harness,project_path,updated_at) VALUES('ops-a','opencode','project-a',1)",[]).map(|_|())).unwrap();
         store
             .commit("ops-a", None, &Default::default(), &ModuleMeta::default())
             .unwrap();
@@ -866,5 +1007,126 @@ mod tests {
             1
         );
         assert!(store.load_meta("ops-a").unwrap().meta.soft_refresh_pending);
+    }
+
+    mod review {
+        use super::*;
+        include!("tests/ops_facade_review.rs");
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ui_arms_reuse_harness_scope_attestation_for_every_harness() {
+        let (handler, store, _dir) = super::tests::fixture();
+        let original = handler.bindings.lock().unwrap().get(&7).unwrap().clone();
+        let before = store.load_meta("ops-a").unwrap().row_version;
+        for harness in ["opencode", "pi"] {
+            let mut binding = original.clone();
+            binding.harness = harness.into();
+            handler.bind_route(7, binding.clone());
+            assert!(matches!(
+                handler
+                    .dispatch_value(
+                        7,
+                        json!({"v":1,"session_id":"ops-a","method":"mc.ui_capabilities"})
+                    )
+                    .await,
+                HandlerOutcome::Response(_)
+            ));
+            for failure in [
+                "no_scope",
+                "unauthorized_owner",
+                "foreign_owner",
+                "gateway_principal",
+            ] {
+                let mut denied = binding.clone();
+                match failure {
+                    "no_scope" => denied.scope = None,
+                    "unauthorized_owner" => denied.scope.as_mut().unwrap().owner_authorized = false,
+                    "foreign_owner" => {
+                        denied.scope.as_mut().unwrap().owner = subc_protocol::Principal::Reserved {
+                            module_id: "foreign".into(),
+                        }
+                    }
+                    "gateway_principal" => {
+                        denied.principal = Some(subc_protocol::Principal::Reserved {
+                            module_id: "thalamus".into(),
+                        })
+                    }
+                    _ => unreachable!(),
+                }
+                handler.bind_route(7, denied);
+                for method in non_served_contract::UI_METHODS {
+                    let reply = handler.dispatch_value(7,json!({"v":1,"session_id":"ops-a","method":method,"command_id":"denied","acked_position":0})).await;
+                    match reply {
+                        HandlerOutcome::Error { code, .. } => assert!(
+                            code == "host_lane_requires_harness_module"
+                                || code == "host_lane_scope_missing",
+                            "{code}"
+                        ),
+                        other => panic!("{failure} reached {method}: {other:?}"),
+                    }
+                }
+            }
+        }
+        assert_eq!(store.load_meta("ops-a").unwrap().row_version, before);
+        assert!(store
+            .ops_job("ops-a", Some("denied"), None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_todo_snapshot_is_explicitly_refused_before_projection() {
+        let (handler, store, _dir) = super::tests::fixture();
+        let text = json!([{"content":"x".repeat(600 * 1024),"status":"pending"}]).to_string();
+        store
+            .set_todo_state("ops-a", &text, "owner", "large")
+            .unwrap();
+        for method in ["mc.read_todos", "mc.read_status", "mc.read_sidebar"] {
+            let reply = handler
+                .dispatch_value(7, json!({"v":1,"session_id":"ops-a","method":method}))
+                .await;
+            match reply {
+                HandlerOutcome::Error { code, .. } => assert_eq!(code, "ui_snapshot_too_large"),
+                other => panic!("oversized snapshot was not refused: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn historian_credentials_never_enter_any_ui_projection() {
+        let (handler, store, _dir) = super::tests::fixture();
+        let mut loaded = store.load_meta("ops-a").unwrap();
+        loaded.meta.historian.coordinator_token = Some("private-claim-token".into());
+        loaded.meta.historian.producer_run_id = Some("private-producer-state".into());
+        store
+            .commit_meta("ops-a", loaded.row_version, &loaded.meta)
+            .unwrap();
+        store.ops_flush("ops-a", "public-job", true, 1).unwrap();
+        for method in ["mc.read_status", "mc.read_sidebar", "mc.ui_events"] {
+            let req = json!({"v":1,"session_id":"ops-a","method":method,"acked_position":0});
+            let HandlerOutcome::Response(bytes) = handler.dispatch_value(7, req).await else {
+                panic!("read failed")
+            };
+            let text = String::from_utf8(bytes).unwrap();
+            for secret in [
+                "private-claim-token",
+                "private-producer-state",
+                "coordinator_token",
+                "producer_run_id",
+            ] {
+                assert!(!text.contains(secret), "{method}: {secret}");
+            }
+        }
+        assert!(!store
+            .ops_snapshot("ops-a")
+            .unwrap()
+            .to_string()
+            .contains("private-claim-token"));
     }
 }

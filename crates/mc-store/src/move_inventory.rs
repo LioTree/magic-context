@@ -118,6 +118,62 @@ macro_rules! table {
     };
 }
 
+// Lazy UI tables are not migration prerequisites or export sections. Validate
+// their exact schema when present without requiring them in a clean store.
+const LAZY_MODULE_TABLES: &[TableInventory] = &[
+    // Transferring a session to another process establishes a new UI connection;
+    // do not export command outcomes or event acknowledgements from the old
+    // project/session connection. mc_ops_retire deletes those records when its
+    // mc_cache_state session row is removed during discard. Keep the requested
+    // refresh flag in exported metadata so the next transform still refreshes.
+    table!(
+        Module,
+        "mc_ops_commands",
+        LocalReset,
+        RowSelector::None,
+        &["project_identity", "session_id", "command_id"],
+        &[
+            "session_id",
+            "command_id",
+            "job_id",
+            "parameters",
+            "job",
+            "project_identity"
+        ],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Module,
+        "mc_ops_stream",
+        LocalReset,
+        RowSelector::None,
+        &["project_identity", "session_id"],
+        &[
+            "session_id",
+            "sequence",
+            "acked",
+            "active_command",
+            "project_identity"
+        ],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Module,
+        "mc_ops_events",
+        LocalReset,
+        RowSelector::None,
+        &["project_identity", "session_id", "sequence"],
+        &["session_id", "sequence", "event", "project_identity"],
+        &[],
+        None,
+        None
+    ),
+];
+
 /// Stable table order for the v1 stream; each store half is filtered from this
 /// explicit list. Schema discovery is validation only and never grants shipping.
 pub const TABLES: &[TableInventory] = &[
@@ -3579,7 +3635,13 @@ pub fn tables(store: Store) -> impl Iterator<Item = &'static TableInventory> {
 }
 
 pub fn entry(store: Store, table: &str) -> Option<&'static TableInventory> {
-    tables(store).find(|entry| entry.table == table)
+    tables(store)
+        .chain(
+            LAZY_MODULE_TABLES
+                .iter()
+                .filter(move |entry| entry.store == store),
+        )
+        .find(|entry| entry.table == table)
 }
 
 /// SQLite owns this namespace, including optional ANALYZE outputs. These tables
