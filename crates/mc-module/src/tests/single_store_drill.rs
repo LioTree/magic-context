@@ -91,10 +91,13 @@ async fn single_store_drill_post_migration_passes() {
     assert_eq!(hard["decision"], "HARD", "{hard}");
     assert_eq!(hard["materialize_reason"], "project_memory_epoch");
 
+    // Only a completed provider reply advances the idle clock; preparing the HARD does not.
+    let completed_at_ms = now_ms();
     let mut served = Vec::new();
     for pass in 2..=4 {
-        let response =
-            call_transform_request(&handler, request_with_usage(messages(), 1_000, 50_000)).await;
+        let mut request = request_with_usage(messages(), 1_000, 50_000);
+        request["prev_response_completed_at_ms"] = json!(completed_at_ms);
+        let response = call_transform_request(&handler, request).await;
         println!(
             "DRILL pass{pass} action={} scheduler={} digest={}",
             response["action"],

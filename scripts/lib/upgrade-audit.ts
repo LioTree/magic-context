@@ -73,7 +73,11 @@ export function inventory(path: string): Record<string, number> {
 	}
 }
 
-export function firstDifference(before: string, after: string): string | null {
+export function firstDifference(
+	before: string,
+	after: string,
+	onlyTables?: readonly string[],
+): string | null {
 	const db = new Database(after, { readonly: true });
 	try {
 		db.query("ATTACH DATABASE ? AS baseline").run(before);
@@ -83,12 +87,23 @@ export function firstDifference(before: string, after: string): string | null {
 			wr: number;
 			schema: string;
 		}[];
+		if (onlyTables) {
+			for (const name of onlyTables) {
+				if (!tables.some((table) =>
+					table.schema === "baseline" && table.name === name &&
+					(table.type === "table" || table.type === "virtual"),
+				)) {
+					throw new Error(`Preservation table not present in baseline: ${name}`);
+				}
+			}
+		}
 		for (const table of tables.sort((a, b) => a.name.localeCompare(b.name))) {
 			const name = table.name;
 			if (
 				table.schema !== "baseline" ||
 				(table.type !== "table" && table.type !== "virtual") ||
-				name.startsWith("sqlite_")
+				name.startsWith("sqlite_") ||
+				(onlyTables && !onlyTables.includes(name))
 			)
 				continue;
 			const oldColumns = db
@@ -164,4 +179,33 @@ export function integrity(path: string): {
 	} finally {
 		db.close();
 	}
+}
+
+/** Compare captured provider payload fields, not a local renderer's output. */
+export function compareServedBodies(
+	before: Record<string, unknown>,
+	after: Record<string, unknown>,
+) {
+	return Object.fromEntries(["system", "messages", "tools"].map((part) => {
+		const left = JSON.stringify(before[part]) ?? "null";
+		const right = JSON.stringify(after[part]) ?? "null";
+		const a = Buffer.from(left);
+		const b = Buffer.from(right);
+		let offset = 0;
+		while (offset < a.length && a[offset] === b[offset]) offset++;
+		const hash = (text: string) =>
+			new Bun.CryptoHasher("sha256").update(text).digest("hex");
+		return [part, {
+			equal: left === right,
+			bytesBefore: a.length,
+			bytesAfter: b.length,
+			sha256Before: hash(left),
+			sha256After: hash(right),
+			firstDifference: left === right ? null : offset,
+			beforeExcerpt: left === right ? null :
+				a.subarray(Math.max(0, offset - 60), offset + 180).toString(),
+			afterExcerpt: left === right ? null :
+				b.subarray(Math.max(0, offset - 60), offset + 180).toString(),
+		}];
+	}));
 }

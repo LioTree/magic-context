@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { firstDifference, snapshotRoot } from "./lib/upgrade-audit";
+import { compareServedBodies, firstDifference, snapshotRoot } from "./lib/upgrade-audit";
 
 function pair(): [string, string] {
 	const parent = join(tmpdir(), "magic-context", "upgrade-audit-test");
@@ -72,4 +72,40 @@ test("upgrade audit compares WITHOUT ROWID tables and skips views", () => {
 	expect(firstDifference(before, after)).toContain(
 		'durable_keys: lost/changed row {"key":"k","value":"original"}',
 	);
+});
+
+test("upgrade audit compares actual served reasoning and does not normalize changed bytes", () => {
+	const before = { system: "Keep 東京", messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "plan", signature: "signed" }] }], tools: [{ name: "ctx" }] };
+	const same = compareServedBodies(before, structuredClone(before));
+	expect(Object.values(same).every((part) => part.equal)).toBe(true);
+	const after = structuredClone(before);
+	after.messages[0].content[0].signature = "changed";
+	const changed = compareServedBodies(before, after);
+	expect(changed.system.equal).toBe(true);
+	expect(changed.tools.equal).toBe(true);
+	expect(changed.messages.equal).toBe(false);
+	expect(changed.messages.firstDifference).toBeGreaterThan(0);
+	expect(changed.messages.sha256Before).not.toBe(changed.messages.sha256After);
+	expect(changed.messages.afterExcerpt).toContain("changed");
+});
+
+test("upgrade audit distinguishes missing payload fields from served empty arrays", () => {
+	const changed = compareServedBodies({}, { system: [], messages: [], tools: [] });
+	for (const part of Object.values(changed)) {
+		expect(part.equal).toBe(false);
+		expect(part.bytesBefore).toBe(4);
+		expect(part.bytesAfter).toBe(2);
+		expect(part.firstDifference).toBe(0);
+	}
+});
+
+test("upgrade audit scopes live domain preservation without hiding changed rows or missing tables", () => {
+	const [before, after] = pair();
+	const db = new Database(after);
+	db.exec("UPDATE session_meta SET state='startup-timestamp'");
+	expect(firstDifference(before, after, ["memories"])).toBeNull();
+	db.exec("DELETE FROM memories");
+	expect(firstDifference(before, after, ["memories"])).toContain("memories: lost/changed row");
+	db.close();
+	expect(() => firstDifference(before, after, ["misspelled_table"])).toThrow("Preservation table not present in baseline");
 });

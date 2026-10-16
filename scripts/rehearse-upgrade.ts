@@ -33,7 +33,7 @@ const option = (name: string): string | undefined => {
 };
 if (args.includes("--help")) {
 	console.log(
-		"bun scripts/rehearse-upgrade.ts [--snapshot <offline-pair-directory>] [--release-archive <v0.49.0.tar>] [--report <markdown-path>]\nRequires Linux, Bun, Cargo offline dependencies and GNU /usr/bin/time. All execution and stores live under $TMPDIR/magic-context/upgrade-rehearsal/run-*/.",
+		"bun scripts/rehearse-upgrade.ts [--snapshot <offline-pair-directory>] [--release-archive <v0.49.7.tar>] [--report <markdown-path>]\nRequires Linux, Bun, Cargo offline dependencies and GNU /usr/bin/time. All execution and stores live under $TMPDIR/magic-context/rehearsal-early/run-*/.",
 	);
 	process.exit(0);
 }
@@ -44,7 +44,7 @@ for (let i = 0; i < args.length; i += 2)
 const snapshot = option("--snapshot")
 	? snapshotRoot(option("--snapshot")!)
 	: undefined;
-const parent = join(tmpdir(), "magic-context", "upgrade-rehearsal");
+const parent = join(tmpdir(), "magic-context", "rehearsal-early");
 mkdirSync(parent, { recursive: true });
 const root = realpathSync(mkdtempSync(join(parent, "run-")));
 const oldTree = join(root, "release");
@@ -68,7 +68,7 @@ const steps: {
 const findings: string[] = [];
 const evidence: Record<string, unknown> = {
 	root,
-	snapshot: snapshot ?? "synthetic v0.49.0",
+	snapshot: snapshot ?? "synthetic v0.49.7",
 	candidate: "",
 	checks: {},
 	versions: {},
@@ -92,6 +92,8 @@ const env: NodeJS.ProcessEnv = {
 	OPENCODE_DB: join(root, "unused-opencode.db"),
 	MAGIC_CONTEXT_LOG_PATH: join(root, "rehearsal.log"),
 	NODE_ENV: "test",
+	RUSTC_WRAPPER: "",
+	CARGO_BUILD_RUSTC_WRAPPER: "",
 };
 // Cargo's dependency cache is an input, not the isolated runtime HOME.
 env.CARGO_HOME = process.env.CARGO_HOME ?? join(process.env.HOME!, ".cargo");
@@ -335,7 +337,7 @@ function writeReport(): void {
 		"",
 		`Date: ${new Date().toISOString()}`,
 		`Candidate: ${evidence.candidate}`,
-		"Release source: v0.49.0 (context 95 / store 63)",
+		"Release source: v0.49.7 (context 95 / store 63)",
 		`Input: ${snapshot ?? "synthetic"}`,
 		`Temporary execution root (removed after recording this report): ${root}`,
 		`Safety findings: ${findings.length}`,
@@ -364,7 +366,8 @@ function writeReport(): void {
 		"- store 68: new provider policy summaries and triggers; no old cache reset.",
 		"- store 69: new memory projection tables; no old memory content reset.",
 		"- store 70: rebuilds mc_provider_conversations_v2 with native generation columns, preserving existing columns/identities; recreated dependent triggers.",
-		"- store 71/72: not approved by this manifest yet. The harness reports a finding until their reset/rewrite policy is reviewed; it does not silently allow data loss.",
+		"- store 71: adds policy revision/preparation caches and revision triggers; invalidates derived preparations on input changes. No release-63 table rewrite.",
+		"- store 72: discards undeployed OpenCode provider projections (introduced at 65+), adds frozen-policy facts, cut/override/view tables and a frontier invalidation trigger. These tables do not exist in released store 63; every released row remains subject to exact preservation checks.",
 		"",
 		"## Coverage",
 		"",
@@ -374,7 +377,7 @@ function writeReport(): void {
 		"",
 		"Five ordered sessions use the real old/candidate materializeM0 renderer, both m[0] and m[1], defaults, frozen clock and an empty project-docs directory. This is the prefix renderer, not a live provider request. Rendering runs on separate copies so cache/render side effects cannot conceal migration loss.",
 		"",
-		"Crash barriers cover three uncommitted context migration transactions per implementation and three store migration transactions. Store crashes use an ignored unit-test helper to install a ledger hook on the real cortexkit-store migrator and McStore SQL chain; reopen uses McStore::open. SIGKILL step peak RSS is the paused child process VmHWM from /proc; all other peaks come from GNU time.",
+		"Crash barriers cover three uncommitted context migration transactions per implementation and five store migration transactions. Store crashes use an ignored unit-test helper to install a ledger hook on the real cortexkit-store migrator and McStore SQL chain; reopen uses McStore::open. SIGKILL step peak RSS is the paused child process VmHWM from /proc; all other peaks come from GNU time.",
 		"",
 		"Old plugin refusal and the placed release ck-mc offline command are checked on both paired and individually advanced stores, with DB/WAL hashes before/after. The release McStore opener is checked separately; the offline command is not a live subc handshake.",
 		"",
@@ -391,7 +394,7 @@ function writeReport(): void {
 			{
 				...evidence,
 				fingerprints: summaryFingerprints,
-				steps: steps.map(({ output: _output, ...step }) => step),
+				steps: steps.map(({ output, ...step }) => ({ ...step, ...(step.exit !== 0 ? { output } : {}) })),
 			},
 			null,
 			2,
@@ -421,14 +424,14 @@ try {
 	);
 	const archive = option("--release-archive") ?? join(root, "release.tar");
 	if (!option("--release-archive"))
-		run("archive-release", ["git", "archive", "v0.49.0", "-o", archive]);
+		run("archive-release", ["git", "archive", "origin/master", "-o", archive]);
 	run("extract-release", ["tar", "-xf", resolve(archive), "-C", oldTree]);
 	evidence.releaseArchiveSha256 = hash(resolve(archive));
 	const pkg = JSON.parse(
 		readFileSync(join(oldTree, "packages/plugin/package.json"), "utf8"),
 	);
-	if (pkg.version !== "0.49.0")
-		throw new Error("Release archive does not identify v0.49.0");
+	if (pkg.version !== "0.49.7")
+		throw new Error("Release archive does not identify v0.49.7");
 	for (const path of [
 		"node_modules",
 		"packages/plugin/node_modules",
@@ -454,13 +457,13 @@ try {
 			"--offline",
 			"--locked",
 			"-j",
-			"8",
+			"4",
 			"-p",
 			"mc-store",
 			"--example",
 			"upgrade_release_store",
 			"--target-dir",
-			join(root, "build-release"),
+			join(repo, "target/rehearsal-release"),
 		],
 		oldTree,
 	);
@@ -472,13 +475,13 @@ try {
 			"--offline",
 			"--locked",
 			"-j",
-			"8",
+			"4",
 			"-p",
 			"mc-module",
 			"--bin",
 			"ck-mc",
 			"--target-dir",
-			join(root, "build-release"),
+			join(repo, "target/rehearsal-release"),
 		],
 		oldTree,
 	);
@@ -488,13 +491,13 @@ try {
 		"--offline",
 		"--locked",
 		"-j",
-		"8",
+		"4",
 		"-p",
 		"mc-store",
 		"--example",
 		"rehearse_upgrade",
 		"--target-dir",
-		join(root, "build-candidate"),
+		join(repo, "target"),
 	]);
 	const testBuild = run("build-store-crash-helper", [
 		"cargo",
@@ -502,14 +505,14 @@ try {
 		"--offline",
 		"--locked",
 		"-j",
-		"8",
+		"4",
 		"-p",
 		"mc-store",
 		"--lib",
 		"--no-run",
 		"--message-format=json",
 		"--target-dir",
-		join(root, "build-candidate"),
+		join(repo, "target"),
 	]);
 	const testArtifact = testBuild
 		.split("\n")
@@ -525,15 +528,15 @@ try {
 	if (!testArtifact)
 		throw new Error("Store crash helper test binary not produced");
 	const storeCrashHelper: string = testArtifact.executable;
-	helper = join(root, "build-candidate/debug/examples/rehearse_upgrade");
+	helper = join(repo, "target/debug/examples/rehearse_upgrade");
 	const oldHelper = join(
-		root,
-		"build-release/debug/examples/upgrade_release_store",
+		repo,
+		"target/rehearsal-release/debug/examples/upgrade_release_store",
 	);
 	const bin = join(root, "bin");
 	mkdirSync(bin);
 	const oldBinary = join(bin, "ckdev-rehearsal-049");
-	copyFileSync(join(root, "build-release/debug/ck-mc"), oldBinary);
+	copyFileSync(join(repo, "target/rehearsal-release/debug/ck-mc"), oldBinary);
 	evidence.placedReleaseVersion = run("placed-release-version", [
 		oldBinary,
 		"--version",
@@ -569,6 +572,7 @@ try {
 		(evidence.integrity as Record<string, unknown>)[`before/${name}`] =
 			integrity(join(baseline, name));
 	}
+	const oldState = snapshot ? undefined : run("release-lkg-recovery-state", [process.execPath, host, "state", oldTree, baseline]);
 	const oldRender = pairCopy(baseline, "old-render");
 	run("render-release", [
 		process.execPath,
@@ -600,7 +604,7 @@ try {
 	check("fresh TypeScript/Rust parity", () =>
 		assertFingerprint(freshFp, hostFp),
 	);
-	if (freshFp.store_version > 70 || freshFp.context_version > 100)
+	if (freshFp.store_version > 72 || freshFp.context_version > 100)
 		findings.push(
 			`Migration effects manifest needs review for candidate context ${freshFp.context_version} / store ${freshFp.store_version}; identify every new reset/rewrite before approving it`,
 		);
@@ -631,6 +635,10 @@ try {
 				throw new Error("Migration did not reach candidate schema ceilings");
 		});
 		check(`${route} data preservation`, () => assertPreserved(baseline, dir));
+		if (oldState) check(`${route} LKG and recovery state`, () => {
+			const state = run(`${route}-lkg-recovery-state`, [process.execPath, host, "state", repo, dir]);
+			if (state !== oldState) throw new Error("Loaded LKG bytes, identities, digests/signatures or recovery state changed");
+		});
 		const fp = fingerprints(dir);
 		(evidence.fingerprints as Record<string, unknown>)[route] = fp;
 		check(`${route} fresh schema fingerprint`, () =>
@@ -814,7 +822,7 @@ try {
 				);
 			}
 		}
-	for (const migration of [64, 66, 70]) {
+	for (const migration of [64, 66, 70, 71, 72]) {
 		const dir = pairCopy(baseline, `crash-store-${migration}`);
 		try {
 			await crash(
@@ -846,6 +854,14 @@ try {
 			findings.push(`Crash store migration ${migration}: ${String(error)}`);
 		}
 	}
+	check("candidate module post-upgrade transforms", () => {
+		const dir = pairCopy(join(root, "rust"), "module-drill");
+		const output = run("module-post-upgrade-transforms", ["cargo", "test", "--offline", "--locked", "-j", "4", "-p", "mc-module", "--lib", "single_store_drill_post_migration_passes", "--", "--ignored", "--nocapture"], repo, { MC_DRILL_DIR: dir, MC_DRILL_PROJECT: "git:upgrade-rehearsal" });
+		evidence.moduleDrillOutput = output;
+		if (!output.includes("1 passed") || !output.includes("DRILL pass4")) throw new Error(`Transform drill did not run: ${output}`);
+	});
+	run("build-candidate-ck-mc", ["cargo", "build", "--offline", "--locked", "-j", "4", "-p", "mc-module", "--bin", "ck-mc"]);
+	evidence.candidateBinaryVersion = run("candidate-ck-mc-version", [join(repo, "target/debug/ck-mc"), "--version"]).trim();
 } catch (error) {
 	findings.push(`Rehearsal execution: ${String(error)}`);
 } finally {
