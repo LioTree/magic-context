@@ -233,16 +233,21 @@ fn oracle_registry() {
 fn oracle_cron_utc() {
     // Non-UTC vectors run in their own process, so no test mutates global TZ.
     if std::env::var("TZ").as_deref() != Ok("UTC") {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "dream_scheduler::tests::oracle_cron_utc",
                 "--nocapture",
             ])
             .env("TZ", "UTC")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert!(
+            output.status.success(),
+            "UTC child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
     }
     for c in oracle()["cron"]
@@ -267,7 +272,7 @@ fn oracle_cron_utc() {
 #[test]
 fn oracle_cron_dst() {
     if std::env::var("DREAM_DST_CHILD").is_err() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "dream_scheduler::tests::oracle_cron_dst",
@@ -275,9 +280,14 @@ fn oracle_cron_dst() {
             ])
             .env("DREAM_DST_CHILD", "1")
             .env("TZ", "America/New_York")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert!(
+            output.status.success(),
+            "DST child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
     }
     for c in oracle()["cron"]
