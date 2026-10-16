@@ -307,7 +307,7 @@ fn part_measurement(
     }
 }
 
-fn excluded_part(key: String, content: &str) -> TailHygienePartMeasurement {
+pub(crate) fn excluded_part(key: String, content: &str) -> TailHygienePartMeasurement {
     part_measurement(
         key,
         TailHygienePartKind::Excluded,

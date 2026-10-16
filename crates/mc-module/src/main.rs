@@ -98,6 +98,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .with_startup_provider_resident_enabled(
                 mc_module::config::user_provider_resident_enabled(),
             )
+            .with_startup_provider_resident_process_cap(
+                mc_module::config::user_provider_resident_process_cap(),
+            )
             .with_log_directory(logger.logs_dir().to_path_buf()),
         ),
     )

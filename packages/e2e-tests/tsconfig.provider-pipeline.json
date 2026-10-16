@@ -8,7 +8,10 @@
         "scripts/provider-preparation-timing.ts",
         "scripts/provider-fold-storage-timing.ts",
         "scripts/provider-resident-snapshot-differential.ts",
+        "scripts/provider-resident-fold-differential.ts",
+        "scripts/provider-resident-fleet-timing.ts",
         "scripts/provider-resident-hook-timing.ts",
+        "scripts/provider-resident-paired-timing.ts",
         "tests/rust-provider-pipeline-opencode1.test.ts",
         "tests/rust-provider-pipeline-opencode2.test.ts"
     ]

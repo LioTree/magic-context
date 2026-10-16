@@ -18,7 +18,11 @@ mod codec;
 mod codec_claude_code;
 mod codec_opencode;
 mod compaction;
+pub(crate) mod fold_prefix;
+mod fold_working;
 mod historian;
+pub(crate) mod historian_budget;
+pub(crate) mod hygiene_memo;
 mod native_cut;
 mod native_plan;
 mod native_view;
@@ -26,7 +30,9 @@ mod policy_summary;
 mod records;
 #[cfg(test)]
 pub(crate) mod resident;
+mod resident_bytes;
 pub(crate) mod resident_hooks;
+mod resident_view;
 mod step_transform;
 #[cfg(test)]
 mod tests;
@@ -380,6 +386,17 @@ impl McHandler {
                 return refusal;
             }
         }
+        let resident_wal = self.provider_resident.is_enabled()
+            && matches!(
+                method,
+                "compaction.setup" | "compaction.step" | "transform.hook"
+            )
+            && matches!(binding.harness.as_str(), "opencode" | "opencode2");
+        if resident_wal {
+            if let Some(store) = self.store.get() {
+                store.prepare_provider_wal();
+            }
+        }
         let result = match method {
             "compaction.setup" => self.provider_setup(binding, params).await,
             "compaction.step" => self.provider_step(binding, params).await,
@@ -389,6 +406,11 @@ impl McHandler {
             "transform.hook" => self.provider_hook(binding, params).await,
             _ => Err(invalid("unknown provider method")),
         };
+        if resident_wal {
+            if let Some(store) = self.store.get() {
+                store.finish_provider_wal();
+            }
+        }
         match result {
             Ok(bytes) => HandlerOutcome::Response(bytes),
             Err(error) => error,

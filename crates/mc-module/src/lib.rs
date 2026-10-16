@@ -3893,11 +3893,20 @@ pub struct McHandler {
     frozen_tool_catalogs: Mutex<HashMap<(PathBuf, String), tool_catalog::FrozenCatalog>>,
     provider_store: Arc<providers::Storage>,
     provider_serial: Arc<providers::ProviderSerial>,
-    provider_resident: providers::resident_hooks::ResidentHooks,
+    provider_resident: Arc<providers::resident_hooks::ResidentHooks>,
     provider_runner: Arc<dyn session_resolver::ProviderRunner>,
     provider_historian_worker: OnceLock<Arc<McHandler>>,
+    provider_historian_budget: Arc<providers::historian_budget::Budget>,
+    provider_historian_evaluations: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
     provider_historian_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    provider_historian_ingest_pause: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     #[cfg(test)]
     provider_historian_scan_rows: Arc<AtomicU64>,
     #[cfg(test)]
@@ -4633,11 +4642,15 @@ impl McHandler {
             frozen_tool_catalogs: Mutex::new(HashMap::new()),
             provider_store,
             provider_serial: Arc::new(providers::ProviderSerial::default()),
-            provider_resident: providers::resident_hooks::ResidentHooks::default(),
+            provider_resident: Arc::new(providers::resident_hooks::ResidentHooks::default()),
             provider_runner,
             provider_historian_worker: OnceLock::new(),
+            provider_historian_budget: providers::historian_budget::Budget::process(),
+            provider_historian_evaluations: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             provider_historian_gate: Mutex::new(None),
+            #[cfg(test)]
+            provider_historian_ingest_pause: Mutex::new(None),
             #[cfg(test)]
             provider_historian_scan_rows: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -5053,10 +5066,14 @@ impl McHandler {
             frozen_tool_catalogs: Mutex::new(HashMap::new()),
             provider_store,
             provider_serial: Arc::new(providers::ProviderSerial::default()),
-            provider_resident: providers::resident_hooks::ResidentHooks::default(),
+            provider_resident: Arc::new(providers::resident_hooks::ResidentHooks::default()),
             provider_runner: Arc::new(session_resolver::MissingProviderRunner),
             provider_historian_worker: OnceLock::new(),
+            provider_historian_budget: providers::historian_budget::Budget::process(),
+            provider_historian_evaluations: Arc::new(Mutex::new(HashSet::new())),
             provider_historian_gate: Mutex::new(None),
+            #[cfg(test)]
+            provider_historian_ingest_pause: Mutex::new(None),
             provider_historian_scan_rows: Arc::new(AtomicU64::new(0)),
             guidance_now_ms: Mutex::new(None),
             reduction_injection: Mutex::new(HashMap::new()),
@@ -5875,7 +5892,16 @@ impl McHandler {
     /// Cache native-host hook policy totals and protection indexes in this process.
     /// Generic runner callbacks still fetch transcripts at reminder cadence.
     pub fn with_startup_provider_resident_enabled(mut self, enabled: bool) -> Self {
-        self.provider_resident = providers::resident_hooks::ResidentHooks::enabled(enabled);
+        self.provider_resident =
+            Arc::new(providers::resident_hooks::ResidentHooks::enabled(enabled));
+        self
+    }
+
+    pub fn with_startup_provider_resident_process_cap(mut self, bytes: usize) -> Self {
+        let enabled = self.provider_resident.is_enabled();
+        self.provider_resident = Arc::new(
+            providers::resident_hooks::ResidentHooks::enabled(enabled).with_process_cap(bytes),
+        );
         self
     }
 
@@ -6222,7 +6248,13 @@ impl McHandler {
                 range.to_ordinal.saturating_add(1),
                 &config.historian_expand_tools,
             );
-            let prior_compartments = match store.load_compartments(&session_id) {
+            let prior_compartments = match if log_publication_fence.is_some() {
+                store
+                    .load_historian_assembly_index(&session_id)
+                    .map(|index| index.snapshot.compartments)
+            } else {
+                store.load_compartments(&session_id)
+            } {
                 Ok(cs) => cs
                     .iter()
                     .map(historian_chunk::stored_range)
@@ -6334,7 +6366,13 @@ impl McHandler {
                     range.to_ordinal.saturating_add(1),
                     &config.historian_expand_tools,
                 );
-                let prior_compartments = match store.load_compartments(&session_id) {
+                let prior_compartments = match if log_publication_fence.is_some() {
+                    store
+                        .load_historian_assembly_index(&session_id)
+                        .map(|index| index.snapshot.compartments)
+                } else {
+                    store.load_compartments(&session_id)
+                } {
                     Ok(cs) => cs
                         .iter()
                         .map(historian_chunk::stored_range)
@@ -6436,6 +6474,7 @@ impl McHandler {
             | HistorianPhase::Publishing => {
                 tokio::spawn(async move {
                     let _guard = guard;
+                    let _log_fence = log_publication_fence;
                     if let Err(e) = historian::handle_restart_load(
                         &store,
                         &session_id,
@@ -6931,7 +6970,12 @@ impl McHandler {
             .cloned()
             .collect();
         let project_slug = project_slug(&binding.project_root);
-        let assemble = assemble_historian_firing(
+        let assembler = if publication_fence.is_some() {
+            historian_chunk::assemble_provider_historian_firing
+        } else {
+            assemble_historian_firing
+        };
+        let assemble = assembler(
             &store,
             &parsed.messages,
             &live,
@@ -15714,11 +15758,26 @@ fn encode_full_native_messages(
     let native_reasoning_keep_mids = &response.native_reasoning_keep_mids;
     profile_start!(perf_decode, "native_reference_decode");
     let sidecar = request
-        .native_messages
-        .as_deref()
-        .map(codec::decode_opencode)
-        .map(|decoded| decoded.sidecar)
-        .unwrap_or_else(|| codec::DecodeSidecar::new("opencode"));
+        .native_fold_sidecar
+        .as_ref()
+        .map(|sidecar| (**sidecar).clone())
+        .unwrap_or_else(|| {
+            request
+                .native_messages
+                .as_deref()
+                .map(|native| {
+                    codec::opencode::decode_opencode_with_sidecar_and_base(
+                        native,
+                        None,
+                        request
+                            .native_fold_prefix
+                            .as_ref()
+                            .map_or(0, |prefix| prefix.messages as u64),
+                    )
+                })
+                .map(|decoded| decoded.sidecar)
+                .unwrap_or_else(|| codec::DecodeSidecar::new("opencode"))
+        });
     profile_end!(perf_decode);
     profile_start!(perf_prepare, "native_reference_prepare");
     let served_messages = served

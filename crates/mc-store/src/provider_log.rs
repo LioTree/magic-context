@@ -170,10 +170,49 @@ pub struct ProviderPolicyPart {
 }
 
 #[derive(Clone, Debug)]
+pub struct ProviderNativePrefix {
+    pub cut_id: u64,
+    pub through: u64,
+    pub parts: usize,
+}
+
+impl McStore {
+    /// Hook answers are immutable apart from their delivery state. This stamp
+    /// scopes replay invalidation to the still-live tail rather than session age.
+    pub fn provider_tail_answer_stamp(
+        &self,
+        key: &ProviderSessionKey,
+        first: u64,
+    ) -> Result<(u64, u64), ProviderError> {
+        self.inner.with_conn(|conn| conn.query_row(
+            "SELECT coalesce(max(answer_seq),0),coalesce(sum(state='live'),0) FROM mc_provider_hook_answers_v1 WHERE conv_key=?1 AND ordinal>=?2",
+            params![key.conversation_key(), as_i64(first)?], |row| Ok((row.get(0)?,row.get(1)?))))
+            .map_err(|error| ProviderError::Storage(error.into()))
+    }
+    /// Detect out-of-band writes before reusing an immutable native snapshot.
+    pub fn provider_external_data_version(&self) -> Result<u64, ProviderError> {
+        self.inner
+            .with_conn(|conn| conn.query_row("PRAGMA data_version", [], |row| row.get(0)))
+            .map_err(|error| ProviderError::Storage(error.into()))
+    }
+    /// Immutable view bytes may be held in memory only while their row exists.
+    pub fn provider_view_exists(
+        &self,
+        key: &ProviderSessionKey,
+        version: u64,
+    ) -> Result<bool, ProviderError> {
+        self.inner.with_conn(|conn| conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2 UNION ALL SELECT 1 FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2)",
+            params![key.conversation_key(), as_i64(version)?], |row| row.get(0))).map_err(|error| ProviderError::Storage(error.into()))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ProviderEnginePolicy {
     pub parts: Vec<ProviderPolicyPart>,
     pub settings: Value,
     pub native_tail_section: bool,
+    pub native_prefix: Option<ProviderNativePrefix>,
 }
 
 pub(crate) fn save_engine_policy_tx(
@@ -621,7 +660,7 @@ fn messages_tx(
         let mut q = conn.prepare("SELECT ordinal,mid,message_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 ORDER BY ordinal")?;
         messages.extend(
             q.query_map(params![conv, row.lineage_id, as_i64(through)?], |r| {
-                crate::provider_meters::read_row(|| {
+                crate::provider_meters::read_message_row(|| {
                     Ok(ProviderMessage {
                         ordinal: r.get(0)?,
                         mid: r.get(1)?,
@@ -1462,6 +1501,56 @@ impl McStore {
             .into_iter()
             .map(|(_, message)| message)
             .collect())
+    }
+
+    /// Read at most `limit` stored provider messages in the inclusive ordinal
+    /// range, honoring every ancestor's descent cut before reading message bodies.
+    pub fn load_provider_messages_page(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+        first: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<Vec<ProviderMessage>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let conv = key.conversation_key();
+            let mut messages = Vec::new();
+            // Ancestor ranges precede their descendants and cannot overlap after
+            // admission validates the cuts. Fill the page oldest-first, without
+            // reading later descendants that do not fit in this page.
+            for (source, cut) in ancestry_tx(conn, &conv, lineage)?.into_iter().rev() {
+                if messages.len() == limit { break; }
+                if cut.min(through) < first { continue; }
+                let mut q = conn.prepare_cached("SELECT ordinal,mid,message_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal>=?3 AND ordinal<=?4 ORDER BY ordinal LIMIT ?5")?;
+                let remaining = limit.saturating_sub(messages.len()).min(i64::MAX as usize) as i64;
+                messages.extend(q.query_map(params![conv, source.lineage_id, as_i64(first)?, as_i64(cut.min(through))?, remaining], |r| {
+                    crate::provider_meters::read_message_row(|| Ok(ProviderMessage { ordinal:r.get(0)?, mid:r.get(1)?, message_bytes:r.get(2)? }))
+                })?.collect::<rusqlite::Result<Vec<_>>>()?);
+            }
+            Ok(messages)
+        })?)
+    }
+
+    /// Measure stored body bytes in the requested ordinal range so background
+    /// historians can reserve working memory before loading or decoding messages.
+    pub fn provider_message_range_bytes(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+        first: u64,
+        through: u64,
+    ) -> Result<usize, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let conv = key.conversation_key();
+            let mut bytes = 0u64;
+            for (source, cut) in ancestry_tx(conn, &conv, lineage)? {
+                let size: u64 = conn.query_row("SELECT coalesce(sum(length(message_bytes)),0) FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal>=?3 AND ordinal<=?4",
+                    params![conv,source.lineage_id,as_i64(first)?,as_i64(cut.min(through))?], |r| r.get(0))?;
+                bytes = bytes.saturating_add(size);
+            }
+            Ok(bytes.min(usize::MAX as u64) as usize)
+        })?)
     }
 
     pub fn load_provider_message_sources_since(

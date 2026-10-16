@@ -386,21 +386,32 @@ fn is_no_content_compartment(c: &ReferenceCompartment) -> bool {
             .all(|p| p.as_deref().unwrap_or("").is_empty())
 }
 
-/// Pick the least-represented available bands against the seeds alone. Recent
-/// reference scores are hidden, so their bands do not count as anchors.
-/// Ties follow the seed's rotating band order; picks within each band use the
-/// same UTF-16 hash. Remove each pick, then render diverse chronological first,
-/// recent chronological last. The input must be chronological.
+/// Pick diverse older references followed by the recent window, in chronological order.
 pub fn select_session_references(
     all_compartments: &[ReferenceCompartment],
     seeds: &[ReferenceSeed],
     session_id: &str,
     chunk_start: i64,
 ) -> Vec<ReferenceCompartment> {
-    let eligible: Vec<_> = all_compartments
+    let candidates: Vec<_> = all_compartments
         .iter()
-        .filter(|c| !is_no_content_compartment(c))
+        .map(|c| (!is_no_content_compartment(c), c.importance.unwrap_or(50)))
         .collect();
+    select_session_reference_indices(&candidates, seeds, session_id, chunk_start)
+        .into_iter()
+        .map(|i| all_compartments[i].clone())
+        .collect()
+}
+
+/// Select on content presence and importance alone, so unselected compartment
+/// bodies need not be loaded just to choose the same deterministic references.
+pub(crate) fn select_session_reference_indices(
+    candidates: &[(bool, i32)],
+    seeds: &[ReferenceSeed],
+    session_id: &str,
+    chunk_start: i64,
+) -> Vec<usize> {
+    let eligible: Vec<_> = candidates.iter().enumerate().filter(|(_, c)| c.0).collect();
     let older_count = eligible.len().saturating_sub(SESSION_REF_WINDOW);
     let recent = &eligible[older_count..];
     let mut bands = vec![Vec::new(); SEED_BANDS.len()];
@@ -408,8 +419,8 @@ pub fn select_session_references(
     for seed in seeds {
         counts[seed_band_index(seed.importance)] += 1;
     }
-    for (i, c) in eligible[..older_count].iter().enumerate() {
-        bands[seed_band_index(c.importance.unwrap_or(50))].push(i);
+    for (i, (_, c)) in eligible[..older_count].iter().enumerate() {
+        bands[seed_band_index(c.1)].push(i);
     }
     let hash = fnv1a(&format!("{session_id}:{chunk_start}")) as usize;
     let band_order: Vec<_> = (0..SEED_BANDS.len())
@@ -430,8 +441,8 @@ pub fn select_session_references(
     picks.sort_unstable();
     picks
         .into_iter()
-        .map(|i| eligible[i].clone())
-        .chain(recent.iter().map(|c| (*c).clone()))
+        .map(|i| eligible[i].0)
+        .chain(recent.iter().map(|c| c.0))
         .collect()
 }
 

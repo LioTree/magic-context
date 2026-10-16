@@ -144,6 +144,24 @@ pub(super) fn save(
     view: &HostView,
     state: &str,
 ) -> Result<(), HandlerOutcome> {
+    save_with_base(store, key, view, state, None, None)
+}
+
+pub(super) trait RecipeBase {
+    fn version(&self) -> u64;
+    fn lineage(&self) -> &str;
+    fn same_slot(&self, position: usize, ck: &ck_wire::CkWireMessage, wire: &Value) -> bool;
+    fn same_native(&self, mid: &str, ordinal: u64, ck: &[u8], wire: &Value) -> bool;
+}
+
+pub(super) fn save_with_base(
+    store: &McStore,
+    key: &Key,
+    view: &HostView,
+    state: &str,
+    previous_view: Option<&dyn RecipeBase>,
+    engine_bytes: Option<&[std::borrow::Cow<'_, [u8]>]>,
+) -> Result<(), HandlerOutcome> {
     let started = std::time::Instant::now();
     let first = view
         .engine
@@ -168,7 +186,12 @@ pub(super) fn save(
         BTreeMap::new()
     };
     let source_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mut metadata = serde_json::to_value(view).map_err(transient)?;
+    let mut metadata = if previous_view.is_some() {
+        serde_json::to_value(super::resident_view::ResidentView::metadata_of(view))
+            .map_err(transient)?
+    } else {
+        serde_json::to_value(view).map_err(transient)?
+    };
     metadata["engine"]["replacement"] = json!([]);
     metadata["wire"]["replacement"] = json!([]);
     let conversation = store
@@ -179,12 +202,22 @@ pub(super) fn save(
         .map(|row| serde_json::from_str(&row.hook_counters_json).map_err(transient))
         .transpose()?
         .unwrap_or(Value::Null);
+    let base = conversation
+        .as_ref()
+        .and_then(|c| c.setup_json.as_ref())
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|s| s.pointer("/produced/version").and_then(Value::as_u64));
+    let previous_view = previous_view.filter(|previous| {
+        Some(previous.version()) == base
+            && previous.lineage() == view.engine.range.lineage_id
+            && previous.version() < view.engine.version
+    });
     let mut recipe = ProviderViewRecipe {
         version: view.engine.version,
         lineage_id: view.engine.range.lineage_id.clone(),
         range_from: view.engine.range.from,
         range_to: view.engine.range.to,
-        base_version: None,
+        base_version: previous_view.map(|previous| previous.version()),
         policy_cut_id: counters
             .pointer("/engine_policy/baseline_cut_id")
             .and_then(Value::as_u64),
@@ -206,9 +239,11 @@ pub(super) fn save(
     {
         if ck.meta.synthetic || ck.meta.harness_id.is_none() {
             let slot = format!("synthetic-{position}");
-            recipe
-                .synthetic
-                .insert(slot.clone(), json!({"engine":ck,"wire":wire}));
+            if !previous_view.is_some_and(|previous| previous.same_slot(position, ck, wire)) {
+                recipe
+                    .synthetic
+                    .insert(slot.clone(), json!({"engine":ck,"wire":wire}));
+            }
             recipe
                 .segments
                 .push(ProviderViewSegment::Synthetic { slot });
@@ -222,25 +257,39 @@ pub(super) fn save(
         let (lineage, message) = sources
             .get(&(mid.to_string(), ordinal))
             .ok_or_else(|| transient("view source message is missing"))?;
-        let (old_engine, old_wire) = original(message)?;
-        let mut engine_edits = Vec::new();
-        let mut wire_edits = Vec::new();
-        difference(
-            &old_engine,
-            &serde_json::to_value(ck).map_err(transient)?,
-            &mut Vec::new(),
-            &mut engine_edits,
-        );
-        difference(&old_wire, wire, &mut Vec::new(), &mut wire_edits);
-        if !engine_edits.is_empty() || !wire_edits.is_empty() {
-            recipe.treatments.push(ProviderViewTreatment {
-                source_lineage_id: lineage.clone(),
-                mid: mid.into(),
-                ordinal,
-                block_index: -1,
-                block_id: format!("{mid}#@message"),
-                patch: Some(json!({"format":1,"engine":engine_edits,"wire":wire_edits})),
-            });
+        let encoded = engine_bytes.map(|bytes| bytes[position].as_ref());
+        let fallback;
+        let encoded = if let Some(encoded) = encoded {
+            encoded
+        } else {
+            fallback = ck.to_canonical_json_vec().map_err(transient)?;
+            &fallback
+        };
+        let unchanged =
+            previous_view.is_some_and(|previous| previous.same_native(mid, ordinal, encoded, wire));
+        if !unchanged {
+            let (old_engine, old_wire) = original(message)?;
+            let mut engine_edits = Vec::new();
+            let mut wire_edits = Vec::new();
+            difference(
+                &old_engine,
+                &serde_json::to_value(ck).map_err(transient)?,
+                &mut Vec::new(),
+                &mut engine_edits,
+            );
+            difference(&old_wire, wire, &mut Vec::new(), &mut wire_edits);
+            let edited = !engine_edits.is_empty() || !wire_edits.is_empty();
+            if edited || previous_view.is_some() {
+                recipe.treatments.push(ProviderViewTreatment {
+                    source_lineage_id: lineage.clone(),
+                    mid: mid.into(),
+                    ordinal,
+                    block_index: -1,
+                    block_id: format!("{mid}#@message"),
+                    patch: edited
+                        .then(|| json!({"format":1,"engine":engine_edits,"wire":wire_edits})),
+                });
+            }
         }
         if let Some(ProviderViewSegment::NativeRange {source_lineage_id,to,last_mid,..})=recipe.segments.last_mut().filter(|segment|matches!(segment,ProviderViewSegment::NativeRange {source_lineage_id,to,..} if source_lineage_id==lineage && *to==ordinal)) {*to=ordinal+1;*last_mid=mid.into();let _=source_lineage_id;} else {
             recipe.segments.push(ProviderViewSegment::NativeRange {source_lineage_id:lineage.clone(),from:ordinal,to:ordinal+1,first_mid:mid.into(),last_mid:mid.into()});
@@ -250,11 +299,7 @@ pub(super) fn save(
     // Store only changed synthetic slots and treatments relative to the base view.
     // After 16 ancestors or 8 MiB of inherited recipes, the store merges their
     // entries into one standalone recipe without copying native message bodies.
-    let base = conversation
-        .and_then(|c| c.setup_json)
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|s| s.pointer("/produced/version").and_then(Value::as_u64));
-    if let Some(base) = base.filter(|base| *base < recipe.version) {
+    if let Some(base) = base.filter(|base| previous_view.is_none() && *base < recipe.version) {
         if let Some(old) = store
             .resolve_provider_view_catalog(&key.store_key(), base)
             .map_err(transient)?

@@ -490,6 +490,7 @@ async fn missing_cached_m1_repair_cannot_be_skipped() {
         &lineage,
         "repair",
         None,
+        None,
     )
     .unwrap();
     assert!(
@@ -583,6 +584,7 @@ async fn pressure_flush_model_and_cold_match_the_real_engine_with_queued_drops_a
                     &lineage,
                     "oracle",
                     None,
+                    None,
                 )
                 .unwrap();
                 assert_eq!(
@@ -597,7 +599,7 @@ async fn pressure_flush_model_and_cold_match_the_real_engine_with_queued_drops_a
                 if let Some(expected) = expected {
                     assert_eq!(
                         actual["compaction"]["replacement"],
-                        serde_json::to_value(expected.wire.replacement).unwrap(),
+                        serde_json::to_value(expected.0.wire.replacement).unwrap(),
                         "tokens={tokens}, event={event}, historian_active={active}"
                     );
                 }

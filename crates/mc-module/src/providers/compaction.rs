@@ -84,8 +84,8 @@ struct HostSetup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cache_policy: Option<Value>,
 }
-#[derive(Serialize, Deserialize)]
-pub(super) struct HostView {
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct HostView {
     pub(super) engine: transform::compaction::View,
     pub(super) wire: compact::answer::CompactionMessage,
     #[serde(default)]
@@ -97,6 +97,7 @@ pub(super) struct HostView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) cut_replacement: Option<super::native_cut::CutReplacement>,
 }
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct HostCoverage {
     pub(super) end_mid: String,
@@ -340,17 +341,30 @@ fn non_tag_messages_since(
 /// be megabytes. Host steps read only the receipt's request id; the view bytes
 /// stay in the immutable view row.
 fn answer_receipt(answer: &Value) -> String {
-    let mut receipt = answer.clone();
-    if let Some(compaction) = receipt.get_mut("compaction") {
-        *compaction = json!({
-            "compaction_id": compaction.get("compaction_id"),
-            "version": compaction.get("version"),
-        });
-    }
-    receipt.to_string()
+    let Some(fields) = answer.as_object() else {
+        return answer.to_string();
+    };
+    Value::Object(fields.iter().map(|(key,value)|(key.clone(),if key=="compaction" {
+        json!({"compaction_id":value.get("compaction_id"),"version":value.get("version")})
+    } else {value.clone()})).collect()).to_string()
 }
 
 fn save_host_setup(
+    store: &McStore,
+    key: &Key,
+    conversation: &mut ProviderConversation,
+    setup: &HostSetup,
+) -> Result<(), HandlerOutcome> {
+    save_host_setup_fields(store, key, conversation, setup)?;
+    if matches!(key.harness.as_str(), "opencode" | "opencode2") {
+        store
+            .prune_provider_views_from_conversation(&key.store_key())
+            .map_err(transient)?;
+    }
+    Ok(())
+}
+
+fn save_host_setup_fields(
     store: &McStore,
     key: &Key,
     conversation: &mut ProviderConversation,
@@ -362,11 +376,6 @@ fn save_host_setup(
     store
         .save_provider_conversation(&key.store_key(), conversation)
         .map_err(transient)?;
-    if matches!(key.harness.as_str(), "opencode" | "opencode2") {
-        store
-            .prune_provider_views_from_conversation(&key.store_key())
-            .map_err(transient)?;
-    }
     Ok(())
 }
 
@@ -427,6 +436,7 @@ struct Work {
     project_directory: String,
     note_project_path: String,
     resident_folds: bool,
+    resident: Arc<super::resident_hooks::ResidentHooks>,
 }
 
 /// Metadata-only skip check shared by the handler and real-state comparison
@@ -578,12 +588,199 @@ fn host_engine_step(
     context: &transform::ProducerContext<'_>,
     status: &transform::compaction::Status,
     state: &mut transform::compaction::State,
+    comparison: Option<&dyn transform::compaction::AppliedComparison>,
 ) -> Result<transform::compaction::Output, transform::TransformError> {
     #[cfg(test)]
     if CC_ENGINE_REFUSAL.with(|flag| flag.replace(false)) {
         return Err(transform::TransformError::ProtectedToolResultsOverLimit);
     }
-    transform::compaction::step(store, request, context, status, state)
+    match comparison {
+        Some(comparison) => {
+            transform::compaction::step_native(store, request, context, status, state, comparison)
+        }
+        None => transform::compaction::step(store, request, context, status, state),
+    }
+}
+
+fn fold_structure(compartments: &[mc_store::StoredCompartment], through: u64) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for compartment in compartments
+        .iter()
+        .filter(|compartment| compartment.end_message <= through as i64)
+    {
+        hash.update(compartment.sequence.to_le_bytes());
+        hash.update(compartment.start_message.to_le_bytes());
+        hash.update(compartment.end_message.to_le_bytes());
+        hash.update((compartment.end_message_id.len() as u64).to_le_bytes());
+        hash.update(compartment.end_message_id.as_bytes());
+    }
+    hash.finalize().into()
+}
+
+pub(super) fn prime_resident_fold(
+    store: &McStore,
+    key: &Key,
+    state: &mut super::policy_summary::ResidentPolicy,
+) -> Result<(), HandlerOutcome> {
+    let Some(mut prefix) = state
+        .fold_prefix
+        .clone()
+        .filter(|prefix| !prefix.has_system)
+    else {
+        return Ok(());
+    };
+    let Some(conversation) = store
+        .load_provider_conversation(&key.store_key())
+        .map_err(transient)?
+    else {
+        return Ok(());
+    };
+    let before = store
+        .compartment_source_revision(&conversation.engine_namespace)
+        .ok()
+        .flatten();
+    let binding = store
+        .provider_cut_source_revision(
+            &key.store_key(),
+            &conversation.engine_namespace,
+            prefix.cut_id,
+        )
+        .ok()
+        .flatten();
+    if before.is_none() || binding != before {
+        return Ok(());
+    }
+    let Some(setup) = conversation
+        .setup_json
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<HostSetup>(raw).ok())
+    else {
+        return Ok(());
+    };
+    let (Some(applied), Some(produced)) = (&setup.applied, &setup.produced) else {
+        return Ok(());
+    };
+    if applied.version != produced.version
+        || applied.range.lineage_id != conversation.lineage_id
+        || setup.invalidated
+        || setup.repair_pending
+    {
+        return Ok(());
+    }
+    let Some(metadata) = store
+        .provider_native_view_metadata(&key.store_key(), applied.version)
+        .map_err(transient)?
+    else {
+        return Ok(());
+    };
+    let metadata: HostView = serde_json::from_value(metadata).map_err(transient)?;
+    if metadata
+        .coverage
+        .as_ref()
+        .is_none_or(|coverage| coverage.ordinal != prefix.through)
+    {
+        return Ok(());
+    }
+    let Some(lineage) = store
+        .load_provider_lineage(&key.store_key(), &conversation.lineage_id)
+        .map_err(transient)?
+    else {
+        return Ok(());
+    };
+    let messages = non_tag_messages_since(store, key, &lineage, prefix.through.saturating_add(1))?;
+    let mut template: TransformRequest = decode(
+        &json!({"v":2,"kind":"compaction.step","serializer_profile":"opencode-aisdk",
+        "session_id":conversation.engine_namespace,"render_config":"","messages":[],"tool_present":true,"auto_search_enabled":false}),
+    )?;
+    Codec::OpencodeAiSdk.prepare_request(&mut template, &messages)?;
+    let mids = template
+        .messages
+        .iter()
+        .map(|message| message.mid.as_str())
+        .collect::<Vec<_>>();
+    let loaded = store
+        .load_native_transform_snapshot(&conversation.engine_namespace, &prefix.reference(), &mids)
+        .map_err(transient)?
+        .loaded;
+    if loaded.core.reconcile_pending
+        || loaded
+            .sections
+            .as_ref()
+            .is_none_or(mc_store::SectionsBase::any_discarded)
+    {
+        return Ok(());
+    }
+    let compartments = store
+        .load_compartments(&conversation.engine_namespace)
+        .map_err(transient)?;
+    if !compartments.iter().any(|compartment| {
+        compartment.end_message == prefix.through as i64
+            && compartment.end_message_id == loaded.core.boundary_id
+    }) {
+        return Ok(());
+    }
+    // Reminder cadence counts every non-synthetic user message with decoded
+    // content, including messages carrying tool results or system reminders.
+    // Policy headers count only authored prompts, so their total is different.
+    let users = store
+        .provider_prefix_user_messages(&key.store_key(), &conversation.lineage_id, prefix.through)
+        .map_err(transient)?;
+    let users = users
+        .into_iter()
+        .map(|message| {
+            Ok(compact::status::StatusMessage {
+                mid: message.mid,
+                ordinal: message.ordinal,
+                raw_message: None,
+                message: serde_json::from_slice(&message.message_bytes).map_err(transient)?,
+            })
+        })
+        .collect::<Result<Vec<_>, HandlerOutcome>>()?;
+    let decoded = super::codec_opencode::decode_messages(&users)?;
+    prefix.users = decoded
+        .messages
+        .iter()
+        .filter(|message| {
+            message.ck.role == "user"
+                && !message.ck.meta.synthetic
+                && !message.ck.content.is_empty()
+        })
+        .count() as u64;
+    let view = load_host_view(store, key, applied)?;
+    if view.engine.replacement.len() > 1500 {
+        return Ok(());
+    }
+    let working = super::fold_working::FoldWorking::build(
+        &mut state.fold_arena,
+        super::fold_working::TailKey {
+            through: prefix.through,
+            newest: template.messages.last().map(|message| message.ordinal),
+            answers: store
+                .provider_tail_answer_stamp(&key.store_key(), prefix.through.saturating_add(1))
+                .map_err(transient)?,
+        },
+        &template,
+        prefix.messages,
+    )?;
+    let saved =
+        super::resident_view::ResidentView::store(&mut state.fold_arena, &view, None, None)?;
+    if store
+        .compartment_source_revision(&conversation.engine_namespace)
+        .ok()
+        .flatten()
+        != before
+    {
+        state.fold_arena = Default::default();
+        return Ok(());
+    }
+    state.fold_structure = Some(fold_structure(&compartments, prefix.through));
+    state.fold_lineage = Some(conversation.lineage_id);
+    state.fold_data_version = Some(store.provider_external_data_version().map_err(transient)?);
+    state.fold_prefix = Some(prefix);
+    state.fold_working = Some(working);
+    state.fold_view = Some(saved);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -596,17 +793,258 @@ fn execute_host(
     lineage: &ProviderLineage,
     request_id: &str,
     native_status: Option<&compact::status::StepStatus>,
-) -> Result<Option<HostView>, HandlerOutcome> {
+    source_revision: Option<&mc_store::CompartmentSourceRevision>,
+) -> Result<Option<(HostView, bool)>, HandlerOutcome> {
     let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
     let started = Instant::now();
-    let messages = non_tag_messages_since(store, &work.key, lineage, 0)?;
+    let mut resident = if work.resident_folds && codec == Codec::OpencodeAiSdk {
+        work.resident
+            .begin(store.tag_cache_namespace(), &work.key)
+            .map_err(transient)?
+    } else {
+        None
+    };
+    if let Some(lease) = resident.as_mut().filter(|lease| lease.cold) {
+        let rebuild_started = Instant::now();
+        let rebuilt = store
+            .read_provider_fold_resident_policy(&work.key.store_key(), |index, counters| {
+                super::policy_summary::ResidentPolicy::rebuild(
+                    index,
+                    counters,
+                    0,
+                    &work.binding.config.protected_tools,
+                )
+            })
+            .map_err(transient)?;
+        if let Some(rebuilt) = rebuilt {
+            lease.state = rebuilt;
+            if prime_resident_fold(store, &work.key, &mut lease.state).is_err() {
+                lease.state.fold_structure = None;
+                lease.state.fold_view = None;
+                lease.state.fold_working = None;
+                lease.state.fold_arena = Default::default();
+            }
+        } else {
+            resident = None;
+        }
+        tracing::info!(session_id=%work.key.session,
+            rebuild_ms=rebuild_started.elapsed().as_secs_f64()*1000.0,
+            "native fold resident rebuild");
+    }
+    let data_version = store.provider_external_data_version().map_err(transient)?;
+    if let Some(lease) = resident.as_mut() {
+        if lease.state.fold_data_version != Some(data_version) {
+            tracing::info!(session_id=%work.key.session, before=?lease.state.fold_data_version, after=data_version,
+                "native fold external data version changed");
+            lease.state.fold_structure = None;
+            lease.state.fold_view = None;
+            lease.state.fold_working = None;
+            lease.state.fold_arena = Default::default();
+        }
+        lease.state.fold_data_version = Some(data_version);
+    }
+    let meta = store
+        .load_meta(&conversation.engine_namespace)
+        .map_err(transient)?
+        .meta;
+    let compartments = if resident.is_some() {
+        store
+            .load_compartments(&conversation.engine_namespace)
+            .map_err(transient)?
+    } else {
+        Vec::new()
+    };
+    let prefix = resident
+        .as_ref()
+        .and_then(|lease| lease.state.fold_prefix.as_ref())
+        .filter(|prefix| {
+            let lease = resident.as_ref().unwrap();
+            source_revision.is_some()
+                && !prefix.has_system
+                // The stored hygiene baseline excludes the newest message's parts.
+                // If a history compartment covers that message, the compact native
+                // encoding cannot represent its covered count; replay all source.
+                && status.newest_ordinal.is_some_and(|newest| {
+                    newest > prefix.through && compartments.iter().all(|compartment| {
+                        u64::try_from(compartment.end_message).is_ok_and(|end| end < newest)
+                    })
+                })
+                && !lease.state.fold_source_raced
+                && !setup.invalidated
+                && !setup.repair_pending
+                && status.last_not_applied.is_none()
+                && setup.applied.as_ref().is_some_and(|applied| {
+                    applied.range.from > 0
+                        && setup
+                            .produced
+                            .as_ref()
+                            .is_some_and(|produced| produced.version == applied.version)
+                })
+                && lease.state.fold_view.as_ref().is_some_and(|view| {
+                    setup
+                        .applied
+                        .as_ref()
+                        .is_some_and(|applied| view.metadata.engine.version == applied.version)
+                        && view
+                            .metadata
+                            .coverage
+                            .as_ref()
+                            .is_some_and(|coverage| coverage.ordinal == prefix.through)
+                })
+                && lease.state.fold_lineage.as_deref() == Some(lineage.lineage_id.as_str())
+                && lease.state.fold_structure == Some(fold_structure(&compartments, prefix.through))
+                && meta.pending_rewrite.is_none()
+                && meta.ordinal_continuation_base.is_none()
+                && meta.coverage_ordinal == Some(prefix.through)
+                && compartments.iter().any(|compartment| {
+                    compartment.end_message == prefix.through as i64
+                        && Some(compartment.sequence) == meta.coverage_compartment_seq
+                })
+        })
+        .cloned();
+    tracing::info!(session_id=%work.key.session, eligible=prefix.is_some(),
+        retained_prefix=?resident.as_ref().and_then(|lease| lease.state.fold_prefix.as_ref()).map(|prefix| (prefix.cut_id,prefix.through,prefix.parts)),
+        applied=?setup.applied.as_ref().map(|view| (view.version,view.range.from)),
+        produced=?setup.produced.as_ref().map(|view| view.version),
+        coverage=?meta.coverage_ordinal, seq=?meta.coverage_compartment_seq,
+        "native fold eligibility");
+    let working_key = prefix
+        .as_ref()
+        .map(|prefix| {
+            Ok(super::fold_working::TailKey {
+                through: prefix.through,
+                newest: status.newest_ordinal,
+                answers: store
+                    .provider_tail_answer_stamp(
+                        &work.key.store_key(),
+                        prefix.through.saturating_add(1),
+                    )
+                    .map_err(transient)?,
+            })
+        })
+        .transpose()?;
+    let reuse_working = working_key.as_ref().is_some_and(|key| {
+        resident
+            .as_ref()
+            .and_then(|lease| lease.state.fold_working.as_ref())
+            .is_some_and(|working| &working.key == key)
+    });
+    let mut messages = if reuse_working {
+        Vec::new()
+    } else {
+        non_tag_messages_since(
+            store,
+            &work.key,
+            lineage,
+            prefix
+                .as_ref()
+                .map_or(0, |prefix| prefix.through.saturating_add(1)),
+        )?
+    };
     let replay_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut template: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
         "serializer_profile":codec.serializer_profile().wire_id(),"session_id":conversation.engine_namespace,
         "render_config":serde_json::to_string(&setup.setup.request.params).map_err(transient)?,
         "model_key":setup.setup.request.model,"messages":[],"tool_present":true,"auto_search_enabled":false}))?;
-    codec.prepare_request(&mut template, &messages)?;
+    if reuse_working {
+        let state = &resident.as_ref().unwrap().state;
+        state
+            .fold_working
+            .as_ref()
+            .unwrap()
+            .install(&state.fold_arena, &mut template)?;
+    } else {
+        codec.prepare_request(&mut template, &messages)?;
+    }
     template.native_tail_section = work.resident_folds && codec == Codec::OpencodeAiSdk;
+    if template.native_tail_section {
+        template.native_compartment_source_revision = source_revision.cloned();
+    }
+    if let Some(prefix) = prefix {
+        // If a summary boundary separates a tool call from its result, reading
+        // only messages after that boundary would omit the call. Validate the
+        // complete stored transcript instead of inventing the missing tool call.
+        let mut open = HashSet::new();
+        let mut intact = true;
+        for block in template
+            .messages
+            .iter()
+            .flat_map(|message| &message.ck.content)
+        {
+            match &block.kind {
+                ck_wire::CkKind::ToolCall {
+                    id,
+                    provider_executed: false,
+                    ..
+                } => {
+                    open.insert(id);
+                }
+                ck_wire::CkKind::ToolResult {
+                    id,
+                    provider_executed: false,
+                    ..
+                } => {
+                    intact &= open.remove(id);
+                }
+                _ => {}
+            }
+        }
+        let mids = template
+            .messages
+            .iter()
+            .map(|message| message.mid.as_str())
+            .collect::<Vec<_>>();
+        let snapshot = store.load_native_transform_snapshot(
+            &conversation.engine_namespace,
+            &prefix.reference(),
+            &mids,
+        );
+        if intact
+            && open.is_empty()
+            && snapshot.as_ref().is_ok_and(|snapshot| {
+                !snapshot.loaded.core.reconcile_pending
+                    && snapshot
+                        .loaded
+                        .sections
+                        .as_ref()
+                        .is_some_and(|sections| !sections.any_discarded())
+                    && snapshot.loaded.core.boundary_id
+                        == compartments
+                            .iter()
+                            .find(|compartment| {
+                                Some(compartment.sequence) == meta.coverage_compartment_seq
+                            })
+                            .map_or("", |compartment| compartment.end_message_id.as_str())
+            })
+        {
+            template.native_fold_snapshot = Some(Arc::new(snapshot.map_err(transient)?));
+            template.native_fold_hygiene =
+                Some(resident.as_ref().unwrap().state.fold_hygiene.clone());
+            template.native_fold_output =
+                Some(resident.as_ref().unwrap().state.fold_output.clone());
+            if !reuse_working {
+                let state = &mut resident.as_mut().unwrap().state;
+                let working = super::fold_working::FoldWorking::build(
+                    &mut state.fold_arena,
+                    working_key.unwrap(),
+                    &template,
+                    prefix.messages,
+                )?;
+                if let Some(old) = state.fold_working.replace(working) {
+                    old.release(&mut state.fold_arena);
+                }
+            }
+            template.native_fold_prefix = Some(prefix);
+        } else {
+            messages = non_tag_messages_since(store, &work.key, lineage, 0)?;
+            codec.prepare_request(&mut template, &messages)?;
+            template.native_fold_sidecar = None;
+            let state = &mut resident.as_mut().unwrap().state;
+            if let Some(old) = state.fold_working.take() {
+                old.release(&mut state.fold_arena);
+            }
+        }
+    }
     if codec == Codec::ClaudeCodeAnthropic {
         if let Some(native_status) = native_status {
             template.geometry =
@@ -622,10 +1060,6 @@ fn execute_host(
             template.mid_turn = native_status.mid_turn.unwrap_or(false);
         }
     }
-    let meta = store
-        .load_meta(&conversation.engine_namespace)
-        .map_err(transient)?
-        .meta;
     if let (Some(coverage), Some(first)) = (
         meta.coverage_ordinal,
         template
@@ -636,10 +1070,20 @@ fn execute_host(
             .min(),
     ) {
         if coverage.checked_add(1) == Some(first) {
-            let core = store
-                .load(&conversation.engine_namespace)
-                .map_err(transient)?
-                .core;
+            let core = if template.native_fold_prefix.is_some() {
+                template
+                    .native_fold_snapshot
+                    .as_ref()
+                    .ok_or_else(|| transient("native fold snapshot missing"))?
+                    .loaded
+                    .core
+                    .clone()
+            } else {
+                store
+                    .load(&conversation.engine_namespace)
+                    .map_err(transient)?
+                    .core
+            };
             if let Some((mid, _)) = core.boundary_id.rsplit_once('#') {
                 // The host may have removed the messages already covered by
                 // summaries. Declare their last block and ordinal, and the
@@ -696,7 +1140,28 @@ fn execute_host(
     let previous = setup
         .produced
         .as_ref()
-        .map(|s| load_host_view(store, &work.key, s))
+        .map(|s| {
+            if let Some(view) = resident
+                .as_ref()
+                .and_then(|lease| lease.state.fold_view.as_ref())
+                .filter(|view| view.metadata.engine.version == s.version)
+            {
+                if store
+                    .provider_view_exists(&work.key.store_key(), s.version)
+                    .map_err(transient)?
+                {
+                    let state = &resident.as_ref().unwrap().state;
+                    let mut view = if template.native_fold_prefix.is_some() {
+                        view.metadata.clone()
+                    } else {
+                        view.load(&state.fold_arena)?
+                    };
+                    view.engine.range.lineage_id = s.range.lineage_id.clone();
+                    return Ok(view);
+                }
+            }
+            load_host_view(store, &work.key, s)
+        })
         .transpose()?;
     state.last_applied = setup
         .applied
@@ -739,24 +1204,168 @@ fn execute_host(
         .map_err(transient)?;
     let prepare_ms = started.elapsed().as_secs_f64() * 1000.0 - replay_ms;
     let engine_started = Instant::now();
-    let output =
-        host_engine_step(store, &template, &context, status, &mut state).map_err(|error| {
-            if codec == Codec::ClaudeCodeAnthropic {
-                claude_code_engine_failure(error, request_id)
-            } else {
-                transient(error)
-            }
-        })?;
+    let comparison = resident
+        .as_ref()
+        .filter(|_| template.native_fold_prefix.is_some())
+        .and_then(|lease| {
+            lease
+                .state
+                .fold_view
+                .as_ref()
+                .map(|view| super::resident_view::AppliedView {
+                    view,
+                    arena: &lease.state.fold_arena,
+                })
+        });
+    let output = host_engine_step(
+        store,
+        &template,
+        &context,
+        status,
+        &mut state,
+        comparison
+            .as_ref()
+            .map(|comparison| comparison as &dyn transform::compaction::AppliedComparison),
+    )
+    .map_err(|error| {
+        if codec == Codec::ClaudeCodeAnthropic {
+            claude_code_engine_failure(error, request_id)
+        } else {
+            transient(error)
+        }
+    })?;
     let engine_ms = engine_started.elapsed().as_secs_f64() * 1000.0;
+    if template.native_fold_prefix.is_some() {
+        tracing::info!(session_id=%work.key.session, timings=?output.engine.response.timings, "native fold engine timings");
+    }
+    if template.native_fold_prefix.is_none() && resident.is_some() {
+        let rebuilt = store
+            .read_provider_fold_resident_policy(&work.key.store_key(), |index, counters| {
+                super::policy_summary::ResidentPolicy::rebuild(
+                    index,
+                    counters,
+                    0,
+                    &work.binding.config.protected_tools,
+                )
+            })
+            .map_err(transient)?;
+        if let Some(rebuilt) = rebuilt {
+            resident.as_mut().unwrap().state = rebuilt;
+        } else {
+            resident = None;
+        }
+    }
+    if let Some(lease) = resident.as_mut() {
+        let current = store
+            .load_provider_conversation(&work.key.store_key())
+            .map_err(transient)?
+            .ok_or_else(|| transient("resident conversation is missing"))?;
+        let counters: Value =
+            serde_json::from_str(&current.hook_counters_json).map_err(transient)?;
+        let settings = &counters["engine_policy"];
+        if let Some(mut prefix) = template.native_fold_prefix.clone().filter(|prefix| {
+            settings["coverage"]
+                .as_u64()
+                .is_some_and(|through| through >= prefix.through)
+        }) {
+            #[cfg(test)]
+            {
+                lease.state.fold_tail_passes += 1;
+            }
+            prefix.cut_id = settings["baseline_cut_id"]
+                .as_u64()
+                .ok_or_else(|| transient("resident cut is missing"))?;
+            let through = settings["coverage"].as_u64().unwrap();
+            if through > prefix.through {
+                let newly_covered = output
+                    .engine
+                    .projection
+                    .blocks
+                    .iter()
+                    .filter(|block| block.ordinal <= through);
+                let mut users = HashSet::new();
+                for block in newly_covered {
+                    if block.role == "user" && !block.synthetic {
+                        users.insert(block.mid.as_str());
+                    }
+                    prefix.push(&crate::tail_hygiene::excluded_part(
+                        format!("{}\0{}", block.id, block.kind_tag),
+                        &block.bytes,
+                    ));
+                }
+                prefix.users += users.len() as u64;
+                prefix.messages += template
+                    .messages
+                    .iter()
+                    .filter(|message| message.ordinal <= through)
+                    .count();
+                prefix.through = through;
+                if let Some(old) = lease.state.fold_working.take() {
+                    old.release(&mut lease.state.fold_arena);
+                }
+            }
+            lease.state.fold_prefix = Some(prefix);
+        } else {
+            if let Some(prefix) = lease.state.fold_prefix.as_mut() {
+                prefix.users = output
+                    .engine
+                    .projection
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        block.ordinal <= prefix.through && block.role == "user" && !block.synthetic
+                    })
+                    .map(|block| block.mid.as_str())
+                    .collect::<HashSet<_>>()
+                    .len() as u64;
+                prefix.messages = template
+                    .messages
+                    .iter()
+                    .filter(|message| message.ordinal <= prefix.through)
+                    .count();
+            }
+        }
+        lease.state.fold_lineage = Some(lineage.lineage_id.clone());
+        lease.state.fold_data_version = Some(data_version);
+        lease.state.fold_structure = lease
+            .state
+            .fold_prefix
+            .as_ref()
+            .map(|prefix| fold_structure(&compartments, prefix.through));
+        lease.state.fold_source_raced = source_revision.is_some_and(|revision| {
+            store
+                .compartment_source_revision(&conversation.engine_namespace)
+                .ok()
+                .flatten()
+                .as_ref()
+                != Some(revision)
+        });
+    }
     // Keep only scalars in Setup. Engine and native bytes are committed together
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
     setup.setup.state.rebuild_epoch = state.rebuild_epoch;
     let transform::compaction::Answer::Replacement(engine) = output.answer else {
+        if let Some(lease) = resident {
+            lease.publish();
+        }
         return Ok(None);
     };
-    let (mut wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) = previous
-        .filter(|p| {
+    let render_context = super::codec_opencode::NativeRenderContext::from(&output.engine);
+    let engine_bytes = super::resident_view::canonical_engine_bytes(
+        &engine.replacement,
+        output.engine.response.messages(),
+    );
+    let encoding_key = resident
+        .as_ref()
+        .filter(|_| template.native_fold_prefix.is_some())
+        .and_then(|lease| {
+            lease.state.fold_working.as_ref().map(|working| {
+                super::codec_opencode::resident_render_key(&template, &render_context, &working.key)
+            })
+        });
+    let (mut wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) =
+        previous.as_ref().filter(|p| {
             status
                 .last_not_applied
                 .is_some_and(|n| !n.structural && n.version == p.engine.version)
@@ -768,13 +1377,13 @@ fn execute_host(
                     output.engine.response.coverage_ordinal,
                 )
         }) {
-        let mut wire = previous.wire;
+        let mut wire = previous.wire.clone();
         wire.version = engine.version;
         (
             wire,
-            previous.coverage,
-            previous.raw_replacement,
-            previous.head_slots,
+            previous.coverage.clone(),
+            previous.raw_replacement.clone(),
+            previous.head_slots.clone(),
         )
     } else {
         let (wire, raw_replacement) = if codec == Codec::ClaudeCodeAnthropic {
@@ -785,23 +1394,72 @@ fn execute_host(
             )?;
             (wire, Some(raw))
         } else {
+            let cached = if let (Some(key), Some(lease)) = (encoding_key, resident.as_ref()) {
+                lease
+                    .state
+                    .fold_view
+                    .as_ref()
+                    .map(|previous| {
+                        super::codec_opencode::encode_resident_view(
+                            &engine,
+                            &template,
+                            &render_context,
+                            previous,
+                            &lease.state.fold_arena,
+                            key,
+                            &engine_bytes,
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            if cached.is_none() {
+                if let Some(lease) = resident
+                    .as_ref()
+                    .filter(|_| template.native_fold_prefix.is_some())
+                {
+                    if let Some(working) = &lease.state.fold_working {
+                        template.native_fold_sidecar =
+                            Some(working.sidecar(&lease.state.fold_arena)?);
+                    }
+                }
+            }
             (
-                codec.encode_view(
-                    &engine,
-                    &template,
-                    &super::codec_opencode::NativeRenderContext::from(&output.engine),
-                )?,
+                if let Some(wire) = cached {
+                    wire
+                } else {
+                    codec.encode_view(
+                        &engine,
+                        &template,
+                        &super::codec_opencode::NativeRenderContext::from(&output.engine),
+                    )?
+                },
                 None,
             )
         };
         let coverage = output.engine.response.coverage_ordinal.and_then(|ordinal| {
-            messages
+            template
+                .messages
                 .iter()
                 .find(|m| m.ordinal == ordinal)
                 .map(|m| HostCoverage {
                     end_mid: m.mid.clone(),
                     ordinal,
                     endpoint: None,
+                })
+                .or_else(|| {
+                    template
+                        .native_fold_prefix
+                        .as_ref()
+                        .filter(|prefix| prefix.through == ordinal)?;
+                    let declared = template.declared_trim.as_ref()?;
+                    Some(HostCoverage {
+                        end_mid: declared.boundary_bare_message_id.clone(),
+                        ordinal,
+                        endpoint: None,
+                    })
                 })
         });
         let head_slots = raw_replacement
@@ -862,7 +1520,48 @@ fn execute_host(
     if codec == Codec::ClaudeCodeAnthropic && view.wire.raw_view.is_some() {
         super::native_cut::attach(&work.key, &mut view, &template)?;
     }
-    Ok(Some(view))
+    let persisted = template.native_fold_prefix.is_some();
+    if persisted {
+        let base = resident.as_ref().and_then(|lease| {
+            lease
+                .state
+                .fold_view
+                .as_ref()
+                .map(|view| super::resident_view::AppliedView {
+                    view,
+                    arena: &lease.state.fold_arena,
+                })
+        });
+        super::view_recipe::save_with_base(
+            store,
+            &work.key,
+            &view,
+            "produced",
+            base.as_ref()
+                .map(|base| base as &dyn super::view_recipe::RecipeBase),
+            Some(&engine_bytes),
+        )?;
+    }
+    let publish_started = Instant::now();
+    if let Some(mut lease) = resident {
+        let state = &mut lease.state;
+        if view.engine.replacement.len() <= 1500 {
+            let saved = super::resident_view::ResidentView::store(
+                &mut state.fold_arena,
+                &view,
+                encoding_key,
+                Some(&engine_bytes),
+            )?;
+            if let Some(old) = state.fold_view.replace(saved) {
+                old.release(&mut state.fold_arena);
+            }
+        }
+        lease.publish();
+    }
+    tracing::info!(session_id=%work.key.session,
+        publish_ms=publish_started.elapsed().as_secs_f64()*1000.0,
+        "native fold resident publication");
+    Ok(Some((view, persisted)))
 }
 
 fn status(
@@ -1248,6 +1947,16 @@ impl McHandler {
         params: &Value,
         request: compact::status::StepStatus,
     ) -> Result<Vec<u8>, HandlerOutcome> {
+        let source_revision = if work.resident_folds
+            && matches!(work.key.harness.as_str(), "opencode" | "opencode2")
+        {
+            store
+                .compartment_source_revision(&conversation.engine_namespace)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let _span =
             tracing::info_span!("provider_step", request_id = %request.request_id).entered();
         let _meters = mc_store::provider_meters::ProviderStoreMeter::start(
@@ -1588,7 +2297,13 @@ impl McHandler {
                     .max(normalized.last_not_applied.map_or(0, |n| n.version))
                     .checked_add(1)
                     .ok_or_else(|| transient("version exhausted"))?;
-                save_host_setup(store, &work.key, &mut conversation, &setup)?;
+                // The final answer publishes and prunes all view references below.
+                // Pruning the same roots before resident execution does no new work.
+                if work.resident_folds && codec == Codec::OpencodeAiSdk {
+                    save_host_setup_fields(store, &work.key, &mut conversation, &setup)?;
+                } else {
+                    save_host_setup(store, &work.key, &mut conversation, &setup)?;
+                }
                 let view = match execute_host(
                     store,
                     work,
@@ -1598,6 +2313,7 @@ impl McHandler {
                     &lineage,
                     &request.request_id,
                     Some(&request),
+                    source_revision.as_ref(),
                 ) {
                     Err(HandlerOutcome::Error { code, message })
                         if codec == Codec::ClaudeCodeAnthropic
@@ -1624,9 +2340,11 @@ impl McHandler {
                     serde_json::from_str(&current.hook_counters_json).map_err(transient)?;
                 counters["channel1_hook_append_pending"] = json!(false);
                 conversation.hook_counters_json = counters.to_string();
-                if let Some(view) = view {
+                if let Some((view, persisted)) = view {
                     raw_replacement = view.raw_replacement.clone();
-                    save_host_view(store, &work.key, &view, "produced")?;
+                    if !persisted {
+                        save_host_view(store, &work.key, &view, "produced")?;
+                    }
                     setup.produced = Some(ViewSummary::from(&view.engine));
                     let mut answer = json!({"answer":"compaction_message","request_id":request.request_id,"compaction":view.wire});
                     if let Some(slots) = view.head_slots {
@@ -1692,6 +2410,7 @@ impl McHandler {
         let route = self.route_project(store, &binding)?;
         Ok(Work {
             resident_folds: self.provider_resident.is_enabled(),
+            resident: self.provider_resident.clone(),
             project_directory: binding.project_root.to_string_lossy().into_owned(),
             note_project_path: route.key.clone(),
             project_path: route.key,
@@ -2029,6 +2748,9 @@ impl McHandler {
 
 #[cfg(test)]
 mod host_tests {
+    mod resident_restart_tests {
+        include!("resident_restart_tests.rs");
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2093,6 +2815,99 @@ mod host_tests {
     }
     fn message(ordinal: u64) -> Value {
         json!({"ordinal":ordinal,"mid":format!("m{ordinal}"),"message":{"info":{"id":format!("m{ordinal}"),"role":"user","time":{"created":1}},"parts":[{"id":format!("p{ordinal}"),"type":"text","text":format!("raw {ordinal}")} ]}})
+    }
+
+    #[tokio::test]
+    async fn intact_resident_fold_matches_full_replay_bytes_and_measurements() {
+        fn source(ordinal: u64) -> Value {
+            if ordinal.is_multiple_of(5) || ordinal % 5 == 4 {
+                return message(ordinal);
+            }
+            let mut value = message(ordinal);
+            value["message"]["info"]["role"] = json!("assistant");
+            value["message"]["parts"] = json!([{"id":format!("p{ordinal}"),"type":"tool","tool":"bash","callID":format!("call{ordinal}"),
+                "state":{"status":"completed","input":{"command":"inspect"},"output":"exact spent output ".repeat(500)}}]);
+            value
+        }
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (ha, ba, sa, key) = handler(a.path(), Arc::new(NoReads::default()));
+        let ha = ha.with_startup_provider_resident_enabled(true);
+        let (hb, bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+        let mut views = Vec::new();
+        for (h, binding, store) in [(&ha, &ba, &sa), (&hb, &bb, &sb)] {
+            answer(h.provider_setup(binding.clone(), &setup()).await);
+            let initial = answer(
+                h.provider_step(
+                    binding.clone(),
+                    &step("initial", (1..=30).map(source).collect(), 30),
+                )
+                .await,
+            );
+            store
+                .replace_compartments(
+                    "s",
+                    &[mc_store::StoredCompartment {
+                        sequence: 1,
+                        start_message: 1,
+                        end_message: 20,
+                        end_message_id: "m20#0".into(),
+                        title: "history".into(),
+                        content: "original history".into(),
+                        p1: Some("original history".into()),
+                        importance: 50,
+                        ..Default::default()
+                    }],
+                )
+                .unwrap();
+            let mut request = step("first-fold", vec![], 30);
+            request["last_applied"] = json!({"compaction_id":initial["compaction"]["compaction_id"],"version":initial["compaction"]["version"]});
+            store.arm_soft_refresh("s").unwrap();
+            views.push(answer(h.provider_step(binding.clone(), &request).await));
+        }
+        for sample in 0..3 {
+            let mut answers = Vec::new();
+            for (at, (h, binding, store)) in
+                [(&ha, &ba, &sa), (&hb, &bb, &sb)].into_iter().enumerate()
+            {
+                let mut rows = store.load_compartments("s").unwrap();
+                rows[0].content.push_str(&format!(" delta {sample}"));
+                rows[0].p1 = Some(rows[0].content.clone());
+                store.replace_compartments("s", &rows).unwrap();
+                store.arm_soft_refresh("s").unwrap();
+                let mut request = step(&format!("fold-{sample}"), vec![], 30);
+                request["last_applied"] = json!({"compaction_id":views[at]["compaction"]["compaction_id"],"version":views[at]["compaction"]["version"]});
+                answers.push(answer(h.provider_step(binding.clone(), &request).await));
+            }
+            assert_eq!(
+                answers[0]["compaction"]["replacement"],
+                answers[1]["compaction"]["replacement"]
+            );
+            assert_eq!(
+                answers[0]["compaction"]["range"],
+                answers[1]["compaction"]["range"]
+            );
+            let mut actual =
+                serde_json::to_value(sa.load("s").unwrap().meta.tail_hygiene_baseline).unwrap();
+            let mut expected =
+                serde_json::to_value(sb.load("s").unwrap().meta.tail_hygiene_baseline).unwrap();
+            // The two stores use independent wall clocks; compare policy state,
+            // not the time each fixture completed its otherwise identical fold.
+            actual.as_object_mut().unwrap().remove("computed_at_ms");
+            expected.as_object_mut().unwrap().remove("computed_at_ms");
+            assert_eq!(actual, expected);
+            views = answers;
+        }
+        let lease = ha
+            .provider_resident
+            .begin(sa.tag_cache_namespace(), &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lease.state.fold_tail_passes, 3,
+            "must exercise tail execution, not a full replay fallback"
+        );
+        lease.publish();
     }
     fn step(id: &str, messages: Vec<Value>, newest: u64) -> Value {
         json!({"session":"s","harness":"opencode","request_id":id,"lineage_id":"L","step_id":"st","step_kind":"user_turn","model":"fixture","context_window":100000,"estimate":{"request_tokens":1000},"messages":messages,"newest":{"ordinal":newest,"mid":format!("m{newest}")},"now":2})

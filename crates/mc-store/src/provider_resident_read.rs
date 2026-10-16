@@ -9,6 +9,12 @@ use rusqlite::params;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CompartmentSourceRevision {
+    pub generation: String,
+    pub version: u64,
+}
+
 pub struct ProviderResidentAuthority {
     pub conversation_key: String,
     pub store_instance: u64,
@@ -23,6 +29,68 @@ pub struct ProviderResidentAuthority {
 }
 
 impl McStore {
+    /// Includes every compartment write, including interior boundary edits that
+    /// leave the last covered message unchanged. Fold reuse needs that stronger
+    /// identity than the revision used to decide whether to refresh history text.
+    pub fn compartment_source_revision(
+        &self,
+        session: &str,
+    ) -> Result<Option<CompartmentSourceRevision>, crate::McStoreError> {
+        use rusqlite::OptionalExtension;
+        self.context_read(|conn| {
+            conn.query_row(
+                "SELECT generation,version FROM compartment_history_versions WHERE session_id=?1",
+                [session],
+                |row| {
+                    Ok(CompartmentSourceRevision {
+                        generation: row.get(0)?,
+                        version: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    /// Read the compartment revision captured with the policy baseline referenced
+    /// by this cache row. The latest conversation baseline may name a newer cut
+    /// and cannot establish which compartments produced an older cached view.
+    pub fn provider_cut_source_revision(
+        &self,
+        key: &ProviderSessionKey,
+        namespace: &str,
+        cut: u64,
+    ) -> Result<Option<CompartmentSourceRevision>, ProviderError> {
+        use rusqlite::OptionalExtension;
+        self.inner.with_conn(|conn| {
+            let tx=conn.unchecked_transaction()?;
+            if crate::cache_codec::native_tail_cut(&tx,namespace)? != Some(cut) { return Ok(None); }
+            let raw:Option<String>=tx.query_row("SELECT defaults_json FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 AND cut_id=?2",
+                params![key.conversation_key(),cut],|row|row.get(0)).optional()?;
+            let revision=raw.and_then(|raw|serde_json::from_str::<Value>(&raw).ok())
+                .and_then(|value|value.get("native_compartment_source_revision").cloned())
+                .and_then(|value|serde_json::from_value(value).ok());
+            tx.commit()?; Ok(revision)
+        }).map_err(|error|ProviderError::Storage(error.into()))
+    }
+
+    pub fn provider_prefix_user_messages(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+        through: u64,
+    ) -> Result<Vec<ProviderMessage>, ProviderError> {
+        self.inner.with_conn(|conn| {
+            let mut out=BTreeMap::new();
+            let mut bytes=0usize;
+            for (lineage,cut) in crate::provider_log::ancestry_tx(conn,&key.conversation_key(),lineage)? {
+                let mut q=conn.prepare_cached("SELECT ordinal,mid,CASE WHEN length(message_bytes)<=8388608 THEN message_bytes ELSE NULL END FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND ordinal<=?3 AND json_extract(CAST(message_bytes AS TEXT),'$.info.role')='user'")?;
+                let rows=q.query_map(params![key.conversation_key(),lineage.lineage_id,cut.min(through)],|row|Ok(ProviderMessage{ordinal:row.get(0)?,mid:row.get(1)?,message_bytes:row.get::<_,Option<Vec<u8>>>(2)?.ok_or(rusqlite::Error::InvalidQuery)?}))?;
+                for row in rows {let row=row?;bytes=bytes.saturating_add(row.message_bytes.len());if bytes>8*1024*1024 {return Err(rusqlite::Error::InvalidQuery);}out.entry(row.ordinal).or_insert(row);}
+            }
+            Ok(out.into_values().collect())
+        }).map_err(|error|ProviderError::Storage(error.into()))
+    }
     /// Read the authoritative policy rows and their counters at one database cut.
     /// This read does not save a resident checkpoint or advance a policy baseline.
     pub fn read_provider_resident_policy<T>(
@@ -48,6 +116,26 @@ impl McStore {
             tx.commit()?;
             Ok(result)
         }).map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
+    }
+
+    /// Too many policy rows, or too much encoded row data, can make rebuilding
+    /// the process cache inadmissible. Folds then read the complete transcript
+    /// instead. Other storage errors still refuse; transform.hook continues to
+    /// use the bounded reader and keeps its retryable admission error.
+    pub fn read_provider_fold_resident_policy<T>(
+        &self,
+        key: &ProviderSessionKey,
+        read: impl FnOnce(&ProviderPolicyIndex<'_>, &Value) -> Result<T, ProviderError>,
+    ) -> Result<Option<T>, ProviderError> {
+        match self.read_provider_resident_policy(key, read) {
+            Ok(value) => Ok(Some(value)),
+            Err(ProviderError::Transient(reason))
+                if reason == "resident_not_ready: policy input exceeds rebuild cap" =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Capture current provider authority in one read transaction. The policy

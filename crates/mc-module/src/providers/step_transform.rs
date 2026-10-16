@@ -898,6 +898,14 @@ impl McHandler {
                     )
                 })
                 .map_err(transient)?;
+            if matches!(key.harness.as_str(), "opencode" | "opencode2")
+                && super::compaction::prime_resident_fold(&store, &key, &mut lease.state).is_err()
+            {
+                lease.state.fold_structure = None;
+                lease.state.fold_view = None;
+                lease.state.fold_working = None;
+                lease.state.fold_arena = Default::default();
+            }
             let rebuild_ms = started.elapsed().as_secs_f64() * 1000.0;
             tracing::info!(session_id = %key.session, harness = %key.harness, rebuild_ms,
                 retained_bytes = lease.state.retained_bytes(),

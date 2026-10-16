@@ -503,6 +503,53 @@ pub fn user_provider_resident_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// A startup-only limit on charged resident cache bytes, not process memory.
+/// SQLite caches, temporary rebuilds and allocator high-water are outside this
+/// charge; a 75-session fleet used about 0.82 GB charged and 2.3 GB RSS.
+/// Projects and requests cannot raise it. Invalid values keep the 1 GiB default.
+pub fn user_provider_resident_process_cap() -> usize {
+    user_provider_resident_process_cap_at(&user_config_path())
+}
+
+pub fn user_provider_resident_process_cap_at(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| parse_config_text(&raw).ok())
+        .and_then(|config| {
+            config
+                .get("rust_provider_resident_process_cap_mb")
+                .and_then(Value::as_u64)
+        })
+        .filter(|value| *value > 0)
+        .map(|value| value.min(1024) as usize * 1024 * 1024)
+        .unwrap_or(1024 * 1024 * 1024)
+}
+
+/// Startup-only process limits. Neither projects nor provider requests can
+/// increase the resources reserved for background historian work.
+pub fn user_provider_historian_budget() -> (usize, usize) {
+    user_provider_historian_budget_at(&user_config_path())
+}
+
+pub fn user_provider_historian_budget_at(path: &Path) -> (usize, usize) {
+    let config = fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| parse_config_text(&raw).ok())
+        .unwrap_or(Value::Null);
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let concurrency = config["rust_provider_historian_concurrency"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .map(|value| value.min(64) as usize)
+        .unwrap_or(cpus.div_ceil(4).clamp(1, 2));
+    let memory_mb = config["rust_provider_historian_working_memory_mb"]
+        .as_u64()
+        .filter(|value| *value >= 32)
+        .map(|value| value.min(4096) as usize)
+        .unwrap_or(512);
+    (concurrency, memory_mb)
+}
+
 /// [`user_configured_runners`] against an explicit user config file.
 pub fn user_configured_runners_at(user_path: &Path) -> ConfiguredRunners {
     let mut tier = TierConfig::default();
@@ -1423,6 +1470,33 @@ mod cache_ttl_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resident_process_limit_is_a_startup_user_setting_with_a_one_gib_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.jsonc");
+        assert_eq!(
+            user_provider_resident_process_cap_at(&path),
+            1024 * 1024 * 1024
+        );
+        for (value, mb) in [
+            ("64", 64),
+            ("1", 1),
+            ("2048", 1024),
+            ("0", 1024),
+            ("true", 1024),
+            ("\"64\"", 1024),
+        ] {
+            fs::write(
+                &path,
+                format!("{{\"rust_provider_resident_process_cap_mb\":{value}}}"),
+            )
+            .unwrap();
+            assert_eq!(
+                user_provider_resident_process_cap_at(&path),
+                mb * 1024 * 1024
+            );
+        }
+    }
     #[test]
     fn signed_thinking_hold_is_off_by_default_and_user_only() {
         use super::{merge_tiers_with_warnings, SignedThinkingHold};
@@ -2352,5 +2426,25 @@ mod config_file_location_tests {
             "{stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_historian_budget_tests {
+    use super::*;
+
+    #[test]
+    fn process_budget_is_startup_user_config_only_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ck-mc.jsonc");
+        let defaults = user_provider_historian_budget_at(&path);
+        assert!((1..=2).contains(&defaults.0));
+        assert_eq!(defaults.1, 512);
+        fs::write(&path, "{ // user process limits\n\"rust_provider_historian_concurrency\": 3, \"rust_provider_historian_working_memory_mb\": 256}").unwrap();
+        assert_eq!(user_provider_historian_budget_at(&path), (3, 256));
+        fs::write(&path, r#"{"rust_provider_historian_concurrency":999,"rust_provider_historian_working_memory_mb":99999}"#).unwrap();
+        assert_eq!(user_provider_historian_budget_at(&path), (64, 4096));
+        fs::write(&path, r#"{"rust_provider_historian_concurrency":0,"rust_provider_historian_working_memory_mb":-1}"#).unwrap();
+        assert_eq!(user_provider_historian_budget_at(&path), defaults);
     }
 }

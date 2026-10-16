@@ -95,6 +95,7 @@ fn provider_pipeline_driver() {
             reads: Arc<ReadTrap>,
             namespaces: HashMap<String,u16>,
             resident_enabled: bool,
+            resident_process_cap: usize,
         }
         fn scheduler_wait_ms() -> f64 {
             std::fs::read_to_string("/proc/thread-self/schedstat").ok()
@@ -102,6 +103,7 @@ fn provider_pipeline_driver() {
                 .unwrap_or(0) as f64 / 1_000_000.0
         }
         let mut rigs: HashMap<String, Rig> = HashMap::new();
+        let mut resident_pools:HashMap<String,Arc<crate::providers::resident_hooks::ResidentHooks>>=HashMap::new();
         for line in std::io::stdin().lock().lines() {
             let cmd: Value = serde_json::from_str(&line.unwrap()).unwrap();
             let name = cmd["rig"].as_str().unwrap_or("default");
@@ -127,10 +129,16 @@ fn provider_pipeline_driver() {
                 std::fs::create_dir_all(&project).unwrap();
                 let store = Arc::new(McStore::open_for_test(&crate::test_support::descriptor(&root)).unwrap());
                 let resident_enabled = cmd["resident_enabled"].as_bool().unwrap_or_else(|| std::env::var("MC_RESIDENT_HOOKS").as_deref() == Ok("1"));
+                let resident_process_cap=cmd["resident_process_cap_mb"].as_u64().map(|mb|mb.min(1024) as usize*1024*1024).unwrap_or(1024*1024*1024);
                 let mut handler = McHandler::with_producer_factory_config_resolver(
                     Arc::new(TestProducerFactory {state:Arc::new(ProducerState::default())}),
                     config.clone(), Arc::new(MissingSessionResolver))
-                    .with_startup_provider_resident_enabled(resident_enabled);
+                     .with_startup_provider_resident_enabled(resident_enabled)
+                     .with_startup_provider_resident_process_cap(resident_process_cap);
+                if let Some(pool)=cmd["resident_pool"].as_str() {
+                    handler.provider_resident=resident_pools.entry(pool.into()).or_insert_with(||
+                        Arc::new(crate::providers::resident_hooks::ResidentHooks::enabled(resident_enabled).with_process_cap(resident_process_cap))).clone();
+                }
                 handler.store.set(store.clone()).ok().unwrap();
                 let binding = SessionBinding {
                     connection_incarnation: 0, native_generation: None, principal: None,
@@ -143,7 +151,7 @@ fn provider_pipeline_driver() {
                 let reads = Arc::new(ReadTrap::default());
                 handler.provider_runner = reads.clone();
                 let sql = rusqlite::Connection::open(root.join("store.db")).unwrap();
-                rigs.insert(name.into(), Rig {handler, store, sql, _dir: dir, binding, reads, namespaces:HashMap::new(), resident_enabled});
+                rigs.insert(name.into(), Rig {handler, store, sql, _dir: dir, binding, reads, namespaces:HashMap::new(), resident_enabled,resident_process_cap});
                 json!({"created": true})
             } else {
                 let rig = rigs.get_mut(name).expect("created rig");
@@ -163,6 +171,17 @@ fn provider_pipeline_driver() {
                         },
                         "delete" => { rig.store.replace_compartments(namespace, &[]).unwrap(); },
                         "flush" => { rig.store.arm_soft_refresh(namespace).unwrap(); },
+                        "resident_memory_delta" => {
+                            let sample=cmd["sample"].as_i64().unwrap();
+                            rig.store.seed_memory(100000+sample,rig.binding.project_root.to_str().unwrap(),"project",
+                                &format!("Memory delta {sample}: preserve changed memory bytes"),50).unwrap();
+                        },
+                        "resident_retier" => {
+                            let mut rows=rig.store.load_compartments(namespace).unwrap();
+                            let sample=cmd["sample"].as_u64().unwrap() as usize;
+                            let at=sample%rows.len();rows[at].importance=if sample%2==0 {1} else {100};
+                            rig.store.replace_compartments(namespace,&rows).unwrap();
+                        },
                         "realistic_seed" => {
                             let covered = cmd["covered"].as_i64().unwrap();
                             let count = cmd["compartments"].as_i64().unwrap();
@@ -210,6 +229,19 @@ fn provider_pipeline_driver() {
                      json!({"settled":true})
                 } else if op == "reads" {
                     json!(rig.reads.0.load(Ordering::SeqCst))
+                } else if op == "historian_stats" || op == "historian_drain" {
+                    if op == "historian_drain" {
+                        tokio::time::timeout(Duration::from_secs(120), async {
+                            loop {
+                                tokio::task::yield_now().await;
+                                let stats = rig.handler.provider_historian_budget.stats();
+                                if stats["active"] == 0 && stats["queued"] == 0
+                                    && rig.handler.provider_historian_evaluations.lock().unwrap().is_empty() { break; }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }).await.expect("historians drain within deadline");
+                    }
+                    rig.handler.provider_historian_budget.stats()
                 } else if op == "resident_stats" {
                     rig.handler.provider_resident.stats()
                 } else if op == "resident_slow_once" {
@@ -341,7 +373,8 @@ fn provider_pipeline_driver() {
                     let mut h = McHandler::with_producer_factory_config_resolver(
                         Arc::new(TestProducerFactory {state: Arc::new(ProducerState::default())}),
                         rig.binding.config.clone(), Arc::new(MissingSessionResolver))
-                        .with_startup_provider_resident_enabled(rig.resident_enabled);
+                        .with_startup_provider_resident_enabled(rig.resident_enabled)
+                        .with_startup_provider_resident_process_cap(rig.resident_process_cap);
                     h.store.set(rig.store.clone()).ok().unwrap();
                     h.bind_route(7, rig.binding.clone());
                     h.set_guidance_now_ms_for_test(1);
@@ -351,6 +384,12 @@ fn provider_pipeline_driver() {
                     }
                     rig.handler = h;
                     json!({"restarted": true})
+                } else if op == "autocheckpoint" {
+                    let frames = cmd["frames"].as_u64().unwrap();
+                    let sql = format!("PRAGMA wal_autocheckpoint={frames}");
+                    rig.store.execute_tag_sql_for_test(&sql).unwrap();
+                    rig.sql.execute_batch(&sql).unwrap();
+                    json!({"serving_and_fixture_connections":frames})
                 } else if op == "sql" {
                     (|| -> Result<Value, rusqlite::Error> {
                         let conn = &rig.sql;
@@ -404,6 +443,7 @@ fn provider_pipeline_driver() {
                             };
                         }
                     }
+                    let historian_before = rig.handler.provider_historian_budget.stats();
                     let module_started = std::time::Instant::now();
                     let cpu_started = cpu_time::ProcessTime::now();
                     let scheduler_before = scheduler_wait_ms();
@@ -414,7 +454,11 @@ fn provider_pipeline_driver() {
                             if cmd["timing"] == true {
                                 let raw = String::from_utf8(bytes).unwrap();
                                 let (acquire,callback,finish) = mc_store::provider_meters::last_transaction_timing();
-                                println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{},\"module_ms\":{},\"cpu_ms\":{},\"scheduler_wait_ms\":{},\"db_acquire_ms\":{},\"db_callback_ms\":{},\"db_finish_ms\":{}}}", raw, serde_json::to_string(&raw).unwrap(), module_ms, cpu_started.elapsed().as_secs_f64()*1000.0,(scheduler_wait_ms()-scheduler_before).max(0.0),acquire,callback,finish);
+                                let historian_after = rig.handler.provider_historian_budget.stats();
+                                let historian_during = historian_before["active"] != 0 || historian_before["queued"] != 0
+                                    || historian_after["active"] != 0 || historian_after["queued"] != 0
+                                    || historian_after["completed"] != historian_before["completed"];
+                                println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{},\"module_ms\":{},\"cpu_ms\":{},\"scheduler_wait_ms\":{},\"db_acquire_ms\":{},\"db_callback_ms\":{},\"db_finish_ms\":{},\"historian_during\":{}}}", raw, serde_json::to_string(&raw).unwrap(), module_ms, cpu_started.elapsed().as_secs_f64()*1000.0,(scheduler_wait_ms()-scheduler_before).max(0.0),acquire,callback,finish,historian_during);
                                 std::io::stdout().flush().unwrap();
                                 continue;
                             }
@@ -444,6 +488,7 @@ fn provider_pipeline_driver() {
 `;
 
 export function buildDriver(directory: string): string {
+    directory = resolve(process.env.MC_PROVIDER_DRIVER_BUILD_DIR ?? directory);
     const link = (source: string, destination: string, type?: "dir") => {
         if (!existsSync(destination)) symlinkSync(source, destination, type);
     };
@@ -699,10 +744,10 @@ function prefix(before: string[], after: string[]) {
 }
 
 let serial = 0;
-export async function fixture(driver: Driver, host: Host, directory?: string, protectBash = false, memoryEnabled = false) {
+export async function fixture(driver: Driver, host: Host, directory?: string, protectBash = false, memoryEnabled = false, residentEnabled?: boolean) {
     const rig = `${host}-${++serial}`;
     const harness = host === "OpenCode1" ? "opencode" : "opencode2";
-    await driver.send({ op: "create", rig, harness, directory, protect_bash: protectBash, memory_enabled: memoryEnabled });
+    await driver.send({ op: "create", rig, harness, directory, protect_bash: protectBash, memory_enabled: memoryEnabled, resident_enabled: residentEnabled });
     const oracleRig = `${rig}-full`;
     await driver.send({
         op: "create",

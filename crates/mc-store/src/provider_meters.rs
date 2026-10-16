@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ProviderStoreMeters {
     pub sql_result_rows: u64,
+    pub native_message_rows: u64,
     pub appended_message_bytes: u64,
     pub answer_json_bytes: u64,
     pub tag_row_bytes: u64,
@@ -63,12 +64,21 @@ impl Drop for ProviderStoreMeter {
         tracing::info!(session_id = %self.session, harness = %self.harness, request_id = %self.request,
             sql_rows_complete = false, sql_rows_scope = "provider_log_and_policy_index_result_rows",
             logical_payload_complete = false, logical_payload_scope = "admission_and_hook_payload_cells",
-            sql_result_rows = measured.sql_result_rows, appended_message_bytes = measured.appended_message_bytes,
+            sql_result_rows = measured.sql_result_rows, native_message_rows = measured.native_message_rows, appended_message_bytes = measured.appended_message_bytes,
             answer_json_bytes = measured.answer_json_bytes, tag_row_bytes = measured.tag_row_bytes,
             provider_state_bytes = measured.provider_state_bytes,
             module_logical_payload_bytes = measured.module_logical_payload_bytes,
             "provider store meters");
     }
+}
+
+pub(crate) fn read_message_row<T>(read: impl FnOnce() -> T) -> T {
+    ACTIVE.with(|active| {
+        if let Some(meters) = active.borrow_mut().as_mut() {
+            meters.native_message_rows += 1;
+        }
+    });
+    read_row(read)
 }
 
 pub(crate) fn read_row<T>(read: impl FnOnce() -> T) -> T {
@@ -112,8 +122,10 @@ impl Drop for WriteMeter {
                 let mut meters = active.borrow_mut();
                 if let (Some(current), Some(before)) = (meters.as_mut(), self.before.take()) {
                     let rows = current.sql_result_rows;
+                    let native_rows = current.native_message_rows;
                     *current = before;
                     current.sql_result_rows = rows;
+                    current.native_message_rows = native_rows;
                 }
             });
         }

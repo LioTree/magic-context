@@ -252,6 +252,20 @@ Magic Context uses the runtime's built-in SQLite: `bun:sqlite` under Bun (OpenCo
 
 ---
 
+### Experimental Rust provider residency
+
+`rust_provider_resident` is a startup-only, user-config-only opt-in for the Rust
+OpenCode provider path. It is disabled by default; projects and requests cannot
+enable it. Changing it requires restarting ck-mc.
+
+`rust_provider_resident_process_cap_mb` defaults to **1024 MiB** and accepts values
+from 1 to 1024. It limits **charged resident cache bytes**, not process memory or
+RSS. Each session also has a 64 MiB charge limit; inadmissible state falls back to
+the standard path. SQLite caches, temporary rebuild working sets and allocator
+high-water are outside this accounting. In a 75-session fleet, approximately
+0.82 GB was charged while process RSS reached 2.3 GB, well above the 1 GiB charge
+cap. Lowering this setting is not a process-memory limit.
+
 ## Cache Awareness
 
 LLM providers cache conversation prefixes server-side. The cache window depends on your provider and subscription tier — Claude Pro offers 5 minutes, Max offers 1 hour, and pricing for cached vs. uncached tokens differs between API and subscription usage.

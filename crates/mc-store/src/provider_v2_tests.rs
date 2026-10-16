@@ -420,6 +420,7 @@ fn native_cache_inputs() -> (ModuleMeta, provider_log::ProviderEnginePolicy) {
         ..Default::default()
     };
     let policy = provider_log::ProviderEnginePolicy {
+        native_prefix: None,
         parts: vec![part],
         settings: json!({"coverage":0,"baseline":{}}),
         native_tail_section: true,

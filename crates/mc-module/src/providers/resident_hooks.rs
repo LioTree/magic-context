@@ -2,21 +2,55 @@
 //! the new message and answer. A failed write discards that cache, so a later
 //! hook cannot use totals containing a message the database never committed.
 use super::{policy_summary::ResidentPolicy, records::Key};
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+};
 
-pub(crate) const SESSION_CAP: usize = 2 * 1024 * 1024;
-pub(crate) const PROCESS_CAP: usize = 64 * 1024 * 1024;
+pub(crate) const SESSION_CAP: usize = 64 * 1024 * 1024;
+// Bounds charged resident structures, not RSS. SQLite caches, transient rebuild
+// working sets and allocator high-water can put fleet RSS well above this cap.
+pub(crate) const PROCESS_CAP: usize = 1024 * 1024 * 1024;
 const SESSION_SLOTS: usize = 1024;
 
-#[derive(Default)]
 pub(crate) struct ResidentHooks {
     enabled: bool,
+    process_cap: usize,
     entries: Mutex<HashMap<(u64, String), Entry>>,
+    clock: AtomicU64,
+}
+
+impl Default for ResidentHooks {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            process_cap: PROCESS_CAP,
+            entries: Mutex::new(HashMap::new()),
+            clock: AtomicU64::new(0),
+        }
+    }
 }
 
 enum Entry {
     Building(usize),
-    Ready(Box<ResidentPolicy>, usize),
+    Ready(Box<ResidentPolicy>, usize, u64),
+}
+
+fn oldest_ready(
+    entries: &HashMap<(u64, String), Entry>,
+    except: Option<&(u64, String)>,
+) -> Option<(u64, String)> {
+    entries
+        .iter()
+        .filter_map(|(key, entry)| match entry {
+            Entry::Ready(_, _, stamp) if except != Some(key) => Some((key, stamp)),
+            _ => None,
+        })
+        .min_by_key(|(_, stamp)| *stamp)
+        .map(|(key, _)| key.clone())
 }
 
 pub(crate) struct Lease<'a> {
@@ -47,6 +81,59 @@ impl ResidentHooks {
             ..Self::default()
         }
     }
+    pub(crate) fn with_process_cap(mut self, bytes: usize) -> Self {
+        self.process_cap = bytes.min(PROCESS_CAP);
+        self
+    }
+
+    /// Copy a current decoded tail without taking a serving lease. A missing,
+    /// leased or stale entry falls back to native range pages, never a rebuild.
+    pub(crate) fn historian_tail(
+        &self,
+        store: &mc_store::McStore,
+        key: &Key,
+        lineage: &str,
+        first: u64,
+        through: u64,
+    ) -> Option<Vec<crate::ck_wire::CkIngressMessage>> {
+        if !self.enabled {
+            return None;
+        }
+        let version = store.provider_external_data_version().ok()?;
+        let entries = self.entries.lock().expect("resident lock");
+        let Entry::Ready(state, _, _) = entries.get(&(
+            store.tag_cache_namespace(),
+            key.store_key().conversation_key(),
+        ))?
+        else {
+            return None;
+        };
+        let working = state.fold_working.as_ref()?;
+        if state.fold_lineage.as_deref() != Some(lineage)
+            || state.fold_data_version != Some(version)
+            || state.fold_source_raced
+            || working.key.newest != Some(through)
+            || first <= working.key.through
+        {
+            return None;
+        }
+        let messages: Vec<_> = working
+            .messages
+            .iter()
+            .filter(|message| message.ordinal >= first && message.ordinal <= through)
+            .cloned()
+            .collect();
+        // An incomplete tail cannot substitute for the admitted raw range.
+        if messages.first().map(|m| m.ordinal) != Some(first)
+            || messages.last().map(|m| m.ordinal) != Some(through)
+            || messages
+                .windows(2)
+                .any(|w| w[1].ordinal != w[0].ordinal.saturating_add(1))
+        {
+            return None;
+        }
+        Some(messages)
+    }
 
     pub(crate) fn begin(
         &self,
@@ -57,38 +144,35 @@ impl ResidentHooks {
             return Ok(None);
         }
         let key = (instance, key.store_key().conversation_key());
-        if key.1.len() > SESSION_CAP / 4 {
-            return Err("resident_not_ready: session key exceeds resident cap");
+        if key.1.len() > SESSION_CAP / 4 || self.process_cap < SESSION_CAP {
+            return Ok(None);
         }
         let mut entries = self.entries.lock().expect("resident lock");
         if matches!(entries.get(&key), Some(Entry::Building(_))) {
             return Err("resident_not_ready: session rebuild or admission in progress");
         }
         if entries.len() >= SESSION_SLOTS && !entries.contains_key(&key) {
-            if let Some(old) = entries
-                .iter()
-                .find_map(|(key, entry)| matches!(entry, Entry::Ready(..)).then_some(key.clone()))
-            {
+            if let Some(old) = oldest_ready(&entries, None) {
                 entries.remove(&old);
             } else {
-                return Err("resident_not_ready: resident session slots exhausted");
+                return Ok(None);
             }
         }
         let charge = |entry: &Entry| match entry {
-            Entry::Ready(_, bytes) | Entry::Building(bytes) => *bytes,
+            Entry::Ready(_, bytes, _) | Entry::Building(bytes) => *bytes,
         };
         let existing = entries.get(&key).map_or(0, charge);
-        while entries.values().map(charge).sum::<usize>() - existing + SESSION_CAP > PROCESS_CAP {
-            if let Some(old) = entries.iter().find_map(|(old, entry)| {
-                (old != &key && matches!(entry, Entry::Ready(..))).then_some(old.clone())
-            }) {
+        while entries.values().map(charge).sum::<usize>() - existing + SESSION_CAP
+            > self.process_cap
+        {
+            if let Some(old) = oldest_ready(&entries, Some(&key)) {
                 entries.remove(&old);
             } else {
-                return Err("resident_not_ready: process resident cap exhausted");
+                return Ok(None);
             }
         }
         let (cold, state) = match entries.insert(key.clone(), Entry::Building(SESSION_CAP)) {
-            Some(Entry::Ready(state, _)) => (false, *state),
+            Some(Entry::Ready(state, _, _)) => (false, *state),
             _ => (true, ResidentPolicy::default()),
         };
         Ok(Some(Lease {
@@ -102,7 +186,16 @@ impl ResidentHooks {
     #[cfg(test)]
     pub(crate) fn stats(&self) -> serde_json::Value {
         let entries = self.entries.lock().expect("resident lock");
-        serde_json::json!({"sessions":entries.len(),"charged_bytes":entries.values().map(|entry| match entry { Entry::Ready(_,bytes)|Entry::Building(bytes)=>*bytes }).sum::<usize>(),"rebuilt_parts":entries.values().map(|entry| match entry { Entry::Ready(state,_)=>state.rebuilt_parts,_=>0 }).sum::<usize>(),"session_cap":SESSION_CAP,"process_cap":PROCESS_CAP})
+        serde_json::json!({"sessions":entries.len(),"charged_bytes":entries.values().map(|entry| match entry { Entry::Ready(_,bytes,_)|Entry::Building(bytes)=>*bytes }).sum::<usize>(),"rebuilt_parts":entries.values().map(|entry| match entry { Entry::Ready(state,_,_)=>state.rebuilt_parts,_=>0 }).sum::<usize>(),"session_cap":SESSION_CAP,"process_cap":self.process_cap,"slot_cap":SESSION_SLOTS,
+            "eviction_order":"least recently published ready lease",
+            "containers":entries.iter().filter_map(|(key,entry)| match entry {
+                Entry::Ready(state,bytes,stamp)=>Some(serde_json::json!({"conversation":key.1,"charged_bytes":bytes,"recency":stamp,
+                    "working":state.fold_working.as_ref().map(|working|working.charges()),
+                    "views":state.fold_view.as_ref().map_or(0,|view|view.retained_bytes()-std::mem::size_of::<super::resident_view::ResidentView>()),
+                    "byte_arena":state.fold_arena.retained_bytes()-std::mem::size_of::<super::resident_bytes::ByteArena>(),
+                    "tier_fragments":0,"memory_fragments":0,"decoded_recipe_originals":0,"tail_passes":state.fold_tail_passes})),
+                _=>None,
+            }).collect::<Vec<_>>()})
     }
 
     #[cfg(test)]
@@ -139,16 +232,14 @@ impl Lease<'_> {
             while entries
                 .values()
                 .map(|entry| match entry {
-                    Entry::Ready(_, bytes) | Entry::Building(bytes) => *bytes,
+                    Entry::Ready(_, bytes, _) | Entry::Building(bytes) => *bytes,
                 })
                 .sum::<usize>()
                 - SESSION_CAP
                 + bytes
-                > PROCESS_CAP
+                > self.owner.process_cap
             {
-                let old = entries.iter().find_map(|(key, entry)| {
-                    matches!(entry, Entry::Ready(..)).then_some(key.clone())
-                });
+                let old = oldest_ready(&entries, None);
                 if let Some(old) = old {
                     entries.remove(&old);
                 } else {
@@ -160,7 +251,11 @@ impl Lease<'_> {
             let mut lease = self;
             entries.insert(
                 lease.key.clone(),
-                Entry::Ready(Box::new(std::mem::take(&mut lease.state)), bytes),
+                Entry::Ready(
+                    Box::new(std::mem::take(&mut lease.state)),
+                    bytes,
+                    lease.owner.clock.fetch_add(1, Ordering::Relaxed),
+                ),
             );
             drop(entries);
         }
@@ -220,7 +315,10 @@ mod tests {
             active.push(resident.begin(1, &key(&n.to_string())).unwrap().unwrap());
         }
         assert_eq!(resident.stats()["charged_bytes"], PROCESS_CAP);
-        assert!(resident.begin(1, &key("extra")).is_err());
+        assert!(
+            resident.begin(1, &key("extra")).unwrap().is_none(),
+            "unavailable capacity uses the non-resident path"
+        );
         drop(active);
         for n in 0..SESSION_SLOTS + 1 {
             resident
@@ -231,5 +329,20 @@ mod tests {
         }
         assert_eq!(resident.stats()["sessions"], SESSION_SLOTS);
         assert!(resident.stats()["charged_bytes"].as_u64().unwrap() <= PROCESS_CAP as u64);
+    }
+
+    #[test]
+    fn lowered_64_mib_pool_keeps_the_same_ready_lease_eviction_control() {
+        let resident = ResidentHooks::enabled(true).with_process_cap(64 * 1024 * 1024);
+        resident.begin(1, &key("first")).unwrap().unwrap().publish();
+        resident
+            .begin(1, &key("second"))
+            .unwrap()
+            .unwrap()
+            .publish();
+        assert_eq!(resident.stats()["sessions"], 1);
+        assert!(resident.begin(1, &key("first")).unwrap().unwrap().cold);
+        let small = ResidentHooks::enabled(true).with_process_cap(1024 * 1024);
+        assert!(small.begin(1, &key("normal-fallback")).unwrap().is_none());
     }
 }

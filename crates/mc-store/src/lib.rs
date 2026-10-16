@@ -41,6 +41,7 @@ mod provider_policy_overlay;
 #[cfg(test)]
 mod provider_v2_tests;
 mod provider_view_recipe;
+mod provider_wal;
 pub use provider_view_recipe::{
     ProviderResolvedView, ProviderViewRecipe, ProviderViewSegment, ProviderViewTreatment,
     MAX_VIEW_ANCESTOR_BYTES, MAX_VIEW_BASE_DEPTH,
@@ -51,6 +52,7 @@ mod provider_resident_read;
 pub use provider_preparation::{
     ProviderPreparationWrite, ProviderStoredPreparation, MAX_PROVIDER_PREPARATION_BYTES,
 };
+pub use provider_resident_read::CompartmentSourceRevision;
 #[cfg(any(test, feature = "test-support"))]
 pub use provider_resident_read::ProviderResidentAuthority;
 pub mod provider_records;
@@ -4233,6 +4235,12 @@ pub struct HistorianAssemblySnapshot {
     pub compartment_set_generation: CompartmentSetGeneration,
 }
 
+pub struct HistorianAssemblyIndex {
+    /// Coordinates and importance only; compartment prose and tiers are absent.
+    pub snapshot: HistorianAssemblySnapshot,
+    pub content_sequences: std::collections::BTreeSet<i64>,
+}
+
 /// Result of a deterministic revert re-cut. The caller must use the returned
 /// row_version for the subsequent pass commit and patch the returned metadata fields
 /// into the whole-blob ModuleMeta it commits.
@@ -7632,6 +7640,7 @@ impl<'a> FacadeMutationTxn<'a> {
 pub struct McStore {
     inner: SqliteStore,
     move_path: Option<std::path::PathBuf>,
+    provider_wal: Mutex<Option<provider_wal::ProviderWal>>,
     // Distinguishes independent stores in the process-local tag baseline cache. Production
     // opens one store for the module lifetime; tests and embedded callers may open several.
     tag_cache_namespace: Arc<std::sync::atomic::AtomicU64>,
@@ -8295,6 +8304,7 @@ impl McStore {
                 }
                 _ => None,
             },
+            provider_wal: Mutex::new(None),
             tag_cache_namespace: Arc::new(std::sync::atomic::AtomicU64::new(
                 NEXT_TAG_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             )),
@@ -9177,15 +9187,39 @@ impl McStore {
         self.load_transform_snapshot_with_hook(session_id, || {})
     }
 
+    /// Internal native execution reads only identities in its validated live
+    /// tail. Public full loads continue to reconstruct the entire baseline.
+    pub fn load_native_transform_snapshot(
+        &self,
+        session_id: &str,
+        prefix: &provider_log::ProviderNativePrefix,
+        mids: &[&str],
+    ) -> Result<TransformSnapshot, McStoreError> {
+        self.load_transform_snapshot_scoped(session_id, Some((prefix, mids)), || {})
+    }
+
     fn load_transform_snapshot_with_hook(
         &self,
         session_id: &str,
         after_state_read: impl FnOnce(),
     ) -> Result<TransformSnapshot, McStoreError> {
+        self.load_transform_snapshot_scoped(session_id, None, after_state_read)
+    }
+
+    fn load_transform_snapshot_scoped(
+        &self,
+        session_id: &str,
+        native: Option<(&provider_log::ProviderNativePrefix, &[&str])>,
+        after_state_read: impl FnOnce(),
+    ) -> Result<TransformSnapshot, McStoreError> {
         let snapshot = self.inner.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
             let cache_state_started_at = Instant::now();
-            let loaded = match cache_codec::read_decoded(&transaction, session_id)? {
+            let decoded = match native {
+                Some((prefix, _)) => cache_codec::read_native_decoded(&transaction, session_id, prefix)?,
+                None => cache_codec::read_decoded(&transaction, session_id)?,
+            };
+            let loaded = match decoded {
                 Some(decoded) => {
                     let cache_codec::DecodedRow {
                         row_version,
@@ -9194,7 +9228,17 @@ impl McStore {
                         sections,
                     } = decoded;
                     log_discarded_sections(session_id, &sections);
-                    hydrate_meta_row_state(&transaction, session_id, &mut meta)?;
+                    if let Some((_, mids)) = native {
+                        let mids=serde_json::to_string(mids).map_err(serde_to_sql_error)?;
+                        let mut query=transaction.prepare_cached("SELECT mid,identities FROM mc_block_identities WHERE session_id=?1 AND mid IN (SELECT value FROM json_each(?2))")?;
+                        for row in query.query_map(params![session_id,mids],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))? {
+                            let (mid,raw)=row?;
+                            meta.block_identity_by_mid.insert(mid,serde_json::from_str(&raw).map_err(serde_to_sql_error)?);
+                        }
+                        meta.served_output_fingerprint = load_served_output_fingerprints_tx(&transaction, session_id)?;
+                    } else {
+                        hydrate_meta_row_state(&transaction, session_id, &mut meta)?;
+                    }
                     LoadedState {
                         core,
                         meta,
@@ -9981,6 +10025,24 @@ impl McStore {
                 out.push(row?);
             }
             Ok(out)
+        })?)
+    }
+
+    /// A native intact cut renders only these blocks. Resolve their immutable
+    /// tags by the block index instead of walking tags for covered history.
+    pub fn load_tags_for_blocks(
+        &self,
+        session_id: &str,
+        blocks: &[&str],
+    ) -> Result<Vec<McTagRow>, McStoreError> {
+        let blocks = serde_json::to_string(blocks)
+            .map_err(|error| McStoreError::Serde(error.to_string()))?;
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare_cached(
+                "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes FROM mc_tags INDEXED BY idx_mc_tags_session_block
+                 WHERE session_id=?1 AND block_id IN (SELECT value FROM json_each(?2)) ORDER BY tag_number")?;
+            let rows = statement.query_map(params![session_id, blocks], tag_row_from_sql)?.collect::<rusqlite::Result<Vec<_>>>();
+            rows
         })?)
     }
 
@@ -11164,6 +11226,7 @@ impl McStore {
             }
         }
         let native_requested = provider_policy.is_some_and(|policy| policy.native_tail_section);
+        let native_prefix = provider_policy.and_then(|policy| policy.native_prefix.as_ref());
         let mut encoded = if native_requested {
             cache_codec::encode_row_parts(core, meta, None)
         } else {
@@ -11251,7 +11314,14 @@ impl McStore {
 
             // Refuse before the diff runs rather than treating an unhydrated meta as a
             // request to delete the session's identity history.
-            if let Some(stored) = refuse_unhydrated_block_identities_tx(tx, session_id, meta)? {
+            if let Some(prefix) = native_prefix {
+                let decoded = cache_codec::read_native_decoded(tx, session_id, prefix)?
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                if !native_requested || meta.coverage_ordinal.is_none_or(|through| through < prefix.through)
+                    || decoded.sections.any_discarded() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            } else if let Some(stored) = refuse_unhydrated_block_identities_tx(tx, session_id, meta)? {
                 return Ok(CommitOutcome::UnhydratedBlockIdentities(stored));
             }
             let stored_units = stored_index
@@ -11270,12 +11340,16 @@ impl McStore {
             // WHICH entries differ means reading every stored row, so a pass that changed
             // none of them proves that from its fingerprint and skips the comparison
             // entirely; that is the common case and it must not cost a walk of the session.
-            let row_state_unchanged =
-                row_state_digest_matches_tx(tx, session_id, current, &fingerprint)?;
+            let row_state_unchanged = native_prefix.is_none()
+                && row_state_digest_matches_tx(tx, session_id, current, &fingerprint)?;
             let row_state_writes = if row_state_unchanged {
                 0
             } else {
-                sync_block_identities_tx(tx, session_id, &meta.block_identity_by_mid)?
+                (if native_prefix.is_some() {
+                    sync_native_block_identities_tx(tx, session_id, &meta.block_identity_by_mid)?
+                } else {
+                    sync_block_identities_tx(tx, session_id, &meta.block_identity_by_mid)?
+                })
                     + sync_served_output_fingerprints_tx(
                         tx,
                         session_id,
@@ -11301,6 +11375,7 @@ impl McStore {
                 if native_requested {
                     encoded = match cache_codec::encode_native_row(tx, session_id, core, meta, policy)? {
                         Some(native) => native,
+                        None if native_prefix.is_some() => return Err(rusqlite::Error::InvalidQuery),
                         None => cache_codec::encode_row(core, meta)?,
                     };
                 }
@@ -11359,13 +11434,18 @@ impl McStore {
                     &index_json,
                     current_time_ms(),
                 )?;
-                record_row_state_digest_tx(tx, session_id, next as i64, &fingerprint)?;
+                if native_prefix.is_none() {
+                    record_row_state_digest_tx(tx, session_id, next as i64, &fingerprint)?;
+                } else {
+                    // A suffix digest cannot certify the full identity table.
+                    tx.execute("DELETE FROM mc_cache_state_digest WHERE session_id=?1", [session_id])?;
+                }
                 next
             } else {
                 // Nothing moved, so the digest now describes the version the session is
                 // already at. Recording it here is what lets the pass after an untrusted
                 // digest take the fast path again.
-                if !row_state_unchanged {
+                if !row_state_unchanged && native_prefix.is_none() {
                     record_row_state_digest_tx(tx, session_id, current.max(0), &fingerprint)?;
                 }
                 current.max(0) as u64
@@ -12258,6 +12338,25 @@ impl McStore {
         &self,
         session_id: &str,
     ) -> Result<HistorianAssemblySnapshot, McStoreError> {
+        Ok(self
+            .load_historian_assembly_read(session_id, false)?
+            .snapshot)
+    }
+
+    /// Reference selection reads small coordinates and content-presence flags,
+    /// not the prose bodies of every previously published compartment.
+    pub fn load_historian_assembly_index(
+        &self,
+        session_id: &str,
+    ) -> Result<HistorianAssemblyIndex, McStoreError> {
+        self.load_historian_assembly_read(session_id, true)
+    }
+
+    fn load_historian_assembly_read(
+        &self,
+        session_id: &str,
+        metadata_only: bool,
+    ) -> Result<HistorianAssemblyIndex, McStoreError> {
         let meta_json = self.inner.with_conn(|conn| {
             conn.query_row(
                 "SELECT meta FROM mc_cache_state WHERE session_id = ?1",
@@ -12266,14 +12365,22 @@ impl McStore {
             )
             .optional()
         })?;
-        let (mut compartments, compartment_set_generation, importance_by_sequence) = self
+        let (mut compartments, compartment_set_generation, importance_by_sequence, content_sequences) = self
             .context_read(|conn| {
+                // Stored byte lengths expose content presence without reading
+                // large prose strings on the metadata-only reference path.
+                let columns = if metadata_only { COMPARTMENT_METADATA_COLUMNS } else { COMPARTMENT_SELECT_COLUMNS };
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT {COMPARTMENT_SELECT_COLUMNS}
+                    "SELECT {columns}, (coalesce(octet_length(title),0) > 0 OR coalesce(octet_length(content),0) > 0 OR coalesce(octet_length(p1),0) > 0 OR coalesce(octet_length(p2),0) > 0 OR coalesce(octet_length(p3),0) > 0 OR coalesce(octet_length(p4),0) > 0)
                  FROM compartments WHERE session_id = ?1 ORDER BY sequence ASC"
                 ))?;
+                let mut content_sequences = std::collections::BTreeSet::new();
                 let compartments = stmt
-                    .query_map(params![session_id], Self::stored_compartment_from_row)?
+                    .query_map(params![session_id], |row| {
+                        let compartment = Self::stored_compartment_from_row(row)?;
+                        if row.get::<_, bool>(17)? { content_sequences.insert(compartment.sequence); }
+                        Ok(compartment)
+                    })?
                     .collect::<Result<Vec<_>, _>>()?;
                 let compartment_set_generation = conn.query_row(
                     "SELECT COALESCE(MAX(sequence), 0), COUNT(*)
@@ -12292,6 +12399,7 @@ impl McStore {
                     compartments,
                     compartment_set_generation,
                     importance_by_sequence,
+                    content_sequences,
                 ))
             })?;
         self.apply_compartment_dates(session_id, &mut compartments)?;
@@ -12303,12 +12411,36 @@ impl McStore {
             }
             None => 0,
         };
-        Ok(HistorianAssemblySnapshot {
-            compartments,
-            importance_by_sequence,
-            revert_epoch,
-            compartment_set_generation,
+        Ok(HistorianAssemblyIndex {
+            snapshot: HistorianAssemblySnapshot {
+                compartments,
+                importance_by_sequence,
+                revert_epoch,
+                compartment_set_generation,
+            },
+            content_sequences,
         })
+    }
+
+    /// Materialize only the reference bodies selected from the assembly index.
+    pub fn load_historian_reference_compartments(
+        &self,
+        session_id: &str,
+        sequences: &[i64],
+    ) -> Result<Vec<StoredCompartment>, McStoreError> {
+        if sequences.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = self.context_read(|conn| {
+            let placeholders = sequences.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let mut args = vec![rusqlite::types::Value::Text(session_id.into())];
+            args.extend(sequences.iter().copied().map(rusqlite::types::Value::Integer));
+            let mut stmt = conn.prepare(&format!("SELECT {COMPARTMENT_SELECT_COLUMNS} FROM compartments WHERE session_id=? AND sequence IN ({placeholders}) ORDER BY sequence ASC"))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(args), Self::stored_compartment_from_row)?.collect::<Result<Vec<_>, _>>();
+            rows
+        })?;
+        self.apply_compartment_dates(session_id, &mut rows)?;
+        Ok(rows)
     }
 
     /// The highest compartment `sequence` for a session (0 when none). A cheap read the
@@ -13094,7 +13226,7 @@ impl McStore {
             if !cas_ok {
                 return Ok(TruncateTxnOutcome::CasConflict(current.max(0) as u64));
             }
-            let prior_meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+            let prior_meta = match cache_codec::decode_small_meta(&meta_json) {
                 Ok(meta) => meta,
                 Err(error) => return Ok(TruncateTxnOutcome::Serde(error.to_string())),
             };
@@ -16742,6 +16874,8 @@ const GLANCE_PAGE: usize = 1000;
 /// The `compartments` columns a [`StoredCompartment`] is read from. `context.db` has no
 /// date columns, so the two date slots read NULL and are filled from `store.db`'s
 /// `mc_compartment_dates` afterwards.
+const COMPARTMENT_METADATA_COLUMNS: &str = "sequence, start_message, end_message, CASE WHEN start_block_index IS NULL THEN start_message_id ELSE start_message_id || '#' || start_block_index END, CASE WHEN end_block_index IS NULL THEN end_message_id ELSE end_message_id || '#' || end_block_index END, NULL, NULL, '', '', NULL, NULL, NULL, NULL, importance, episode_type, legacy, created_at";
+
 const COMPARTMENT_SELECT_COLUMNS: &str = "sequence, start_message, end_message, CASE WHEN start_block_index IS NULL THEN start_message_id ELSE start_message_id || '#' || start_block_index END, CASE WHEN end_block_index IS NULL THEN end_message_id ELSE end_message_id || '#' || end_block_index END, NULL, NULL, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at";
 
 /// The `notes` columns a [`StoredNote`] is read from. `updated_at` is read twice: once as
@@ -17156,6 +17290,27 @@ fn sync_block_identities_tx(
         written += tx
             .prepare_cached("DELETE FROM mc_block_identities WHERE session_id = ?1 AND mid = ?2")?
             .execute(params![session_id, mid])?;
+    }
+    Ok(written)
+}
+
+/// Covered identities remain authoritative rows. A validated native tail may
+/// update its identities, but cannot delete rows it deliberately did not read.
+fn sync_native_block_identities_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    desired: &BTreeMap<String, Vec<BlockIdentity>>,
+) -> rusqlite::Result<usize> {
+    let mut written = 0;
+    for (mid, identities) in desired {
+        let json = serde_json::to_string(identities).map_err(serde_to_sql_error)?;
+        written += tx
+            .prepare_cached(
+                "INSERT INTO mc_block_identities(session_id,mid,identities) VALUES (?1,?2,?3)
+             ON CONFLICT(session_id,mid) DO UPDATE SET identities=excluded.identities
+             WHERE identities IS NOT excluded.identities",
+            )?
+            .execute(params![session_id, mid, json])?;
     }
     Ok(written)
 }

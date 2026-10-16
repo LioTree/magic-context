@@ -261,7 +261,12 @@ pub(crate) fn freeze_cut_tx(
     } else {
         (0, serde_json::json!({}))
     };
-    conn.execute("INSERT INTO mc_provider_policy_cuts_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,json_extract(?1,'$[1]'))",params![conv,cut,lineage,coverage,old_count+frozen_parts,settings.get("baseline").unwrap_or(&Value::Null).to_string(),serde_json::json!({"format":1,"covered_measurements":true,"through_ordinal":coverage}).to_string(),serde_json::json!({"users":old_totals.get("users").and_then(Value::as_u64).unwrap_or(0)+frozen_users}).to_string(),settings.to_string()])?;
+    let mut defaults =
+        serde_json::json!({"format":1,"covered_measurements":true,"through_ordinal":coverage});
+    if let Some(revision) = settings.get("native_compartment_source_revision") {
+        defaults["native_compartment_source_revision"] = revision.clone();
+    }
+    conn.execute("INSERT INTO mc_provider_policy_cuts_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,json_extract(?1,'$[1]'))",params![conv,cut,lineage,coverage,old_count+frozen_parts,settings.get("baseline").unwrap_or(&Value::Null).to_string(),defaults.to_string(),serde_json::json!({"users":old_totals.get("users").and_then(Value::as_u64).unwrap_or(0)+frozen_users}).to_string(),settings.to_string()])?;
     // Keep the current per-part exceptions attached to the new baseline; do not
     // copy a complete set of old measurement values for each prior boundary.
     conn.execute(

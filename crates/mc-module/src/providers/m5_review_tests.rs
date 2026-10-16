@@ -145,6 +145,11 @@ async fn review_m5_randomized_200_complete_inputs_and_publications() {
                 a.task.firing.raw_chunk_messages.as_bytes(),
                 e.task.firing.raw_chunk_messages.as_bytes(),
             );
+            review_bytes(
+                &format!("case {case} prompt"),
+                a.task.firing.prompt.as_bytes(),
+                e.task.firing.prompt.as_bytes(),
+            );
             assert_eq!(
                 a.task.firing.chunk_fingerprint, e.task.firing.chunk_fingerprint,
                 "case {case}"

@@ -545,6 +545,30 @@ fn read_decoded_in_cut(
     Ok(Some(decoded))
 }
 
+/// Native folds already hold the immutable prefix checkpoint. Decode the live
+/// section without expanding it, but only when its reference still matches.
+pub(crate) fn read_native_decoded(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    prefix: &crate::provider_log::ProviderNativePrefix,
+) -> rusqlite::Result<Option<DecodedRow>> {
+    let Some(row) = read_small_row(conn, session_id)? else {
+        return Ok(None);
+    };
+    let reference = native_tail::reference(&row.meta)?.ok_or(rusqlite::Error::InvalidQuery)?;
+    if reference.cut_id != prefix.cut_id || reference.prefix_count != prefix.parts {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let through: Option<u64> = conn.query_row(
+        "SELECT frozen_through_ordinal FROM mc_provider_policy_cuts_v1 WHERE cut_id=?1 AND conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE engine_namespace=?2)",
+        params![prefix.cut_id, session_id], |row| row.get(0))?;
+    if through != Some(prefix.through) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let sections = read_sections(conn, session_id)?;
+    Ok(Some(decode_row(row, sections)?))
+}
+
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Full decodes run on this thread, so a test can pin how many a pass performs. Per

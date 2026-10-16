@@ -10,7 +10,7 @@ const FORMAT: &str = "mc_native_tail_v1";
 pub(super) struct NativeReference {
     format: String,
     pub(super) cut_id: u64,
-    prefix_count: usize,
+    pub(super) prefix_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -108,7 +108,7 @@ pub(crate) fn encode_native_row(
     let Some(cut_id) = crate::provider_policy_overlay::current_cut_tx(conn, &owners[0])? else {
         return Ok(None);
     };
-    let prefix_count = policy
+    let live_prefix_count = policy
         .parts
         .iter()
         .take_while(|part| {
@@ -117,28 +117,35 @@ pub(crate) fn encode_native_row(
         })
         .filter(|part| part.kind != "header")
         .count();
-    if prefix_count > baseline.baseline_parts.len() {
+    if live_prefix_count > baseline.baseline_parts.len() {
         return Ok(None);
     }
     // coverage_ordinal is the last message summarized by the cached history.
     // The hygiene walk gives every covered part zero tokens and no tag, protection
     // or drop state. Only its key/hash remain; any other measurement values require
     // storing the complete baseline vector rather than replacing its prefix with facts.
-    if baseline.baseline_parts[..prefix_count].iter().any(|part| {
-        part.kind != crate::TailHygienePartKind::Excluded
-            || part.tokens != 0
-            || part.u_tokens != 0
-            || part.tag_number.is_some()
-            || part.tag_status.is_some()
-            || part.protected
-            || part.queued_for_drop
-    }) {
+    if baseline.baseline_parts[..live_prefix_count]
+        .iter()
+        .any(|part| {
+            part.kind != crate::TailHygienePartKind::Excluded
+                || part.tokens != 0
+                || part.u_tokens != 0
+                || part.tag_number.is_some()
+                || part.tag_status.is_some()
+                || part.protected
+                || part.queued_for_drop
+        })
+    {
         return Ok(None);
     }
     let reference = NativeReference {
         format: FORMAT.into(),
         cut_id,
-        prefix_count,
+        prefix_count: live_prefix_count
+            + policy
+                .native_prefix
+                .as_ref()
+                .map_or(0, |prefix| prefix.parts),
     };
     #[derive(Serialize)]
     struct Body<'a> {
@@ -150,7 +157,7 @@ pub(crate) fn encode_native_row(
         baseline: RecordFields {
             value: baseline,
             omit: &[],
-            baseline_parts: Some(&baseline.baseline_parts[prefix_count..]),
+            baseline_parts: Some(&baseline.baseline_parts[live_prefix_count..]),
         },
     })
     .map_err(|error| CodecError::Serde(error.to_string()))?;

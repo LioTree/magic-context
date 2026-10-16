@@ -892,14 +892,26 @@ struct HistorianPromptFitInput<'a> {
 /// the untrimmed blocks are returned so the firing's admission check refuses the
 /// prompt and records the failure with a backoff. Untrimmed blocks are
 /// byte-identical to the ones the prompt golden pins.
+#[cfg(test)]
 fn fit_historian_prompt(input: &HistorianPromptFitInput<'_>) -> HistorianPromptFit {
+    fit_historian_prompt_selected(input, None)
+}
+
+fn fit_historian_prompt_selected(
+    input: &HistorianPromptFitInput<'_>,
+    selected: Option<&[ReferenceCompartment]>,
+) -> HistorianPromptFit {
     let seeds = select_seeds(input.session_id, input.chunk_start as i64, SEED_FLOOR);
-    let references = select_session_references(
-        input.compartments,
-        &seeds,
-        input.session_id,
-        input.chunk_start as i64,
-    );
+    let references = selected
+        .map(<[ReferenceCompartment]>::to_vec)
+        .unwrap_or_else(|| {
+            select_session_references(
+                input.compartments,
+                &seeds,
+                input.session_id,
+                input.chunk_start as i64,
+            )
+        });
     let memories = order_historian_memories(input.memories);
     let render = |refs: usize, memory_count: usize, seed_count: usize| {
         (
@@ -1035,6 +1047,45 @@ pub fn assemble_historian_firing(
     config: HistorianAssemblerConfig,
     now_ms: i64,
 ) -> Result<AssembleHistorianFiringOutcome, mc_store::McStoreError> {
+    assemble_historian_firing_inner(
+        store,
+        messages,
+        live,
+        block_identities_by_mid,
+        config,
+        now_ms,
+        false,
+    )
+}
+
+pub(crate) fn assemble_provider_historian_firing(
+    store: &McStore,
+    messages: &[CkIngressMessage],
+    live: &[FlatBlock],
+    block_identities_by_mid: &BTreeMap<String, Vec<BlockIdentity>>,
+    config: HistorianAssemblerConfig,
+    now_ms: i64,
+) -> Result<AssembleHistorianFiringOutcome, mc_store::McStoreError> {
+    assemble_historian_firing_inner(
+        store,
+        messages,
+        live,
+        block_identities_by_mid,
+        config,
+        now_ms,
+        true,
+    )
+}
+
+fn assemble_historian_firing_inner(
+    store: &McStore,
+    messages: &[CkIngressMessage],
+    live: &[FlatBlock],
+    block_identities_by_mid: &BTreeMap<String, Vec<BlockIdentity>>,
+    config: HistorianAssemblerConfig,
+    now_ms: i64,
+    bounded_context: bool,
+) -> Result<AssembleHistorianFiringOutcome, mc_store::McStoreError> {
     let producer_key = config.model_chain.first().map(String::as_str);
     let seed = crate::decision_calibration::DecisionCalibration::for_model(producer_key);
     let source_ratio = seed.prose_ratio.max(seed.tools_ratio);
@@ -1044,7 +1095,15 @@ pub fn assemble_historian_firing(
             HistorianNoFireReason::NoModels,
         ));
     }
-    let snapshot = store.load_historian_assembly_snapshot(&config.session_id)?;
+    let (snapshot, content_sequences) = if bounded_context {
+        let index = store.load_historian_assembly_index(&config.session_id)?;
+        (index.snapshot, index.content_sequences)
+    } else {
+        (
+            store.load_historian_assembly_snapshot(&config.session_id)?,
+            Default::default(),
+        )
+    };
     let compartments = snapshot.compartments;
     let expected_revert_epoch = snapshot.revert_epoch;
     let compartment_set_generation = snapshot.compartment_set_generation;
@@ -1106,7 +1165,39 @@ pub fn assemble_historian_firing(
         primary_input,
         config.max_output_tokens,
     );
-    let reference_compartments: Vec<ReferenceCompartment> = compartments
+    let selected_compartments;
+    let references = if bounded_context {
+        let seeds = select_seeds(&config.session_id, chunk_start as i64, SEED_FLOOR);
+        let candidates: Vec<_> = compartments
+            .iter()
+            .map(|c| {
+                (
+                    content_sequences.contains(&c.sequence),
+                    snapshot
+                        .importance_by_sequence
+                        .get(&c.sequence)
+                        .copied()
+                        .unwrap_or(c.importance),
+                )
+            })
+            .collect();
+        let selected = crate::historian_prompt::select_session_reference_indices(
+            &candidates,
+            &seeds,
+            &config.session_id,
+            chunk_start as i64,
+        );
+        let sequences: Vec<_> = selected
+            .into_iter()
+            .map(|i| compartments[i].sequence)
+            .collect();
+        selected_compartments =
+            store.load_historian_reference_compartments(&config.session_id, &sequences)?;
+        &selected_compartments
+    } else {
+        &compartments
+    };
+    let reference_compartments: Vec<ReferenceCompartment> = references
         .iter()
         .map(|compartment| {
             // Calibration references show rescored importance as soon as it is
@@ -1119,19 +1210,22 @@ pub fn assemble_historian_firing(
             reference
         })
         .collect();
-    let prompt_fit = fit_historian_prompt(&HistorianPromptFitInput {
-        session_id: &config.session_id,
-        chunk_start,
-        last_ordinal: eligible_end.saturating_sub(1),
-        compartments: &reference_compartments,
-        memories: &memories,
-        memory_enabled: config.memory_enabled,
-        extraction_free: config.extraction_free,
-        limit: producer_input_limit,
-        seed: &seed,
-        system_tokens,
-        requested: source_budget,
-    });
+    let prompt_fit = fit_historian_prompt_selected(
+        &HistorianPromptFitInput {
+            session_id: &config.session_id,
+            chunk_start,
+            last_ordinal: eligible_end.saturating_sub(1),
+            compartments: &reference_compartments,
+            memories: &memories,
+            memory_enabled: config.memory_enabled,
+            extraction_free: config.extraction_free,
+            limit: producer_input_limit,
+            seed: &seed,
+            system_tokens,
+            requested: source_budget,
+        },
+        bounded_context.then_some(reference_compartments.as_slice()),
+    );
     if prompt_fit.trimmed || prompt_fit.chunk_tokens < source_budget {
         tracing::info!(
             "[mc-module][{}] historian prompt fit: chunkTokens={} requestedChunkTokens={} sessionReferences={} memories={}/{} seeds={}",

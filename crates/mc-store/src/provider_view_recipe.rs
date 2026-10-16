@@ -236,6 +236,17 @@ fn resolve_tx(
 }
 
 impl McStore {
+    pub fn provider_native_view_metadata(
+        &self,
+        key: &ProviderSessionKey,
+        version: u64,
+    ) -> Result<Option<Value>, ProviderError> {
+        self.inner.with_conn(|conn| {
+            let raw:Option<String>=conn.query_row("SELECT view_meta_json FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2",
+                params![key.conversation_key(),version],|row|row.get(0)).optional()?;
+            raw.map(|raw|serde_json::from_str(&raw).map_err(|_|rusqlite::Error::InvalidQuery)).transpose()
+        }).map_err(|error|ProviderError::Storage(error.into()))
+    }
     /// List stored model-view recipe versions without decoding native message bodies.
     pub fn load_provider_view_recipe_versions(
         &self,
@@ -399,8 +410,10 @@ impl McStore {
                     let mut depth=0;
                     while let Some(version)=current {
                         if depth>MAX_VIEW_BASE_DEPTH {return Err(invalid("provider view retention inheritance exceeds bound"));}
-                        let recipe=load_recipe_tx(conn,&conv,version)?.ok_or_else(||invalid("still-referenced provider view is missing"))?;
-                        keep.insert(version); current=recipe.base_version; depth+=1;
+                        let base = conn.prepare_cached("SELECT base_version FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2")?
+                            .query_row(params![conv,version], |row| row.get::<_,Option<u64>>(0)).optional()?
+                            .ok_or_else(||invalid("still-referenced provider view is missing"))?;
+                        keep.insert(version); current=base; depth+=1;
                     }
                 }
                 let mut q=conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 ORDER BY version DESC")?;

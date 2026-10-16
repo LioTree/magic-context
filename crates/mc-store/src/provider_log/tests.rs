@@ -823,3 +823,94 @@ fn meters_count_inserted_tag_cells_but_not_ignored_tags() {
     drop(transaction);
     assert_eq!(meter.snapshot().tag_row_bytes, bytes);
 }
+
+#[test]
+fn historian_pages_bound_rows_across_lineage_cuts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let messages: Vec<_> = (1..=900).map(message).collect();
+    store
+        .commit_provider_status(&key(), &lineage("L", 1), &messages, Some(900), &[])
+        .unwrap();
+    let child = ProviderLineage {
+        lineage_id: "C".into(),
+        first_ordinal: 501,
+        descends_from: Some("L".into()),
+        through_ordinal: Some(500),
+    };
+    store
+        .commit_provider_status(
+            &key(),
+            &child,
+            &(501..=1000).map(message).collect::<Vec<_>>(),
+            Some(1000),
+            &[],
+        )
+        .unwrap();
+    let meter =
+        crate::provider_meters::ProviderStoreMeter::start("session", "opencode", "historian-page");
+    let mut next = 480;
+    let mut ordinals = Vec::new();
+    while next <= 520 {
+        let page = store
+            .load_provider_messages_page(&key(), "C", next, 520, 7)
+            .unwrap();
+        assert!(!page.is_empty());
+        assert!(page.len() <= 7);
+        next = page.last().unwrap().ordinal + 1;
+        ordinals.extend(page.iter().map(|m| m.ordinal));
+    }
+    assert_eq!(ordinals, (480..=520).collect::<Vec<_>>());
+    assert_eq!(
+        meter.snapshot().native_message_rows,
+        41,
+        "SQL must not materialize covered or future native rows"
+    );
+    assert_eq!(
+        store
+            .provider_message_range_bytes(&key(), "C", 480, 520)
+            .unwrap(),
+        (480..=520)
+            .map(|n| message(n).message_bytes.len())
+            .sum::<usize>()
+    );
+}
+
+#[test]
+fn historian_reference_index_does_not_materialize_unselected_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let rows: Vec<_> = (1..=100)
+        .map(|n| crate::StoredCompartment {
+            sequence: n,
+            start_message: n * 10 - 9,
+            end_message: n * 10,
+            start_message_id: format!("m{}#0", n * 10 - 9),
+            end_message_id: format!("m{}#0", n * 10),
+            title: format!("Chapter {n}"),
+            content: "retained prose ".repeat(1000),
+            importance: (n % 100) as i32,
+            ..Default::default()
+        })
+        .collect();
+    store.replace_compartments("engine", &rows).unwrap();
+    let index = store.load_historian_assembly_index("engine").unwrap();
+    assert_eq!(index.snapshot.compartments.len(), 100);
+    assert_eq!(index.content_sequences.len(), 100);
+    assert!(index
+        .snapshot
+        .compartments
+        .iter()
+        .all(|c| c.content.is_empty() && c.title.is_empty() && c.p1.is_none()));
+    let selected = store
+        .load_historian_reference_compartments("engine", &[1, 50, 100])
+        .unwrap();
+    assert_eq!(selected.len(), 3);
+    assert_eq!(
+        selected.iter().map(|c| c.sequence).collect::<Vec<_>>(),
+        vec![1, 50, 100]
+    );
+    assert!(selected
+        .iter()
+        .all(|c| c.content == "retained prose ".repeat(1000)));
+}

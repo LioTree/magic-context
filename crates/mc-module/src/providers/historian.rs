@@ -1,6 +1,49 @@
 //! Barrier-driven historian evaluation over the provider's durable ingest log.
 use super::*;
 
+#[cfg(test)]
+struct HistorianBlockingProbe {
+    stage: &'static str,
+    harness: String,
+    thread: Option<std::path::PathBuf>,
+    started: std::time::Instant,
+    cpu_ticks: Option<u64>,
+}
+#[cfg(test)]
+fn thread_cpu_ticks() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
+    let fields = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
+}
+#[cfg(test)]
+impl HistorianBlockingProbe {
+    fn new(stage: &'static str, harness: &str) -> Self {
+        let probe = Self {
+            stage,
+            harness: harness.into(),
+            thread: std::fs::read_link("/proc/thread-self").ok(),
+            started: std::time::Instant::now(),
+            cpu_ticks: thread_cpu_ticks(),
+        };
+        tracing::info!(stage, harness, thread=?probe.thread, marker="begin", "historian blocking work");
+        probe
+    }
+}
+#[cfg(test)]
+impl Drop for HistorianBlockingProbe {
+    fn drop(&mut self) {
+        let cpu_ticks = thread_cpu_ticks()
+            .zip(self.cpu_ticks)
+            .map(|(after, before)| after.saturating_sub(before));
+        tracing::info!(stage=self.stage,harness=%self.harness,thread=?self.thread,marker="end",
+            wall_ms=self.started.elapsed().as_secs_f64()*1000.0,cpu_ticks=?cpu_ticks,"historian blocking work");
+    }
+}
+
 /// Only scalar/model policy accompanies a pass. Transcript bytes come exclusively
 /// from the message log; a host cannot substitute a second history for the trigger.
 pub(super) fn checked_inputs(value: &Value) -> Result<Value, HandlerOutcome> {
@@ -51,8 +94,9 @@ pub(super) fn record_barrier(counters: &mut Value) {
 }
 
 /// Advance raw-ingest cadence only for new contiguous ordinals. A replay is not
-/// another user/tool event. Legacy histories, gaps and descents stay unknown
-/// until one completed evaluation rebuilds these scalar watermarks from the log.
+/// another user/tool event. Unknown cadence after a gap or descent is rebaselined
+/// from the unsummarized range at the next completed evaluation; intact scalar
+/// watermarks continue advancing without reading covered messages.
 pub(super) fn advance_ingest_watermarks(
     counters: &mut Value,
     lineage: &str,
@@ -99,6 +143,19 @@ pub(super) fn advance_ingest_watermarks(
     counters["historian_ingest"] = watermark;
 }
 
+struct EvaluationClaim {
+    entries: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+impl Drop for EvaluationClaim {
+    fn drop(&mut self) {
+        self.entries
+            .lock()
+            .expect("historian evaluations")
+            .remove(&self.key);
+    }
+}
+
 struct IngestSnapshot {
     messages: Vec<ck_wire::CkIngressMessage>,
     user: Value,
@@ -106,6 +163,7 @@ struct IngestSnapshot {
 }
 
 struct LogPublicationFence {
+    _budget: Arc<historian_budget::Permit>,
     key: Key,
     lineage: String,
     serial: Arc<ProviderSerial>,
@@ -236,6 +294,10 @@ impl McHandler {
             worker.store = Arc::clone(&self.store);
             worker.provider_store = Arc::clone(&self.provider_store);
             worker.provider_serial = Arc::clone(&self.provider_serial);
+            worker.provider_resident = Arc::clone(&self.provider_resident);
+            worker.provider_historian_budget = Arc::clone(&self.provider_historian_budget);
+            worker.provider_historian_evaluations =
+                Arc::clone(&self.provider_historian_evaluations);
             worker.producer_factory = Arc::clone(&self.producer_factory);
             worker.session_resolver = Arc::clone(&self.session_resolver);
             worker.config = Arc::clone(&self.config);
@@ -260,12 +322,21 @@ impl McHandler {
     }
 
     pub(crate) fn schedule_provider_historian(&self, binding: SessionBinding, key: Key) {
+        // Bulk residency fixtures can isolate serving-cache charges by disabling
+        // background historians. This switch does not ship in ck-mc.
+        #[cfg(test)]
+        if std::env::var_os("MC_TEST_HISTORIAN_HOLD").is_some() {
+            return;
+        }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let worker = self.provider_historian_worker();
         runtime.spawn(async move {
-            match worker.prepare_provider_historian(&binding, &key).await {
+            let mut retry_snapshot = true;
+            while retry_snapshot {
+                retry_snapshot = false;
+                match worker.prepare_provider_historian_snapshot(&binding, &key, &mut retry_snapshot).await {
                 Ok(Some(PreparedHistorianAction::FireReady(prepared))) => {
                     worker.spawn_historian_firing(prepared.task);
                 }
@@ -274,6 +345,7 @@ impl McHandler {
                     worker.retry_provider_historian(&key).await;
                     tracing::warn!(session=%key.session, ?error, "provider historian evaluation failed");
                 }
+            }
             }
         });
     }
@@ -338,15 +410,40 @@ impl McHandler {
             .map_err(transient)
     }
 
+    #[cfg(test)]
     async fn prepare_provider_historian(
         &self,
         binding: &SessionBinding,
         key: &Key,
     ) -> Result<Option<PreparedHistorianAction>, HandlerOutcome> {
+        self.prepare_provider_historian_snapshot(binding, key, &mut false)
+            .await
+    }
+
+    async fn prepare_provider_historian_snapshot(
+        &self,
+        binding: &SessionBinding,
+        key: &Key,
+        retry_snapshot: &mut bool,
+    ) -> Result<Option<PreparedHistorianAction>, HandlerOutcome> {
         let store = self
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
+        let evaluation_key = key.store_key().conversation_key();
+        {
+            let mut evaluations = self
+                .provider_historian_evaluations
+                .lock()
+                .expect("historian evaluations");
+            if !evaluations.insert(evaluation_key.clone()) {
+                return Ok(None);
+            }
+        }
+        let _evaluation = EvaluationClaim {
+            entries: Arc::clone(&self.provider_historian_evaluations),
+            key: evaluation_key,
+        };
         let serial = self.provider_serial.lock_for(key).await;
         let Some(mut conversation) = store
             .load_provider_conversation(&key.store_key())
@@ -375,7 +472,9 @@ impl McHandler {
         let generation = counters["historian_barrier_generation"]
             .as_u64()
             .unwrap_or(0);
-        if counters["historian_evaluated_barrier"].as_u64() == Some(generation) {
+        if counters["historian_evaluated_barrier"].as_u64() == Some(generation)
+            && counters["historian_evaluation_due"].as_bool() != Some(true)
+        {
             return Ok(None);
         }
         // Admission maintains the complete frontier on this small row. A final
@@ -389,6 +488,7 @@ impl McHandler {
             .load_meta(&conversation.engine_namespace)
             .map_err(transient)?;
         let active = meta.meta.historian.state != HistorianPhase::Idle;
+        drop(meta);
         let live = self
             .live_historian_completion_wait(&conversation.engine_namespace)
             .is_some();
@@ -397,7 +497,8 @@ impl McHandler {
         let watermark = &counters["historian_ingest"];
         let known = watermark["lineage"].as_str() == Some(&conversation.lineage_id)
             && watermark["through"].as_u64() == Some(through);
-        let requested = counters["historian_evaluation_due"].as_bool() == Some(true)
+        let requested = !known
+            || counters["historian_evaluation_due"].as_bool() == Some(true)
             || counters["historian_run_retry_due"].as_bool() == Some(true)
             || counters["historian_launch_pending"].is_object()
             || cadence.is_null()
@@ -425,49 +526,124 @@ impl McHandler {
             .map_err(transient)?;
         drop(serial);
 
+        let covered = store
+            .max_compartment_end_ordinal(&conversation.engine_namespace)
+            .map_err(transient)?;
+        let first = if covered > 0 {
+            (covered as u64).saturating_add(1)
+        } else {
+            0
+        };
+        let native_bytes = store
+            .provider_message_range_bytes(
+                &key.store_key(),
+                &conversation.lineage_id,
+                first,
+                through,
+            )
+            .map_err(transient)?;
+        let budget = self.provider_historian_budget.acquire(native_bytes).await;
+        // Revalidate after queueing, before allocating a transcript. Hooks and
+        // folds may have advanced the barrier or published a newer boundary.
+        let current = store
+            .load_provider_conversation(&key.store_key())
+            .map_err(transient)?;
+        if current.as_ref().is_none_or(|current| {
+            current.lineage_id != conversation.lineage_id
+                || current.hook_counters_json != conversation.hook_counters_json
+        }) || store
+            .max_compartment_end_ordinal(&conversation.engine_namespace)
+            .map_err(transient)?
+            != covered
+        {
+            *retry_snapshot = true;
+            return Ok(None);
+        }
+        let resident = self.provider_resident.historian_tail(
+            store,
+            key,
+            &conversation.lineage_id,
+            first,
+            through,
+        );
+        let load_budget = Arc::clone(&budget);
+        let ingest_watermark = counters["historian_ingest"].clone();
         let load_store = Arc::clone(store);
         let load_key = key.store_key();
         let lineage = conversation.lineage_id.clone();
         #[cfg(test)]
         let scan_rows = Arc::clone(&self.provider_historian_scan_rows);
+        #[cfg(test)]
+        let mut ingest_pause = self
+            .provider_historian_ingest_pause
+            .lock()
+            .expect("ingest pause")
+            .take();
         let ingest = tokio::task::spawn_blocking(
             move || -> Result<Option<IngestSnapshot>, HandlerOutcome> {
-                let held = load_store
-                    .load_provider_messages(&load_key, &lineage)
-                    .map_err(transient)?;
                 #[cfg(test)]
-                scan_rows.fetch_add(held.len() as u64, Ordering::Relaxed);
-                if held.last().is_some_and(|m| m.ordinal != through) {
+                let _probe = HistorianBlockingProbe::new("ingest", &load_key.harness);
+                let _budget = load_budget;
+                let mut messages = resident.unwrap_or_default();
+                if messages.is_empty() {
+                    let mut next = first;
+                    loop {
+                        let held = load_store
+                            .load_provider_messages_page(&load_key, &lineage, next, through, 256)
+                            .map_err(transient)?;
+                        #[cfg(test)]
+                        scan_rows.fetch_add(held.len() as u64, Ordering::Relaxed);
+                        if held.is_empty() {
+                            break;
+                        }
+                        let last = held.last().unwrap().ordinal;
+                        for m in held {
+                            let entry = compact::status::StatusMessage {
+                                raw_message: None,
+                                mid: m.mid,
+                                ordinal: m.ordinal,
+                                message: serde_json::from_slice(&m.message_bytes)
+                                    .map_err(transient)?,
+                            };
+                            messages.push(codec::Codec::OpencodeAiSdk.decode_message(&entry)?);
+                            #[cfg(test)]
+                            if let Some((entered, release)) = ingest_pause.take() {
+                                let _ = entered.send(());
+                                release.recv().map_err(transient)?;
+                            }
+                        }
+                        if last >= through {
+                            break;
+                        }
+                        next = last.saturating_add(1);
+                    }
+                }
+                if messages.last().is_some_and(|m| m.ordinal != through) {
                     return Ok(None);
                 }
-                let entries = held
-                    .into_iter()
-                    .map(|m| {
-                        Ok(compact::status::StatusMessage {
-                            raw_message: None,
-                            mid: m.mid,
-                            ordinal: m.ordinal,
-                            message: serde_json::from_slice(&m.message_bytes).map_err(transient)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, HandlerOutcome>>()?;
-                let decoded = codec_opencode::decode_messages(&entries)?;
-                let user = decoded
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.ck.role == "user" && !m.ck.meta.synthetic)
-                    .map(|m| json!([m.mid, m.ordinal]))
-                    .unwrap_or(Value::Null);
-                let tools = decoded
-                    .messages
-                    .iter()
-                    .filter(|m| !m.ck.meta.synthetic)
-                    .flat_map(|m| &m.ck.content)
-                    .filter(|b| matches!(b.kind, mc_store::CkKind::ToolResult { .. }))
-                    .count() as u64;
+                let user = if known {
+                    ingest_watermark["user"].clone()
+                } else {
+                    messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.ck.role == "user" && !m.ck.meta.synthetic)
+                        .map(|m| json!([m.mid, m.ordinal]))
+                        .unwrap_or(Value::Null)
+                };
+                let tools = if known {
+                    ingest_watermark["tools"].as_u64().unwrap_or(0)
+                } else {
+                    messages
+                        .iter()
+                        .filter(|m| !m.ck.meta.synthetic)
+                        .flat_map(|m| &m.ck.content)
+                        .filter(|b| matches!(b.kind, mc_store::CkKind::ToolResult { .. }))
+                        .count() as u64
+                };
+                drop(load_store);
                 Ok(Some(IngestSnapshot {
-                    messages: decoded.messages,
+                    messages,
                     user,
                     tools,
                 }))
@@ -498,6 +674,7 @@ impl McHandler {
                 != generation
             || current_counters["historian_evaluated_barrier"].as_u64() != Some(generation)
         {
+            *retry_snapshot = true;
             return Ok(None);
         }
         conversation = current;
@@ -557,8 +734,12 @@ impl McHandler {
         let prepare_binding = binding.clone();
         let prepare_key = key.clone();
         let prepare_lineage = conversation.lineage_id.clone();
+        let prepare_budget = Arc::clone(&budget);
         let mut action = tokio::task::spawn_blocking(
             move || -> Result<PreparedHistorianAction, HandlerOutcome> {
+                #[cfg(test)]
+                let _probe = HistorianBlockingProbe::new("prepare", &prepare_key.harness);
+                let _budget = prepare_budget;
                 let projection = ck_wire::project_messages(&parsed.messages).map_err(transient)?;
                 let mut timings = HistorianTriggerTimings::default();
                 Ok(worker.prepare_historian_fire(
@@ -571,6 +752,9 @@ impl McHandler {
                         now: now_ms(),
                         snapshot_generation: None,
                         publication_fence: Some(Arc::new(LogPublicationFence {
+                            // Firings and restart adoption retain the fence for
+                            // their entire drive, so they retain admission too.
+                            _budget: Arc::clone(&_budget),
                             key: prepare_key,
                             lineage: prepare_lineage,
                             serial: Arc::clone(&worker.provider_serial),
@@ -1006,10 +1190,12 @@ mod tests {
         assert_eq!(store.provider_frontier(&k, "child").unwrap(), 4002);
     }
 
+    include!("historian_bounded_tests.rs");
     include!("m5_review_tests.rs");
 
     fn handler(path: &Path) -> McHandler {
         let mut h = McHandler::new();
+        h.provider_historian_budget = historian_budget::Budget::new(2, 512);
         h.fixed_config = Some(McModuleConfig {
             inject_docs: false,
             memory_enabled: false,

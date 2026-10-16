@@ -387,7 +387,7 @@ impl Default for SerializedOutputCache {
 }
 
 impl SerializedOutputCache {
-    fn new(max_retained_bytes: usize) -> Self {
+    pub(crate) fn new(max_retained_bytes: usize) -> Self {
         Self {
             sessions: HashMap::new(),
             lru: VecDeque::new(),
@@ -433,6 +433,14 @@ impl SerializedOutputCache {
             .map(|session| session.entries.len())
             .sum();
         (self.retained_bytes, entry_count)
+    }
+
+    pub(crate) fn resident_retained_bytes(&self) -> usize {
+        use crate::retained_size::hash_map_allocation_bytes;
+        self.retained_bytes
+            + std::mem::size_of::<Self>()
+            + hash_map_allocation_bytes(&self.sessions)
+            + self.lru.capacity() * std::mem::size_of::<String>()
     }
 
     pub(crate) fn remove(&mut self, session_id: &str) {
@@ -706,6 +714,20 @@ pub struct TransformRequest {
     /// Set only by the native provider handler, never by a wire request.
     #[serde(skip)]
     pub native_tail_section: bool,
+    #[serde(skip)]
+    pub(crate) native_fold_prefix: Option<crate::providers::fold_prefix::FoldPrefix>,
+    #[serde(skip)]
+    pub(crate) native_fold_sidecar: Option<Arc<crate::codec::DecodeSidecar>>,
+    #[serde(skip)]
+    pub(crate) native_compartment_source_revision: Option<mc_store::CompartmentSourceRevision>,
+    #[serde(skip)]
+    pub(crate) native_fold_snapshot: Option<Arc<mc_store::TransformSnapshot>>,
+    #[serde(skip)]
+    pub(crate) native_fold_hygiene: Option<Arc<Mutex<crate::providers::hygiene_memo::HygieneMemo>>>,
+    #[serde(skip)]
+    pub(crate) native_fold_output: Option<Arc<Mutex<SerializedOutputCache>>>,
+    #[serde(skip)]
+    pub(crate) native_fold_projection: Option<Arc<FlatProjection>>,
     #[serde(default)]
     pub kind: String,
     #[serde(default = "default_wire_version")]
@@ -1185,6 +1207,13 @@ impl<'de> Deserialize<'de> for TransformRequest {
             .unwrap_or_else(default_protected_tags);
         Ok(Self {
             native_tail_section: false,
+            native_fold_prefix: None,
+            native_fold_sidecar: None,
+            native_compartment_source_revision: None,
+            native_fold_snapshot: None,
+            native_fold_hygiene: None,
+            native_fold_output: None,
+            native_fold_projection: None,
             kind: wire.kind,
             v: wire.v,
             serializer_profile: wire.serializer_profile.unwrap_or_default(),
@@ -2077,6 +2106,7 @@ impl PendingOverlayDecisions {
 }
 
 struct Channel1NudgeInputs<'a, 'ctx> {
+    covered_users: u64,
     ctx: &'a ProducerContext<'ctx>,
     core: &'a CoreState,
     projection: &'a FlatProjection,
@@ -2542,7 +2572,7 @@ pub mod compaction {
         status: &Status,
         state: &mut State,
     ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, true)
+        run(store, template, ctx, status, state, true, None)
     }
 
     pub fn step(
@@ -2552,7 +2582,22 @@ pub mod compaction {
         status: &Status,
         state: &mut State,
     ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, false)
+        run(store, template, ctx, status, state, false, None)
+    }
+
+    pub(crate) trait AppliedComparison {
+        fn matches(&self, candidate: &View, raw: &[CkIngressMessage]) -> bool;
+    }
+
+    pub(crate) fn step_native(
+        store: &McStore,
+        template: &TransformRequest,
+        ctx: &ProducerContext<'_>,
+        status: &Status,
+        state: &mut State,
+        comparison: &dyn AppliedComparison,
+    ) -> Result<Output, TransformError> {
+        run(store, template, ctx, status, state, false, Some(comparison))
     }
 
     fn run(
@@ -2562,6 +2607,7 @@ pub mod compaction {
         status: &Status,
         state: &mut State,
         initial: bool,
+        comparison: Option<&dyn AppliedComparison>,
     ) -> Result<Output, TransformError> {
         if !ctx.compaction_enabled || status.context_window == 0 {
             return Err(TransformError::LineageProtocol(
@@ -2573,7 +2619,15 @@ pub mod compaction {
                 "compaction setup missing".to_string(),
             ));
         }
-        let range = working_range(status, &template.messages)?;
+        let mut range = working_range(status, &template.messages)?;
+        if template.native_fold_prefix.is_some() {
+            range.from = state
+                .last_applied
+                .as_ref()
+                .ok_or(TransformError::OrdinalViolation)?
+                .range
+                .from;
+        }
         if state
             .last_applied
             .as_ref()
@@ -2675,7 +2729,15 @@ pub mod compaction {
                 ));
             }
         });
-        let engine = transform_with_projection(store, &req, ctx)?;
+        let engine = if let Some(cache) = req
+            .native_fold_output
+            .as_ref()
+            .filter(|_| req.native_fold_prefix.is_some())
+        {
+            transform_with_projection_cached(store, &req, ctx, cache, None)?
+        } else {
+            transform_with_projection(store, &req, ctx)?
+        };
         let permitted = engine.response.prefix_bust_permitted;
         let mut answer = Answer::Noop;
         // The host may already be serving a whole-request transform. When it
@@ -2698,7 +2760,10 @@ pub mod compaction {
             if !structural_repeat
                 && (rejected.is_some_and(|r| !r.structural)
                     || initial
-                    || !matches_served(&candidate, state.last_applied.as_ref(), &req.messages))
+                    || !comparison.map_or_else(
+                        || matches_served(&candidate, state.last_applied.as_ref(), &req.messages),
+                        |comparison| comparison.matches(&candidate, &req.messages),
+                    ))
             {
                 // The runner may have missed an earlier answer, but this step may
                 // already have committed newer history or removed output. Return
@@ -2772,11 +2837,11 @@ pub mod compaction {
     }
 
     fn same_view(left: &View, right: &View) -> bool {
-        left.range == right.range && bytes(&left.replacement) == bytes(&right.replacement)
+        left.range == right.range && bytes(&left.replacement).eq(bytes(&right.replacement))
     }
 
-    fn bytes(messages: &[CkWireMessage]) -> Vec<Vec<u8>> {
-        messages.iter().map(canonical_message_bytes).collect()
+    fn bytes(messages: &[CkWireMessage]) -> impl Iterator<Item = Vec<u8>> + '_ {
+        messages.iter().map(canonical_message_bytes)
     }
 
     fn matches_served(candidate: &View, applied: Option<&View>, raw: &[CkIngressMessage]) -> bool {
@@ -2788,13 +2853,16 @@ pub mod compaction {
         {
             return false;
         }
-        let mut served = applied.replacement.clone();
-        served.extend(
-            raw.iter()
-                .filter(|m| m.ordinal >= applied.range.to)
-                .map(|m| m.ck.clone()),
-        );
-        bytes(&served) == bytes(&candidate.replacement)
+        applied
+            .replacement
+            .iter()
+            .chain(
+                raw.iter()
+                    .filter(|m| m.ordinal >= applied.range.to)
+                    .map(|m| &m.ck),
+            )
+            .map(canonical_message_bytes)
+            .eq(bytes(&candidate.replacement))
     }
 
     fn replacement(
@@ -4481,7 +4549,16 @@ fn apply_once(
             && cache.replace_from <= ingress_req.messages.len()
             && cache.replace_from <= cache.projection.message_count()
     });
-    let initial_projection = if let Some(cache) = reusable_projection {
+    // This projection and the decoded messages share a validated resident tail
+    // key. Do not reuse it if todo normalization changed the ingress messages.
+    let resident_projection = ingress_req.native_fold_projection.as_ref().filter(|_| {
+        ingress_req.native_fold_prefix.is_some()
+            && normalized_req.is_none()
+            && !ingress_req.lineage_switched
+    });
+    let initial_projection = if let Some(projection) = resident_projection {
+        projection.as_ref().clone()
+    } else if let Some(cache) = reusable_projection {
         project_messages_incremental(&ingress_req.messages, &cache.projection, cache.replace_from)?
     } else {
         project_messages(&ingress_req.messages)?
@@ -4494,7 +4571,11 @@ fn apply_once(
     });
     timings.projection = elapsed_ms(projection_started_at);
     profile_end!(perf_projection);
-    timings.projection_reused_messages = reusable_projection.map_or(0, |cache| cache.replace_from);
+    timings.projection_reused_messages = if resident_projection.is_some() {
+        ingress_req.messages.len()
+    } else {
+        reusable_projection.map_or(0, |cache| cache.replace_from)
+    };
     timings.projection_projected_messages = ingress_req
         .messages
         .len()
@@ -4625,13 +4706,44 @@ fn apply_once(
     profile_end!(perf_ingress_validation);
     let seed_or_sync_started_at = Instant::now();
     profile_start!(perf_seed, "seed_or_sync");
-    let transform_snapshot = store.load_transform_snapshot(&req.session_id)?;
+    let transform_snapshot = if let Some(snapshot) =
+        req.native_fold_snapshot.as_ref().filter(|snapshot| {
+            store
+                .load_meta(&req.session_id)
+                .is_ok_and(|meta| meta.row_version == snapshot.loaded.row_version)
+        }) {
+        (**snapshot).clone()
+    } else if let Some(prefix) = &req.native_fold_prefix {
+        store.load_native_transform_snapshot(
+            &req.session_id,
+            &prefix.reference(),
+            &req.messages
+                .iter()
+                .map(|message| message.mid.as_str())
+                .collect::<Vec<_>>(),
+        )?
+    } else {
+        store.load_transform_snapshot(&req.session_id)?
+    };
     timings.seed_or_sync = elapsed_ms(seed_or_sync_started_at);
     profile_end!(perf_seed);
     timings.store_cache_state = transform_snapshot.timings.cache_state_ms;
     profile_start!(perf_tags, "store_tags");
     let tag_hydration_started_at = Instant::now();
-    let mut tag_rows = load_cached_tags(store, &req.session_id)?;
+    let mut tag_rows = if req.native_fold_prefix.is_some() {
+        Arc::new(
+            store.load_tags_for_blocks(
+                &req.session_id,
+                &projection
+                    .blocks
+                    .iter()
+                    .map(|block| block.id.as_str())
+                    .collect::<Vec<_>>(),
+            )?,
+        )
+    } else {
+        load_cached_tags(store, &req.session_id)?
+    };
     let hydrated_tag_count = tag_rows.len();
     timings.store_tags = elapsed_ms(tag_hydration_started_at);
     profile_end!(perf_tags);
@@ -7653,19 +7765,57 @@ fn apply_once(
             &adopted_tools_policy,
         )
     };
-    let nudge_protected_block_ids = nudge_base_protected_block_ids
+    let nudge_protected_block_ids: HashSet<String> = nudge_base_protected_block_ids
         .union(&nudge_tool_blocks)
         .cloned()
         .collect();
-    let hygiene_measurement = measure_tail_hygiene_with_pending_drops(
-        &projection,
-        &core,
-        meta.coverage_ordinal,
-        &hygiene_tag_rows,
-        &protection_window.tag_numbers,
-        &nudge_protected_block_ids,
-        &pending_drop_target_ids,
-    );
+    let hygiene_key = req.native_fold_hygiene.as_ref().map(|_| {
+        crate::providers::hygiene_memo::HygieneMemo::key(&(
+            &projection.identity_by_mid,
+            meta.coverage_ordinal,
+            hygiene_tag_rows
+                .iter()
+                .map(|tag| (&tag.block_id, tag.tag_number, &tag.kind))
+                .collect::<Vec<_>>(),
+            format!("{:?}", protection_window.tag_numbers.coordinate_space),
+            protection_window
+                .tag_numbers
+                .tag_numbers
+                .iter()
+                .collect::<BTreeSet<_>>(),
+            nudge_protected_block_ids.iter().collect::<BTreeSet<_>>(),
+            pending_drop_target_ids.iter().collect::<BTreeSet<_>>(),
+            core.frozen_units
+                .iter()
+                .filter(|unit| unit.key.starts_with("red:") || unit.key.starts_with("cav:"))
+                .collect::<Vec<_>>(),
+        ))
+    });
+    let held_hygiene = req.native_fold_hygiene.as_ref().and_then(|memo| {
+        let memo = memo.lock().expect("fold hygiene memo");
+        (memo.key == hygiene_key)
+            .then(|| memo.measured.clone())
+            .flatten()
+    });
+    let mut hygiene_measurement = held_hygiene.unwrap_or_else(|| {
+        measure_tail_hygiene_with_pending_drops(
+            &projection,
+            &core,
+            meta.coverage_ordinal,
+            &hygiene_tag_rows,
+            &protection_window.tag_numbers,
+            &nudge_protected_block_ids,
+            &pending_drop_target_ids,
+        )
+    });
+    if let Some(memo) = &req.native_fold_hygiene {
+        let mut memo = memo.lock().expect("fold hygiene memo");
+        memo.key = hygiene_key;
+        memo.measured = Some(hygiene_measurement.clone());
+    }
+    if let Some(prefix) = &req.native_fold_prefix {
+        hygiene_measurement.content_signature = prefix.signature(&hygiene_measurement.parts);
+    }
     profile_end!(perf_hygiene_measure);
     profile_start!(perf_hygiene_refresh, "hygiene_refresh");
     let provider_measurement = store
@@ -7743,6 +7893,10 @@ fn apply_once(
     if tagging_active {
         if let Some((row, unit)) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
+                covered_users: req
+                    .native_fold_prefix
+                    .as_ref()
+                    .map_or(0, |prefix| prefix.users),
                 ctx,
                 core: &core,
                 projection: &projection,
@@ -8361,6 +8515,10 @@ fn apply_once(
         run_transform_attempt_hook(&req.session_id);
         let provider_policy = provider_measurement.as_ref().map(|measurement| {
             mc_store::provider_records::ProviderEnginePolicy {
+                native_prefix: req
+                    .native_fold_prefix
+                    .as_ref()
+                    .map(|prefix| prefix.reference()),
                 parts: capture_provider_parts(
                     req,
                     &projection,
@@ -8370,7 +8528,19 @@ fn apply_once(
                     true,
                 ),
                 native_tail_section: req.native_tail_section,
-                settings: provider_engine_settings(&meta),
+                settings: {
+                    let mut settings = provider_engine_settings(&meta);
+                    if let Some(revision) = &req.native_compartment_source_revision {
+                        settings["native_compartment_source_revision"] =
+                            serde_json::to_value(revision).expect("source revision JSON");
+                    }
+                    if let Some(prefix) = &req.native_fold_prefix {
+                        settings["baseline_len"] = serde_json::json!(
+                            settings["baseline_len"].as_u64().unwrap_or(0) + prefix.parts as u64
+                        );
+                    }
+                    settings
+                },
             }
         });
         store.commit_transform_with_provider_policy(
@@ -14027,7 +14197,7 @@ fn maybe_append_channel1_nudge(
     if input.agent_drops_applied_this_pass || meta.channel1_reduce_suppressed {
         return None;
     }
-    let current_real_user_turn_count = real_user_turn_count(input.projection);
+    let current_real_user_turn_count = real_user_turn_count(input.projection) + input.covered_users;
     let decision = decide_channel1(input.baseline, meta, current_real_user_turn_count);
     if !decision.fire {
         apply_channel1_decision_state(meta, &decision);
@@ -22379,6 +22549,13 @@ pub(crate) mod tests {
     ) -> TransformRequest {
         TransformRequest {
             native_tail_section: false,
+            native_fold_prefix: None,
+            native_fold_sidecar: None,
+            native_compartment_source_revision: None,
+            native_fold_snapshot: None,
+            native_fold_hygiene: None,
+            native_fold_output: None,
+            native_fold_projection: None,
             cache_ttl: None,
             effective_execute_threshold: None,
             auto_search_enabled: true,

@@ -1,10 +1,23 @@
-//! Hook token totals, protection windows and hint candidates rebuilt from policy rows.
-//! Hooks admit one message and decide tag/reminder operations; they do not render
-//! a conversation replacement, so native history and fold fragments are unnecessary.
+//! Policy aggregates and bounded derived fold state share one session lease.
+//! Hooks update policy totals; folds additionally reuse the live tail and view.
 use super::*;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub(crate) struct ResidentPolicy {
+    pub(crate) fold_prefix: Option<crate::providers::fold_prefix::FoldPrefix>,
+    pub(crate) fold_lineage: Option<String>,
+    pub(crate) fold_structure: Option<[u8; 32]>,
+    pub(crate) fold_source_raced: bool,
+    pub(in crate::providers) fold_view: Option<crate::providers::resident_view::ResidentView>,
+    pub(in crate::providers) fold_arena: crate::providers::resident_bytes::ByteArena,
+    pub(crate) fold_hygiene:
+        std::sync::Arc<std::sync::Mutex<crate::providers::hygiene_memo::HygieneMemo>>,
+    pub(crate) fold_data_version: Option<u64>,
+    pub(in crate::providers) fold_working: Option<crate::providers::fold_working::FoldWorking>,
+    pub(crate) fold_output: Arc<Mutex<transform::SerializedOutputCache>>,
+    #[cfg(test)]
+    pub(crate) fold_tail_passes: u64,
     summary: Option<PolicySummary>,
     saved: Option<String>,
     before: HashMap<String, Option<ProviderPolicyPart>>,
@@ -51,6 +64,23 @@ impl ResidentPolicy {
             None
         };
         Ok(Self {
+            fold_prefix: crate::providers::fold_prefix::FoldPrefix::build(
+                &parts,
+                &counters["engine_policy"],
+            ),
+            fold_lineage: None,
+            fold_structure: None,
+            fold_source_raced: false,
+            fold_view: None,
+            fold_arena: Default::default(),
+            fold_hygiene: Default::default(),
+            fold_data_version: None,
+            fold_working: None,
+            fold_output: Arc::new(Mutex::new(transform::SerializedOutputCache::new(
+                16 * 1024 * 1024,
+            ))),
+            #[cfg(test)]
+            fold_tail_passes: 0,
             summary,
             saved,
             before,
@@ -66,6 +96,33 @@ impl ResidentPolicy {
         // read_provider_resident_policy bounds input to 100,000 rows / 128 MiB
         // before allocating the temporary rebuild input.
         std::mem::size_of::<Self>()
+            + crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES
+            + std::mem::size_of::<Mutex<transform::SerializedOutputCache>>()
+            + self
+                .fold_output
+                .lock()
+                .expect("fold output cache")
+                .resident_retained_bytes()
+            - std::mem::size_of::<transform::SerializedOutputCache>()
+            + self.fold_lineage.as_ref().map_or(0, String::capacity)
+            + self.fold_view.as_ref().map_or(0, |view| {
+                view.retained_bytes()
+                    - std::mem::size_of::<crate::providers::resident_view::ResidentView>()
+            })
+            + self.fold_arena.retained_bytes()
+            - std::mem::size_of::<crate::providers::resident_bytes::ByteArena>()
+            + crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES
+            + std::mem::size_of::<std::sync::Mutex<crate::providers::hygiene_memo::HygieneMemo>>()
+            + self
+                .fold_hygiene
+                .lock()
+                .expect("fold hygiene memo")
+                .retained_bytes()
+            - std::mem::size_of::<crate::providers::hygiene_memo::HygieneMemo>()
+            + self.fold_working.as_ref().map_or(0, |working| {
+                working.retained_bytes()
+                    - std::mem::size_of::<crate::providers::fold_working::FoldWorking>()
+            })
             + self.saved.as_ref().map_or(0, String::capacity)
             + self.summary.as_ref().map_or(0, |summary| {
                 serde_json::to_vec(summary).expect("summary JSON").len() * 4
