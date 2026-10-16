@@ -5620,9 +5620,9 @@ fn apply_once(
     //   drain hold is lifted, queued work is applied only to blocks after the turn's kept
     //   signed thinking (`active_thinking_prefix_edit_ids`), and with the head still frozen.
     // Each is the single permission its mutation paths read; none is vetoed separately.
-    // `open_signed_turn` is the request-level fact this hold reads. The edit-admission
-    // `protected_signed_prefix` below is narrower (it replays persisted reasoning removals
-    // and frozen reset units) and governs trigger parking and per-block admission.
+    // `open_signed_turn` is the request-level fact used by the drain hold and recovery. The
+    // head freeze and trigger parking use retained-thinking admission, which first replays
+    // persisted reasoning removals and frozen reset units.
     let active_thinking_turn = active_anthropic_thinking_turn(req);
     let open_signed_turn =
         active_thinking_turn && is_prefix_bound_thinking_model(req.model_key.as_deref());
@@ -5670,6 +5670,16 @@ fn apply_once(
         reset_planning_core = core;
         &reset_planning_core
     };
+    // Reset retries include persisted omissions, so removed signatures do not hold the prefix.
+    let retained_admission = edit_admission_for_request(planning_core, req);
+    let protected_signed_prefix =
+        !retained_admission.admit(crate::edit_admission::EditCoord::Prefix);
+    let hold_enabled = ctx.signed_thinking_hold == crate::config::SignedThinkingHold::On;
+    let admission = if hold_enabled {
+        retained_admission
+    } else {
+        crate::edit_admission::EditAdmission::new(&[], false)
+    };
     let force_band_active = usage_percentage
         >= scheduler::escalation_bands(ctx.execute_threshold_percentage)
             .force_materialize_percentage;
@@ -5686,7 +5696,15 @@ fn apply_once(
     let head_replay_impossible = head_rebuild_forced
         || (!req.is_subagent
             && (loaded.meta.bootstrap_seed_fold_pending || is_legacy_baseline(&loaded.core)));
-    let signed_head_frozen = open_signed_turn && !head_replay_impossible;
+    // Summarizing more history changes both cached head messages and which raw messages are
+    // omitted. Neither may move before kept signed thinking. Ask admission after replaying
+    // saved thinking removals; with the feature off, keep the legacy request-level freeze.
+    let signed_head_frozen = !head_replay_impossible
+        && if hold_enabled {
+            !admission.admit(crate::edit_admission::EditCoord::Prefix)
+        } else {
+            open_signed_turn
+        };
     // The drain hold lifts when this pass relieves pressure (force band, Emergency95) or is a
     // full provider-cache write anyway (an expired cache, discarded cache sections, a head
     // that cannot be replayed): queued work is then applied in this same pass. For a primary
@@ -5755,16 +5773,6 @@ fn apply_once(
     // below can authorize new provider-visible mutations.
     // Subagents execute a reductions-only branch, not the prefix plan. Inherited
     // HARD/reconcile advisories cannot price automatic reductions without a fold.
-    // Reset retries include persisted omissions, so removed signatures do not hold the prefix.
-    let retained_admission = edit_admission_for_request(planning_core, req);
-    let protected_signed_prefix =
-        !retained_admission.admit(crate::edit_admission::EditCoord::Prefix);
-    let hold_enabled = ctx.signed_thinking_hold == crate::config::SignedThinkingHold::On;
-    let admission = if hold_enabled {
-        retained_admission
-    } else {
-        crate::edit_admission::EditAdmission::new(&[], false)
-    };
     // For models whose signatures bind thinking to preceding bytes, Anthropic rejects
     // changes before a resent block. The Claude Code serializer keeps completed-turn
     // blocks, so releasing a parked /ctx-flush at the next user turn would be rejected.
@@ -6537,6 +6545,18 @@ fn apply_once(
         meta.last_serializer_profile = req.serializer_profile.clone();
     }
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
+
+    // The scheduler can select Execute even though kept thinking prevents a new head from
+    // being served. Preserve the deferred work until that publication or refresh can land,
+    // without undoing this pass's emergency-drain pressure and timestamp observations.
+    if hold_enabled
+        && signed_head_frozen
+        && (compartment_seq_changed_since_meta
+            || current_m1_digest != applied_m1_revision
+            || loaded.meta.soft_refresh_pending)
+    {
+        meta.deferred_execute_state = loaded.meta.deferred_execute_state.clone();
+    }
 
     if lineage_anchor_failure {
         core.reconcile_pending = true;

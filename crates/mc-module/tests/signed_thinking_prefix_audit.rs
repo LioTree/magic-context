@@ -521,6 +521,15 @@ impl Fixture {
             )
             .unwrap();
         self.served = self.pass();
+        if self.scenario == "coverage-commit" {
+            // Claude Code must rebuild m0, not append an m1 delta, when new summary coverage
+            // absorbs a previously served system message. Exercise that fold trigger too.
+            self.push(
+                "covered-system",
+                "system",
+                vec![json!({"type":"text","text":"Keep the parser API backward compatible."})],
+            );
+        }
         self.user_turn(
             "prompt-1",
             "Inspect the parser and the attached screenshot, then report.",
@@ -659,6 +668,26 @@ impl Fixture {
         }
     }
 
+    /// Cached head bytes and metadata that claim which raw history has been summarized.
+    fn fold_state(&self) -> Value {
+        let loaded = self.store.load(&self.req.session_id).unwrap();
+        json!({
+            "head": loaded.core.frozen_units.iter()
+                .filter(|unit| matches!(unit.key.as_str(), "m0" | "m1"))
+                .collect::<Vec<_>>(),
+            "boundary": loaded.core.boundary_id,
+            "coverage": loaded.meta.coverage_ordinal,
+            "coverage_start": loaded.meta.coverage_start_ordinal,
+            "coverage_seq": loaded.meta.coverage_compartment_seq,
+            "folded_seq": loaded.meta.folded_compartment_seq,
+            "m1_revision": loaded.meta.m1_revision,
+            "m1_seq": loaded.meta.m1_compartment_seq,
+            "rendered_m0": loaded.meta.rendered_m0_coverage,
+            "rendered_m1": loaded.meta.rendered_m1_coverage,
+            "deferred_execute": loaded.meta.deferred_execute_state,
+        })
+    }
+
     fn todo(&self, state: &str, anchor: &str) {
         self.store
             .set_todo_state(&self.req.session_id, state, anchor, "audit")
@@ -758,6 +787,7 @@ fn mid_loop(profile: &str, subagent: bool, lane: Lane) {
     let before = f.tool_loop(4);
     f.arm_and_bust(subagent);
     let armed = f.triggers();
+    let fold_before = f.fold_state();
     if std::env::var("MC_AUDIT_DEBUG").as_deref() == Ok("1") {
         println!("META armed {lane:?} subagent={subagent}: {armed:?}");
     }
@@ -794,6 +824,17 @@ fn mid_loop(profile: &str, subagent: bool, lane: Lane) {
         !landed,
         "{profile} subagent={subagent} {lane:?}: held lane landed"
     );
+    if lane == Lane::HardFold {
+        audit_assert!(
+            !f.served.prefix_bust_permitted,
+            "{profile}: held fold priced a bust"
+        );
+        audit_assert_eq!(
+            f.fold_state(),
+            fold_before,
+            "{profile}: held fold advanced served state"
+        );
+    }
     if profile == "opencode-aisdk"
         && matches!(
             lane,
@@ -813,6 +854,10 @@ fn mid_loop(profile: &str, subagent: bool, lane: Lane) {
         after,
         "{profile} subagent={subagent} {lane:?}: a repeat pass changed the held bytes"
     );
+    if lane == Lane::HardFold {
+        audit_assert!(!f.served.prefix_bust_permitted);
+        audit_assert_eq!(f.fold_state(), fold_before);
+    }
     f.tool_loop(2);
     if subagent {
         return;
@@ -871,6 +916,13 @@ fn mid_loop(profile: &str, subagent: bool, lane: Lane) {
         released_landed,
         "{profile} {lane:?}: the held edit did not land at the next user turn"
     );
+    if lane == Lane::HardFold {
+        audit_assert!(
+            f.served.prefix_bust_permitted,
+            "{profile}: released fold did not bust"
+        );
+        audit_assert!(f.fold_state() != fold_before);
+    }
 }
 
 fn control(profile: &str, lane: Lane) {
@@ -992,6 +1044,48 @@ macro_rules! audit {
 
 audit!(opencode_rust_mode, "opencode-aisdk");
 audit!(claude_code, "claude-code-anthropic");
+
+#[test]
+fn coverage_fold_preserves_deferred_execute_until_admitted() {
+    for profile in ["opencode-aisdk", "claude-code-anthropic"] {
+        let mut f = Fixture::new(profile, false, Lane::HardFold, "coverage-commit");
+        f.tool_loop(4);
+        f.arm_and_bust(false);
+        let mut snapshot = f.store.load_meta(&f.req.session_id).unwrap();
+        snapshot.meta.deferred_execute_state = Some(mc_store::DeferredExecuteState {
+            reason: "execute-none".into(),
+        });
+        f.store
+            .commit_meta(&f.req.session_id, snapshot.row_version, &snapshot.meta)
+            .unwrap();
+        let before = f.wire();
+        let state = f.fold_state();
+        for _ in 0..2 {
+            f.served = f.pass();
+            audit_assert_eq!(f.mock.check(&f.wire()), None, "{profile}");
+            audit_assert_eq!(f.wire(), before, "{profile}");
+            audit_assert!(!f.served.prefix_bust_permitted, "{profile}");
+            audit_assert_eq!(f.fold_state(), state, "{profile}");
+        }
+        // OpenCode strips completed-turn thinking before serving the newly summarized head.
+        // Claude Code does not yet do so, so changing that head at the next user turn would
+        // invalidate the old signatures; only OpenCode can assert a valid release here.
+        if profile == "opencode-aisdk" {
+            f.next_user_turn("coverage-release");
+            audit_assert_eq!(f.mock.check(&f.wire()), None);
+            audit_assert!(f.landed(&before, &f.wire()));
+            audit_assert!(f.served.prefix_bust_permitted);
+            audit_assert!(f.fold_state() != state);
+            audit_assert!(f
+                .store
+                .load_meta(&f.req.session_id)
+                .unwrap()
+                .meta
+                .deferred_execute_state
+                .is_none());
+        }
+    }
+}
 
 #[test]
 fn force_latch_ignores_bookkeeping_without_thinking() {
