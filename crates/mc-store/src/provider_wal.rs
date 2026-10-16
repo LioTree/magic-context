@@ -203,6 +203,25 @@ impl Drop for ProviderWal {
 }
 
 impl McStore {
+    /// Pay WAL's first-header sync on the startup worker, before publishing the
+    /// serving store. NORMAL still syncs a fresh WAL header on its first commit.
+    /// Rewriting the unchanged user version dirties page one without changing
+    /// application rows, the schema or the sync policy. The usual fenced writer
+    /// still checks the lease epoch and commits this write.
+    pub fn prime_wal_for_serving(&self) -> Result<(), McStoreError> {
+        let wal = self.inner.with_conn(|conn| {
+            conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+        })?;
+        if wal.eq_ignore_ascii_case("wal") {
+            self.inner.with_conn_fenced(|conn| {
+                let version: i64 =
+                    conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+                conn.pragma_update(None, "user_version", version)
+            })?;
+        }
+        Ok(())
+    }
+
     /// Called by ck-mc after validating the OpenCode session/harness route and
     /// plan, with the startup `rust_provider_resident` user setting enabled.
     /// Failure retains SQLite's ordinary autocheckpoint policy rather than refusing.

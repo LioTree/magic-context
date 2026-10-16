@@ -4737,11 +4737,12 @@ impl McHandler {
             .fetch_add(1, Ordering::Relaxed);
         let store = Arc::clone(&self.store);
         let coordinator = Arc::clone(&self.store_open);
+        let prime_serving_wal = self.provider_resident.is_enabled();
         tokio::spawn(async move {
             let _guard = StoreOpenWaiterGuard {
                 coordinator: Arc::clone(&coordinator),
             };
-            Self::run_store_open(store, coordinator, descriptor).await;
+            Self::run_store_open(store, coordinator, descriptor, prime_serving_wal).await;
         });
     }
 
@@ -4749,6 +4750,7 @@ impl McHandler {
         store_slot: Arc<OnceLock<Arc<McStore>>>,
         coordinator: Arc<StoreOpenCoordinator>,
         descriptor: StorageDescriptor,
+        prime_serving_wal: bool,
     ) {
         #[cfg(test)]
         {
@@ -4762,7 +4764,8 @@ impl McHandler {
             }
         }
         let policy = *coordinator.policy.lock().expect("store open policy mutex");
-        let mut last_lease_error = match Self::open_store_once(&descriptor).await {
+        let mut last_lease_error = match Self::open_store_once(&descriptor, prime_serving_wal).await
+        {
             Ok(opened) => {
                 if coordinator.cancelled.load(Ordering::Acquire) {
                     coordinator.fail_and_idle(
@@ -4835,7 +4838,7 @@ impl McHandler {
                 continue;
             }
 
-            match Self::open_store_once(&descriptor).await {
+            match Self::open_store_once(&descriptor, prime_serving_wal).await {
                 Ok(opened) => {
                     if coordinator.cancelled.load(Ordering::Acquire) {
                         Self::abandon_lease_wait_on_shutdown(&coordinator, started.elapsed());
@@ -4940,7 +4943,10 @@ impl McHandler {
     /// Open `store.db`, then attach `context.db`, where every domain row lives. The pair is
     /// served only when both record the same single-store migration; otherwise the open
     /// fails with the refusal that names why, before any request is served.
-    async fn open_store_once(descriptor: &StorageDescriptor) -> Result<McStore, McStoreError> {
+    async fn open_store_once(
+        descriptor: &StorageDescriptor,
+        prime_serving_wal: bool,
+    ) -> Result<McStore, McStoreError> {
         let descriptor = descriptor.clone();
         let enforce_private_permissions = crate::config::private_storage_permissions_enabled();
         let open = move || {
@@ -4956,6 +4962,9 @@ impl McHandler {
                 &context_path,
                 enforce_private_permissions,
             )?;
+            if prime_serving_wal {
+                store.prime_wal_for_serving()?;
+            }
             Ok(store)
         };
         match tokio::task::spawn_blocking(open).await {
@@ -21172,6 +21181,38 @@ mod tests {
                 "Magic Context refused to start: its store (store.db) is at schema v{ahead} but this ck-mc build only knows up to v{LATEST_MIGRATION_VERSION}. Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup. (MC-C13)"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn resident_startup_primes_wal_before_publishing_the_store() {
+        for enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let descriptor = dev_descriptor_at(dir.path().to_str().unwrap());
+            drop(McStore::open_for_test(&descriptor).unwrap());
+            // Match the migration timestamps in store.db and context.db, then
+            // remove the fresh-install marker so attachment performs no repair
+            // writes that could hide a missing startup prime.
+            let seeded = McHandler::open_store_once(&descriptor, false)
+                .await
+                .unwrap();
+            seeded
+                .set_single_store_marker_build_for_test("restart-fixture")
+                .unwrap();
+            drop(seeded);
+            let StorageBackend::Sqlite { path } = &descriptor.backend else {
+                unreachable!()
+            };
+            let handler = McHandler::new().with_startup_provider_resident_enabled(enabled);
+            handler.begin_store_open(descriptor.clone(), DescriptorOrigin::DevFallback);
+            wait_for_store_open_phase(&handler, STORE_OPENED).await;
+            assert!(handler.store.get().is_some());
+            let bytes = std::fs::metadata(format!("{path}-wal")).map_or(0, |meta| meta.len());
+            assert_eq!(
+                bytes > 32,
+                enabled,
+                "only resident startup must prime WAL before publication"
+            );
+        }
     }
 
     #[tokio::test]

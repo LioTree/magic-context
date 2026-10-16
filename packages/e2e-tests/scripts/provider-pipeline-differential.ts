@@ -15,6 +15,7 @@ import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import {
     existsSync,
+    lstatSync,
     mkdirSync,
     mkdtempSync,
     readFileSync,
@@ -135,6 +136,18 @@ fn provider_pipeline_driver() {
                 std::fs::create_dir_all(&project).unwrap();
                 let store = Arc::new(McStore::open_for_test(&crate::test_support::descriptor(&root)).unwrap());
                 let resident_enabled = cmd["resident_enabled"].as_bool().unwrap_or_else(|| std::env::var("MC_RESIDENT_HOOKS").as_deref() == Ok("1"));
+                let startup_probe = (cmd["commit_probe"] == true).then(|| mc_store::commit_probe::Guard::install(store.clone()));
+                mc_store::commit_probe::take();
+                if let Some(ms) = cmd["wal_sync_delay_ms"].as_u64().filter(|ms| *ms > 0) {
+                    mc_store::commit_probe::delay_next_wal_sync(Duration::from_millis(ms));
+                }
+                let startup_started = std::time::Instant::now();
+                if resident_enabled && cmd["skip_wal_prime"] != true {
+                    store.prime_wal_for_serving().unwrap();
+                }
+                let startup_ms = startup_started.elapsed().as_secs_f64() * 1000.0;
+                let startup_io = mc_store::commit_probe::take();
+                drop(startup_probe);
                 let resident_process_cap=cmd["resident_process_cap_mb"].as_u64().map(|mb|mb.min(1024) as usize*1024*1024).unwrap_or(1024*1024*1024);
                 let mut handler = McHandler::with_producer_factory_config_resolver(
                     Arc::new(TestProducerFactory {state:Arc::new(ProducerState::default())}),
@@ -164,7 +177,7 @@ fn provider_pipeline_driver() {
                 let handler = Arc::new(handler);
                 transports[usize::from(resident_enabled)].register(&format!("{name}-7"), handler.clone(), binding.clone());
                 rigs.insert(name.into(), Rig {handler, store, sql, _dir: dir, binding, reads, namespaces:HashMap::new(), resident_enabled,resident_process_cap});
-                json!({"created": true})
+                json!({"created": true, "startup_ms": startup_ms, "startup_io": startup_io})
             } else if op == "concurrent_calls" {
                 let calls = cmd["calls"].as_array().unwrap();
                 let barrier = Arc::new(tokio::sync::Barrier::new(calls.len()));
@@ -266,7 +279,8 @@ fn provider_pipeline_driver() {
                      else { std::env::remove_var("MC_TEST_HISTORIAN_HOLD"); }
                      json!({"held":cmd["held"]})
                  } else if op == "historian_requeue" {
-                     for rig in rigs.values() {
+                     for (name, rig) in &rigs {
+                         if cmd["prefix"].as_str().is_some_and(|prefix| !name.starts_with(prefix)) { continue; }
                          let key = crate::providers::Key::new(&rig.binding, "session", &rig.binding.harness).unwrap();
                          if let Some(mut conversation) = rig.store.load_provider_conversation(&key.store_key()).unwrap() {
                              let mut counters: Value = serde_json::from_str(&conversation.hook_counters_json).unwrap();
@@ -510,11 +524,21 @@ fn provider_pipeline_driver() {
                         std::io::stdout().flush().unwrap();
                         continue;
                     }
+                    // Commit probes below check direct-dispatch correctness only;
+                    // end-to-end timings always use the shipping transport above.
+                    let _commit_probe = (cmd["commit_probe"] == true).then(|| mc_store::commit_probe::Guard::install(rig.store.clone()));
+                    if _commit_probe.is_some() { mc_store::commit_probe::take(); }
                     let module_started = std::time::Instant::now();
                     let cpu_started = cpu_time::ProcessTime::now();
                     match rig.handler.dispatch_value(channel, request).await {
                         HandlerOutcome::Response(bytes) => {
                             if cmd["settle_tasks"] == true { tokio::task::yield_now().await; }
+                            if _commit_probe.is_some() {
+                                let raw = String::from_utf8(bytes).unwrap();
+                                println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{},\"correctness_probe\":true,\"commit_probe\":{}}}", raw, serde_json::to_string(&raw).unwrap(),serde_json::to_string(&mc_store::commit_probe::take()).unwrap());
+                                std::io::stdout().flush().unwrap();
+                                continue;
+                            }
                             if cmd["raw_response"] == true {
                                 let raw = String::from_utf8(bytes).unwrap();
                                 println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{}}}",raw,serde_json::to_string(&raw).unwrap());
@@ -554,8 +578,25 @@ export function buildDriver(directory: string): string {
         writeCurrent(join(overlay, file), readFileSync(join(ROOT, file), "utf8"));
     for (const name of ["packages", "tests", "docs", "assets", "scripts", "testdata"])
         link(join(ROOT, name), join(overlay, name), "dir");
-    for (const name of ["mc-core", "mc-store", "mc-tokenizer"])
+    for (const name of ["mc-core", "mc-tokenizer"])
         link(join(ROOT, "crates", name), join(overlay, "crates", name), "dir");
+    // The generated test-driver workspace alone includes raw SQLite callbacks
+    // for timing fsync and checkpoint I/O. Only its copied lib.rs relaxes the
+    // unsafe-code prohibition; product sources remain unchanged.
+    const storeOriginal = join(ROOT, "crates/mc-store");
+    const storeGenerated = join(overlay, "crates/mc-store");
+    if (existsSync(storeGenerated) && lstatSync(storeGenerated).isSymbolicLink()) rmSync(storeGenerated);
+    mkdirSync(join(storeGenerated, "src"), { recursive: true });
+    for (const name of readdirSync(storeOriginal)) {
+        if (name !== "src") link(join(storeOriginal, name), join(storeGenerated, name));
+    }
+    for (const name of readdirSync(join(storeOriginal, "src"))) {
+        if (name !== "lib.rs") link(join(storeOriginal, "src", name), join(storeGenerated, "src", name));
+    }
+    const storeLib = readFileSync(join(storeOriginal, "src/lib.rs"), "utf8");
+    assert.equal(storeLib.split("#![forbid(unsafe_code)]").length, 2);
+    writeCurrent(join(storeGenerated, "src/lib.rs"), storeLib.replace("#![forbid(unsafe_code)]", "") +
+        `\n#[path = ${JSON.stringify(join(ROOT, "packages/e2e-tests/scripts/provider-commit-probe.rs"))}]\npub mod commit_probe;\n`);
     const original = join(ROOT, "crates/mc-module");
     const generated = join(overlay, "crates/mc-module");
     for (const name of readdirSync(original)) {
@@ -648,6 +689,8 @@ export class Driver {
     ) {
         this.child = Bun.spawn(
             [
+                ...(process.env.MC_COMMIT_STRACE_OUT ? ["strace", "-f", "-ttt", "-T", "-yy", "-e",
+                    "trace=fsync,fdatasync,ftruncate", "-o", `${process.env.MC_COMMIT_STRACE_OUT}.${Date.now()}`] : []),
                 binary,
                 "--exact",
                 "tests::provider_pipeline_driver",

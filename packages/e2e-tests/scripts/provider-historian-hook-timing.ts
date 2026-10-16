@@ -51,23 +51,50 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
         db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); db.close();
     }
     const batches: unknown[] = [];
-    for (const mode of ["held", "budget2", "budget1"] as const) {
+    if (process.env.MC_COLD_HOOK_STRACE_OUT) process.env.MC_COMMIT_STRACE_OUT = process.env.MC_COLD_HOOK_STRACE_OUT;
+    const paired = process.env.MC_COLD_HOOK_PAIR === "1";
+    for (const lane of paired
+        ? ["before-held", "after-held", "before-budget2", "after-budget2", "before-budget1", "after-budget1"]
+        : ["held", "budget2", "budget1"]) {
+        const mode = lane.replace(/^(before|after)-/, "");
+        const skipPrime = lane.startsWith("before-");
         // Each fresh driver starts cold. The second batch uses only the caches
         // populated by the first batch, never a rebuild or an eviction.
         if (mode === "held") process.env.MC_TEST_HISTORIAN_HOLD = "1";
         else delete process.env.MC_TEST_HISTORIAN_HOLD;
         driver = new Driver(binary, stores);
         const cold: any[] = [];
+        const startup: any[] = [];
+        if (paired && mode !== "held") {
+            // Only these already resident sessions supply historian activity.
+            // Requeue writes their conversation rows; excluding the unserved
+            // sessions keeps those sessions' first-write WAL sync unprimed.
+            for (let index = 0; index < 4; index++) {
+                const directory = join(stores, `${lane}-load-${index}`);
+                mkdirSync(directory);
+                for (const name of ["store.db", "context.db"]) copyFileSync(join(seedDirectory, name), join(directory, name));
+                await driver.send({ op: "create", rig: `load-${index}`, harness: "opencode", directory,
+                    project_root: join(seedDirectory, "project"), resident_enabled: true, memory_enabled: true,
+                    historian_concurrency: mode === "budget1" ? 1 : 2 });
+                await driver.send({ op: "call", rig: `load-${index}`,
+                    body: { method: "transform.hook", params: { ...hook, request_id: `load-${index}` } } });
+            }
+            await driver.send({ op: "historian_requeue", rig: "load-0", prefix: "load-" });
+        }
         const coldBefore = systemSample();
         try {
             for (let index = 0; index < sessions; index++) {
                 const rig = `fleet-${index}`;
-                const directory = join(stores, `${mode}-${index}`);
+                const directory = join(stores, `${lane}-${index}`);
                 mkdirSync(directory);
                 for (const name of ["store.db", "context.db"]) copyFileSync(join(seedDirectory, name), join(directory, name));
-                await driver.send({ op: "create", rig, harness: "opencode", directory, project_root: join(seedDirectory, "project"),
-                    memory_enabled: true, resident_enabled: true, resident_pool: "fleet", historian_concurrency: mode === "budget1" ? 1 : 2 });
+                startup.push(await driver.send({ op: "create", rig, harness: "opencode", directory, project_root: join(seedDirectory, "project"),
+                    skip_wal_prime: skipPrime, commit_probe: process.env.MC_COLD_HOOK_ONLY === "1",
+                    wal_sync_delay_ms: Number(process.env.MC_COLD_HOOK_SYNC_DELAY_MS ?? 0),
+                    memory_enabled: true, resident_enabled: true, resident_pool: "fleet", historian_concurrency: mode === "budget1" ? 1 : 2 }));
+                if (paired && mode !== "held") await driver.send({ op: "historian_requeue", rig: "load-0", prefix: "load-" });
                 const first = await driver.send({ op: "call", rig, timing: true,
+                    commit_probe: process.env.MC_COLD_HOOK_ONLY === "1",
                     body: { method: "transform.hook", params: { ...hook, request_id: `cold-${index}` } } });
                 cold.push(first);
                 if (first.error) {
@@ -78,6 +105,17 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
                 }
             }
             const coldAfter = systemSample();
+            if (process.env.MC_COLD_HOOK_ONLY === "1") {
+                const active = cold.filter(row => row.historian_before?.active > 0 || row.historian_after?.active > 0);
+                if (paired && mode !== "held") assert.ok(active.length > 0, "cold batch must overlap admitted historians");
+                const batch = { lane, mode, sessions, cold: quantiles(cold.map(row => row.module_ms)),
+                    active_cold: quantiles(active.map(row => row.module_ms)), startup,
+                    before: coldBefore, after: coldAfter, psi: psiDelta(coldBefore, coldAfter),
+                    rows: cold.map(({ ok, raw, ...row }) => row) };
+                batches.push(batch);
+                console.log(`COLD_HOOK_BATCH=${JSON.stringify(batch)}`);
+                continue;
+            }
             const residentBefore = await driver.send({ op: "resident_stats", rig: "fleet-0" });
             assert.equal(residentBefore.sessions, sessions);
             await driver.send({ op: "historian_drain", rig: "fleet-0" });
