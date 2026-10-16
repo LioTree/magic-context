@@ -141,6 +141,7 @@ pub mod healing;
 pub mod historian;
 pub mod historian_chunk;
 pub mod historian_host;
+mod historian_numerical_drain;
 pub mod historian_producer;
 pub mod historian_prompt;
 pub mod historian_recovery;
