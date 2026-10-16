@@ -1,7 +1,11 @@
 //! Vector persistence extension; register store and drain implementations in this namespace.
 
 pub mod drain;
+pub mod queue;
 pub mod store;
+
+#[cfg(test)]
+mod queue_tests;
 
 use crate::parity_schema_manifest::*;
 
