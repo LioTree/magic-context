@@ -2995,8 +2995,13 @@ describe("registerPiContextHandler", () => {
 		try {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, { db });
-			const pass = async () => {
-				const messages = [userMessage("latest real user", 1)];
+			const pass = async (earlier = false) => {
+				const messages = [
+					userMessage(
+						earlier ? "earlier user" : "latest real user",
+						earlier ? 0 : 1,
+					),
+				];
 				const handler = fake.handlers.get("context") as (
 					event: { messages: never[] },
 					ctx: never,
@@ -3007,18 +3012,25 @@ describe("registerPiContextHandler", () => {
 						fakeContext(
 							sessionId,
 							process.cwd(),
-							["entry-latest"],
+							[earlier ? "entry-earlier" : "entry-latest"],
 							messages,
 						) as never,
 					)
 				).messages;
 			};
+			await pass(true);
+			appendAutoSearchHintDecision(db, sessionId, {
+				messageId: "entry-latest",
+				decision: "hint",
+				text: "\n\n<ctx-search-hint>saved recall</ctx-search-hint>",
+			});
 			addNote(db, "session", { sessionId, content: "Rebuild reminder" });
 			onNoteTrigger(db, sessionId, "historian_complete");
 			setPersistedNoteNudgeTriggerMessageId(db, sessionId, "entry-latest");
 			signalPiPendingMaterialization(sessionId);
 			const rebuilt = await pass();
 			expect(textOf(rebuilt[0] as never)).toContain("deferred_notes");
+			expect(textOf(rebuilt[0] as never)).toContain("ctx-search-hint");
 			expect(await pass()).toEqual(rebuilt);
 		} finally {
 			clearContextHandlerSession(sessionId);
@@ -3054,6 +3066,8 @@ describe("registerPiContextHandler", () => {
 			addNote(db, "session", { sessionId, content: "Late reminder" });
 			onNoteTrigger(db, sessionId, "historian_complete");
 			setPersistedNoteNudgeTriggerMessageId(db, sessionId, "entry-old-trigger");
+			expect(await pass()).toEqual(served);
+			signalPiPendingMaterialization(sessionId);
 			expect(await pass()).toEqual(served);
 			clearContextHandlerSession(sessionId);
 			registerPiContextHandler(fake.pi as never, { db });
@@ -3875,7 +3889,7 @@ describe("registerPiContextHandler", () => {
 		});
 	});
 
-	it("gates new stale ctx_reduce strips by provider but replays already-stripped tags", async () => {
+	it("cleans stale ctx_reduce arcs across providers and replays already-stripped tags", async () => {
 		const buildMessages = () =>
 			[
 				userMessage("older request", 1),
@@ -4007,9 +4021,11 @@ describe("registerPiContextHandler", () => {
 			}
 		}
 
+		// Stale ctx_reduce cleanup removes call/result pairs or writes non-empty
+		// markers; whether a provider accepts empty text must not restrict it.
 		await expect(runProviderScenario("openai")).resolves.toEqual({
-			reduceStatus: "active",
-			replayedToolResult: "§3§ reduced old tags",
+			reduceStatus: "dropped",
+			replayedToolResult: "",
 		});
 		await expect(runProviderScenario("anthropic", "openai")).resolves.toEqual({
 			reduceStatus: "dropped",
@@ -6357,6 +6373,59 @@ describe("registerPiContextHandler", () => {
 			await handler({ messages }, ctx as never);
 		}
 
+		it("retires a permanently synthetic kept boundary once without appending", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-synthetic-kept";
+			const logger = await import("@magic-context/core/shared/logger");
+			const log = spyOn(logger, "sessionLog");
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: null,
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 2151,
+					summary: "Mock history",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiPendingMaterialization(sessionId);
+				const appendCompaction = mock(() => "compact-1");
+				const args = {
+					db,
+					sessionId,
+					appendCompaction,
+					messages: [
+						userMessage("first", 1),
+						assistantMessage("second", 2),
+						toolResultMessage("call", "result", 3),
+						assistantMessage("fourth", 4),
+					],
+					entryIds: ["entry-1", "entry-2", "result-3", "entry-4"],
+				};
+				await runDrainPass(args);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
+				await runDrainPass(args);
+				expect(appendCompaction).not.toHaveBeenCalled();
+				expect(
+					log.mock.calls.filter(
+						([id, text]) =>
+							id === sessionId &&
+							text.startsWith("Pi compaction-marker clear:"),
+					),
+				).toEqual([
+					[
+						sessionId,
+						"Pi compaction-marker clear: reason=synthetic-kept-entry endMessageId=entry-2 ordinal=2 firstKeptEntryId=<none>",
+					],
+				]);
+			} finally {
+				log.mockRestore();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
 		it("drains a deferred Pi marker only on a materializing pass", async () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-marker-drain";
@@ -6492,6 +6561,8 @@ describe("registerPiContextHandler", () => {
 		it("defers rehydrated Pi marker signals until the next natural bust", async () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-marker-rehydrated-deferred";
+			const logger = await import("@magic-context/core/shared/logger");
+			const log = spyOn(logger, "sessionLog");
 			try {
 				const { signalPiDeferredCompactionMarkerDrain } = await import(
 					"./index"
@@ -6521,6 +6592,18 @@ describe("registerPiContextHandler", () => {
 
 				expect(appendCompaction).not.toHaveBeenCalled();
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 0,
+				});
+				expect(
+					log.mock.calls.filter(
+						([id, text]) =>
+							id === sessionId && text.includes("gate=drain-not-eligible"),
+					),
+				).toHaveLength(1);
 
 				await runDrainPass({
 					db,
@@ -6533,6 +6616,7 @@ describe("registerPiContextHandler", () => {
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 				expect(consumePendingMaterialization(sessionId)).toBe(false);
 			} finally {
+				log.mockRestore();
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);
 			}

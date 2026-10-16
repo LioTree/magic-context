@@ -177,6 +177,7 @@ import {
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { evaluateChannel2 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
+import { DegradedPassRefusalError } from "@magic-context/core/hooks/magic-context/degraded-pass-refusal";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import {
 	type DroppedTokenReduction,
@@ -257,6 +258,7 @@ import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provid
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
+import { recoveryReasoningPrefixes } from "@magic-context/core/shared/recovery-reasoning-prefix";
 import {
 	guardSqliteTransformPass,
 	type Statement as PreparedStatement,
@@ -266,6 +268,7 @@ import {
 } from "@magic-context/core/shared/sqlite";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
+	buildPersistedDropTargets,
 	TEXT_TAG_IDENTITY_MARKER,
 	tagTranscript,
 } from "@magic-context/core/shared/tag-transcript";
@@ -4245,6 +4248,7 @@ export function registerPiContextHandler(
 		let sessionIdForError: string | undefined;
 		let lkgPassSnapshot: PiLkgPassSnapshot | undefined;
 		let lkgCompactionOff = baseOptions.compactionOff === true;
+		let lkgOptions = baseOptions;
 		let lkgEmergencyRecoveryArmed = false;
 		const captureServedEvidence = (
 			...args: Parameters<typeof capturePiServedArray>
@@ -4295,6 +4299,7 @@ export function registerPiContextHandler(
 			// resolver is wired (tests) or the resolver returns nothing.
 			const options =
 				baseOptions.resolveForProject?.(projectDirectory) ?? baseOptions;
+			lkgOptions = options;
 			await guardAwait(
 				awaitSessionIdentityDecision(sessionId, projectDirectory, {
 					allowHomeProject: options.allowHomeProject,
@@ -6826,6 +6831,69 @@ export function registerPiContextHandler(
 								(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
 							);
 					if (replay.ok) {
+						const reasoningPrefixes = recoveryReasoningPrefixes(
+							replay.messages,
+							"content",
+						);
+						// A later write can fail after earlier drops committed. Render those
+						// decisions on the saved request now, not for the first time on defer.
+						const entryIds = lkgCoordinator.recoveryEntryIds(lkgPassSnapshot);
+						const recoverySessionId = sessionIdForError;
+						const recoveryTranscript = createPiTranscript(
+							replay.messages,
+							sessionIdForError,
+							entryIds.map((id) => id ?? undefined),
+							{
+								preserveReasoningToolArcs:
+									ctx.model?.api !== "openai-codex-responses" &&
+									ctx.model?.api !== "openai-responses",
+								authorizeToolRemoval: (callId) =>
+									authorizePiToolRemoval({
+										db: lkgOptions.db,
+										sessionId: recoverySessionId,
+										callId,
+										saved: getNativeReplayState(
+											lkgOptions.db,
+											recoverySessionId,
+										).toolInputs,
+										canApply: false,
+									}),
+							},
+						);
+						const drops = getTagsBySession(
+							lkgOptions.db,
+							sessionIdForError,
+						).filter((tag) => tag.status === "dropped");
+						const changed = applyFlushedStatuses(
+							sessionIdForError,
+							lkgOptions.db,
+							buildPersistedDropTargets(recoveryTranscript, drops, {
+								allowReasoningPrefixRewrite: true,
+							}),
+							drops,
+						);
+						const working = recoveryTranscript.getWorkingMessages();
+						recoveryTranscript.commit();
+						const idsByOutput = new Map<unknown, string | null>(
+							working.map((message, index) => [message, entryIds[index]]),
+						);
+						recoveryTranscript.finalizeToolRemovals();
+						// Applying already stored drops does not authorize new history edits.
+						// Removing every thinking block needs a successful rebuild that also
+						// persists those omissions. Refuse here instead of removing thinking
+						// on a fallback that may run while scheduled edits are deferred.
+						if (
+							JSON.stringify(
+								recoveryReasoningPrefixes(replay.messages, "content"),
+							) !== JSON.stringify(reasoningPrefixes)
+						)
+							throw new DegradedPassRefusalError(
+								"lkg-reasoning-prefix-changed",
+								{ cause: err },
+							);
+						const recoveryIds = replay.messages.map(
+							(message) => idsByOutput.get(message) ?? null,
+						);
 						// A valid stored prefix does not bound the newly appended raw tail.
 						assertPiRawFallbackFits(
 							replay.messages,
@@ -6842,7 +6910,7 @@ export function registerPiContextHandler(
 								sessionDecisionCalibration(baseOptions.db, sessionIdForError),
 								toolWireSchema,
 							),
-							replay.measuredPrefix,
+							changed ? undefined : replay.measuredPrefix,
 						);
 						const reason = piStorageErrorReason(err);
 						logPiLkgRecovery(
@@ -6850,7 +6918,11 @@ export function registerPiContextHandler(
 							`${failureLabel} ${reason}: LKG replay served ${replay.messages.length} messages instead of raw ${rawMessageCount}`,
 						);
 						budget.assertOutcome();
-						lkgCoordinator.noteRecovery(lkgPassSnapshot, replay.messages);
+						lkgCoordinator.noteRecovery(
+							lkgPassSnapshot,
+							replay.messages,
+							recoveryIds,
+						);
 						if (!budget.sideTurn)
 							captureServedEvidence(sessionIdForError, replay.messages, {
 								recoveryWithoutTagState: true,
@@ -6868,6 +6940,8 @@ export function registerPiContextHandler(
 					);
 				} catch (replayError) {
 					budget.assertOutcome();
+					if (replayError instanceof DegradedPassRefusalError)
+						throw replayError;
 					if (replayError instanceof PiStorageBusyError) throw replayError;
 					logPiLkgRecovery(
 						sessionIdForError,
@@ -9754,7 +9828,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						? protectionWindowForPass.cutoff
 						: undefined,
 					routine: routineCleanupApplied,
-					staleReduceStripEnabled: args.canUseEmptySentinels,
+					staleReduceStripEnabled: true,
 					onStaleReduceEdit: recordStaleReduceEdit,
 					// Tiered emergency drop fires only at the derived force band AND when the
 					// ceiling is known. forceMaterialization already incorporates
@@ -9791,7 +9865,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 							? protectionWindowForPass.cutoff
 							: undefined,
 						routine: true,
-						staleReduceStripEnabled: args.canUseEmptySentinels,
+						staleReduceStripEnabled: true,
 						onStaleReduceEdit: recordStaleReduceEdit,
 						caveman: args.isSubagent ? undefined : args.heuristics.caveman,
 					},
@@ -10120,20 +10194,87 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		}
 	}
 
-	// 4c. Processed-image replay/detection. Pi carries base64 image data in
-	// user and tool-result parts. Frozen ids replay on every Anthropic pass;
-	// newly aged ids are detected only while this pass is already busting and
-	// are persisted before their bytes are replaced with empty text sentinels.
-	if (args.canUseEmptySentinels) {
+	// 4c. Replace answered images at/below the dropped-tag watermark with
+	// non-empty text markers. Discover new message ids only when this pass is
+	// already allowed to rewrite the prefix, and persist them before editing.
+	// Replay saved ids on every provider and pass so removed bytes cannot return.
+	{
 		const tProcessedImages = performance.now();
 		try {
+			const imagePositionTags = new Map<string, number>();
+			const noteImagePosition = (id: string | undefined, tag: number) => {
+				if (id && tag > (imagePositionTags.get(id) ?? 0))
+					imagePositionTags.set(id, tag);
+			};
+			for (const [tagNumber, target] of targets) {
+				for (const { message, part } of target.mutationParts ?? []) {
+					if (
+						typeof part === "object" &&
+						part !== null &&
+						"kind" in part &&
+						part.kind === "text"
+					)
+						noteImagePosition(message.info.id, tagNumber);
+				}
+			}
+			// Transcript user rows can contain several results and a later user's
+			// text. Associate tool tags with their native occurrences, never that row.
+			const imageToolTags = new Map(
+				allTagsForPass
+					.filter((tag) => tag.type === "tool")
+					.map((tag) => [
+						`${tag.toolOwnerMessageId ?? ""}\0${tag.messageId}`,
+						tag.tagNumber,
+					]),
+			);
+			const imageToolOwners = new Map<string, string>();
+			for (let index = 0; index < workingMessages.length; index++) {
+				const message = workingMessages[index];
+				const id = stableIdResolver(message, index);
+				if (message.role === "assistant" && Array.isArray(message.content)) {
+					for (const part of message.content) {
+						if (part.type !== "toolCall") continue;
+						imageToolOwners.set(part.id, id ?? "");
+						noteImagePosition(
+							id,
+							imageToolTags.get(`${id ?? ""}\0${part.id}`) ?? 0,
+						);
+					}
+				} else if (message.role === "toolResult") {
+					noteImagePosition(
+						id,
+						imageToolTags.get(
+							`${imageToolOwners.get(message.toolCallId) ?? ""}\0${message.toolCallId}`,
+						) ?? 0,
+					);
+				}
+			}
+			const protectedImageToolKeys = new Set(
+				activeTags
+					.filter(
+						(tag) =>
+							tag.type === "tool" && protectedToolTags.has(tag.tagNumber),
+					)
+					.map((tag) =>
+						tag.toolOwnerMessageId
+							? `${tag.toolOwnerMessageId}\x00${tag.messageId}`
+							: tag.messageId,
+					),
+			);
 			const imageResult = stripPiProcessedImages({
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
 				detect: isCacheBustingPass && !protectedSignedPrefix,
 				watermark: getMaxDroppedTagNumber(args.db, args.sessionId),
-				messageIdToMaxTag,
+				messageIdToMaxTag: imagePositionTags,
+				protectedCutoff: usesTokenProtection
+					? protectionWindowForPass.cutoff
+					: protectedTagNumbersForPass.size > 0
+						? Math.min(...protectedTagNumbersForPass)
+						: null,
+				usagePercentage: args.contextUsage.percentage,
+				protectedToolKeys: protectedImageToolKeys,
 				stableId: stableIdResolver,
 				onFirstApplication: recordFirstApplicationAt,
 			});
@@ -10454,6 +10595,31 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		!casLost;
 	let preserveDeferredMaterializationForMarkerDrain = false;
 	let pendingForDrain: PendingPiCompactionMarker | null = null;
+	if (
+		!deferredHistoryDrainEligible &&
+		(deferredHistoryWasPendingAtPassStart || hasPendingMaterializeSignal)
+	) {
+		try {
+			const pending = getPendingPiCompactionMarkerState(
+				args.db,
+				args.sessionId,
+			);
+			if (pending)
+				logPiCompactionMarkerDrainGateOnce(
+					args.sessionId,
+					pending,
+					"drain-not-eligible",
+					{
+						historyConsumed: historyWasConsumedThisPass,
+						materializationSatisfied: materializationSatisfiedThisPass,
+						drainSuppressed: suppressDeferredHistoryDrain,
+						casLost,
+					},
+				);
+		} catch {
+			// A failed marker-state read for logging must not abort sending the unchanged conversation.
+		}
+	}
 	if (deferredHistoryDrainEligible) {
 		try {
 			args.assertCurrentPass?.();
@@ -10600,6 +10766,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						args.db,
 						args.sessionId,
 						pending,
+						outcome.kind === "stale-skip" ? outcome.reason : outcome.kind,
 					)
 				) {
 					consumeDeferredHistoryRefresh(args.sessionId);
@@ -11072,23 +11239,6 @@ function applyNoteNudges(args: {
 			anchor.text,
 		);
 	}
-	const autoSearchDecisions =
-		args.postTransformSnapshot?.autoSearchDecisions ??
-		getAutoSearchHintDecisions(db, sessionId);
-	for (const decision of autoSearchDecisions) {
-		if (
-			decision.decision === "hint" &&
-			getUnpublishedAutoSearchNoHint(sessionId, decision.messageId) ===
-				undefined
-		) {
-			appendReminderToUserMessageByIdPi(
-				messages,
-				replayMessageIdByIndex,
-				decision.messageId,
-				decision.text,
-			);
-		}
-	}
 	logTransformTiming(sessionId, "stickyReplayDecisions", tStickyReplay);
 
 	// Path 2: fresh delivery. Observe even when no trigger is pending, so a
@@ -11111,7 +11261,10 @@ function applyNoteNudges(args: {
 			.map(([, id]) => id),
 		anchorMessageId: latestUserId,
 		isLiveTail: latestUser?.index === messages.length - 1,
-		isCacheBustingPass: args.isCacheBusting,
+		// Pi's cache-bust permission does not prove bytes before this user message
+		// actually changed. Without that evidence, append only to an unserved user
+		// message at the tail so the reminder cannot originate a prefix rewrite.
+		prefixRewriteCoversAnchor: false,
 	});
 	const noteReadStillVisible = hasVisibleNoteReadCallPi(messages);
 	// The row snapshot is the change signal for expensive note/smart-note reads.
@@ -11160,6 +11313,26 @@ function applyNoteNudges(args: {
 			sessionLog(
 				sessionId,
 				`Pi note-nudge delivery skipped wire append: ${outcome.kind}`,
+			);
+		}
+	}
+
+	// Saved auto-search hints follow both saved and newly delivered note nudges;
+	// reversing that order on replay would rewrite the cached user message.
+	const autoSearchDecisions =
+		args.postTransformSnapshot?.autoSearchDecisions ??
+		getAutoSearchHintDecisions(db, sessionId);
+	for (const decision of autoSearchDecisions) {
+		if (
+			decision.decision === "hint" &&
+			getUnpublishedAutoSearchNoHint(sessionId, decision.messageId) ===
+				undefined
+		) {
+			appendReminderToUserMessageByIdPi(
+				messages,
+				replayMessageIdByIndex,
+				decision.messageId,
+				decision.text,
 			);
 		}
 	}

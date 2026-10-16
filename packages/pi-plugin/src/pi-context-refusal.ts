@@ -23,6 +23,7 @@ import {
 	PI_CONTEXT_BUDGET,
 	PiContextBudget,
 	PiContextDeadlineError,
+	PiContextSupersededError,
 } from "./pi-context-budget";
 import {
 	piConversationFields as conversationFields,
@@ -41,14 +42,7 @@ const RETRY_MESSAGE =
 	"Magic Context could not safely prepare this turn; send your message again.";
 const MAX_UNSENDABLE_NONCES_PER_SESSION = 32;
 
-export class PiContextSupersededError extends Error {
-	constructor(
-		message: string,
-		readonly origin = "context ownership",
-	) {
-		super(message);
-	}
-}
+export { PiContextSupersededError } from "./pi-context-budget";
 
 interface Operation {
 	// One pass prepares a context-hook input; its ready receipt records returned
@@ -383,6 +377,8 @@ export function registerPiGuardedContext(
 	receiptMaps.add(unsendableNonces);
 	const structureWarnings = new Map<string | object, boolean>();
 	receiptMaps.add(structureWarnings);
+	const imageTrimNotices = new Map<string | object, boolean>();
+	receiptMaps.add(imageTrimNotices);
 	const refuse = (
 		ctx: ExtensionContext,
 		budget: PiContextBudget,
@@ -613,7 +609,17 @@ export function registerPiGuardedContext(
 				}
 				const structureMismatch = skipReason
 					? undefined
-					: piPreparedStructureMismatch(payload, active.preparedStructure);
+					: piPreparedStructureMismatch(
+							payload,
+							active.preparedStructure,
+							(counts) => {
+								if (imageTrimNotices.has(key)) return;
+								imageTrimNotices.set(key, true);
+								log(
+									`[magic-context][pi] OMP provider images trimmed: planned=${counts.planned} actual=${counts.actual} trimmed=${counts.trimmed}`,
+								);
+							},
+						);
 				if (structureMismatch)
 					throw new Error(
 						`provider request does not match this pass's managed dispatch (prepared turn structure); ${structureMismatch}`,

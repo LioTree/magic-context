@@ -16,6 +16,7 @@ pub mod test_bin;
 #[cfg(test)]
 pub mod test_env;
 pub mod workspaces;
+pub mod writer_diagnostics;
 
 use std::path::PathBuf;
 

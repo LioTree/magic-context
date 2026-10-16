@@ -21,6 +21,7 @@ import {
     getActiveTagsBySession,
     getAutoSearchHintDecisions,
     getChannel1NudgeState,
+    getMaxDroppedTagNumber,
     getMaxM0MutationId,
     getNoteNudgeAnchors,
     getPendingCompactionMarkerState,
@@ -46,6 +47,7 @@ import {
     getEmergencyInputSample,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
+    getProcessedImageMarkers,
     getThinkingBindingRecoveryTarget,
     getTrailingBlankDecisions,
     type PersistedCompactionMarkerState,
@@ -1232,14 +1234,6 @@ export function runRustModePostprocess(args: {
     for (const anchor of getNoteNudgeAnchors(args.db, args.sessionId)) {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
-    for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-        if (
-            decision.decision === "hint" &&
-            getUnpublishedAutoSearchNoHint(args.sessionId, decision.messageId) === undefined
-        ) {
-            appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
-        }
-    }
     const trailingBlankDecisions = new Map<string, TrailingBlankDecision>();
     // Only visible assistants can be stripped or become candidates. The persisted
     // replay document also contains archived turns, often far larger than this tail.
@@ -1312,7 +1306,10 @@ export function runRustModePostprocess(args: {
             .map((m) => m.info.id as string),
         anchorMessageId: currentUserMessageId,
         isLiveTail: args.messages.at(-1)?.info.id === currentUserMessageId,
-        isCacheBustingPass: args.cacheBustingPass === true,
+        // Rust's prefix_bust_permitted flag authorizes edits but does not prove
+        // any bytes before this user message actually changed. Wait for an
+        // unserved user message at the tail rather than originate a rewrite.
+        prefixRewriteCoversAnchor: false,
     });
     const noteReadStillVisible = hasVisibleNoteReadCall(args.messages);
     const deferredNoteText = peekNoteNudgeText(
@@ -1340,6 +1337,17 @@ export function runRustModePostprocess(args: {
                 args.sessionId,
                 `rust note-nudge delivery skipped wire append: ${outcome.kind}`,
             );
+        }
+    }
+
+    // Render a newly delivered note before the saved auto-search hint so the
+    // next request's note-then-hint replay preserves these exact message bytes.
+    for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
+        if (
+            decision.decision === "hint" &&
+            getUnpublishedAutoSearchNoHint(args.sessionId, decision.messageId) === undefined
+        ) {
+            appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
         }
     }
 
@@ -3302,21 +3310,45 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Processed-image strip — same REPLAY/DETECT freeze as stale ctx_reduce.
-    // The empty image sentinel is filtered off the Anthropic wire, so the first
-    // strip of a message removes its image blocks (a real byte change). Keying
-    // that first strip on the live watermark let a DEFER pass cross an older
-    // image message and remove its images mid-prefix, busting the cache.
-    // Freeze the id set on cache-busting passes; replay it every pass.
-    if (canUseEmptySentinels && !compactionOff && replaySnapshot) {
+    // Persist image ids and replacement text only when the cached prefix may
+    // change. Later cache-preserving passes restore only those saved decisions,
+    // including after a provider switch, instead of discovering new strips.
+    if (!compactionOff && replaySnapshot) {
         try {
             const tImg = performance.now();
+            // Applying queued reductions and emergency cleanup above can mark
+            // additional tags dropped after the input watermark was sampled.
+            // Refresh the maximum dropped tag only when the prefix may change;
+            // cache-preserving passes restore saved decisions without discovery.
+            const imageWatermark = canEditWholePrefix
+                ? Math.max(args.watermark, getMaxDroppedTagNumber(args.db, args.sessionId))
+                : args.watermark;
             const frozenImageIds = replaySnapshot.processedImageStrippedIds;
+            const frozenMarkers = replaySnapshot.processedImageMarkers;
+            const replacementText = canUseEmptySentinels ? "" : "[image stripped]";
             stripProcessedImages(args.messages, frozenImageIds, {
-                detect: canEditWholePrefix && args.watermark > 0,
-                watermark: args.watermark,
+                detect: canEditWholePrefix && imageWatermark > 0,
+                watermark: imageWatermark,
                 messageTagNumbers: args.messageTagNumbers,
-                persistNewIds: (ids) => addProcessedImageStrippedIds(args.db, args.sessionId, ids),
+                protectedCutoff: args.protectedCutoff,
+                contextPercentage: args.contextUsage.percentage,
+                replacementText,
+                frozenMarkers,
+                protectedMessageIds: new Set([
+                    ...args.tags
+                        .filter((tag) => protectedToolTags.has(tag.tagNumber))
+                        .map((tag) => tag.toolOwnerMessageId ?? tag.messageId),
+                ]),
+                persistNewIds: (ids, markers) => {
+                    if (!addProcessedImageStrippedIds(args.db, args.sessionId, ids, markers))
+                        return false;
+                    // Another plugin process sharing this session may have saved
+                    // a different marker before our compare-and-swap completed.
+                    const committed = getProcessedImageMarkers(args.db, args.sessionId);
+                    for (const id of ids)
+                        frozenMarkers.set(id, committed.get(id) ?? replacementText);
+                    return true;
+                },
                 onFirstApplication: recordFirstApplicationAt,
             });
             logTransformTiming(args.sessionId, "stripProcessedImages", tImg);
@@ -3597,20 +3629,6 @@ export async function runPostTransformPhase(
 
     const tNudgeBlock = performance.now();
 
-    // Sticky-injection replay (§2.4): every pass replays every persisted anchor
-    // so cached user-message bytes remain identical until that message leaves
-    // the visible window. Prune happens later, only on cache-busting passes.
-    if (args.fullFeatureMode && !compactionOff && replaySnapshot) {
-        for (const anchor of replaySnapshot.noteNudgeAnchors) {
-            appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
-        }
-        for (const decision of replaySnapshot.autoSearchHintDecisions) {
-            if (decision.decision === "hint") {
-                appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
-            }
-        }
-    }
-
     // Visibility check: scan the post-drop messages array for a non-stripped
     // ctx_note(action="read") tool call. This decides whether the suppression
     // path inside `peekNoteNudgeText` should fire — see the comment block
@@ -3802,6 +3820,24 @@ export async function runPostTransformPhase(
         : false;
     let noteNudgeAppendedThisPass = false;
     const noteNudgeUserMessageId = findNoteNudgeUserMessageId(args.messages);
+    // A changed m[0]/m[1] history message proves the request is already rewriting
+    // bytes before the target user message. Reductions after that user message,
+    // or cleanup that was permitted but changed nothing, cannot pay for a nudge.
+    const lastServedForNote =
+        canEditWholePrefix && (m0RematerializedThisPass || historyWasConsumedThisPass)
+            ? args.readLastServedMessages?.()
+            : null;
+    const rewrittenHeadCoversNote =
+        !!lastServedForNote &&
+        args.messages
+            .slice(0, prependedMessageCount)
+            .some(
+                (message, index) =>
+                    isSyntheticHeadMessage(message) &&
+                    index < lastServedForNote.length &&
+                    servedMessageKey(message, args.resolvedProviderID) !==
+                        servedMessageKey(lastServedForNote[index], args.resolvedProviderID),
+            );
     const noteNudgeEligibility = args.fullFeatureMode
         ? observeNoteNudgeServe({
               db: args.db,
@@ -3811,7 +3847,7 @@ export async function runPostTransformPhase(
                   .map((m) => m.info.id as string),
               anchorMessageId: noteNudgeUserMessageId,
               isLiveTail: args.messages.at(-1)?.info.id === noteNudgeUserMessageId,
-              isCacheBustingPass,
+              prefixRewriteCoversAnchor: canEditWholePrefix && rewrittenHeadCoversNote,
           })
         : undefined;
     const deferredNoteText = args.fullFeatureMode
@@ -3841,6 +3877,19 @@ export async function runPostTransformPhase(
             // history is intact, so an optional delivery failure must not block.
             args.passOutcome?.record("note-nudge-cas-failure");
             sessionLog(args.sessionId, `note-nudge delivery skipped wire append: ${outcome.kind}`);
+        }
+    }
+
+    // Render notes before hints on first delivery AND replay. Replaying hints
+    // before a newly delivered note would reverse their order on the next pass.
+    if (args.fullFeatureMode && !compactionOff && replaySnapshot) {
+        for (const anchor of replaySnapshot.noteNudgeAnchors) {
+            appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
+        }
+        for (const decision of replaySnapshot.autoSearchHintDecisions) {
+            if (decision.decision === "hint") {
+                appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
+            }
         }
     }
 

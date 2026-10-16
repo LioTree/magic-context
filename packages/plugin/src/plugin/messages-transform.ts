@@ -27,6 +27,7 @@ import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-repla
 import { lkgReplayFits, lkgReplayLimit } from "../hooks/magic-context/lkg-replay-fit";
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
+import { replayCommittedDrops } from "../hooks/magic-context/replay-committed-drops";
 import {
     noteExternalLkgReplay,
     type RustLkgReplayParticipant,
@@ -304,6 +305,12 @@ export function tryMessagesTransformLkgReplay(args: {
                 });
                 if (replay.ok && !rust && lkgRecoveryReplayUnproven(sessionId)) {
                     sessionLog(sessionId, "lkg_restart_rebuild_required");
+                    return false;
+                }
+                // A failed batch may already have committed earlier drops. The
+                // fallback must serve that subset before a later defer replays it.
+                if (replay.ok && !rust && !replayCommittedDrops(db, sessionId, replay.messages)) {
+                    sessionLog(sessionId, "lkg_reasoning_prefix_changed");
                     return false;
                 }
                 // TypeScript mode has no Rust result to check, but replaying

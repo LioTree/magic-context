@@ -6,6 +6,17 @@ import {
 } from "./pi-dispatch-chat-history";
 import { piGoogleConversation } from "./pi-dispatch-google";
 import {
+	type PiImageBudgetPlan,
+	type PiImageRun,
+	type PiInputImage,
+	piImageBudgetPlan,
+	piMatchesImages,
+	piRecordImages,
+	piRemainingImages,
+	piWireImageCount,
+	piWireImages,
+} from "./pi-dispatch-image-budget";
+import {
 	piResponsesAssistantTexts,
 	piResponsesWireTexts,
 } from "./pi-dispatch-responses-history";
@@ -28,6 +39,7 @@ interface MessageStructure {
 	idlessResults?: boolean[];
 	/** JSON [text, phase] pairs for every assistant text block, retained in wire order. */
 	responseTexts?: string[];
+	images?: readonly PiInputImage[];
 }
 
 /** Transport-independent roles and ordered tool IDs, captured before text transforms. */
@@ -38,9 +50,29 @@ export interface PiPreparedStructure {
 	api?: string;
 	googleFunctionIds?: boolean;
 	structuralSkipReason?: string;
+	imageBudget?: PiImageBudgetPlan<MessageStructure>;
 }
 
 const MAX_MESSAGES = 100_000;
+const ORPHAN_NOTE = Symbol("prepared orphan tool result");
+// These native serializers share transformMessages. Cursor, GitLab and custom
+// APIs do not, so their result rows must retain their existing expectations.
+const TRANSFORM_MESSAGES_APIS = new Set([
+	"openai-completions",
+	"openai-responses",
+	"openrouter",
+	"openai-codex-responses",
+	"azure-openai-responses",
+	"anthropic-messages",
+	"bedrock-converse-stream",
+	"google-generative-ai",
+	"google-gemini-cli",
+	"google-vertex",
+	"ollama-chat",
+	"factory-droid-agent",
+	"devin-agent",
+	"apple-foundation-models",
+]);
 
 function object(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value)
@@ -65,6 +97,10 @@ function messageStructure(value: unknown): MessageStructure | undefined {
 	if (role !== "user" && role !== "assistant" && role !== "toolResult")
 		return undefined;
 	const row: MessageStructure = { role, calls: [], results: [] };
+	if (ORPHAN_NOTE in message && typeof message.content === "string") {
+		if (message.content.length > 32 * 1024 * 1024) return undefined;
+		row.exactText = message.content;
+	}
 	if (typeof message.timestamp === "number") row.timestamp = message.timestamp;
 	if (role === "toolResult") {
 		if (typeof message.toolCallId !== "string") return undefined;
@@ -83,9 +119,14 @@ function messageStructure(value: unknown): MessageStructure | undefined {
 	return row;
 }
 
-function projectMissingToolResults(messages: readonly unknown[]): unknown[] {
+function projectMissingToolResults(
+	messages: readonly unknown[],
+	api?: string,
+): unknown[] {
+	const projectOrphans = TRANSFORM_MESSAGES_APIS.has(api ?? "");
 	const responsesComponents = new Set<string>();
 	const opaqueIds = new Set<string>();
+	const validToolUseIds = projectOrphans ? new Set<string>() : undefined;
 	const component = (id: string) => {
 		const pipe = id.indexOf("|");
 		return pipe > 0 ? id.slice(0, pipe) : id;
@@ -103,9 +144,13 @@ function projectMissingToolResults(messages: readonly unknown[]): unknown[] {
 					"azure-openai-responses",
 					"openai-codex-responses",
 				].includes(String(message.api))
-			)
+			) {
 				responsesComponents.add(component(block.id));
-			else if (block.id.includes("|")) opaqueIds.add(block.id);
+				validToolUseIds?.add(component(block.id));
+			} else {
+				if (block.id.includes("|")) opaqueIds.add(block.id);
+				validToolUseIds?.add(block.id);
+			}
 		}
 	}
 	// Responses item suffixes are not part of the call identity; opaque Chat IDs
@@ -168,6 +213,42 @@ function projectMissingToolResults(messages: readonly unknown[]): unknown[] {
 			)
 		)
 			resolved.add(pairingId(message.toolCallId));
+		else if (
+			validToolUseIds &&
+			message?.role === "toolResult" &&
+			typeof message.toolCallId === "string" &&
+			typeof message.toolName === "string" &&
+			!validToolUseIds.has(pairingId(message.toolCallId)) &&
+			Array.isArray(message.content)
+		) {
+			// Native replay drops an orphan inside an unresolved normal or aborted
+			// result window; otherwise it preserves nonblank text as an unprivileged
+			// user note. This changes only the plan, never the returned history.
+			// @oh-my-pi/pi-ai transform-messages.ts:1406-1460 (18.11.1).
+			if (pending.some((call) => !resolved.has(pairingId(call.id)))) continue;
+			const parts = message.content.flatMap((value) => {
+				const part = object(value);
+				return part?.type === "text" &&
+					typeof part.text === "string" &&
+					part.text.trim()
+					? [part.text]
+					: [];
+			});
+			if (parts.length) {
+				const error = message.isError ? ' is-error="true"' : "";
+				const note = `<stale-tool-result tool="${message.toolName}" id="${message.toolCallId}"${error}>\n${parts.join("\n")}\n</stale-tool-result>`;
+				projected.push({
+					role: "user",
+					content:
+						api === "ollama-chat"
+							? note
+							: new TextDecoder().decode(new TextEncoder().encode(note)),
+					timestamp: message.timestamp,
+					[ORPHAN_NOTE]: true,
+				});
+			}
+			continue;
+		}
 		projected.push(value);
 		if (message?.role !== "assistant" || !Array.isArray(message.content))
 			continue;
@@ -234,6 +315,7 @@ function buildPiPreparedStructure(
 	}
 	const projectedMessages = projectMissingToolResults(
 		model?.api ? piAgentHistory(messages, model.api) : messages,
+		model?.api,
 	);
 	if (projectedMessages.length > MAX_MESSAGES) return undefined;
 	const rows: MessageStructure[] = [];
@@ -241,6 +323,7 @@ function buildPiPreparedStructure(
 	const toolIds = new Map<string, string | undefined>();
 	const responsesToolIds = new Map<string, string | undefined>();
 	const byIndex = new Map<number, MessageStructure>();
+	const imageBudget = piImageBudgetPlan<MessageStructure>(model);
 	let valid = true;
 	for (let index = 0; index < projectedMessages.length; index++) {
 		const message = projectedMessages[index];
@@ -323,6 +406,7 @@ function buildPiPreparedStructure(
 		}
 		rows.push(row);
 		byIndex.set(index, row);
+		piRecordImages(imageBudget, row, source);
 	}
 	if (!valid) return undefined;
 	const responsesApi = responsesLane(model?.api);
@@ -359,24 +443,35 @@ function buildPiPreparedStructure(
 		}
 	}
 	const plan = piChatHistoryPlan(projectedMessages, model);
+	let pendingToolImages: PiImageRun[] = [];
 	const chatMessages = plan?.flatMap((step): MessageStructure[] => {
 		if (step.kind === "source") {
 			const row = byIndex.get(step.index);
+			const images = row && imageBudget?.rows.get(row);
+			if (row?.role === "toolResult" && images) pendingToolImages.push(images);
 			return row ? [row] : [];
 		}
-		return [
-			{
-				role: "user",
-				calls: [],
-				results: [],
-				...(step.kind === "note"
-					? { exactText: step.text }
-					: { exactImages: step.urls }),
-			},
-		];
+		const row: MessageStructure = {
+			role: "user",
+			calls: [],
+			results: [],
+			...(step.kind === "note"
+				? { exactText: step.text }
+				: { exactImages: step.urls }),
+		};
+		if (step.kind === "images" && imageBudget && pendingToolImages.length) {
+			imageBudget.rows.set(row, {
+				first: pendingToolImages[0].first,
+				images: pendingToolImages.flatMap((run) => run.images),
+				synthesized: true,
+			});
+			pendingToolImages = [];
+		}
+		return [row];
 	});
 	return {
 		messages: rows,
+		...(imageBudget?.count ? { imageBudget } : {}),
 		...(responsesApi && !responsesMessages
 			? { structuralSkipReason: "Responses history transform is not modeled" }
 			: model?.api === "openai-completions" && !chatMessages
@@ -406,11 +501,13 @@ function payloadStructure(
 	payload: unknown,
 	ollama = false,
 	responsesItems = false,
+	imageProjection = false,
 ): MessageStructure[] | undefined {
 	const body = object(payload);
 	if (!body) return undefined;
 	const google = piGoogleConversation(payload);
-	if (google) return googleStructure(google.contents as unknown[]);
+	if (google)
+		return googleStructure(google.contents as unknown[], imageProjection);
 	const bedrock = body.inferenceConfig !== undefined;
 	if (body.messages === undefined && typeof body.input === "string")
 		return [{ role: "user", calls: [], results: [] }];
@@ -464,6 +561,8 @@ function payloadStructure(
 		) {
 			if (typeof message.call_id !== "string") return undefined;
 			rows.push({ role: "toolResult", calls: [], results: [message.call_id] });
+			if (imageProjection)
+				rows[rows.length - 1].images = piWireImages(message.output);
 			continue;
 		}
 		if (message.role === "tool") {
@@ -482,6 +581,9 @@ function payloadStructure(
 					results: [""],
 					resultNames: [message.tool_name],
 					idlessResults: [true],
+					...(imageProjection
+						? { images: piWireImages(message.content, message.images) }
+						: {}),
 				});
 				continue;
 			}
@@ -490,6 +592,14 @@ function payloadStructure(
 				role: "toolResult",
 				calls: [],
 				results: [message.tool_call_id],
+				...(imageProjection
+					? {
+							images: piWireImages(
+								message.content,
+								ollama ? message.images : undefined,
+							),
+						}
+					: {}),
 			});
 			continue;
 		}
@@ -509,7 +619,21 @@ function payloadStructure(
 						role: "toolResult",
 						calls: [],
 						results: [id],
+						...(imageProjection
+							? {
+									images: piWireImages(
+										bedrock ? block.toolResult?.content : block.content,
+									),
+								}
+							: {}),
 					});
+				}
+				if (imageProjection) {
+					const images = piWireImages(
+						message.content.filter((block) => !results.includes(block)),
+					);
+					if (images.length)
+						rows.push({ role: "user", calls: [], results: [], images });
 				}
 				continue;
 			}
@@ -521,6 +645,11 @@ function payloadStructure(
 		);
 		if (!row) return undefined;
 		row.wireContent = message.content;
+		if (imageProjection)
+			row.images = piWireImages(
+				message.content,
+				ollama ? message.images : undefined,
+			);
 		if (responses && responsesItems && row.role === "assistant") {
 			const texts = piResponsesWireTexts(message.content, message.phase);
 			if (!texts) return undefined;
@@ -572,7 +701,10 @@ function payloadStructure(
 	return rows;
 }
 
-function googleStructure(contents: unknown[]): MessageStructure[] | undefined {
+function googleStructure(
+	contents: unknown[],
+	imageProjection = false,
+): MessageStructure[] | undefined {
 	if (contents.length > MAX_MESSAGES) return undefined;
 	const rows: MessageStructure[] = [];
 	for (const value of contents) {
@@ -583,6 +715,9 @@ function googleStructure(contents: unknown[]): MessageStructure[] | undefined {
 			role: message.role === "model" ? "assistant" : "user",
 			calls: [],
 			results: [],
+			...(imageProjection ? { images: piWireImages(message.parts) } : {}),
+			wireRole: message.role,
+			wireContent: message.parts,
 		};
 		const results: MessageStructure[] = [];
 		for (const value of message.parts) {
@@ -613,13 +748,17 @@ function googleStructure(contents: unknown[]): MessageStructure[] | undefined {
 					calls: [],
 					results: [(result.id as string) ?? ""],
 					resultNames: [result.name],
+					...(imageProjection ? { images: piWireImages(result.parts) } : {}),
 				});
 			}
 		}
 		// Gemini packs adjacent function results into one user content. Its older
 		// models omit IDs, but preserve the ordered function names and result run.
-		if (results.length) rows.push(...results);
-		else rows.push(row);
+		if (results.length) {
+			rows.push(...results);
+			if (imageProjection && row.images?.length)
+				rows.push({ role: "user", calls: [], results: [], images: row.images });
+		} else rows.push(row);
 	}
 	return rows;
 }
@@ -637,6 +776,34 @@ function wireId(
 		return /^[a-zA-Z0-9_-]{1,64}$/.test(callId) ? callId : undefined;
 	}
 	return id;
+}
+
+function matchesUserText(
+	content: unknown,
+	text: string,
+	api: string | undefined,
+	responses: boolean,
+	googleOrBedrock: boolean,
+): boolean {
+	if (responses || googleOrBedrock) {
+		if (!Array.isArray(content) || content.length !== 1) return false;
+		const block = object(content[0]);
+		return (
+			!!block &&
+			block.text === text &&
+			(responses
+				? block.type === "input_text"
+				: Object.keys(block).length === 1)
+		);
+	}
+	if (
+		(api === "anthropic-messages" || api === "factory-droid-agent") &&
+		Array.isArray(content)
+	) {
+		const block = content.length === 1 ? object(content[0]) : undefined;
+		return block?.type === "text" && block.text === text;
+	}
+	return content === text;
 }
 
 type StructureComparison =
@@ -678,13 +845,67 @@ function structureDetail(
 	return `row=${index} expectedRows=${safeCount(expected?.length)} actualRows=${safeCount(actual?.length)} expectedRole=${safeRole(expectedRow, !!expected)} actualRole=${safeRole(actualRow, !!actual)} expectedCalls=${safeCount(expected ? (expectedRow?.calls.length ?? 0) : undefined)} actualCalls=${safeCount(actual ? (actualRow?.calls.length ?? 0) : undefined)} expectedResults=${safeCount(expected ? (expectedRow?.results.length ?? 0) : undefined)} actualResults=${safeCount(actual ? (actualRow?.results.length ?? 0) : undefined)} comparison=${comparison}`;
 }
 
+/** Derive only image-dependent rows; all other structural receipts are reused unchanged. */
+function trimPreparedImageRows(
+	rows: readonly MessageStructure[],
+	budget: PiImageBudgetPlan<MessageStructure>,
+	drops: number,
+): MessageStructure[] {
+	const projected: MessageStructure[] = [];
+	let hoisted: PiInputImage[] = [];
+	const flush = () => {
+		if (hoisted.length)
+			projected.push({ role: "user", calls: [], results: [], images: hoisted });
+		hoisted = [];
+	};
+	for (const row of rows) {
+		if (row.role !== "toolResult") flush();
+		const run = budget.rows.get(row);
+		if (
+			!run ||
+			(budget.api === "openai-completions" && row.role === "toolResult")
+		) {
+			projected.push(row);
+			continue;
+		}
+		const images = piRemainingImages(run, drops);
+		if (run.synthesized) {
+			if (images.length)
+				projected.push({
+					...row,
+					images,
+					exactImages: row.exactImages?.slice(
+						run.images.length - images.length,
+					),
+				});
+		} else if (run.hoisted) {
+			projected.push(row);
+			hoisted.push(...images);
+		} else projected.push({ ...row, images });
+	}
+	flush();
+	return projected;
+}
+
 /** Return metadata for the first differing zero-based normalized row, or no mismatch. */
 export function piPreparedStructureMismatch(
 	payload: unknown,
 	prepared: PiPreparedStructure | undefined,
+	onImageTrim?: (counts: {
+		planned: number;
+		actual: number;
+		trimmed: number;
+	}) => void,
 ): string | undefined {
 	try {
 		if (prepared?.structuralSkipReason) return undefined;
+		const imageBudget = prepared?.imageBudget;
+		const actualImages = imageBudget ? piWireImageCount(payload) : 0;
+		const trimmed = imageBudget ? imageBudget.count - actualImages : 0;
+		if (trimmed < 0) return "comparison=image count";
+		// An equal count must take the original structural comparison, including
+		// its existing provider text equivalences. Image projection is trim-only.
+		const imageProjection = trimmed > 0;
 		const body = object(payload);
 		const ollama =
 			prepared?.api === "ollama-chat" &&
@@ -699,6 +920,7 @@ export function piPreparedStructureMismatch(
 			payload,
 			ollama,
 			responses && !!prepared?.responsesMessages,
+			imageProjection,
 		);
 		const chat =
 			!!body &&
@@ -706,12 +928,14 @@ export function piPreparedStructureMismatch(
 			(prepared?.api === "openai-completions" || body.system === undefined) &&
 			body.input === undefined &&
 			body.inferenceConfig === undefined;
-		const expectedRows =
+		let expectedRows =
 			responses && prepared?.responsesMessages
 				? prepared.responsesMessages
 				: chat && prepared?.chatMessages
 					? prepared.chatMessages
 					: prepared?.messages;
+		if (expectedRows && imageProjection && imageBudget)
+			expectedRows = trimPreparedImageRows(expectedRows, imageBudget, trimmed);
 		if (!rows || !expectedRows)
 			return structureDetail(0, expectedRows, rows, "count");
 		if (!body) return structureDetail(0, expectedRows, rows, "count");
@@ -729,6 +953,11 @@ export function piPreparedStructureMismatch(
 			if (actual.role !== expected.role)
 				return structureDetail(i, expectedRows, rows, "role");
 			if (
+				imageProjection &&
+				!piMatchesImages(actual.images ?? [], expected.images ?? [])
+			)
+				return structureDetail(i, expectedRows, rows, "content");
+			if (
 				expected.responseTexts !== undefined &&
 				(expected.responseTexts.length !== actual.responseTexts?.length ||
 					expected.responseTexts.some(
@@ -744,7 +973,13 @@ export function piPreparedStructureMismatch(
 					return structureDetail(i, expectedRows, rows, "role");
 				if (
 					(expected.exactText !== undefined &&
-						actual.wireContent !== expected.exactText) ||
+						!matchesUserText(
+							actual.wireContent,
+							expected.exactText,
+							prepared?.api,
+							responses,
+							google || body.inferenceConfig !== undefined,
+						)) ||
 					(expected.exactImages !== undefined &&
 						!piMatchesChatImages(actual.wireContent, expected.exactImages))
 				)
@@ -814,6 +1049,12 @@ export function piPreparedStructureMismatch(
 				rows,
 				"count",
 			);
+		if (imageProjection && imageBudget)
+			onImageTrim?.({
+				planned: imageBudget.count,
+				actual: actualImages,
+				trimmed,
+			});
 		return undefined;
 	} catch {
 		// Unreadable payloads still fail closed without exposing a getter's error.
