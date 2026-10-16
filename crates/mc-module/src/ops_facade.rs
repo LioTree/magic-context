@@ -10,7 +10,8 @@ const OPS_VECTORS: &str = r#"
     "thalamus_sha256": "15c49d01a67ade1736d18c1c1ceb80d7ac0ab963be153018ff6fcefc408022c2",
     "bridge_sha256": "28bbe2780131017452feb4002ff3886374c1d763448181772b6ad31b572b2fc2",
     "sources": ["THALAMUS section 2 operation table", "THALAMUS section 4", "bridge items 3 and 4"],
-    "oracle": "MC schemas specified before Rust implementation; not generated from Rust"
+    "oracle": "MC schemas specified before Rust implementation; not generated from Rust",
+    "flush_correction":"Owner-authorized deferred-drop semantics: next transform performs protected/live-input checked reductions; the bridge must act on refresh obligations."
   },
   "partial": {"v":1,"ok":false,"state":"partial","reason":"store_unavailable","authority":"unknown","data":null},
   "authorization": [
@@ -50,13 +51,15 @@ const OPS_VECTORS: &str = r#"
   "flush": {
     "command_id":"flush-1",
     "effect_count":1,
-    "job_state":"completed",
-    "result":{"queued_drops":"processed","history_refresh_armed":true,"system_refresh_armed":true,"materialization_refresh_armed":true,"history_rebuilt":false},
+    "job_state":"armed",
+    "result":{"queued_drops":{"state":"pending","count":2,"target_tag_ids":["tag-a","tag-b"]},"soft_refresh_pending":true,"bridge_refresh_obligations":["materialization","history","system"],"history_rebuilt":false},
     "duplicate":"same_job_same_result",
     "parameter_mismatch":"command_parameter_mismatch",
-    "compaction_off":{"queued_drops":"not_processed","history_refresh_armed":false,"system_refresh_armed":false,"materialization_refresh_armed":false,"history_rebuilt":false,"reason":"compaction_off"}
+    "completion_hook":"deferred; no drained claim without transform acknowledgement",
+    "superseding_flush":"superseded",
+    "compaction_off":{"queued_drops":{"state":"pending","count":2,"target_tag_ids":["tag-a","tag-b"]},"soft_refresh_pending":false,"bridge_refresh_obligations":[],"history_rebuilt":false,"reason":"compaction_off"}
   },
-  "jobs": {"lookup":"job_id_or_command_id","cancel_terminal":"too_late","missing":"job_not_found","foreign_session":"job_not_found"},
+  "jobs": {"lookup":"job_id_or_command_id","cancel_terminal":"too_late","cancel_armed":"cancel_unsupported","missing":"job_not_found","foreign_session":"job_not_found"},
   "events": {
     "acked_position":1,
     "through_sequence":3,
