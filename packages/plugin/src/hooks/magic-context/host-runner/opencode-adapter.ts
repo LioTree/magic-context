@@ -46,6 +46,7 @@ import {
     type ProviderUsageInput,
     recordProviderUsage,
 } from "./fallback-admissibility";
+import { openCodeStepInputs } from "./opencode-step-inputs";
 import {
     type FrozenProviderPlan,
     freezeProviderPlan,
@@ -1056,41 +1057,13 @@ export function createOpenCodeProviderTransform(
         return `${row.mutation}:${row.epoch}:${row.legacy > 0 ? "legacy" : "ready"}`;
     }
     function inputs(id: string, messages: MessageLike[], meta: SessionMeta): StepInputs {
-        const entry = deps.contextUsageMap.get(id);
-        const currentModel = model(id, messages);
-        const usage =
-            entry &&
-            Date.now() - entry.updatedAt < 60 * 60 * 1000 &&
-            (!entry.usage.providerUsage || entry.usage.providerUsage.model === currentModel)
-                ? entry.usage
-                : undefined;
-        const meters = usage?.providerUsage;
-        return {
-            model: currentModel,
-            step_id: messages.at(-1)?.info.id ?? randomUUID(),
-            step_kind: "model",
-            context_window: meta.lastUsageContextLimit || 200_000,
-            previous_usage: usage
-                ? meters
-                    ? {
-                          input: meters.input,
-                          cache_read: meters.cache_read,
-                          cache_write: meters.cache_write,
-                          output: meters.output,
-                          completed_at: meters.completed_at,
-                          finish_reason: meters.finish_reason,
-                      }
-                    : {
-                          input: usage.inputTokens,
-                          cache_read: 0,
-                          cache_write: 0,
-                          output: 0,
-                          completed_at: meta.lastResponseTime,
-                          finish_reason: "stop",
-                      }
-                : undefined,
-            estimate: { request_tokens: usage?.inputTokens ?? 0 },
-        };
+        return openCodeStepInputs({
+            model: model(id, messages),
+            stepId: messages.at(-1)?.info.id ?? randomUUID(),
+            meta,
+            entry: deps.contextUsageMap.get(id),
+            now: now(),
+        });
     }
     function rebuildReason(
         id: string,

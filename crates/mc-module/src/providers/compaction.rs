@@ -949,6 +949,49 @@ fn status(
     Ok(status)
 }
 
+/// Compare frame-derived decisions through the real decoder and scheduler.
+/// Omitting message rendering and history mutations keeps saved-view changes out of this comparison.
+#[cfg(test)]
+pub(super) fn oracle_input_decision(frame: &Value, now: u64, mid_tool_use: bool) -> Value {
+    let mut params = frame.clone();
+    params["session"] = json!("relay-v1");
+    params["harness"] = json!("opencode");
+    params["request_id"] = json!("input-differential");
+    params["lineage_id"] = json!("input-differential");
+    params["messages"] = json!([]);
+    params["now"] = json!(now);
+    let _: compact::status::StepStatus =
+        decode(&params).unwrap_or_else(|_| panic!("invalid frame"));
+    let parsed = status(&params, &Record::default()).unwrap_or_else(|_| panic!("invalid status"));
+    let usage = parsed.usage();
+    let percentage = usage.current_total_input_tokens as f64 * 100.0 / parsed.context_window as f64;
+    let outcome = crate::scheduler::decide(&crate::scheduler::SchedulerInputs {
+        config: crate::scheduler::SchedulerConfig::default(),
+        usage: crate::scheduler::ContextUsage {
+            percentage,
+            input_tokens: usage.current_total_input_tokens as f64,
+            hard_wall_percentage: Some(percentage),
+        },
+        // execute() sets "never" to disable time-based expiry: it does not read
+        // previous_usage.completed_at. OpenCode reports idle rebuilds separately
+        // through prefix_rebuilding, not this completion timestamp.
+        session: crate::scheduler::SessionMeta {
+            last_response_time_ms: 0,
+            cache_ttl: "never".into(),
+        },
+        now_ms: now,
+        model_key: frame["model"].as_str().map(str::to_owned),
+        context_limit: Some(parsed.context_window as f64),
+        tail_state: crate::scheduler::TailState { mid_tool_use },
+        deferred_execute: None,
+        boundary_bypass: crate::scheduler::BoundaryBypass::default(),
+        drain_latch: crate::scheduler::LatchState::default(),
+        overflow_error_text: None,
+        emergency_recovery_armed: false,
+    });
+    json!({"input_tokens":usage.current_total_input_tokens,"outcome":outcome})
+}
+
 fn execute(
     store: &McStore,
     work: &Work,

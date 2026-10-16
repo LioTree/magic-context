@@ -61,6 +61,7 @@ import { hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { removeCompactionMarkerForSession } from "./compaction-marker-manager";
 import { noteContextLimitResolution } from "./context-limit-resolution";
+import { CONTEXT_USAGE_TTL_MS } from "./context-usage";
 import {
     getMessageRemovedInfo,
     getMessageUpdatedAssistantInfo,
@@ -96,7 +97,6 @@ import { isAnthropicFamilyRoute } from "./sentinel";
 import { clearMessageTokensCache } from "./transform";
 import { resetDegradedCacheCount } from "./transform-postprocess-phase";
 
-const CONTEXT_USAGE_TTL_MS = 60 * 60 * 1000;
 // Session/model pairs whose current run of above-window readings was logged.
 const usageAboveWallLogSeen = new Set<string>();
 

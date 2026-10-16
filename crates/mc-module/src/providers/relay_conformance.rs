@@ -87,6 +87,21 @@ async fn oracle() {
                 serde_json::to_string(&crate::scheduler::ORACLE_OUTCOME.lock().unwrap().take())
                     .unwrap()
             }
+            Some("input_decisions") => serde_json::to_string(
+                &request["cases"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|case| {
+                        super::compaction::oracle_input_decision(
+                            &case["frame"],
+                            case["now"].as_u64().unwrap(),
+                            case["mid_tool_use"].as_bool().unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
             Some("publish") => {
                 let ordinal = request["ordinal"].as_u64().unwrap() as i64;
                 mc.store
