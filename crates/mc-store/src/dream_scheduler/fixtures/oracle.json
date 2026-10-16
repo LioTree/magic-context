@@ -1,0 +1,994 @@
+{
+  "provenance": {
+    "revision": "282d9c08bce490346583a3b8c145c402499f980f",
+    "sha256": {
+      "cron.ts": "d680a8181b7f2195f23bf59cf32f7b696264335378e5695588298de30cfc3bd1",
+      "storage-dream-state.ts": "0a2f32d7f1ec3f64ea9e687aa03019efd8d16cbab574c7adbe1d52826fa88c06",
+      "storage-task-schedule.ts": "a80e1237092dfe02b87136131b6ec4427a5efb5ba7c6c82b0e0fc496718a30cf",
+      "lease.ts": "1ae06cadfd8253122329802ba43a35bb1f67be001aa130f292fb5caf44c3ea70",
+      "task-registry.ts": "cdfb1edb7c1ec685cd81945992f2ea8892cfd0ad4042baf72a3c87e3714b18c2",
+      "token-budget.ts": "00cc4f68fb83e4263a79ffc1552f830f071f1172cc8239260800fc0575790d0b",
+      "task-scheduler.ts": "a984c8d6ffc28a94c3dcc19bef18c98efee9e7762b14fc8f3b9fc1ded4208e52",
+      "task-config.ts": "ffb80b46395ed66d43388060b8c09d33117d5914ab24965cdf38e97b25a77844",
+      "task-gates.ts": "2e10073543917758e8d77673a711c202d490d837b3c325f4fe7fd4b6614feb52",
+      "idle-schedule-prune.ts": "2a758e0e6c1d06aeea90617eebfbedbb8054b2088677c0fad0c6a8df7371aae3",
+      "provider-output-failure.ts": "c36e3b1e822aa97dcbb1569f008214a3ccd41ba95a13f02b30af56851601384c",
+      "mod.rs": "35130a4af00b9b2ba335475da387549a67cc35f599d827b7ab0baabdd39aae5e"
+    },
+    "dependencies": "Gate/input booleans, no-op idle GC/cooldown/logging, in-memory fixture SQL schema, and fake Date.now are injected. All scheduler, lease, cron and token-budget function bodies are pinned and unmodified."
+  },
+  "scenarios": [
+    {
+      "name": "due_skip_complete",
+      "steps": [
+        {
+          "time": 0,
+          "op": "plan",
+          "input": false,
+          "expected": {
+            "state": null,
+            "executed": 0,
+            "due": []
+          }
+        },
+        {
+          "time": 0,
+          "op": "plan",
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 60000,
+              "last_status": null,
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        },
+        {
+          "time": 59999,
+          "op": "plan",
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 60000,
+              "last_status": null,
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        },
+        {
+          "time": 60000,
+          "op": "tick",
+          "gate": false,
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 120000,
+              "last_status": "skipped",
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        },
+        {
+          "time": 120000,
+          "op": "tick",
+          "post_gate": false,
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 180000,
+              "last_status": "skipped",
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        },
+        {
+          "time": 180000,
+          "op": "tick",
+          "advance_ms": 1000,
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": 180000,
+              "next_due_at": 240000,
+              "last_status": "completed",
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 1,
+            "due": []
+          }
+        },
+        {
+          "time": 240000,
+          "op": "plan",
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": 180000,
+              "next_due_at": 240000,
+              "last_status": "completed",
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": [
+              240000
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "retry_cap",
+      "steps": [
+        {
+          "time": 0,
+          "op": "plan",
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 60000,
+              "last_status": null,
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        },
+        {
+          "time": 60000,
+          "op": "tick",
+          "outcome": {
+            "status": "failed",
+            "transient": true,
+            "error": "network"
+          },
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 60000,
+              "last_status": "failed",
+              "last_error": "network",
+              "retry_count": 1,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 1,
+            "due": []
+          }
+        },
+        {
+          "time": 61000,
+          "op": "tick",
+          "outcome": {
+            "status": "failed",
+            "transient": true,
+            "error": "network"
+          },
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 60000,
+              "last_status": "failed",
+              "last_error": "network",
+              "retry_count": 2,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 1,
+            "due": []
+          }
+        },
+        {
+          "time": 62000,
+          "op": "tick",
+          "outcome": {
+            "status": "failed",
+            "transient": true,
+            "error": "network"
+          },
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 60000,
+              "last_status": "failed",
+              "last_error": "network",
+              "retry_count": 3,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 1,
+            "due": []
+          }
+        },
+        {
+          "time": 63000,
+          "op": "tick",
+          "outcome": {
+            "status": "failed",
+            "transient": true,
+            "error": "network"
+          },
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 120000,
+              "last_status": "failed",
+              "last_error": "network",
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 1,
+            "due": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "manual_disabled",
+      "steps": [
+        {
+          "time": 1000,
+          "op": "manual",
+          "schedule": "",
+          "gate": false,
+          "outcome": {
+            "status": "failed",
+            "transient": true,
+            "error": "network"
+          },
+          "expected": {
+            "state": {
+              "schedule": "",
+              "last_run_at": null,
+              "next_due_at": null,
+              "last_status": "failed",
+              "last_error": "network",
+              "retry_count": 1,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 1,
+            "due": []
+          }
+        },
+        {
+          "time": 2000,
+          "op": "manual",
+          "schedule": "",
+          "gate": false,
+          "expected": {
+            "state": {
+              "schedule": "",
+              "last_run_at": 2000,
+              "next_due_at": null,
+              "last_status": "completed",
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 1,
+            "due": []
+          }
+        },
+        {
+          "time": 60000,
+          "op": "plan",
+          "schedule": "",
+          "expected": {
+            "state": {
+              "schedule": "",
+              "last_run_at": 2000,
+              "next_due_at": null,
+              "last_status": "completed",
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "reconcile",
+      "steps": [
+        {
+          "time": 0,
+          "op": "plan",
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 60000,
+              "last_status": null,
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        },
+        {
+          "time": 30000,
+          "op": "plan",
+          "schedule": "*/5 * * * *",
+          "expected": {
+            "state": {
+              "schedule": "*/5 * * * *",
+              "last_run_at": null,
+              "next_due_at": 60000,
+              "last_status": null,
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        },
+        {
+          "time": 31000,
+          "op": "plan",
+          "schedule": "",
+          "expected": {
+            "state": {
+              "schedule": "*/5 * * * *",
+              "last_run_at": null,
+              "next_due_at": 60000,
+              "last_status": null,
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        },
+        {
+          "time": 60000,
+          "op": "tick",
+          "schedule": "*/5 * * * *",
+          "expected": {
+            "state": {
+              "schedule": "*/5 * * * *",
+              "last_run_at": 60000,
+              "next_due_at": 300000,
+              "last_status": "completed",
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 1,
+            "due": []
+          }
+        },
+        {
+          "time": 61000,
+          "op": "tick",
+          "memory_enabled": false,
+          "expected": {
+            "state": {
+              "schedule": "*/5 * * * *",
+              "last_run_at": 60000,
+              "next_due_at": 300000,
+              "last_status": "completed",
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "watermark_success_and_failure",
+      "steps": [
+        {
+          "time": 0,
+          "op": "plan",
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": null,
+              "next_due_at": 60000,
+              "last_status": null,
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": null,
+              "retrospective_watermark_ms": null
+            },
+            "executed": 0,
+            "due": []
+          }
+        },
+        {
+          "time": 60000,
+          "op": "tick",
+          "advance_ms": 3000,
+          "outcome": {
+            "status": "completed",
+            "schedulePatch": {
+              "taskStateJson": "cursor",
+              "retrospectiveWatermarkMs": 62000
+            }
+          },
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": 60000,
+              "next_due_at": 120000,
+              "last_status": "completed",
+              "last_error": null,
+              "retry_count": 0,
+              "task_state_json": "cursor",
+              "retrospective_watermark_ms": 62000
+            },
+            "executed": 1,
+            "due": []
+          }
+        },
+        {
+          "time": 120000,
+          "op": "tick",
+          "outcome": {
+            "status": "failed",
+            "error": "permanent"
+          },
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": 60000,
+              "next_due_at": 180000,
+              "last_status": "failed",
+              "last_error": "permanent",
+              "retry_count": 0,
+              "task_state_json": "cursor",
+              "retrospective_watermark_ms": 62000
+            },
+            "executed": 1,
+            "due": []
+          }
+        },
+        {
+          "time": 180000,
+          "op": "tick",
+          "outcome": {
+            "status": "skipped",
+            "detail": "no work"
+          },
+          "expected": {
+            "state": {
+              "schedule": "* * * * *",
+              "last_run_at": 60000,
+              "next_due_at": 240000,
+              "last_status": "skipped",
+              "last_error": "no work",
+              "retry_count": 0,
+              "task_state_json": "cursor",
+              "retrospective_watermark_ms": 62000
+            },
+            "executed": 1,
+            "due": []
+          }
+        }
+      ]
+    }
+  ],
+  "lease_steps": [
+    {
+      "time": 0,
+      "op": "acquire",
+      "holder": "a",
+      "expected": {
+        "allowed": true,
+        "holder": "a",
+        "active": true
+      }
+    },
+    {
+      "time": 1,
+      "op": "acquire",
+      "holder": "b",
+      "expected": {
+        "allowed": false,
+        "holder": "a",
+        "active": true
+      }
+    },
+    {
+      "time": 120000,
+      "op": "refresh",
+      "holder": "a",
+      "generation": 1,
+      "expected": {
+        "allowed": true,
+        "holder": "a",
+        "active": true
+      }
+    },
+    {
+      "time": 240000,
+      "op": "acquire",
+      "holder": "b",
+      "expected": {
+        "allowed": true,
+        "holder": "b",
+        "active": true
+      }
+    },
+    {
+      "time": 240001,
+      "op": "refresh",
+      "holder": "a",
+      "generation": 1,
+      "expected": {
+        "allowed": false,
+        "holder": "b",
+        "active": true
+      }
+    },
+    {
+      "time": 240001,
+      "op": "release",
+      "holder": "a",
+      "expected": {
+        "allowed": null,
+        "holder": "b",
+        "active": true
+      }
+    },
+    {
+      "time": 240002,
+      "op": "renew",
+      "holder": "b",
+      "generation": 2,
+      "expected": {
+        "allowed": true,
+        "holder": "b",
+        "active": true
+      }
+    },
+    {
+      "time": 240003,
+      "op": "release",
+      "holder": "b",
+      "expected": {
+        "allowed": null,
+        "holder": null,
+        "active": false
+      }
+    },
+    {
+      "time": 240004,
+      "op": "acquire",
+      "holder": "c",
+      "expected": {
+        "allowed": true,
+        "holder": "c",
+        "active": true
+      }
+    }
+  ],
+  "manual_wait_cases": [
+    {
+      "release_at": 6000,
+      "delays": [
+        2000,
+        2000,
+        2000
+      ],
+      "ran": 1,
+      "deferred": 0,
+      "state": {
+        "schedule": "* * * * *",
+        "last_run_at": 6000,
+        "next_due_at": 60000,
+        "last_status": "completed",
+        "last_error": null,
+        "retry_count": 0,
+        "task_state_json": null,
+        "retrospective_watermark_ms": null
+      }
+    },
+    {
+      "release_at": null,
+      "delays": [
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000,
+        2000
+      ],
+      "ran": 0,
+      "deferred": 1,
+      "state": {
+        "schedule": "* * * * *",
+        "last_run_at": null,
+        "next_due_at": 60000,
+        "last_status": null,
+        "last_error": null,
+        "retry_count": 0,
+        "task_state_json": null,
+        "retrospective_watermark_ms": null
+      }
+    }
+  ],
+  "budget_cases": [
+    {
+      "name": "threshold_and_refusal",
+      "budget": 100,
+      "ops": [
+        {
+          "charge": [
+            50,
+            20,
+            9,
+            false,
+            true
+          ],
+          "expected": {
+            "action": "continue",
+            "spent": 79,
+            "finalize_fired": false,
+            "refused_calls": 0,
+            "hard_stopped": false
+          }
+        },
+        {
+          "charge": [
+            1,
+            0,
+            0,
+            false,
+            true
+          ],
+          "expected": {
+            "action": "finalize",
+            "spent": 80,
+            "finalize_fired": true,
+            "refused_calls": 0,
+            "hard_stopped": false
+          }
+        },
+        {
+          "refuse": true,
+          "expected": {
+            "action": {
+              "message": "Out of token budget: no more tool calls. Output your result now.",
+              "hardStopped": false
+            },
+            "spent": 80,
+            "finalize_fired": true,
+            "refused_calls": 1,
+            "hard_stopped": false
+          }
+        },
+        {
+          "refuse": true,
+          "expected": {
+            "action": {
+              "message": "Out of token budget: no more tool calls. Output your result now.",
+              "hardStopped": true
+            },
+            "spent": 80,
+            "finalize_fired": true,
+            "refused_calls": 2,
+            "hard_stopped": true
+          }
+        },
+        {
+          "charge": [
+            20,
+            0,
+            0,
+            false,
+            true
+          ],
+          "expected": {
+            "action": "stop",
+            "spent": 100,
+            "finalize_fired": true,
+            "refused_calls": 2,
+            "hard_stopped": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "completed_over_budget",
+      "budget": 100,
+      "ops": [
+        {
+          "charge": [
+            110,
+            0,
+            0,
+            true,
+            true
+          ],
+          "expected": {
+            "action": "continue",
+            "spent": 110,
+            "finalize_fired": false,
+            "refused_calls": 0,
+            "hard_stopped": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "no_finalize_transport",
+      "budget": 100,
+      "ops": [
+        {
+          "charge": [
+            80,
+            0,
+            0,
+            false,
+            false
+          ],
+          "expected": {
+            "action": "stop",
+            "spent": 80,
+            "finalize_fired": false,
+            "refused_calls": 0,
+            "hard_stopped": true
+          }
+        },
+        {
+          "refuse": true,
+          "expected": {
+            "action": {
+              "message": "Out of token budget: no more tool calls. Output your result now.",
+              "hardStopped": true
+            },
+            "spent": 80,
+            "finalize_fired": false,
+            "refused_calls": 1,
+            "hard_stopped": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "explicit_finalize",
+      "budget": 100,
+      "ops": [
+        {
+          "finalize": true,
+          "expected": {
+            "action": "finalize",
+            "spent": 0,
+            "finalize_fired": true,
+            "refused_calls": 0,
+            "hard_stopped": false
+          }
+        },
+        {
+          "finalize": true,
+          "expected": {
+            "action": "continue",
+            "spent": 0,
+            "finalize_fired": true,
+            "refused_calls": 0,
+            "hard_stopped": false
+          }
+        },
+        {
+          "refuse": true,
+          "expected": {
+            "action": {
+              "message": "Out of token budget: no more tool calls. Output your result now.",
+              "hardStopped": false
+            },
+            "spent": 0,
+            "finalize_fired": true,
+            "refused_calls": 1,
+            "hard_stopped": false
+          }
+        },
+        {
+          "refuse": true,
+          "expected": {
+            "action": {
+              "message": "Out of token budget: no more tool calls. Output your result now.",
+              "hardStopped": true
+            },
+            "spent": 0,
+            "finalize_fired": true,
+            "refused_calls": 2,
+            "hard_stopped": true
+          }
+        }
+      ]
+    }
+  ],
+  "cron": [
+    {
+      "zone": "UTC",
+      "expression": "*/7 1-3/2 * * 7",
+      "after": 1704067200000,
+      "expected": 1704589200000
+    },
+    {
+      "zone": "UTC",
+      "expression": "0 0 31 2 *",
+      "after": 1704067200000,
+      "expected": null
+    },
+    {
+      "zone": "UTC",
+      "expression": "0 0 1 * 1",
+      "after": 1704067200000,
+      "expected": 1704672000000
+    },
+    {
+      "zone": "UTC",
+      "expression": "bad",
+      "after": 1704067200000,
+      "expected": null
+    },
+    {
+      "zone": "UTC",
+      "expression": "",
+      "after": 1704067200000,
+      "expected": null
+    },
+    {
+      "zone": "UTC",
+      "expression": "5/20 * * * *",
+      "after": 1704067200000,
+      "expected": 1704067500000
+    },
+    {
+      "zone": "America/New_York",
+      "expression": "30 2 * * *",
+      "after": 1710046800000,
+      "expected": 1710138600000
+    },
+    {
+      "zone": "America/New_York",
+      "expression": "30 1 * * *",
+      "after": 1730611800000,
+      "consumed": 1730611800000,
+      "expected": 1730701800000
+    }
+  ],
+  "registry": [
+    {
+      "task": "map-memories",
+      "domain": "memory:git:fixture",
+      "budget": 2500000
+    },
+    {
+      "task": "verify",
+      "domain": "memory:git:fixture",
+      "budget": 2500000
+    },
+    {
+      "task": "verify-broad",
+      "domain": "memory:git:fixture",
+      "budget": 3000000
+    },
+    {
+      "task": "curate",
+      "domain": "memory:git:fixture",
+      "budget": 1500000
+    },
+    {
+      "task": "compress-cues",
+      "domain": "memory:git:fixture",
+      "budget": null
+    },
+    {
+      "task": "classify-memories",
+      "domain": "memory:git:fixture",
+      "budget": null
+    },
+    {
+      "task": "retrospective",
+      "domain": "memory:git:fixture",
+      "budget": 300000
+    },
+    {
+      "task": "maintain-docs",
+      "domain": "maintain-docs:git:fixture",
+      "budget": 1600000
+    },
+    {
+      "task": "evaluate-smart-notes",
+      "domain": "evaluate-smart-notes:git:fixture",
+      "budget": null
+    },
+    {
+      "task": "review-user-memories",
+      "domain": "user-memories",
+      "budget": null
+    },
+    {
+      "task": "promote-primers",
+      "domain": "memory:git:fixture",
+      "budget": null
+    },
+    {
+      "task": "refresh-primers",
+      "domain": "memory:git:fixture",
+      "budget": 350000
+    }
+  ]
+}
