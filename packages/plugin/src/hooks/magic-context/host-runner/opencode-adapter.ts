@@ -1797,7 +1797,11 @@ export function createOpenCodeProviderTransform(
             const s = hydrate(id);
             return s?.metadata.active && !s.record.pipeline_exit ? s.record.ids : undefined;
         },
-        isFallbackAdmissible(id: string, input: FallbackInputs): FallbackAdmissibility {
+        isFallbackAdmissible(
+            id: string,
+            input: FallbackInputs,
+            nativeCut?: import("./bridge-marker").BridgeNativeCut,
+        ): FallbackAdmissibility {
             const s = hydrate(id);
             if (deps.rustPipeline !== "provider" || !s?.metadata.active || s.record.pipeline_exit) {
                 return {
@@ -1806,7 +1810,7 @@ export function createOpenCodeProviderTransform(
                     detail: "No active provider record for this session",
                 };
             }
-            return isFallbackAdmissible(s.record, input);
+            return isFallbackAdmissible(s.record, input, nativeCut);
         },
         /** Save input-token usage for the caller's exact served request without exposing the internal record. */
         recordProviderUsage(id: string, usage: ProviderUsageInput): void {

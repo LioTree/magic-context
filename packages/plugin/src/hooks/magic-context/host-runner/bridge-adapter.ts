@@ -9,6 +9,7 @@ import { getOrCreateSessionMeta } from "../../../features/magic-context/storage-
 import {
     clearPendingCompactionMarkerStateIf,
     getPendingCompactionMarkerState,
+    getPersistedCompactionMarkerState,
 } from "../../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../../features/magic-context/tagger";
 import type { PluginContext } from "../../../plugin/types";
@@ -19,6 +20,7 @@ import { hasRawMessageProvider } from "../read-session-chunk";
 import { createRustModeTransform } from "../rust-mode-transform";
 import type { TransformDeps } from "../transform";
 import { type BridgeMarkerOutcome, createBridgeReceiptStore } from "./bridge-marker";
+import { openCodeCutProblem, openCodeCutSources } from "./bridge-native-cut";
 import type { BridgeReceipt, BridgeRequestCompletion } from "./bridge-receipt";
 import { BridgeStep } from "./bridge-step";
 import {
@@ -164,6 +166,17 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             if (v2 && !hasRawMessageProvider(id))
                 throw new BridgeRefusalError("raw_history_provider_missing");
             if (activeSessions.has(id)) throw new Error("Bridge pass already in flight");
+            const nativeStore = createBridgeReceiptStore(db, id, harness);
+            const nativeCut = nativeStore.appliedCut();
+            if (
+                nativeStore.cutState() === "applied" &&
+                (nativeCut?.kind !== "opencode" ||
+                    openCodeCutProblem(
+                        messages.filter((m) => !isMagicContextHead(m)),
+                        nativeCut,
+                    ))
+            )
+                throw new BridgeRefusalError("covered_range_changed");
             // Transport follows symlinks to bind a real filesystem directory, but a
             // non-git project's memory key hashes the path string supplied by the host.
             // Save that key in session_projects before the module looks up memories;
@@ -243,23 +256,38 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                 const { applyDeferredCompactionMarker } = await import(
                     "../compaction-marker-manager"
                 );
-                return createBridgeReceiptStore(db, id, harness).advance(
+                const store = createBridgeReceiptStore(db, id, harness);
+                const nativeCut = store.appliedCut();
+                let raw = inputs.messages.filter((m) => !isMagicContextHead(m));
+                if (store.cutState() === "applied") {
+                    if (nativeCut?.kind !== "opencode" || openCodeCutProblem(raw, nativeCut))
+                        return { kind: "deferred", reason: "covered_range_changed" };
+                    const ordinals = provider.ordinals(id);
+                    const ordered = ordinals && openCodeCutSources(raw, nativeCut, ordinals);
+                    if (!ordered) return { kind: "deferred", reason: "covered_range_changed" };
+                    raw = ordered;
+                }
+                return store.advance(
                     {
                         receipt,
                         target: { ordinal: pending.ordinal, end_mid: pending.endMessageId },
-                        raw: inputs.messages,
+                        raw,
                         proveFit: () => {
                             if (
                                 JSON.stringify(provider.receipt(id).last_applied) !==
                                 JSON.stringify(receipt.last_applied)
                             )
                                 return { admissible: false };
-                            return provider.isFallbackAdmissible(id, {
-                                ...inputs,
-                                messages: inputs.messages
-                                    .filter((m) => !isMagicContextHead(m))
-                                    .map((m) => providerIncoming(m).read()),
-                            });
+                            return provider.isFallbackAdmissible(
+                                id,
+                                {
+                                    ...inputs,
+                                    messages: inputs.messages
+                                        .filter((m) => !isMagicContextHead(m))
+                                        .map((m) => providerIncoming(m).read()),
+                                },
+                                nativeCut,
+                            );
                         },
                     },
                     () => {
@@ -275,8 +303,24 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                             options.projectRoot,
                         );
                         if (outcome.kind === "applied" || outcome.kind === "already-current") {
+                            const state = getPersistedCompactionMarkerState(db, id);
+                            if (!state) return "unknown";
+                            const native = {
+                                kind: "opencode" as const,
+                                boundary_mid: state.boundaryMessageId,
+                                summary_mid: state.summaryMessageId,
+                                compaction_part_id: state.compactionPartId,
+                            };
+                            if (
+                                outcome.kind === "already-current" &&
+                                openCodeCutProblem(
+                                    inputs.messages.filter((m) => !isMagicContextHead(m)),
+                                    native,
+                                )
+                            )
+                                return "deferred";
                             clearPendingCompactionMarkerStateIf(db, id, pending);
-                            return "applied";
+                            return { kind: "applied", native };
                         }
                         return outcome.kind === "retryable-failure" &&
                             outcome.cut !== "definitely-no-cut"
@@ -290,18 +334,29 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
         },
         isFallbackAdmissible(id: string, inputs: BridgeFallbackInputs) {
             assertOpen();
-            if (createBridgeReceiptStore(db, id, harness).cutState() === "unknown")
+            const store = createBridgeReceiptStore(db, id, harness);
+            if (store.cutState() === "unknown")
                 return {
                     admissible: false as const,
                     reason: "covered_range_changed" as const,
                     detail: "Native cut outcome is unknown; rebuild or recover the cut before replaying a pre-cut request",
                 };
-            return provider.isFallbackAdmissible(id, {
-                ...inputs,
-                messages: inputs.messages
-                    .filter((message) => !isMagicContextHead(message))
-                    .map((message) => providerIncoming(message).read()),
-            });
+            if (store.cutState() === "applied" && !store.appliedCut())
+                return {
+                    admissible: false as const,
+                    reason: "covered_range_changed" as const,
+                    detail: "Native cut identity is unavailable",
+                };
+            return provider.isFallbackAdmissible(
+                id,
+                {
+                    ...inputs,
+                    messages: inputs.messages
+                        .filter((message) => !isMagicContextHead(message))
+                        .map((message) => providerIncoming(message).read()),
+                },
+                store.appliedCut(),
+            );
         },
         recordProviderUsage(id: string, usage: ProviderUsageInput): void {
             assertOpen();

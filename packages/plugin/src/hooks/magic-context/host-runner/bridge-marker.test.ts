@@ -16,7 +16,7 @@ const raw = [message("raw-end"), message("tail")];
 const delivered = [message("summary"), raw[1]];
 const target = { ordinal: 12, end_mid: "raw-end" };
 
-function fixture(edit?: (r: BridgeReceipt) => void) {
+function fixture(edit?: (r: BridgeReceipt) => void, complete = true) {
     const db = new Database(":memory:");
     dbs.push(db);
     installHostRunnerSchema(db);
@@ -36,7 +36,9 @@ function fixture(edit?: (r: BridgeReceipt) => void) {
     const candidate = bridgeReceipt(record);
     edit?.(candidate);
     const pending = store.publish(candidate, delivered, 3);
-    const receipt = store.complete(pending.request_id, { status: 200, cleanEnd: true })!;
+    const receipt = complete
+        ? store.complete(pending.request_id, { status: 200, cleanEnd: true })!
+        : pending;
     const advance = (r = receipt, fit = true, view = delivered, source = raw) => {
         const apply = mock(() => "applied" as const);
         const outcome = store.advance(
@@ -66,6 +68,31 @@ test("marker moves only on covering applied receipt in distinct raw coordinates"
     expect(f.receipt.served_through_ordinal).toBe(3);
     expect(outcome).toEqual({ kind: "applied" });
     expect(apply).toHaveBeenCalledTimes(1);
+});
+
+test("durable covering applied receipt advances while delivery is pending", () => {
+    const f = fixture(undefined, false);
+    expect(f.receipt.delivery).toBe("pending");
+    expect(f.advance().outcome).toEqual({ kind: "applied" });
+    expect(f.store.current()?.served_through_ordinal).toBe(0);
+    expect(f.store.current()?.delivery).toBe("pending");
+});
+
+test("pending-apply receipt cannot advance without durable applied identity", () => {
+    const f = fixture((r) => {
+        delete r.last_applied;
+    }, false);
+    const { outcome, apply } = f.advance();
+    expect(outcome).toEqual({ kind: "deferred", reason: "no-current-applied-receipt" });
+    expect(apply).not.toHaveBeenCalled();
+});
+
+test("unpersisted applied receipt cannot authorize a native write", () => {
+    const f = fixture(undefined, false);
+    f.db.prepare("DELETE FROM host_runner_state").run();
+    const { outcome, apply } = f.advance();
+    expect(outcome).toEqual({ kind: "deferred", reason: "no-current-applied-receipt" });
+    expect(apply).not.toHaveBeenCalled();
 });
 
 test("scalar watermark without applied receipt defers without refusing", () => {

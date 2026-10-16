@@ -165,23 +165,50 @@ This persists the clean receipt before returning it. `receipt(sessionId)` reload
 the current pending/clean receipt after restart. Unknown or superseded request IDs
 do not acknowledge anything.
 
-Then call `advanceNativeMarker(sessionId, cleanReceipt, fallbackInputs)` for
-OpenCode 1. Supply the complete canonical raw window and the **current** model,
+After `run()` commits an applied covering view, call
+`advanceNativeMarker(sessionId, receipt, fallbackInputs)` for OpenCode 1.
+Delivery may still be `pending`: native admission requires the current durable
+applied receipt, not provider completion. Pending-apply, superseded, unpersisted
+or not-applied receipts cannot authorize a cut. Clean delivery remains required
+for the served/tag watermark only. Supply the complete canonical raw window and the **current** model,
 usable context window and complete system/tool envelope, just as for fallback
-admission. The exact delivered representation must pass both the token and byte
+admission. The exact applied representation must pass both the token and byte
 fit checks, preserve uncovered parts, and retain paired tool calls/results. The
 existing OpenCode writer uses its separate host connection; its 5-second deletion
 timeout is unchanged. OpenCode 2 does not have this OpenCode 1 marker integration.
 The native in-tree marker paths are unchanged.
 
 For Pi, `createPiBridgeMarkerOwner({db,reloadSession}, sessionId)` exposes
-`publish`, `complete`, `current`, and `advance(receipt, record, fallbackInputs)`.
+`publish`, `complete`, `current`, `isFallbackAdmissible(record, fallbackInputs)`,
+and `advance(receipt, record, fallbackInputs)`.
 The relay supplies the real applied runner record, not a scalar watermark.
 `reloadSession()` must reload the current host journal and return its
 `readBranchEntries`/`appendCompaction` methods together. It runs under the shared
 MC database writer lease, so different processes cannot append concurrently;
 retry rechecks the journal before appending. All mode-3 Pi native appends for that
 session must use this owner, not the standalone context-handler appender.
+Use the owner's fallback method rather than the record-only helper: it loads the
+committed native boundary from MC's store and checks it against the active
+journal branch. Preserve `/tree`'s selected leaf when reloading: simply reopening
+at the last entry in the file can select an abandoned branch.
+
+OpenCode admission records the completed user-compaction/assistant-summary pair
+written by MC. The writer deliberately omits `tail_start_id`, so its existing
+boundary user message is the first retained source; no dangling tail is created.
+Fallback and subsequent bridge runs validate the pair in the actual host array,
+not mere marker presence. Missing/unfinished summaries, edited tail pointers,
+dangling tails, or a returned hidden prefix refuse with `covered_range_changed`
+(the detail names the broken boundary). A retained pre-boundary tail, when part
+of the recorded native cut, is restored to append order for source comparison.
+Pi likewise validates the recorded compaction and live `firstKeptEntryId`.
+
+Both hosts accept a shorter post-cut array by aligning its first retained source
+ID to the runner record and checking hidden source evidence in that record.
+Visible covered source and coverage beyond the effective cut are still checked.
+An unplaceable cut or missing stored evidence refuses with
+`covered_range_changed`; missing pre-cut messages alone are not a source change.
+Old cut records without native boundary identities must be recovered or rebuilt,
+not used as proof that the current host window is cut.
 
 Receipt/cut state uses JSON in the existing host-runner table; no schema change is
 needed. Marker admission failures return `deferred` and leave valid messages

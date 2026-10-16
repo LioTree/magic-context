@@ -8,7 +8,9 @@ import { setPendingPiCompactionMarkerState } from "@magic-context/core/features/
 import { killBridgeMarkerOwner } from "@magic-context/core/hooks/magic-context/host-runner/bridge-marker-test-support";
 import { bridgeReceipt } from "@magic-context/core/hooks/magic-context/host-runner/bridge-receipt";
 import {
+	commitScan,
 	createRecord,
+	scanWindow,
 	sourceDigest,
 } from "@magic-context/core/hooks/magic-context/host-runner/record";
 import type { MessageLike } from "@magic-context/core/hooks/magic-context/transform-operations";
@@ -26,7 +28,7 @@ const message = (id: string): MessageLike =>
 		parts: [{ id: `${id}-part`, type: "text", text: id }],
 	}) as MessageLike;
 
-function fixture() {
+function fixture(complete = true) {
 	const scratch = createTestTempDir("pi-bridge-marker-");
 	cleanups.push(scratch.cleanup);
 	const db = new Database(join(scratch.dir, "context.db"));
@@ -118,10 +120,12 @@ function fixture() {
 	};
 	const owner = createPiBridgeMarkerOwner(deps, session.getSessionId());
 	const pending = owner.publish(bridgeReceipt(record), view, 2);
-	const receipt = owner.complete(pending.request_id, {
-		status: 200,
-		cleanEnd: true,
-	})!;
+	const receipt = complete
+		? owner.complete(pending.request_id, {
+				status: 200,
+				cleanEnd: true,
+			})!
+		: pending;
 	const inputs = {
 		messages: raw,
 		model: "openai/gpt-5.6",
@@ -133,7 +137,7 @@ function fixture() {
 	return { db, session, record, owner, receipt, inputs, deps, scratch };
 }
 
-test("Pi bridge native owner appends only after a covering clean receipt and fit", () => {
+test("Pi bridge native owner appends only after a covering applied receipt and fit", () => {
 	const f = fixture();
 	expect(
 		f.owner.advance(f.receipt, f.record, { ...f.inputs, contextWindow: 1 })
@@ -152,6 +156,133 @@ test("Pi bridge native owner appends only after a covering clean receipt and fit
 			.readBranchEntries()
 			.filter((e) => (e as any).type === "compaction"),
 	).toHaveLength(1);
+});
+
+test("Pi durable applied receipt advances with delivery pending and survives restart for fallback", () => {
+	const f = fixture(false);
+	expect(f.receipt.delivery).toBe("pending");
+	expect(f.owner.advance(f.receipt, f.record, f.inputs).kind).toBe("applied");
+	expect(f.owner.current()).toMatchObject({
+		delivery: "pending",
+		served_through_ordinal: 0,
+	});
+	const restarted = createPiBridgeMarkerOwner(f.deps, f.session.getSessionId());
+	const append = message("new-tail");
+	expect(
+		restarted.isFallbackAdmissible(f.record, {
+			...f.inputs,
+			messages: [f.inputs.messages[1], append],
+		}),
+	).toEqual({
+		admissible: true,
+		view: [f.record.view.replacement[0], f.inputs.messages[1], append],
+	});
+});
+
+for (const state of ["pending-apply", "not-applied"] as const)
+	test(`Pi ${state} receipt does not advance`, () => {
+		const f = fixture(false);
+		if (state === "pending-apply") f.record.view.state = "invalidated";
+		else
+			f.record.last_not_applied = {
+				compaction_id: "rejected",
+				version: 2,
+				reason: "structural",
+			};
+		const receipt = f.owner.publish(
+			bridgeReceipt(f.record),
+			[f.record.view.replacement[0], f.inputs.messages[1]],
+			2,
+		);
+		expect(f.owner.advance(receipt, f.record, f.inputs).kind).toBe("deferred");
+		expect(
+			f.deps
+				.reloadSession()
+				.readBranchEntries()
+				.filter((e) => (e as any).type === "compaction"),
+		).toHaveLength(0);
+	});
+
+test("Pi branch below the marker removes it from the active branch and invalidates the covered view", () => {
+	const f = fixture(false);
+	f.record.view.range.to = 3;
+	f.record.view.coverage = {
+		end_mid: f.inputs.messages[1].info.id!,
+		ordinal: 2,
+	};
+	const receipt = f.owner.publish(
+		bridgeReceipt(f.record),
+		[f.record.view.replacement[0]],
+		2,
+	);
+	expect(f.owner.advance(receipt, f.record, f.inputs).kind).toBe("applied");
+	const journal = SessionManager.open(f.session.getSessionFile()!);
+	expect(journal.getBranch().some((e) => e.type === "compaction")).toBe(true);
+	journal.branch(f.inputs.messages[0].info.id!);
+	expect(journal.getBranch().some((e) => e.type === "compaction")).toBe(false);
+	expect(journal.getEntries().some((e) => e.type === "compaction")).toBe(true);
+	journal.appendMessage({ role: "user", content: "new branch", timestamp: 3 });
+	expect(
+		f.owner.isFallbackAdmissible(f.record, {
+			...f.inputs,
+			messages: f.inputs.messages.slice(0, 1),
+		}),
+	).toMatchObject({
+		admissible: false,
+		reason: "covered_range_changed",
+		detail: "native-cut-journal-boundary-changed",
+	});
+	const scan = scanWindow(f.record, [
+		{
+			id: f.inputs.messages[0].info.id,
+			classify: () => "terminal" as const,
+			read: () => f.inputs.messages[0],
+		},
+	]);
+	commitScan(f.record, scan, "reverted-pi-lineage");
+	expect(f.record.view.state).toBe("invalidated");
+	expect(
+		f.owner.isFallbackAdmissible(f.record, {
+			...f.inputs,
+			messages: f.inputs.messages.slice(0, 1),
+		}),
+	).toMatchObject({ admissible: false, reason: "covered_range_changed" });
+});
+
+test("Pi effective cut rejects a dangling or edited first-kept entry", () => {
+	const f = fixture(false);
+	expect(f.owner.advance(f.receipt, f.record, f.inputs).kind).toBe("applied");
+	const branch = f.deps.reloadSession().readBranchEntries();
+	for (const [entries, detail] of [
+		[
+			branch.filter((e) => (e as any).id !== f.inputs.messages[1].info.id),
+			"native-cut-first-kept-dangling",
+		],
+		[
+			branch.map((e) =>
+				(e as any).type === "compaction"
+					? { ...(e as object), firstKeptEntryId: f.inputs.messages[0].info.id }
+					: e,
+			),
+			"native-cut-journal-boundary-changed",
+		],
+	] as const) {
+		const owner = createPiBridgeMarkerOwner(
+			{
+				...f.deps,
+				reloadSession: () => ({
+					...f.deps.reloadSession(),
+					readBranchEntries: () => [...entries],
+				}),
+			},
+			f.session.getSessionId(),
+		);
+		expect(owner.isFallbackAdmissible(f.record, f.inputs)).toMatchObject({
+			admissible: false,
+			reason: "covered_range_changed",
+			detail,
+		});
+	}
 });
 
 test("Pi bridge never has two appenders even through independent database connections", () => {

@@ -12,16 +12,29 @@ export interface BridgeNativeTarget {
     ordinal: number;
     end_mid: string;
 }
+export type BridgeNativeCut =
+    | {
+          kind: "opencode";
+          boundary_mid: string;
+          summary_mid: string;
+          compaction_part_id: string;
+          tail_start_id?: string;
+      }
+    | { kind: "pi"; compaction_id: string; first_kept_id: string };
 export type BridgeMarkerOutcome =
     | { kind: "applied" }
     | { kind: "deferred"; reason: string }
     | { kind: "unknown"; reason: string };
-export type BridgeMarkerWrite = "applied" | "deferred" | "unknown";
+export type BridgeMarkerWrite =
+    | "applied"
+    | "deferred"
+    | "unknown"
+    | { kind: "applied"; native: BridgeNativeCut };
 interface Saved {
     receipt: BridgeReceipt;
     through: number;
     digest: string;
-    cut?: { target: BridgeNativeTarget; state: "unknown" | "applied" };
+    cut?: { target: BridgeNativeTarget; state: "unknown" | "applied"; native?: BridgeNativeCut };
 }
 
 /** Separate from the cancellable transform. Uses existing host-runner JSON storage,
@@ -49,6 +62,10 @@ export function createBridgeReceiptStore(db: Database, sessionId: string, harnes
     return {
         cutState(): "unknown" | "applied" | undefined {
             return read()?.cut?.state;
+        },
+        appliedCut(): BridgeNativeCut | undefined {
+            const cut = read()?.cut;
+            return cut?.state === "applied" ? cut.native : undefined;
         },
         current(): BridgeReceipt | undefined {
             return read()?.receipt;
@@ -99,7 +116,8 @@ export function createBridgeReceiptStore(db: Database, sessionId: string, harnes
             input: {
                 receipt: BridgeReceipt;
                 target: BridgeNativeTarget;
-                /** Re-measure the exact delivered request with the current model/envelope. */
+                /** Check the applied messages against the current model's prompt limit,
+                 * including the complete system prompt and tool definitions. */
                 proveFit: () => { admissible: boolean; view?: readonly MessageLike[] };
                 /** Complete canonical raw window, in order, before the native cut. */
                 raw: readonly MessageLike[];
@@ -125,7 +143,6 @@ export function createBridgeReceiptStore(db: Database, sessionId: string, harnes
                         if (
                             !receipt ||
                             JSON.stringify(receipt) !== JSON.stringify(input.receipt) ||
-                            receipt.delivery !== "clean" ||
                             !applied ||
                             !coverage ||
                             receipt.last_not_applied
@@ -176,8 +193,15 @@ export function createBridgeReceiptStore(db: Database, sessionId: string, harnes
                         if (!held || !latest || JSON.stringify(latest) !== JSON.stringify(held))
                             return defer("receipt-superseded");
                         const outcome = apply();
-                        if (outcome === "applied") {
-                            latest.cut = { target: input.target, state: "applied" };
+                        if (
+                            outcome === "applied" ||
+                            (typeof outcome === "object" && outcome.kind === "applied")
+                        ) {
+                            latest.cut = {
+                                target: input.target,
+                                state: "applied",
+                                ...(typeof outcome === "object" ? { native: outcome.native } : {}),
+                            };
                             save(latest);
                             return { kind: "applied" };
                         }

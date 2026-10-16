@@ -14,7 +14,10 @@ import {
 } from "../../../features/magic-context/storage-db";
 import * as runnerStorage from "../../../features/magic-context/storage-host-runner";
 import { getOrCreateSessionMeta } from "../../../features/magic-context/storage-meta";
-import { setPendingCompactionMarkerState } from "../../../features/magic-context/storage-meta-persisted";
+import {
+    setPendingCompactionMarkerState,
+    setPersistedCompactionMarkerState,
+} from "../../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../../features/magic-context/tagger";
 import {
     BridgeRefusalError,
@@ -31,6 +34,7 @@ import { createRustModeTransform } from "../rust-mode-transform";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
 import { defaultCompactionMarkerStrategy } from "../transform-postprocess-phase";
+import { createBridgeReceiptStore } from "./bridge-marker";
 import { createOpenCodeProviderTransform } from "./opencode-adapter";
 
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -51,6 +55,32 @@ function message(id: string): MessageLike {
 function firstText(row: MessageLike | undefined): string | undefined {
     const block = row?.parts[0] as { text?: unknown } | undefined;
     return typeof block?.text === "string" ? block.text : undefined;
+}
+function persistNativePair(db: Database, boundary: MessageLike, ordinal: number) {
+    setPersistedCompactionMarkerState(db, "session", {
+        boundaryMessageId: boundary.info.id!,
+        summaryMessageId: "native-summary",
+        compactionPartId: "native-part",
+        summaryPartId: "native-text",
+        boundaryOrdinal: ordinal,
+        targetEndMessageId: boundary.info.id!,
+    });
+    return [
+        {
+            ...boundary,
+            parts: [...boundary.parts, { id: "native-part", type: "compaction", auto: true }],
+        },
+        {
+            info: {
+                id: "native-summary",
+                role: "assistant",
+                parentID: boundary.info.id,
+                summary: true,
+                finish: "stop",
+            },
+            parts: [{ id: "native-text", type: "text", text: "native summary" }],
+        },
+    ] as MessageLike[];
 }
 function fixture(version = LATEST_SUPPORTED_VERSION) {
     const scratch = createTestTempDir("mc-bridge-constructor-");
@@ -210,6 +240,106 @@ function fakeModule() {
 }
 
 describe("supported bridge constructor", () => {
+    test("OpenCode durable applied pending view advances and post-cut fallback serves replacement plus raw tail", async () => {
+        const options = fixture();
+        const wire = fakeModule();
+        wire.setReply((request) => {
+            if (request.method !== "compaction.step") return;
+            return {
+                answer: "compaction_message",
+                request_id: request.params.request_id,
+                compaction: {
+                    compaction_id: "covering-pending",
+                    version: 2,
+                    range: { from: 1, to: 3 },
+                    replacement: [message("summary")],
+                },
+                coverage: { end_mid: "first", ordinal: 2 },
+            };
+        });
+        const rows = [message("prefix"), message("first"), message("second")];
+        canonicalRows(rows);
+        const adapter = await createBridgeAdapter(options);
+        cleanups.push(() => adapter.dispose());
+        const view = await adapter.run({ sessionId: "session", messages: rows, kind: "model" });
+        const db = new Database(options.dbPath);
+        cleanups.push(() => db.close());
+        setPendingCompactionMarkerState(db, "session", {
+            endMessageId: "first",
+            ordinal: 2,
+            publishedAt: 1,
+        });
+        let pair: MessageLike[] = [];
+        const marker = spyOn(markerManager, "applyDeferredCompactionMarker").mockImplementation(
+            (writerDb) => {
+                const durable = createBridgeReceiptStore(db, "session", "opencode");
+                expect(durable.current()).toEqual(view.receipt);
+                expect(durable.cutState()).toBe("unknown");
+                pair = persistNativePair(writerDb, rows[1], 2);
+                return { kind: "applied", markerOrdinal: 2 };
+            },
+        );
+        cleanups.push(() => marker.mockRestore());
+        const inputs = {
+            messages: rows,
+            model: "openai/gpt-5.6",
+            envelope: "complete",
+            contextWindow: 100_000,
+            systemPromptTokens: 100,
+            toolDefinitionTokens: 0,
+        };
+        expect(view.receipt.delivery).toBe("pending");
+        expect((await adapter.advanceNativeMarker("session", view.receipt, inputs)).kind).toBe(
+            "applied",
+        );
+        expect(marker).toHaveBeenCalledTimes(1);
+        expect(adapter.receipt("session")).toMatchObject({
+            delivery: "pending",
+            served_through_ordinal: 0,
+        });
+        await adapter.dispose();
+        const restarted = await createBridgeAdapter(options);
+        cleanups.push(() => restarted.dispose());
+        const append = message("third");
+        expect(
+            restarted.isFallbackAdmissible("session", {
+                ...inputs,
+                messages: [...pair, rows[2], append],
+            }),
+        ).toEqual({ admissible: true, view: [...view.messages, append] });
+        setPendingCompactionMarkerState(db, "session", {
+            endMessageId: "first",
+            ordinal: 2,
+            publishedAt: 2,
+        });
+        marker.mockReturnValue({ kind: "already-current" });
+        expect(
+            (
+                await restarted.advanceNativeMarker("session", view.receipt, {
+                    ...inputs,
+                    messages: [...pair, rows[2]],
+                })
+            ).kind,
+        ).toBe("applied");
+        expect(marker).toHaveBeenCalledTimes(2);
+        expect(
+            restarted.isFallbackAdmissible("session", {
+                ...inputs,
+                messages: [pair[0], rows[2]],
+            }),
+        ).toMatchObject({
+            admissible: false,
+            reason: "covered_range_changed",
+            detail: "native-cut-summary-missing",
+        });
+        await expect(
+            restarted.run({
+                sessionId: "session",
+                messages: [pair[0], rows[2]],
+                kind: "model",
+            }),
+        ).rejects.toMatchObject({ reason: "covered_range_changed" });
+    });
     test("applied bridge receipt round-trips and acknowledges only a clean carrying response", async () => {
         const options = fixture();
         const wire = fakeModule();
@@ -268,10 +398,13 @@ describe("supported bridge constructor", () => {
             ordinal: 1,
             publishedAt: 1,
         });
-        markerDb.close();
-        const marker = spyOn(markerManager, "applyDeferredCompactionMarker").mockReturnValue({
-            kind: "already-current",
-        });
+        cleanups.push(() => markerDb.close());
+        const marker = spyOn(markerManager, "applyDeferredCompactionMarker").mockImplementation(
+            (writerDb) => {
+                persistNativePair(writerDb, rows[0], 1);
+                return { kind: "applied", markerOrdinal: 1 };
+            },
+        );
         cleanups.push(() => marker.mockRestore());
         expect(
             (

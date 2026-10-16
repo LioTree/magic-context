@@ -21,7 +21,9 @@ import {
 export interface PiBridgeMarkerDeps {
 	db: ApplyDeferredPiCompactionMarkerDeps["db"];
 	/** Reload the host journal and return its reader/appender as one snapshot.
-	 * Called under the writer lease; never return a previously cached branch. */
+	 * Preserve the active leaf selected by /tree: reopening at the file's latest
+	 * entry can select an abandoned branch. Native writes call this under the
+	 * writer lease; fallback also calls it to validate the current boundary. */
 	reloadSession: () => Omit<ApplyDeferredPiCompactionMarkerDeps, "db">;
 }
 
@@ -33,10 +35,50 @@ export function createPiBridgeMarkerOwner(
 	sessionId: string,
 ) {
 	const store = createBridgeReceiptStore(deps.db, sessionId, "pi");
+	const fallback = <P>(
+		record: RunnerRecord<MessageLike, P>,
+		inputs: FallbackInputs,
+	) => {
+		const refuse = (detail: string) => ({
+			admissible: false as const,
+			reason: "covered_range_changed" as const,
+			detail,
+		});
+		if (store.cutState() === "unknown")
+			return refuse(
+				"Native cut outcome is unknown; recover the cut before fallback replay",
+			);
+		const cut = store.appliedCut();
+		if (store.cutState() === "applied") {
+			if (cut?.kind !== "pi")
+				return refuse("Native cut identity is unavailable");
+			try {
+				const branch = deps.reloadSession().readBranchEntries() as {
+					id?: string;
+					type?: string;
+					firstKeptEntryId?: string;
+				}[];
+				const latest = branch.filter((e) => e.type === "compaction").at(-1);
+				if (
+					!latest ||
+					latest.id !== cut.compaction_id ||
+					latest.firstKeptEntryId !== cut.first_kept_id
+				)
+					return refuse("native-cut-journal-boundary-changed");
+				const first = branch.findIndex((e) => e.id === cut.first_kept_id);
+				if (first < 0 || first >= branch.indexOf(latest))
+					return refuse("native-cut-first-kept-dangling");
+			} catch {
+				return refuse("native-cut-journal-unavailable");
+			}
+		}
+		return isFallbackAdmissible(record, inputs, cut);
+	};
 	return {
 		publish: store.publish,
 		complete: store.complete,
 		current: store.current,
+		isFallbackAdmissible: fallback,
 		advance<P>(
 			receipt: BridgeReceipt,
 			record: RunnerRecord<MessageLike, P>,
@@ -58,7 +100,9 @@ export function createPiBridgeMarkerOwner(
 								record.view.version !== receipt.last_applied?.version
 							)
 								return { admissible: false };
-							return isFallbackAdmissible(record, inputs);
+							return store.cutState() === "applied"
+								? fallback(record, inputs)
+								: isFallbackAdmissible(record, inputs);
 						},
 					},
 					() => {
@@ -82,7 +126,14 @@ export function createPiBridgeMarkerOwner(
 								sessionId,
 								pending,
 							);
-							return "applied";
+							return {
+								kind: "applied",
+								native: {
+									kind: "pi",
+									compaction_id: outcome.compactionId,
+									first_kept_id: outcome.firstKeptEntryId,
+								},
+							};
 						}
 						return outcome.kind === "retryable-failure"
 							? "unknown"

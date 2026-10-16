@@ -62,13 +62,14 @@ export class StepBudgetExceededError extends Error {
 }
 
 export type BridgeFallbackInputs = Omit<FallbackInputs, "messages"> & {
-    /** Complete raw host window in append order; the facade applies provider normalization. */
+    /** Complete host-sent window; the facade normalizes OpenCode's C/S-before-tail order. */
     messages: readonly MessageLike[];
 };
 
 export type BridgeRefusalReason =
     | NonNullable<Parameters<NonNullable<OpenCodeProviderOptions["fullRequest"]>>[5]>
-    | "raw_history_provider_missing";
+    | "raw_history_provider_missing"
+    | "covered_range_changed";
 
 /** Refuse the native adapter's full-request execution path; callers must prove fallback admission before sending history. */
 export class BridgeRefusalError extends EmergencyFailClosedError {
