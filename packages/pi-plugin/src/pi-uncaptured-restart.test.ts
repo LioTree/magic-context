@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
 	cleanupTestTempDir,
 	createTestTempDirFromPath,
@@ -115,7 +115,7 @@ db.close();
 process.exit(0);
 `;
 
-function child(root: string, mode: string): Record<string, any> {
+function child(root: string, mode: string): Record<string, unknown> {
 	const result = spawnSync(process.execPath, ["--eval", childCode], {
 		windowsHide: true,
 		cwd: root,
@@ -142,7 +142,9 @@ function child(root: string, mode: string): Record<string, any> {
 		.split("\n")
 		.find((value) => value.startsWith("UNCAPTURED_PROOF="));
 	expect(line, result.stdout + result.stderr).toBeDefined();
-	return JSON.parse(line!.slice("UNCAPTURED_PROOF=".length));
+	if (line === undefined)
+		throw new Error("Child process produced no restart proof");
+	return JSON.parse(line.slice("UNCAPTURED_PROOF=".length));
 }
 
 function fixture(): string {

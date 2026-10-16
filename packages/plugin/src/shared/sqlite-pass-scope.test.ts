@@ -124,7 +124,8 @@ test("foreground deferred read snapshots do not change the writer timeout", () =
     const exec = spyOn(db, "exec");
     try {
         withSqliteTransformPass(() => {
-            const read = () => db.prepare("SELECT COUNT(*) AS count FROM context_privilege_state").get();
+            const read = () =>
+                db.prepare("SELECT COUNT(*) AS count FROM context_privilege_state").get();
             expect(db.transaction(read).deferred()).toEqual({ count: 0 });
             db.exec("BEGIN");
             expect(read()).toEqual({ count: 0 });

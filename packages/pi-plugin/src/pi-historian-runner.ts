@@ -173,13 +173,13 @@ import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child
 import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
-import { acknowledgePiHistoryRetirement } from "./pi-history-retirement";
 import {
 	isPiRpcHistorianRunner,
 	PI_RPC_CARRIER,
 	recoverLostPiRpcStages,
 	schedulePiHistorianTurnTwo,
 } from "./pi-historian-turn-two";
+import { acknowledgePiHistoryRetirement } from "./pi-history-retirement";
 import {
 	isPiOrdinalAlignmentUnanchored,
 	resolvePiOrdinalAlignment,

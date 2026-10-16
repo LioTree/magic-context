@@ -29,7 +29,6 @@
  * native compaction.
  */
 
-import { getInMemorySlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import * as crypto from "node:crypto";
 import type {
 	ContextEvent,
@@ -215,6 +214,7 @@ import {
 	invalidateCleanLkgRecoveryFence,
 	LkgRecoveryFenceError,
 } from "@magic-context/core/hooks/magic-context/lkg-recovery-fence";
+import { getInMemorySlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import {
 	markNoteNudgeDelivered,
 	observeNoteNudgeServe,
