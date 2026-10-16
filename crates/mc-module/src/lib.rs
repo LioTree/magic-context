@@ -156,6 +156,7 @@ pub mod m1_compose;
 pub mod memory_render;
 pub mod memory_tool;
 mod memory_verification;
+mod ops_facade;
 pub mod parity_contract;
 pub mod project_docs;
 pub mod project_identity;
@@ -8232,6 +8233,9 @@ impl McHandler {
         request: &Value,
         method: &str,
     ) -> HandlerOutcome {
+        if non_served_contract::UI_METHODS.contains(&method) {
+            return self.handle_ops_facade(channel, request, method);
+        }
         let (_, binding) = match self.management_binding(channel, request, method) {
             Ok(value) => value,
             Err(outcome) => return outcome,
@@ -19985,11 +19989,52 @@ mod tests {
 
     #[tokio::test]
     async fn owner_prep_authorized_arms_refuse_by_exact_route_without_effects() {
+        let recorded = [
+            "mc.ui_capabilities",
+            "mc.read_sidebar",
+            "mc.read_status",
+            "mc.read_embed",
+            "mc.read_compartment_count",
+            "mc.read_todos",
+            "mc.recomp_preview",
+            "mc.recomp_start",
+            "mc.rescore",
+            "mc.wrapup",
+            "mc.flush",
+            "mc.dream",
+            "mc.embed",
+            "mc.job_read",
+            "mc.job_cancel",
+            "mc.ui_events",
+            "mc.notice_currentness",
+            "mc.retrieval",
+            "mc.memory",
+        ];
+        assert_eq!(owner_prep_methods().collect::<Vec<_>>(), recorded);
+        let partition = ops_facade::IMPLEMENTED
+            .iter()
+            .chain(ops_facade::UNPORTED)
+            .copied()
+            .chain([
+                non_served_contract::RETRIEVAL_METHOD,
+                non_served_contract::MEMORY_METHOD,
+            ])
+            .collect::<Vec<_>>();
+        assert_eq!(partition.len(), recorded.len());
+        assert_eq!(
+            partition
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            recorded.into_iter().collect()
+        );
         let (handler, store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         store.set_route_identity_for_test(project.to_str().unwrap(), "git:bound-project");
         let before = store.load("ses").unwrap().row_version;
-        for method in owner_prep_methods() {
+        for method in ops_facade::UNPORTED.iter().copied().chain([
+            non_served_contract::RETRIEVAL_METHOD,
+            non_served_contract::MEMORY_METHOD,
+        ]) {
             match handler
                 .dispatch_value(
                     7,
