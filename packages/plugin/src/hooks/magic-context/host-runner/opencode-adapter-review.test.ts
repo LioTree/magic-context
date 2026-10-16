@@ -24,6 +24,7 @@ import {
 import { adaptPayload } from "../../../v2/hooks/payload";
 import type { SessionContext } from "../../../v2/hooks/types";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
+import { clearLkgRecoveryFence } from "../lkg-recovery-fence";
 import { captureSlot, lkgContentDigest, resetLkgSlotsForTest } from "../lkg-slot";
 import { setRawMessageProvider } from "../read-session-chunk";
 import type { createRustModeTransform } from "../rust-mode-transform";
@@ -568,6 +569,9 @@ for (const host of ["v1", "v2"] as const)
             try {
                 for (const lane of ["legacy", "adapter"] as const) {
                     resetLkgSlotsForTest();
+                    // These are independent implementations of the same fixture,
+                    // not a restart inheriting the preceding arm's dirty return.
+                    clearLkgRecoveryFence("full-only", () => undefined);
                     expect(
                         captureSlot("full-only", {
                             jsonPrefix: JSON.stringify([managed]),

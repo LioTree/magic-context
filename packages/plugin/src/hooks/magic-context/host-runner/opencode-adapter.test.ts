@@ -22,6 +22,7 @@ import { adaptPayload, HEAD_IDS } from "../../../v2/hooks/payload";
 import type { SessionContext, V2Context } from "../../../v2/hooks/types";
 import { deliverSyntheticUserMessage } from "../channel2-delivery";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
+import { clearLkgRecoveryFence } from "../lkg-recovery-fence";
 import { createRustModeTransform } from "../rust-mode-transform";
 import { StoreAheadOfBinaryError } from "../store-ahead-refusal";
 import { createTransform, type TransformDeps } from "../transform";
@@ -1159,6 +1160,9 @@ for (const host of ["v1", "v2"] as const)
         try {
             for (const lane of ["legacy", "absent", "full_request"] as const) {
                 resetLkgSlotsForTest();
+                // Each comparison starts from a new in-memory database. Its
+                // recovery fence must not come from another arm's same-named session.
+                clearLkgRecoveryFence("session", () => undefined);
                 const f = fixture(host);
                 const methods: string[] = [];
                 const deps: TransformDeps = {
