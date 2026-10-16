@@ -29,6 +29,7 @@
  * native compaction.
  */
 
+import { getInMemorySlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import * as crypto from "node:crypto";
 import type {
 	ContextEvent,
@@ -5843,16 +5844,16 @@ export function registerPiContextHandler(
 					if (
 						options.todowriteEnabled === true &&
 						!options.compactionOff &&
-                        !sessionMetaForTodo.isSubagent
-                    ) {
-                        const isCacheBustingForTodo = result.prefixBustPermitted;
+						!sessionMetaForTodo.isSubagent
+					) {
+						const isCacheBustingForTodo = result.prefixBustPermitted;
 						outputMessages = injectSyntheticTodowriteForPi({
 							db: options.db,
 							sessionId,
 							isSubagent: sessionMetaForTodo.isSubagent,
-                            isCacheBusting: isCacheBustingForTodo,
-                            editAdmission: result.editAdmission,
-                            stableId: (message) => result.postCommitEntryIdByRef.get(message),
+							isCacheBusting: isCacheBustingForTodo,
+							editAdmission: result.editAdmission,
+							stableId: (message) => result.postCommitEntryIdByRef.get(message),
 							lastTodoState: sessionMetaForTodo.lastTodoState,
 							messages: outputMessages as unknown as Parameters<
 								typeof injectSyntheticTodowriteForPi
@@ -6642,16 +6643,18 @@ export function registerPiContextHandler(
 					if (error instanceof LkgRecoveryFenceError)
 						throw new PiServedIdentityError(error);
 					try {
-						invalidateCleanLkgRecoveryFence(sessionId, () =>
-							loadPersistedLkgSlot(options.db, sessionId),
-						);
+						const supersededLkg =
+							getInMemorySlot(sessionId) ??
+							loadPersistedLkgSlot(options.db, sessionId);
+						if (supersededLkg) {
+							invalidateCleanLkgRecoveryFence(sessionId, () => supersededLkg);
+							// Later provider usage must not be attached to the superseded request.
+							clearPiLkgSessionState(sessionId);
+						}
 					} catch (fenceError) {
 						throw new PiServedIdentityError(fenceError);
 					}
 					budget.assertOutcome();
-					// Do not attach the next assistant's provider-usage measurement to a
-					// previous request when this newly served request was not captured.
-					clearPiLkgSessionState(sessionId);
 					if (error instanceof PiLkgUncapturable) {
 						try {
 							// Even without a replay snapshot, the tag numbers on the served bytes
@@ -6741,7 +6744,7 @@ export function registerPiContextHandler(
 			}
 			budget.assertOutcome();
 			publishTransformDecision?.();
-            options.onPostprocess?.({ bustedThisPass: result.bustedThisPass });
+			options.onPostprocess?.({ bustedThisPass: result.bustedThisPass });
 			if (
 				!budget.sideTurn &&
 				result.strictThinkingKept &&
@@ -8396,10 +8399,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		activeThinkingTurn = false;
 		protectedSignedPrefix = false;
 	};
-    if (
-        args.recoveryRebuildReason ||
-        (!holdEnabled && args.forceSignedRebuildForFit && protectedSignedPrefix)
-    )
+	if (
+		args.recoveryRebuildReason ||
+		(!holdEnabled && args.forceSignedRebuildForFit && protectedSignedPrefix)
+	)
 		stripForPrefixRewrite();
 	// Messages without a real entry id get a position-independent fallback id
 	// computed once from this pass's input, before any stage edits content.
@@ -9363,10 +9366,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		),
 	);
 	if (
-        !holdEnabled &&
-        protectedSignedPrefix &&
-        args.contextUsage.percentage >= 95 &&
-        !args.upperEstimateOnly
+		!holdEnabled &&
+		protectedSignedPrefix &&
+		args.contextUsage.percentage >= 95 &&
+		!args.upperEstimateOnly
 	) {
 		const candidates = getActiveTagsBySession(args.db, args.sessionId).filter(
 			(tag) => tag.type === "tool" && targets.get(tag.tagNumber)?.canDrop?.(),

@@ -248,23 +248,14 @@ export function invalidateCleanLkgRecoveryFence(
     load: () => LkgSlot | undefined,
     ownRevision?: string,
 ): string | undefined {
-    if (!durableFencesSupported()) return "process-local";
+    if (!durableFencesSupported()) return load() ? "process-local" : undefined;
     const prior = known(sessionId);
     if (prior.state === "dirty")
         return prior.record?.revision === ownRevision ? ownRevision : undefined;
     return locked(sessionId, () => {
-        // If even the first capture is declined, record that its returned output
-        // was not saved. This empty generation means no last-good request exists;
-        // it is never a request that can be replayed.
-        const slot = load() ?? {
-            jsonPrefix: "",
-            inputIdSeq: [],
-            inputContentDigests: [],
-            lastInputMessageId: "",
-            modelKey: null,
-            providerKey: null,
-            capturedAt: 0,
-        };
+        // write a dirty tombstone only when an LKG exists that it would supersede
+        const slot = load();
+        if (!slot) return undefined;
         const record = read(sessionId);
         if (record?.state !== "dirty") {
             const revision = randomUUID();
