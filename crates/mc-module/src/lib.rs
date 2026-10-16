@@ -73,10 +73,13 @@ pub mod project_docs;
 pub mod project_identity;
 pub mod prompt_surface;
 pub mod protection_window;
+#[cfg(test)]
+pub(crate) mod provider_transport_tests;
 mod providers;
 mod reply_pages;
 mod retained_size;
 pub mod retrieval;
+mod transport_admission;
 mod transport_handler;
 pub use transport_handler::McTransportHandler;
 pub mod edit_admission;

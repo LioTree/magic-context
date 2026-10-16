@@ -23,6 +23,10 @@ impl Probe {
             .insert(name, now.duration_since(self.since).as_secs_f64() * 1000.0);
         self.since = now;
     }
+
+    pub(crate) fn value(&mut self, name: &'static str, value: f64) {
+        self.stages.insert(name, value);
+    }
 }
 impl Drop for Probe {
     fn drop(&mut self) {

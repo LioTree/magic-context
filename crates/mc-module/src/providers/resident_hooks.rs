@@ -21,6 +21,12 @@ pub(crate) struct ResidentHooks {
     process_cap: usize,
     entries: Mutex<HashMap<(u64, String), Entry>>,
     clock: AtomicU64,
+    #[cfg(test)]
+    evictions: AtomicU64,
+    #[cfg(test)]
+    oversize_discards: AtomicU64,
+    #[cfg(test)]
+    peak_building: AtomicU64,
 }
 
 impl Default for ResidentHooks {
@@ -30,6 +36,12 @@ impl Default for ResidentHooks {
             process_cap: PROCESS_CAP,
             entries: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(0),
+            #[cfg(test)]
+            evictions: AtomicU64::new(0),
+            #[cfg(test)]
+            oversize_discards: AtomicU64::new(0),
+            #[cfg(test)]
+            peak_building: AtomicU64::new(0),
         }
     }
 }
@@ -154,6 +166,8 @@ impl ResidentHooks {
         if entries.len() >= SESSION_SLOTS && !entries.contains_key(&key) {
             if let Some(old) = oldest_ready(&entries, None) {
                 entries.remove(&old);
+                #[cfg(test)]
+                self.evictions.fetch_add(1, Ordering::Relaxed);
             } else {
                 return Ok(None);
             }
@@ -167,6 +181,8 @@ impl ResidentHooks {
         {
             if let Some(old) = oldest_ready(&entries, Some(&key)) {
                 entries.remove(&old);
+                #[cfg(test)]
+                self.evictions.fetch_add(1, Ordering::Relaxed);
             } else {
                 return Ok(None);
             }
@@ -175,6 +191,14 @@ impl ResidentHooks {
             Some(Entry::Ready(state, _, _)) => (false, *state),
             _ => (true, ResidentPolicy::default()),
         };
+        #[cfg(test)]
+        self.peak_building.fetch_max(
+            entries
+                .values()
+                .filter(|entry| matches!(entry, Entry::Building(_)))
+                .count() as u64,
+            Ordering::Relaxed,
+        );
         Ok(Some(Lease {
             owner: self,
             key,
@@ -184,12 +208,28 @@ impl ResidentHooks {
     }
 
     #[cfg(test)]
+    pub(crate) fn session_stats(&self, instance: u64, key: &Key) -> serde_json::Value {
+        let entries = self.entries.lock().expect("resident lock");
+        match entries.get(&(instance, key.store_key().conversation_key())) {
+            Some(Entry::Ready(state, _, _)) => {
+                serde_json::json!({"ready":true,"rebuilt_parts":state.rebuilt_parts})
+            }
+            _ => serde_json::json!({"ready":false}),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> serde_json::Value {
         let entries = self.entries.lock().expect("resident lock");
         serde_json::json!({"sessions":entries.len(),"charged_bytes":entries.values().map(|entry| match entry { Entry::Ready(_,bytes,_)|Entry::Building(bytes)=>*bytes }).sum::<usize>(),"rebuilt_parts":entries.values().map(|entry| match entry { Entry::Ready(state,_,_)=>state.rebuilt_parts,_=>0 }).sum::<usize>(),"session_cap":SESSION_CAP,"process_cap":self.process_cap,"slot_cap":SESSION_SLOTS,
+            "evictions":self.evictions.load(Ordering::Relaxed),"oversize_discards":self.oversize_discards.load(Ordering::Relaxed),
+            "peak_building":self.peak_building.load(Ordering::Relaxed),
             "eviction_order":"least recently published ready lease",
             "containers":entries.iter().filter_map(|(key,entry)| match entry {
                 Entry::Ready(state,bytes,stamp)=>Some(serde_json::json!({"conversation":key.1,"charged_bytes":bytes,"recency":stamp,
+                    "store_instance":key.0,
+                    "output_cache":state.fold_output.lock().expect("fold output cache").resident_retained_bytes(),
+                    "hygiene":state.fold_hygiene.lock().expect("fold hygiene memo").retained_bytes(),
                     "working":state.fold_working.as_ref().map(|working|working.charges()),
                     "views":state.fold_view.as_ref().map_or(0,|view|view.retained_bytes()-std::mem::size_of::<super::resident_view::ResidentView>()),
                     "byte_arena":state.fold_arena.retained_bytes()-std::mem::size_of::<super::resident_bytes::ByteArena>(),
@@ -242,6 +282,8 @@ impl Lease<'_> {
                 let old = oldest_ready(&entries, None);
                 if let Some(old) = old {
                     entries.remove(&old);
+                    #[cfg(test)]
+                    self.owner.evictions.fetch_add(1, Ordering::Relaxed);
                 } else {
                     break;
                 }
@@ -258,6 +300,9 @@ impl Lease<'_> {
                 ),
             );
             drop(entries);
+        } else {
+            #[cfg(test)]
+            self.owner.oversize_discards.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

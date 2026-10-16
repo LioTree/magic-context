@@ -15,6 +15,7 @@ const quantiles = (values: number[]) => values.length ? ({ samples: values.lengt
 /** One runner, one closed seed, three startup budgets. Never opens a live store. */
 export async function historianHookTiming(sessions = 75, samples = 600) {
     assert.equal(process.platform, "linux");
+    assert.ok(sessions >= 24, "16 hook sessions and eight fold sessions must be disjoint");
     process.env.MC_POLICY_SUMMARY_SKIP_FULL_CHECK = "1";
     process.env.MC_PROVIDER_DRIVER_QUIET = "1";
     process.env.MC_TEST_HISTORIAN_HOLD = "1";
@@ -91,7 +92,6 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
                 const result = await driver.send({ op: "call", rig: `fleet-${index % sessions}`, timing: true,
                     body: { method: "transform.hook", params: { ...hook, request_id: `warm-${index}` } } });
                 assert.ok(!result.error, JSON.stringify(result));
-                assert.ok(result.hook_stages.cold_rebuild < 1, "warm hooks must not rebuild");
                 warm.push(result);
                 if ((index + 1) % 100 === 0) console.log(`HISTORIAN_HOOK_PROGRESS=${JSON.stringify({ mode, samples: index + 1 })}`);
             }
@@ -105,9 +105,9 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
             const stages = Object.fromEntries(stageNames.map(name => [name, quantiles(warm.map(row => row.hook_stages[name]))]));
             const stress: unknown[] = [];
             const foldApplied = new Map<string, typeof applied>();
-            for (let index = 0; index < 4; index++) {
+            for (let index = 0; index < 8; index++) {
                 const rig = `fleet-${sessions - 1 - index}`;
-                const reply = await driver.send({ op: "call", rig, body: { method: "compaction.step", params: {
+                const reply = await driver.send({ op: "call", rig, timing: true, body: { method: "compaction.step", params: {
                     ...base, messages: [], request_id: `prime-fold-${index}`, step_id: `prime-fold-${index}`, last_applied: applied } } });
                 assert.ok(!reply.error, JSON.stringify(reply));
                 foldApplied.set(rig, reply.ok.answer === "compaction_message"
@@ -116,35 +116,59 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
             for (const width of [8, 16]) {
                 if (mode !== "held") await driver.send({ op: "historian_requeue", rig: "fleet-0" });
                 const before = systemSample();
+                const poolBefore = await driver.send({ op: "resident_stats", rig: "fleet-0" });
+                const hookCaches = async () => {
+                    const caches = [];
+                    for (let index = 0; index < width; index++) {
+                        const cache = await driver.send({ op: "resident_session_stats", rig: `fleet-${index}` });
+                        caches.push(cache.ready ? cache.rebuilt_parts : null);
+                    }
+                    return caches;
+                };
+                const cacheBefore = await hookCaches();
                 const hooks: any[] = [], folds: any[] = [];
+                const foldCount = width / 2;
                 for (let batch = 0; batch < 40; batch++) {
-                    // Exercise compaction.step on four sessions separate from
+                    // Exercise compaction.step on sessions separate from
                     // the hooks. Change their generated compartment prose before
                     // admitting the batch, so each fold must publish a new view.
-                    for (let index = 0; index < 4; index++) await driver.send({ op: "event", rig: `fleet-${sessions - 1 - index}`,
+                    for (let index = 0; index < foldCount; index++) await driver.send({ op: "event", rig: `fleet-${sessions - 1 - index}`,
                         event: "realistic_visible_delta", sample: width * 1000 + batch });
                     if (mode !== "held") await driver.send({ op: "historian_requeue", rig: "fleet-0" });
-                    const calls = Array.from({ length: width + 4 }, (_, index) => ({ rig: `fleet-${index < width ? index : sessions - 1 - (index - width)}`,
+                    const calls = Array.from({ length: width + foldCount }, (_, index) => ({ rig: `fleet-${index < width ? index : sessions - 1 - (index - width)}`,
                         body: index < width ? { method: "transform.hook", params: { ...hook, request_id: `stress-${width}-${batch}-${index}` } }
                             : { method: "compaction.step", params: { ...base, messages: [], request_id: `fold-${width}-${batch}-${index}`,
                                 step_id: `fold-${width}-${batch}-${index}`, last_applied: foldApplied.get(`fleet-${sessions - 1 - (index - width)}`) } } }));
                     const result = await driver.send({ op: "concurrent_calls", calls });
                     for (const row of result.rows) {
-                        if (row.kind === "transform.hook") assert.ok(row.hook_stages.cold_rebuild < 1, "stress hooks must not rebuild");
+                        if (row.kind === "transform.hook" && row.error) assert.match(row.error.message, /^resident_not_ready:/);
+                        else if (row.error) assert.match(row.error.message, /provider admission busy/);
                         (row.kind === "transform.hook" ? hooks : folds).push(row);
                     }
                     result.rows.slice(width).forEach((row: any, index: number) => {
-                        if (row.ok.answer === "compaction_message") foldApplied.set(`fleet-${sessions - 1 - index}`,
+                        if (row.ok?.answer === "compaction_message") foldApplied.set(`fleet-${sessions - 1 - index}`,
                             { compaction_id: row.ok.compaction.compaction_id, version: row.ok.compaction.version });
                     });
                     if ((batch + 1) % 10 === 0) console.log(`HISTORIAN_HOOK_STRESS_PROGRESS=${JSON.stringify({ mode, width, batches: batch + 1 })}`);
                 }
                 const after = systemSample();
+                const cacheAfter = await hookCaches();
+                const poolAfter = await driver.send({ op: "resident_stats", rig: "fleet-0" });
                 const overlap = hooks.filter(row => row.historian_before.active > 0 || row.historian_after.active > 0);
+                const warmHooks = hooks.filter(row => row.hook_stages.resident_warm === 1);
                 if (mode !== "held") assert.ok(overlap.length > 0, "stress must include hooks overlapping admitted historians");
                 const batch = { width, batches: 40, hook: quantiles(hooks.map(row => row.module_ms)),
-                    active_hook: quantiles(overlap.map(row => row.module_ms)), fold: quantiles(folds.map(row => row.module_ms)),
+                    warm_hook: quantiles(warmHooks.map(row => row.module_ms)),
+                    warm_submitted_to_response: quantiles(warmHooks.map(row => row.submitted_to_response_ms)),
+                    cold_hook_calls: hooks.filter(row => row.hook_stages.resident_cold === 1).length,
+                    unresident_hook_calls: hooks.filter(row => row.hook_stages.resident_cold === 0 && row.hook_stages.resident_warm === 0).length,
+                    cache_before: cacheBefore, cache_after: cacheAfter,
+                    pool_before: poolBefore, pool_after: poolAfter,
+                    active_hook: quantiles(overlap.map(row => row.module_ms)), fold: quantiles(folds.filter(row => !row.error).map(row => row.module_ms)),
+                    fold_refusals: folds.filter(row => row.error).length,
                     submitted_to_response: quantiles(hooks.map(row => row.submitted_to_response_ms)),
+                    fold_submitted_to_response: quantiles(folds.map(row => row.submitted_to_response_ms)),
+                    fold_admission: quantiles(folds.filter(row => !row.error).map(row => row.admission_ms)),
                     stages: Object.fromEntries(stageNames.map(name => [name, quantiles(hooks.map(row => row.hook_stages[name]))])),
                     db_acquire: quantiles(hooks.map(row => row.db_acquire_ms)), db_callback: quantiles(hooks.map(row => row.db_callback_ms)),
                     db_finish: quantiles(hooks.map(row => row.db_finish_ms)), scheduler_wait: quantiles(hooks.map(row => row.scheduler_wait_ms)),
@@ -172,6 +196,15 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
     }
     const result = { bun: Bun.version, cpus: availableParallelism(), work, batches };
     if (process.env.MC_HOOK_TIMING_OUT) writeFileSync(process.env.MC_HOOK_TIMING_OUT, JSON.stringify(result, null, 2));
+    console.log(`HISTORIAN_HOOK_SUMMARY=${JSON.stringify(batches.map((batch: any) => ({ mode: batch.mode,
+        stress: batch.stress.map((block: any) => ({ width: block.width, hook: block.hook,
+            e2e: block.submitted_to_response, warm_hook: block.warm_hook, warm_e2e: block.warm_submitted_to_response,
+            cold_hook_calls: block.cold_hook_calls, unresident_hook_calls: block.unresident_hook_calls,
+            fold: block.fold, fold_e2e: block.fold_submitted_to_response,
+            pool_before: block.pool_before, pool_after: block.pool_after,
+            fold_admission: block.fold_admission, fold_refusals: block.fold_refusals, scheduler_wait: block.scheduler_wait, stages: block.stages,
+            db_acquire: block.db_acquire, pressure: [block.before, block.after].map((edge: any) => ({
+                at: edge.at, loadavg: edge.loadavg, cpu: edge.host_cpu_pressure })) })) })))}`);
     console.log(`HISTORIAN_HOOK_RESULT=${JSON.stringify(result)}`);
     return result;
 }

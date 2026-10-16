@@ -19,6 +19,7 @@ use subc_protocol::ModuleHelloAckBody;
 pub struct McTransportHandler<H: ModuleHandler = McHandler> {
     inner: Arc<H>,
     replies: Arc<Mutex<ReplyPages>>,
+    admission: Option<Arc<crate::transport_admission::Admission>>,
 }
 
 impl<H: ModuleHandler> McTransportHandler<H> {
@@ -26,7 +27,16 @@ impl<H: ModuleHandler> McTransportHandler<H> {
         Self {
             inner: Arc::new(inner),
             replies: Arc::new(Mutex::new(ReplyPages::default())),
+            admission: None,
         }
+    }
+
+    /// Use the same trusted startup flag as the inner handler's resident lane.
+    /// Disabled adapters retain their original dispatch path without admission.
+    pub fn with_resident_admission(mut self, enabled: bool) -> Self {
+        self.admission =
+            enabled.then(|| Arc::new(crate::transport_admission::Admission::default()));
+        self
     }
 
     async fn remove_reply_channel(&self, channel: u16) {
@@ -48,9 +58,15 @@ impl<H: ModuleHandler> ModuleHandler for McTransportHandler<H> {
     }
     async fn on_bind(&self, req: &RouteBindRequest) -> subc_client_rs::BindDecision {
         self.remove_reply_channel(req.handle.channel).await;
+        if let Some(admission) = &self.admission {
+            admission.bind(req);
+        }
         self.inner.on_bind(req).await
     }
     async fn on_route_gone(&self, handle: &RouteHandle) {
+        if let Some(admission) = &self.admission {
+            admission.remove(handle);
+        }
         self.remove_reply_channel(handle.channel).await;
         self.inner.on_route_gone(handle).await;
     }
@@ -72,7 +88,21 @@ impl<H: ModuleHandler> ModuleHandler for McTransportHandler<H> {
         let runtime = tokio::runtime::Handle::current();
         let route = ctx.route_handle();
         let channel = (route.channel, route.epoch);
+        let admitted = if let Some(admission) = &self.admission {
+            match admission.admit(&route, &body).await {
+                Ok(admitted) => admitted,
+                Err(refusal) => return refusal,
+            }
+        } else {
+            None
+        };
         match tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            crate::transport_admission::LAST_WAIT_MS
+                .with(|last| last.set(admitted.as_ref().map_or(0.0, |a| a.wait_ms)));
+            // Keep ownership through cancellation: dropping the response future
+            // must not release ordering or CPU slots while its worker still runs.
+            let _admitted = admitted;
             if let Ok(request) =
                 serde_json::from_slice::<serde_json::Value>(if body.len() <= 1024 {
                     &body
@@ -116,5 +146,16 @@ impl<H: ModuleHandler> ModuleHandler for McTransportHandler<H> {
                 message: error.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_resident_adapter_has_no_admission_layer() {
+        let adapter = McTransportHandler::new(McHandler::new()).with_resident_admission(false);
+        assert!(adapter.admission.is_none());
     }
 }

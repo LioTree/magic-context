@@ -881,7 +881,17 @@ impl McHandler {
             .begin(store.tag_cache_namespace(), &key)
             .map_err(transient)?;
         #[cfg(test)]
-        probe.stage("resident_begin");
+        {
+            probe.stage("resident_begin");
+            probe.value(
+                "resident_cold",
+                u8::from(resident.as_ref().is_some_and(|lease| lease.cold)) as f64,
+            );
+            probe.value(
+                "resident_warm",
+                u8::from(resident.as_ref().is_some_and(|lease| !lease.cold)) as f64,
+            );
+        }
         let _serial = self.provider_serial.lock_for(&key).await;
         #[cfg(test)]
         probe.stage("serial_wait");

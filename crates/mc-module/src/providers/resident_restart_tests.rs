@@ -1,5 +1,9 @@
 use super::*;
 
+mod hook_isolation {
+    include!("hook_isolation_tests.rs");
+}
+
 fn compartments() -> Vec<mc_store::StoredCompartment> {
     [(1,6),(7,12),(13,20)].into_iter().enumerate().map(|(index,(start,end))|mc_store::StoredCompartment {
         sequence:index as i64+1,start_message:start,end_message:end,end_message_id:format!("m{end}#0"),
