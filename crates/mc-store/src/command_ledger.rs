@@ -114,7 +114,7 @@ impl McStore {
                 let rows = stmt.query_map([session], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 rows
             };
-            if targets.len() > 512 || targets.iter().any(|v| v.len() > 256) { return Ok(json!({"error":"flush_queue_too_large"})); }
+            if targets.len() > 512 || targets.iter().any(|v| v.len() > 256) || serde_json::to_vec(&targets).map_err(crate::serde_to_sql_error)?.len() > 256 * 1024 { return Ok(json!({"error":"flush_queue_too_large"})); }
             initialize(tx)?;
             let row = cache_codec::read_small_row(tx,session)?;
             let mut meta = row.as_ref().map(|row| cache_codec::decode_small_meta(&row.meta)).transpose().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?.unwrap_or_default();
@@ -142,6 +142,7 @@ impl McStore {
             let inserted = tx.execute("INSERT OR IGNORE INTO mc_ops_commands(session_id,command_id,job_id,parameters,job) VALUES(?1,?2,?3,?4,?5)",params![session,command,id,parameters,job.to_string()])?;
             if inserted != 1 { return Err(rusqlite::Error::InvalidQuery); }
             let event = json!({"v":1,"event_id":format!("{id}:{}",sequence+1),"sequence":sequence+1,"session_id":session,"command_id":command,"job_id":id,"kind":if compaction {"job.armed"} else {"job.terminal"},"invalidates":["mc.read_sidebar","mc.read_status"],"currentness":{"policy":"current_until_withdrawn","current":true},"job":job});
+            if event.to_string().len() > 512 * 1024 { return Err(rusqlite::Error::InvalidQuery); }
             tx.execute("INSERT INTO mc_ops_events(session_id,sequence,event) VALUES(?1,?2,?3)",params![session,sequence+1,event.to_string()])?;
             tx.execute("INSERT INTO mc_ops_stream(session_id,sequence,acked,active_command) VALUES(?1,?2,0,?3) ON CONFLICT(session_id) DO UPDATE SET sequence=excluded.sequence,active_command=COALESCE(excluded.active_command,active_command)",params![session,sequence+1,if compaction {Some(command)} else {None}])?;
             Ok(job)
@@ -186,6 +187,14 @@ impl McStore {
             let mut stmt = tx.prepare("SELECT event FROM mc_ops_events WHERE session_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3")?;
             let events = stmt.query_map(params![session,ack,limit as i64], |r| decode(r.get(0)?))?.collect::<rusqlite::Result<Vec<_>>>()?;
             drop(stmt);
+            // A count bound alone can exceed the bridge's 1 MiB reply ceiling
+            // when many jobs carry large pending-drop snapshots. Leave room for
+            // the page envelope and resume after the last event actually sent.
+            let mut bytes = 0;
+            let events = events.into_iter().take_while(|event| {
+                bytes += event.to_string().len();
+                bytes <= 512 * 1024
+            }).collect::<Vec<_>>();
             tx.execute("UPDATE mc_ops_stream SET acked=?2 WHERE session_id=?1", params![session,ack])?;
             tx.execute("DELETE FROM mc_ops_events WHERE session_id=?1 AND sequence<=?2", params![session,ack])?;
             let next = events.last().and_then(|v| v["sequence"].as_i64()).unwrap_or(ack);
@@ -311,5 +320,30 @@ mod tests {
         store.delete_session("a", "project-a").unwrap();
         assert!(store.ops_job("a", Some("one"), None).unwrap().is_none());
         assert_eq!(store.ops_job("b", Some("one"), None).unwrap(), Some(other));
+    }
+
+    #[test]
+    fn ops_event_pages_are_byte_bounded_without_skipping_events() {
+        let (store, _dir) = fixture();
+        let targets = (0..512)
+            .map(|id| format!("{id:04}{}", "x".repeat(252)))
+            .collect::<Vec<_>>();
+        store.append_pending_agent_drops("a", &targets, 1).unwrap();
+        for id in 0..8 {
+            store.ops_flush("a", &id.to_string(), true, id).unwrap();
+        }
+        let mut ack = 0;
+        let mut seen = Vec::new();
+        while ack < 8 {
+            let page = store.ops_events("a", ack, 64).unwrap();
+            assert!(page.to_string().len() < 1024 * 1024);
+            for event in page["events"].as_array().unwrap() {
+                seen.push(event["sequence"].as_i64().unwrap());
+            }
+            let next = page["next_position"].as_i64().unwrap();
+            assert!(next > ack);
+            ack = next;
+        }
+        assert_eq!(seen, (1..=8).collect::<Vec<_>>());
     }
 }
