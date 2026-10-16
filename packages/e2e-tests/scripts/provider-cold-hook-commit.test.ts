@@ -1,5 +1,29 @@
-import { test, expect } from "bun:test";
+import { afterAll, beforeAll, test, expect } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { historianHookTiming } from "./provider-historian-hook-timing";
+import { buildDriver } from "./provider-pipeline-differential";
+
+if (process.env.MC_RUN_COLD_COMMIT_REGRESSION === "1" || process.env.MC_RUN_WAL_RESTART_REGRESSION === "1") {
+    const priorBuildDirectory = process.env.MC_PROVIDER_DRIVER_BUILD_DIR;
+    let buildRoot: string | undefined;
+    beforeAll(() => {
+        buildRoot = mkdtempSync(join(tmpdir(), "mc-wal-probe-build-"));
+        process.env.MC_PROVIDER_DRIVER_BUILD_DIR = join(buildRoot, "build");
+        // Compile the complete optimized Rust test binary once before timing
+        // either fixture. A fresh overlay per probe recompiles the whole module,
+        // consuming the case's runtime budget before it can check WAL behavior.
+        const started = performance.now();
+        buildDriver(process.env.MC_PROVIDER_DRIVER_BUILD_DIR);
+        console.log(`WAL_PROBE_BUILD_MS=${(performance.now() - started).toFixed(1)}`);
+    }, 600_000);
+    afterAll(() => {
+        if (priorBuildDirectory === undefined) delete process.env.MC_PROVIDER_DRIVER_BUILD_DIR;
+        else process.env.MC_PROVIDER_DRIVER_BUILD_DIR = priorBuildDirectory;
+        if (buildRoot) rmSync(buildRoot, { recursive: true, force: true });
+    });
+}
 
 test.skipIf(process.platform !== "linux")("ordinary timing requires disjoint 16-hook and eight-fold sessions", async () => {
     const cold = process.env.MC_COLD_HOOK_ONLY;

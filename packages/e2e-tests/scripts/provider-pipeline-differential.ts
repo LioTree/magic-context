@@ -547,7 +547,9 @@ fn provider_pipeline_driver() {
                     }
                     // Commit probes below check direct-dispatch correctness only;
                     // end-to-end timings always use the shipping transport above.
-                    let _commit_probe = (cmd["commit_probe"] == true).then(|| mc_store::commit_probe::Guard::install(rig.store.clone()));
+                    // probe_on already owns this store's SQLite callbacks. Reuse
+                    // its guard instead of replacing callbacks that are still live.
+                    let _commit_probe = (cmd["commit_probe"] == true && rig.commit_probe.is_none()).then(|| mc_store::commit_probe::Guard::install(rig.store.clone()));
                     let correctness_probe = _commit_probe.is_some() || rig.commit_probe.is_some();
                     let historian_before = rig.handler.provider_historian_budget.stats();
                     if correctness_probe {
