@@ -14,11 +14,10 @@ and steps establish the retained-prefix fork. No discovery capability is added.
 
 ## Reproducible identity versus byte oracles
 
-Run the feature replay with the Git SHA embedded in the recorded `role.describe`
-answer's `implementation_version` (the MC binary's compile-time build identity):
+Run the feature replay without requiring the recording's build identity:
 
 ```sh
-MC_BUILD_SHA=7e915050844ecdf41a0f62206ff2626664bead78 cargo test -p mc-module --features advertise-claude-code-candidate --lib g8_
+cargo test -p mc-module --features advertise-claude-code-candidate --lib g8_
 ```
 
 The default build does not publish or admit the Claude Code capability bundle
@@ -40,10 +39,16 @@ The first produced answer binds an ID;
 later answers must keep it and two recorded IDs cannot share one produced ID.
 Later params use that same mapping. Comparisons replace only complete JSON string
 tokens in the recorded bytes: they do not reserialize the expected answer.
-Build version text is not normalized. Every other byte, including content hashes,
-lengths, versions, endpoints, and payloads, must remain exact. Hook answers are
-additionally checked before any answer normalization. Recorded hook params are
-unchanged except any already-bound opaque ID field.
+
+`role.describe` removes only an optional parenthesized 40-hex Git SHA from the
+top-level `implementation_version` string on both sides. Its version prefix,
+feature suffix and every other role-description byte stay exact. The recordings
+contain no `session.status` calls. For such a call, the runner removes only the
+top-level `step_lane` field, which was added to diagnostic status after recording;
+all remaining status bytes stay exact. This status rule does not apply to hook or
+step replies. Hook answers are checked byte-for-byte before any answer
+normalization. Recorded hook params are unchanged except any already-bound opaque
+ID field.
 
 The runner checks session allocation order and uniqueness from stored answers,
 tracks unserved reports and forbids later reuse, checks frozen allocations across
