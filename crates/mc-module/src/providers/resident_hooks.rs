@@ -15,6 +15,13 @@ pub(crate) const SESSION_CAP: usize = 64 * 1024 * 1024;
 // working sets and allocator high-water can put fleet RSS well above this cap.
 pub(crate) const PROCESS_CAP: usize = 1024 * 1024 * 1024;
 const SESSION_SLOTS: usize = 1024;
+// Measured retained fold growth was 10,924,256 - 2,255,089 = 8,669,167
+// bytes; 12 MiB leaves 45% headroom. Hooks retained only 4,735 bytes, so
+// sharing the larger fold allowance also covers their measured working set.
+// These are estimates, not limits: publish reconciles any overrun against both
+// hard caps. A cold lease uses the same estimate without an unbounded history map.
+const GROWTH_ALLOWANCE: usize = 12 * 1024 * 1024;
+const COLD_RESERVATION: usize = GROWTH_ALLOWANCE;
 
 pub(crate) struct ResidentHooks {
     enabled: bool,
@@ -49,6 +56,14 @@ impl Default for ResidentHooks {
 enum Entry {
     Building(usize),
     Ready(Box<ResidentPolicy>, usize, u64),
+}
+
+impl Entry {
+    fn charge(&self) -> usize {
+        match self {
+            Self::Ready(_, bytes, _) | Self::Building(bytes) => *bytes,
+        }
+    }
 }
 
 fn oldest_ready(
@@ -156,7 +171,7 @@ impl ResidentHooks {
             return Ok(None);
         }
         let key = (instance, key.store_key().conversation_key());
-        if key.1.len() > SESSION_CAP / 4 || self.process_cap < SESSION_CAP {
+        if key.1.len() > SESSION_CAP / 4 {
             return Ok(None);
         }
         let mut entries = self.entries.lock().expect("resident lock");
@@ -172,11 +187,16 @@ impl ResidentHooks {
                 return Ok(None);
             }
         }
-        let charge = |entry: &Entry| match entry {
-            Entry::Ready(_, bytes, _) | Entry::Building(bytes) => *bytes,
+        let existing = entries.get(&key).map_or(0, Entry::charge);
+        let reservation = if entries.contains_key(&key) {
+            existing.saturating_add(GROWTH_ALLOWANCE).min(SESSION_CAP)
+        } else {
+            COLD_RESERVATION
         };
-        let existing = entries.get(&key).map_or(0, charge);
-        while entries.values().map(charge).sum::<usize>() - existing + SESSION_CAP
+        if reservation > self.process_cap {
+            return Ok(None);
+        }
+        while entries.values().map(Entry::charge).sum::<usize>() - existing + reservation
             > self.process_cap
         {
             if let Some(old) = oldest_ready(&entries, Some(&key)) {
@@ -187,7 +207,7 @@ impl ResidentHooks {
                 return Ok(None);
             }
         }
-        let (cold, state) = match entries.insert(key.clone(), Entry::Building(SESSION_CAP)) {
+        let (cold, state) = match entries.insert(key.clone(), Entry::Building(reservation)) {
             Some(Entry::Ready(state, _, _)) => (false, *state),
             _ => (true, ResidentPolicy::default()),
         };
@@ -269,14 +289,14 @@ impl Lease<'_> {
             self.state.retained_bytes() + self.key.1.capacity() + std::mem::size_of::<Entry>();
         let mut entries = self.owner.entries.lock().expect("resident lock");
         if bytes <= SESSION_CAP {
-            while entries
-                .values()
-                .map(|entry| match entry {
-                    Entry::Ready(_, bytes, _) | Entry::Building(bytes) => *bytes,
-                })
-                .sum::<usize>()
-                - SESSION_CAP
-                + bytes
+            let reservation = match entries.get(&self.key) {
+                Some(Entry::Building(bytes)) => *bytes,
+                _ => return,
+            };
+            if bytes > self.owner.process_cap {
+                return;
+            }
+            while entries.values().map(Entry::charge).sum::<usize>() - reservation + bytes
                 > self.owner.process_cap
             {
                 let old = oldest_ready(&entries, None);
@@ -285,7 +305,9 @@ impl Lease<'_> {
                     #[cfg(test)]
                     self.owner.evictions.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    break;
+                    // Other leases cannot be evicted to cover this overrun.
+                    // Discard this cache; committed rows remain authoritative.
+                    return;
                 }
             }
             // Replace the busy reservation with policy derived from committed
@@ -354,12 +376,12 @@ mod tests {
 
     #[test]
     fn resident_caps_include_in_flight_leases_and_evict_idle_sessions() {
-        let resident = ResidentHooks::enabled(true);
+        let resident = ResidentHooks::enabled(true).with_process_cap(2 * COLD_RESERVATION);
         let mut active = Vec::new();
-        for n in 0..PROCESS_CAP / SESSION_CAP {
+        for n in 0..2 {
             active.push(resident.begin(1, &key(&n.to_string())).unwrap().unwrap());
         }
-        assert_eq!(resident.stats()["charged_bytes"], PROCESS_CAP);
+        assert_eq!(resident.stats()["charged_bytes"], 2 * COLD_RESERVATION);
         assert!(
             resident.begin(1, &key("extra")).unwrap().is_none(),
             "unavailable capacity uses the non-resident path"
@@ -377,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn lowered_64_mib_pool_keeps_the_same_ready_lease_eviction_control() {
+    fn lowered_64_mib_pool_fits_small_entries_and_too_small_pool_falls_back() {
         let resident = ResidentHooks::enabled(true).with_process_cap(64 * 1024 * 1024);
         resident.begin(1, &key("first")).unwrap().unwrap().publish();
         resident
@@ -385,9 +407,134 @@ mod tests {
             .unwrap()
             .unwrap()
             .publish();
-        assert_eq!(resident.stats()["sessions"], 1);
-        assert!(resident.begin(1, &key("first")).unwrap().unwrap().cold);
+        assert_eq!(resident.stats()["sessions"], 2);
+        assert!(!resident.begin(1, &key("first")).unwrap().unwrap().cold);
         let small = ResidentHooks::enabled(true).with_process_cap(1024 * 1024);
         assert!(small.begin(1, &key("normal-fallback")).unwrap().is_none());
+    }
+
+    fn charged(resident: &ResidentHooks) -> usize {
+        resident.stats()["charged_bytes"].as_u64().unwrap() as usize
+    }
+
+    fn ready(resident: &ResidentHooks, session: &str) -> bool {
+        resident.session_stats(1, &key(session))["ready"] == true
+    }
+
+    fn retained(lease: &Lease<'_>) -> usize {
+        lease.state.retained_bytes() + lease.key.1.capacity() + std::mem::size_of::<Entry>()
+    }
+
+    #[test]
+    fn warm_reservation_is_retained_size_plus_bounded_growth() {
+        let resident = ResidentHooks::enabled(true);
+        resident.begin(1, &key("hook")).unwrap().unwrap().publish();
+        let bytes = charged(&resident);
+        let lease = resident.begin(1, &key("hook")).unwrap().unwrap();
+        assert!(!lease.cold);
+        assert_eq!(charged(&resident), bytes + GROWTH_ALLOWANCE);
+        assert!(charged(&resident) <= bytes + 16 * 1024 * 1024);
+        drop(lease);
+        assert_eq!(charged(&resident), 0);
+    }
+
+    #[test]
+    fn cold_reservation_is_bounded_and_released_on_failure() {
+        let resident = ResidentHooks::enabled(true);
+        let lease = resident.begin(1, &key("cold")).unwrap().unwrap();
+        assert!(lease.cold);
+        assert_eq!(charged(&resident), COLD_RESERVATION);
+        assert!(charged(&resident) <= 16 * 1024 * 1024);
+        drop(lease);
+        assert_eq!(charged(&resident), 0);
+    }
+
+    #[test]
+    fn publish_accounts_for_overrun_instead_of_the_estimate() {
+        let resident = ResidentHooks::enabled(true);
+        let mut lease = resident.begin(1, &key("grow")).unwrap().unwrap();
+        lease.state.fold_lineage = Some(String::with_capacity(COLD_RESERVATION + 1024));
+        let bytes = retained(&lease);
+        assert!(bytes > charged(&resident));
+        lease.publish();
+        assert_eq!(charged(&resident), bytes);
+        assert_eq!(resident.stats()["evictions"], 0);
+        assert!(ready(&resident, "grow"));
+    }
+
+    #[test]
+    fn publish_overrun_evicts_only_oldest_ready_and_preserves_building() {
+        let resident = ResidentHooks::enabled(true).with_process_cap(3 * COLD_RESERVATION);
+        for session in ["oldest", "newer"] {
+            let mut lease = resident.begin(1, &key(session)).unwrap().unwrap();
+            lease.state.fold_lineage = Some(String::with_capacity(4 * 1024 * 1024));
+            lease.publish();
+        }
+        let mut grow = resident.begin(1, &key("grow")).unwrap().unwrap();
+        let busy = resident.begin(1, &key("busy")).unwrap().unwrap();
+        grow.state.fold_lineage = Some(String::with_capacity(18 * 1024 * 1024));
+        let oldest_bytes = resident.entries.lock().unwrap()
+            [&(1, key("oldest").store_key().conversation_key())]
+            .charge();
+        let expected = charged(&resident) - COLD_RESERVATION - oldest_bytes + retained(&grow);
+        assert_eq!(
+            resident.stats()["evictions"],
+            0,
+            "begin fits without eviction"
+        );
+        grow.publish();
+        assert_eq!(charged(&resident), expected);
+        assert!(charged(&resident) <= resident.process_cap);
+        assert!(!ready(&resident, "oldest"));
+        assert!(ready(&resident, "newer"));
+        assert!(ready(&resident, "grow"));
+        assert!(resident.is_building(1, &key("busy")));
+        assert_eq!(resident.stats()["evictions"], 1);
+        drop(busy);
+    }
+
+    #[test]
+    fn publish_discards_overrun_when_only_building_capacity_remains() {
+        let resident = ResidentHooks::enabled(true).with_process_cap(2 * COLD_RESERVATION);
+        let mut grow = resident.begin(1, &key("grow")).unwrap().unwrap();
+        let busy = resident.begin(1, &key("busy")).unwrap().unwrap();
+        grow.state.fold_lineage = Some(String::with_capacity(COLD_RESERVATION + 1024));
+        grow.publish();
+        assert_eq!(charged(&resident), COLD_RESERVATION);
+        assert!(charged(&resident) <= resident.process_cap);
+        assert!(!ready(&resident, "grow"));
+        assert!(resident.is_building(1, &key("busy")));
+        assert_eq!(resident.stats()["evictions"], 0);
+        drop(busy);
+        assert_eq!(charged(&resident), 0);
+    }
+
+    #[test]
+    fn publish_discards_entry_larger_than_process_without_evicting_ready() {
+        let resident = ResidentHooks::enabled(true).with_process_cap(2 * COLD_RESERVATION);
+        resident.begin(1, &key("keep")).unwrap().unwrap().publish();
+        let before = charged(&resident);
+        let mut grow = resident.begin(1, &key("grow")).unwrap().unwrap();
+        grow.state.fold_lineage = Some(String::with_capacity(2 * COLD_RESERVATION));
+        grow.publish();
+        assert_eq!(charged(&resident), before);
+        assert!(ready(&resident, "keep"));
+        assert!(!ready(&resident, "grow"));
+        assert_eq!(resident.stats()["evictions"], 0);
+    }
+
+    #[test]
+    fn publish_discards_entry_over_64_mib_even_with_process_capacity() {
+        let resident = ResidentHooks::enabled(true);
+        resident.begin(1, &key("keep")).unwrap().unwrap().publish();
+        let before = charged(&resident);
+        let mut grow = resident.begin(1, &key("oversize")).unwrap().unwrap();
+        grow.state.fold_lineage = Some(String::with_capacity(SESSION_CAP));
+        assert!(retained(&grow) > SESSION_CAP);
+        grow.publish();
+        assert_eq!(resident.stats()["oversize_discards"], 1);
+        assert_eq!(charged(&resident), before);
+        assert!(ready(&resident, "keep"));
+        assert!(resident.begin(1, &key("oversize")).unwrap().unwrap().cold);
     }
 }
