@@ -2,6 +2,8 @@
 //! Stored message IDs retain their first bytes across scalar/single-text-block
 //! form flips; all other changes remain conflicts. No LLM runner is used here.
 use super::*;
+#[path = "cc_multiblock_vector_tests.rs"]
+mod cc_multiblock_vector_tests;
 #[path = "context_fixture_tests.rs"]
 mod context_fixture_tests;
 #[path = "g8_replay_tests.rs"]
