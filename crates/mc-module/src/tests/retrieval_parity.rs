@@ -1851,7 +1851,25 @@ mod served_differential {
         json!({"ordinal":ordinal,"mid":format!("m{ordinal}"),"message":{"info":{"id":format!("m{ordinal}"),"role":"user","time":{"created":1}},"parts":[{"id":format!("p{ordinal}"),"type":"text","text":text}]}})
     }
     async fn provider_lane() -> Value {
-        let (handler, store, _dir, _bound) = fixture();
+        let (handler, store, _dir, mut bound) = fixture();
+        // Bridged provider operations require the daemon-stamped harness principal
+        // and session scope; the legacy Rust transform fixture remains unprivileged.
+        bound.principal = Some(subc_protocol::Principal::Reserved {
+            module_id: "thalamus-harness".into(),
+        });
+        bound.scope = Some(subc_protocol::scope::ScopeStamp {
+            owner: subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            scope_ref: "ses".into(),
+            scope_epoch: 1,
+            kind: subc_protocol::scope::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+            attributes: Default::default(),
+            owner_authorized: true,
+        });
+        handler.bind_route(7, bound);
         let setup = json!({"session":"ses","harness":"opencode","request_id":"setup","preset":"head","params":{"serializer_profile":"opencode-aisdk","observation":"answer","auto_search_enabled":true,"auto_search_min_prompt_chars":0,"auto_search_score_threshold":0.0},"composition":{},"model":"fixture","context_window":100000,"now":1,"lineage_id":"L"});
         outcome_bytes(
             handler
