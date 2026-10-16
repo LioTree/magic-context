@@ -79,23 +79,19 @@ export function stripPiLeadingTemporalMarker(message: unknown): boolean {
 }
 
 /**
- * Inject HTML-comment gap markers into Pi user messages. Mirrors
- * OpenCode's `injectTemporalMarkers` 1:1 in agent-visible behavior;
- * differences are limited to the message-shape walking and write
- * back into Pi's content union.
- *
- * Returns the number of user messages that received a new marker.
+ * Collect elapsed-time markers by session entry ID so later rendering finds the same messages.
  */
 export function collectPiTemporalCandidates(
 	messages: unknown[],
 	entryIds: readonly (string | undefined)[],
+	resolveId?: (message: unknown, index: number) => string | undefined,
 ): Map<string, string> {
 	const candidates = new Map<string, string>();
 	let previous: number | undefined;
 	for (let i = 0; i < messages.length; i++) {
 		const message = messages[i] as PiAgentMessage | undefined;
 		if (!message || typeof message !== "object") continue;
-		const id = entryIds[i];
+		const id = resolveId ? resolveId(message, i) : entryIds[i];
 		if (id && message.role === "user") {
 			candidates.set(
 				id,
@@ -113,6 +109,7 @@ export function injectPiTemporalMarkers(
 	messages: unknown[],
 	frozen?: ReadonlyMap<string, string>,
 	resolveId?: (message: unknown, index: number) => string | undefined,
+	onInjected?: (message: unknown, index: number, block: number) => void,
 ): number {
 	let injected = 0;
 	let prevTimestampMs: number | undefined;
@@ -138,6 +135,7 @@ export function injectPiTemporalMarkers(
 					if (content !== user.content) {
 						user.content = content;
 						injected++;
+						onInjected?.(raw, i, 0);
 					}
 				} else if (Array.isArray(user.content)) {
 					const index = user.content.findIndex((part) => part?.type === "text");
@@ -148,6 +146,7 @@ export function injectPiTemporalMarkers(
 							user.content = user.content.slice();
 							user.content[index] = { ...part, text };
 							injected++;
+							onInjected?.(raw, i, index);
 						}
 					}
 				}

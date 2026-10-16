@@ -207,6 +207,7 @@ import {
     type TailHygieneStructuralSignature,
     tailHygieneStructuralSignature,
 } from "./tail-hygiene-walk";
+import { admitTemporalCandidates } from "./temporal-admission";
 import { injectTemporalMarkers } from "./temporal-awareness";
 import { buildSyntheticTodoPart, isSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
 import {
@@ -2602,23 +2603,53 @@ export async function runPostTransformPhase(
                   ),
               ])
             : undefined;
+    const admittedTemporalCandidates =
+        args.temporalCandidates && isCacheBustingPass && !compactionOff
+            ? admitTemporalCandidates({
+                  candidates: args.temporalCandidates,
+                  frozen: previousTemporalDecisions ?? new Map(),
+                  admission: editAdmission,
+                  locations: args.messages.map((message) => ({
+                      id: message.info.id,
+                      block: message.parts.findIndex((part) => {
+                          if (!part || typeof part !== "object") return false;
+                          const text = part as { type?: string; ignored?: boolean; text?: unknown };
+                          return (
+                              text.type === "text" &&
+                              text.ignored !== true &&
+                              typeof text.text === "string"
+                          );
+                      }),
+                  })),
+                  onHeld: (ids) => {
+                      if (editAdmission.frame.kind === "boundary")
+                          sessionLog(
+                              args.sessionId,
+                              `edit admission: held lane=temporal marker first application coords=${ids.join(",")} boundary=${editAdmission.frame.messageId ?? "<unresolved>"} held_edits=${ids.length}`,
+                          );
+                  },
+              })
+            : new Map<string, string>();
+    const temporalFirstApplications: { message: MessageLike; block: number }[] = [];
     const temporalDecisions =
         args.temporalCandidates && !compactionOff
-            ? canEditWholePrefix
+            ? isCacheBustingPass
                 ? new Map([
                       ...(previousTemporalDecisions ?? []),
-                      ...freezeTemporalDecisions(args.db, args.sessionId, args.temporalCandidates),
+                      ...freezeTemporalDecisions(
+                          args.db,
+                          args.sessionId,
+                          admittedTemporalCandidates,
+                      ),
                   ])
                 : previousTemporalDecisions
             : undefined;
-    const temporalInjected = temporalDecisions
-        ? injectTemporalMarkers(args.messages, temporalDecisions)
-        : 0;
-    const temporalFirstApplication =
-        temporalInjected > 0 &&
-        [...(temporalDecisions ?? [])].some(
-            ([id, marker]) => marker && !previousTemporalDecisions?.has(id),
-        );
+    if (temporalDecisions)
+        injectTemporalMarkers(args.messages, temporalDecisions, (raw, block) => {
+            const message = raw as MessageLike;
+            if (message.info.id && admittedTemporalCandidates.get(message.info.id))
+                temporalFirstApplications.push({ message, block });
+        });
     // A permission deny known before the first freeze already made the verdict
     // "unavailable" (see primeCtxReduceSpawnPermission). A deny added after the
     // freeze cannot flip it without rewriting the cached prefix, so observe the
@@ -2809,7 +2840,6 @@ export async function runPostTransformPhase(
         firstApplicationEdits.any = true;
         firstApplicationEdits.beforeNewerThinking ||= beforeNewerThinking;
     };
-    if (temporalFirstApplication) recordFirstApplicationWireEdit(true);
     const firstApplicationLocations = new Map<MessageLike, number>();
     const recordFirstApplicationAt = (message: MessageLike, partIndex: number): void => {
         recordFirstApplicationWireEdit(false);
@@ -2818,6 +2848,8 @@ export async function runPostTransformPhase(
             Math.min(firstApplicationLocations.get(message) ?? Infinity, partIndex),
         );
     };
+    for (const { message, block } of temporalFirstApplications)
+        recordFirstApplicationAt(message, block);
     let heuristicOrReasoningDidMutate = false;
     // Like heuristicOrReasoningDidMutate, but leaving out the oldest-prefix
     // reasoning removal, which on a prefix-bound model leaves every newer

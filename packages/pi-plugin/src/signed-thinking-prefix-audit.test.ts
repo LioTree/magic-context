@@ -147,7 +147,8 @@ type Lane =
 	| "reasoning clearing (keep_reasoning_tokens)"
 	| "processed image strip"
 	| "stale ctx_reduce strip"
-	| "frozen-sentinel first application";
+	| "frozen-sentinel first application"
+	| "temporal marker first application";
 
 /**
  * Lanes whose mid-loop bust changes the request before a signed thinking block the
@@ -173,6 +174,7 @@ const PRIMARY_LANES: Lane[] = [
 	"processed image strip",
 	"stale ctx_reduce strip",
 	"frozen-sentinel first application",
+	"temporal marker first application",
 ];
 /**
  * Obligation lanes whose held work must still be released at the next user turn when the
@@ -283,6 +285,7 @@ async function fixture(
 					injectionBudgetTokens: 4000,
 					memoryEnabled: false,
 					injectDocs: false,
+					temporalAwareness: lane === "temporal marker first application",
 				}
 			: undefined,
 		heuristics: {
@@ -383,7 +386,9 @@ async function fixture(
 		messages.push(
 			userMessage(
 				extra.length ? ([{ type: "text", text }, ...extra] as never) : text,
-				1000 + messages.length,
+				lane === "temporal marker first application" && id !== "prompt-1"
+					? 720000 + messages.length
+					: 1000 + messages.length,
 			),
 		);
 		ids.push(id);
@@ -663,6 +668,8 @@ function landed(f: Fixture, lane: Lane, after: Wire): boolean {
 	const text = JSON.stringify(after);
 	const old = ["old-read-a", "old-read-b", "old-read-c"];
 	switch (lane) {
+		case "temporal marker first application":
+			return text.includes("<!-- +");
 		case "ctx_reduce drop (full removal)":
 		case "/ctx-flush":
 			return f.tagStatus("old-read-b") === "dropped";
@@ -741,6 +748,14 @@ for (const subagent of [false, true]) {
 						return;
 					}
 					expect(error).toBeNull();
+					if (lane === "temporal marker first application")
+						expect(
+							f.db
+								.prepare(
+									"SELECT marker FROM temporal_decisions WHERE session_id=? AND message_id='prompt-2'",
+								)
+								.get(f.sessionId),
+						).toEqual({ marker: null });
 					if (lane !== "reasoning clearing (keep_reasoning_tokens)")
 						expect(edit).toBe(false);
 					// At the 95% wall Pi drops the newest tool result, which sits
@@ -768,6 +783,11 @@ for (const subagent of [false, true]) {
 					);
 					expect(f.mock.check(released)).toBeNull();
 					expect(landed(f, lane, released)).toBe(true);
+					if (lane === "temporal marker first application") {
+						const replay = await f.pass();
+						expect(wire(replay.messages)).toEqual(released);
+						expect(replay.bustedThisPass).toBe(false);
+					}
 				}),
 			);
 		}

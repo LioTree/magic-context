@@ -132,7 +132,8 @@ type Lane =
     | "processed image strip"
     | "stale ctx_reduce strip"
     | "frozen-sentinel first application"
-    | "system-injected neutralization";
+    | "system-injected neutralization"
+    | "temporal marker first application";
 
 /**
  * Lanes whose mid-loop bust changes the request before a signed thinking block the
@@ -157,6 +158,7 @@ const PRIMARY_LANES: Lane[] = [
     "stale ctx_reduce strip",
     "frozen-sentinel first application",
     "system-injected neutralization",
+    "temporal marker first application",
 ];
 /**
  * Obligation lanes whose held work must still be released at the next user turn when the
@@ -310,6 +312,7 @@ async function fixture(
             db,
             storeGeneration: generation,
             signedThinkingHold: "on",
+            experimentalTemporalAwareness: lane === "temporal marker first application",
             tagger: createTagger(),
             scheduler: { shouldExecute: () => decision } as never,
             liveModelBySession: liveModel,
@@ -366,7 +369,15 @@ async function fixture(
         const block = mock.respond(wire(served), withThinking);
         step++;
         raw.push({
-            info: { id: `step-${step}`, role: "assistant", sessionID: sessionId, ...MODEL },
+            info: {
+                id: `step-${step}`,
+                role: "assistant",
+                sessionID: sessionId,
+                ...MODEL,
+                ...(lane === "temporal marker first application"
+                    ? { time: { created: 1000 + raw.length * 1000 } }
+                    : {}),
+            },
             parts: [
                 ...(block
                     ? [
@@ -384,7 +395,14 @@ async function fixture(
     const userTurn = (id: string, text: string, extra: unknown[] = []) => {
         mock.newUserTurn();
         raw.push({
-            info: { id, role: "user", sessionID: sessionId },
+            info: {
+                id,
+                role: "user",
+                sessionID: sessionId,
+                ...(lane === "temporal marker first application"
+                    ? { time: { created: id === "prompt-1" ? 1000 : 720000 + raw.length * 1000 } }
+                    : {}),
+            },
             parts: [{ type: "text", text }, ...extra],
         });
     };
@@ -659,6 +677,8 @@ function landed(f: Fixture, lane: Lane, after: Wire): boolean {
     const text = JSON.stringify(after);
     const old = ["old-read-a", "old-read-b", "old-read-c"];
     switch (lane) {
+        case "temporal marker first application":
+            return text.includes("<!-- +");
         case "ctx_reduce drop (full removal)":
         case "/ctx-flush":
             return f.tagStatus("old-read-b") === "dropped";
@@ -750,6 +770,14 @@ for (const generation of ["v1", "v2"] as const) {
                         // the next real user turn. Reasoning clearing is valid by
                         // construction: it removes an oldest contiguous run.
                         expect(error).toBeNull();
+                        if (lane === "temporal marker first application")
+                            expect(
+                                f.db
+                                    .prepare(
+                                        "SELECT marker FROM temporal_decisions WHERE session_id=? AND message_id='prompt-2'",
+                                    )
+                                    .get(f.sessionId),
+                            ).toEqual({ marker: null });
                         // At the 95% wall a reduction after the last kept thinking block (the
                         // newest tool results) is admitted; nothing before that block may change.
                         if (lane === "emergency 95% wall")

@@ -272,6 +272,7 @@ enum Lane {
     Placeholder,
     /// An older assistant message holding only a host notification.
     SystemInjected,
+    Temporal,
 }
 
 const SUMMARY_TEXT: &str = "I have finished reading the parser and the lexer. The parser consumes tokens from the lexer, and the error recovery path is incomplete because it never resynchronises after an unexpected token.";
@@ -326,7 +327,8 @@ impl Fixture {
             "messages": []
         }))
         .unwrap();
-        let ctx = context();
+        let mut ctx = context();
+        ctx.temporal_awareness = lane == Lane::Temporal;
         let mut fixture = Fixture {
             served: transform(&store, &req, &ctx)
                 .unwrap_or_else(|_| TransformResponse::need_full_sync(None)),
@@ -352,6 +354,12 @@ impl Fixture {
         self.req
             .messages
             .push(serde_json::from_value(message(mid, self.ordinal, role, kinds)).unwrap());
+        if self.lane == Lane::Temporal {
+            self.req.messages.last_mut().unwrap().ck.meta.created_at_ms = Some(
+                i64::try_from(self.ordinal).unwrap() * 1000
+                    + if mid == "prompt-2" { 720_000 } else { 0 },
+            );
+        }
     }
 
     fn pass(&mut self) -> TransformResponse {
@@ -676,7 +684,7 @@ impl Fixture {
             // An answered image is stripped once its tag is at or below the highest
             // dropped tag number. The module computes that number after this pass's
             // drops, so the image is stripped on the same pass as a drop.
-            Lane::DropFull | Lane::Flush | Lane::Image => {
+            Lane::DropFull | Lane::Flush | Lane::Image | Lane::Temporal => {
                 self.store.append_pending_agent_drops(&sid, &["step-2-result-0#0".into()], 1).unwrap();
             }
             Lane::HardFold | Lane::Recomp => {
@@ -728,6 +736,18 @@ impl Fixture {
             Lane::Image => !text.contains("\"media\""),
             Lane::Placeholder => !text.contains("[dropped §998§]"),
             Lane::SystemInjected => !text.contains("Background task bg-7"),
+            Lane::Temporal => {
+                if std::env::var("MC_AUDIT_DEBUG").as_deref() == Ok("1") {
+                    println!(
+                        "TEMPORAL rows={:?} frontier={:?}",
+                        self.store
+                            .load_temporal_marks(&self.req.session_id)
+                            .unwrap(),
+                        self.store.overlay_watermark(&self.req.session_id).unwrap()
+                    );
+                }
+                text.contains("<!-- +")
+            }
         }
     }
 }
@@ -899,7 +919,7 @@ fn control(profile: &str, lane: Lane) {
 // supersession, the 85% force band, reasoning clearing and the stale ctx_reduce strip
 // did not price a bust or select work here even at a new user turn, so a held result
 // for them would be vacuous; the report covers them from the code.
-const PRIMARY_LANES: [Lane; 10] = [
+const PRIMARY_LANES: [Lane; 11] = [
     Lane::DropFull,
     Lane::Wall95,
     Lane::Flush,
@@ -910,6 +930,7 @@ const PRIMARY_LANES: [Lane; 10] = [
     Lane::Image,
     Lane::Placeholder,
     Lane::SystemInjected,
+    Lane::Temporal,
 ];
 // A subagent pass at the execute threshold is already allowed to change the request
 // (the module reports a SOFT `m1_delta` pass), so a held result here is the thinking
@@ -926,7 +947,7 @@ const SUBAGENT_LANES: [Lane; 4] = [
 /// fails until the module strips that completed-turn thinking; lanes join its list together
 /// with that strip (rollout step 8 in .cortexkit/internal-docs/designs/designs/signed-thinking-hold.md).
 fn on_profile(profile: &str, lane: Lane) -> bool {
-    profile != "claude-code-anthropic" || lane != Lane::SystemInjected
+    profile != "claude-code-anthropic" || !matches!(lane, Lane::SystemInjected | Lane::Temporal)
 }
 
 /// `MC_AUDIT_LANE=<Lane>` restricts a diagnostic run to one lane.

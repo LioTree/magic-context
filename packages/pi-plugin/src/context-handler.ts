@@ -251,6 +251,7 @@ import {
 import { stripSystemInjection } from "@magic-context/core/hooks/magic-context/system-injection-stripper";
 import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import { formatTailHygienePrefixMismatch } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
+import { admitTemporalCandidates } from "@magic-context/core/hooks/magic-context/temporal-admission";
 import { readServedTemporalDecisions } from "@magic-context/core/hooks/magic-context/temporal-served-projection";
 import {
 	advanceToolReclaimWatermarkToCurrentMax,
@@ -8750,7 +8751,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// Observe candidates before any history cut. Replay only durable decisions
 	// until the independently priced rebuild permission below is known.
 	const temporalCandidates = args.temporalAwareness
-		? collectPiTemporalCandidates(args.messages, args.entryIds ?? [])
+		? collectPiTemporalCandidates(
+				args.messages,
+				args.entryIds ?? [],
+				stableIdResolver,
+			)
 		: new Map<string, string>();
 	// Older versions removed a gap at a compaction seam. Preserve those already
 	// served choices; new seams no longer create a position-dependent removal.
@@ -8967,22 +8972,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		holdEnabled && protectedSignedPrefix && piM0State !== undefined;
 	if (materializationHeld && rideSignals.explicitFlush)
 		parkedTriggers?.holdMaterialization();
-	if (args.temporalAwareness && isCacheBustingPass) {
-		temporalDecisions = freezeTemporalDecisions(
-			args.db,
-			args.sessionId,
-			temporalCandidates,
-		);
-		if (
-			injectPiTemporalMarkers(
-				args.messages,
-				temporalDecisions,
-				stableIdResolver,
-			) > 0
-		) {
-			recordFirstApplicationWireEdit(true);
-		}
-	}
 	let publishedWorkDrainAllowed = isCacheBustingPass;
 	const usesTokenProtection =
 		args.protectedTokenTierOverrides !== undefined ||
@@ -9161,21 +9150,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				);
 			}
 		}
-	}
-	if (args.temporalAwareness && isCacheBustingPass && !protectedSignedPrefix) {
-		temporalDecisions = freezeTemporalDecisions(
-			args.db,
-			args.sessionId,
-			temporalCandidates,
-		);
-		if (
-			injectPiTemporalMarkers(
-				args.messages,
-				temporalDecisions,
-				stableIdResolver,
-			) > 0
-		)
-			recordFirstApplicationWireEdit(true);
 	}
 	logPiUnresolvedIdentities(args.sessionId, [
 		...guardPiToolAllocations(
@@ -9390,6 +9364,43 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			shouldRunHeuristics = args.heuristics !== undefined;
 			hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
 		}
+	}
+	if (args.temporalAwareness && isCacheBustingPass) {
+		const admitted = admitTemporalCandidates({
+			candidates: temporalCandidates,
+			frozen: temporalDecisions,
+			admission: editAdmission,
+			locations: workingMessages.map((message, index) => ({
+				id: stableIdResolver(message, index),
+				block:
+					typeof message.content === "string"
+						? 0
+						: Array.isArray(message.content)
+							? message.content.findIndex((part) => part.type === "text")
+							: -1,
+			})),
+			onHeld: (ids) => {
+				if (editAdmission.frame.kind === "boundary")
+					sessionLog(
+						args.sessionId,
+						`edit admission: held lane=temporal marker first application coords=${ids.join(",")} boundary=${editAdmission.frame.messageId ?? "<unresolved>"} held_edits=${ids.length}`,
+					);
+			},
+		});
+		temporalDecisions = new Map([
+			...temporalDecisions,
+			...freezeTemporalDecisions(args.db, args.sessionId, admitted),
+		]);
+		injectPiTemporalMarkers(
+			workingMessages,
+			temporalDecisions,
+			stableIdResolver,
+			(message, index, block) => {
+				const id = stableIdResolver(message, index);
+				if (id && admitted.get(id))
+					recordFirstApplicationAt(message, index, block);
+			},
+		);
 	}
 	for (const number of identityAdoption.protectedTagNumbers) {
 		if (rewritingSignedPrefix) break;

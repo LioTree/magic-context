@@ -6643,21 +6643,30 @@ fn apply_once(
             lineage_anchor_mid,
             &meta.rendered_memory_ids,
         )? {
-            if !hint.hint_text.is_empty()
-                && user_hint_target_was_served(&loaded.meta, &hint.block_id)
-                && prefix_replay_must_be_preserved
-            {
-                // A decision for a previously served block is immutable, but its first append
-                // must ride a later independent bust rather than rewriting the cached prefix.
-                meta.pending_user_hint_block_ids
-                    .insert(hint.block_id.clone());
+            if !admit_block_id(&admission, &hint.block_id) {
+                // Marker and hint decisions share a processed-message watermark. Advancing
+                // it past this withheld hint would make the hint ineligible on later passes.
+                pending_overlays.max_seen_ordinal = pending_overlays
+                    .max_seen_ordinal
+                    .and_then(|ordinal| hint.ordinal.checked_sub(1).map(|cap| ordinal.min(cap)))
+                    .filter(|ordinal| overlay_frontier.is_none_or(|old| *ordinal > old));
+            } else {
+                if !hint.hint_text.is_empty()
+                    && user_hint_target_was_served(&loaded.meta, &hint.block_id)
+                    && prefix_replay_must_be_preserved
+                {
+                    // A decision for a previously served block is immutable, but its first append
+                    // must ride a later independent bust rather than rewriting the cached prefix.
+                    meta.pending_user_hint_block_ids
+                        .insert(hint.block_id.clone());
+                }
+                user_hints.push(UserHintRow {
+                    block_id: hint.block_id.clone(),
+                    hint_text: hint.hint_text.clone(),
+                    created_at: ctx.now_ms,
+                });
+                pending_overlays.user_hint = Some(hint);
             }
-            user_hints.push(UserHintRow {
-                block_id: hint.block_id.clone(),
-                hint_text: hint.hint_text.clone(),
-                created_at: ctx.now_ms,
-            });
-            pending_overlays.user_hint = Some(hint);
         }
         if !prefix_replay_must_be_preserved {
             meta.pending_user_hint_block_ids
@@ -13494,18 +13503,32 @@ fn compute_active_overlay_decisions(
         .iter()
         .map(|row| (row.block_id.as_str(), row.created_at_ms))
         .collect::<HashMap<_, _>>();
+    let admission = if ctx.signed_thinking_hold == crate::config::SignedThinkingHold::On {
+        edit_admission_for_request(core, req)
+    } else {
+        crate::edit_admission::EditAdmission::new(&[], false)
+    };
+    let mut decided_temporal = temporal_rows
+        .iter()
+        .map(|row| row.block_id.clone())
+        .collect::<HashSet<_>>();
+    let mut held_temporal = false;
     let canonical_marks = if temporal_enabled {
         timestamp_temporal_marks(req, projection, mutation_exempt_mid, lineage_anchor_mid)
+            .into_iter()
+            .filter(|mark| {
+                let admitted = decided_temporal.contains(&mark.block_id)
+                    || admit_block_id(&admission, &mark.block_id);
+                held_temporal |= !admitted;
+                admitted
+            })
+            .collect()
     } else {
         Vec::new()
     };
     let canonical_ids = canonical_marks
         .iter()
         .map(|mark| mark.block_id.clone())
-        .collect::<HashSet<_>>();
-    let mut decided_temporal = temporal_rows
-        .iter()
-        .map(|row| row.block_id.clone())
         .collect::<HashSet<_>>();
     let mut temporal_marks = reconcile_canonical_temporal_marks(
         temporal_rows,
@@ -13576,6 +13599,11 @@ fn compute_active_overlay_decisions(
                 .and_then(temporal_gap_prefix)
                 .unwrap_or_default()
         };
+        if !admit_block_id(&admission, &block_id) {
+            held_temporal = true;
+            previous_new_user_mint = Some(current_mint);
+            continue;
+        }
         temporal_marks.push(TemporalMarkInput {
             ordinal: message.ordinal,
             block_id: block_id.clone(),
@@ -13616,7 +13644,8 @@ fn compute_active_overlay_decisions(
         decided_frontier.filter(|ordinal| frontier.is_none_or(|current| *ordinal > current));
     let temporal_ms = elapsed_ms(temporal_started_at);
     profile_end!(perf_temporal);
-    let rewrite_temporal_marks = rewrite_temporal_marks && !temporal_marks.is_empty();
+    let rewrite_temporal_marks =
+        rewrite_temporal_marks && !held_temporal && !temporal_marks.is_empty();
 
     Ok(PendingOverlayDecisions {
         max_seen_ordinal,
@@ -32912,6 +32941,7 @@ pub(crate) mod tests {
     include!("transform/stale_reduce_tests.rs");
     include!("transform/image_admission_tests.rs");
     include!("transform/todo_admission_tests.rs");
+    include!("transform/temporal_admission_tests.rs");
     include!("tests/signed_prefix_hold.rs");
     include!("tests/signed_prefix_hold_review.rs");
     include!("tests/signed_prefix_hold_review_r2.rs");

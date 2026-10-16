@@ -183,6 +183,7 @@ export function collectTemporalCandidates(messages: unknown[]): Map<string, stri
 export function injectTemporalMarkers(
     messages: unknown[],
     frozen?: ReadonlyMap<string, string>,
+    onInjected?: (message: unknown, block: number) => void,
 ): number {
     let injected = 0;
     let prev: MessageLikeWithTime | null = null;
@@ -202,6 +203,7 @@ export function injectTemporalMarkers(
                 if (text !== target.text) {
                     target.text = text;
                     injected++;
+                    onInjected?.(raw, msg.parts.indexOf(target));
                 }
             }
             continue;
@@ -227,6 +229,7 @@ export function injectTemporalMarkers(
                         if (!TEMPORAL_MARKER_PATTERN.test(body)) {
                             target.text = tagPrefix + prefix + body;
                             injected++;
+                            onInjected?.(raw, msg.parts.indexOf(target));
                         }
                     }
                 }
