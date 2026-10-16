@@ -2039,6 +2039,8 @@ impl McHandler {
                 // Automatic tagging belongs to the conversation's frozen plan,
                 // not the engine prefix being discarded. Preserve absence too:
                 // legacy conversations must not opt in during a lineage switch.
+                // The store separately preserves the conversation's tag allocator
+                // watermarks when saving these reset counters.
                 let counters: Value =
                     serde_json::from_str(&conversation.hook_counters_json).map_err(transient)?;
                 let mut retained = json!({});

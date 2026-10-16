@@ -254,8 +254,10 @@ fn admit_policy_parts_tx(
         let mut part = part.clone();
         let held:Option<String>=conn.query_row("SELECT policy_json FROM mc_provider_policy_parts_v1 WHERE conv_key=?1 AND lineage_id=?2 AND block_id=?3",params![conv,lineage,part.block_id],|r|r.get(0)).optional()?;
         let mut retired = false;
+        let mut held_number = None;
         if let Some(held) = held {
             let held: ProviderPolicyPart = serde_json::from_str(&held).map_err(sql_json)?;
+            held_number = held.tag_number.filter(|_| !held.retired);
             if let Some(number) = held.tag_number {
                 if tag_consumed_tx(conn, namespace, number)? {
                     continue;
@@ -298,6 +300,23 @@ fn admit_policy_parts_tx(
             {
                 part.tag_number = held.tag_number;
             }
+        }
+        if let Some(number) = part.tag_number {
+            let pending_owner = pending_tags.iter().any(|tag| {
+                tag.number == number
+                    && tag.block_id == part.block_id
+                    && repeat.is_some_and(|s| {
+                        s.subject_mid == part.mid && s.subject_part == part.subject_part
+                    })
+            });
+            let engine_owner: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mc_tags WHERE session_id=?1 AND block_id=?2 AND tag_number=?3)",
+                params![namespace, part.block_id, number], |r| r.get(0),
+            )?;
+            if number <= *high && held_number != Some(number) && !pending_owner && !engine_owner {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            *high = (*high).max(number);
         }
         if part.tag_kind.is_some() && part.tag_number.is_none() {
             if !reuse_held || !retired {
@@ -576,10 +595,48 @@ pub(crate) fn save_conversation_tx(
     key: &ProviderSessionKey,
     c: &ProviderConversation,
 ) -> rusqlite::Result<()> {
+    let mut counters = parse(&c.hook_counters_json)?;
+    preserve_tag_high_water_tx(conn, &key.conversation_key(), &mut counters)?;
     conn.execute("INSERT INTO mc_provider_conversations_v2 (conv_key,project_root,session,harness,lineage_id,preset,params_json,setup_json,engine_namespace,version_high_water,rebuild_epoch,hook_counters_json,last_answer_json,wait_request,cursor_frontier,served_through_ordinal,historian_model_chain_json,profile_generation,provider_generation,native_pins_json,native_plan_json)
         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
         ON CONFLICT(conv_key) DO UPDATE SET lineage_id=excluded.lineage_id,preset=excluded.preset,params_json=excluded.params_json,setup_json=excluded.setup_json,engine_namespace=excluded.engine_namespace,version_high_water=max(version_high_water,excluded.version_high_water),rebuild_epoch=excluded.rebuild_epoch,hook_counters_json=excluded.hook_counters_json,last_answer_json=excluded.last_answer_json,wait_request=excluded.wait_request,cursor_frontier=excluded.cursor_frontier,served_through_ordinal=excluded.served_through_ordinal,historian_model_chain_json=excluded.historian_model_chain_json,native_pins_json=excluded.native_pins_json,native_plan_json=excluded.native_plan_json",
-        params![key.conversation_key(),key.project_root,key.session,key.harness,c.lineage_id,c.preset,c.params_json,c.setup_json,c.engine_namespace,as_i64(c.version_high_water)?,as_i64(c.rebuild_epoch)?,c.hook_counters_json,c.last_answer_json,c.wait_request,as_i64(c.cursor_frontier)?,c.served_through_ordinal.map(as_i64).transpose()?,c.historian_model_chain_json,key.generation.as_ref().map_or("",|g|g.profile.as_str()),key.generation.as_ref().map_or("",|g|g.provider.as_str()),c.native_pins_json,c.native_plan_json])?;
+        params![key.conversation_key(),key.project_root,key.session,key.harness,c.lineage_id,c.preset,c.params_json,c.setup_json,c.engine_namespace,as_i64(c.version_high_water)?,as_i64(c.rebuild_epoch)?,counters.to_string(),c.last_answer_json,c.wait_request,as_i64(c.cursor_frontier)?,c.served_through_ordinal.map(as_i64).transpose()?,c.historian_model_chain_json,key.generation.as_ref().map_or("",|g|g.profile.as_str()),key.generation.as_ref().map_or("",|g|g.provider.as_str()),c.native_pins_json,c.native_plan_json])?;
+    Ok(())
+}
+
+// Allocator watermarks belong to the provider conversation, not its current
+// lineage or engine cache. Resetting other hook state must not release numbers.
+fn preserve_tag_high_water_tx(
+    conn: &Connection,
+    conv: &str,
+    counters: &mut Value,
+) -> rusqlite::Result<()> {
+    if !counters.is_object() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let held: Option<String> = conn
+        .query_row(
+            "SELECT hook_counters_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+            [conv],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let held = held
+        .map(|raw| parse(&raw))
+        .transpose()?
+        .unwrap_or_else(|| json!({}));
+    let mut high = 0;
+    for field in ["reserved_tag_high_water", "tag_high_water", "high_water"] {
+        let previous = held[field].as_i64().unwrap_or(0);
+        let next = counters[field].as_i64().unwrap_or(0);
+        high = high.max(previous).max(next);
+        if previous > next {
+            counters[field] = json!(previous);
+        }
+    }
+    if high > 0 {
+        counters["reserved_tag_high_water"] = json!(high);
+    }
     Ok(())
 }
 fn lineage_tx(
@@ -1460,6 +1517,7 @@ impl McStore {
                 return Err(rusqlite::Error::InvalidQuery);
             }
             let result = update(&mut counters);
+            preserve_tag_high_water_tx(conn, &key.conversation_key(), &mut counters)?;
             conn.execute(
                 "UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1",
                 params![key.conversation_key(), counters.to_string()],
@@ -1734,6 +1792,7 @@ impl McStore {
                 let live_max: i64 = conn.query_row("SELECT coalesce(max(tag_number),0) FROM mc_tags WHERE session_id=?1",[&c.engine_namespace],|r|r.get(0))?;
                 let tag_high_water = counters.get("tag_high_water").and_then(Value::as_i64).unwrap_or(0).max(counters.get("high_water").and_then(Value::as_i64).unwrap_or(0)).max(live_max);
                 let mut reserved_high=tag_high_water.max(counters.get("reserved_tag_high_water").and_then(Value::as_i64).unwrap_or(0));
+                let allocation_floor = reserved_high;
                  // Replayed or inherited answers already own their policy rows.
                  // Do not shadow an ancestor reservation in the child lineage.
                  if !repeat_answer.as_ref().is_some_and(|a|a.state=="live" || a.lineage_id!=request.lineage.lineage_id) {
@@ -1755,7 +1814,7 @@ impl McStore {
                 }
                 if let Some(summary)=&write.policy_summary {save_policy_summary_tx(conn,&conv,summary)?;}
                 let answer_policy = write.counters.as_object_mut().and_then(|c|c.remove("answer_policy")).unwrap_or_else(||json!({}));
-                let mut high = tag_high_water;
+                let mut high = allocation_floor;
                 if let Some(a) = write.answer.filter(|_| !replay_heal) {
                     if a.subject.subject_mid != request.message.map_or(a.subject.subject_mid.as_str(),|m|m.mid.as_str()) || request.message.is_some_and(|m|m.ordinal!=a.ordinal) {return Err(ProviderError::InvalidParams {field:"subject_mid"})}
                     parse(&a.ops_json)?;
@@ -1778,6 +1837,8 @@ impl McStore {
                     }
                 }
                 write.counters["tag_high_water"]=json!(high);
+                write.counters["reserved_tag_high_water"]=json!(reserved_high.max(high));
+                preserve_tag_high_water_tx(conn, &conv, &mut write.counters)?;
                 conn.execute("UPDATE mc_provider_conversations_v2 SET lineage_id=?2,served_through_ordinal=?3,hook_counters_json=?4,cursor_frontier=?5 WHERE conv_key=?1",params![conv,request.lineage.lineage_id,acknowledged.map(as_i64).transpose()?,write.counters.to_string(),as_i64(frontier)?])?;
                 if let Some(metrics) = answer_policy.get("metrics") {
                     let metrics: ProviderPolicyTotals = serde_json::from_value(metrics.clone()).map_err(sql_json)?;
@@ -1945,6 +2006,7 @@ impl McStore {
             let c = conversation_tx(conn, key)?.ok_or(rusqlite::Error::InvalidQuery)?;
             let mut counters = parse(&c.hook_counters_json)?;
             counters["reserved_tag_high_water"] = json!(high);
+            preserve_tag_high_water_tx(conn, &conv, &mut counters)?;
             counters["signed_prefix_holds"] = json!(healing.signed_holds);
             if let Some(failed) = counters.get_mut("failed_subjects").and_then(Value::as_array_mut) {
                 failed.retain(|s| !healing.answers.iter().any(|a| serde_json::to_value(&a.subject).ok().as_ref() == Some(s)));
@@ -2622,6 +2684,124 @@ mod policy_tests {
             rows.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
             ["pending", "burned"]
         );
+    }
+
+    #[test]
+    fn unanswered_pass_and_healing_reservations_survive_descent_and_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, key, lineage) = fixture(dir.path());
+        let messages = (1..=2)
+            .map(|ordinal| ProviderMessage {
+                mid: format!("m{ordinal}"),
+                ordinal,
+                message_bytes: b"{}".to_vec(),
+            })
+            .collect::<Vec<_>>();
+        let parts = (1..=2)
+            .map(|ordinal| {
+                let mut part = lifecycle_part(&format!("m{ordinal}"), ordinal, 0);
+                part.tag_number = None;
+                part
+            })
+            .collect::<Vec<_>>();
+        store
+            .admit_provider_pass(
+                &key,
+                &lineage,
+                &messages,
+                &parts,
+                &json!({"pass_id":"pass"}),
+            )
+            .unwrap();
+        assert!(store.load_provider_hook_answers(&key).unwrap().is_empty());
+        let child = ProviderLineage {
+            lineage_id: "B".into(),
+            first_ordinal: 2,
+            descends_from: Some("L".into()),
+            through_ordinal: Some(1),
+        };
+        store
+            .start_provider_descendant_lineage(&key, &child)
+            .unwrap();
+        let mut reset = store.load_provider_conversation(&key).unwrap().unwrap();
+        reset.hook_counters_json = "{}".into();
+        store.save_provider_conversation(&key, &reset).unwrap();
+        let mut fresh = lifecycle_part("fresh", 2, 0);
+        fresh.tag_number = None;
+        let planned = store.plan_provider_healing(&key, "B", &[fresh]).unwrap();
+        assert_eq!(planned[0].tag_number, Some(3));
+        let view = ProviderView {
+            version: 1,
+            lineage_id: "B".into(),
+            range_from: 1,
+            range_to: 3,
+            replacement_json: "[]".into(),
+            state: "produced".into(),
+        };
+        store
+            .save_provider_view_with_healing(
+                &key,
+                &view,
+                &ProviderViewHealing {
+                    parts: planned,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .update_provider_hook_counters(&key, |c| *c = json!({}))
+            .unwrap();
+        let mut later = lifecycle_part("later", 3, 0);
+        later.tag_number = None;
+        assert_eq!(
+            store.plan_provider_healing(&key, "B", &[later]).unwrap()[0].tag_number,
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn numbered_policy_input_cannot_reallocate_reserved_session_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, key, lineage) = fixture(dir.path());
+        store
+            .update_provider_hook_counters(&key, |c| c["reserved_tag_high_water"] = json!(40))
+            .unwrap();
+        let message = ProviderMessage {
+            mid: "new".into(),
+            ordinal: 1,
+            message_bytes: b"{}".to_vec(),
+        };
+        let part = lifecycle_part("new", 1, 40);
+        assert!(store
+            .admit_provider_pass(
+                &key,
+                &lineage,
+                std::slice::from_ref(&message),
+                std::slice::from_ref(&part),
+                &json!({"pass_id":"stale"})
+            )
+            .is_err());
+        assert!(store.load_provider_messages(&key, "L").unwrap().is_empty());
+        let mut fresh = part;
+        fresh.tag_number = Some(41);
+        store
+            .admit_provider_pass(
+                &key,
+                &lineage,
+                &[message],
+                &[fresh],
+                &json!({"pass_id":"fresh"}),
+            )
+            .unwrap();
+        let counters: Value = serde_json::from_str(
+            &store
+                .load_provider_conversation(&key)
+                .unwrap()
+                .unwrap()
+                .hook_counters_json,
+        )
+        .unwrap();
+        assert_eq!(counters["reserved_tag_high_water"], 41);
     }
 
     #[test]

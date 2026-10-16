@@ -427,17 +427,17 @@ async fn retained_auto_tag_conversation(auto_tag: Option<bool>, descend: bool) {
     );
     let lineage = if descend { "child" } else { "L" };
     let answer = value(cc::call(&h, "transform.hook", hook(lineage, "new", 1)).await);
-    cc::assert_admission_answer(&answer, enabled, &[(0, 2)]);
+    // The rebuild reserved tag 2 for the discarded suffix. Descent retires that
+    // number even though the served watermark never confirmed it.
+    let number = if descend { 3 } else { 2 };
+    cc::assert_admission_answer(&answer, enabled, &[(0, number)]);
+    let tagged = format!(r#"{{"role":"user","content":"§{number}§ prefix"}}"#);
     cc::assert_stored_and_served_raw_in_lineage(
         &h,
         lineage,
         "new",
         raw,
-        if enabled {
-            r#"{"role":"user","content":"§2§ prefix"}"#
-        } else {
-            raw
-        },
+        if enabled { &tagged } else { raw },
     );
 }
 

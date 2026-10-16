@@ -106,6 +106,100 @@ fn hook(
 }
 
 #[test]
+fn tag_high_water_survives_conversation_and_counter_resets() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let l = lineage("L", 0);
+    assert_eq!(hook(&store, &l, &message(0), "a", None, false), 1);
+    let mut reset = store.load_provider_conversation(&key()).unwrap().unwrap();
+    reset.hook_counters_json = "{}".into();
+    store.save_provider_conversation(&key(), &reset).unwrap();
+    assert_eq!(hook(&store, &l, &message(1), "a", None, false), 2);
+    store
+        .update_provider_hook_counters(&key(), |c| *c = json!({}))
+        .unwrap();
+    assert_eq!(hook(&store, &l, &message(2), "a", None, false), 3);
+    store
+        .commit_provider_hook(
+            &key(),
+            ProviderHookRequest {
+                lineage: &l,
+                message: None,
+                served_through_ordinal: None,
+                unserved_subjects: &[],
+                repeat_subject: None,
+            },
+            |_| {
+                Ok((
+                    ProviderHookWrite {
+                        answer: None,
+                        counters: json!({}),
+                        policy_summary: None,
+                    },
+                    (),
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(hook(&store, &l, &message(3), "a", None, false), 4);
+}
+
+#[test]
+fn tag_allocation_at_or_below_reserved_session_high_water_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    store
+        .update_provider_hook_counters(&key(), |c| c["reserved_tag_high_water"] = json!(40))
+        .unwrap();
+    let l = lineage("L", 0);
+    for number in [39, 40] {
+        let m = message(0);
+        let result = store.commit_provider_hook(
+            &key(),
+            ProviderHookRequest {
+                lineage: &l,
+                message: Some(&m),
+                served_through_ordinal: None,
+                unserved_subjects: &[],
+                repeat_subject: None,
+            },
+            |_| {
+                Ok((
+                    ProviderHookWrite {
+                        answer: Some(ProviderHookAnswer {
+                            subject: subject(&m.mid, "a"),
+                            ordinal: 0,
+                            ops_json: "[]".into(),
+                            tags: vec![ProviderAnswerTag {
+                                number,
+                                block_id: "m0#a".into(),
+                                kind: "tool_result".into(),
+                                source: "payload".into(),
+                                token_count: 2,
+                                created_at_ms: 10,
+                            }],
+                        }),
+                        counters: json!({}),
+                        policy_summary: None,
+                    },
+                    (),
+                ))
+            },
+        );
+        assert!(
+            matches!(result, Err(ProviderError::Transient(ref text)) if text == "tag allocation must advance its high water"),
+            "{result:?}"
+        );
+        assert!(store.load_provider_hook_answers(&key()).unwrap().is_empty());
+        assert!(store
+            .load_provider_messages(&key(), "L")
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(hook(&store, &l, &message(0), "a", None, false), 41);
+}
+
+#[test]
 fn v65_blob_round_trips_messages_answers_views_pending_drops_and_empty_lineages() {
     let dir = tempfile::tempdir().unwrap();
     let descriptor = descriptor(dir.path());
