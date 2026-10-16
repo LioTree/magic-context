@@ -230,16 +230,20 @@ function assertFingerprint(expected: Fingerprints, actual: Fingerprints): void {
 				),
 		);
 		const next = right.tables.find((row) => row.name === table?.name);
-		const column = table?.columns.find(
-			(row, i) => JSON.stringify(row) !== JSON.stringify(next?.columns[i]),
+		const namePosition = db === "context" ? 0 : 1;
+		const names = new Set([
+			...(table?.columns ?? []).map((row) => row[namePosition]),
+			...(next?.columns ?? []).map((row) => row[namePosition]),
+		]);
+		const name = [...names].find(
+			(name) =>
+				JSON.stringify(table?.columns.find((row) => row[namePosition] === name)) !==
+				JSON.stringify(next?.columns.find((row) => row[namePosition] === name)),
 		);
-		const i = column ? table!.columns.indexOf(column) : -1;
-		const cause =
-			db === "context" && table?.name === "session_meta"
-				? "Fresh initialization and context migrations 98/100 install session_meta additions in different column order; not allowed away by the strict parity fingerprint."
-				: "Cause requires migration review.";
+		const column = table?.columns.find((row) => row[namePosition] === name);
+		const nextColumn = next?.columns.find((row) => row[namePosition] === name);
 		differences.push(
-			`${db}.db fingerprint ${actual[db]} != reference ${expected[db]}; first differing schema object ${object?.[0]}/${object?.[1]}, table ${table?.name}, column ordinal ${i}: reference=${JSON.stringify(column)} upgraded=${JSON.stringify(next?.columns[i])}. ${cause}`,
+			`${db}.db fingerprint ${actual[db]} != reference ${expected[db]}; first differing schema object ${object?.[0]}/${object?.[1]}, table ${table?.name}, column ${String(name)}: reference=${JSON.stringify(column)} upgraded=${JSON.stringify(nextColumn)}. Cause requires migration review.`,
 		);
 	}
 	if (differences.length) throw new Error(differences.join("; "));

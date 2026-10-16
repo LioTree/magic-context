@@ -83,8 +83,8 @@ fn data(db: &Connection, starting_version: u32) -> Value {
         let mut statement = db.prepare(&format!("PRAGMA table_info('{quoted}')")).unwrap();
         let columns = statement.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         let mut statement = db.prepare(&format!("SELECT * FROM '{quoted}'")).unwrap();
-        let mut rows = statement.query_map([], |row| columns.iter().enumerate().map(|(index,column)| {
-            let value = row.get_ref(index)?;
+        let mut rows = statement.query_map([], |row| columns.iter().map(|column| {
+            let value = row.get_ref(column.as_str())?;
             if name == "schema_migrations" && column == "applied_at" { return Ok(json!(":clock")); }
             if name == "compartment_history_versions" && column == "generation" && starting_version < 93 {
                 let generation = value.as_str().unwrap();

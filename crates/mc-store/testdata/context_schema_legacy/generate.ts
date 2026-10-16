@@ -2,6 +2,7 @@ import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Database as Db } from "../../../../packages/plugin/src/shared/sqlite";
+import { schemaSnapshot as snapshot } from "../../../../packages/plugin/src/features/magic-context/schema-fingerprint";
 
 const output = resolve(process.argv[2]);
 mkdirSync(output, { recursive: true });
@@ -141,22 +142,6 @@ function populate(db: Db): void {
     db.exec("INSERT INTO schema_migrations VALUES (10001,'downstream fixture',123)");
 }
 
-const normalize = (sql: string) => sql.split(/('(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\])/)
-    .map((part, i) => i % 2 ? part : part.replace(/\s+/g, " ")).join("").trim();
-function snapshot(db: Db): unknown {
-    const master = db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all() as {type: string; name: string; tbl_name: string; sql: string | null}[];
-    return {
-        user_version: (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-        migrations: (db.prepare("SELECT version,description FROM schema_migrations ORDER BY version").all() as {version: number; description: string}[]).map(r => [r.version, r.description]),
-        master: master.map(r => [r.type, r.name, r.tbl_name, r.sql === null ? null : normalize(r.sql)]),
-        tables: master.filter(r => r.type === "table").map(({name}) => ({
-            name,
-            columns: (db.prepare(`PRAGMA table_info('${name}')`).all() as any[]).map(c => [c.cid,c.name,c.type,c.notnull,c.dflt_value,c.pk]),
-            indexes: (db.prepare(`PRAGMA index_list('${name}')`).all() as any[]).map(i => [i.name,i.unique,i.origin,i.partial]).sort((a,b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0),
-            foreign_keys: (db.prepare(`PRAGMA foreign_key_list('${name}')`).all() as any[]).map(f => [f.id,f.seq,f.table,f.from,f.to,f.on_update,f.on_delete,f.match]),
-        })),
-    };
-}
 function data(db: Db, startingVersion: number): unknown {
     const tables = db.prepare("PRAGMA table_list").all() as {name: string; type: string; schema: string}[];
     return tables.filter(t => t.schema === "main" && t.type !== "shadow" && !t.name.startsWith("sqlite_schema"))

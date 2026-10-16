@@ -1,0 +1,38 @@
+{
+  "sql": "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, description TEXT); INSERT INTO schema_migrations VALUES(100,'vector'); CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE session_meta(session_id TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT 'a,b', extra INTEGER, parent_id INTEGER REFERENCES parent(id), CHECK(length(value)>0)); CREATE INDEX idx_value ON session_meta(value DESC); CREATE TRIGGER keep_value BEFORE UPDATE ON session_meta BEGIN SELECT CASE WHEN NEW.value = '' THEN RAISE(ABORT,'empty') END; END;",
+  "equivalent": "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, description TEXT); INSERT INTO schema_migrations VALUES(100,'vector'); CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE session_meta(extra INTEGER, parent_id INTEGER REFERENCES parent(id), value TEXT NOT NULL DEFAULT 'a,b', session_id TEXT PRIMARY KEY, CHECK(length(value)>0)); CREATE INDEX idx_value ON session_meta(value DESC); CREATE TRIGGER keep_value BEFORE UPDATE ON session_meta BEGIN SELECT CASE WHEN NEW.value = '' THEN RAISE(ABORT,'empty') END; END;",
+  "mutations": [
+    { "name": "missing_column", "before": "extra INTEGER,", "after": "" },
+    { "name": "wrong_type", "before": "extra INTEGER", "after": "extra TEXT" },
+    { "name": "wrong_default", "before": "DEFAULT 'a,b'", "after": "DEFAULT 'a,c'" },
+    { "name": "missing_index", "before": "CREATE INDEX idx_value ON session_meta(value DESC);", "after": "" },
+    { "name": "missing_trigger", "before": "CREATE TRIGGER keep_value BEFORE UPDATE ON session_meta BEGIN SELECT CASE WHEN NEW.value = '' THEN RAISE(ABORT,'empty') END; END;", "after": "" },
+    { "name": "wrong_notnull", "before": "NOT NULL", "after": "" },
+    { "name": "missing_foreign_key", "before": "REFERENCES parent(id)", "after": "" },
+    { "name": "wrong_check", "before": "length(value)>0", "after": "length(value)>1" },
+    { "name": "wrong_index_direction", "before": "value DESC", "after": "value ASC" }
+  ],
+  "order_vectors": [
+    {
+      "sql": "CREATE TABLE schema_migrations(version INTEGER,description TEXT); CREATE TABLE x(id TEXT PRIMARY KEY, b INTEGER, a TEXT) WITHOUT ROWID; CREATE INDEX idx_b ON x(b)",
+      "equivalent": "CREATE TABLE schema_migrations(version INTEGER,description TEXT); CREATE TABLE x(a TEXT, b INTEGER, id TEXT PRIMARY KEY) WITHOUT ROWID; CREATE INDEX idx_b ON x(b)"
+    },
+    {
+      "sql": "CREATE TABLE schema_migrations(version INTEGER,description TEXT); CREATE TABLE p(id INTEGER PRIMARY KEY); CREATE TABLE x(a TEXT UNIQUE REFERENCES p(id), b TEXT UNIQUE REFERENCES p(id), id TEXT PRIMARY KEY)",
+      "equivalent": "CREATE TABLE schema_migrations(version INTEGER,description TEXT); CREATE TABLE p(id INTEGER PRIMARY KEY); CREATE TABLE x(id TEXT PRIMARY KEY, b TEXT UNIQUE REFERENCES p(id), a TEXT UNIQUE REFERENCES p(id))"
+    },
+    {
+      "sql": "CREATE TABLE schema_migrations(version INTEGER,description TEXT); CREATE TABLE x(id TEXT PRIMARY KEY); ALTER TABLE x ADD COLUMN b INTEGER DEFAULT 0; ALTER TABLE x ADD COLUMN a TEXT",
+      "equivalent": "CREATE TABLE schema_migrations(version INTEGER,description TEXT); CREATE TABLE x(a TEXT, b INTEGER DEFAULT 0, id TEXT PRIMARY KEY)"
+    },
+    {
+      "sql": "CREATE TABLE schema_migrations(version INTEGER,description TEXT); CREATE TABLE x(id TEXT PRIMARY KEY); ALTER TABLE x ADD COLUMN a TEXT; ALTER TABLE x ADD COLUMN b INTEGER DEFAULT 0",
+      "equivalent": "CREATE TABLE schema_migrations(version INTEGER,description TEXT); CREATE TABLE x(a TEXT, b INTEGER DEFAULT 0, id TEXT PRIMARY KEY)"
+    }
+  ],
+  "sql_vectors": [
+    { "sql": "CREATE TABLE x(z TEXT /* comma, parens ) */ DEFAULT '/*,*/', -- comment ( ,\n a INTEGER)", "canonical": "CREATE TABLE x(a INTEGER,z TEXT DEFAULT '/*,*/')" },
+    { "sql": "CREATE TABLE x (z TEXT DEFAULT 'a,b) CHECK(', a INTEGER CHECK(a IN (1, 2)), PRIMARY KEY (a, z)) STRICT", "canonical": "CREATE TABLE x(PRIMARY KEY(a,z),a INTEGER CHECK(a IN(1,2)),z TEXT DEFAULT 'a,b) CHECK(') STRICT" },
+    { "sql": "CREATE TABLE x(\"z,z\" TEXT DEFAULT 'it''s,ok', [a] TEXT)", "canonical": "CREATE TABLE x(\"z,z\" TEXT DEFAULT 'it''s,ok',[a] TEXT)" }
+  ]
+}

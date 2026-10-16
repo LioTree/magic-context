@@ -533,8 +533,8 @@ pub(crate) fn read_named_rows(
     let rows = statement
         .query_map(params_from_iter(args.iter()), |row| {
             let mut out = Row::new();
-            for (index, name) in names.iter().enumerate() {
-                out.insert(name.clone(), row.get::<_, SqlValue>(index)?);
+            for name in &names {
+                out.insert(name.clone(), row.get::<_, SqlValue>(name.as_str())?);
             }
             Ok(out)
         })?

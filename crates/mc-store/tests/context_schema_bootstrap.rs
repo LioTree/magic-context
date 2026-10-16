@@ -128,7 +128,7 @@ fn bootstrap_preserves_typescript_seed_rows() {
             .query_map([], |row| {
                 (0..columns.len())
                     .map(|index| {
-                        let value = row.get_ref(index)?;
+                        let value = row.get_ref(columns[index].as_str().unwrap())?;
                         Ok(if columns[index] == "activated_at" {
                             assert!(value.as_i64().unwrap() > 0);
                             Value::from(":applied_at")

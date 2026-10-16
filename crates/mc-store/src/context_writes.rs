@@ -818,11 +818,17 @@ mod tests {
             .into_iter()
             .map(|name| {
                 let mut statement = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
-                let cols = statement.column_count();
+                let mut cols: Vec<String> = statement
+                    .column_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                cols.sort();
                 let mut rows = statement
                     .query_map([], |row| {
-                        Ok((0..cols)
-                            .map(|col| format!("{:?}", row.get_ref(col).unwrap()))
+                        Ok(cols
+                            .iter()
+                            .map(|col| format!("{:?}", row.get_ref(col.as_str()).unwrap()))
                             .collect::<Vec<_>>()
                             .join("|"))
                     })

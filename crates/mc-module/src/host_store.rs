@@ -331,103 +331,103 @@ fn counted<T>(result: Result<T, HostStoreError>) -> Result<T, HostStoreError> {
 pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     (
         "compartment_history_versions",
-        "23795e6c060f4dac4cbf8036abb4cba1db284c063f10aeb7eb23ee576a0b24e5",
+        "706ce735be1a9e8ba50ea089720ec9ab4bf1cf1e58506d6d3784d55b972ef524",
     ),
     (
         "compartment_events",
-        "79cb5301803217125d3831923e70a5d913754d6d733a96727f8cb86f2f5e138d",
+        "31785d0df2b666385d47d2d07d6e515c419bb00e55bc71b23b08c98c6ea41412",
     ),
     (
         "compartments",
-        "849679458a3d6f4a495e336221c770066806aba16794f36ee79fbdcd3e32e89c",
+        "349b4b0d73c95beac3f2c61c70a1060367c725dbcf472c63c7c858c4aa22dedc",
     ),
     (
         "context_privilege_state",
-        "ffe1e5a4d218c3a16cacc0a4c716eb227fa1bba59f203f035226d73ee0f88751",
+        "2fea45e66025c6da6739a62092d1a23b95d948876d589846135731de64b64b75",
     ),
     (
         "historian_runs",
-        "4fdc0eabcd26ec85f2ad536402f2dbcc3d097a29644ab9f95683a40e38fa5643",
+        "80139fb9cccc43f0a1e81248223c83c70aa813365d9add4d1d356f86bb79c5fb",
     ),
     (
         "memories",
-        "58c79f0e321c82007bebfe3fb250e318786c920ac36320e6883d44013d051fd5",
+        "b9b8c9026bcc2969b2dfd4d6455a31b98a05d9ea196ff26dbcaf4a5b4f63829b",
     ),
     (
         "memory_agent_fragments",
-        "f0c95f8d4c5610e0a37b196be1e0b646e50fecda2f3cddafe59b1e4930a58d56",
+        "ca71b2c88331f0a9c4c6060082524796e96a955fde1a892f3ea5cc4cad8ccede",
     ),
     (
         "memory_history",
-        "0fe79728828749f14b1351f91eab71d8c603d987446cb14ee665a14ffb1ab346",
+        "67a2df22103f7626006561a18284c4a6127edc6b91923e406459c360fe268d2d",
     ),
     (
         "memory_classification_items",
-        "f414a42b0dd8a73e859c8687089c5616abe3ae12fb4fe33e2fbbbb30646c57cc",
+        "646c842ff17ac814bec9224c2c8cf4ca3c2b84a7c8fbc7ff181bef7f5e20571d",
     ),
     (
         "memory_conflict_links",
-        "3d308f6b95bcefc97e5464c472375262c922c9193f9ff4a78d351fabe30d48bb",
+        "61d5cad9cfb896feb5e2f5b3251d8dc2e80dd5e5e324abc8023660fed82007f2",
     ),
     (
         "memory_decision_receipts",
-        "86a4a15bd8b225f239ae2726b7111c26387f167b0dc0dbed071a5f67d97ed415",
+        "ea9a6740b2999310b31f34eb854b5bf6cea97d4dfd4190fd4e0cf370980fae70",
     ),
     (
         "memory_embedding_watermarks",
-        "b3012ecd26bbc261bbd51ce0e7cdfaa9068864b0d32701c23d7b4704cf9560cc",
+        "b9657db17af7a4355e736708bb9a8b5ca45c81737b1d885e6fcf64ab6613ee45",
     ),
     (
         "memory_journal",
-        "2f123fe99d3f82f66538c56e43e225068d693977eabb754895c22d0737a7b983",
+        "61362a19e97a925b8189f7120dd7a37cc18ae9ff70521d9f964fec68c13fb870",
     ),
     (
         "memory_mutation_log",
-        "3df65a4de3a311e953e06adbe65c53f168c51e9847322130b5adff823ff6bb91",
+        "f2394ccc269706af3835560f32ad82ff1d2fa0072a35756d61b7b9c23b1e8db9",
     ),
     (
         "memory_publications",
-        "366cf8bd34848e91be75433186cac20f902d40edf826ecbd24249ab28702fd43",
+        "fb6b30ab412b5a1d3fd8a2495c17f13b63450e933e851b63c704c320f3ba17d4",
     ),
     (
         "memory_stage_attempts",
-        "dbc66bedb9f92ff24ca83cb734892c2f2fea6c8d195912e869f68cfa26fabaa6",
+        "f177165dbf66d60a932fc64c8c84a68a70d9d3cf5cfd31b692268f911b329eea",
     ),
     (
         "memory_activity_ledger",
-        "7f73fa2ad2d786d34b29998e0d5250608c7c1fb9a22b9001c537928804feaa58",
+        "739873bd790a86404d94d064191425d67a5cdeffd6455b8a813b85bab15060ce",
     ),
     (
         "memory_pending_facts",
-        "aea2c0879d21921958b5d4266604d658fb8ac5a1256b004b76a0567735cdea27",
+        "f02ca8dc2cf0f8252a8ac9509f4ecee36e76d8fc8fc9fa75354c41085bbd48b4",
     ),
     (
         "memory_verifications",
-        "e559c4cbe733627673d9ff0ccd7f5a498eff616c77a4e8d7b44d2b2b3a5e4132",
+        "0b731eeb94b7d58df6ce57c8c1838dcae126729302e5f786628c4920faa5c964",
     ),
     (
         "notes",
-        "31bf819717d1a09f3762fb1f56848fc19612f110fae8cc894bad5dc00f4ae2db",
+        "980355840f86a0f9f9adb03f0a3eba978f7b7227e48681f1720b15df38941eca",
     ),
     (
         "primer_candidates",
-        "9992d881ec72626d4656a7c73c8779e33f1762cf106ea9ffff72e3b08dd3ec27",
+        "a97dcffd0547b7f419e49d40fdac690d918fa7c82b4047b6a26da56dbfb3aa39",
     ),
     (
         "session_facts",
-        "4a51eda591fa24f51a6b500a0773a9a648f1e53a1ada9352b195039230e11ec5",
+        "3b7d6be554db4c187f63586a6b445af4e282dc6d02e56e69b4354aad8ab103e3",
     ),
     (
         "user_memories",
-        "db3e60857602228326096491485382054f65432421e673b669b5a91f7dc8c865",
+        "31a9531a85f6e6d6644f6b918748fd1ee3cf5e19c3eb18cc3f6162faa9b20c7a",
     ),
     (
         "subagent_invocations",
-        "e99ff3c619f1905c7cd4ef83b6ef82bed73c2fffb5c12ff35d01fb6756718c58",
+        "f97fd81d4e270ae855d3952580569b22b042450130c2f2e8971d326bf86dad8e",
     ),
     (
         "user_memory_candidates",
-        "1d918414e8a99614d6fb0b72a55ae40b2006c46dbf7303d4fe5546feff2e182e",
+        "57f72a5ebf5241583e90dd4f33af74f02ce21b0e58901367b53df85c68df10d6",
     ),
 ];
 
@@ -436,85 +436,6 @@ pub(crate) fn expected_fingerprint(table: &str) -> Option<&'static str> {
         .iter()
         .find(|(name, _)| *name == table)
         .map(|(_, fingerprint)| *fingerprint)
-}
-
-/// Normalise schema SQL so that spelling alone never reads as a schema change.
-///
-/// Whitespace runs collapse to one space. Spaces next to parentheses and commas go, and
-/// so do identifier quotes (`"`, `` ` ``, `[`, `]`); string literals are left as written.
-/// Changing a column, a constraint, an index or a trigger body still changes the result.
-fn normalize_schema_sql(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut in_string = false;
-    let mut pending_space = false;
-    for ch in sql.chars() {
-        if in_string {
-            out.push(ch);
-            if ch == '\'' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '\'' => {
-                if pending_space && !out.is_empty() && !out.ends_with(['(', ',']) {
-                    out.push(' ');
-                }
-                pending_space = false;
-                in_string = true;
-                out.push(ch);
-            }
-            '"' | '`' | '[' | ']' => {}
-            c if c.is_whitespace() => pending_space = true,
-            '(' | ')' | ',' => {
-                pending_space = false;
-                out.push(ch);
-            }
-            _ => {
-                if pending_space && !out.is_empty() && !out.ends_with(['(', ',']) {
-                    out.push(' ');
-                }
-                pending_space = false;
-                out.push(ch);
-            }
-        }
-    }
-    out
-}
-
-/// The CHECK constraints a CREATE TABLE statement declares, normalised and sorted, so
-/// their place in the statement (inline, or appended by `ALTER TABLE ADD COLUMN`) does
-/// not matter.
-fn check_constraints(create_sql: &str) -> Vec<String> {
-    let normalized = normalize_schema_sql(create_sql);
-    let upper = normalized.to_ascii_uppercase();
-    let bytes = normalized.as_bytes();
-    let mut found = Vec::new();
-    let mut from = 0;
-    while let Some(offset) = upper[from..].find("CHECK(") {
-        let start = from + offset;
-        let mut depth = 0usize;
-        let mut in_string = false;
-        let mut end = normalized.len();
-        for (index, byte) in bytes.iter().enumerate().skip(start + "CHECK".len()) {
-            match byte {
-                b'\'' => in_string = !in_string,
-                b'(' if !in_string => depth += 1,
-                b')' if !in_string => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = index + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        found.push(normalized[start..end].to_string());
-        from = end;
-    }
-    found.sort();
-    found
 }
 
 /// Hash one table's full `sqlite_master` surface.
@@ -534,123 +455,7 @@ pub(crate) fn read_table_fingerprint(
     }))
 }
 
-/// The text [`read_table_fingerprint`] hashes: what the table declares, independent of
-/// how its CREATE statement happens to be spelled.
-///
-/// A file that gained columns through `ALTER TABLE ADD COLUMN` over many releases stores a
-/// different CREATE text from a file created at the latest lane in one go, with the same
-/// columns in another order. Hashing the text would read that as a schema change, and
-/// on a long-lived host file every write would be refused. So the description is built
-/// from what SQLite reports instead:
-/// - every column's name, declared type, NOT NULL flag, default and primary-key position,
-///   sorted by name;
-/// - the table's CHECK constraints, normalised and sorted;
-/// - every index (including the ones UNIQUE and PRIMARY KEY constraints create), with its
-///   uniqueness, origin, partial flag and key columns, plus the normalised SQL of an
-///   explicitly created one;
-/// - every trigger by name with its normalised SQL.
-///
-/// Returns `None` when the table does not exist.
-pub(crate) fn table_schema_description(
-    conn: &Connection,
-    table: &str,
-) -> Result<Option<String>, rusqlite::Error> {
-    let create_sql: Option<String> = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            params![table],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(create_sql) = create_sql else {
-        return Ok(None);
-    };
-    let mut lines = Vec::new();
-
-    let mut columns = conn
-        .prepare("SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?1)")?
-        .query_map(params![table], |row| {
-            Ok(format!(
-                "column\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
-                row.get::<_, String>(0)?,
-                normalize_schema_sql(&row.get::<_, String>(1)?).to_ascii_uppercase(),
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<String>>(3)?
-                    .map(|value| normalize_schema_sql(&value))
-                    .unwrap_or_else(|| "NULL".to_string()),
-                row.get::<_, i64>(4)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    columns.sort();
-    lines.extend(columns);
-
-    lines.extend(
-        check_constraints(&create_sql)
-            .into_iter()
-            .map(|check| format!("check\u{1f}{check}")),
-    );
-
-    let index_list = conn
-        .prepare("SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1)")?
-        .query_map(params![table], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut indexes = Vec::new();
-    for (name, unique, origin, partial) in index_list {
-        let key_columns = conn
-            .prepare("SELECT COALESCE(name, '<expr>') FROM pragma_index_info(?1) ORDER BY seqno")?
-            .query_map(params![name], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-            .join(",");
-        let sql: Option<String> = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
-                params![name],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        // An index SQLite made for a UNIQUE or PRIMARY KEY constraint is named by its
-        // position in the CREATE statement, which differs between an evolved file and a
-        // fresh one, so it is identified by what it covers instead.
-        let identity = if origin == "c" {
-            name.clone()
-        } else {
-            format!("{origin}:{key_columns}")
-        };
-        indexes.push(format!(
-            "index\u{1f}{identity}\u{1f}{unique}\u{1f}{origin}\u{1f}{partial}\u{1f}{key_columns}\u{1f}{}",
-            sql.map(|sql| normalize_schema_sql(&sql)).unwrap_or_default()
-        ));
-    }
-    indexes.sort();
-    lines.extend(indexes);
-
-    let mut triggers = conn
-        .prepare(
-            "SELECT name, sql FROM sqlite_master
-              WHERE type = 'trigger' AND tbl_name = ?1 AND sql IS NOT NULL",
-        )?
-        .query_map(params![table], |row| {
-            Ok(format!(
-                "trigger\u{1f}{}\u{1f}{}",
-                row.get::<_, String>(0)?,
-                normalize_schema_sql(&row.get::<_, String>(1)?)
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    triggers.sort();
-    lines.extend(triggers);
-
-    Ok(Some(lines.join("\u{1e}")))
-}
+pub(crate) use mc_store::context_schema::fingerprints::table_schema_description;
 
 /// Read the persisted upstream migration lane, ignoring downstream fork numbers.
 fn read_persisted_fence(conn: &Connection) -> Result<Option<i64>, rusqlite::Error> {

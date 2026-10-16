@@ -5,73 +5,16 @@ import { describe, expect, test } from "bun:test";
 import { Database, type Database as DatabaseType } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { runMigrations } from "./migrations";
+import { schemaSnapshot } from "./schema-fingerprint";
 import { initializeDatabase } from "./storage-db";
-
-interface SchemaObjectRow {
-    type: string;
-    name: string;
-    tbl_name: string;
-    sql: string;
-}
-
-interface TableInfoRow {
-    cid: number;
-    name: string;
-    type: string;
-    notnull: number;
-    dflt_value: string | null;
-    pk: number;
-}
-
-function normalizeSchemaSql(sql: string): string {
-    return sql
-        .replace(/\bIF\s+NOT\s+EXISTS\b/gi, "")
-        .replace(/["`]/g, "")
-        .replace(/\s+/g, " ")
-        .replace(/\s*([(),=])\s*/g, "$1")
-        .replace(/;$/, "")
-        .trim()
-        .toLowerCase();
-}
-
-function schemaSnapshot(db: DatabaseType): {
-    objects: SchemaObjectRow[];
-    tables: Record<string, TableInfoRow[]>;
-} {
-    const objects = db
-        .prepare(
-            `SELECT type, name, tbl_name, sql
-               FROM sqlite_master
-              WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
-              ORDER BY type, name`,
-        )
-        .all() as SchemaObjectRow[];
-    const tableNames = db
-        .prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        )
-        .all() as Array<{ name: string }>;
-    return {
-        objects: objects.map((row) => ({ ...row, sql: normalizeSchemaSql(row.sql) })),
-        tables: Object.fromEntries(
-            tableNames.map(({ name }) => [
-                name,
-                db.prepare(`PRAGMA table_info(${name})`).all() as TableInfoRow[],
-            ]),
-        ),
-    };
-}
 
 function makePreV65ReplayFixture(db: DatabaseType): void {
     // Start from the complete prior object set, then remove only the v65-v69
     // artifacts. This keeps the fixture compact while making every versioned
     // column and index flow through migrations rather than fresh declarations.
     //
-    // Columns added AFTER v69 have to come out too, even though they are not
-    // v65-v69 artifacts: SQLite appends a new column at the end of the table, so
-    // leaving them in place would have the replay re-add the v65-v69 columns
-    // behind them and produce a different column ORDER than a fresh database for
-    // the same set of columns.
+    // Replay subsequent column additions too, so the fixture exercises the
+    // migration chain rather than relying on columns supplied by the initializer.
     db.exec(`
         ALTER TABLE memories DROP COLUMN verify_commit;
         ALTER TABLE memories DROP COLUMN verify_files_json;
@@ -178,7 +121,7 @@ describe("migration v69: visibility mutation indexes", () => {
 });
 
 describe("fresh and replayed schema convergence", () => {
-    test("normalized sqlite_master and ordered table_info are exactly equal", () => {
+    test("canonical schema definitions are exactly equal regardless of column order", () => {
         const fresh = new Database(":memory:");
         const replay = new Database(":memory:");
         const initializerUpgrade = new Database(":memory:");

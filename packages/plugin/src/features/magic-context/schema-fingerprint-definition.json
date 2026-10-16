@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "description": "Context schema identity: columns keyed by name, never by physical cid. Table declarations are sorted at top-level commas only; quoted text and nested expressions remain intact, SQL comments are ignored. Implicit indexes are identified by coverage, foreign keys by grouped definitions rather than SQLite declaration IDs. All other schema objects, index key order/collation/direction, foreign keys, migration identities and user_version remain significant. Canonical JSON sorts object keys and SHA-256 hashes UTF-8 without whitespace.",
+  "master": "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name",
+  "columns": "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?1) ORDER BY name",
+  "indexes": "SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1) ORDER BY name",
+  "index_columns": "SELECT CASE WHEN key = 0 AND name IS NOT NULL THEN -1 ELSE seqno END AS seqno, name, \"desc\", coll, key FROM pragma_index_xinfo(?1) ORDER BY key DESC, CASE WHEN key = 1 OR name IS NULL THEN seqno END, name",
+  "foreign_keys": "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete, match FROM pragma_foreign_key_list(?1) ORDER BY id, seq",
+  "migrations": "SELECT version, description FROM schema_migrations ORDER BY version"
+}

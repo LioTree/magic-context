@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { schemaSnapshot } from "../../../../packages/plugin/src/features/magic-context/schema-fingerprint";
 
 // Isolate even incidental logger/config writes made by migration dependencies.
 const sandbox = mkdtempSync(join(tmpdir(), "mc-context-schema-"));
@@ -31,21 +32,8 @@ try {
     const master = db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all() as {
         type: string; name: string; tbl_name: string; sql: string | null;
     }[];
-    const normalize = (sql: string) => sql.split(/('(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\])/)
-        .map((part, i) => i % 2 ? part : part.replace(/\s+/g, " ")).join("").trim();
-    const tables = master.filter(row => row.type === "table").map(row => {
-        const name = `'${row.name.replaceAll("'", "''")}'`;
-        return {
-            name: row.name,
-            columns: db.prepare(`PRAGMA table_info(${name})`).all().map((c: any) =>
-                [c.cid, c.name, c.type, c.notnull, c.dflt_value, c.pk]) as (string | number | null)[][],
-            // Sequence numbers describe creation order, not index definitions.
-            indexes: db.prepare(`PRAGMA index_list(${name})`).all().map((i: any) =>
-                [i.name, i.unique, i.origin, i.partial]).sort((a: any, b: any) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0),
-            foreign_keys: db.prepare(`PRAGMA foreign_key_list(${name})`).all().map((f: any) =>
-                [f.id, f.seq, f.table, f.from, f.to, f.on_update, f.on_delete, f.match]),
-        };
-    });
+    const snapshot = schemaSnapshot(db);
+    const tables = snapshot.tables;
     const migrations = db.prepare("SELECT version, description FROM schema_migrations ORDER BY version").all() as {
         version: number; description: string;
     }[];
@@ -54,18 +42,12 @@ try {
     const seeds = tables.filter(table => !shadows.has(table.name) && !table.name.startsWith("sqlite_") &&
         table.name !== "schema_migrations" && !master.find(row => row.name === table.name)?.sql?.startsWith("CREATE VIRTUAL TABLE"))
         .map(table => {
-            const columns = table.columns.map(column => column[1] as string);
+            const columns = table.columns.map(column => column[0] as string);
             const name = `'${table.name.replaceAll("'", "''")}'`;
             const rows: unknown[][] = db.prepare(`SELECT * FROM ${name}`).all().map((row: Record<string, unknown>) => columns.map(column =>
                 column === "activated_at" ? ":applied_at" : row[column]));
             return { name: table.name, columns, rows };
         }).filter(table => table.rows.length > 0);
-    const snapshot = {
-        user_version: (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-        migrations: migrations.map(row => [row.version, row.description]),
-        master: master.map(row => [row.type, row.name, row.tbl_name, row.sql === null ? null : normalize(row.sql)]),
-        tables,
-    };
     writeFileSync(output, JSON.stringify({ fence, seeds, snapshot }, null, 2) + "\n");
     if (process.argv[3]) {
         const rows = db.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY rowid").all() as {

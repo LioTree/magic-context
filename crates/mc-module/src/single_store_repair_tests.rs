@@ -264,12 +264,18 @@ impl Fixture {
                 .unwrap();
             for table in tables {
                 let mut statement = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
-                let width = statement.column_count();
+                let mut columns: Vec<String> = statement
+                    .column_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                columns.sort();
                 let mut rows: Vec<String> = statement
                     .query_map([], |row| {
-                        (0..width)
-                            .map(|index| {
-                                row.get::<_, SqlValue>(index)
+                        columns
+                            .iter()
+                            .map(|column| {
+                                row.get::<_, SqlValue>(column.as_str())
                                     .map(|value| format!("{value:?}"))
                             })
                             .collect::<Result<Vec<_>, _>>()

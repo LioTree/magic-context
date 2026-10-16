@@ -193,13 +193,13 @@ fn snapshot(db: &Connection) -> Value {
         .unwrap()
         .query_map([], |row| {
             Ok(json!({
-                "sha": row.get::<_, String>(0)?,
-                "project_path": row.get::<_, String>(1)?,
-                "short_sha": row.get::<_, String>(2)?,
-                "message": row.get::<_, String>(3)?,
-                "author": row.get::<_, Option<String>>(4)?,
-                "committed_at": row.get::<_, i64>(5)?,
-                "indexed_at": row.get::<_, i64>(6)?,
+                "sha": row.get::<_, String>("sha")?,
+                "project_path": row.get::<_, String>("project_path")?,
+                "short_sha": row.get::<_, String>("short_sha")?,
+                "message": row.get::<_, String>("message")?,
+                "author": row.get::<_, Option<String>>("author")?,
+                "committed_at": row.get::<_, i64>("committed_at")?,
+                "indexed_at": row.get::<_, i64>("indexed_at")?,
             }))
         })
         .unwrap()

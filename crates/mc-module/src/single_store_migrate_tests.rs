@@ -309,12 +309,17 @@ impl Fixture {
             for table in tables {
                 hasher.update(table.as_bytes());
                 let mut statement = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
-                let width = statement.column_count();
+                let mut columns: Vec<String> = statement
+                    .column_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                columns.sort();
                 let mut rows: Vec<String> = statement
                     .query_map([], |row| {
                         let mut values = Vec::new();
-                        for index in 0..width {
-                            values.push(format!("{:?}", row.get::<_, SqlValue>(index)?));
+                        for column in &columns {
+                            values.push(format!("{:?}", row.get::<_, SqlValue>(column.as_str())?));
                         }
                         Ok(values.join("|"))
                     })
