@@ -13419,7 +13419,10 @@ impl McHandler {
         let route_project_root = binding.project_root.to_string_lossy().to_string();
         let requested_project =
             arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
-        // Both OpenCode entry points use server-observed transform state as the session proof.
+        // OpenCode can prove a session with server-observed transform state. Claude Code can also
+        // use the conversation stored by its admitted native plan: the daemon must identify the
+        // caller as reserved:thalamus, the plan must be admitted on this channel, and the lookup
+        // must match the binding's frozen generation of native capabilities.
         // Wrapper labels and authority routes alone are insufficient: either could otherwise
         // rebind a known project to a second root without a host session lookup.
         let opencode_harness =
@@ -13428,8 +13431,8 @@ impl McHandler {
             self.module_knows_transform_session(bound_session, &binding.project_root);
         let conversation_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
             self.provider_store.tool_key(&binding)?.engine_key()
-        } else if opencode_harness
-            && (transform_session_known || self.host_provider_conversation(&binding).is_some())
+        } else if (opencode_harness && transform_session_known)
+            || self.host_provider_conversation(&binding).is_some()
         {
             bound_session.to_string()
         } else {
@@ -14195,6 +14198,20 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
+        // Legacy search uses the bound session ID, but native history uses a provider key that
+        // includes its frozen generation. Without a native-history reader here, an empty legacy
+        // result would misleadingly suggest that the native history had been searched.
+        if sources.message
+            && self.facade_binding(channel).is_ok_and(|binding| {
+                binding.harness == "claude-code"
+                    && self.host_provider_conversation(&binding).is_some()
+            })
+        {
+            return HandlerOutcome::Error {
+                code: "ctx_search_unavailable".into(),
+                message: "ctx_search cannot search message history on the Claude Code step lane; use sources=[\"memory\",\"note\"] for project search.".into(),
+            };
+        }
         let store = match self.store_for_request().await {
             Ok(store) => store,
             Err(refusal) => return refusal.into_facade_outcome(),
@@ -14285,6 +14302,18 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
+        // This reader looks up legacy transcripts and tags by bound session ID; it cannot read
+        // native history stored under the provider's generation-specific key.
+        if self.facade_binding(channel).is_ok_and(|binding| {
+            binding.harness == "claude-code" && self.host_provider_conversation(&binding).is_some()
+        }) {
+            return HandlerOutcome::Error {
+                code: "ctx_expand_unavailable".into(),
+                message:
+                    "ctx_expand is unavailable for native history on the Claude Code step lane."
+                        .into(),
+            };
+        }
         let store = match self.store_for_request().await {
             Ok(store) => store,
             Err(refusal) => return refusal.into_facade_outcome(),

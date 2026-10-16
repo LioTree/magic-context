@@ -6,6 +6,8 @@ use super::*;
 mod cc_multiblock_vector_tests;
 #[path = "context_fixture_tests.rs"]
 mod context_fixture_tests;
+#[path = "facade_scope_tests.rs"]
+mod facade_scope_tests;
 #[path = "g8_replay_tests.rs"]
 mod g8_replay_tests;
 #[path = "late_descent_tests.rs"]
