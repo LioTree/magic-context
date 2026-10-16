@@ -138,6 +138,7 @@ pub mod decay_render;
 pub mod decision_calibration;
 mod digest;
 pub mod divergence;
+mod dream_runner;
 pub mod healing;
 pub mod historian;
 pub mod historian_chunk;
