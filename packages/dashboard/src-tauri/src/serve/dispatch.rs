@@ -74,6 +74,9 @@ struct ApplyWorkspaceChangesArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryStatusArgs {
+    project_path: String,
+    operation_id: String,
+    expected_revision: i64,
     memory_id: i64,
     status: String,
 }
@@ -81,6 +84,9 @@ struct MemoryStatusArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryContentArgs {
+    project_path: String,
+    operation_id: String,
+    expected_revision: i64,
     memory_id: i64,
     content: String,
 }
@@ -88,6 +94,9 @@ struct MemoryContentArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryCategoryArgs {
+    project_path: String,
+    operation_id: String,
+    expected_revision: i64,
     memory_id: i64,
     category: String,
 }
@@ -95,12 +104,18 @@ struct MemoryCategoryArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryIdArgs {
+    project_path: String,
+    operation_id: String,
+    expected_revision: i64,
     memory_id: i64,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BulkMemoryStatusArgs {
+    project_path: String,
+    operation_id: String,
+    expected_revisions: Vec<mc_store::memory_history::RevisionExpectation>,
     memory_ids: Vec<i64>,
     status: String,
 }
@@ -108,6 +123,9 @@ struct BulkMemoryStatusArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BulkMemoryIdsArgs {
+    project_path: String,
+    operation_id: String,
+    expected_revisions: Vec<mc_store::memory_history::RevisionExpectation>,
     memory_ids: Vec<i64>,
 }
 
@@ -376,42 +394,153 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
         }
         "update_memory_status" => {
             let a: MemoryStatusArgs = parse_args(args)?;
-            let mut conn = open_readwrite(state)?;
-            json(db::update_memory_status(&mut conn, a.memory_id, &a.status).map_err(to_command)?)
+            let request = crate::memory_bridge::edit_request(
+                &a.project_path,
+                &a.operation_id,
+                &[a.memory_id],
+                &[mc_store::memory_history::RevisionExpectation {
+                    memory_id: a.memory_id,
+                    revision: a.expected_revision,
+                }],
+                "status",
+                &a.status,
+            );
+            json(
+                db::memory_request(
+                    &state.get_db_path().map_err(to_command)?,
+                    "memory.edit",
+                    request,
+                )
+                .await
+                .map_err(to_command)?,
+            )
         }
         "update_memory_content" => {
             let a: MemoryContentArgs = parse_args(args)?;
-            let mut conn = open_readwrite(state)?;
+            let request = crate::memory_bridge::edit_request(
+                &a.project_path,
+                &a.operation_id,
+                &[a.memory_id],
+                &[mc_store::memory_history::RevisionExpectation {
+                    memory_id: a.memory_id,
+                    revision: a.expected_revision,
+                }],
+                "content",
+                &a.content,
+            );
             json(
-                db::update_memory_content(&mut conn, a.memory_id, &a.content)
-                    .map_err(to_command)?,
+                db::memory_request(
+                    &state.get_db_path().map_err(to_command)?,
+                    "memory.edit",
+                    request,
+                )
+                .await
+                .map_err(to_command)?,
             )
         }
         "update_memory_category" => {
             let a: MemoryCategoryArgs = parse_args(args)?;
-            let mut conn = open_readwrite(state)?;
+            let request = crate::memory_bridge::edit_request(
+                &a.project_path,
+                &a.operation_id,
+                &[a.memory_id],
+                &[mc_store::memory_history::RevisionExpectation {
+                    memory_id: a.memory_id,
+                    revision: a.expected_revision,
+                }],
+                "category",
+                &a.category,
+            );
             json(
-                db::update_memory_category(&mut conn, a.memory_id, &a.category)
-                    .map_err(to_command)?,
+                db::memory_request(
+                    &state.get_db_path().map_err(to_command)?,
+                    "memory.edit",
+                    request,
+                )
+                .await
+                .map_err(to_command)?,
             )
         }
         "delete_memory" => {
             let a: MemoryIdArgs = parse_args(args)?;
-            let mut conn = open_readwrite(state)?;
-            json(db::delete_memory(&mut conn, a.memory_id).map_err(to_command)?)
+            let request = crate::memory_bridge::edit_request(
+                &a.project_path,
+                &a.operation_id,
+                &[a.memory_id],
+                &[mc_store::memory_history::RevisionExpectation {
+                    memory_id: a.memory_id,
+                    revision: a.expected_revision,
+                }],
+                "status",
+                "archived",
+            );
+            json(
+                db::memory_request(
+                    &state.get_db_path().map_err(to_command)?,
+                    "memory.edit",
+                    request,
+                )
+                .await
+                .map_err(to_command)?,
+            )
         }
         "bulk_update_memory_status" => {
             let a: BulkMemoryStatusArgs = parse_args(args)?;
-            let mut conn = open_readwrite(state)?;
+            let request = crate::memory_bridge::edit_request(
+                &a.project_path,
+                &a.operation_id,
+                &a.memory_ids,
+                &a.expected_revisions,
+                "status",
+                &a.status,
+            );
             json(
-                db::bulk_update_memory_status(&mut conn, &a.memory_ids, &a.status)
-                    .map_err(to_command)?,
+                db::memory_request(
+                    &state.get_db_path().map_err(to_command)?,
+                    "memory.edit",
+                    request,
+                )
+                .await
+                .map_err(to_command)?,
             )
         }
         "bulk_delete_memory" => {
             let a: BulkMemoryIdsArgs = parse_args(args)?;
-            let mut conn = open_readwrite(state)?;
-            json(db::bulk_delete_memory(&mut conn, &a.memory_ids).map_err(to_command)?)
+            let request = crate::memory_bridge::edit_request(
+                &a.project_path,
+                &a.operation_id,
+                &a.memory_ids,
+                &a.expected_revisions,
+                "status",
+                "archived",
+            );
+            json(
+                db::memory_request(
+                    &state.get_db_path().map_err(to_command)?,
+                    "memory.edit",
+                    request,
+                )
+                .await
+                .map_err(to_command)?,
+            )
+        }
+        "get_memory_history" | "preview_memory_restore" | "restore_memory_history" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct HistoryArgs {
+                request: Value,
+            }
+            let a: HistoryArgs = parse_args(args)?;
+            let method = match cmd {
+                "get_memory_history" => "memory.history",
+                "preview_memory_restore" => "memory.restore.preview",
+                _ => "memory.restore",
+            };
+            json(
+                db::memory_request(&state.get_db_path().map_err(to_command)?, method, a.request)
+                    .await
+                    .map_err(to_command)?,
+            )
         }
         "get_sessions" => {
             parse_args::<NoArgs>(args)?;

@@ -439,6 +439,11 @@ pub fn read_memory_render_snapshot(
         },
         memories,
         revision: MemoryRevision {
+            project_memory_epoch: if table_exists(conn, "main", "project_state")? {
+                conn.query_row("SELECT COALESCE((SELECT project_memory_epoch FROM project_state WHERE project_path=?1),0)", [project_path], |row|row.get(0))?
+            } else {
+                0
+            },
             project_paths,
             reader_project_path: project_path.to_string(),
             expiry_cutoff_ms: now_ms,

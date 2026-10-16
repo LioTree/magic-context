@@ -13,6 +13,13 @@ import type {
   Harness,
   LogEntry,
   Memory,
+  MemoryEditReceipt,
+  MemoryHistoryPage,
+  MemoryHistoryRequest,
+  MemoryRestorePreview,
+  MemoryRestoreReceipt,
+  MemoryRestoreRequest,
+  MemoryRevisionRef,
   MemoryStats,
   ModelCatalogs,
   MuralManifest,
@@ -133,28 +140,94 @@ export async function applyWorkspaceChanges(params: {
   return invoke("apply_workspace_changes", params);
 }
 
-export async function updateMemoryStatus(memoryId: number, status: string): Promise<void> {
-  return invoke("update_memory_status", { memoryId, status });
+/** Client-generated id for one write request. The backend replays the stored
+ *  reply for a repeated id, so a retried click can never apply twice. */
+export function newOperationId(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  // randomUUID needs a secure context; the served dashboard on a LAN address
+  // is not one, so fall back to 128 random bits rendered as hex.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-export async function updateMemoryContent(memoryId: number, content: string): Promise<void> {
-  return invoke("update_memory_content", { memoryId, content });
+/** The memory a single-row edit targets, with the revision the UI displayed.
+ *  The edit is refused as a conflict when the stored revision has moved on. */
+export interface MemoryEditTarget {
+  projectPath: string;
+  memoryId: number;
+  expectedRevision: number;
+  operationId: string;
 }
 
-export async function updateMemoryCategory(memoryId: number, category: string): Promise<void> {
-  return invoke("update_memory_category", { memoryId, category });
+/** A bulk edit: one expected revision per memory, applied all-or-nothing. */
+export interface MemoryBulkEditTarget {
+  projectPath: string;
+  memoryIds: number[];
+  expectedRevisions: MemoryRevisionRef[];
+  operationId: string;
 }
 
-export async function deleteMemory(memoryId: number): Promise<void> {
-  return invoke("delete_memory", { memoryId });
+export async function updateMemoryStatus(
+  target: MemoryEditTarget,
+  status: string,
+): Promise<MemoryEditReceipt> {
+  return invoke("update_memory_status", { ...target, status });
 }
 
-export async function bulkUpdateMemoryStatus(memoryIds: number[], status: string): Promise<number> {
-  return invoke("bulk_update_memory_status", { memoryIds, status });
+export async function updateMemoryContent(
+  target: MemoryEditTarget,
+  content: string,
+): Promise<MemoryEditReceipt> {
+  return invoke("update_memory_content", { ...target, content });
 }
 
-export async function bulkDeleteMemory(memoryIds: number[]): Promise<number> {
-  return invoke("bulk_delete_memory", { memoryIds });
+export async function updateMemoryCategory(
+  target: MemoryEditTarget,
+  category: string,
+): Promise<MemoryEditReceipt> {
+  return invoke("update_memory_category", { ...target, category });
+}
+
+/** Archives the memory (the command keeps its historical name; it never
+ *  hard-deletes). The reply's decision key lets the archive be undone. */
+export async function archiveMemory(target: MemoryEditTarget): Promise<MemoryEditReceipt> {
+  return invoke("delete_memory", { ...target });
+}
+
+export async function bulkUpdateMemoryStatus(
+  target: MemoryBulkEditTarget,
+  status: string,
+): Promise<MemoryEditReceipt> {
+  return invoke("bulk_update_memory_status", { ...target, status });
+}
+
+/** Archives every listed memory in one undoable decision (never hard-deletes). */
+export async function bulkArchiveMemories(
+  target: MemoryBulkEditTarget,
+): Promise<MemoryEditReceipt> {
+  return invoke("bulk_delete_memory", { ...target });
+}
+
+// ── Memory history and undo ───────────────────────────────
+
+/** Newest decision first; pass the returned cursor to read older ones. */
+export async function getMemoryHistory(request: MemoryHistoryRequest): Promise<MemoryHistoryPage> {
+  return invoke("get_memory_history", { request });
+}
+
+/** Plans an undo without changing anything. */
+export async function previewMemoryRestore(request: {
+  projectPath: string;
+  decisionKey: string;
+}): Promise<MemoryRestorePreview> {
+  return invoke("preview_memory_restore", { request });
+}
+
+/** Restores the memories a decision touched to their state before it. */
+export async function restoreMemoryHistory(
+  request: MemoryRestoreRequest,
+): Promise<MemoryRestoreReceipt> {
+  return invoke("restore_memory_history", { request });
 }
 
 // ── Session API ─────────────────────────────────────────────

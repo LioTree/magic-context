@@ -30,6 +30,151 @@ export interface Memory {
   shareable: boolean;
   has_embedding: boolean;
   source_display_name?: string | null;
+  /** Canonical revision this row was read at. Every dashboard edit sends it
+   *  back as the expected revision, so an edit made against a stale view is
+   *  refused as a conflict instead of overwriting a newer change. */
+  revision: number;
+}
+
+// ── Memory history and undo (camelCase wire shape) ─────────
+
+/** One recorded memory change: an automated or manual decision that may touch
+ *  several memories at once (a merge archives its sources and creates or
+ *  updates a survivor). `rows` always carries the full decision. */
+export interface MemoryHistoryDecision {
+  version: 1;
+  decisionKey: string;
+  projectPath: string;
+  /** curate, verify, expire, ctx_memory, dashboard_edit, dashboard_restore,
+   *  historian, or unknown. */
+  writer: string;
+  operation: string;
+  reason: string;
+  appliedAt: number;
+  evidence: unknown;
+  sourceIds: number[];
+  survivorId: number | null;
+  rows: MemoryHistoryChange[];
+  restorable: boolean;
+  refusalReason: string | null;
+}
+
+export interface MemoryHistoryChange {
+  memoryId: number;
+  role: "source" | "survivor" | "target";
+  /** Null only when the row was created by this decision. */
+  beforeRevision: number | null;
+  /** Null only when the row is proven absent afterwards, not for missing data. */
+  afterRevision: number | null;
+  before: MemoryHistorySnapshot | null;
+  after: MemoryHistorySnapshot | null;
+  completeness: "complete" | "legacy-partial" | "unsupported";
+}
+
+export interface MemoryHistorySnapshot {
+  id: number;
+  projectPath: string;
+  revision: number;
+  category: string;
+  content: string;
+  normalizedHash: string;
+  importance: number | null;
+  scope: string;
+  shareable: number;
+  sourceSessionId: string | null;
+  sourceType: string | null;
+  seenCount: number;
+  retrievalCount: number;
+  firstSeenAt: number;
+  createdAt: number;
+  updatedAt: number;
+  lastSeenAt: number;
+  lastRetrievedAt: number | null;
+  status: MemoryStatus;
+  expiresAt: number | null;
+  verificationStatus: string;
+  verifiedAt: number | null;
+  supersededByMemoryId: number | null;
+  mergedFrom: string | null;
+  metadataJson: string | null;
+}
+
+export interface MemoryHistoryPage {
+  version: 1;
+  decisions: MemoryHistoryDecision[];
+  nextCursor: string | null;
+}
+
+export interface MemoryHistoryRequest {
+  projectPath: string;
+  memoryId?: number;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface MemoryRevisionRef {
+  memoryId: number;
+  revision: number;
+}
+
+export interface MemoryRevisionConflict {
+  memoryId: number;
+  expectedRevision: number | null;
+  currentRevision: number | null;
+  duplicateId?: number;
+}
+
+export interface MemoryRestorePreview {
+  version: 1;
+  state: "ready" | "refused" | "conflict";
+  projectPath: string;
+  decisionKey: string;
+  reason: string | null;
+  decision: MemoryHistoryDecision | null;
+  expectedRevisions: MemoryRevisionRef[];
+  changes: Array<{
+    memoryId: number;
+    before: MemoryHistorySnapshot;
+    after: MemoryHistorySnapshot;
+  }>;
+  adoption: "next_natural_hard";
+}
+
+export interface MemoryRestoreRequest {
+  projectPath: string;
+  decisionKey: string;
+  operationId: string;
+  expectedRevisions: MemoryRevisionRef[];
+}
+
+export interface MemoryRestoreReceipt {
+  version: 1;
+  state: "applied" | "refused" | "conflict";
+  projectPath: string;
+  /** The decision that was undone. */
+  decisionKey: string;
+  operationId: string;
+  reason: string | null;
+  /** The new history decision recording the undo; non-null only when applied. */
+  restoredDecisionKey: string | null;
+  revisions: MemoryRevisionRef[];
+  conflicts: MemoryRevisionConflict[];
+  adoption: "next_natural_hard";
+}
+
+/** Reply of every dashboard memory setter (status, category, content,
+ *  archive, and their bulk forms). Bulk edits are all-or-nothing. */
+export interface MemoryEditReceipt {
+  version: 1;
+  state: "applied" | "refused" | "conflict";
+  projectPath: string;
+  operationId: string;
+  reason: string | null;
+  /** Key of the history event recorded for this dashboard edit; non-null only
+   *  when applied. Undo uses this key to preview and reverse the edit. */
+  decisionKey: string | null;
+  revisions: MemoryRevisionRef[];
+  conflicts: MemoryRevisionConflict[];
 }
 
 export type MemoryScope = "project" | "ecosystem" | "universe";

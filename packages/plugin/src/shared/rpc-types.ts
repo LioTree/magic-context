@@ -484,3 +484,18 @@ export interface RpcNotificationMessage {
     payload: Record<string, unknown>;
     sessionId?: string;
 }
+
+export type {
+    MemoryEditReceipt,
+    MemoryEditRequest,
+    MemoryHistoryChange,
+    MemoryHistoryDecision,
+    MemoryHistoryPage,
+    MemoryHistoryRequest,
+    MemoryHistorySnapshot,
+    MemoryRestorePreview,
+    MemoryRestoreReceipt,
+    MemoryRestoreRequest,
+    MemoryRevisionExpectation,
+    MemoryWriteConflict,
+} from "../features/magic-context/memory/history-contract";

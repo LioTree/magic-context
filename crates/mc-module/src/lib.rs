@@ -13152,6 +13152,10 @@ impl McHandler {
                 self.handle_ctx_memory_facade(channel, &request, false)
                     .await
             }
+            "memory.history" | "memory.restore.preview" | "memory.restore" | "memory.edit" => {
+                self.handle_memory_history_facade(channel, name, &request)
+                    .await
+            }
             "memory.curate" => self.handle_memory_curate_facade(channel, &request).await,
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
@@ -13589,6 +13593,53 @@ impl McHandler {
             reply.push('.');
         }
         mcp_text_result(reply, false)
+    }
+
+    async fn handle_memory_history_facade(
+        &self,
+        channel: u16,
+        method: &str,
+        request: &Value,
+    ) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request, &["projectPath"]) else {
+            return invalid_params_error("memory request must be an object");
+        };
+        let binding = match self.facade_binding(channel) {
+            Ok(binding) => binding,
+            Err(_) => return session_unresolved_error(),
+        };
+        let store = match self.store_for_request().await {
+            Ok(store) => store,
+            Err(refusal) => return refusal.into_facade_outcome(),
+        };
+        // External editors have no served session. The authenticated connection fixes
+        // their project directory and identity; the write transaction checks again
+        // whether this process may still change that project's memories.
+        let route = match self.route_project(&store, &binding) {
+            Ok(route) => route,
+            Err(outcome) => return outcome,
+        };
+        let params = Value::Object(args.clone());
+        let writing = matches!(method, "memory.edit" | "memory.restore");
+        if writing && mc_store::memory_history::validate_write_request(method, &params).is_err() {
+            return invalid_params_error("invalid_request");
+        }
+        if args.get("projectPath").and_then(Value::as_str) != Some(route.key.as_str())
+            || route.memory_paused.is_some()
+            || !binding.config.memory_enabled
+        {
+            return if writing {
+                respond(
+                    json!({ "structuredContent":mc_store::memory_history::refused_write(&params,"authority_unavailable"), "isError":false }),
+                )
+            } else {
+                tool_error_result("Memory authority is unavailable for this project.")
+            };
+        }
+        match store.memory_history_rpc(method, &params, now_ms()) {
+            Ok(payload) => respond(json!({ "structuredContent": payload, "isError": false })),
+            Err(error) => tool_error_result(error.to_string()),
+        }
     }
 
     async fn handle_memory_curate_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {

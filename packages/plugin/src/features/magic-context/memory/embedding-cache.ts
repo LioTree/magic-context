@@ -1,12 +1,18 @@
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 import type { Database } from "../../../shared/sqlite";
 import { loadAllEmbeddings, type StoredMemoryEmbedding } from "./storage-memory-embeddings";
 
 interface ProjectEmbeddingCacheEntry {
+    db: Database;
+    projectMemoryEpoch: number;
     embeddings: Map<number, StoredMemoryEmbedding>;
     expiresAt: number;
 }
 
 const DEFAULT_EMBEDDING_CACHE_TTL_MS = 60_000;
+export const PROJECT_EMBEDDING_CACHE_EPOCH_SQL =
+    "SELECT COALESCE((SELECT project_memory_epoch FROM project_state WHERE project_path=?),0) AS projectMemoryEpoch";
 
 const projectEmbeddingCache = new Map<string, ProjectEmbeddingCacheEntry>();
 
@@ -38,13 +44,29 @@ export function getProjectEmbeddings(
     projectPath: string,
     modelId: string,
 ): Map<number, StoredMemoryEmbedding> {
+    // The dashboard increments this project's epoch whenever it edits or restores memory.
+    // Checking it reloads vectors changed by another process without treating unrelated
+    // database writes as a reason to reload. Other processes' automated edits and
+    // re-embedding expire via the 60-second TTL; local writes evict affected vectors directly.
+    const epochProject =
+        projectPath.startsWith("git:") || projectPath.startsWith("dir:")
+            ? projectPath
+            : `dir:${createHash("md5").update(resolve(projectPath)).digest("hex").slice(0, 12)}`;
+    const { projectMemoryEpoch } = db
+        .prepare(PROJECT_EMBEDDING_CACHE_EPOCH_SQL)
+        .get(epochProject) as { projectMemoryEpoch: number };
     const cached = getValidCacheEntry(projectPath, modelId);
-    if (cached) {
+    if (cached?.db === db && cached.projectMemoryEpoch === projectMemoryEpoch)
         return cached.embeddings;
+    if (cached) {
+        cached.embeddings.clear();
+        projectEmbeddingCache.delete(cacheKey(projectPath, modelId));
     }
 
     const embeddings = loadAllEmbeddings(db, projectPath, modelId);
     projectEmbeddingCache.set(cacheKey(projectPath, modelId), {
+        db,
+        projectMemoryEpoch,
         embeddings,
         expiresAt: Date.now() + embeddingCacheTtlMs,
     });

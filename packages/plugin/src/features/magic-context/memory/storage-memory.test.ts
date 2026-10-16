@@ -68,6 +68,13 @@ function makeMemoryDatabase(): Database {
       PRIMARY KEY(memory_id, model_id)
     );
 
+    CREATE TABLE IF NOT EXISTS project_state (
+      project_path TEXT PRIMARY KEY,
+      project_memory_epoch INTEGER NOT NULL DEFAULT 0,
+      project_user_profile_version INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+
     CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
       content,
       category,

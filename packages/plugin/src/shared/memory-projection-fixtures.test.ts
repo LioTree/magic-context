@@ -43,7 +43,12 @@ import { createTestTempDirFromPath } from "./test-temp-dir";
  */
 
 /** Thrown when a gated pass reads memories or the mutation log (rows or heads). */
-export const MEMORY_LOADER_BLOCKED = "memory loader called on a gated pass";
+import {
+    applyMemoryRestore,
+    listMemoryHistory,
+    normalizeMemoryHistorySnapshot,
+    previewMemoryRestore,
+} from "../features/magic-context/memory/history-applier";
 
 /**
  * Whether a statement reads memories or the mutation log at all, including aggregate
@@ -51,6 +56,7 @@ export const MEMORY_LOADER_BLOCKED = "memory loader called on a gated pass";
  * may read either table; automatic and explicit search are the named exceptions and
  * are not part of these passes.
  */
+export const MEMORY_LOADER_BLOCKED = "memory loader called on a gated pass";
 function readsMemoryTables(sql: string): boolean {
     return /\b(?:FROM|JOIN)\s+(?:memories|memory_mutation_log)\b/i.test(sql);
 }
@@ -425,7 +431,9 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
                     .all(target.id) as { previous_text: string; before_json: string }[];
                 expect(history).toHaveLength(1);
                 expect(history[0]!.previous_text).toBe(target.content);
-                expect(JSON.parse(history[0]!.before_json).status).toBe("active");
+                expect(
+                    normalizeMemoryHistorySnapshot(JSON.parse(history[0]!.before_json))?.status,
+                ).toBe("active");
                 if (second)
                     expect(
                         f.db
@@ -453,6 +461,54 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
                 expect(hard.materialized).toBe(true);
                 expect(hard.m0 + hard.m1).not.toContain(target.content);
                 if (!operation.endsWith("archive")) expect(hard.m0 + hard.m1).toContain(corrected);
+                const decisions = listMemoryHistory(f.db, {
+                    projectPath: f.projectPath,
+                    memoryId: target.id,
+                }).decisions;
+                expect(decisions).toHaveLength(1);
+                const preview = previewMemoryRestore(f.db, {
+                    projectPath: f.projectPath,
+                    decisionKey: decisions[0]!.decisionKey,
+                });
+                expect(preview.state).toBe("ready");
+                const restored = applyMemoryRestore(f.db, {
+                    projectPath: f.projectPath,
+                    decisionKey: decisions[0]!.decisionKey,
+                    operationId: `${operation}-undo`,
+                    expectedRevisions: preview.expectedRevisions,
+                });
+                expect(restored.state).toBe("applied");
+                expect(getMemoryById(f.db, target.id)?.content).toBe(target.content);
+                expect(getMemoryById(f.db, target.id)?.status).toBe("active");
+                if (second) expect(getMemoryById(f.db, second.id)?.status).toBe("active");
+                // Unlike automation, an external editor explicitly signals that sessions should rebuild.
+                const epochHard = driver.pass(f, session, false);
+                expect(epochHard.materialized).toBe(true);
+                expect(epochHard.m0 + epochHard.m1).toContain(target.content);
+                const afterEpoch = driver.pass(f, session, true);
+                expect(afterEpoch.materialized).toBe(false);
+                expect(afterEpoch.m0).toBe(epochHard.m0);
+                const epoch = f.db
+                    .prepare(
+                        "SELECT project_memory_epoch n FROM project_state WHERE project_path=?",
+                    )
+                    .get(f.projectPath);
+                expect(epoch).toEqual({ n: 1 });
+                expect(
+                    applyMemoryRestore(f.db, {
+                        projectPath: f.projectPath,
+                        decisionKey: decisions[0]!.decisionKey,
+                        operationId: `${operation}-undo`,
+                        expectedRevisions: preview.expectedRevisions,
+                    }),
+                ).toEqual(restored);
+                expect(
+                    f.db
+                        .prepare(
+                            "SELECT project_memory_epoch n FROM project_state WHERE project_path=?",
+                        )
+                        .get(f.projectPath),
+                ).toEqual({ n: 1 });
             } finally {
                 f.close();
             }

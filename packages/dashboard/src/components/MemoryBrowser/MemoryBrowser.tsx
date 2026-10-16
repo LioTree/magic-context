@@ -1,26 +1,44 @@
 import { createEffect, createResource, createSignal, For, Show } from "solid-js";
 
 import {
-  bulkDeleteMemory,
-  bulkUpdateMemoryStatus,
-  deleteMemory,
+  archiveMemory,
+  bulkArchiveMemories,
   enumerateMemoryProjects,
   formatDateTime,
   formatRelativeTime,
   getMemories,
+  getMemoryHistory,
   getMemoryStats,
   getMural,
   listWorkspaceSummaries,
+  type MemoryEditTarget,
+  newOperationId,
   truncate,
   updateMemoryCategory,
   updateMemoryContent,
   updateMemoryStatus,
 } from "../../lib/api";
 import { ask } from "../../lib/platform";
-import type { Memory, MemoryCategory, MuralManifest } from "../../lib/types";
+import type {
+  Memory,
+  MemoryCategory,
+  MemoryEditReceipt,
+  MemoryHistoryDecision,
+  MuralManifest,
+} from "../../lib/types";
 import HarnessBadge from "../HarnessBadge";
 import FilterSelect from "../shared/FilterSelect";
+import EditNotice from "./EditNotice";
 import MemoryDetail from "./MemoryDetail";
+import MemoryHistoryTimeline from "./MemoryHistoryTimeline";
+import {
+  bulkProject,
+  decisionView,
+  type EditOutcome,
+  editOutcome,
+  HISTORY_PAGE_SIZE,
+} from "./memory-history";
+import UndoDialog from "./UndoDialog";
 
 // LocalStorage key for persisted collapsed-category state. Versioned so future
 // schema changes to stored value don't poison old clients.
@@ -149,54 +167,123 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
 
   const [error, setError] = createSignal<string | null>(null);
 
-  const handleStatusChange = async (memoryId: number, newStatus: string) => {
+  // ── Audited edits ────────────────────────────────────────────
+  // Each edit carries the revision the panel displayed. The backend records
+  // it as an undoable history decision, or answers "conflict" when the memory
+  // moved on since it was loaded; the panel then offers a reload.
+
+  const [view, setView] = createSignal<"memories" | "history">("memories");
+  const [historyReload, setHistoryReload] = createSignal(0);
+  const [undoTarget, setUndoTarget] = createSignal<{
+    decisionKey: string;
+    projectPath: string;
+    title: string;
+  } | null>(null);
+  const [bulkNotice, setBulkNotice] = createSignal<EditOutcome | null>(null);
+  const [bulkProjectPath, setBulkProjectPath] = createSignal("");
+
+  const editTarget = (memory: Memory): MemoryEditTarget => ({
+    projectPath: memory.project_path,
+    memoryId: memory.id,
+    expectedRevision: memory.revision,
+    operationId: newOperationId(),
+  });
+
+  /** Re-reads the list and swaps the open panel to the fresh row, so the
+   *  next edit sends the revision that is now stored. */
+  const refreshAfterEdit = async (memoryId: number | null) => {
+    refetchStats();
+    setHistoryReload((n) => n + 1);
+    const rows = await refetchMemories();
+    if (memoryId == null) return;
+    const fresh = rows?.find((m) => m.id === memoryId);
+    if (fresh) setSelectedMemory((prev) => (prev && prev.id === memoryId ? fresh : prev));
+  };
+
+  const applyEdit = async (
+    memory: Memory,
+    send: (target: MemoryEditTarget) => Promise<MemoryEditReceipt>,
+    patch: Partial<Memory>,
+    appliedMessage: string,
+  ): Promise<EditOutcome> => {
+    setError(null);
     try {
-      setError(null);
-      await updateMemoryStatus(memoryId, newStatus);
-      refetchMemories();
-      refetchStats();
-      setSelectedMemory(null);
+      const outcome = editOutcome(await send(editTarget(memory)), memory.id, appliedMessage);
+      if (outcome.kind === "applied") {
+        setSelectedMemory((prev) =>
+          prev && prev.id === memory.id
+            ? { ...prev, ...patch, revision: outcome.revision ?? prev.revision }
+            : prev,
+        );
+        await refreshAfterEdit(memory.id);
+      }
+      return outcome;
     } catch (e: unknown) {
-      setError(`Failed to update status: ${e instanceof Error ? e.message : String(e)}`);
+      return {
+        kind: "refused",
+        message: `The change didn't go through: ${e instanceof Error ? e.message : String(e)}`,
+      };
     }
   };
 
-  const handleContentChange = async (memoryId: number, content: string) => {
-    try {
-      setError(null);
-      await updateMemoryContent(memoryId, content);
-      refetchMemories();
-      setSelectedMemory((prev) => (prev && prev.id === memoryId ? { ...prev, content } : prev));
-    } catch (e: unknown) {
-      setError(`Failed to update content: ${e instanceof Error ? e.message : String(e)}`);
-    }
+  const handleStatusChange = (memory: Memory, status: string) =>
+    applyEdit(
+      memory,
+      (t) => updateMemoryStatus(t, status),
+      { status: status as Memory["status"] },
+      status === "permanent"
+        ? "Pinned."
+        : status === "archived"
+          ? "Archived. It no longer goes into sessions."
+          : `Status set to ${status}.`,
+    );
+
+  const handleContentChange = (memory: Memory, content: string) =>
+    applyEdit(memory, (t) => updateMemoryContent(t, content), { content }, "Content saved.");
+
+  const handleCategoryChange = (memory: Memory, category: string) =>
+    applyEdit(
+      memory,
+      (t) => updateMemoryCategory(t, category),
+      { category: category as MemoryCategory },
+      "Category changed.",
+    );
+
+  const handleArchive = (memory: Memory) =>
+    applyEdit(
+      memory,
+      archiveMemory,
+      { status: "archived" },
+      "Archived. It no longer goes into sessions.",
+    );
+
+  const reloadMemory = async (memoryId: number) => {
+    const rows = await refetchMemories();
+    const fresh = rows?.find((m) => m.id === memoryId);
+    // A memory the current filters no longer list closes the panel instead of
+    // leaving its stale copy open for another edit.
+    setSelectedMemory(fresh ?? null);
+    refetchStats();
+    setHistoryReload((n) => n + 1);
   };
 
-  const handleCategoryChange = async (memoryId: number, category: string) => {
-    try {
-      setError(null);
-      await updateMemoryCategory(memoryId, category);
-      refetchMemories();
-      refetchStats();
-      setSelectedMemory((prev) =>
-        prev && prev.id === memoryId ? { ...prev, category: category as MemoryCategory } : prev,
-      );
-    } catch (e: unknown) {
-      setError(`Failed to update category: ${e instanceof Error ? e.message : String(e)}`);
-    }
+  const openUndo = (decisionKey: string, projectPath: string, title: string) =>
+    setUndoTarget({ decisionKey, projectPath, title });
+
+  const undoDecision = (decision: MemoryHistoryDecision) =>
+    openUndo(decision.decisionKey, decision.projectPath, decisionView(decision).headline);
+
+  const afterUndo = async () => {
+    setBulkNotice(null);
+    await refreshAfterEdit(selectedMemory()?.id ?? null);
   };
 
-  const handleDelete = async (memoryId: number) => {
-    try {
-      setError(null);
-      await deleteMemory(memoryId);
-      refetchMemories();
-      refetchStats();
-      setSelectedMemory(null);
-    } catch (e: unknown) {
-      setError(`Failed to delete memory: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  };
+  const loadProjectHistory = (cursor: string | undefined) =>
+    getMemoryHistory({
+      projectPath: props.project?.identity ?? "",
+      limit: HISTORY_PAGE_SIZE,
+      ...(cursor ? { cursor } : {}),
+    });
 
   // ── Selection helpers ───────────────────────────────────────
 
@@ -285,40 +372,48 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
   // ── Bulk actions ─────────────────────────────────────────────
 
   const handleBulkArchive = async () => {
-    const ids = [...selectedIds()];
-    if (ids.length === 0) return;
+    const ids = new Set(selectedIds());
+    const rows = (memories() ?? []).filter((m) => ids.has(m.id));
+    if (rows.length === 0) return;
+    const projectPath = bulkProject(rows);
+    if (projectPath == null) {
+      setError("Select memories from one project at a time to archive them together.");
+      return;
+    }
     const confirmed = await ask(
-      `Archive ${ids.length} memor${ids.length === 1 ? "y" : "ies"}? Archived memories are hidden from injection but can be restored later.`,
+      `Archive ${rows.length} memor${rows.length === 1 ? "y" : "ies"}? They stop going into sessions. You can undo this from History.`,
       { title: "Confirm Archive", kind: "warning" },
     );
     if (!confirmed) return;
     try {
       setError(null);
-      await bulkUpdateMemoryStatus(ids, "archived");
-      clearSelection();
-      refetchMemories();
-      refetchStats();
+      const receipt = await bulkArchiveMemories({
+        projectPath,
+        memoryIds: rows.map((m) => m.id),
+        expectedRevisions: rows.map((m) => ({ memoryId: m.id, revision: m.revision })),
+        operationId: newOperationId(),
+      });
+      setBulkProjectPath(projectPath);
+      const outcome = editOutcome(
+        receipt,
+        null,
+        `Archived ${rows.length} memor${rows.length === 1 ? "y" : "ies"}.`,
+      );
+      setBulkNotice(
+        outcome.kind === "conflict"
+          ? {
+              kind: "conflict",
+              message:
+                "Some of these memories changed since the list was loaded, so nothing was archived. Reload and try again.",
+            }
+          : outcome,
+      );
+      if (outcome.kind === "applied") {
+        clearSelection();
+        await refreshAfterEdit(null);
+      }
     } catch (e: unknown) {
       setError(`Failed to archive memories: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  };
-
-  const handleBulkDelete = async () => {
-    const ids = [...selectedIds()];
-    if (ids.length === 0) return;
-    const confirmed = await ask(
-      `Permanently delete ${ids.length} memor${ids.length === 1 ? "y" : "ies"}? This cannot be undone.`,
-      { title: "Confirm Delete", kind: "warning" },
-    );
-    if (!confirmed) return;
-    try {
-      setError(null);
-      await bulkDeleteMemory(ids);
-      clearSelection();
-      refetchMemories();
-      refetchStats();
-    } catch (e: unknown) {
-      setError(`Failed to delete memories: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
@@ -464,280 +559,351 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
         )}
       </Show>
 
-      <div class="filter-bar">
-        <Show when={!embedded()}>
-          <FilterSelect
-            value={workspaceFilter() === "" ? "" : String(workspaceFilter())}
-            onChange={(v) => {
-              if (v === "") {
-                setWorkspaceFilter("");
-              } else {
-                setWorkspaceFilter(Number(v));
-                setProjectFilter("");
-              }
-            }}
-            placeholder="All workspaces"
-            align="left"
-            options={[
-              { value: "", label: "All workspaces" },
-              ...(workspaceSummaries() ?? []).map((w) => ({
-                value: String(w.id),
-                label: w.name,
-              })),
-            ]}
-          />
-          <FilterSelect
-            value={projectFilter()}
-            onChange={(v) => {
-              setProjectFilter(v);
-              if (v) setWorkspaceFilter("");
-            }}
-            placeholder="All projects"
-            align="left"
-            options={[
-              { value: "", label: "All projects" },
-              ...(projects() ?? []).map((p) => ({
-                value: p.identity,
-                label: (
-                  <span style={{ display: "inline-flex", "align-items": "center", gap: "6px" }}>
-                    <span>{p.display_name}</span>
-                    <span style={{ display: "inline-flex", gap: "3px" }}>
-                      <For each={p.harnesses}>
-                        {(harness) => <HarnessBadge harness={harness} />}
-                      </For>
-                    </span>
-                  </span>
-                ),
-              })),
-            ]}
-          />
-        </Show>
-        <input
-          class="search-input"
-          type="text"
-          placeholder="Search memories..."
-          onInput={(e) => handleSearch(e.currentTarget.value)}
-        />
-        <FilterSelect
-          value={statusFilter()}
-          onChange={setStatusFilter}
-          placeholder="All status"
-          options={[
-            { value: "", label: "All status" },
-            { value: "active", label: "Active" },
-            { value: "permanent", label: "Permanent" },
-            { value: "archived", label: "Archived" },
-          ]}
-        />
-        <FilterSelect
-          value={categoryFilter()}
-          onChange={setCategoryFilter}
-          placeholder="All categories"
-          options={[
-            { value: "", label: "All categories" },
-            ...(stats()?.categories ?? []).map((c) => ({
-              value: c.category,
-              label: `${c.category} (${c.count})`,
-            })),
-          ]}
-        />
-      </div>
-
-      {/* Sticky bulk-action bar: appears only when ≥1 memory is selected.
-          Keeps vertical space free in the common case of no selection. */}
-      <Show when={selectedCount() > 0}>
-        <div class="bulk-action-bar">
-          <div class="bulk-action-left">
-            <TriStateCheckbox
-              state={allVisibleSelectionState()}
-              onToggle={toggleAllVisibleSelection}
-              ariaLabel="Toggle all visible memories"
-            />
-            <span class="bulk-action-count">
-              {selectedCount()} selected
-              <Show when={selectedCount() < allVisibleMemoryIds().length}>
-                <button type="button" class="bulk-action-link" onClick={toggleAllVisibleSelection}>
-                  Select all {allVisibleMemoryIds().length} visible
-                </button>
-              </Show>
-            </span>
-          </div>
-          <div class="bulk-action-right">
-            <button type="button" class="btn sm" onClick={handleBulkArchive}>
-              Archive
-            </button>
-            <button type="button" class="btn sm danger" onClick={handleBulkDelete}>
-              Delete
-            </button>
-            <button type="button" class="btn sm ghost" onClick={clearSelection}>
-              Clear
-            </button>
-          </div>
-        </div>
-      </Show>
-
-      {/* Expand/collapse controls — small link-style buttons above the list. */}
-      <Show when={!memories.loading && (memories() ?? []).length > 0}>
-        <div class="memory-controls">
-          <button type="button" class="bulk-action-link" onClick={expandAll}>
-            Expand all
-          </button>
-          <span style={{ color: "var(--text-muted)" }}>·</span>
-          <button type="button" class="bulk-action-link" onClick={collapseAll}>
-            Collapse all
-          </button>
-        </div>
-      </Show>
-
-      <div class="scroll-area">
-        <Show
-          when={!memories.loading}
-          fallback={<div class="empty-state">Loading memories...</div>}
-        >
-          <Show
-            when={(memories() ?? []).length > 0}
-            fallback={
-              <div class="empty-state">
-                <span class="empty-state-icon">🧠</span>
-                <span>No memories found</span>
-              </div>
-            }
+      <Show when={embedded()}>
+        <div class="tab-pills memory-view-tabs">
+          <button
+            type="button"
+            class="tab-pill"
+            classList={{ active: view() === "memories" }}
+            onClick={() => setView("memories")}
           >
-            <div class="list-gap">
-              <For each={groupedMemories()}>
-                {([category, mems]) => {
-                  const collapsed = () => collapsedCategories().has(category);
-                  return (
-                    <>
-                      <button
-                        type="button"
-                        class="category-header clickable"
-                        onClick={() => toggleCategoryCollapse(category)}
-                      >
-                        {/* Tri-state checkbox: clicking stops propagation so it
-                            doesn't also collapse the category. */}
-                        <span style={{ display: "flex", "align-items": "center" }}>
-                          <TriStateCheckbox
-                            state={categorySelectionState(mems)}
-                            onToggle={() => toggleCategorySelection(mems)}
-                            ariaLabel={`Toggle all in ${category}`}
-                          />
-                        </span>
-                        <span>{category}</span>
-                        <span class="category-count">({mems.length})</span>
-                        <span class="category-divider" />
-                        <span
-                          class="category-chevron"
-                          classList={{ collapsed: collapsed() }}
-                          aria-hidden="true"
-                        >
-                          ▾
-                        </span>
-                      </button>
-                      <Show when={!collapsed()}>
-                        <For each={mems}>
-                          {(mem) => {
-                            const isSelected = () => selectedIds().has(mem.id);
-                            return (
-                              <button
-                                type="button"
-                                class="card memory-card"
-                                classList={{ selected: isSelected() }}
-                                onClick={() => setSelectedMemory(mem)}
-                                style={{ width: "100%", "text-align": "left" }}
-                              >
-                                <span class="memory-card-checkbox">
-                                  <input
-                                    type="checkbox"
-                                    checked={isSelected()}
-                                    onChange={() => toggleSelect(mem.id)}
-                                    onClick={(e) => e.stopPropagation()}
-                                    aria-label={`Select memory ${mem.id}`}
-                                  />
-                                </span>
-                                <div class="memory-card-body">
-                                  <div class="card-title">
-                                    <span
-                                      class="mono"
-                                      style={{
-                                        color: "var(--text-muted)",
-                                        "margin-right": "6px",
-                                      }}
-                                    >
-                                      #{mem.id}
-                                    </span>
-                                    {truncate(mem.content, 100)}
-                                  </div>
-                                  <div class="card-meta">
-                                    <span class={`pill ${statusPillClass(mem.status)}`}>
-                                      {mem.status}
-                                    </span>
-                                    <span class={`pill ${sourcePillClass(mem.source_type)}`}>
-                                      {mem.source_type}
-                                    </span>
-                                    <span
-                                      class={`pill ${importanceBand(mem.importance).cls}`}
-                                      title={`importance ${mem.importance} · ${importanceBand(mem.importance).label} (classify)`}
-                                    >
-                                      imp {mem.importance}
-                                    </span>
-                                    <Show when={mem.scope !== "project"}>
-                                      <span class="pill indigo" title="memory scope (classify)">
-                                        {mem.scope}
-                                      </span>
-                                    </Show>
-                                    <Show when={mem.shareable}>
-                                      <span
-                                        class="pill green"
-                                        title="safe to share with teammates (classify)"
-                                      >
-                                        shareable
-                                      </span>
-                                    </Show>
-                                    <Show
-                                      when={workspaceFilter() !== "" && mem.source_display_name}
-                                    >
-                                      <span class="pill gray">
-                                        source: {mem.source_display_name}
-                                      </span>
-                                    </Show>
-                                    <span>seen {mem.seen_count}×</span>
-                                    <span>retrieved {mem.retrieval_count}×</span>
-                                    <span>{formatRelativeTime(mem.updated_at)}</span>
-                                    <span
-                                      style={{
-                                        color: mem.has_embedding
-                                          ? "var(--accent)"
-                                          : "var(--text-muted)",
-                                      }}
-                                    >
-                                      {mem.has_embedding ? "● embedded" : "○ no embedding"}
-                                    </span>
-                                  </div>
-                                </div>
-                              </button>
-                            );
-                          }}
+            Memories
+          </button>
+          <button
+            type="button"
+            class="tab-pill"
+            classList={{ active: view() === "history" }}
+            onClick={() => setView("history")}
+          >
+            History
+          </button>
+        </div>
+      </Show>
+
+      <Show when={view() === "history" && embedded()}>
+        <div class="scroll-area">
+          <p class="history-intro">
+            Every change to this project's memories, newest first: what the dreamer, the historian,
+            your agent and you changed, and why. Undo restores the memories a change touched to how
+            they were before it.
+          </p>
+          <MemoryHistoryTimeline
+            load={loadProjectHistory}
+            reloadToken={historyReload()}
+            emptyText="No recorded memory changes for this project yet."
+            onUndo={undoDecision}
+          />
+        </div>
+      </Show>
+
+      <Show when={view() === "memories" || !embedded()}>
+        <div class="filter-bar">
+          <Show when={!embedded()}>
+            <FilterSelect
+              value={workspaceFilter() === "" ? "" : String(workspaceFilter())}
+              onChange={(v) => {
+                if (v === "") {
+                  setWorkspaceFilter("");
+                } else {
+                  setWorkspaceFilter(Number(v));
+                  setProjectFilter("");
+                }
+              }}
+              placeholder="All workspaces"
+              align="left"
+              options={[
+                { value: "", label: "All workspaces" },
+                ...(workspaceSummaries() ?? []).map((w) => ({
+                  value: String(w.id),
+                  label: w.name,
+                })),
+              ]}
+            />
+            <FilterSelect
+              value={projectFilter()}
+              onChange={(v) => {
+                setProjectFilter(v);
+                if (v) setWorkspaceFilter("");
+              }}
+              placeholder="All projects"
+              align="left"
+              options={[
+                { value: "", label: "All projects" },
+                ...(projects() ?? []).map((p) => ({
+                  value: p.identity,
+                  label: (
+                    <span style={{ display: "inline-flex", "align-items": "center", gap: "6px" }}>
+                      <span>{p.display_name}</span>
+                      <span style={{ display: "inline-flex", gap: "3px" }}>
+                        <For each={p.harnesses}>
+                          {(harness) => <HarnessBadge harness={harness} />}
                         </For>
-                      </Show>
-                    </>
-                  );
-                }}
-              </For>
-            </div>
+                      </span>
+                    </span>
+                  ),
+                })),
+              ]}
+            />
           </Show>
+          <input
+            class="search-input"
+            type="text"
+            placeholder="Search memories..."
+            onInput={(e) => handleSearch(e.currentTarget.value)}
+          />
+          <FilterSelect
+            value={statusFilter()}
+            onChange={setStatusFilter}
+            placeholder="All status"
+            options={[
+              { value: "", label: "All status" },
+              { value: "active", label: "Active" },
+              { value: "permanent", label: "Permanent" },
+              { value: "archived", label: "Archived" },
+            ]}
+          />
+          <FilterSelect
+            value={categoryFilter()}
+            onChange={setCategoryFilter}
+            placeholder="All categories"
+            options={[
+              { value: "", label: "All categories" },
+              ...(stats()?.categories ?? []).map((c) => ({
+                value: c.category,
+                label: `${c.category} (${c.count})`,
+              })),
+            ]}
+          />
+        </div>
+
+        {/* Sticky bulk-action bar: appears only when ≥1 memory is selected.
+          Keeps vertical space free in the common case of no selection. */}
+        <Show when={selectedCount() > 0}>
+          <div class="bulk-action-bar">
+            <div class="bulk-action-left">
+              <TriStateCheckbox
+                state={allVisibleSelectionState()}
+                onToggle={toggleAllVisibleSelection}
+                ariaLabel="Toggle all visible memories"
+              />
+              <span class="bulk-action-count">
+                {selectedCount()} selected
+                <Show when={selectedCount() < allVisibleMemoryIds().length}>
+                  <button
+                    type="button"
+                    class="bulk-action-link"
+                    onClick={toggleAllVisibleSelection}
+                  >
+                    Select all {allVisibleMemoryIds().length} visible
+                  </button>
+                </Show>
+              </span>
+            </div>
+            <div class="bulk-action-right">
+              <button type="button" class="btn sm" onClick={handleBulkArchive}>
+                Archive
+              </button>
+              <button type="button" class="btn sm ghost" onClick={clearSelection}>
+                Clear
+              </button>
+            </div>
+          </div>
         </Show>
-      </div>
+
+        <Show when={bulkNotice()}>
+          {(n) => (
+            <div style={{ padding: "0 20px 8px" }}>
+              <EditNotice
+                outcome={n()}
+                onReload={() => {
+                  setBulkNotice(null);
+                  void refreshAfterEdit(null);
+                }}
+                onUndo={(key) => openUndo(key, bulkProjectPath(), "Your bulk archive")}
+                onDismiss={() => setBulkNotice(null)}
+              />
+            </div>
+          )}
+        </Show>
+
+        {/* Expand/collapse controls — small link-style buttons above the list. */}
+        <Show when={!memories.loading && (memories() ?? []).length > 0}>
+          <div class="memory-controls">
+            <button type="button" class="bulk-action-link" onClick={expandAll}>
+              Expand all
+            </button>
+            <span style={{ color: "var(--text-muted)" }}>·</span>
+            <button type="button" class="bulk-action-link" onClick={collapseAll}>
+              Collapse all
+            </button>
+          </div>
+        </Show>
+
+        <div class="scroll-area">
+          <Show
+            when={!memories.loading}
+            fallback={<div class="empty-state">Loading memories...</div>}
+          >
+            <Show
+              when={(memories() ?? []).length > 0}
+              fallback={
+                <div class="empty-state">
+                  <span class="empty-state-icon">🧠</span>
+                  <span>No memories found</span>
+                </div>
+              }
+            >
+              <div class="list-gap">
+                <For each={groupedMemories()}>
+                  {([category, mems]) => {
+                    const collapsed = () => collapsedCategories().has(category);
+                    return (
+                      <>
+                        <button
+                          type="button"
+                          class="category-header clickable"
+                          onClick={() => toggleCategoryCollapse(category)}
+                        >
+                          {/* Tri-state checkbox: clicking stops propagation so it
+                            doesn't also collapse the category. */}
+                          <span style={{ display: "flex", "align-items": "center" }}>
+                            <TriStateCheckbox
+                              state={categorySelectionState(mems)}
+                              onToggle={() => toggleCategorySelection(mems)}
+                              ariaLabel={`Toggle all in ${category}`}
+                            />
+                          </span>
+                          <span>{category}</span>
+                          <span class="category-count">({mems.length})</span>
+                          <span class="category-divider" />
+                          <span
+                            class="category-chevron"
+                            classList={{ collapsed: collapsed() }}
+                            aria-hidden="true"
+                          >
+                            ▾
+                          </span>
+                        </button>
+                        <Show when={!collapsed()}>
+                          <For each={mems}>
+                            {(mem) => {
+                              const isSelected = () => selectedIds().has(mem.id);
+                              return (
+                                <button
+                                  type="button"
+                                  class="card memory-card"
+                                  classList={{ selected: isSelected() }}
+                                  onClick={() => setSelectedMemory(mem)}
+                                  style={{ width: "100%", "text-align": "left" }}
+                                >
+                                  <span class="memory-card-checkbox">
+                                    <input
+                                      type="checkbox"
+                                      checked={isSelected()}
+                                      onChange={() => toggleSelect(mem.id)}
+                                      onClick={(e) => e.stopPropagation()}
+                                      aria-label={`Select memory ${mem.id}`}
+                                    />
+                                  </span>
+                                  <div class="memory-card-body">
+                                    <div class="card-title">
+                                      <span
+                                        class="mono"
+                                        style={{
+                                          color: "var(--text-muted)",
+                                          "margin-right": "6px",
+                                        }}
+                                      >
+                                        #{mem.id}
+                                      </span>
+                                      {truncate(mem.content, 100)}
+                                    </div>
+                                    <div class="card-meta">
+                                      <span class={`pill ${statusPillClass(mem.status)}`}>
+                                        {mem.status}
+                                      </span>
+                                      <span class={`pill ${sourcePillClass(mem.source_type)}`}>
+                                        {mem.source_type}
+                                      </span>
+                                      <span
+                                        class={`pill ${importanceBand(mem.importance).cls}`}
+                                        title={`importance ${mem.importance} · ${importanceBand(mem.importance).label} (classify)`}
+                                      >
+                                        imp {mem.importance}
+                                      </span>
+                                      <Show when={mem.scope !== "project"}>
+                                        <span class="pill indigo" title="memory scope (classify)">
+                                          {mem.scope}
+                                        </span>
+                                      </Show>
+                                      <Show when={mem.shareable}>
+                                        <span
+                                          class="pill green"
+                                          title="safe to share with teammates (classify)"
+                                        >
+                                          shareable
+                                        </span>
+                                      </Show>
+                                      <Show
+                                        when={workspaceFilter() !== "" && mem.source_display_name}
+                                      >
+                                        <span class="pill gray">
+                                          source: {mem.source_display_name}
+                                        </span>
+                                      </Show>
+                                      <span>seen {mem.seen_count}×</span>
+                                      <span>retrieved {mem.retrieval_count}×</span>
+                                      <span>{formatRelativeTime(mem.updated_at)}</span>
+                                      <span
+                                        style={{
+                                          color: mem.has_embedding
+                                            ? "var(--accent)"
+                                            : "var(--text-muted)",
+                                        }}
+                                      >
+                                        {mem.has_embedding ? "● embedded" : "○ no embedding"}
+                                      </span>
+                                    </div>
+                                  </div>
+                                </button>
+                              );
+                            }}
+                          </For>
+                        </Show>
+                      </>
+                    );
+                  }}
+                </For>
+              </div>
+            </Show>
+          </Show>
+        </div>
+      </Show>
 
       <Show when={selectedMemory()}>
         {(mem) => (
           <MemoryDetail
             memory={mem()}
+            historyReload={historyReload()}
             onClose={() => setSelectedMemory(null)}
             onStatusChange={handleStatusChange}
             onContentChange={handleContentChange}
             onCategoryChange={handleCategoryChange}
-            onDelete={handleDelete}
+            onArchive={handleArchive}
+            onReload={reloadMemory}
+            onUndo={openUndo}
+          />
+        )}
+      </Show>
+
+      <Show when={undoTarget()}>
+        {(target) => (
+          <UndoDialog
+            projectPath={target().projectPath}
+            decisionKey={target().decisionKey}
+            title={target().title}
+            onClose={() => setUndoTarget(null)}
+            onApplied={afterUndo}
           />
         )}
       </Show>

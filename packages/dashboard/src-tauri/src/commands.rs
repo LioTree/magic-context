@@ -163,65 +163,176 @@ pub fn apply_workspace_changes(
     .map_err(|e| e.to_string())
 }
 
-#[tauri::command(async)]
-pub fn update_memory_status(
+async fn dashboard_edit(
+    state: State<'_, AppState>,
+    project_path: &str,
+    operation_id: &str,
+    ids: &[i64],
+    expectations: &[mc_store::memory_history::RevisionExpectation],
+    field: &str,
+    value: &str,
+) -> Result<serde_json::Value, String> {
+    let request = crate::memory_bridge::edit_request(
+        project_path,
+        operation_id,
+        ids,
+        expectations,
+        field,
+        value,
+    );
+    db::memory_request(&state.get_db_path()?, "memory.edit", request).await
+}
+
+#[tauri::command]
+pub async fn update_memory_status(
     state: State<'_, AppState>,
     memory_id: i64,
     status: String,
-) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_memory_status(&mut conn, memory_id, &status).map_err(|e| e.to_string())
+    project_path: String,
+    operation_id: String,
+    expected_revision: i64,
+) -> Result<serde_json::Value, String> {
+    dashboard_edit(
+        state,
+        &project_path,
+        &operation_id,
+        &[memory_id],
+        &[mc_store::memory_history::RevisionExpectation {
+            memory_id,
+            revision: expected_revision,
+        }],
+        "status",
+        &status,
+    )
+    .await
 }
-
-#[tauri::command(async)]
-pub fn update_memory_content(
+#[tauri::command]
+pub async fn update_memory_content(
     state: State<'_, AppState>,
     memory_id: i64,
     content: String,
-) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_memory_content(&mut conn, memory_id, &content).map_err(|e| e.to_string())
+    project_path: String,
+    operation_id: String,
+    expected_revision: i64,
+) -> Result<serde_json::Value, String> {
+    dashboard_edit(
+        state,
+        &project_path,
+        &operation_id,
+        &[memory_id],
+        &[mc_store::memory_history::RevisionExpectation {
+            memory_id,
+            revision: expected_revision,
+        }],
+        "content",
+        &content,
+    )
+    .await
 }
-
-#[tauri::command(async)]
-pub fn update_memory_category(
+#[tauri::command]
+pub async fn update_memory_category(
     state: State<'_, AppState>,
     memory_id: i64,
     category: String,
-) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_memory_category(&mut conn, memory_id, &category).map_err(|e| e.to_string())
+    project_path: String,
+    operation_id: String,
+    expected_revision: i64,
+) -> Result<serde_json::Value, String> {
+    dashboard_edit(
+        state,
+        &project_path,
+        &operation_id,
+        &[memory_id],
+        &[mc_store::memory_history::RevisionExpectation {
+            memory_id,
+            revision: expected_revision,
+        }],
+        "category",
+        &category,
+    )
+    .await
 }
-
-#[tauri::command(async)]
-pub fn delete_memory(state: State<'_, AppState>, memory_id: i64) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::delete_memory(&mut conn, memory_id).map_err(|e| e.to_string())
+#[tauri::command]
+pub async fn delete_memory(
+    state: State<'_, AppState>,
+    memory_id: i64,
+    project_path: String,
+    operation_id: String,
+    expected_revision: i64,
+) -> Result<serde_json::Value, String> {
+    dashboard_edit(
+        state,
+        &project_path,
+        &operation_id,
+        &[memory_id],
+        &[mc_store::memory_history::RevisionExpectation {
+            memory_id,
+            revision: expected_revision,
+        }],
+        "status",
+        "archived",
+    )
+    .await
 }
-
-#[tauri::command(async)]
-pub fn bulk_update_memory_status(
+#[tauri::command]
+pub async fn bulk_update_memory_status(
     state: State<'_, AppState>,
     memory_ids: Vec<i64>,
     status: String,
-) -> Result<usize, String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::bulk_update_memory_status(&mut conn, &memory_ids, &status).map_err(|e| e.to_string())
+    project_path: String,
+    operation_id: String,
+    expected_revisions: Vec<mc_store::memory_history::RevisionExpectation>,
+) -> Result<serde_json::Value, String> {
+    dashboard_edit(
+        state,
+        &project_path,
+        &operation_id,
+        &memory_ids,
+        &expected_revisions,
+        "status",
+        &status,
+    )
+    .await
 }
-
-#[tauri::command(async)]
-pub fn bulk_delete_memory(
+#[tauri::command]
+pub async fn bulk_delete_memory(
     state: State<'_, AppState>,
     memory_ids: Vec<i64>,
-) -> Result<usize, String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::bulk_delete_memory(&mut conn, &memory_ids).map_err(|e| e.to_string())
+    project_path: String,
+    operation_id: String,
+    expected_revisions: Vec<mc_store::memory_history::RevisionExpectation>,
+) -> Result<serde_json::Value, String> {
+    dashboard_edit(
+        state,
+        &project_path,
+        &operation_id,
+        &memory_ids,
+        &expected_revisions,
+        "status",
+        "archived",
+    )
+    .await
+}
+#[tauri::command]
+pub async fn get_memory_history(
+    state: State<'_, AppState>,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    db::memory_request(&state.get_db_path()?, "memory.history", request).await
+}
+#[tauri::command]
+pub async fn preview_memory_restore(
+    state: State<'_, AppState>,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    db::memory_request(&state.get_db_path()?, "memory.restore.preview", request).await
+}
+#[tauri::command]
+pub async fn restore_memory_history(
+    state: State<'_, AppState>,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    db::memory_request(&state.get_db_path()?, "memory.restore", request).await
 }
 
 // ── Session commands ────────────────────────────────────────

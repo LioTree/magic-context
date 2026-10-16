@@ -6713,6 +6713,26 @@ fn apply_once(
                 // The probe reproduces the baseline, delta and image already served.
                 // Commit only external/history markers. Rebuilding the baseline here
                 // would erase shown fragments or acknowledge pending memory revisions.
+                if let (Some(composition), Some(shown)) = (
+                    marker_hard_composition.as_ref(),
+                    loaded.meta.memory_projection.as_ref(),
+                ) {
+                    if composition.memory_projection.project_memory_epoch
+                        != shown.project_memory_epoch
+                    {
+                        // A dashboard edit permits loading current memory rows. When the
+                        // prompt bytes are unchanged, acknowledge the new row revisions
+                        // while keeping previously shown update lines and without releasing
+                        // pending automatic reductions solely because of this edit.
+                        let mut projection = composition.memory_projection.clone();
+                        projection.generation = shown.generation;
+                        projection.bind_m0(&composition.m0_bytes);
+                        projection.committed = shown.committed.clone();
+                        projection.fragment_watermark = shown.fragment_watermark;
+                        meta.rendered_memory_ids = composition.rendered_memory_ids.clone();
+                        meta.memory_projection = Some(projection);
+                    }
+                }
                 meta.m1_external_revision = m1_signal.external_revision;
                 meta.m1_history_revision = m1_signal.history_revision;
                 meta.project_memory_epoch_pending = false;
@@ -10802,6 +10822,9 @@ fn compose_hard_fold_m0(
     )
     .ok()?;
     if let Some(projection) = &loaded.meta.memory_projection {
+        if composed.memory_projection.project_memory_epoch != projection.project_memory_epoch {
+            return Some(composed);
+        }
         composed.memory_projection = projection.clone();
         composed.rendered_memory_ids = loaded.meta.rendered_memory_ids.clone();
         composed.memory_mutation_cursor = loaded.meta.memory_mutation_cursor;
@@ -10817,9 +10840,9 @@ fn compose_hard_fold_m0(
     Some(composed)
 }
 
-/// A marker requests a content check, not permission to adopt pending memories.
-/// Compose current compartment history beside the previously served memory view.
-/// Only separately requested SQL repair may expose a changed same-revision row.
+/// A cache-validity check keeps the memory text previously shown. A dashboard
+/// change counter instead allows reading new memory revisions at the rebuild.
+/// Same-revision repairs still require the separate allow_external_repair flag.
 struct MarkerMemorySource<'a> {
     store: &'a McStore,
     projection: Option<&'a mc_store::memory_projection::AppliedProjection>,
@@ -10864,6 +10887,12 @@ impl crate::m0_compose::M0Source for MarkerMemorySource<'_> {
         let current = self
             .store
             .load_memory_render_snapshot(project, membership, cutoff)?;
+        if current.revision.project_memory_epoch != projection.project_memory_epoch {
+            // The dashboard signals an explicit edit through this change counter.
+            // Its rebuild can load new revisions and memories reactivated by undo;
+            // ordinary cache-validity checks must still replay the previous rows.
+            return Ok(current);
+        }
         let memories = projection
             .rows
             .iter()

@@ -32,6 +32,39 @@ function row(db: Database, id: number) {
     return db.prepare("SELECT * FROM memories WHERE id=?").get(id) as Record<string, unknown>;
 }
 
+function canonicalSnapshot(raw: Record<string, unknown>): Record<string, unknown> {
+    const columns: Record<string, string> = {
+        id: "id",
+        projectPath: "project_path",
+        revision: "revision",
+        category: "category",
+        content: "content",
+        normalizedHash: "normalized_hash",
+        importance: "importance",
+        scope: "scope",
+        shareable: "shareable",
+        sourceSessionId: "source_session_id",
+        sourceType: "source_type",
+        seenCount: "seen_count",
+        retrievalCount: "retrieval_count",
+        firstSeenAt: "first_seen_at",
+        createdAt: "created_at",
+        updatedAt: "updated_at",
+        lastSeenAt: "last_seen_at",
+        lastRetrievedAt: "last_retrieved_at",
+        status: "status",
+        expiresAt: "expires_at",
+        verificationStatus: "verification_status",
+        verifiedAt: "verified_at",
+        supersededByMemoryId: "superseded_by_memory_id",
+        mergedFrom: "merged_from",
+        metadataJson: "metadata_json",
+    };
+    return Object.fromEntries(
+        Object.entries(columns).map(([field, column]) => [field, raw[column]]),
+    );
+}
+
 describe("immediate agent memory mutations", () => {
     test("agent update logs the mutation, records its session fragment, keeps complete undo history and bumps no epoch", () => {
         const db = store();
@@ -107,14 +140,24 @@ describe("immediate agent memory mutations", () => {
             };
             expect(history.previous_text).toBe(input.content);
             expect(history.after_text).toBe("cache_ttl=10m");
-            expect(JSON.parse(history.before_json)).toEqual(before);
-            expect(JSON.parse(history.after_json)).toEqual(row(db, memory.id));
+            expect(JSON.parse(history.before_json)).toEqual({
+                version: 1,
+                snapshot: canonicalSnapshot(before),
+            });
+            expect(JSON.parse(history.after_json)).toEqual({
+                version: 1,
+                snapshot: canonicalSnapshot(row(db, memory.id)),
+            });
             const journal = db
                 .prepare("SELECT operation,before_json,after_json FROM memory_journal")
                 .get() as { operation: string; before_json: string; after_json: string };
             expect(journal.operation).toBe("ctx_memory_update");
-            expect(JSON.parse(journal.before_json)).toEqual([before]);
-            expect(JSON.parse(journal.after_json)).toEqual([row(db, memory.id)]);
+            expect(JSON.parse(journal.before_json).rows[0].before).toEqual(
+                canonicalSnapshot(before),
+            );
+            expect(JSON.parse(journal.after_json).rows[0].after).toEqual(
+                canonicalSnapshot(row(db, memory.id)),
+            );
             expect(applyAgentMemoryMutation(db, request(memory.id))).toEqual(receipt);
             expect(db.prepare("SELECT COUNT(*) AS n FROM memory_mutation_log").get()).toEqual({
                 n: 1,
@@ -244,7 +287,12 @@ describe("immediate agent memory mutations", () => {
                     status: "archived",
                     supersededByMemoryId: canonical.id,
                 });
-            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({ n: 2 });
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({ n: 3 });
+            const created = db
+                .prepare("SELECT revision,before_json FROM memory_history WHERE memory_id=?")
+                .get(canonical.id) as { revision: number; before_json: string };
+            expect(created.revision).toBe(0);
+            expect(JSON.parse(created.before_json)).toEqual({ version: 1, snapshot: null });
             expect(
                 db.prepare("SELECT mutation_type,operation_id FROM memory_mutation_log").all(),
             ).toEqual(Array(2).fill({ mutation_type: "superseded", operation_id: "operation" }));
@@ -261,9 +309,22 @@ describe("immediate agent memory mutations", () => {
             const journal = db
                 .prepare("SELECT before_json,after_json FROM memory_journal")
                 .get() as { before_json: string; after_json: string };
-            expect(JSON.parse(journal.before_json)).toEqual([...before, null]);
-            expect(JSON.parse(journal.after_json)).toEqual(
-                db.prepare("SELECT * FROM memories ORDER BY id").all(),
+            expect(
+                JSON.parse(journal.before_json).rows.map(
+                    (change: { before: unknown }) => change.before,
+                ),
+            ).toEqual([...before.map(canonicalSnapshot), null]);
+            expect(
+                JSON.parse(journal.after_json).rows.map(
+                    (change: { after: unknown }) => change.after,
+                ),
+            ).toEqual(
+                (
+                    db.prepare("SELECT * FROM memories ORDER BY id").all() as Record<
+                        string,
+                        unknown
+                    >[]
+                ).map(canonicalSnapshot),
             );
             expect(db.prepare("SELECT * FROM project_state").all()).toEqual([]);
         } finally {
@@ -291,7 +352,7 @@ describe("immediate agent memory mutations", () => {
             db.close();
         }
     });
-    test("archive saves exact before and after state and cleans derived data", () => {
+    test("archive saves versioned canonical before and after state and cleans derived data", () => {
         const db = store();
         try {
             const memory = insertMemory(db, input);
@@ -315,8 +376,14 @@ describe("immediate agent memory mutations", () => {
             const history = db
                 .prepare("SELECT before_json,after_json FROM memory_history")
                 .get() as { before_json: string; after_json: string };
-            expect(JSON.parse(history.before_json)).toEqual(before);
-            expect(JSON.parse(history.after_json)).toEqual(row(db, memory.id));
+            expect(JSON.parse(history.before_json)).toEqual({
+                version: 1,
+                snapshot: canonicalSnapshot(before),
+            });
+            expect(JSON.parse(history.after_json)).toEqual({
+                version: 1,
+                snapshot: canonicalSnapshot(row(db, memory.id)),
+            });
             expect(getMemoryById(db, memory.id)?.metadataJson).toContain("obsolete");
             expect(
                 db.prepare("SELECT mutation_type,operation_id FROM memory_mutation_log").all(),

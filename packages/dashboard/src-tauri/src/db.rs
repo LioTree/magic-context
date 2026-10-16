@@ -776,6 +776,7 @@ pub fn open_readwrite(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct Memory {
+    pub revision: i64,
     pub id: i64,
     pub project_path: String,
     pub category: String,
@@ -1609,40 +1610,9 @@ pub struct TableCount {
 
 // ── Helpers ───────────────────────────────────────────────────
 
-/// Match the plugin's `computeNormalizedHash` (`normalize-hash.ts`): lowercase,
-/// replace every JS `\s+` run with one space, trim, then MD5 hex. The whitespace
-/// set must be JavaScript's, not Rust's `char::is_whitespace`: the two disagree on
-/// U+0085 (Rust only) and U+FEFF (JS only), and any disagreement gives the same
-/// memory two hashes, which defeats the `UNIQUE(project_path, category,
-/// normalized_hash)` dedup the plugin relies on.
+#[cfg(test)]
 fn normalize_hash(content: &str) -> String {
-    let lowered = content.to_lowercase();
-    let normalized = lowered
-        .split(is_js_whitespace)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let digest = md5::compute(normalized.as_bytes());
-    format!("{:032x}", digest)
-}
-
-/// The characters matched by a JavaScript regex `\s`: ECMAScript WhiteSpace
-/// (including U+FEFF and the Unicode `Zs` spaces) plus LineTerminator.
-fn is_js_whitespace(c: char) -> bool {
-    matches!(
-        c,
-        '\u{0009}'..='\u{000D}'
-            | '\u{0020}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-            | '\u{FEFF}'
-    )
+    mc_store::memory_history::normalized_hash(content)
 }
 
 #[cfg(test)]
@@ -5207,6 +5177,17 @@ pub fn get_memories(
     // the schema lifecycle). A new dashboard against a pre-v44 plugin DB lacks the
     // classify columns — select literal defaults instead so the viewer degrades
     // rather than erroring. Mapper indices 21/22/23 stay stable either way.
+    let revision_select = if conn
+        .prepare("PRAGMA table_info(memories)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "revision")
+    {
+        "m.revision"
+    } else {
+        "1 AS revision"
+    };
     let classify_cols = if memories_has_classify_columns(conn) {
         "m.importance, m.scope, m.shareable,"
     } else {
@@ -5313,7 +5294,7 @@ pub fn get_memories(
                     m.last_retrieved_at, m.status, m.expires_at, m.verification_status,
                     m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
                     {classify_cols}
-                    {has_embedding}
+                    {has_embedding}, {revision_select}
              FROM memories m
              INNER JOIN memories_fts ON memories_fts.rowid = m.id
              WHERE memories_fts MATCH ?1
@@ -5334,7 +5315,7 @@ pub fn get_memories(
                     m.last_retrieved_at, m.status, m.expires_at, m.verification_status,
                     m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
                     {classify_cols}
-                    {has_embedding}
+                    {has_embedding}, {revision_select}
              FROM memories m
              WHERE (m.content LIKE ?1 ESCAPE '\\' OR m.category LIKE ?1 ESCAPE '\\')
              {}
@@ -5353,7 +5334,7 @@ pub fn get_memories(
                     m.last_retrieved_at, m.status, m.expires_at, m.verification_status,
                     m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
                     {classify_cols}
-                    {has_embedding}
+                    {has_embedding}, {revision_select}
              FROM memories m
              WHERE 1=1
              {}
@@ -5380,22 +5361,23 @@ pub fn get_memories(
             enrich_memories_workspace_source(conn, workspace_filter, &mut memories)?;
             Ok(memories)
         }
-        Ok(empty) if use_fts && !use_like_fallback && offset > 0 && {
-            // An empty page past the first one only falls back to LIKE when FTS
-            // matches nothing at all. Otherwise it is just the end of the FTS
-            // results, and a LIKE page at the same offset would splice a
-            // different result set onto the pages already shown.
-            let mut probe: Vec<&dyn rusqlite::types::ToSql> = params[..params.len() - 2]
-                .iter()
-                .map(|p| p.as_ref())
-                .collect();
-            probe.push(&1i64);
-            probe.push(&0i64);
-            conn.prepare(&sql)?
-                .query(probe.as_slice())?
-                .next()?
-                .is_some()
-        } =>
+        Ok(empty)
+            if use_fts && !use_like_fallback && offset > 0 && {
+                // An empty page past the first one only falls back to LIKE when FTS
+                // matches nothing at all. Otherwise it is just the end of the FTS
+                // results, and a LIKE page at the same offset would splice a
+                // different result set onto the pages already shown.
+                let mut probe: Vec<&dyn rusqlite::types::ToSql> = params[..params.len() - 2]
+                    .iter()
+                    .map(|p| p.as_ref())
+                    .collect();
+                probe.push(&1i64);
+                probe.push(&0i64);
+                conn.prepare(&sql)?
+                    .query(probe.as_slice())?
+                    .next()?
+                    .is_some()
+            } =>
         {
             Ok(empty)
         }
@@ -5408,7 +5390,7 @@ pub fn get_memories(
                         m.last_retrieved_at, m.status, m.expires_at, m.verification_status,
                         m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
                         {classify_cols}
-                        {has_embedding}
+                        {has_embedding}, {revision_select}
                  FROM memories m
                  WHERE (m.content LIKE ?1 ESCAPE '\\' OR m.category LIKE ?1 ESCAPE '\\')
                  {}
@@ -5456,7 +5438,7 @@ pub fn get_memories(
                         m.last_retrieved_at, m.status, m.expires_at, m.verification_status,
                         m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
                         {classify_cols}
-                        {has_embedding}
+                        {has_embedding}, {revision_select}
                  FROM memories m
                  WHERE (m.content LIKE ?1 ESCAPE '\\' OR m.category LIKE ?1 ESCAPE '\\')
                  {}
@@ -5657,6 +5639,7 @@ fn memories_has_classify_columns(conn: &Connection) -> bool {
 
 fn map_memory_row(row: &rusqlite::Row<'_>) -> Result<Memory, rusqlite::Error> {
     Ok(Memory {
+        revision: row.get(25)?,
         id: row.get(0)?,
         project_path: row.get(1)?,
         category: row.get(2)?,
@@ -5842,121 +5825,6 @@ fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct MemoryMutationTarget {
-    project_path: String,
-    category: Option<String>,
-    status: Option<String>,
-}
-
-fn lookup_memory_mutation_target(
-    conn: &Connection,
-    memory_id: i64,
-) -> Result<MemoryMutationTarget, rusqlite::Error> {
-    conn.query_row(
-        "SELECT project_path, category, status FROM memories WHERE id = ?1",
-        params![memory_id],
-        |row| {
-            Ok(MemoryMutationTarget {
-                project_path: row.get(0)?,
-                category: row.get(1)?,
-                status: row.get(2)?,
-            })
-        },
-    )
-}
-
-fn fetch_memory_mutation_targets(
-    conn: &Connection,
-    memory_ids: &[i64],
-) -> Result<HashMap<i64, MemoryMutationTarget>, rusqlite::Error> {
-    if memory_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let placeholders = memory_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT id, project_path, category, status FROM memories WHERE id IN ({placeholders})"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(memory_ids.iter()), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            MemoryMutationTarget {
-                project_path: row.get(1)?,
-                category: row.get(2)?,
-                status: row.get(3)?,
-            },
-        ))
-    })?;
-
-    rows.collect::<Result<HashMap<_, _>, _>>()
-}
-
-fn fetch_memory_project_paths_in_tx(
-    tx: &Transaction<'_>,
-    memory_ids: &[i64],
-) -> Result<HashMap<i64, String>, rusqlite::Error> {
-    if memory_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let placeholders = memory_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!("SELECT id, project_path FROM memories WHERE id IN ({placeholders})");
-    let mut stmt = tx.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(memory_ids.iter()), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-
-    rows.collect::<Result<HashMap<_, _>, _>>()
-}
-
-fn normalize_memory_project_identities(paths: &HashMap<i64, String>) -> HashSet<String> {
-    paths
-        .values()
-        .map(|stored| normalize_stored_project_path(stored))
-        .filter(|identity| !identity.is_empty())
-        .collect()
-}
-
-fn verify_memory_project_path_unchanged(
-    tx: &Transaction<'_>,
-    memory_id: i64,
-    expected: &str,
-) -> Result<(), rusqlite::Error> {
-    let current: Option<String> = tx
-        .query_row(
-            "SELECT project_path FROM memories WHERE id = ?1",
-            params![memory_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-
-    if current.as_deref() == Some(expected) {
-        Ok(())
-    } else {
-        Err(mutation_race_error())
-    }
-}
-
-fn verify_bulk_memory_project_paths_unchanged(
-    tx: &Transaction<'_>,
-    expected: &HashMap<i64, String>,
-) -> Result<(), rusqlite::Error> {
-    if expected.is_empty() {
-        return Ok(());
-    }
-
-    let mut ids: Vec<i64> = expected.keys().copied().collect();
-    ids.sort_unstable();
-    let current = fetch_memory_project_paths_in_tx(tx, &ids)?;
-    if current == *expected {
-        Ok(())
-    } else {
-        Err(mutation_race_error())
-    }
-}
-
 fn bump_project_memory_epoch_for_identity(
     tx: &Transaction<'_>,
     identity: &str,
@@ -5972,37 +5840,6 @@ fn bump_project_memory_epoch_for_identity(
            project_memory_epoch = project_memory_epoch + 1,
            updated_at = excluded.updated_at",
         params![identity, now_millis()],
-    )?;
-    Ok(())
-}
-
-fn queue_memory_mutation(
-    tx: &Transaction<'_>,
-    project_path: &str,
-    mutation_type: &str,
-    target_memory_id: i64,
-    superseded_by_id: Option<i64>,
-    category: Option<&str>,
-    new_content: Option<&str>,
-) -> Result<(), rusqlite::Error> {
-    // Store the row under the resolved identity (git:/dir:), mirroring the plugin's
-    // queueMemoryMutation. The render-side filter queries by resolved identity, so a
-    // raw-path row would be invisible to it. Idempotent on already-resolved paths
-    // (every live memory row), defensive for any legacy raw path.
-    let identity = normalize_stored_project_path(project_path);
-    tx.execute(
-        "INSERT INTO memory_mutation_log
-           (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            identity,
-            mutation_type,
-            target_memory_id,
-            superseded_by_id,
-            category,
-            new_content,
-            now_millis()
-        ],
     )?;
     Ok(())
 }
@@ -6085,391 +5922,55 @@ pub fn invalidate_all_memory_block_caches(conn: &Connection) -> Result<usize, ru
 
 pub fn update_memory_status(
     conn: &mut Connection,
-    memory_id: i64,
-    new_status: &str,
-) -> Result<(), rusqlite::Error> {
-    // Reject any status outside the canonical set before touching the DB. A
-    // malformed call setting status="archive" (vs "archived") or any free string
-    // would make the memory vanish from active/permanent/archived logic with no
-    // valid epoch/delta interpretation.
-    if !matches!(new_status, "active" | "permanent" | "archived") {
-        return Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-            Some(format!(
-                "Invalid memory status '{new_status}' (expected active, permanent, or archived)."
-            )),
-        ));
-    }
-    // Phase A: resolve the target row before opening a write transaction.
-    let target = lookup_memory_mutation_target(conn, memory_id)?;
-    // Any transition that CHANGES which memories enter or how they rank in the
-    // m[0] baseline must bump the epoch to invalidate cached m[0]. That covers
-    // every status change into an injectable status (`active`/`permanent`) from a
-    // different status — including archived->active/permanent (restore) AND
-    // active<->permanent (pin/unpin), since memory selection is permanent-first
-    // under budget pressure, so pinning reorders the rendered set. Gating only on
-    // archived-origin left active<->permanent invalidating nothing.
-    let prior_status = target.status.as_deref();
-    let into_injectable = new_status == "active" || new_status == "permanent";
-    let needs_epoch_bump = into_injectable && prior_status != Some(new_status);
-    let project_identity = if needs_epoch_bump {
-        Some(normalize_stored_project_path(&target.project_path))
-    } else {
-        None
-    };
-    let is_archive = new_status == "archived" && prior_status != Some("archived");
-
-    // Phase B: re-check the target row, mutate, and queue/bump in one tx.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    verify_memory_project_path_unchanged(&tx, memory_id, &target.project_path)?;
-    tx.execute(
-        "UPDATE memories SET status = ?1, updated_at = ?2 WHERE id = ?3",
-        params![new_status, now_millis(), memory_id],
-    )?;
-    // Resolve workspace fan-out INSIDE the write transaction so a concurrent
-    // add-member committing between Phase A and here can't leave a new member's
-    // epoch un-bumped (it would then miss this restored memory).
-    let epoch_bump_identities = if let Some(ref id) = project_identity {
-        Some(crate::workspaces::workspace_member_identities_for_project(
-            &tx, id,
-        )?)
-    } else {
-        None
-    };
-    if let Some(identities) = epoch_bump_identities.as_ref() {
-        crate::workspaces::bump_epochs_for_identities(&tx, identities)?;
-    } else if is_archive {
-        queue_memory_mutation(
-            &tx,
-            &target.project_path,
-            "archive",
-            memory_id,
-            None,
-            target.category.as_deref(),
-            None,
-        )?;
-    }
-    tx.commit()?;
-    Ok(())
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    crate::memory_bridge::local_request(conn, "memory.edit", request)
 }
 
 pub fn update_memory_content(
     conn: &mut Connection,
-    memory_id: i64,
-    new_content: &str,
-) -> Result<(), rusqlite::Error> {
-    // Phase A: resolve the target row before opening a write transaction.
-    let target = lookup_memory_mutation_target(conn, memory_id)?;
-    let new_hash = normalize_hash(new_content);
-
-    // Phase B: re-check the target row, mutate, clear stale embeddings, and queue once.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    verify_memory_project_path_unchanged(&tx, memory_id, &target.project_path)?;
-
-    // Pre-check the UNIQUE(project_path, category, normalized_hash) constraint
-    // INSIDE the Immediate transaction (no TOCTOU). If editing this memory's
-    // content makes its hash match another memory in the same project+category,
-    // a plain UPDATE aborts with a raw `UNIQUE constraint failed: ...` string
-    // that surfaces verbatim in the dashboard toast. Mirror the TS plugin's
-    // friendly message so the user knows to merge/archive the duplicate.
-    // `category = ?2` (not `IS`): SQLite's UNIQUE treats NULL categories as
-    // distinct (NULLs never collide), and `category = NULL` is never true — so
-    // a NULL category yields no match here, exactly mirroring the constraint
-    // the real UPDATE would (not) violate. Avoids a false rejection on NULL.
-    let collision_id: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM memories
-             WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3 AND id != ?4
-             LIMIT 1",
-            params![target.project_path, target.category, new_hash, memory_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(existing_id) = collision_id {
-        // SqliteFailure(_, Some(msg)) Displays as exactly `msg`, so commands.rs's
-        // `.to_string()` surfaces this friendly text (not a raw SQLite error)
-        // in the dashboard toast. rusqlite 0.31 has no ModuleError variant.
-        return Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-            Some(format!(
-                "Memory content already exists as ID {existing_id} in this category; merge or archive the duplicate first."
-            )),
-        ));
-    }
-
-    tx.execute(
-        "UPDATE memories SET content = ?1, normalized_hash = ?2, updated_at = ?3 WHERE id = ?4",
-        params![new_content, new_hash, now_millis(), memory_id],
-    )?;
-    // The classify `shareable` verdict was scored against the OLD content; a
-    // dashboard content edit invalidates it. Fail closed → private; the dreamer
-    // re-scores later. Mirrors the plugin's updateMemoryContent. Column-guarded
-    // for pre-v44 DBs.
-    if memories_has_classify_columns(&tx) {
-        tx.execute(
-            "UPDATE memories SET shareable = 0 WHERE id = ?1",
-            params![memory_id],
-        )?;
-    }
-    tx.execute(
-        "DELETE FROM memory_embeddings WHERE memory_id = ?1",
-        params![memory_id],
-    )?;
-    queue_memory_mutation(
-        &tx,
-        &target.project_path,
-        "update",
-        memory_id,
-        None,
-        target.category.as_deref(),
-        Some(new_content),
-    )?;
-    tx.commit()?;
-    Ok(())
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    crate::memory_bridge::local_request(conn, "memory.edit", request)
 }
 
 pub fn update_memory_category(
     conn: &mut Connection,
-    memory_id: i64,
-    new_category: &str,
-) -> Result<(), rusqlite::Error> {
-    const VALID_CATEGORIES: [&str; 5] = [
-        "PROJECT_RULES",
-        "ARCHITECTURE",
-        "CONSTRAINTS",
-        "CONFIG_VALUES",
-        "NAMING",
-    ];
-
-    if !VALID_CATEGORIES.contains(&new_category) {
-        return Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-            Some(format!(
-                "Invalid category: {new_category}. Must be one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, NAMING."
-            )),
-        ));
-    }
-
-    // Phase A: resolve the target row before opening a write transaction.
-    let target = lookup_memory_mutation_target(conn, memory_id)?;
-
-    // No-op guard: changing a memory to its current category must NOT bump any
-    // epoch (that would force a needless hard fold across every workspace member).
-    if target.category.as_deref() == Some(new_category) {
-        return Ok(());
-    }
-
-    // Phase B: re-check the target row, mutate, and bump epochs once.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    verify_memory_project_path_unchanged(&tx, memory_id, &target.project_path)?;
-
-    let normalized_hash: String = tx.query_row(
-        "SELECT normalized_hash FROM memories WHERE id = ?1",
-        params![memory_id],
-        |row| row.get(0),
-    )?;
-
-    // Pre-check the UNIQUE(project_path, category, normalized_hash) constraint
-    let collision_id: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM memories
-             WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3 AND id != ?4
-             LIMIT 1",
-            params![
-                target.project_path,
-                new_category,
-                normalized_hash,
-                memory_id
-            ],
-            |row| row.get(0),
-        )
-        .optional()?;
-
-    if let Some(existing_id) = collision_id {
-        return Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-            Some(format!(
-                "Memory already exists as ID {existing_id} in {new_category}; merge or archive the duplicate first."
-            )),
-        ));
-    }
-
-    tx.execute(
-        "UPDATE memories SET category = ?1, updated_at = ?2 WHERE id = ?3",
-        params![new_category, now_millis(), memory_id],
-    )?;
-
-    // A category change is visibility- AND render-changing: it alters the heading
-    // a memory renders under in <project-memory>, and (in a workspace) can flip a
-    // foreign memory between shared and non-shared. Both change m[0] bytes, so bump
-    // member epochs to force a hard fold — exactly like update_memory_status. The
-    // hard fold re-renders m[0] from true memory state, so we do NOT also queue an
-    // m[1] "update" delta (epoch-bump XOR delta, matching the status path). Fan-out
-    // is resolved INSIDE the write tx so a concurrent add-member can't miss it.
-    let project_identity = normalize_stored_project_path(&target.project_path);
-    let epoch_bump_identities =
-        crate::workspaces::workspace_member_identities_for_project(&tx, &project_identity)?;
-    crate::workspaces::bump_epochs_for_identities(&tx, &epoch_bump_identities)?;
-
-    tx.commit()?;
-    Ok(())
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    crate::memory_bridge::local_request(conn, "memory.edit", request)
 }
 
-pub fn delete_memory(conn: &mut Connection, memory_id: i64) -> Result<(), rusqlite::Error> {
-    // Phase A: resolve the target row before opening a write transaction.
-    let target = lookup_memory_mutation_target(conn, memory_id)?;
-
-    // Phase B: re-check, queue before delete, then delete.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    verify_memory_project_path_unchanged(&tx, memory_id, &target.project_path)?;
-    queue_memory_mutation(
-        &tx,
-        &target.project_path,
-        "delete",
-        memory_id,
-        None,
-        target.category.as_deref(),
-        None,
-    )?;
-    tx.execute(
-        "DELETE FROM memory_embeddings WHERE memory_id = ?1",
-        params![memory_id],
-    )?;
-    tx.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])?;
-    tx.commit()?;
-    Ok(())
+/// Project-memory deletion is an undoable archive, never a physical deletion.
+pub fn delete_memory(
+    conn: &mut Connection,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    crate::memory_bridge::local_request(conn, "memory.edit", request)
 }
 
-/// Bulk-update status for a set of memory IDs in one transaction.
-///
-/// Empty input is a no-op and returns 0 (affected rows).
 pub fn bulk_update_memory_status(
     conn: &mut Connection,
-    memory_ids: &[i64],
-    new_status: &str,
-) -> Result<usize, rusqlite::Error> {
-    if memory_ids.is_empty() {
-        return Ok(0);
-    }
-
-    // Phase A: one read round-trip for all target rows, then identity normalization lock-free.
-    let phase_a_targets = fetch_memory_mutation_targets(conn, memory_ids)?;
-    let phase_a_paths: HashMap<i64, String> = phase_a_targets
-        .iter()
-        .map(|(id, target)| (*id, target.project_path.clone()))
-        .collect();
-    // Both `active` and `permanent` re-enter the m[0] baseline, so a bulk
-    // status change INTO either counts as a restore for epoch-bump purposes
-    // (matches update_memory_status). Only bump for rows whose status ACTUALLY
-    // changes — a no-op (already in new_status) must not bust the epoch and
-    // force a needless m[0]/m[1] rematerialization (mirrors the single-row
-    // `prior_status != Some(new_status)` gate).
-    let is_restore = new_status == "active" || new_status == "permanent";
-    let is_archive = new_status == "archived";
-    let changed_paths: HashMap<i64, String> = phase_a_targets
-        .iter()
-        .filter(|(_, target)| target.status.as_deref() != Some(new_status))
-        .map(|(id, target)| (*id, target.project_path.clone()))
-        .collect();
-    let phase_a_identities = if is_restore {
-        normalize_memory_project_identities(&changed_paths)
-    } else {
-        HashSet::new()
-    };
-
-    let placeholders = memory_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql =
-        format!("UPDATE memories SET status = ?, updated_at = ? WHERE id IN ({placeholders})");
-    let now = now_millis();
-
-    // Phase B: bulk re-verify, bulk update, then queue per archive or bump per restore.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    verify_bulk_memory_project_paths_unchanged(&tx, &phase_a_paths)?;
-    let affected = {
-        let status_value = new_status.to_string();
-        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(2 + memory_ids.len());
-        params_vec.push(&status_value);
-        params_vec.push(&now);
-        for id in memory_ids {
-            params_vec.push(id);
-        }
-        tx.execute(&sql, params_from_iter(params_vec))?
-    };
-    // Resolve workspace fan-out INSIDE the write transaction (same TOCTOU fix as
-    // update_memory_status): a concurrent add-member must not slip a new member
-    // in with a stale epoch between Phase A and the bump.
-    if is_restore {
-        let mut epoch_bump_identities = HashSet::new();
-        for identity in &phase_a_identities {
-            epoch_bump_identities.extend(
-                crate::workspaces::workspace_member_identities_for_project(&tx, identity)?,
-            );
-        }
-        crate::workspaces::bump_epochs_for_identities(&tx, &epoch_bump_identities)?;
-    } else if is_archive {
-        for id in memory_ids {
-            if let Some(target) = phase_a_targets.get(id) {
-                if target.status.as_deref() != Some("archived") {
-                    queue_memory_mutation(
-                        &tx,
-                        &target.project_path,
-                        "archive",
-                        *id,
-                        None,
-                        target.category.as_deref(),
-                        None,
-                    )?;
-                }
-            }
-        }
-    }
-    tx.commit()?;
-    Ok(affected)
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    crate::memory_bridge::local_request(conn, "memory.edit", request)
 }
 
-/// Bulk-delete memories and their embeddings in one transaction.
+/// Archive all requested rows atomically, save one history event and retry result,
+/// and send one rebuild signal per affected project.
 pub fn bulk_delete_memory(
     conn: &mut Connection,
-    memory_ids: &[i64],
-) -> Result<usize, rusqlite::Error> {
-    if memory_ids.is_empty() {
-        return Ok(0);
-    }
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    crate::memory_bridge::local_request(conn, "memory.edit", request)
+}
 
-    // Phase A: one read round-trip for all target rows, then identity normalization lock-free.
-    let phase_a_targets = fetch_memory_mutation_targets(conn, memory_ids)?;
-    let phase_a_paths: HashMap<i64, String> = phase_a_targets
-        .iter()
-        .map(|(id, target)| (*id, target.project_path.clone()))
-        .collect();
-    let placeholders = memory_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-
-    // Phase B: bulk re-verify, queue one delete per memory, then delete.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    verify_bulk_memory_project_paths_unchanged(&tx, &phase_a_paths)?;
-    for id in memory_ids {
-        if let Some(target) = phase_a_targets.get(id) {
-            queue_memory_mutation(
-                &tx,
-                &target.project_path,
-                "delete",
-                *id,
-                None,
-                target.category.as_deref(),
-                None,
-            )?;
-        }
-    }
-    {
-        let sql = format!("DELETE FROM memory_embeddings WHERE memory_id IN ({placeholders})");
-        tx.execute(&sql, params_from_iter(memory_ids.iter()))?;
-    }
-    let affected = {
-        let sql = format!("DELETE FROM memories WHERE id IN ({placeholders})");
-        tx.execute(&sql, params_from_iter(memory_ids.iter()))?
-    };
-    tx.commit()?;
-    Ok(affected)
+pub async fn memory_request(
+    path: &Path,
+    method: &str,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    crate::memory_bridge::request(path, method, request).await
 }
 
 // ── Session queries ─────────────────────────────────────────
@@ -12057,8 +11558,8 @@ mod memory_project_filter_tests {
         insert_memory_with_content(&conn, "nothing special", 2000);
         insert_memory_with_content(&conn, r"the tree lives under C:\Users\dev", 3000);
 
-        let rows = get_memories(&conn, None, None, None, None, Some(r"\n"), 100, 0)
-            .expect("get_memories");
+        let rows =
+            get_memories(&conn, None, None, None, None, Some(r"\n"), 100, 0).expect("get_memories");
         assert_eq!(rows.iter().map(|m| m.id).collect::<Vec<_>>(), vec![literal]);
 
         // A Windows path whose FTS tokens match nothing exactly falls back to

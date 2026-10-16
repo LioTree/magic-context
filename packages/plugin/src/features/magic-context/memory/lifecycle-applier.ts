@@ -12,6 +12,14 @@ import { sessionShowsMemoryText } from "./applied-projection";
 import { CATEGORY_DEFAULT_TTL } from "./constants";
 import { embedTextForProject } from "./embedding";
 import { invalidateMemory } from "./embedding-cache";
+import {
+    makeMemoryHistoryDecision,
+    memoryHistoryJson,
+    memoryHistorySnapshot,
+    normalizeMemoryHistorySnapshot,
+    recordMemoryHistoryDecision,
+} from "./history-applier";
+import type { MemoryHistoryDecision } from "./history-contract";
 import { checkMemoryRevision } from "./lifecycle-check-ledger";
 import { MAX_STAGE2_ATTEMPTS } from "./lifecycle-constants";
 import type { CheckReply, CheckRequest, ReportedProfile } from "./lifecycle-gates";
@@ -37,6 +45,14 @@ import {
 } from "./storage-memory";
 import { saveEmbeddingIfHashMatches } from "./storage-memory-embeddings";
 import { recordMemoryVerifications } from "./storage-memory-verifications";
+
+export {
+    applyDashboardMemoryEdit,
+    applyMemoryRestore,
+    listMemoryHistory,
+    previewMemoryRestore,
+} from "./history-applier";
+
 import type { Memory, MemoryInput } from "./types";
 
 export type AdoptionClass = "live" | "deferred" | null;
@@ -208,6 +224,27 @@ export function applyMemoryVerification(
                     }),
                     memory.id,
                 );
+            }
+            if (mutation && !refusalReason) {
+                const mutationKey = `${request.key}:mutation`;
+                const saved = db
+                    .prepare("SELECT before_json FROM memory_journal WHERE decision_key=?")
+                    .get(mutationKey) as { before_json: string } | null;
+                if (saved) {
+                    const decision = JSON.parse(saved.before_json) as MemoryHistoryDecision;
+                    const after = memoryHistorySnapshot(db, memory.id)!;
+                    decision.rows[0]!.after = after;
+                    db.prepare(
+                        "UPDATE memory_history SET after_json=? WHERE decision_key=? AND memory_id=?",
+                    ).run(
+                        memoryHistoryJson({ version: 1, snapshot: after }),
+                        mutationKey,
+                        memory.id,
+                    );
+                    db.prepare(
+                        "UPDATE memory_journal SET before_json=?,after_json=? WHERE decision_key=?",
+                    ).run(memoryHistoryJson(decision), memoryHistoryJson(decision), mutationKey);
+                }
             }
             const receipt = record(
                 "applied",
@@ -525,41 +562,42 @@ export function resolveFactDecision(
         .immediate();
 }
 
-/**
- * Record an automated writer's direct edit of one memory (such as an expiry
- * archive) as undo history. The caller has already changed
- * the row inside the same transaction. Automated edits write no mutation-log row
- * and no agent fragment: cached prompts adopt them only at the next independently
- * authorized full history rebuild (HARD fold).
- */
+/** Record an automated transaction without signaling an external-editor epoch. */
 export function recordAutomatedMemoryEdit(
     db: Database,
-    input: {
-        writer: "verify" | "expire";
-        before: Memory;
-        reason: string;
-    },
+    input: { writer: "verify" | "expire"; before: Memory; reason: string },
 ): void {
     const revision = getMemoryRevision(db, input.before.id);
     if (revision === null) return;
-    const after = getMemoryById(db, input.before.id);
-    const key = `${input.writer}:${input.before.id}:${revision}`;
-    db.prepare(
-        "INSERT OR IGNORE INTO memory_history(memory_id,revision,previous_text,after_text,before_json,after_json,applied_at,reason,evidence_json,source_ids_json,decision_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-    ).run(
+    const before = normalizeMemoryHistorySnapshot(input.before, revision)!;
+    db.prepare("UPDATE memories SET revision=revision+1 WHERE id=? AND revision=?").run(
         input.before.id,
         revision,
-        input.before.content,
-        after?.content ?? input.before.content,
-        JSON.stringify(input.before),
-        JSON.stringify(after),
-        Date.now(),
-        input.reason,
-        "[]",
-        JSON.stringify([input.before.id]),
-        key,
     );
-    db.prepare("UPDATE memories SET revision=revision+1 WHERE id=?").run(input.before.id);
+    const after = memoryHistorySnapshot(db, input.before.id)!;
+    const key = `${input.writer}:${input.before.id}:${revision}`;
+    const decision = makeMemoryHistoryDecision({
+        key,
+        projectPath: input.before.projectPath,
+        writer: input.writer,
+        operation: "archive",
+        reason: input.reason,
+        now: Date.now(),
+        before: [before],
+        after: [after],
+        sourceIds: [input.before.id],
+    });
+    recordMemoryHistoryDecision(db, decision);
+    db.prepare(
+        "INSERT INTO memory_journal(project_path,decision_key,operation,receipt_json,applied_at,before_json,after_json) VALUES(?,?,?,'{}',?,?,?)",
+    ).run(
+        input.before.projectPath,
+        key,
+        input.writer,
+        decision.appliedAt,
+        memoryHistoryJson(decision),
+        memoryHistoryJson(decision),
+    );
 }
 
 export interface AgentMemoryMutation {
@@ -863,24 +901,21 @@ function applyMemoryMutation(
             const after = sources.map((source) => snapshotMemoryRow(db, source.id));
             if (canonical && !sources.some((source) => source.id === canonical.id))
                 after.push(snapshotMemoryRow(db, canonical.id));
-            for (const [index, source] of sources.entries()) {
-                const afterRow = getMemoryById(db, source.id)!;
-                db.prepare(
-                    "INSERT INTO memory_history(memory_id,revision,previous_text,after_text,before_json,after_json,applied_at,reason,evidence_json,source_ids_json,decision_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                ).run(
-                    source.id,
-                    request.targets[index]!.revision,
-                    source.content,
-                    afterRow.content,
-                    JSON.stringify(before[index]),
-                    JSON.stringify(after[index]),
-                    Date.now(),
-                    request.reason ?? `${writer}_${request.operation}`,
-                    "[]",
-                    JSON.stringify(sources.map((memory) => memory.id)),
-                    request.key,
-                );
-            }
+            const historyDecision = makeMemoryHistoryDecision({
+                key: request.key,
+                projectPath: first.projectPath,
+                writer,
+                operation: request.operation,
+                reason: request.reason ?? `${writer}_${request.operation}`,
+                now: Date.now(),
+                before: before.map((row) =>
+                    row === null ? null : normalizeMemoryHistorySnapshot(row),
+                ),
+                after: after.map((row) => normalizeMemoryHistorySnapshot(row)!),
+                sourceIds: sources.map((source) => source.id),
+                survivorId: request.operation === "merge" ? canonical?.id : null,
+            });
+            recordMemoryHistoryDecision(db, historyDecision);
             if (!automated)
                 recordAgentFragment(db, {
                     sessionId: request.sourceSessionId,
@@ -913,7 +948,11 @@ function applyMemoryMutation(
             });
             db.prepare(
                 "UPDATE memory_journal SET before_json=?,after_json=? WHERE decision_key=?",
-            ).run(JSON.stringify(before), JSON.stringify(after), request.key);
+            ).run(
+                memoryHistoryJson(historyDecision),
+                memoryHistoryJson(historyDecision),
+                request.key,
+            );
             return receipt;
         })
         .immediate();
@@ -1096,6 +1135,7 @@ function commitMemoryRevision(
     plan: Extract<GatePlan, { ok: true }>,
     factId?: number,
 ): ApplierReceipt {
+    const before = context.sources.map((source) => memoryHistorySnapshot(db, source.id));
     const survivor = getMemoryById(db, decision.survivorId)!;
     let survivorId = survivor.id;
     if (decision.action === "replaces")
@@ -1123,18 +1163,6 @@ function commitMemoryRevision(
             }>,
     );
     for (const source of context.sources) {
-        db.prepare(
-            "INSERT INTO memory_history(memory_id,revision,previous_text,applied_at,reason,evidence_json,source_ids_json,decision_key) VALUES(?,?,?,?,?,?,?,?)",
-        ).run(
-            source.id,
-            source.revision,
-            source.content,
-            Date.now(),
-            decision.action,
-            JSON.stringify(plan.spans),
-            JSON.stringify(context.sources.map((row) => row.id)),
-            decision.key,
-        );
         if (source.id === survivorId) {
             updateMemoryContent(
                 db,
@@ -1165,7 +1193,26 @@ function commitMemoryRevision(
                 "INSERT INTO memory_clause_evidence(memory_id,revision,clause_ordinal,text_hash,evidence_json) VALUES(?,?,?,?,?)",
             ).run(survivorId, survivorRevision, clause.ordinal, hash, JSON.stringify(evidence));
     }
-    return recordReceipt(
+    const after = context.sources.map((source) => memoryHistorySnapshot(db, source.id)!);
+    if (!context.sources.some((source) => source.id === survivorId)) {
+        before.push(null);
+        after.push(memoryHistorySnapshot(db, survivorId)!);
+    }
+    const historyDecision = makeMemoryHistoryDecision({
+        key: decision.key,
+        projectPath: decision.projectPath,
+        writer: "historian",
+        operation: decision.action,
+        reason: decision.action,
+        now: Date.now(),
+        before,
+        after,
+        sourceIds: context.sources.map((row) => row.id),
+        survivorId,
+        evidence: plan.spans,
+    });
+    recordMemoryHistoryDecision(db, historyDecision);
+    const receipt = recordReceipt(
         db,
         {
             key: decision.key,
@@ -1175,6 +1222,12 @@ function commitMemoryRevision(
         },
         { state: "applied", reason: decision.action, memoryId: survivorId, adoptionClass: "live" },
     );
+    db.prepare("UPDATE memory_journal SET before_json=?,after_json=? WHERE decision_key=?").run(
+        memoryHistoryJson(historyDecision),
+        memoryHistoryJson(historyDecision),
+        decision.key,
+    );
+    return receipt;
 }
 export function releaseMemoryReservations(
     db: Database,

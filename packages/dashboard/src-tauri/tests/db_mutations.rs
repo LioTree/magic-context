@@ -32,7 +32,13 @@ fn create_schema(conn: &Connection) {
             verified_at INTEGER,
             superseded_by_memory_id INTEGER,
             merged_from TEXT,
-            metadata_json TEXT
+            metadata_json TEXT,
+            revision INTEGER NOT NULL DEFAULT 1,
+            importance INTEGER DEFAULT 50,
+            scope TEXT DEFAULT 'project',
+            shareable INTEGER DEFAULT 0,
+            classified_at INTEGER,
+            UNIQUE(project_path,category,normalized_hash)
         );
         CREATE TABLE memory_embeddings (
             memory_id INTEGER PRIMARY KEY,
@@ -89,6 +95,10 @@ fn create_schema(conn: &Connection) {
             new_content TEXT,
             queued_at INTEGER NOT NULL
         );
+        CREATE TABLE memory_history (id INTEGER PRIMARY KEY AUTOINCREMENT,memory_id INTEGER NOT NULL,revision INTEGER NOT NULL,previous_text TEXT NOT NULL,after_text TEXT,before_json TEXT,after_json TEXT,applied_at INTEGER NOT NULL,reason TEXT NOT NULL,evidence_json TEXT NOT NULL,source_ids_json TEXT NOT NULL,decision_key TEXT NOT NULL,UNIQUE(memory_id,revision));
+        CREATE TABLE memory_journal(id INTEGER PRIMARY KEY AUTOINCREMENT,project_path TEXT NOT NULL,decision_key TEXT NOT NULL UNIQUE,operation TEXT NOT NULL,receipt_json TEXT NOT NULL,applied_at INTEGER NOT NULL,before_json TEXT,after_json TEXT);
+        CREATE TABLE memory_decision_receipts(decision_key TEXT PRIMARY KEY,project_path TEXT NOT NULL,fact_id INTEGER,receipt_json TEXT NOT NULL,resolved_at INTEGER NOT NULL);
+        CREATE TABLE memory_successor_links(source_id INTEGER NOT NULL,successor_id INTEGER NOT NULL,decision_key TEXT NOT NULL,PRIMARY KEY(source_id,successor_id));
         CREATE TABLE tx_probe (value TEXT NOT NULL);
         CREATE TABLE notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,12 +118,58 @@ fn create_schema(conn: &Connection) {
     .expect("create schema");
 }
 
+fn audited_edit(
+    conn: &mut Connection,
+    ids: &[i64],
+    field: &str,
+    value: &str,
+) -> Result<serde_json::Value, String> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let project: String = conn
+        .query_row(
+            "SELECT project_path FROM memories WHERE id=?1",
+            [ids[0]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let expected = ids
+        .iter()
+        .map(|id| mc_store::memory_history::RevisionExpectation {
+            memory_id: *id,
+            revision: conn
+                .query_row("SELECT revision FROM memories WHERE id=?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let operation = format!(
+        "test-{}",
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let request = magic_context_dashboard_lib::memory_bridge::edit_request(
+        &project, &operation, ids, &expected, field, value,
+    );
+    match field {
+        "content" => db::update_memory_content(conn, &request),
+        "category" => db::update_memory_category(conn, &request),
+        _ if ids.len() > 1 => db::bulk_update_memory_status(conn, &request),
+        _ => db::update_memory_status(conn, &request),
+    }
+}
+
 fn insert_memory(conn: &Connection, project_path: &str, status: &str) -> i64 {
+    let next: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id),0)+1 FROM memories", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let content = format!("memory {next} for {project_path}");
     conn.execute(
         "INSERT INTO memories
            (project_path, category, content, normalized_hash, status, created_at, updated_at, first_seen_at, last_seen_at)
          VALUES (?1, 'CONSTRAINTS', ?2, ?3, ?4, 1, 1, 1, 1)",
-        params![project_path, format!("memory for {project_path}"), format!("hash-{project_path}"), status],
+        params![project_path, content, mc_store::memory_history::normalized_hash(&content), status],
     )
     .expect("insert memory");
     conn.last_insert_rowid()
@@ -178,25 +234,24 @@ fn seed_project_state(conn: &Connection, project_path: &str, memory_epoch: i64, 
 }
 
 #[test]
-fn archive_memory_status_queues_mutation_without_epoch_bump() {
+fn archive_memory_status_is_audited_and_bumps_epoch_without_delta() {
     let mut conn = make_db();
     let id = insert_memory(&conn, "git:project-a", "active");
     seed_project_state(&conn, "git:project-a", 9, 0);
-    seed_project_state(&conn, "git:unrelated", 7, 0);
-
-    db::update_memory_status(&mut conn, id, "archived").expect("update status");
-
-    assert_eq!(memory_epoch(&conn, "git:project-a"), 9);
-    assert_eq!(memory_epoch(&conn, "git:unrelated"), 7);
+    seed_project_state(&conn, "git:other", 5, 0);
+    let receipt = audited_edit(&mut conn, &[id], "status", "archived").unwrap();
+    assert_eq!(receipt["state"], "applied");
+    assert_eq!(memory_epoch(&conn, "git:project-a"), 10);
+    assert_eq!(memory_epoch(&conn, "git:other"), 5);
+    assert!(mutation_log_rows(&conn).is_empty());
     assert_eq!(
-        mutation_log_rows(&conn),
-        vec![(
-            "git:project-a".to_string(),
-            "archive".to_string(),
-            id,
-            Some("CONSTRAINTS".to_string()),
-            None,
-        )]
+        conn.query_row(
+            "SELECT COUNT(*) FROM memory_history WHERE memory_id=?1",
+            [id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
     );
 }
 
@@ -206,7 +261,7 @@ fn restore_memory_status_keeps_epoch_bump_without_mutation_log() {
     let id = insert_memory(&conn, "git:project-a", "archived");
     seed_project_state(&conn, "git:project-a", 9, 0);
 
-    db::update_memory_status(&mut conn, id, "active").expect("restore status");
+    audited_edit(&mut conn, &[id], "status", "active").expect("restore status");
 
     assert_eq!(memory_epoch(&conn, "git:project-a"), 10);
     assert!(mutation_log_rows(&conn).is_empty());
@@ -222,7 +277,7 @@ fn pin_active_to_permanent_bumps_epoch_without_mutation_log() {
     let id = insert_memory(&conn, "git:project-a", "active");
     seed_project_state(&conn, "git:project-a", 9, 0);
 
-    db::update_memory_status(&mut conn, id, "permanent").expect("pin status");
+    audited_edit(&mut conn, &[id], "status", "permanent").expect("pin status");
 
     assert_eq!(memory_epoch(&conn, "git:project-a"), 10);
     assert!(mutation_log_rows(&conn).is_empty());
@@ -234,7 +289,7 @@ fn unpin_permanent_to_active_bumps_epoch_without_mutation_log() {
     let id = insert_memory(&conn, "git:project-a", "permanent");
     seed_project_state(&conn, "git:project-a", 9, 0);
 
-    db::update_memory_status(&mut conn, id, "active").expect("unpin status");
+    audited_edit(&mut conn, &[id], "status", "active").expect("unpin status");
 
     assert_eq!(memory_epoch(&conn, "git:project-a"), 10);
     assert!(mutation_log_rows(&conn).is_empty());
@@ -247,108 +302,104 @@ fn no_op_status_change_does_not_bump_epoch() {
     let id = insert_memory(&conn, "git:project-a", "active");
     seed_project_state(&conn, "git:project-a", 9, 0);
 
-    db::update_memory_status(&mut conn, id, "active").expect("no-op status");
+    audited_edit(&mut conn, &[id], "status", "active").expect("no-op status");
 
     assert_eq!(memory_epoch(&conn, "git:project-a"), 9);
     assert!(mutation_log_rows(&conn).is_empty());
 }
 
 #[test]
-fn bulk_archive_memory_status_queues_one_mutation_per_memory_without_epoch_bumps() {
+fn bulk_archive_status_has_one_audited_decision_and_one_epoch() {
     let mut conn = make_db();
-    let a1 = insert_memory(&conn, "git:project-a", "active");
-    let a2 = insert_memory(&conn, "git:project-a", "active");
-    let b1 = insert_memory(&conn, "dir:bbbbbbbbbbbb", "active");
-    seed_project_state(&conn, "git:project-a", 4, 0);
-    seed_project_state(&conn, "dir:bbbbbbbbbbbb", 6, 0);
-    seed_project_state(&conn, "git:unrelated", 3, 0);
-
-    let affected =
-        db::bulk_update_memory_status(&mut conn, &[a1, a2, b1], "archived").expect("bulk update");
-
-    assert_eq!(affected, 3);
-    assert_eq!(memory_epoch(&conn, "git:project-a"), 4);
-    assert_eq!(memory_epoch(&conn, "dir:bbbbbbbbbbbb"), 6);
-    assert_eq!(memory_epoch(&conn, "git:unrelated"), 3);
+    let first = insert_memory(&conn, "git:project-a", "active");
+    let second = insert_memory(&conn, "git:project-a", "permanent");
+    let other = insert_memory(&conn, "git:other", "active");
+    seed_project_state(&conn, "git:project-a", 9, 0);
+    seed_project_state(&conn, "git:other", 5, 0);
+    let receipt = audited_edit(&mut conn, &[first, second], "status", "archived").unwrap();
+    assert_eq!(receipt["state"], "applied");
+    assert_eq!(receipt["revisions"].as_array().unwrap().len(), 2);
+    assert_eq!(memory_epoch(&conn, "git:project-a"), 10);
+    assert_eq!(memory_epoch(&conn, "git:other"), 5);
+    assert!(mutation_log_rows(&conn).is_empty());
     assert_eq!(
-        mutation_log_rows(&conn),
-        vec![
-            (
-                "git:project-a".to_string(),
-                "archive".to_string(),
-                a1,
-                Some("CONSTRAINTS".to_string()),
-                None,
-            ),
-            (
-                "git:project-a".to_string(),
-                "archive".to_string(),
-                a2,
-                Some("CONSTRAINTS".to_string()),
-                None,
-            ),
-            (
-                "dir:bbbbbbbbbbbb".to_string(),
-                "archive".to_string(),
-                b1,
-                Some("CONSTRAINTS".to_string()),
-                None,
-            ),
-        ]
+        conn.query_row(
+            "SELECT COUNT(DISTINCT decision_key) FROM memory_history",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT status FROM memories WHERE id=?1", [other], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        "active"
     );
 }
 
 #[test]
-fn bulk_delete_memories_queues_one_delete_per_memory_without_epoch_bumps() {
+fn bulk_delete_archives_rows_in_one_undoable_decision() {
     let mut conn = make_db();
-    let a1 = insert_memory(&conn, "git:project-a", "active");
-    let a2 = insert_memory(&conn, "git:project-a", "active");
-    let b1 = insert_memory(&conn, "git:project-b", "active");
+    let first = insert_memory(&conn, "git:project-a", "active");
+    let second = insert_memory(&conn, "git:project-a", "active");
     let other = insert_memory(&conn, "git:other", "active");
-    seed_project_state(&conn, "git:project-a", 2, 0);
-    seed_project_state(&conn, "git:project-b", 3, 0);
-    seed_project_state(&conn, "git:other", 5, 0);
-
-    let affected = db::bulk_delete_memory(&mut conn, &[a1, a2, b1]).expect("bulk delete");
-
-    assert_eq!(affected, 3);
-    assert_eq!(memory_epoch(&conn, "git:project-a"), 2);
-    assert_eq!(memory_epoch(&conn, "git:project-b"), 3);
-    assert_eq!(memory_epoch(&conn, "git:other"), 5);
-    assert_eq!(
-        mutation_log_rows(&conn),
-        vec![
-            (
-                "git:project-a".to_string(),
-                "delete".to_string(),
-                a1,
-                Some("CONSTRAINTS".to_string()),
-                None,
-            ),
-            (
-                "git:project-a".to_string(),
-                "delete".to_string(),
-                a2,
-                Some("CONSTRAINTS".to_string()),
-                None,
-            ),
-            (
-                "git:project-b".to_string(),
-                "delete".to_string(),
-                b1,
-                Some("CONSTRAINTS".to_string()),
-                None,
-            ),
-        ]
+    let ids = [first, second];
+    let expected = ids
+        .iter()
+        .map(|id| mc_store::memory_history::RevisionExpectation {
+            memory_id: *id,
+            revision: 1,
+        })
+        .collect::<Vec<_>>();
+    let request = magic_context_dashboard_lib::memory_bridge::edit_request(
+        "git:project-a",
+        "delete",
+        &ids,
+        &expected,
+        "status",
+        "archived",
     );
-    let remaining: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM memories WHERE id = ?1",
-            params![other],
-            |row| row.get(0),
-        )
-        .expect("remaining count");
-    assert_eq!(remaining, 1);
+    let receipt = db::bulk_delete_memory(&mut conn, &request).unwrap();
+    assert_eq!(receipt["state"], "applied");
+    assert_eq!(memory_epoch(&conn, "git:project-a"), 1);
+    assert_eq!(memory_epoch(&conn, "git:other"), 0);
+    assert!(mutation_log_rows(&conn).is_empty());
+    for id in ids {
+        assert_eq!(
+            conn.query_row("SELECT status FROM memories WHERE id=?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "archived"
+        );
+    }
+    assert_eq!(
+        conn.query_row("SELECT status FROM memories WHERE id=?1", [other], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        "active"
+    );
+    let undo = serde_json::json!({ "projectPath":"git:project-a", "operationId":"undo-delete", "decisionKey":receipt["decisionKey"], "expectedRevisions":receipt["revisions"] });
+    let restored = magic_context_dashboard_lib::memory_bridge::local_request(
+        &mut conn,
+        "memory.restore",
+        &undo,
+    )
+    .unwrap();
+    assert_eq!(restored["state"], "applied");
+    for id in ids {
+        assert_eq!(
+            conn.query_row("SELECT status FROM memories WHERE id=?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "active"
+        );
+    }
 }
 
 #[test]
@@ -506,7 +557,7 @@ fn routine_memory_mutation_does_not_clear_memory_block_caches() {
     )
     .expect("insert session meta");
 
-    db::update_memory_status(&mut conn, id, "archived").expect("update status");
+    audited_edit(&mut conn, &[id], "status", "archived").expect("update status");
 
     let row: (String, String, Vec<u8>, Vec<u8>, i64) = conn
         .query_row(
@@ -528,50 +579,44 @@ fn routine_memory_mutation_does_not_clear_memory_block_caches() {
 }
 
 #[test]
-fn bulk_update_binds_status_as_value_and_ids_as_parameters() {
+fn bulk_update_refuses_invalid_status_without_sql_side_effects() {
     let mut conn = make_db();
     let target = insert_memory(&conn, "git:project-a", "active");
-    let untouched = insert_memory(&conn, "git:project-b", "active");
-    let malicious_status = "archived', project_path = 'git:evil";
-
-    db::bulk_update_memory_status(&mut conn, &[target], malicious_status).expect("bulk update");
-
-    let stored: String = conn
-        .query_row(
-            "SELECT status FROM memories WHERE id = ?1",
-            params![target],
-            |row| row.get(0),
-        )
-        .expect("target status");
-    let untouched_status: String = conn
-        .query_row(
-            "SELECT status FROM memories WHERE id = ?1",
-            params![untouched],
-            |row| row.get(0),
-        )
-        .expect("untouched status");
-    assert_eq!(stored, malicious_status);
-    assert_eq!(untouched_status, "active");
+    let other = insert_memory(&conn, "git:project-a", "active");
+    let receipt = audited_edit(
+        &mut conn,
+        &[target],
+        "status",
+        "archived'; DELETE FROM memories; --",
+    )
+    .unwrap();
+    assert_eq!(receipt["state"], "refused");
+    assert_eq!(receipt["reason"], "invalid_request");
+    for id in [target, other] {
+        assert_eq!(
+            conn.query_row("SELECT status FROM memories WHERE id=?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "active"
+        );
+    }
 }
 
 #[test]
-fn update_memory_content_queues_update_without_epoch_bump() {
+fn update_memory_content_has_history_and_epoch_without_delta() {
     let mut conn = make_db();
     let id = insert_memory(&conn, "git:project-a", "active");
     seed_project_state(&conn, "git:project-a", 11, 0);
-
-    db::update_memory_content(&mut conn, id, "new dashboard content").expect("update content");
-
-    assert_eq!(memory_epoch(&conn, "git:project-a"), 11);
+    let receipt = audited_edit(&mut conn, &[id], "content", "new dashboard content").unwrap();
+    assert_eq!(receipt["state"], "applied");
+    assert_eq!(memory_epoch(&conn, "git:project-a"), 12);
+    assert!(mutation_log_rows(&conn).is_empty());
     assert_eq!(
-        mutation_log_rows(&conn),
-        vec![(
-            "git:project-a".to_string(),
-            "update".to_string(),
-            id,
-            Some("CONSTRAINTS".to_string()),
-            Some("new dashboard content".to_string()),
-        )]
+        conn.query_row("SELECT revision FROM memories WHERE id=?1", [id], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
     );
 }
 
@@ -615,7 +660,7 @@ fn raw_path_memory_mutation_uses_directory_fallback_identity() {
     };
 
     let mut conn = Connection::open(&db_path).expect("open db file");
-    db::update_memory_status(&mut conn, memory_id, "active").expect("restore memory");
+    audited_edit(&mut conn, &[memory_id], "status", "active").expect("restore memory");
 
     let expected_identity = normalize_stored_project_path(&raw_project_path);
     assert_eq!(memory_epoch(&conn, &expected_identity), 1);
@@ -656,7 +701,7 @@ fn test_update_memory_category_success() {
     let id = insert_memory(&conn, "git:project-a", "active");
     seed_project_state(&conn, "git:project-a", 11, 0);
 
-    db::update_memory_category(&mut conn, id, "NAMING").expect("update category");
+    audited_edit(&mut conn, &[id], "category", "NAMING").expect("update category");
 
     // Verify category is updated
     let category: String = conn
@@ -668,9 +713,9 @@ fn test_update_memory_category_success() {
         .expect("get category");
     assert_eq!(category, "NAMING");
 
-    // A category change is render- AND visibility-changing (heading + workspace
-    // shared/non-shared flip), so it bumps the epoch to force a hard fold and
-    // writes NO m[1] mutation-log row (epoch-bump XOR delta, like status changes).
+    // Changing a category affects the heading and workspace visibility, so the
+    // project change counter asks sessions to rebuild. Dashboard edits never add
+    // agent-only prompt update lines or mutation-log rows.
     assert_eq!(memory_epoch(&conn, "git:project-a"), 12);
     assert_eq!(mutation_log_rows(&conn), vec![]);
 }
@@ -691,7 +736,7 @@ fn update_memory_category_noop_does_not_bump_epoch() {
         .expect("get category");
     seed_project_state(&conn, "git:project-a", 5, 0);
 
-    db::update_memory_category(&mut conn, id, &current).expect("noop category update");
+    audited_edit(&mut conn, &[id], "category", &current).expect("noop category update");
 
     assert_eq!(memory_epoch(&conn, "git:project-a"), 5);
     assert_eq!(mutation_log_rows(&conn), vec![]);
@@ -720,11 +765,13 @@ fn test_update_memory_category_collision() {
     // Memory 2 exists with category NAMING; we don't need its id below.
 
     // Try to update Memory 1's category to NAMING. This should collide with Memory 2.
-    let res = db::update_memory_category(&mut conn, id1, "NAMING");
-    assert!(res.is_err());
-    let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("Memory already exists as ID"));
-    assert!(err_msg.contains("in NAMING"));
+    // Both rows use the production hash so the category change truly collides.
+    let hash = mc_store::memory_history::normalized_hash("same content");
+    conn.execute("UPDATE memories SET normalized_hash=?1", [hash])
+        .unwrap();
+    let receipt = audited_edit(&mut conn, &[id1], "category", "NAMING").unwrap();
+    assert_eq!(receipt["state"], "conflict");
+    assert_eq!(receipt["reason"], "duplicate_content");
 
     // Verify Memory 1's category was NOT changed
     let category: String = conn
@@ -742,10 +789,9 @@ fn test_update_memory_category_invalid() {
     let mut conn = make_db();
     let id = insert_memory(&conn, "git:project-a", "active");
 
-    let res = db::update_memory_category(&mut conn, id, "INVALID_CATEGORY");
-    assert!(res.is_err());
-    let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("Invalid category: INVALID_CATEGORY"));
+    let receipt = audited_edit(&mut conn, &[id], "category", "INVALID_CATEGORY").unwrap();
+    assert_eq!(receipt["state"], "refused");
+    assert_eq!(receipt["reason"], "invalid_request");
 
     // Verify category was NOT changed
     let category: String = conn
@@ -799,6 +845,11 @@ fn managed_memory_update_is_rejected_by_the_database_guard() {
     }
 
     let mut conn = db::open_readwrite(&path).expect("open managed context db");
-    let error = db::update_memory_content(&mut conn, 1, "new").expect_err("guard must reject");
+    let receipt = audited_edit(&mut conn, &[1], "content", "new").unwrap();
+    assert_eq!(receipt["state"], "refused");
+    assert_eq!(receipt["reason"], "authority_unavailable");
+    let error = conn
+        .execute("UPDATE memories SET content='new' WHERE id=1", [])
+        .expect_err("database guard must also reject an unprivileged write");
     assert!(error.to_string().contains("managed by the Rust module"));
 }

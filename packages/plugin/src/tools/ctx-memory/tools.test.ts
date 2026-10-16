@@ -2146,7 +2146,7 @@ describe("createCtxMemoryTools", () => {
                     },
                 ]);
                 expect(db.prepare("SELECT COUNT(*) AS n FROM memory_history").get()).toEqual({
-                    n: 2,
+                    n: 3,
                 });
                 expect(getProjectMemoryEpoch(db, "/repo/project")).toBe(0);
                 expect(syncSessions).toEqual(["merge-session"]);

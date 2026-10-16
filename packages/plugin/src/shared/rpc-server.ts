@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readdirSync, readFileSync, unlinkSync } from "node:fs";
 import type { Server, ServerWebSocket } from "bun";
+import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { log } from "./logger";
 import {
     acknowledgeNotifications,
@@ -93,7 +94,10 @@ export class MagicContextRpcServer {
     // discovers/guesses the port.
     private readonly token = randomBytes(32).toString("hex");
 
-    constructor(storageDir: string, directory: string) {
+    constructor(
+        storageDir: string,
+        private readonly directory: string,
+    ) {
         this.portFilePath = rpcPortFilePath(storageDir, directory, process.pid, this.instanceId);
         this.portDir = rpcPortDir(storageDir, directory);
     }
@@ -179,6 +183,8 @@ export class MagicContextRpcServer {
                     kind: "OpenCode server",
                     token: this.token,
                     instance_id: this.instanceId,
+                    directory: this.directory,
+                    projectPath: resolveProjectIdentity(this.directory),
                 }),
             );
             log(`[rpc] server listening on 127.0.0.1:${this.port}`);

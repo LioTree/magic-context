@@ -27,6 +27,7 @@ pub mod git_archive;
 mod historian_claim;
 mod historian_telemetry;
 pub use historian_telemetry::{HistorianInvocation, HistorianRunTelemetry};
+pub mod memory_history;
 pub mod memory_lifecycle;
 pub mod memory_projection;
 pub mod move_inventory;
@@ -5549,6 +5550,7 @@ pub struct StoredCompartment {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryRevision {
+    pub project_memory_epoch: i64,
     pub project_paths: Vec<String>,
     pub reader_project_path: String,
     pub expiry_cutoff_ms: i64,
@@ -6781,6 +6783,10 @@ const FACADE_COMMAND_TABLES: &[&str] = &[
     "memory_pending_facts",
     "memory_conflict_links",
     "memory_classification_items",
+    "memory_history",
+    "memory_successor_links",
+    "memory_embeddings",
+    "memory_verifications",
 ];
 
 /// Transaction-scoped ports used by the module facade. Every method operates on the
@@ -6801,13 +6807,18 @@ pub fn with_automated_memory_mutation_tx<T>(
     if conn.is_autocommit() {
         return Err("automated memory mutation requires an active transaction".into());
     }
-    apply(
+    let before = memory_history::capture(conn)?;
+    let result = apply(
         &FacadeMutationTxn {
             tx: conn,
             automated: false,
         }
         .automated(),
-    )
+    )?;
+    let now = current_time_ms();
+    let key = memory_lifecycle::applier::fresh_decision_key("verify", now);
+    memory_history::finish_capture(conn, &before, &key, "verify", "update", now)?;
+    Ok(result)
 }
 
 impl<'a> FacadeMutationTxn<'a> {
@@ -7114,7 +7125,7 @@ impl<'a> FacadeMutationTxn<'a> {
             self.tx
                 .execute(
                     "UPDATE memories
-                        SET seen_count = ?1, retrieval_count = ?2, merged_from = ?3
+                        SET seen_count = ?1, retrieval_count = ?2, merged_from = ?3, revision = 1
                       WHERE id = ?4",
                     params![seen_count, retrieval_count, merged_from, target_id],
                 )
@@ -8501,13 +8512,44 @@ impl McStore {
         }
 
         let response = self.context_write(FACADE_COMMAND_TABLES, |tx| {
-            mutation(&FacadeMutationTxn {
+            let audited = matches!(action, "update" | "archive" | "merge")
+                && matches!(tool, "ctx_memory" | "memory.curate");
+            let before = if audited {
+                Some(memory_history::capture(tx).map_err(|error| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+                })?)
+            } else {
+                None
+            };
+            let response = mutation(&FacadeMutationTxn {
                 tx,
                 automated: false,
             })
             .map_err(|error| {
                 rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
-            })
+            })?;
+            if let Some(before) = before {
+                let now = current_time_ms();
+                let key = command_id
+                    .map(|id| format!("{tool}:{action}:{identity_scope}:{id}"))
+                    .unwrap_or_else(|| memory_lifecycle::applier::fresh_decision_key(tool, now));
+                memory_history::finish_capture(
+                    tx,
+                    &before,
+                    &key,
+                    if tool == "memory.curate" {
+                        "curate"
+                    } else {
+                        "ctx_memory"
+                    },
+                    action,
+                    now,
+                )
+                .map_err(|error| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+                })?;
+            }
+            Ok(response)
         })?;
         if let Some(command_id) = command_id {
             self.inner.with_conn_fenced(|tx| {
@@ -17755,43 +17797,60 @@ fn expire_memories_tx(
     Ok(VerificationApplyResult { accepted, rejected })
 }
 
-/// Record an automated writer's direct content edit as undo history and advance the
-/// memory's revision. The caller has already changed the row in this transaction.
+/// Save the complete before/after state and advance the memory's revision.
+/// Automation does not increment the dashboard counter that asks sessions to rebuild.
 fn record_automated_memory_edit_tx(
     tx: &rusqlite::Connection,
     memory_id: i64,
     before: &StoredMemoryFull,
-    after_text: &str,
+    _after_text: &str,
     reason: &str,
     now_ms: i64,
 ) -> rusqlite::Result<()> {
     let revision: i64 = tx.query_row(
-        "SELECT revision FROM memories WHERE id = ?1",
-        params![memory_id],
+        "SELECT revision FROM memories WHERE id=?1",
+        [memory_id],
         |row| row.get(0),
     )?;
     tx.execute(
-        "INSERT OR IGNORE INTO memory_history
-            (memory_id, revision, previous_text, after_text, applied_at, reason, before_json,
-             evidence_json, source_ids_json, decision_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?9, '[]', ?7, ?8)",
-        params![
-            memory_id,
-            revision,
-            before.content,
-            after_text,
-            now_ms,
-            reason,
-            serde_json::json!([memory_id]).to_string(),
-            format!("{reason}:{memory_id}:{revision}"),
-            serde_json::to_string(before)
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
-        ],
+        "UPDATE memories SET revision=revision+1 WHERE id=?1 AND revision=?2",
+        params![memory_id, revision],
     )?;
-    tx.execute(
-        "UPDATE memories SET revision = revision + 1 WHERE id = ?1",
-        params![memory_id],
-    )?;
+    let error = |error: String| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+    };
+    let prior = memory_history::normalize_snapshot(
+        &serde_json::to_value(before).map_err(|err| error(err.to_string()))?,
+        Some(revision),
+    );
+    let after = memory_history::snapshot(tx, memory_id)
+        .map_err(error)?
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let writer = if reason == "expired" {
+        "expire"
+    } else {
+        "verify"
+    };
+    let key = format!("{writer}:{memory_id}:{revision}");
+    let decision = memory_history::decision(
+        &key,
+        &before.project_path,
+        writer,
+        if reason.contains("update") {
+            "update"
+        } else {
+            "archive"
+        },
+        reason,
+        now_ms,
+        &[prior],
+        &[after],
+        &[memory_id],
+        None,
+        serde_json::json!([]),
+    );
+    memory_history::record_decision(tx, &decision).map_err(error)?;
+    tx.execute("INSERT INTO memory_journal(project_path,decision_key,operation,receipt_json,applied_at,before_json,after_json) VALUES(?1,?2,?3,'{}',?4,?5,?5)", params![before.project_path,key,writer,now_ms,memory_history::canonical_json(&decision)])?;
     Ok(())
 }
 

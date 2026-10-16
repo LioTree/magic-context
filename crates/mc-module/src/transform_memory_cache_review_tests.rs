@@ -51,7 +51,7 @@ fn assert_automated_memory_change(operation: &str) {
         "memories",
         "ses",
         "memory.curate",
-        operation,
+        operation.rsplit('_').next().unwrap(),
         Some(operation),
         |agent_tx| {
             let tx = agent_tx.automated();
@@ -116,7 +116,11 @@ fn assert_automated_memory_change(operation: &str) {
         )?;
         assert_eq!(previous, "cache_ttl is 5 minutes in config.ts.");
         assert_eq!(
-            serde_json::from_str::<Value>(&snapshot).unwrap()["status"],
+            mc_store::memory_history::normalize_snapshot(
+                &serde_json::from_str::<Value>(&snapshot).unwrap(),
+                None
+            )
+            .unwrap()["status"],
             "active"
         );
         if let Some(second) = second {
@@ -160,6 +164,49 @@ fn assert_automated_memory_change(operation: &str) {
     if !operation.ends_with("archive") {
         assert!(m0_bytes(&hard).contains(corrected));
     }
+    let page = s
+        .memory_history_rpc(
+            "memory.history",
+            &json!({ "projectPath":"git:proj", "memoryId":id }),
+            3,
+        )
+        .unwrap();
+    assert_eq!(page["decisions"].as_array().unwrap().len(), 1);
+    let key = page["decisions"][0]["decisionKey"].clone();
+    let preview = s
+        .memory_history_rpc(
+            "memory.restore.preview",
+            &json!({ "projectPath":"git:proj", "decisionKey":key }),
+            3,
+        )
+        .unwrap();
+    assert_eq!(preview["state"], "ready");
+    let restore = json!({ "projectPath":"git:proj", "decisionKey":key, "operationId":format!("{operation}-undo"), "expectedRevisions":preview["expectedRevisions"] });
+    let receipt = s.memory_history_rpc("memory.restore", &restore, 3).unwrap();
+    assert_eq!(receipt["state"], "applied");
+    assert_eq!(s.get_memory_full(id).unwrap().unwrap().status, "active");
+    assert_eq!(
+        s.get_memory_full(id).unwrap().unwrap().content,
+        "cache_ttl is 5 minutes in config.ts."
+    );
+    let epoch_hard = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(epoch_hard.action, "HARD");
+    assert!(
+        m0_bytes(&epoch_hard).contains("cache_ttl is 5 minutes"),
+        "restored HARD bytes: {}",
+        m0_bytes(&epoch_hard)
+    );
+    assert_eq!(
+        s.memory_history_rpc("memory.restore", &restore, 4).unwrap(),
+        receipt
+    );
+    s.arm_soft_refresh("ses").unwrap();
+    let after_epoch = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(after_epoch.action, "SOFT");
+    assert_eq!(
+        serde_json::to_vec(after_epoch.messages()).unwrap(),
+        serde_json::to_vec(epoch_hard.messages()).unwrap()
+    );
 }
 
 #[test]
@@ -913,13 +960,30 @@ fn noprop_agent_m1_fingerprint_matches_baseline() {
 fn assert_module_verification_cache(kind: &str) {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path());
-    s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")]).unwrap();
-    let id = s.insert_memory(memory_input("git:proj", "CONSTRAINTS", "Verified code claim.", 0)).unwrap();
+    s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+        .unwrap();
+    let id = s
+        .insert_memory(memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "Verified code claim.",
+            0,
+        ))
+        .unwrap();
     let hash = s.get_memory_full(id).unwrap().unwrap().normalized_hash;
-    let mut request = req("ses", "cfg0", vec![item("a", 1, "raw"), item("tail", 2, "tail")]);
+    let mut request = req(
+        "ses",
+        "cfg0",
+        vec![item("a", 1, "raw"), item("tail", 2, "tail")],
+    );
     request.serializer_profile = "opencode-aisdk".into();
     request.auto_search_enabled = false;
-    request.mural = Some(crate::m0_compose::M0MuralInput { enabled: true, supports_vision: true, data_url: Some(format!("data:image/png;base64,{NO_GLYPH_PNG}")), content_hash: Some("verification-mural".into()) });
+    request.mural = Some(crate::m0_compose::M0MuralInput {
+        enabled: true,
+        supports_vision: true,
+        data_url: Some(format!("data:image/png;base64,{NO_GLYPH_PNG}")),
+        content_hash: Some("verification-mural".into()),
+    });
     let ctx = pctx("git:proj", "/nonexistent-docs", 0);
     let first = transform(&s, &request, &ctx).unwrap();
     let served = serde_json::to_vec(first.messages()).unwrap();
@@ -929,14 +993,36 @@ fn assert_module_verification_cache(kind: &str) {
         "verification_status": kind, "updated_content": "Corrected code claim.", "files": ["source.rs"], "checked_commit": null,
     }])).unwrap();
     s.with_context_conn_for_test(|tx| {
-        let receipt = crate::memory_verification::apply_row(tx, "git:proj", "verify-cache", &rows[0], None, 1234)?;
-        assert_eq!(receipt["result"], if kind == "update" { "updated" } else { "confirmed" });
-        let history: i64 = tx.query_row("SELECT COUNT(*) FROM memory_history WHERE memory_id=?1", [id], |row| row.get(0))?;
+        let receipt = crate::memory_verification::apply_row(
+            tx,
+            "git:proj",
+            "verify-cache",
+            &rows[0],
+            None,
+            1234,
+        )?;
+        assert_eq!(
+            receipt["result"],
+            if kind == "update" {
+                "updated"
+            } else {
+                "confirmed"
+            }
+        );
+        let history: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM memory_history WHERE memory_id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
         assert_eq!(history, if kind == "update" { 1 } else { 0 });
-        let proposals: i64 = tx.query_row("SELECT COUNT(*) FROM memory_tool_proposals", [], |row| row.get(0))?;
+        let proposals: i64 =
+            tx.query_row("SELECT COUNT(*) FROM memory_tool_proposals", [], |row| {
+                row.get(0)
+            })?;
         assert_eq!(proposals, 0);
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     let deferred = transform(&s, &request, &ctx).unwrap();
     assert_eq!(deferred.action, "SOFT+");
     assert_eq!(serde_json::to_vec(deferred.messages()).unwrap(), served);
@@ -949,9 +1035,17 @@ fn assert_module_verification_cache(kind: &str) {
     request.render_config = "independent-hard".into();
     let hard = transform(&s, &request, &ctx).unwrap();
     assert_eq!(hard.action, "HARD");
-    assert!(m0_bytes(&hard).contains(if kind == "update" { "Corrected code claim." } else { "Verified code claim." }));
-    if kind == "update" { assert!(!m0_bytes(&hard).contains("Verified code claim.")); }
-    assert!(serde_json::to_string(hard.messages()).unwrap().contains(NO_GLYPH_PNG));
+    assert!(m0_bytes(&hard).contains(if kind == "update" {
+        "Corrected code claim."
+    } else {
+        "Verified code claim."
+    }));
+    if kind == "update" {
+        assert!(!m0_bytes(&hard).contains("Verified code claim."));
+    }
+    assert!(serde_json::to_string(hard.messages())
+        .unwrap()
+        .contains(NO_GLYPH_PNG));
 }
 
 #[test]
@@ -962,4 +1056,156 @@ fn module_verification_freezes_served_m0_m1_and_mural_until_natural_hard() {
 #[test]
 fn module_verification_direct_update_freezes_served_m0_m1_and_mural_until_natural_hard() {
     assert_module_verification_cache("update");
+}
+
+#[test]
+fn module_dashboard_pin_admits_revision_even_when_prefix_bytes_are_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+        .unwrap();
+    let id = s
+        .insert_memory(memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "cache_ttl is 5 minutes in config.ts.",
+            0,
+        ))
+        .unwrap();
+    let mut request = req(
+        "ses",
+        "cfg",
+        vec![item("a", 1, "raw"), item("tail", 2, "tail")],
+    );
+    request.auto_search_enabled = false;
+    let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    let original = transform(&s, &request, &ctx).unwrap();
+    let receipt = s.memory_history_rpc("memory.edit", &json!({ "projectPath":"git:proj", "operationId":"pin", "expectedRevisions":[{"memoryId":id,"revision":1}], "changes":[{"memoryId":id,"status":"permanent"}] }), 1).unwrap();
+    assert_eq!(receipt["state"], "applied");
+    let hard = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(hard.action, "HARD");
+    assert_eq!(m0_bytes(&hard), m0_bytes(&original));
+    let applied = s.load("ses").unwrap().meta.memory_projection.unwrap();
+    assert_eq!(applied.project_memory_epoch, 1);
+    assert_eq!(applied.rows[0].revision, 2);
+    s.arm_soft_refresh("ses").unwrap();
+    let soft = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(soft.action, "SOFT");
+    assert_eq!(
+        serde_json::to_vec(soft.messages()).unwrap(),
+        serde_json::to_vec(hard.messages()).unwrap()
+    );
+}
+
+#[test]
+#[ignore = "writes independent base/tip served output when MC_REVIEW_OUTPUT is set"]
+#[allow(unexpected_cfgs)]
+fn independent_review_randomized_base_served_requests() {
+    let output = std::env::var("MC_REVIEW_OUTPUT").unwrap();
+    let dashboard = std::env::var("MC_REVIEW_DASHBOARD").as_deref() == Ok("1");
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let schema_conn = rusqlite::Connection::open_with_flags(
+        dir.path().join("store.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let schema = schema_conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").unwrap().query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
+    }).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    drop(schema_conn);
+    s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+        .unwrap();
+    for text in [
+        "Agent baseline.",
+        "Automated baseline.",
+        "Dashboard baseline.",
+        "Spare four.",
+        "Spare five.",
+        "Spare six.",
+        "Spare seven.",
+    ] {
+        s.insert_memory(memory_input("git:proj", "CONSTRAINTS", text, 0))
+            .unwrap();
+    }
+    let mut request = req(
+        "ses",
+        "cfg0",
+        vec![item("a", 1, "raw"), item("tail", 2, "tail")],
+    );
+    request.auto_search_enabled = false;
+    let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    let mut records = Vec::new();
+    let initial = transform(&s, &request, &ctx).unwrap();
+    records.push(json!({"step": -1, "action": initial.action, "messages": initial.messages()}));
+    let mut rng = 0x68291cadu32;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        rng
+    };
+    let mut counts = [0usize; 3];
+    for step in 0..120 {
+        let random_kind = next() % 3;
+        let kind = if !dashboard && random_kind == 2 {
+            1
+        } else {
+            random_kind
+        };
+        match kind {
+            0 => edit(
+                &s,
+                if next() % 2 == 0 { "ses" } else { "foreign" },
+                1,
+                &format!("Agent correction {step} & <quoted>."),
+                &format!("review-agent:{step}"),
+            )
+            .unwrap(),
+            1 => noprop_automated(&s, 0, step),
+            _ => {
+                let status = if step % 2 == 0 { "permanent" } else { "active" };
+                // Conditional compilation lets the same witness exercise each
+                // revision's real dashboard effects without a compatibility API.
+                #[cfg(mc_memory_history_review_tip)]
+                {
+                    let revision = s
+                        .with_context_conn_for_test(|conn| {
+                            conn.query_row("SELECT revision FROM memories WHERE id=3", [], |row| {
+                                row.get::<_, i64>(0)
+                            })
+                        })
+                        .unwrap();
+                    let receipt = s.memory_history_rpc("memory.edit", &json!({"projectPath":"git:proj", "operationId":format!("review-dashboard:{step}"), "expectedRevisions":[{"memoryId":3,"revision":revision}], "changes":[{"memoryId":3,"status":status}]}), 2).unwrap();
+                    assert!(receipt["state"] == "applied" || receipt["reason"] == "no_change");
+                }
+                #[cfg(not(mc_memory_history_review_tip))]
+                s.with_context_conn_for_test(|conn| {
+                    let current: String = conn.query_row("SELECT status FROM memories WHERE id=3", [], |row| row.get(0))?;
+                    if current != status {
+                        conn.execute("UPDATE memories SET status=?1 WHERE id=3", [status])?;
+                        conn.execute("INSERT INTO project_state(project_path,project_memory_epoch,updated_at) VALUES('git:proj',1,2) ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch=project_memory_epoch+1", [])?;
+                    }
+                    Ok(())
+                }).unwrap();
+            }
+        }
+        let pass = next() % 3;
+        counts[pass as usize] += 1;
+        if pass == 2 {
+            request.render_config = format!("natural-{step}");
+        } else if pass == 1 {
+            s.arm_soft_refresh("ses").unwrap();
+        }
+        let served = transform(&s, &request, &ctx).unwrap();
+        records.push(
+            json!({"step":step, "kind":kind, "action":served.action, "messages":served.messages()}),
+        );
+    }
+    std::fs::write(
+        output,
+        serde_json::to_vec(&json!({"schema":schema,"records":records})).unwrap(),
+    )
+    .unwrap();
+    println!("independent base differential: {} serialized Rust requests; requested defer/SOFT/natural HARD={counts:?}", records.len());
 }

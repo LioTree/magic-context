@@ -19,6 +19,8 @@ import ts from "typescript";
  * block every writer for the length of the read.
  */
 const READ_ONLY_DEFERRED_TRANSACTIONS: Record<string, string> = {
+    "packages/plugin/src/features/magic-context/memory/history-applier.ts#previewMemoryRestore":
+        "reads history, canonical memories and successor links to construct a preview; never writes receipts, revisions, epochs or derived data",
     "packages/plugin/src/hooks/magic-context/score-visibility.ts#readCompartmentScoreVisibility":
         "reads base rows, sidecar selections and the cached watermark for display-only copies; never writes",
     "packages/plugin/src/hooks/magic-context/inject-compartments.ts#renderFreshM0NonPersisted":

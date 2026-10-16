@@ -936,6 +936,291 @@ body {
   color: var(--text-secondary);
 }
 
+/* ── Memory history and undo ──────────────────────────── */
+.memory-view-tabs {
+  padding: 0 20px 8px;
+}
+
+.memory-detail-tabs {
+  padding: 0 0 12px;
+}
+
+.slide-panel.wide {
+  width: 600px;
+}
+
+.memory-detail-actions {
+  display: flex;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.history-intro {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 0 0 12px;
+  max-width: 70ch;
+  line-height: 1.5;
+}
+
+.history-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.history-item {
+  position: relative;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 10px 12px 10px 24px;
+}
+
+/* A thin rail with a dot on each card's left edge reads as a timeline. */
+.history-item::before {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+
+.history-dot {
+  position: absolute;
+  left: 8px;
+  top: 15px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.history-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.history-headline {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.history-when {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.history-why {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 4px 0 6px;
+  line-height: 1.45;
+}
+
+.history-merge {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.history-merge-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.history-row {
+  border-top: 1px solid var(--border);
+  padding: 6px 0 4px;
+}
+
+.history-row:first-of-type,
+.history-merge-label + .history-row {
+  border-top: none;
+}
+
+.history-row-summary {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.history-row.focus .history-row-summary {
+  color: var(--accent);
+}
+
+.history-fields {
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.history-fields th {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  text-align: left;
+  padding: 0 8px 2px 0;
+}
+
+.history-fields td {
+  padding: 1px 8px 1px 0;
+  vertical-align: top;
+}
+
+.history-field-label {
+  color: var(--text-secondary);
+  min-width: 84px;
+}
+
+.history-field-before {
+  color: var(--text-secondary);
+  text-decoration: line-through;
+}
+
+.history-field-arrow {
+  color: var(--text-secondary);
+}
+
+.history-field-after {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.history-content {
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 6px 8px;
+  font-family: var(--mono-font);
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow-y: auto;
+  color: var(--text-primary);
+}
+
+.history-content.muted {
+  color: var(--text-secondary);
+}
+
+.history-add {
+  text-decoration: none;
+  background: color-mix(in srgb, var(--green) 16%, transparent);
+  color: var(--text-primary);
+  border-radius: 2px;
+}
+
+.history-del {
+  background: color-mix(in srgb, var(--red) 11%, transparent);
+  color: var(--text-secondary);
+  border-radius: 2px;
+}
+
+.history-note {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+  margin: 4px 0 0;
+}
+
+.history-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+.history-limit {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+  margin-right: auto;
+}
+
+.history-empty {
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 12px 0;
+}
+
+.history-more {
+  align-self: center;
+}
+
+/* Status banners for edits and undo: a tinted surface with ordinary text
+   colour, so the message stays readable in both themes. */
+.history-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius-md);
+  padding: 8px 10px;
+  margin-bottom: 12px;
+}
+
+.history-banner > span,
+.history-banner > div {
+  flex: 1;
+}
+
+.history-banner p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+}
+
+.history-banner.success {
+  background: color-mix(in srgb, var(--green) 8%, var(--bg-card));
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+  border-left-color: var(--green);
+}
+
+.history-banner.warning {
+  background: color-mix(in srgb, var(--amber) 8%, var(--bg-card));
+  border-color: color-mix(in srgb, var(--amber) 35%, var(--border));
+  border-left-color: var(--amber);
+}
+
+.history-banner.error {
+  background: var(--error-bg);
+  border-color: var(--error-border);
+  border-left-color: var(--error-text);
+}
+
+.undo-lead {
+  font-size: 12px;
+  color: var(--text-primary);
+  margin: 0 0 8px;
+}
+
+.undo-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* ── Tri-state checkbox ──────────────────────────────── */
 /* Native checkbox styled to match dark theme. Indeterminate state is set
    imperatively via ref in JS — CSS alone can't style it reliably across

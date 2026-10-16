@@ -36,39 +36,15 @@ impl FacadeMutationTxn<'_> {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("memory {id} disappeared during its operation"))
     }
-    /// Retain the prior text before an agent changes an existing row. Saving this
-    /// history never requests a prefix rebuild or changes another session's cache.
+    /// Advance the changed memory's revision here; the enclosing transaction records
+    /// before/after snapshots for every row changed by the same operation.
     pub(crate) fn record_agent_history(
         &self,
         memory: &crate::StoredMemoryFull,
-        after: &str,
-        operation: &str,
-        now_ms: i64,
+        _after: &str,
+        _operation: &str,
+        _now_ms: i64,
     ) -> Result<(), crate::FacadeMemoryMutationError> {
-        let revision: i64 = self
-            .tx
-            .query_row(
-                "SELECT revision FROM memories WHERE id=?1",
-                [memory.id],
-                |row| row.get(0),
-            )
-            .map_err(crate::FacadeMemoryMutationError::storage)?;
-        let operation = if self.automated {
-            operation.replace("agent_", "curate_")
-        } else {
-            operation.to_string()
-        };
-        let key = crate::memory_lifecycle::applier::fresh_decision_key(
-            if self.automated {
-                "curate-history"
-            } else {
-                "agent-history"
-            },
-            now_ms,
-        );
-        let before = serde_json::to_string(memory)
-            .map_err(|error| crate::FacadeMemoryMutationError::Storage(error.to_string()))?;
-        self.tx.execute("INSERT INTO memory_history(memory_id,revision,previous_text,after_text,applied_at,reason,before_json,evidence_json,source_ids_json,decision_key) VALUES(?1,?2,?3,?4,?5,?6,?8,'[]','[]',?7)",params![memory.id,revision,memory.content,after,now_ms,operation,key,before]).map_err(crate::FacadeMemoryMutationError::storage)?;
         self.tx
             .execute(
                 "UPDATE memories SET revision=revision+1 WHERE id=?1",
@@ -130,6 +106,10 @@ pub struct CommittedFragment {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedProjection {
     pub generation: u64,
+    /// The dashboard change counter reflected in this saved prompt baseline.
+    /// Automated memory edits do not increment it.
+    #[serde(default, skip_serializing_if = "epoch_is_zero")]
+    pub project_memory_epoch: i64,
     pub m0_sha256: String,
     pub hard_memory_block: String,
     pub fragment_watermark: i64,
@@ -139,6 +119,10 @@ pub struct AppliedProjection {
     pub legacy: bool,
 }
 
+fn epoch_is_zero(epoch: &i64) -> bool {
+    *epoch == 0
+}
+
 impl AppliedProjection {
     pub fn hard(
         snapshot: &MemoryRenderSnapshot,
@@ -146,6 +130,7 @@ impl AppliedProjection {
         profile: &[String],
     ) -> Self {
         Self {
+            project_memory_epoch: snapshot.revision.project_memory_epoch,
             fragment_watermark: snapshot.fragment_watermark,
             rows: selected
                 .iter()

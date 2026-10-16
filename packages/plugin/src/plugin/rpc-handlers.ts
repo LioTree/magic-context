@@ -28,6 +28,8 @@ import {
     getDreamerTickFailure,
 } from "../features/magic-context/dreamer/tick-failure";
 import { getLocalEmbeddingNativeMemoryStats } from "../features/magic-context/memory/embedding-local";
+import { memoryHistoryRpc } from "../features/magic-context/memory/history-rpc";
+
 import {
     emptyMemoryImportanceHistogram,
     getActiveMemoryImportanceHistogram,
@@ -1495,6 +1497,22 @@ export function registerRpcHandlers(
                 config.toast_duration_ms,
         );
 
+    for (const method of [
+        "memory.history",
+        "memory.restore.preview",
+        "memory.restore",
+        "memory.edit",
+    ] as const) {
+        rpcServer.handle(method, async (params) => {
+            const db = readDatabase();
+            if (!db) return { error: "db unavailable" };
+            return memoryHistoryRpc(
+                { db, directory, moduleClient: rustModeModuleClient },
+                method,
+                params,
+            );
+        });
+    }
     const injectionBudgetTokens = config.memory?.injection_budget_tokens;
 
     rpcServer.handle("rescore", async (params) => {
