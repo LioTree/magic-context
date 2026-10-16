@@ -713,6 +713,11 @@ export function createOpenCodeProviderTransform(
     }
     function checkFailure(result: ProviderResult<unknown>): void {
         if (result.status === "unavailable") {
+            const error = part(result.error ?? {});
+            // A relay refusal does not prove the module did no work; never serve a raw hook fallback.
+            if (error.source === "relay") {
+                throw new EmergencyFailClosedError(`Bridge relay transport refused: ${error.code}`);
+            }
             const ahead = storeAheadOfBinaryFailure(result.error);
             if (ahead) throw ahead;
         } else {

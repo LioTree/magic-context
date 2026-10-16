@@ -222,7 +222,7 @@ export interface ModuleCallTimings {
     settle: number;
 }
 
-function moduleRequestBody(body: unknown, method: string): unknown {
+export function moduleRequestBody(body: unknown, method: string): unknown {
     if (!isRecord(body)) return body;
     // Flat management requests dispatch on method; MCP facade calls dispatch on
     // name/arguments and must remain method-free to reach the facade handler.

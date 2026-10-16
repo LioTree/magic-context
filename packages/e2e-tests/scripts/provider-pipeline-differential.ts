@@ -133,7 +133,9 @@ fn provider_pipeline_driver() {
                     .with_startup_provider_resident_enabled(resident_enabled);
                 handler.store.set(store.clone()).ok().unwrap();
                 let binding = SessionBinding {
-                    connection_incarnation: 0, native_generation: None, principal: None,
+                    connection_incarnation: 0, native_generation: None,
+                    principal: matches!(cmd["harness"].as_str(), Some("opencode" | "opencode2")).then(|| subc_protocol::Principal::Reserved { module_id: "thalamus-harness".into() }),
+                    scope: matches!(cmd["harness"].as_str(), Some("opencode" | "opencode2")).then(|| serde_json::from_value(json!({"owner":subc_protocol::Principal::Reserved { module_id: "prefrontal-core".into() },"ref":"test-scope","scope_epoch":1,"kind":"head","owner_authorized":true})).unwrap()),
                     project_root: project, harness: cmd["harness"].as_str().unwrap().into(),
                     session: "session".into(), model_key: None, config,
                     history_budget_tokens: 100000.0,

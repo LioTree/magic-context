@@ -17,6 +17,7 @@ import { getOrCreateSessionMeta } from "../../../features/magic-context/storage-
 import { createTagger } from "../../../features/magic-context/tagger";
 import {
     BridgeRefusalError,
+    type BridgeTransportError,
     createBridgeAdapter,
     StoreVersionMismatchError,
 } from "../../../host-runner";
@@ -113,6 +114,7 @@ function recordSnapshot(path: string) {
 }
 function fakeModule() {
     const calls: Record<string, any>[] = [];
+    const payloads: Uint8Array[] = [];
     const binds: any[] = [];
     const close = mock(() => {});
     let version = 1;
@@ -181,8 +183,10 @@ function fakeModule() {
                     binds.push({ target, identity, options });
                     return { channel: binds.length, epoch: 1 };
                 },
-                request: async (_route: unknown, body: Uint8Array) =>
-                    answer(JSON.parse(Buffer.from(body).toString())),
+                request: async (_route: unknown, body: Uint8Array) => {
+                    payloads.push(body.slice());
+                    return answer(JSON.parse(Buffer.from(body).toString()));
+                },
                 close,
             }) as any,
     );
@@ -192,6 +196,8 @@ function fakeModule() {
     });
     return {
         calls,
+        payloads,
+        answer,
         binds,
         close,
         connect,
@@ -202,6 +208,122 @@ function fakeModule() {
 }
 
 describe("supported bridge constructor", () => {
+    test("injected bridge uses only the relay and matches the direct bridge view and method sequence", async () => {
+        const options = fixture();
+        const wire = fakeModule();
+        const rows = [message("first")];
+        canonicalRows(rows);
+        const direct = await createBridgeAdapter(options);
+        const first = await direct.run({
+            sessionId: "session",
+            messages: rows.slice(),
+            kind: "model",
+        });
+        rows.push(message("second"));
+        const second = await direct.run({
+            sessionId: "session",
+            messages: rows.slice(),
+            kind: "model",
+        });
+        await direct.dispose();
+        const methods = wire.calls.map((call) => call.method);
+        const relayed = fakeModule();
+        relayed.connect.mockClear();
+        const requests: { method: string; body: Uint8Array; deadlineMs: number }[] = [];
+        const injected = await createBridgeAdapter({
+            ...fixture(),
+            transport: {
+                async request(method, body, opts) {
+                    expect(opts.deadlineMs).toBeGreaterThan(Date.now());
+                    expect(opts.signal).toBeInstanceOf(AbortSignal);
+                    requests.push({ method, body: body.slice(), deadlineMs: opts.deadlineMs });
+                    return Buffer.from(
+                        JSON.stringify(relayed.answer(JSON.parse(Buffer.from(body).toString()))),
+                    );
+                },
+            },
+        });
+        cleanups.push(() => injected.dispose());
+        expect(
+            await injected.run({ sessionId: "session", messages: rows.slice(0, 1), kind: "model" }),
+        ).toEqual(first);
+        expect(
+            await injected.run({ sessionId: "session", messages: rows.slice(), kind: "model" }),
+        ).toEqual(second);
+        expect(requests.map((call) => call.method)).toEqual(methods);
+        expect(new Set(methods)).toEqual(
+            new Set([
+                "state_sync",
+                "transform.declare",
+                "compaction.setup",
+                "transform.hook",
+                "compaction.step",
+            ]),
+        );
+        expect(relayed.connect).not.toHaveBeenCalled();
+        await injected.dispose();
+        expect(relayed.close).not.toHaveBeenCalled();
+    });
+
+    for (const code of [
+        "relay_unavailable",
+        "session_scope_missing",
+        "deadline",
+        "aborted",
+    ] as const) {
+        test(`injected relay ${code} keeps bootstrap fail closed`, async () => {
+            const wire = fakeModule();
+            canonicalRows([]);
+            const adapter = await createBridgeAdapter({
+                ...fixture(),
+                transport: {
+                    async request(method, body) {
+                        if (method === "transform.declare")
+                            throw { source: "relay", code } satisfies BridgeTransportError;
+                        return Buffer.from(
+                            JSON.stringify(wire.answer(JSON.parse(Buffer.from(body).toString()))),
+                        );
+                    },
+                },
+            });
+            cleanups.push(() => adapter.dispose());
+            await expect(
+                adapter.run({ sessionId: "session", messages: [], kind: "model" }),
+            ).rejects.toMatchObject({ code: "EMERGENCY_FAIL_CLOSED" });
+        });
+        test(`injected relay ${code} keeps ordinary hooks fail closed without record writes`, async () => {
+            const wire = fakeModule();
+            const options = fixture();
+            const rows = [message("first")];
+            canonicalRows(rows);
+            let refuse = false;
+            const adapter = await createBridgeAdapter({
+                ...options,
+                transport: {
+                    async request(method, body) {
+                        if (refuse && method === "transform.hook")
+                            throw { source: "relay", code } satisfies BridgeTransportError;
+                        return Buffer.from(
+                            JSON.stringify(wire.answer(JSON.parse(Buffer.from(body).toString()))),
+                        );
+                    },
+                },
+            });
+            cleanups.push(() => adapter.dispose());
+            await adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" });
+            const before = recordSnapshot(options.dbPath);
+            const observe = mock(() => {});
+            adapter.onOutcome(observe);
+            refuse = true;
+            rows.push(message("second"));
+            await expect(
+                adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" }),
+            ).rejects.toMatchObject({ code: "EMERGENCY_FAIL_CLOSED" });
+            expect(recordSnapshot(options.dbPath)).toEqual(before);
+            expect(observe).not.toHaveBeenCalled();
+        });
+    }
+
     test("state-sync barriers use the flat module envelope on bootstrap and no-tail ordinary passes", async () => {
         const options = fixture();
         const wire = fakeModule();

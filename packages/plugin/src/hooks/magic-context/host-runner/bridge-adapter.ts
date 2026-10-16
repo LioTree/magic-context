@@ -24,6 +24,7 @@ import {
     type BridgeView,
 } from "./bridge-types";
 import type { ProviderUsageInput } from "./fallback-admissibility";
+import { InjectedBridgeTransport } from "./injected-transport";
 import {
     createOpenCodeProviderTransform,
     isMagicContextHead,
@@ -44,13 +45,9 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
         join(options.storageDir, "context.db"),
         options.allowMigration === true,
     );
-    const transport = new SubcModuleTransport(
-        options.connectionFile,
-        undefined,
-        undefined,
-        "",
-        harness,
-    );
+    const transport = options.transport
+        ? new InjectedBridgeTransport(options.transport)
+        : new SubcModuleTransport(options.connectionFile, undefined, undefined, "", harness);
     let legacy: ReturnType<typeof createRustModeTransform> | undefined;
     let provider: ReturnType<typeof createOpenCodeProviderTransform>;
     let deps: TransformDeps;
