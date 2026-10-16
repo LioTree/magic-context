@@ -389,6 +389,13 @@ mod replay {
         assert_eq!(high_water(conversation), high);
         for (numbers, first_later_row) in retired {
             assert!(
+                rows.iter()
+                    .filter(|row| row.state != "burned")
+                    .flat_map(|row| &row.answer.tags)
+                    .all(|tag| !numbers.contains(&tag.number)),
+                "reported unserved allocation remained live or pending"
+            );
+            assert!(
                 rows[*first_later_row..]
                     .iter()
                     .flat_map(|row| &row.answer.tags)
