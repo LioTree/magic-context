@@ -24,7 +24,16 @@ MC_BUILD_SHA=7e915050844ecdf41a0f62206ff2626664bead78 cargo test -p mc-module --
 The default build does not publish or admit the Claude Code capability bundle
 (the serializer/provider generations, flags and wire limits in `claude_code`), so
 it runs the fixture digest and hook/call alignment checks, not RPC replays.
-The feature build uses actual compiled flags, with no test override.
+The `advertise-claude-code-candidate` G8 replay uses actual compiled flags and capabilities. Provider
+generations fingerprint source bytes, so a native reduction implementation change
+can change the generation without changing any advertised capability. The replay
+uses the existing test-only bundle override to pin only `provider_generation` to
+the recording's identity (and derives the bundle digest from that identity). It
+asserts that the recorded and compiled bundles are otherwise identical. No
+recorded response bytes are normalized for this: they still compare exactly.
+`g8_compiled_generation_changed_and_production_refuses_recorded_pins` separately
+checks that the compiled generation changed and that a handler without the test
+override refuses the old generation. Production generation fencing is unchanged.
 
 A fresh provider binding/project path produces different opaque IDs. The replay
 contract therefore permits alpha-renaming only these JSON string fields, without

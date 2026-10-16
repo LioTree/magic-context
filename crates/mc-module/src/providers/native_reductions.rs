@@ -47,11 +47,11 @@ fn restore_arc(index: usize, slots: &mut [Option<CkWireMessage>], request: &Tran
     }
 }
 
-/// Apply edits alongside a fold/flush or an execute/force opportunity that can
-/// replace queued tool results. The returned ordinal is the last summarized or
-/// changed original message for validating signed-thinking edits, not the full replacement
-/// range. Keep it separate from both the wire removal endpoint and the engine's
-/// summary boundary so unsummarized messages never become summarized history.
+/// Apply queued tool-result edits only when this pass may replace cached input.
+/// Return the position of the last original message summarized or changed, so
+/// signed-thinking validation can check every preceding edit. The replacement
+/// can also copy later messages unchanged; its end is not the last edit, and
+/// neither position means that the engine has summarized those copied messages.
 pub(super) fn apply(
     view: &mut transform::compaction::View,
     request: &TransformRequest,
@@ -86,7 +86,27 @@ pub(super) fn apply(
         .iter()
         .filter_map(|m| identity(m).map(|id| (id, m)))
         .collect::<BTreeMap<_, _>>();
-    let prefix_edit = !head.is_empty()
+    // Anthropic thinking signatures can authenticate preceding message bytes.
+    // Include queued drops when comparing the proposed view to the original:
+    // changing an earlier result must remove later unprotected thinking, or
+    // preserving its signature would restore that result and undo the drop.
+    // A drop after the last thinking block does not invalidate its signature.
+    let last_thinking = request
+        .messages
+        .iter()
+        .rposition(|entry| entry.ck.content.iter().any(thinking));
+    let queued_prefix_edit = rebuild
+        && last_thinking.is_some_and(|last| {
+            request.messages[..last].iter().any(|entry| {
+                !protected.contains(&entry.mid)
+                    && entry.ck.content.iter().enumerate().any(|(part, block)| {
+                        matches!(block.kind, CkKind::ToolResult { .. })
+                            && pending.contains(&format!("{}#{part}", entry.mid))
+                    })
+            })
+        });
+    let prefix_edit = queued_prefix_edit
+        || !head.is_empty()
         || request.messages.iter().any(|entry| {
             candidates
                 .get(&(entry.mid.as_str(), entry.ordinal))

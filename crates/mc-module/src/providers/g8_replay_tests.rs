@@ -486,11 +486,62 @@ mod replay {
             .unwrap()
     }
 
+    fn pin_recorded_identity(h: &McHandler, f: &Fixture) {
+        let recorded: hooks::claude_code::ClaudeCodeCapabilities = serde_json::from_value(
+            f.calls
+                .iter()
+                .find(|rpc| rpc.method == "transform.declare")
+                .unwrap()
+                .params["claude_code"]
+                .clone(),
+        )
+        .unwrap();
+        let mut pins = capability_candidate::CANDIDATE.clone();
+        // Generations fingerprint source bytes, not just wire capabilities. Pin
+        // only the recording's build identity; any capability drift still fails.
+        pins.provider_generation = recorded.provider_generation.clone();
+        assert_eq!(
+            serde_json::to_value(&pins).unwrap(),
+            serde_json::to_value(&recorded).unwrap()
+        );
+        *h.native_bundle_override.lock().unwrap() = Some(pins);
+    }
+
+    #[tokio::test]
+    async fn g8_compiled_generation_changed_and_production_refuses_recorded_pins() {
+        let f = fixture("synthetic-hooks.json");
+        let declaration = &f
+            .calls
+            .iter()
+            .find(|rpc| rpc.method == "transform.declare")
+            .unwrap()
+            .params;
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path(), thalamus());
+        assert!(h.native_bundle_override.lock().unwrap().is_none());
+        assert_ne!(
+            h.native_pins().provider_generation,
+            declaration["claude_code"]["provider_generation"]
+                .as_str()
+                .unwrap()
+        );
+        let binding = h.facade_binding(7).unwrap();
+        assert!(matches!(
+            h.admit_native_plan(7, &binding, "transform.declare", declaration).await,
+            Err(HandlerOutcome::ErrorWithDetail { detail, .. }) if detail["field"] == "claude_code"
+        ));
+        assert!(matches!(
+            call(&h, "transform.declare", declaration.clone()).await,
+            HandlerOutcome::ErrorWithDetail { detail, .. } if detail["field"] == "claude_code"
+        ));
+    }
+
     async fn replay_recording(name: &str) {
         let f = fixture(name);
         assert_hook_call_alignment(&f);
         let dir = tempfile::tempdir().unwrap();
         let h = handler(dir.path(), thalamus());
+        pin_recorded_identity(&h, &f);
         let mut ids = Ids::default();
         let mut retired = Vec::new();
         let mut repeated_hooks = 0;
@@ -660,6 +711,7 @@ mod replay {
         let f = fixture("synthetic-hooks.json");
         let dir = tempfile::tempdir().unwrap();
         let h = handler(dir.path(), thalamus());
+        pin_recorded_identity(&h, &f);
         let mut ids = Ids::default();
         let first_hook = f
             .calls

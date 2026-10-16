@@ -703,6 +703,11 @@ impl BoundaryState {
 /// back to CK messages at egress.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransformRequest {
+    /// Allow queued native-step edits to share a requested prefix rebuild or
+    /// pressure relief at the force threshold, never an ordinary Execute pass.
+    /// Set internally, not accepted from the transform wire.
+    #[serde(skip)]
+    pub(crate) native_step_bust: bool,
     #[serde(default)]
     pub kind: String,
     #[serde(default = "default_wire_version")]
@@ -1181,6 +1186,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or_else(default_protected_tags);
         Ok(Self {
+            native_step_bust: false,
             kind: wire.kind,
             v: wire.v,
             serializer_profile: wire.serializer_profile.unwrap_or_default(),
@@ -2639,6 +2645,13 @@ pub mod compaction {
             })?;
         }
         let mut req = template.clone();
+        req.native_step_bust = native_cc
+            && (template.native_step_bust
+                || status.prefix_rebuilding
+                || usage.current_total_input_tokens as f64 * 100.0
+                    >= execute_window as f64
+                        * scheduler::escalation_bands(ctx.execute_threshold_percentage)
+                            .force_materialize_percentage);
         req.kind = if host {
             if state.rebuild_epoch == 0 {
                 HOST_PASS_KIND
@@ -2686,13 +2699,13 @@ pub mod compaction {
             }
         });
         let engine = transform_with_projection(store, &req, ctx)?;
-        let permitted = engine.response.prefix_bust_permitted;
+        let permitted = engine.response.prefix_bust_permitted || req.native_step_bust;
         let mut answer = Answer::Noop;
         // The host may already be serving a whole-request transform. When it
         // switches to compaction messages, return those same frozen prompt bytes
         // in a View; this transport-only copy does not authorize new prefix edits.
         let transport_replay = host && status.pipeline_switch;
-        if initial || permitted || transport_replay {
+        if initial || engine.response.prefix_bust_permitted || transport_replay {
             let replacement = replacement(&engine.response, &req, state.preset)?;
             let candidate = View {
                 compaction_id: state.compaction_id.clone(),
@@ -5589,7 +5602,8 @@ fn apply_once(
     // full provider-cache write anyway (an expired cache, discarded cache sections, a head
     // that cannot be replayed): queued work is then applied in this same pass. For a primary
     // with a replayable head, the head itself still replays unchanged.
-    let signed_drains_released = force_band_active
+    let signed_drains_released = req.native_step_bust
+        || force_band_active
         || scheduler_outcome.pass == scheduler::PassDecision::Emergency95
         || scheduler_outcome.idle_ttl_fired
         || cache_sections_discarded
@@ -5796,7 +5810,8 @@ fn apply_once(
     // held subagent pass also replays its previous bytes.
     let subagent_execute_permitted =
         !signed_prefix_hold && scheduler_outcome.pass != scheduler::PassDecision::Defer;
-    let supersession_ride_available = independent_rebuild
+    let supersession_ride_available = req.native_step_bust
+        || independent_rebuild
         // Subagents cannot fold history. Execute is their one shared permission
         // for queued drops and automatic cleanup, not a request to change bytes.
         || (req.is_subagent && subagent_execute_permitted)
@@ -22283,6 +22298,7 @@ pub(crate) mod tests {
         messages: Vec<CkIngressMessage>,
     ) -> TransformRequest {
         TransformRequest {
+            native_step_bust: false,
             cache_ttl: None,
             effective_execute_threshold: None,
             auto_search_enabled: true,

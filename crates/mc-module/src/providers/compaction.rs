@@ -1054,6 +1054,7 @@ fn execute_host_with_healing(
     codec.prepare_request(&mut template, &messages)?;
     if codec == Codec::ClaudeCodeAnthropic {
         if let Some(native_status) = native_status {
+            template.native_step_bust = native_status.prefix_rebuilding.is_some();
             template.geometry =
                 native_status
                     .geometry
@@ -1199,20 +1200,11 @@ fn execute_host_with_healing(
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
     setup.setup.state.rebuild_epoch = state.rebuild_epoch;
-    // The engine's "execute" decision permits queued drops to replace history.
-    // Ordinary execution can be deferred while a tool turn is unfinished; force
-    // pressure (at least 85% of the soft budget) still allows pressure relief.
-    let execute_ride = output.engine.response.scheduler_decision.as_deref() == Some("execute");
-    let force_due = status.usage().current_total_input_tokens as f64 * 100.0
-        >= template
-            .geometry
-            .as_ref()
-            .map_or(status.context_window, |geometry| geometry.usable_soft) as f64
-            * crate::scheduler::escalation_bands(context.execute_threshold_percentage)
-                .force_materialize_percentage;
+    // Queue draining and replacement publication share the engine's permission.
+    // Execute alone does not pay for a provider-cache rewrite.
     let promoted = codec == Codec::ClaudeCodeAnthropic
         && !native_pending.is_empty()
-        && (execute_ride || force_due)
+        && output.prefix_bust_permitted
         && matches!(output.answer, transform::compaction::Answer::Noop);
     let answer = if promoted {
         transform::compaction::Answer::Replacement(
@@ -1242,25 +1234,25 @@ fn execute_host_with_healing(
                     .any(super::codec_claude_code::is_thinking_block)
             })
         {
-            // Claude Code's signed thinking binds message order and preceding
-            // bytes. A queued-only replacement must preserve that input prefix,
-            // rather than inserting summary heads or stripping earlier thinking.
-            if state.last_applied.as_ref().is_some_and(|previous| {
+            // A queued-only replacement keeps the raw head instead of inserting
+            // summaries. The native reduction mapper removes signed thinking
+            // only when an applied edit would invalidate its preceding bytes.
+            let prior_removed_thinking = state.last_applied.as_ref().is_some_and(|previous| {
                 previous
                     .replacement
                     .iter()
                     .any(super::codec_claude_code::strips_signed_turn)
-            }) {
-                // The installed view removed thinking that template.messages
-                // still retains. Reconstructing those originals would resurrect
-                // deleted blocks, so wait for an engine-authorized rebuild.
-                return Ok(None);
+            });
+            // A prior view's reasoning removals must remain removed. The engine
+            // candidate replays those frozen omissions; rebuilding from raw
+            // originals would resurrect thinking the provider no longer sees.
+            if !prior_removed_thinking {
+                engine.replacement = template
+                    .messages
+                    .iter()
+                    .map(|entry| entry.ck.clone())
+                    .collect();
             }
-            engine.replacement = template
-                .messages
-                .iter()
-                .map(|entry| entry.ck.clone())
-                .collect();
         }
         let rebuild = meta.initialized && (output.prefix_bust_permitted || promoted);
         if !rebuild
@@ -2491,7 +2483,15 @@ impl McHandler {
             .as_ref()
             .is_some_and(|n| frontier <= n.ordinal);
         let mut normalized = match native_window {
-            Some(window) => status_with_window(params, &status_record, window)?,
+            Some(window) => {
+                let mut status = status_with_window(params, &status_record, window)?;
+                // Claude Code reports usage for the previous response, not the
+                // request being admitted now. It can be zero for a fake provider
+                // or stale after new messages arrive. Use the gateway's complete
+                // current-request estimate for every pressure decision instead.
+                status.previous_usage = None;
+                status
+            }
             None => status(params, &status_record)?,
         };
         setup.setup.request.model = request.model.clone();
@@ -3173,8 +3173,7 @@ impl McHandler {
             .unwrap_or(Value::Null);
         let applied_drops_last_step = step_record
             .get("applied_drops_last_step")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+            .and_then(Value::as_u64);
         Ok(json!({
             "last_step": last_step,
             "protected_tokens": protected_tokens,

@@ -41,6 +41,7 @@ pub(crate) use historian::RunCompletion;
 pub(crate) use native_plan::NativeConnectionPlan;
 use records::{frontier, ingest, scan, HookRecord, HookState, Key, Record, Setup};
 pub(crate) use records::{Catalog, Storage};
+#[cfg(test)]
 use step_transform::declaration;
 
 pub const HOOK_BUDGET_MS: u64 = 1_500;
@@ -134,6 +135,7 @@ fn admit_claude_code(
     binding: &SessionBinding,
     method: &str,
     params: &Value,
+    _pins: &hooks::claude_code::ClaudeCodeCapabilities,
 ) -> Result<(), HandlerOutcome> {
     // Claude Code capability selection is not offered yet. Reject a supplied
     // bundle by name instead of ignoring it and running the existing codec path
@@ -149,9 +151,7 @@ fn admit_claude_code(
         ));
 
         #[cfg(feature = "advertise-claude-code-candidate")]
-        if params["claude_code"]
-            != serde_json::to_value(&*capability_candidate::CANDIDATE)
-                .expect("candidate is serializable")
+        if params["claude_code"] != serde_json::to_value(_pins).expect("candidate is serializable")
         {
             return Err(invalid_field(
                 "claude_code",
@@ -274,6 +274,21 @@ pub fn fault(point: &str) {
 }
 
 impl McHandler {
+    pub(crate) fn provider_discovery(&self) -> HandlerOutcome {
+        let described = describe_for_discovery();
+        #[cfg(all(test, feature = "advertise-claude-code-candidate"))]
+        if let Some(pins) = self.native_bundle_override.lock().unwrap().as_ref() {
+            // Replay uses the same test-only identity for discovery and admission.
+            // A handler without an override still advertises the compiled bundle.
+            if let HandlerOutcome::Response(bytes) = &described {
+                let mut answer: Value = serde_json::from_slice(bytes).unwrap();
+                answer["claude_code"] = serde_json::to_value(pins).unwrap();
+                return HandlerOutcome::Response(serde_jcs::to_vec(&answer).unwrap());
+            }
+        }
+        described
+    }
+
     pub(crate) async fn handle_provider_value(
         &self,
         channel: u16,
@@ -289,7 +304,7 @@ impl McHandler {
                 )
             }
         };
-        if let Err(error) = admit_claude_code(&binding, method, params) {
+        if let Err(error) = admit_claude_code(&binding, method, params, &self.native_pins()) {
             return error;
         }
         // OpenCode keeps its existing authorization by bound harness. Claude Code
@@ -354,7 +369,9 @@ impl McHandler {
             }
         }
         if method == "transform.declare" {
-            return match declaration(params).and_then(|d| bytes(&d)) {
+            return match step_transform::declaration_with_pins(params, &self.native_pins())
+                .and_then(|d| bytes(&d))
+            {
                 Ok(bytes) => HandlerOutcome::Response(bytes),
                 Err(e) => e,
             };

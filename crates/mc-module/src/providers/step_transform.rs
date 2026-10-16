@@ -224,6 +224,13 @@ fn channel1_meta(state: &Value) -> mc_store::ModuleMeta {
 }
 
 pub fn declaration(params: &Value) -> Result<hooks::subscription::Declaration, HandlerOutcome> {
+    declaration_with_pins(params, &super::capability_candidate::CANDIDATE)
+}
+
+pub(super) fn declaration_with_pins(
+    params: &Value,
+    _pins: &hooks::claude_code::ClaudeCodeCapabilities,
+) -> Result<hooks::subscription::Declaration, HandlerOutcome> {
     use hooks::subscription::{Declaration, DeclaredSubscription as Sub, Hook, OnUnavailable, Op};
     let request: hooks::subscription::DeclareRequest = decode(params)?;
     preset(request.preset.as_deref())?;
@@ -273,9 +280,7 @@ pub fn declaration(params: &Value) -> Result<hooks::subscription::Declaration, H
     }
     #[cfg(feature = "advertise-claude-code-candidate")]
     let claude_code = match request.claude_code.as_ref() {
-        Some(selection) if selection == &*super::capability_candidate::CANDIDATE => {
-            Some(super::capability_candidate::CANDIDATE.clone())
-        }
+        Some(selection) if selection == _pins => Some(_pins.clone()),
         Some(_) => {
             return Err(invalid_field(
                 "claude_code",
