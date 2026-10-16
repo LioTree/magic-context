@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cache_codec;
+pub mod command_ledger;
 pub use cache_codec::{
     DiscardReason, FrozenBase, HashBase, SectionState, SectionsBase, FROZEN_CHUNK_UNITS,
 };
