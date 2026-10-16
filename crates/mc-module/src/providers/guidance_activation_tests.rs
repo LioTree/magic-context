@@ -356,6 +356,16 @@ async fn compiled_candidate_controls_new_plan_tagging() {
     .await;
 }
 
+#[tokio::test]
+async fn release_flags_report_enabled_before_and_after_new_plan_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = cc::handler(dir.path(), cc::thalamus());
+    assert_eq!(status(&h).await, json!({"enabled":true,"reason":"enabled"}));
+    cc::setup(&h).await;
+    assert_eq!(status(&h).await, json!({"enabled":true,"reason":"enabled"}));
+    assert_guidance(&guidance(&h, "full").await, true);
+}
+
 async fn retained_auto_tag_conversation(auto_tag: Option<bool>, descend: bool) {
     let enabled = auto_tag == Some(true);
     let dir = tempfile::tempdir().unwrap();
