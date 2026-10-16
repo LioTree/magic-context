@@ -1,3 +1,4 @@
+import { clearLkgRecoveryFence } from "../../hooks/magic-context/lkg-recovery-fence";
 import { getHarness } from "../../shared/harness";
 import type { Database } from "../../shared/sqlite";
 import { deleteChunkEmbedBackoffForSession } from "./compartment-chunk-embedding";
@@ -233,5 +234,6 @@ export function deleteSessionScopedRows(
             );
         }
     }
+    for (const sessionId of deletableSessionIds) clearLkgRecoveryFence(sessionId);
     return deletableSessionIds.length;
 }

@@ -319,6 +319,8 @@ export interface HistorianRunResult {
     ok: boolean;
     result?: string;
     error?: string;
+    /** Select a failure reason suitable for durable storage where the source is known. */
+    failureReason?: string;
     dumpPath?: string;
     invocationId?: number;
 }
@@ -350,7 +352,12 @@ export type ValidatedHistorianPassResult =
           /** The child that produced the published reply, kept open for turn two. */
           retainedChild?: RetainedHistorianChild;
       }
-    | { ok: false; error: string; invocationId?: number | null };
+    | {
+          ok: false;
+          error: string;
+          failureReason?: string;
+          invocationId?: number | null;
+      };
 
 export interface StoredCompartmentRange {
     startMessage: number;

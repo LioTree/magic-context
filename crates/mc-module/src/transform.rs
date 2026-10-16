@@ -6156,13 +6156,18 @@ fn apply_once(
             // published prefix work, an explicit flush, force, or actual reductions.
             bust_opportunity,
         });
-        // Attachment restoration, todo insertion and an expired retry's new tail reductions do not need a coverage
-        // anchor: neither moves the frozen m0/m1 boundary. The generic classifier requires
-        // an anchor for history deltas, so promote only an ordinary defer here, after the
-        // independent bust gate has priced the work. Reconcile defers remain untouched.
+        let boundaryless_explicit_flush = loaded.meta.soft_refresh_pending
+            && !signed_head_frozen
+            && loaded.core.boundary_id.is_empty()
+            && loaded.meta.coverage_ordinal.is_none();
+        // Before any raw history is summarized, there is no boundary message to
+        // locate. An explicit flush can still refresh the cached head, just as
+        // attachments and todos can be inserted without moving that boundary.
+        // Missing boundaries during reconciliation must still be repaired first.
         if (attachment_upgrade.is_some()
             || todo_injection_pending
-            || (scheduler_outcome.idle_ttl_fired && reclaim_pending_now))
+            || (scheduler_outcome.idle_ttl_fired && reclaim_pending_now)
+            || boundaryless_explicit_flush)
             && bust_opportunity
             && !loaded.core.reconcile_pending
             && matches!(plan, PassPlan::Defer)
@@ -18689,6 +18694,11 @@ fn active_anthropic_thinking_turn(req: &TransformRequest) -> bool {
     req.messages
         .iter()
         .any(|m| protected.contains(m.mid.as_str()) && m.ck.content.iter().any(is_reasoning_block))
+}
+
+#[cfg(test)]
+pub(crate) fn active_signed_head_for_test(req: &TransformRequest) -> bool {
+    active_anthropic_thinking_turn(req) && is_prefix_bound_thinking_model(req.model_key.as_deref())
 }
 
 /// Reproduce persisted reasoning decisions before protecting a new prefix edit.
@@ -49302,3 +49312,7 @@ mod user_answer_marker_tests {
         assert!(items.iter().any(|item| item.user_answer));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/system_delivery_mixed_inputs.rs"]
+mod system_delivery_mixed_inputs;

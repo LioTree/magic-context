@@ -1850,7 +1850,7 @@ describe("deferred compaction marker representation", () => {
         expect(rustMessages).toEqual(tsMessages);
     });
 
-    it("applies a Rust materialized boundary on its serving pass and replays identical bytes", () => {
+    it("applies a Rust materialized boundary on its serving pass and replays identical bytes", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-rust-marker-reverse-edge";
@@ -1887,6 +1887,7 @@ describe("deferred compaction marker representation", () => {
             },
         ] as unknown as MessageLike[];
         const first = structuredClone(source);
+        expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
         const applied = runRustModePostprocess({
             db,
             sessionId,
@@ -1925,7 +1926,7 @@ describe("deferred compaction marker representation", () => {
         expect(JSON.stringify(replay)).toBe(firstBytes);
     });
 
-    it("newer pending publication waits until consumed by the served response", () => {
+    it("newer pending publication waits until consumed by the served response", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-rust-consumed-coverage";
@@ -1990,6 +1991,7 @@ describe("deferred compaction marker representation", () => {
             expect(getCompactionMarkerHealth(db, sessionId).attempts).toBe(3);
         }
         // A noncommitting response can retry, but only with its own consumed coverage.
+        expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
         applyRustModeDeferredCompactionMarker({
             db,
             sessionId,
@@ -2156,7 +2158,7 @@ describe("deferred compaction marker representation", () => {
         expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
     });
 
-    it("an upgraded indexed pending waits through byte-identical defers and moves on the next bust", () => {
+    it("an upgraded indexed pending waits through byte-identical defers and moves on the next bust", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-upgraded-indexed-pending";
@@ -2245,6 +2247,7 @@ describe("deferred compaction marker representation", () => {
             expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
             expect(getCompactionMarkerHealth(db, sessionId).attempts).toBe(3);
         }
+        expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
         const bust = serve(true);
         expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
         expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryMessageId).toBe(
@@ -2333,7 +2336,7 @@ describe("deferred compaction marker representation", () => {
         expect(JSON.stringify(messages)).toBe(served[0]);
     });
 
-    it("clears retry health when the next bust retries successfully, not on the intervening defer", () => {
+    it("clears retry health when the next bust retries successfully, not on the intervening defer", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-rust-marker-retry-heals";
@@ -2406,6 +2409,7 @@ describe("deferred compaction marker representation", () => {
 
         expect(drain()).toBe(failedAttemptBytes);
         expect(getPendingCompactionMarkerState(db, sessionId)?.injectAttempts).toBe(1);
+        expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
         const healedAttemptBytes = drain(true);
         expect(healedAttemptBytes).toBe(failedAttemptBytes);
         expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
@@ -3120,6 +3124,71 @@ describe("deferred compaction marker advance representation", () => {
 });
 
 describe("deferred compaction marker CAS drain", () => {
+    for (const unavailableAt of ["preparation", "replacement"] as const) {
+        it(`serves rebuilt history when marker candidates are unavailable at ${unavailableAt}`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            createOpenCodeDbWithoutMessages("postprocess-deferred-candidates-");
+            const sessionId = `ses-marker-candidates-${unavailableAt}`;
+            const pending = { ordinal: 1, endMessageId: "u1", publishedAt: 1 };
+            setPendingCompactionMarkerState(db, sessionId, pending);
+            const messages = [
+                {
+                    info: { id: "fresh", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "fresh rebuilt turn" }],
+                },
+            ] as MessageLike[];
+            const deferredHistoryRefreshSessions = new Set([sessionId]);
+            const passOutcome = createPassOutcome();
+            const prepare = spyOn(
+                markerCandidates,
+                "prepareMarkerCandidateBasis",
+            ).mockResolvedValue(false);
+            let replacementCalls = 0;
+            try {
+                await runPostTransformPhase(
+                    basePostTransformArgs(db, sessionId, messages, {
+                        fullFeatureMode: false,
+                        passOutcome,
+                        historyRebuiltThisPass: true,
+                        canConsumeDeferredLate: true,
+                        deferredHistoryWasPendingAtPassStart: true,
+                        deferredHistoryRefreshSessions,
+                        pendingCompartmentInjection: {
+                            compartmentEndMessage: 1,
+                            compartmentEndMessageId: "u1",
+                            compartmentCount: 1,
+                            renderedText: "rebuilt history",
+                            skippedVisibleMessages: 0,
+                        } as PostTransformArgs["pendingCompartmentInjection"],
+                        ...(unavailableAt === "replacement"
+                            ? {
+                                  compactionMarkerStrategy: {
+                                      applyDeferred: () => {
+                                          replacementCalls++;
+                                          return {
+                                              kind: "deferred",
+                                              reason: "candidate-preparation",
+                                          };
+                                      },
+                                      reconcile: () => {},
+                                  } as PostTransformArgs["compactionMarkerStrategy"],
+                              }
+                            : {}),
+                    }),
+                );
+                expect(passOutcome.degradations).toEqual([]);
+                expect(JSON.stringify(messages)).toContain("fresh rebuilt turn");
+                expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+                expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(true);
+                if (unavailableAt === "preparation") expect(prepare).toHaveBeenCalled();
+                else expect(replacementCalls).toBe(1);
+            } finally {
+                prepare.mockRestore();
+            }
+        });
+    }
+
     it("preserves the deferred-history signal when a newer pending blob exists", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -12922,3 +12991,6 @@ it("a first render reproducing the served pair keeps all signed thinking", async
     ).toHaveLength(2);
     expect(result.proactiveThinkingStrip).toBeNull();
 });
+
+import { prepareCompactionMarkerCandidates } from "../../features/magic-context/compaction-marker";
+import * as markerCandidates from "../../features/magic-context/compaction-marker-candidates";

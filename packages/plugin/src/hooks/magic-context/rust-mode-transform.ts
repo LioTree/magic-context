@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
+import { prepareCompactionMarkerCandidates } from "../../features/magic-context/compaction-marker";
 import {
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
@@ -103,10 +104,11 @@ import {
 } from "./latest-thinking-recovery";
 import {
     claimLkgRequestIdentity,
+    currentLkgRequestIdentity,
     type LkgRequestIdentity,
     noteCapturedLkgRequest,
 } from "./lkg-measured-request";
-import { clearPersistedLkgSlotStrict, saveLkgSlotToDb } from "./lkg-persist";
+import { clearPersistedLkgSlotStrict, loadPersistedLkgSlot, saveLkgSlotToDb } from "./lkg-persist";
 import {
     coldStartRawServedIndex,
     coldStartUncapturedReplay,
@@ -188,6 +190,7 @@ import {
     findReasoningBearingAssistantIds,
     snapshotTrailingBlankSourceDecisions,
 } from "./strip-content";
+import { deferDeliveredSystemRefresh, recordHeldHeadForRequest } from "./system-prompt-delivery";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { TransformDeps } from "./transform";
 import { resolveHistoryBudgetTokens } from "./transform";
@@ -334,6 +337,15 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
 
 interface RustLkgCapturePlan {
     servedCaptureId?: number;
+    prepared?: {
+        slot: LkgSlot;
+        inputs: { id: string; fields: MessageContentSnapshot["fields"] }[];
+        reusedPrefix: number;
+    };
+    fenceRevision?: string;
+    eligibleForClean?: boolean;
+    committed?: boolean;
+    returnedDigest?: string;
     sessionId: string;
     inputIds: string[];
     inputSnapshots: readonly Pick<MessageContentSnapshot, "fields">[];
@@ -484,6 +496,7 @@ interface RustSessionState extends ModuleStateSyncState {
         captureSequence: number;
         rowVersion: number;
     };
+    lkgLatestServedDigest?: string;
     /** A fallback replay is provider-visible output. Keep that exact representation
      * through ordinary defers until a producer rebuild or safety escape adopts native bytes. */
     lkgRepresentationFrozen: boolean;
@@ -2281,8 +2294,21 @@ export function createRustModeTransform(
             return false;
         }
         // OpenCode aliases input and output; count ingress before replay shortens that array.
+        rememberLkgDirtyRevision(
+            sessionId,
+            markLkgRecoveryDirty({
+                sessionId,
+                slot,
+
+                processLocalProof: hasProcessLocalLkgProof(sessionId),
+                ownDirtyRevision: lkgDirtyRevision(sessionId),
+            }),
+        );
         const replayInputCount = currentMessages.length;
         replaceMessagesInPlace(output, replay.messages);
+        ensureState(states, sessionId).lkgLatestServedDigest = lkgServedArrayDigest(
+            JSON.stringify(replay.messages),
+        );
         // Every provider-visible replay enters the freeze here: the failure ladder,
         // the parked shortcut and the parked health-probe failure alike.
         enterLkgReplayFreeze(ensureState(states, sessionId), replayInputCount);
@@ -2515,6 +2541,7 @@ export function createRustModeTransform(
         state: RustSessionState,
         plan: RustLkgCapturePlan,
         requireDurable = false,
+        prepareOnly = false,
     ): "captured" | "superseded" => {
         if (
             states.get(plan.sessionId) !== state ||
@@ -2523,48 +2550,52 @@ export function createRustModeTransform(
         ) {
             return "superseded";
         }
-        // Reuse requires the exact inputs from a previously accepted capture in this
-        // process; a restarted adapter has no such proof. Compute FNV signatures at
-        // commit, not before the RPC, retaining Pi's input_content_signatures format.
-        // Cache-busting/recovery captures still commit synchronously for durability.
-        const prior = getSlot(plan.sessionId);
-        const inputs = plan.inputIds.map((id, index) => ({
-            id,
-            fields: plan.inputSnapshots[index]?.fields ?? [],
-        }));
-        // A failed durable refresh followed by eviction can hydrate an older slot.
-        // Its digests must not borrow the newer in-memory capture's equality proof.
-        const accepted = state.lkgAcceptedCapture;
-        const {
-            digests: inputContentDigests,
-            inputContentSignatures,
-            reusedPrefix,
-        } = rustCaptureDigests(
-            inputs,
-            prior?.modelKey === plan.modelKey &&
-                prior?.providerKey === plan.providerKey &&
-                prior?.captureSequence === accepted?.captureSequence &&
-                prior?.rowVersion === accepted?.rowVersion
-                ? prior
-                : undefined,
-            accepted?.inputs ?? null,
-        );
-        const slot = {
-            jsonPrefix: plan.jsonPrefix,
-            inputIdSeq: plan.inputIds,
-            inputContentDigests,
-            inputContentSignatures,
-            lastInputMessageId: plan.inputIds[plan.inputIds.length - 1] as string,
-            modelKey: plan.modelKey,
-            providerKey: plan.providerKey,
-            capturedAt: plan.capturedAt,
-            rowVersion: plan.rowVersion,
-            captureSequence: plan.captureSequence,
-            servedCaptureId: plan.servedCaptureId,
-            fullCoverage: true,
-            inputMoveDigests: inputs.map((input) => moveMessageDigestFromFields(input.fields)),
-        };
+        if (!plan.prepared) {
+            // Validate detached raw-input fields against this process's prior
+            // accepted snapshot. Prepare hashes once, after the module response,
+            // for both immediate memory installation and deferred persistence.
+            const prior = getSlot(plan.sessionId);
+            const inputs = plan.inputIds.map((id, index) => ({
+                id,
+                fields: plan.inputSnapshots[index]?.fields ?? [],
+            }));
+            // A failed durable refresh followed by eviction can hydrate an older slot.
+            // Its digests must not borrow the newer in-memory capture's equality proof.
+            const accepted = state.lkgAcceptedCapture;
+            const {
+                digests: inputContentDigests,
+                inputContentSignatures,
+                reusedPrefix,
+            } = rustCaptureDigests(
+                inputs,
+                prior?.modelKey === plan.modelKey &&
+                    prior?.providerKey === plan.providerKey &&
+                    prior?.captureSequence === accepted?.captureSequence &&
+                    prior?.rowVersion === accepted?.rowVersion
+                    ? prior
+                    : undefined,
+                accepted?.inputs ?? null,
+            );
+            const slot = {
+                jsonPrefix: plan.jsonPrefix,
+                inputIdSeq: plan.inputIds,
+                inputContentDigests,
+                inputContentSignatures,
+                lastInputMessageId: plan.inputIds[plan.inputIds.length - 1] as string,
+                modelKey: plan.modelKey,
+                providerKey: plan.providerKey,
+                capturedAt: plan.capturedAt,
+                rowVersion: plan.rowVersion,
+                captureSequence: plan.captureSequence,
+                servedCaptureId: plan.servedCaptureId,
+                fullCoverage: true,
+                inputMoveDigests: inputs.map((input) => moveMessageDigestFromFields(input.fields)),
+            };
+            plan.prepared = { slot, inputs, reusedPrefix };
+        }
+        const { slot, inputs, reusedPrefix } = plan.prepared;
         const rejection = lkgSlotRejection(plan.sessionId, slot);
+        if (prepareOnly) return rejection === null ? "captured" : "superseded";
         const captured = rejection === null && captureSlot(plan.sessionId, slot);
         if (!captured)
             throw new Error(
@@ -2583,10 +2614,22 @@ export function createRustModeTransform(
             agentName: plan.agentName,
         });
         options.onLkgCaptureForTests?.(reusedPrefix);
-        // Durability across restarts: store the exact accepted snapshot (the
-        // jsonPrefix string is reused as-is, never re-serialized). Best-effort —
-        // a write failure leaves the in-memory slot serving this process.
-        const persisted = saveLkgSlotToDb(deps.db, plan.sessionId, slot);
+        // A busy context database must not prevent serving a healthy module
+        // result. The pre-return dirty certificate prevents a restart from
+        // trusting the older row until this matching deferred save succeeds.
+        const persisted = saveLkgSlotToDb(deps.db, plan.sessionId, slot, undefined, {
+            rebuild: requireDurable,
+            ownDirtyRevision: plan.fenceRevision ?? lkgDirtyRevision(plan.sessionId),
+            requiredRevision: plan.fenceRevision,
+            cleanDigest: plan.fenceRevision
+                ? state.lkgLatestServedDigest
+                : lkgServedArrayDigest(plan.jsonPrefix),
+            retainDirtyRevision:
+                !plan.eligibleForClean || plan.returnedDigest !== state.lkgLatestServedDigest
+                    ? plan.fenceRevision
+                    : undefined,
+        });
+        plan.committed = persisted;
         if (requireDurable && !persisted) {
             throw new Error("priced LKG snapshot did not reach durable storage");
         }
@@ -2614,8 +2657,19 @@ export function createRustModeTransform(
         bindSystemDateRequest(output, dateRequest);
         const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
+        let entrySlot = getSlot(sessionId);
+        try {
+            entrySlot = loadPersistedLkgSlot(deps.db, sessionId, true) ?? entrySlot;
+        } catch {
+            /* A busy read cannot prevent a healthy module response. */
+        }
+        const recoveryFenceRebuild =
+            !!entrySlot &&
+            !hasProcessLocalLkgProof(sessionId) &&
+            !hasCleanLkgRecoveryFence(sessionId, entrySlot);
         let markerApplyAttempted = false;
         let markerDefinitelyNoCut = false;
+        let captureForCertificate: RustLkgCapturePlan | undefined;
         let markerSafeSnapshot: LkgSlot | undefined;
         let markerOriginalMessages: MessageLike[] | undefined;
         state.lastPassMarkerApplyAttempted = false;
@@ -3317,9 +3371,10 @@ export function createRustModeTransform(
             }
             const effectiveFloor = protectionFloorResolution.floor;
             const historianRun = deps.resolveHistorianRun?.();
-            // The system hook acknowledges its first hash and idle-expired changes in
-            // the durable cached marker. Forward that acknowledgement separately from
-            // the actual identity so the module can adopt only a system-only delta.
+            // cachedM0SystemHash also records system prompts the provider accepted
+            // while signed thinking required m[0]/m[1] to stay unchanged. Send that
+            // acknowledgement separately: the module compares all the other render
+            // inputs before updating its system identity without rebuilding messages.
             const observedSystemHash = sessionMeta.systemPromptHash ?? "";
             const rustSystemHash = observedSystemHash;
             const historianModels = {
@@ -4376,6 +4431,11 @@ export function createRustModeTransform(
                 } else if (coldStartLastServed) {
                     frozenReleaseLastServed = coldStartLastServed;
                 }
+                if (recoveryFenceRebuild) {
+                    frozenReplayReleased = true;
+                    frozenReleaseReason = "lkg_recovery_fence_unproven";
+                    frozenReleaseLastServed = { messages: null, proven: false };
+                }
                 if (
                     state.lkgRepresentationFrozen &&
                     !shouldAdoptModuleAfterFreeze(moduleDecisionBusts, frozenReplayReleased)
@@ -4418,14 +4478,40 @@ export function createRustModeTransform(
                             frozenReleaseReason = releaseReason;
                             frozenReleaseLastServed = lastServedSnapshot();
                         } else {
-                            appliedMessages = frozen.messages;
-                            replayedFrozenRepresentation = true;
-                            servedFrom = "lkg_frozen";
-                            sessionLog(sessionId, "lkg_frozen_replay_served");
-                            sessionLog(
-                                sessionId,
-                                `lkg_frozen_replay_debt healthy_passes=${frozenHealthyPassesAfterApply} raw_messages=${rawTailGrowth}`,
-                            );
+                            let frozenAdmitted = false;
+                            try {
+                                const frozenSlot = getSlot(sessionId);
+                                if (!frozenSlot)
+                                    throw new LkgRecoveryFenceError(
+                                        "Frozen request disappeared before return",
+                                    );
+                                rememberLkgDirtyRevision(
+                                    sessionId,
+                                    markLkgRecoveryDirty({
+                                        sessionId,
+                                        slot: frozenSlot,
+
+                                        processLocalProof: hasProcessLocalLkgProof(sessionId),
+                                        ownDirtyRevision: lkgDirtyRevision(sessionId),
+                                    }),
+                                );
+                                frozenAdmitted = true;
+                            } catch (error) {
+                                if (!(error instanceof LkgRecoveryFenceError)) throw error;
+                                frozenReplayReleased = true;
+                                frozenReleaseReason = "lkg_recovery_fence_unproven";
+                                frozenReleaseLastServed = lastServedSnapshot();
+                            }
+                            if (frozenAdmitted) {
+                                appliedMessages = frozen.messages;
+                                replayedFrozenRepresentation = true;
+                                servedFrom = "lkg_frozen";
+                                sessionLog(sessionId, "lkg_frozen_replay_served");
+                                sessionLog(
+                                    sessionId,
+                                    `lkg_frozen_replay_debt healthy_passes=${frozenHealthyPassesAfterApply} raw_messages=${rawTailGrowth}`,
+                                );
+                            }
                         }
                     }
                 }
@@ -4441,7 +4527,12 @@ export function createRustModeTransform(
                 // LKG captures postprocessed output, so running postprocess again would stop the
                 // fallback artifact from being an exact replay.
                 if (!replayedFrozenRepresentation) {
-                    if (materializedBoundary && !deps.compactionOff) {
+                    if (
+                        (materializedBoundary ||
+                            getPendingCompactionMarkerState(deps.db, sessionId) !== null) &&
+                        !deps.compactionOff
+                    ) {
+                        await prepareCompactionMarkerCandidates(sessionId);
                         try {
                             await withAsyncPrivilegedWriter(deps.db, () => undefined);
                         } catch (error) {
@@ -4661,6 +4752,23 @@ export function createRustModeTransform(
                 );
                 let captureMode = "async";
                 if (capturePlan) state.lkgLastServedCaptureSequence = capturePlan.captureSequence;
+                if (capturePlan) {
+                    const previousSlot = getSlot(sessionId);
+                    const installed = commitRustCapture(state, capturePlan, false, true);
+                    if (installed === "captured" && capturePlan.prepared) {
+                        if (!synchronousReplacement && !state.lkgSyncCaptureRequired) {
+                            capturePlan.fenceRevision = prepareLkgCaptureFence({
+                                sessionId,
+                                previousSlot,
+                                slot: capturePlan.prepared.slot,
+                                ownDirtyRevision: lkgDirtyRevision(sessionId),
+                                rebuild: synchronousReplacement,
+                            });
+                            rememberLkgDirtyRevision(sessionId, capturePlan.fenceRevision);
+                        }
+                        captureForCertificate = capturePlan;
+                    }
+                }
                 // After a provider rejected edits to the latest turn, reactive recovery restores
                 // that turn's original thinking on each pass. A served signed-thinking reset
                 // removed all of it because bytes before it changed, so there is nothing valid
@@ -4679,7 +4787,7 @@ export function createRustModeTransform(
                     ) {
                         return;
                     }
-                    if (!markerDefinitelyNoCut)
+                    if (!markerDefinitelyNoCut && !(error instanceof LkgRecoveryFenceError))
                         dropSlot(
                             sessionId,
                             `lkg_${mode}_capture_failed`,
@@ -4694,6 +4802,9 @@ export function createRustModeTransform(
                     );
                 };
                 if (!capturePlan) {
+                    invalidateCleanLkgRecoveryFence(sessionId, () =>
+                        loadPersistedLkgSlot(deps.db, sessionId),
+                    );
                     captureMode = "declined";
                     const error = new Error("LKG snapshot preparation was rejected");
                     captureFailed("async", error);
@@ -4705,7 +4816,8 @@ export function createRustModeTransform(
                         endRecoveryAfterResetCapture();
                     } catch (error) {
                         captureFailed("sync", error);
-                        if (synchronousReplacement) throw error;
+                        if (synchronousReplacement || error instanceof LkgRecoveryFenceError)
+                            throw error;
                     }
                 } else {
                     try {
@@ -4915,6 +5027,17 @@ export function createRustModeTransform(
                 resolveKeepReasoningTokens(deps.keepReasoningTokens, modelKey ?? undefined),
                 isPrefixBoundThinkingModel(model?.providerID, model?.modelID),
             );
+            if (
+                !moduleDecisionBusts &&
+                inputHasActiveThinking &&
+                isPrefixBoundThinkingModel(model?.providerID, model?.modelID)
+            ) {
+                recordHeldHeadForRequest(
+                    sessionId,
+                    currentLkgRequestIdentity(sessionId),
+                    (ownsHistory) => deferDeliveredSystemRefresh(deps, sessionId, ownsHistory),
+                );
+            }
             finishPass(true);
             // Validation, message replacement, synchronous LKG persistence and
             // bookkeeping have finished. Clear the persisted replay block last; if
@@ -4922,6 +5045,70 @@ export function createRustModeTransform(
             if (state.markerAdmissionFenced) {
                 setRustMarkerAdmissionFence(deps.db, sessionId, false);
                 state.markerAdmissionFenced = false;
+            }
+            const returnedJson = JSON.stringify(output.messages);
+            state.lkgLatestServedDigest = lkgServedArrayDigest(returnedJson);
+            if (captureForCertificate) {
+                captureForCertificate.returnedDigest = state.lkgLatestServedDigest;
+                if (
+                    captureForCertificate.prepared &&
+                    captureForCertificate.captureSequence === state.lkgCaptureSequence &&
+                    captureForCertificate.rowVersion >= state.lkgLastCapturedRowVersion
+                ) {
+                    const returnedSlot = {
+                        ...captureForCertificate.prepared.slot,
+                        jsonPrefix: returnedJson,
+                    };
+                    captureSlot(sessionId, returnedSlot);
+                    noteCapturedLkgRequest({
+                        sessionId,
+                        slot: returnedSlot,
+                        request: captureForCertificate.requestIdentity,
+                        systemPromptTokens: captureForCertificate.systemPromptTokens,
+                        agentName: captureForCertificate.agentName,
+                    });
+                }
+                captureForCertificate.eligibleForClean =
+                    lkgServedArrayDigest(captureForCertificate.jsonPrefix) ===
+                    state.lkgLatestServedDigest;
+                if (
+                    (!captureForCertificate.committed || !captureForCertificate.eligibleForClean) &&
+                    captureForCertificate.prepared &&
+                    !captureForCertificate.fenceRevision
+                ) {
+                    // A failed synchronous save or later host edit turned this into
+                    // an uncommitted return. Publish dirty before returning those bytes.
+                    captureForCertificate.fenceRevision = prepareLkgCaptureFence({
+                        sessionId,
+                        slot: captureForCertificate.prepared.slot,
+                        previousSlot: loadPersistedLkgSlot(deps.db, sessionId, true),
+                        ownDirtyRevision: lkgDirtyRevision(sessionId),
+                        rebuild: true,
+                    });
+                    rememberLkgDirtyRevision(sessionId, captureForCertificate.fenceRevision);
+                }
+                if (
+                    captureForCertificate.committed &&
+                    captureForCertificate.eligibleForClean &&
+                    captureForCertificate.prepared &&
+                    captureForCertificate.fenceRevision
+                ) {
+                    try {
+                        certifyCommittedLkgCapture({
+                            sessionId,
+                            slot: captureForCertificate.prepared.slot,
+                            revision: captureForCertificate.fenceRevision,
+                            latestServedDigest: state.lkgLatestServedDigest,
+                            load: () => loadPersistedLkgSlot(deps.db, sessionId, true),
+                        });
+                    } catch (error) {
+                        sessionLog(
+                            sessionId,
+                            "Last-good certificate remains dirty after publication failure:",
+                            error,
+                        );
+                    }
+                }
             }
         } catch (error) {
             if (markerDefinitelyNoCut) {
@@ -4938,7 +5125,18 @@ export function createRustModeTransform(
                                         ? undefined
                                         : recordServedCapture(deps.db, sessionId, true),
                                 };
-                                if (!saveLkgSlotToDb(deps.db, sessionId, markerSafeSnapshot))
+                                if (
+                                    !saveLkgSlotToDb(
+                                        deps.db,
+                                        sessionId,
+                                        markerSafeSnapshot,
+                                        undefined,
+                                        {
+                                            ownDirtyRevision: captureForCertificate?.fenceRevision,
+                                            requiredRevision: captureForCertificate?.fenceRevision,
+                                        },
+                                    )
+                                )
                                     throw new Error("could not restore the unchanged-boundary LKG");
                             } else {
                                 clearPersistedLkgSlotStrict(deps.db, sessionId);
@@ -5282,6 +5480,20 @@ import {
     protectedToolRefusal,
     signedTurnContextRefusal,
 } from "./emergency-fail-closed";
+import {
+    certifyCommittedLkgCapture,
+    hasCleanLkgRecoveryFence,
+    invalidateCleanLkgRecoveryFence,
+    LkgRecoveryFenceError,
+    lkgServedArrayDigest,
+    markLkgRecoveryDirty,
+    prepareLkgCaptureFence,
+} from "./lkg-recovery-fence";
+import {
+    hasProcessLocalLkgProof,
+    lkgDirtyRevision,
+    rememberLkgDirtyRevision,
+} from "./lkg-recovery-prefix";
 import {
     beginSystemDateRequest,
     bindSystemDateRequest,

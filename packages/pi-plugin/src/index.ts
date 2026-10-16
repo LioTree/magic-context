@@ -122,11 +122,14 @@ import {
 	providerResponseFailed,
 } from "@magic-context/core/shared/provider-response-completion";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
-import { reloadWindowOverlay } from "@magic-context/core/shared/window-geometry";
 import { registerStandalonePluginMarker } from "@magic-context/core/standalone-plugin-marker";
 import { startHostStallProfilerSwitch } from "../../plugin/src/shared/host-stall-profiler";
 import packageMetadata from "../package.json";
-import { handlePiCloneSessionStart } from "./clone-inheritance";
+import {
+	handlePiCloneSessionStart,
+	type PiCloneTransitionRegistrar,
+	registerPiCloneSessionTransitions,
+} from "./clone-inheritance";
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
 import {
 	maybeAutoEmbedPiSession,
@@ -156,9 +159,7 @@ import {
 	registerPiContextHandler,
 	signalPiDeferredHistoryRefresh,
 	signalPiDeferredMaterialization,
-	signalPiHistoryRefresh,
-	signalPiPendingMaterialization,
-	signalPiSystemPromptRefresh,
+	signalPiSystemHashChange,
 	signalPiSystemPromptRefreshForProject,
 	trackSessionForProject,
 } from "./context-handler";
@@ -243,6 +244,10 @@ import {
 	composeMagicContextSystemPrompt,
 	processSystemPromptForCache,
 } from "./system-prompt";
+import {
+	acknowledgePiPendingSystemPromptResponses,
+	acknowledgePiSystemPromptResponse,
+} from "./system-prompt-delivery-pi";
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools, syncCtxMemoryToolEnabled } from "./tools";
 import {
@@ -627,8 +632,25 @@ export function registerConfiguredTodoLifecycle(
 		: undefined;
 }
 
+const PI_MARKER_REHYDRATION_SESSION_ID_LIMIT = 5;
+
+function formatPiMarkerRehydrationLine(
+	sessionIds: readonly string[],
+	activeSessionId: string,
+): string {
+	const shownIds = sessionIds.slice(0, PI_MARKER_REHYDRATION_SESSION_ID_LIMIT);
+	const omitted = sessionIds.length - shownIds.length;
+	const suffix = omitted > 0 ? ` +${omitted} more` : "";
+	return (
+		`${PREFIX} rehydrated ${sessionIds.length} Pi deferred compaction marker session(s)` +
+		`; sessionIds=${shownIds.join(",")}${suffix}` +
+		`; activeSessionIncluded=${sessionIds.includes(activeSessionId)}`
+	);
+}
+
 export const __test = {
 	logPiConfigLoad,
+	formatPiMarkerRehydrationLine,
 	resetLoggedPiConfigDirs(): void {
 		loggedPiConfigDirs.clear();
 	},
@@ -712,6 +734,7 @@ export async function persistPiPressureFromMessageEnd(args: {
 	readBranch?: () => readonly unknown[] | undefined;
 	notifyIssue?: (message: string) => unknown | Promise<unknown>;
 }): Promise<void> {
+	acknowledgePiSystemPromptResponse(args.sessionId, args.message);
 	// Pi emits message_end before it appends the message to the branch, so the
 	// branch read for the flag does not hold this message yet. A reply with
 	// provider usage becomes the anchor of Pi's live figure once appended.
@@ -1164,7 +1187,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;
 	}
-	reloadWindowOverlay(bootConfig.config.models?.window_overlay_path);
 	setStoragePrivatePermissionEnforcement(
 		bootConfig.config.storage.enforce_private_permissions,
 	);
@@ -1383,16 +1405,13 @@ async function startPiMagicContextRuntime(
 	// boot-resolved rather than following later /cd project config changes.
 	const compactionOff = !isCompactionEnabled(config);
 	setCtxReduceRegisteredGlobally(!compactionOff);
+	let pendingPiMarkerSessions: string[] = [];
+	let piMarkerRehydrationLogged = false;
 	if (!compactionOff) {
 		try {
-			const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
+			pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
 			for (const sid of pendingPiMarkerSessions) {
 				signalPiDeferredCompactionMarkerDrain(sid);
-			}
-			if (pendingPiMarkerSessions.length > 0) {
-				log(
-					`${PREFIX} rehydrated ${pendingPiMarkerSessions.length} Pi deferred compaction marker session(s)`,
-				);
 			}
 		} catch (err) {
 			warn(
@@ -1927,6 +1946,16 @@ async function startPiMagicContextRuntime(
 				: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
 	);
 
+	// Stock Pi's types omit OMP's completed-copy events. OMP reuses the extension
+	// instance when copying sessions, so finish copying durable tag state before
+	// the destination's first context preparation can assign fresh tag numbers.
+	registerPiCloneSessionTransitions(
+		pi.on.bind(pi) as unknown as PiCloneTransitionRegistrar,
+		{
+			db,
+			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
+		},
+	);
 	pi.on("session_start", async (event, ctx) => {
 		bindStaleBuildNotice(ctx, import.meta.url);
 		// Pi emits session_start for new, resumed, and reloaded sessions. Re-read
@@ -1955,7 +1984,21 @@ async function startPiMagicContextRuntime(
 			ctx.ui.notify(formatProtectedTagsDeprecationNotice(), "warning");
 		}
 
+		// Inherit before saving cache-TTL preferences creates the child's metadata
+		// row: the clone guard uses that row to distinguish first open from resume.
+		await handlePiCloneSessionStart(event, ctx, {
+			db,
+			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
+		});
 		const sessionId = resolveSessionId(ctx);
+		if (
+			!piMarkerRehydrationLogged &&
+			pendingPiMarkerSessions.length > 0 &&
+			sessionId
+		) {
+			log(formatPiMarkerRehydrationLine(pendingPiMarkerSessions, sessionId));
+			piMarkerRehydrationLogged = true;
+		}
 		const model = ctx.model;
 		recoverLostPiRpcStages(db);
 		if (sessionId && model?.provider && model.id) {
@@ -1966,11 +2009,6 @@ async function startPiMagicContextRuntime(
 				modelKey: canonicalPiModelKey(model.provider, model.id),
 			});
 		}
-
-		await handlePiCloneSessionStart(event, ctx, {
-			db,
-			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
-		});
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
@@ -2625,9 +2663,7 @@ async function startPiMagicContextRuntime(
 				// materialize, AND the next before_agent_start refreshes
 				// adjuncts (since this turn's adjunct read used the
 				// cached values that are now potentially stale).
-				signalPiHistoryRefresh(sessionId);
-				signalPiSystemPromptRefresh(sessionId);
-				signalPiPendingMaterialization(sessionId, "system_hash");
+				signalPiSystemHashChange(sessionId, result.currentHash);
 			}
 
 			// PEEK-then-drain-on-success (Oracle audit Round 8 #6):
@@ -2691,6 +2727,9 @@ async function startPiMagicContextRuntime(
 	// Headless Pi exits after agent_end. The context handler leaves eligible
 	// history queued rather than launching a child that would outlive Pi.
 	pi.on("agent_end", (event, ctx) => {
+		acknowledgePiPendingSystemPromptResponses(
+			ctx.sessionManager.getSessionId(),
+		);
 		setEmbeddingSessionBusy(ctx.sessionManager.getSessionId(), false);
 		// Synchronous return — DO NOT await background work here.
 		// awaitInFlightHistorians()/awaitInFlightDreamers() are still

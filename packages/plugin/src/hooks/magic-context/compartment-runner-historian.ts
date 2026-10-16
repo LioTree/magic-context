@@ -9,6 +9,7 @@ import {
     rememberRescoreSampling,
 } from "../../config/live-child-output-cap";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
+import { externalHistorianFailureReason } from "../../features/magic-context/historian-failure-reason";
 import { openDatabase } from "../../features/magic-context/storage";
 import type {
     SubagentInvocationStatus,
@@ -62,6 +63,7 @@ import {
     validateHistorianOutput,
 } from "./compartment-runner-validation";
 import { resolveHistorianProducerLimits } from "./derive-budgets";
+import { PRODUCER_PROMPT_FIT_FAILURE_PATTERN } from "./historian-prompt-fit";
 import {
     historianProducerReserve,
     producerInputTokenLimit,
@@ -428,11 +430,16 @@ export async function runValidatedHistorianPass(args: {
     });
     if (!firstRun.ok || !firstRun.result) {
         if (firstRun.refusal?.terminal)
-            return { ok: false, error: firstRun.error ?? firstRun.refusal.message };
+            return {
+                ok: false,
+                error: firstRun.error ?? firstRun.refusal.message,
+                failureReason: firstRun.failureReason ?? "provider_error",
+            };
         return runFallbackHistorianPass({
             ...args,
             prompt: args.prompt,
             error: firstRun.error ?? "historian run failed",
+            failureReason: firstRun.failureReason ?? "provider_error",
             dumpPaths: [firstRun.dumpPath],
         });
     }
@@ -479,11 +486,16 @@ export async function runValidatedHistorianPass(args: {
     });
     if (!repairRun.ok || !repairRun.result) {
         if (repairRun.refusal?.terminal)
-            return { ok: false, error: repairRun.error ?? repairRun.refusal.message };
+            return {
+                ok: false,
+                error: repairRun.error ?? repairRun.refusal.message,
+                failureReason: repairRun.failureReason ?? "provider_error",
+            };
         return runFallbackHistorianPass({
             ...args,
             prompt: repairPrompt,
             error: repairRun.error ?? "historian repair run failed",
+            failureReason: repairRun.failureReason ?? "provider_error",
             dumpPaths: [firstRun.dumpPath, repairRun.dumpPath],
         });
     }
@@ -520,6 +532,7 @@ export async function runValidatedHistorianPass(args: {
         ...args,
         prompt: repairPrompt,
         error: repairValidation.error ?? "invalid compartment output",
+        failureReason: repairValidation.error ?? "parse_failed",
         dumpPaths: [firstRun.dumpPath, repairRun.dumpPath],
     });
 }
@@ -757,6 +770,7 @@ async function runHistorianPrompt(args: {
         return {
             ok: false,
             error: `Historian failed while processing this session: ${preOpenFailure}`,
+            failureReason: preOpenFailure,
         };
     }
 
@@ -792,7 +806,11 @@ async function runHistorianPrompt(args: {
                 status: "failed",
                 error: "Historian could not create its child session.",
             });
-            return { ok: false, error: "Historian could not create its child session." };
+            return {
+                ok: false,
+                error: "Historian could not create its child session.",
+                failureReason: "provider_error",
+            };
         }
 
         for (let retryIndex = 0; retryIndex <= MAX_HISTORIAN_RETRIES; retryIndex += 1) {
@@ -899,7 +917,12 @@ async function runHistorianPrompt(args: {
             error: emptyError,
         });
         if (emptyError && (!reasoningResult || lengthCapped)) {
-            return { ok: false, error: emptyError, invocationId: invocationId ?? undefined };
+            return {
+                ok: false,
+                error: emptyError,
+                failureReason: "empty_output",
+                invocationId: invocationId ?? undefined,
+            };
         }
 
         // The empty-output guard above returns when neither text nor reasoning came back.
@@ -908,6 +931,7 @@ async function runHistorianPrompt(args: {
             return {
                 ok: false,
                 error: emptyError ?? "Historian returned no assistant output.",
+                failureReason: "empty_output",
                 invocationId: invocationId ?? undefined,
             };
         }
@@ -964,9 +988,13 @@ async function runHistorianPrompt(args: {
             status: failedInvocationStatus(modelError),
             error: modelError,
         });
+        const failureMessage = getErrorMessage(modelError);
         return {
             ok: false,
             error: `Historian failed while processing this session: ${desc.brief}`,
+            failureReason: PRODUCER_PROMPT_FIT_FAILURE_PATTERN.test(failureMessage)
+                ? failureMessage
+                : externalHistorianFailureReason(modelError, "exception"),
             ...(modelError instanceof HiddenCompletionRefusal ? { refusal: modelError } : {}),
         };
     } finally {
@@ -1018,6 +1046,7 @@ async function runFallbackHistorianPass(args: {
     callbacks?: HistorianProgressCallbacks;
     agentId?: string;
     error: string;
+    failureReason?: string;
     language?: string;
     dumpPaths: Array<string | undefined>;
     retainChild?: boolean;
@@ -1050,10 +1079,15 @@ async function runFallbackHistorianPass(args: {
         chain.push(candidate);
     }
     if (chain.length === 0) {
-        return { ok: false, error: args.error };
+        return {
+            ok: false,
+            error: args.error,
+            failureReason: args.failureReason ?? "provider_error",
+        };
     }
 
     let lastError = args.error;
+    let lastFailureReason = args.failureReason ?? "provider_error";
     for (let i = 0; i < chain.length; i += 1) {
         const modelOverride = chain[i];
         const modelId = modelOverride.model;
@@ -1086,6 +1120,7 @@ async function runFallbackHistorianPass(args: {
         });
         if (!fallbackRun.ok || !fallbackRun.result) {
             lastError = fallbackRun.error ?? lastError;
+            lastFailureReason = fallbackRun.failureReason ?? "provider_error";
             continue;
         }
 
@@ -1108,10 +1143,11 @@ async function runFallbackHistorianPass(args: {
         }
         await fallbackRun.retained?.close();
         lastError = fallbackValidation.error ?? lastError;
+        lastFailureReason = fallbackValidation.error ?? "parse_failed";
         // Keep the dump for debugging; escalate to the next candidate.
     }
 
-    return { ok: false, error: lastError };
+    return { ok: false, error: lastError, failureReason: lastFailureReason };
 }
 
 /**

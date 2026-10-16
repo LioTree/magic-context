@@ -1104,8 +1104,13 @@ function sweepOrphanedOpenCodeMessageIndexesInBackground(
                    )
                  LIMIT 1`,
             );
-            const eligibleSessionIds = missingSessionIds.filter((sessionId) =>
-                stillEligible.get(sessionId, cutoff),
+            // A session absent from OpenCode's first probe may have been imported
+            // while this worker waited for the context writer lock. Recheck just
+            // those IDs in OpenCode's session table before deleting their context
+            // rows, including any tags written since the initial probe.
+            const eligibleSessionIds = missingSessionIds.filter(
+                (sessionId) =>
+                    !sessionExists.get(sessionId) && stillEligible.get(sessionId, cutoff),
             );
             // A provider ledger proves module ownership for this harness/session.
             // Keep its project coordinate until the existing Rust cleanup retry

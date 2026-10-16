@@ -17,6 +17,38 @@ struct ExecutableKey {
     identifier: String,
 }
 
+const FALLBACK_EXECUTABLE_ROOT: &str = "/tmp/magic-context-exec";
+
+fn executable_root() -> PathBuf {
+    let tmp_dir = std::env::var_os("TMPDIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let resolved_tmp_dir = tmp_dir
+        .as_deref()
+        .and_then(|path| fs::canonicalize(path).ok());
+    executable_root_for_tmpdir(tmp_dir.as_deref(), resolved_tmp_dir.as_deref())
+}
+
+/// Selects TMPDIR only when its resolved path is not macOS's transient folder.
+pub fn executable_root_for_tmpdir(
+    tmp_dir: Option<&Path>,
+    resolved_tmp_dir: Option<&Path>,
+) -> PathBuf {
+    let (Some(tmp_dir), Some(resolved_tmp_dir)) = (tmp_dir, resolved_tmp_dir) else {
+        return PathBuf::from(FALLBACK_EXECUTABLE_ROOT);
+    };
+
+    if [Path::new("/var/folders"), Path::new("/private/var/folders")]
+        .iter()
+        .any(|prefix| resolved_tmp_dir == *prefix || resolved_tmp_dir.starts_with(prefix))
+    {
+        PathBuf::from(FALLBACK_EXECUTABLE_ROOT)
+    } else {
+        tmp_dir.join("magic-context-exec")
+    }
+}
+
+
 struct StageFailure {
     kind: io::ErrorKind,
     message: String,
@@ -67,8 +99,8 @@ fn stage_executable_once(
     name: &str,
     identifier: &str,
 ) -> io::Result<PathBuf> {
-    let root = Path::new("/tmp/magic-context-exec");
-    ensure_private_directory(root)?;
+    let root = executable_root();
+    ensure_private_directory(&root)?;
     let directory = root.join(digest);
     ensure_private_directory(&directory)?;
     let destination = directory.join(name);

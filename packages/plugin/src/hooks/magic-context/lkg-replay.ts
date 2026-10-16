@@ -164,6 +164,8 @@ function projectEntryWithDigests(
 }
 
 export interface LkgCaptureInput {
+    /** Certify the complete returned array, not just an early stable anchor. */
+    completeOutput?: boolean;
     sessionId: string;
     input: LkgEntryProjection[] | MessageLike[];
     output: MessageLike[];
@@ -315,6 +317,7 @@ function outputMessageIsPostAnchor(
 export function buildLkgPrefix(
     input: LkgEntryProjection[] | MessageLike[],
     output: MessageLike[],
+    completeOutput = false,
 ): {
     anchorIndex: number;
     anchorMessageId: string;
@@ -323,7 +326,8 @@ export function buildLkgPrefix(
     jsonPrefix: string;
 } | null {
     const projected = asEntryProjection(input);
-    const anchorIndex = findLkgAnchor(projected);
+    const anchorIndex =
+        completeOutput && projected.length > 0 ? projected.length - 1 : findLkgAnchor(projected);
     if (anchorIndex === null) return null;
     const ids = projected.map((message) => message.id);
     if (ids.some((id) => id === null)) return null;
@@ -337,7 +341,9 @@ export function buildLkgPrefix(
     const inputIndexById = new Map(validIds.map((id, index) => [id, index]));
     const prefix: MessageLike[] = [];
     for (const message of output) {
-        const postAnchor = outputMessageIsPostAnchor(message, inputIndexById, anchorIndex);
+        const postAnchor = completeOutput
+            ? false
+            : outputMessageIsPostAnchor(message, inputIndexById, anchorIndex);
         if (postAnchor === null) return null;
         // Store only what the provider receives (see provider-visible-parts.ts).
         // The hosts build the request from the replayed array through conversions
@@ -364,7 +370,7 @@ export function buildLkgPrefix(
 }
 
 export function captureLkgSlot(args: LkgCaptureInput): boolean {
-    const built = buildLkgPrefix(args.input, args.output);
+    const built = buildLkgPrefix(args.input, args.output, args.completeOutput);
     if (!built) return false;
     const modelKeys = canonicalLkgModelKeys(args.modelKey, args.providerKey);
     const slot: LkgSlot = {

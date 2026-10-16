@@ -32,13 +32,13 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(71);
+        expect(ts).toHaveLength(72);
         expect(rust).toHaveLength(59);
         expect(rust).toContain("tests/rust-tool-attachments.test.ts");
         expect(rust).toContain("tests/rust-tool-attachment-upgrade.test.ts");
         expect(rust).toContain("tests/idle-ttl-restart.test.ts");
         expect(rust).toContain("tests/subagent-behavior.test.ts");
-        expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(4);
+        expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(5);
         expect(filesForMode(validation, "ts", "opencode")).toHaveLength(45);
         expect(ts).toContain("tests/latest-turn-thinking.test.ts");
         expect(ts).toContain("tests/opencode2/latest-turn-thinking-recovery.test.ts");
@@ -46,7 +46,7 @@ describe("mode manifest validator", () => {
         expect(rust).not.toContain("tests/opencode2/latest-turn-thinking-recovery.test.ts");
         expect(ts).toContain("tests/reasoning-token-budget.test.ts");
         expect(rust).not.toContain("tests/reasoning-token-budget.test.ts");
-        expect(filesForMode(validation, "ts", "pi")).toHaveLength(29);
+        expect(filesForMode(validation, "ts", "pi")).toHaveLength(30);
         expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(43);
         // These OpenCode 2 files are ts-only with hosts ["opencode2"], so only the
         // OpenCode 2 host lane runs them; the other host lanes never select them.
@@ -71,7 +71,7 @@ describe("mode manifest validator", () => {
         }
         // OMP hashes each request into its system header, breaking within-session byte identity
         // in cache-stability and long-running-session; their manifest entries declare the omission.
-        expect(filesForMode(validation, "ts", "omp")).toHaveLength(21);
+        expect(filesForMode(validation, "ts", "omp")).toHaveLength(22);
         const excluded = validation.manifest.entries
             .filter((entry) => entry.tier === "excluded")
             .map((entry) => entry.path);
@@ -152,7 +152,6 @@ describe("mode manifest validator", () => {
             "tests/rust-provider-pipeline-opencode1.test.ts",
             "tests/rust-provider-pipeline-opencode2.test.ts",
             "tests/system-prompt-change-order.test.ts",
-            "tests/window-overlay-reload.test.ts",
         ]);
         for (const path of [
             "tests/rust-provider-pipeline-opencode1.test.ts",

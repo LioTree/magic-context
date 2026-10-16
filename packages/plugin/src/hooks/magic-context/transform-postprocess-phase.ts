@@ -28,6 +28,7 @@ import {
     getPendingOpsCount,
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
+    getTagsBySession,
     type PendingCompactionMarker,
     pruneNoteNudgeAnchors,
     replacePendingCompactionMarkerStateIf,
@@ -935,6 +936,12 @@ export function applyRustModeDeferredCompactionMarker(args: {
     );
     args.afterApply?.(outcome);
     switch (outcome.kind) {
+        case "deferred":
+            sessionLog(
+                args.sessionId,
+                "rust compaction-marker drain: candidate preparation deferred; pending target retained",
+            );
+            break;
         case "applied":
         case "already-current":
         case "stale-skip":
@@ -1556,6 +1563,8 @@ export const defaultCompactionMarkerStrategy: CompactionMarkerStrategy = {
 };
 
 interface RunPostTransformPhaseArgs {
+    /** Add §N§ reduction handles to messages sent untagged during recovery, once a fold replaces the provider's cached prefix. */
+    normalizeRecoveryTail?: () => void;
     compactionMarkerStrategy?: CompactionMarkerStrategy;
     sessionId: string;
     db: ContextDatabase;
@@ -2382,6 +2391,16 @@ export async function runPostTransformPhase(
         sessionLog(
             args.sessionId,
             `m[0] HARD fold decision: reason=${m0MaterializeReason ?? foldDueDecision.reason ?? (foldExecutedThisPass ? "drift" : "soft_refresh")} executed=${foldExecutedThisPass} bustsServedPrefix=${foldBustsServedPrefixThisPass}`,
+        );
+    }
+    if (args.normalizeRecoveryTail && (foldBustsServedPrefixThisPass || firstRenderBust)) {
+        args.normalizeRecoveryTail();
+        args.tags = getTagsBySession(args.db, args.sessionId);
+        newTargets = protectNewTagMutations(
+            args.messages,
+            args.targets,
+            retainedThinking,
+            args.thinkingBindingRecoveryEnabledForModel === true,
         );
     }
     // Fold decision, cached-prefix capture and the m[1] soft refresh run above;
@@ -3795,9 +3814,18 @@ export async function runPostTransformPhase(
                 );
             } else {
                 const tMarkerDrain = performance.now();
-                const outcome = (
-                    args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy
-                ).applyDeferred(args.db, args.sessionId, pending, args.sessionDirectory);
+                const strategy = args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy;
+                const candidatesReady =
+                    strategy.applyDeferred !== applyDeferredCompactionMarker ||
+                    (await prepareCompactionMarkerCandidates(args.sessionId));
+                const outcome: MarkerUpdateOutcome = candidatesReady
+                    ? strategy.applyDeferred(
+                          args.db,
+                          args.sessionId,
+                          pending,
+                          args.sessionDirectory,
+                      )
+                    : { kind: "deferred", reason: "candidate-preparation" };
                 logTransformTiming(
                     args.sessionId,
                     "pp.markerDrain",
@@ -3805,6 +3833,16 @@ export async function runPostTransformPhase(
                     `outcome=${outcome.kind}`,
                 );
                 switch (outcome.kind) {
+                    case "deferred":
+                        // Summary discovery may observe a new summary or fail to load
+                        // its worker. Only marker replacement waits: serve the rebuilt
+                        // request now and retry replacement on a later history rebuild.
+                        suppressV12HistoryDrain = true;
+                        sessionLog(
+                            args.sessionId,
+                            "compaction-marker drain: candidate preparation deferred; preserving deferred history refresh signal",
+                        );
+                        break;
                     case "applied":
                     case "already-current":
                     case "stale-skip":
@@ -4820,6 +4858,7 @@ export function checkM0MutationDriftAndSignal(args: {
     return false;
 }
 
+import { prepareCompactionMarkerCandidates } from "../../features/magic-context/compaction-marker";
 import {
     clearPendingMaterialization,
     pendingMaterializationOrigin,

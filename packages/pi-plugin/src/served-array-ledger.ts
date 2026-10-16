@@ -7,6 +7,7 @@ import {
 	ensureStorageDirectorySync,
 	writeStorageFileSync,
 } from "@magic-context/core/shared/storage-permissions";
+import { PiContextSupersededError } from "./pi-context-budget";
 import type { PiLkgSerializedOutput } from "./pi-lkg";
 import {
 	PiServedEnvelopeUnavailable,
@@ -83,6 +84,8 @@ function sameIdentityFile(
 }
 
 interface CaptureOptions {
+	/** The saved request plus raw recovery messages assigns no new tag numbers; log bytes without consulting or publishing their identity tables. */
+	recoveryWithoutTagState?: boolean;
 	/** Managed identities are authoritative in SQLite; JSONL is a post-commit mirror. */
 	db?: import("@magic-context/core/shared/sqlite").Database;
 	/** Numbers assigned to identities represented by this managed result, not parsed from text. */
@@ -335,6 +338,9 @@ export function flushPiServedArrayLedger(): void {
 					item.assertCurrentPass?.();
 					return true;
 				} catch (error) {
+					// A deferred capture can outlive its pass. Discard that capture quietly;
+					// unexpected ownership failures still need a diagnostic.
+					if (error instanceof PiContextSupersededError) return false;
 					log(
 						"[magic-context][pi] DISCARDED CONTEXT RESULT: queued served capture",
 						error,
@@ -385,14 +391,19 @@ export function capturePiServedArray(
 		const digest = sha256(serializedArray);
 		const storageDir = options.storageDir ?? getMagicContextStorageDir();
 		identityPersistenceFailed = true;
-		const previousNumbers = getPiServedTagNumbers(sessionId, storageDir);
+		const previousNumbers = options.recoveryWithoutTagState
+			? new Set<number>()
+			: getPiServedTagNumbers(sessionId, storageDir);
+		const managedNumbers = options.recoveryWithoutTagState
+			? []
+			: (options.servedTagNumbers ?? []);
 		identityPersistenceFailed = false;
 		const served = new Set(previousNumbers);
-		if (options.db) {
+		if (options.db && !options.recoveryWithoutTagState) {
 			identityPersistenceFailed = true;
 			for (const number of readPiCommittedServedNumbers(options.db, sessionId))
 				served.add(number);
-			for (const number of options.servedTagNumbers ?? []) {
+			for (const number of managedNumbers) {
 				if (!served.has(number))
 					throw new PiServedIdentityError(
 						new Error("Pi identities have no committed LKG"),
@@ -400,7 +411,7 @@ export function capturePiServedArray(
 			}
 			identityPersistenceFailed = false;
 		}
-		for (const number of options.servedTagNumbers ?? []) {
+		for (const number of managedNumbers) {
 			if (Number.isSafeInteger(number) && number > 0) served.add(number);
 		}
 		const previous = previousBySession.get(sessionId);

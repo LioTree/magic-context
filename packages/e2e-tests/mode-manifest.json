@@ -19,6 +19,14 @@
             "hosts": ["opencode2"]
         },
         {
+            "path": "tests/pi-tree-history.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real Pi and OMP tree navigation leaves abandoned entries in JSONL. Published compartments must retire on proven active-branch mismatch so wrapup and later provider requests use reachable history; host PID lsof proves throwaway containment.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["pi", "omp"]
+        },
+        {
             "path": "tests/latest-turn-thinking.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
@@ -2712,26 +2720,6 @@
                     "contract_ref": "packages/plugin/PARITY.md#native-todos"
                 }
             ]
-        },
-        {
-            "path": "tests/window-overlay-reload.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
-            "contract_refs": [
-                "OVERLAY-SAME-PATH-AUTO-REFRESH",
-                "PI-EXTENSION-RELOAD"
-            ],
-            "hosts": [
-                "opencode",
-                "opencode2",
-                "pi",
-                "omp"
-            ],
-            "behavior": true
         },
         {
             "path": "tests/opencode2/rust-mode-boundary-restart-gate.test.ts",

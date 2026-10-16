@@ -1,5 +1,6 @@
 import { withContentLanguageDirective } from "../../agents/language-directive";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
+import { prepareCompactionMarkerCandidates } from "../../features/magic-context/compaction-marker";
 import { embedAndStoreCompartmentChunks } from "../../features/magic-context/compartment-embedding";
 import { insertCompartmentEvents } from "../../features/magic-context/compartment-events";
 import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
@@ -7,6 +8,7 @@ import {
     appendCompartments,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
+import { externalHistorianFailureReason } from "../../features/magic-context/historian-failure-reason";
 import {
     embedPromotedFacts,
     promoteSessionFactsDurable,
@@ -306,7 +308,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             subagentInvocationId: invocationId,
             runKind: telemetry.runKind ?? "incremental",
             status: telemetry.status ?? "failed",
-            failureReason: telemetry.failureReason ?? null,
+            failureReason:
+                telemetry.failureReason ??
+                (telemetry.status === "failed" ? "provider_error" : null),
             chunkStartOrdinal: telemetry.chunkStartOrdinal ?? null,
             chunkEndOrdinal: telemetry.chunkEndOrdinal ?? null,
             unprocessedFrom: telemetry.unprocessedFrom ?? null,
@@ -885,7 +889,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 `historian failure: source=validation reason="${validatedPass.error}" chunkRange=${chunk.startIndex}-${chunk.endIndex} fallbackModel=${deps.fallbackModelId ?? "<none>"} twoPass=${deps.historianTwoPass ? "true" : "false"}`,
             );
             const failCount = incrementHistorianFailure(db, sessionId, validatedPass.error);
-            telemetry.failureReason = `validation: ${validatedPass.error}`;
+            telemetry.failureReason = validatedPass.failureReason ?? validatedPass.error;
             await notifyHistorianIssue(buildHistorianFailureNotice(failCount, validatedPass.error));
             return;
         }
@@ -1329,6 +1333,11 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             deps.onDeferredMarkerPending?.(sessionId);
         } else {
             try {
+                if (
+                    !deps.compactionMarkerStrategy?.publish ||
+                    deps.compactionMarkerStrategy.publish === updateCompactionMarkerAfterPublication
+                )
+                    await prepareCompactionMarkerCandidates(sessionId);
                 (deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication)(
                     db,
                     sessionId,
@@ -1556,7 +1565,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             // as a historian failure would warn the user about a run that succeeded and
             // feed the failure backoff.
             telemetry.status = "success";
-            telemetry.failureReason = `post_publish_exception: ${desc.brief}`;
+            telemetry.failureReason = `post_publish_exception: ${externalHistorianFailureReason(error, "exception")}`;
             sessionLog(
                 sessionId,
                 `historian post-publish step failed; publication stands: ${desc.brief}`,
@@ -1564,7 +1573,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             return;
         }
         // Historian runs are fail-closed because they update durable compartment state.
-        telemetry.failureReason = `exception: ${desc.brief}`;
+        telemetry.failureReason = externalHistorianFailureReason(error, "exception");
         sessionLog(
             sessionId,
             `historian failure: source=exception ${desc.brief}${desc.stackHead ? ` stackHead="${desc.stackHead}"` : ""}`,
