@@ -54,6 +54,22 @@ pub use provider_preparation::{
 pub use provider_resident_read::ProviderResidentAuthority;
 pub mod provider_records;
 pub mod retrieval_vectors;
+
+/// Reserved embedding-effect queue API for transactional memory writers and
+/// off-thread drains. This names the shared interface; it does not implement a
+/// queue or change storage. The retrieval-vector backfill lease is not a durable
+/// mutation-effect queue and cannot replace enqueueing in the memory transaction.
+///
+/// The queue implementation belongs in `mc_store::embedding_queue`:
+/// - `enqueue_tx`: insert/invalidate an effect in the source mutation's transaction;
+/// - `claim_batch`: claim a bounded batch after activation is captured by the caller;
+/// - `complete_batch`: acknowledge only the claimed effects after guarded vector publication;
+/// - `release_batch`: retain failed effects for a later retry.
+///
+/// Writers do no embedding RPC inside their transaction. Drains reuse
+/// `retrieval_vectors` for generation/hash-guarded publication, do network work
+/// outside the store lock, and never read module configuration.
+pub const EMBEDDING_QUEUE_API: &str = "mc_store::embedding_queue";
 pub use provider_records::ProviderSessionKey;
 pub mod score_projection;
 pub mod single_store_domain;

@@ -43,6 +43,94 @@ pub mod classify;
 pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
+
+/// Names reserved for scoped, non-tool management requests. These are not facade
+/// tools: adding them to the model-visible catalog would invalidate cached prefixes.
+pub mod non_served_contract {
+    pub const UI_METHODS: &[&str] = &[
+        "mc.ui_capabilities",
+        "mc.read_sidebar",
+        "mc.read_status",
+        "mc.read_embed",
+        "mc.read_compartment_count",
+        "mc.read_todos",
+        "mc.recomp_preview",
+        "mc.recomp_start",
+        "mc.rescore",
+        "mc.wrapup",
+        "mc.flush",
+        "mc.dream",
+        "mc.embed",
+        "mc.job_read",
+        "mc.job_cancel",
+        "mc.ui_events",
+        "mc.notice_currentness",
+    ];
+    pub const RETRIEVAL_METHOD: &str = "mc.retrieval";
+    pub const MEMORY_METHOD: &str = "mc.memory";
+
+    /// Resolve the project from the session attached to the admitted channel,
+    /// using `route_project_identity`, never from request project/directory fields.
+    /// All other reserved methods are restricted to that channel's session.
+    pub const PROJECT_METHODS: &[&str] = &[
+        "mc.ui_capabilities",
+        "mc.read_sidebar",
+        "mc.read_status",
+        "mc.read_embed",
+        "mc.rescore",
+        "mc.dream",
+        "mc.embed",
+        RETRIEVAL_METHOD,
+        MEMORY_METHOD,
+    ];
+    pub const UI_READ_METHODS: &[&str] = &[
+        "mc.ui_capabilities",
+        "mc.read_sidebar",
+        "mc.read_status",
+        "mc.read_embed",
+        "mc.read_compartment_count",
+        "mc.read_todos",
+    ];
+
+    /// `HandlerOutcome::Error` has two wire fields. Its `message` is the exact
+    /// refused method name, not prose, so clients can identify the unsupported route.
+    pub const ROUTE_REFUSAL_CODE: &str = "route_not_ported";
+    pub const ROUTE_NAME_FIELD: &str = "message";
+    /// Keys are Rust `RetrievalSource` ids. In particular `raw_message` and
+    /// `compartment` are separate keys, unlike the TS request source `message`.
+    pub const RETRIEVAL_AVAILABILITY_FIELD: &str = "source_availability";
+
+    /// Selectors for comparing the existing transform paths: the legacy Rust
+    /// adapter, a complete message-array request, and the fast provider protocol.
+    /// `full_request` selects the adapter but may still send only changed messages
+    /// via `tail_delta`. For a complete array, omit that field and supply `messages`.
+    /// The provider protocol also needs compaction enabled and an available module
+    /// client, just like today's Rust adapter.
+    /// See the plugin's config/schema/magic-context.ts and rust-mode-transform.ts.
+    pub const SERVED_LANE_SELECTORS: &[(&str, &str)] = &[
+        (
+            "current_rust",
+            "transform_mode=rust; rust_pipeline=full_request",
+        ),
+        (
+            "full_array",
+            "transform_mode=rust; rust_pipeline=full_request; request.messages; tail_delta absent",
+        ),
+        (
+            "fast_rust_provider",
+            "transform_mode=rust; rust_pipeline=provider; compaction.enabled=true",
+        ),
+    ];
+
+    /// Missing handles and busy/locked reads share this unknown-state envelope.
+    /// Unknown values must never be displayed as successful, authoritative zeros.
+    pub fn partial_state_body() -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ok": false, "state": "partial", "reason": "store_unavailable",
+            "authority": "unknown", "data": null,
+        })
+    }
+}
 pub mod config_parity;
 mod content_language;
 pub mod decay_render;
@@ -4963,6 +5051,7 @@ impl McHandler {
         Self::with_producer_factory_and_config(
             factory,
             McModuleConfig {
+                rust_background_enabled: false,
                 cache_ttl_by_model: std::collections::BTreeMap::new(),
                 catalog: crate::config::CatalogConfigInputs::default(),
                 historian_temperature: None,
@@ -8135,6 +8224,39 @@ impl McHandler {
             }
         };
         Ok((session_id.to_string(), binding))
+    }
+
+    fn handle_non_served_method(
+        &self,
+        channel: u16,
+        request: &Value,
+        method: &str,
+    ) -> HandlerOutcome {
+        let (_, binding) = match self.management_binding(channel, request, method) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let store = self.store.get();
+        if non_served_contract::UI_READ_METHODS.contains(&method) && store.is_none() {
+            return respond(non_served_contract::partial_state_body());
+        }
+        if non_served_contract::PROJECT_METHODS.contains(&method) {
+            if let Some(store) = store {
+                if let Err(outcome) = self.route_project_identity(store, &binding) {
+                    return outcome;
+                }
+            }
+        }
+        if method == "mc.dream" {
+            return self.dream_control_entry(&binding, request);
+        }
+        non_served_route_refusal(method)
+    }
+
+    // The manual dream controller is deliberately separate from dreamer.run_task.
+    // Until a scheduler owns this entry, it starts no host or Rust work.
+    fn dream_control_entry(&self, _binding: &SessionBinding, _request: &Value) -> HandlerOutcome {
+        non_served_route_refusal("mc.dream")
     }
 
     fn handle_todo_state_set_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -14966,6 +15088,72 @@ impl McHandler {
             .get("method")
             .and_then(Value::as_str)
             .or_else(|| request.get("kind").and_then(Value::as_str));
+        // Authenticate these non-tool routes before store-open or provider checks.
+        // Their executors will replace the named refusals without retargeting served paths.
+        match method {
+            Some("mc.ui_capabilities") => {
+                return self.handle_non_served_method(channel, &request, "mc.ui_capabilities")
+            }
+            Some("mc.read_sidebar") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_sidebar")
+            }
+            Some("mc.read_status") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_status")
+            }
+            Some("mc.read_embed") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_embed")
+            }
+            Some("mc.read_compartment_count") => {
+                return self.handle_non_served_method(
+                    channel,
+                    &request,
+                    "mc.read_compartment_count",
+                )
+            }
+            Some("mc.read_todos") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_todos")
+            }
+            Some("mc.recomp_preview") => {
+                return self.handle_non_served_method(channel, &request, "mc.recomp_preview")
+            }
+            Some("mc.recomp_start") => {
+                return self.handle_non_served_method(channel, &request, "mc.recomp_start")
+            }
+            Some("mc.rescore") => {
+                return self.handle_non_served_method(channel, &request, "mc.rescore")
+            }
+            Some("mc.wrapup") => {
+                return self.handle_non_served_method(channel, &request, "mc.wrapup")
+            }
+            Some("mc.flush") => {
+                return self.handle_non_served_method(channel, &request, "mc.flush")
+            }
+            Some("mc.dream") => {
+                return self.handle_non_served_method(channel, &request, "mc.dream")
+            }
+            Some("mc.embed") => {
+                return self.handle_non_served_method(channel, &request, "mc.embed")
+            }
+            Some("mc.job_read") => {
+                return self.handle_non_served_method(channel, &request, "mc.job_read")
+            }
+            Some("mc.job_cancel") => {
+                return self.handle_non_served_method(channel, &request, "mc.job_cancel")
+            }
+            Some("mc.ui_events") => {
+                return self.handle_non_served_method(channel, &request, "mc.ui_events")
+            }
+            Some("mc.notice_currentness") => {
+                return self.handle_non_served_method(channel, &request, "mc.notice_currentness")
+            }
+            Some("mc.retrieval") => {
+                return self.handle_non_served_method(channel, &request, "mc.retrieval")
+            }
+            Some("mc.memory") => {
+                return self.handle_non_served_method(channel, &request, "mc.memory")
+            }
+            _ => {}
+        }
         let provider_operation = if method == Some("tools/call") {
             request.pointer("/params/name").and_then(Value::as_str)
         } else {
@@ -15064,6 +15252,13 @@ impl McHandler {
             return self.handle_facade_value(channel, request).await;
         }
         unrecognized_request_error(&request)
+    }
+}
+
+fn non_served_route_refusal(method: &str) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: non_served_contract::ROUTE_REFUSAL_CODE.to_string(),
+        message: method.to_string(),
     }
 }
 
@@ -19708,6 +19903,166 @@ mod tests {
     // The per-harness default runner, driven through real passes.
     mod default_runner;
 
+    fn owner_prep_methods() -> impl Iterator<Item = &'static str> {
+        non_served_contract::UI_METHODS.iter().copied().chain([
+            non_served_contract::RETRIEVAL_METHOD,
+            non_served_contract::MEMORY_METHOD,
+        ])
+    }
+
+    #[tokio::test]
+    async fn owner_prep_each_arm_authorizes_before_read_write_replay_or_job_lookup() {
+        assert_eq!(owner_prep_methods().count(), 19);
+        assert_eq!(
+            owner_prep_methods()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            19
+        );
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        store.set_route_identity_for_test(project.to_str().unwrap(), "git:bound-project");
+        store
+            .replace_compartments("ses", &[stored_comp(1, 1, 1, "m1", "owned")])
+            .unwrap();
+        store
+            .replace_compartments("foreign", &[stored_comp(2, 1, 1, "m2", "private")])
+            .unwrap();
+        let changes = || {
+            store
+                .with_context_conn_for_test(|tx| {
+                    tx.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                })
+                .unwrap()
+        };
+        let before = changes();
+        for method in owner_prep_methods() {
+            for (channel, request, expected) in [
+                (
+                    7,
+                    json!({"method":method,"session_id":"ses"}),
+                    "bad_request",
+                ),
+                (
+                    7,
+                    json!({"method":method,"v":2,"session_id":"ses"}),
+                    "bad_request",
+                ),
+                (7, json!({"method":method,"v":1}), "bad_request"),
+                (
+                    7,
+                    json!({"method":method,"v":1,"session_id":""}),
+                    "bad_request",
+                ),
+                (
+                    7,
+                    json!({"method":method,"v":1,"session_id":"  "}),
+                    "bad_request",
+                ),
+                (
+                    8,
+                    json!({"method":method,"v":1,"session_id":"ses"}),
+                    "route_unbound",
+                ),
+                (
+                    7,
+                    json!({"method":method,"v":1,"session_id":"foreign"}),
+                    "session_mismatch",
+                ),
+            ] {
+                match handler.dispatch_value(channel, request).await {
+                    HandlerOutcome::Error { code, .. } => assert_eq!(code, expected, "{method}"),
+                    _ => panic!("{method} must refuse {expected} without returning data"),
+                }
+            }
+        }
+        assert_eq!(
+            changes(),
+            before,
+            "refused arms must write nothing in any table"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_prep_authorized_arms_refuse_by_exact_route_without_effects() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        store.set_route_identity_for_test(project.to_str().unwrap(), "git:bound-project");
+        let before = store.load("ses").unwrap().row_version;
+        for method in owner_prep_methods() {
+            match handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method":method,"v":1,"session_id":"ses", "project":"git:foreign-project",
+                        "directory":"/foreign", "command_id":"same-command", "job_id":"foreign-job",
+                        "acked_position":0,
+                    }),
+                )
+                .await
+            {
+                HandlerOutcome::Error { code, message } => {
+                    assert_eq!(code, "route_not_ported", "{method}");
+                    assert_eq!(message, method);
+                }
+                _ => panic!("{method} must not claim an executor is implemented"),
+            }
+        }
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+        assert_eq!(non_served_contract::ROUTE_NAME_FIELD, "message");
+        assert_eq!(
+            non_served_contract::RETRIEVAL_AVAILABILITY_FIELD,
+            "source_availability"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_prep_store_absence_is_partial_only_after_authorization() {
+        let handler = McHandler::new();
+        let dir = tempfile::tempdir().unwrap();
+        handler.bind_route(7, binding(dir.path().to_str().unwrap(), "ses"));
+        for method in non_served_contract::UI_READ_METHODS {
+            let request = json!({"method":method,"v":1,"session_id":"ses"});
+            assert_eq!(
+                error_code(handler.dispatch_value(8, request.clone()).await),
+                "route_unbound"
+            );
+            let body = call_dispatch_request(&handler, request).await;
+            assert_eq!(
+                body,
+                json!({
+                    "v":1,"ok":false,"state":"partial","reason":"store_unavailable",
+                    "authority":"unknown","data":null,
+                }),
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_prep_project_scope_uses_bound_identity_not_request_fields() {
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        std::fs::write(project.join(".git"), "gitdir: /nonexistent/for/this/test\n").unwrap();
+        handler
+            .resolve_project_identity_for_test
+            .store(true, Ordering::Relaxed);
+        // The throwaway checkout has a broken Git identity. A caller-supplied
+        // project must not rescue it or authorize another project's rows.
+        for method in non_served_contract::PROJECT_METHODS {
+            let outcome = handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method":method,"v":1,"session_id":"ses",
+                        "project":"git:forged", "project_path":"git:forged", "directory":"/forged",
+                    }),
+                )
+                .await;
+            assert_eq!(error_code(outcome), "git_identity_unavailable", "{method}");
+        }
+    }
+
     #[test]
     fn search_date_bounds_are_utc_inclusive_and_reject_invalid_values() {
         let date_args = serde_json::from_value::<Map<String, Value>>(serde_json::json!({
@@ -22596,6 +22951,7 @@ mod tests {
 
     fn default_test_config() -> McModuleConfig {
         McModuleConfig {
+            rust_background_enabled: false,
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             catalog: crate::config::CatalogConfigInputs::default(),
             historian_temperature: None,
