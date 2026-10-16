@@ -183,6 +183,7 @@ import {
 } from "@magic-context/core/hooks/magic-context/dropped-token-estimate";
 import {
 	createEditAdmission,
+	type EditAdmission,
 	isAdmissionUser,
 	thinkingAnchor,
 } from "@magic-context/core/hooks/magic-context/edit-admission";
@@ -5842,16 +5843,16 @@ export function registerPiContextHandler(
 					if (
 						options.todowriteEnabled === true &&
 						!options.compactionOff &&
-						!sessionMetaForTodo.isSubagent &&
-						sessionMetaForTodo.lastTodoState !== ""
-					) {
-						const isCacheBustingForTodo =
-							result.prefixBustPermitted && !result.strictThinkingKept;
+                        !sessionMetaForTodo.isSubagent
+                    ) {
+                        const isCacheBustingForTodo = result.prefixBustPermitted;
 						outputMessages = injectSyntheticTodowriteForPi({
 							db: options.db,
 							sessionId,
 							isSubagent: sessionMetaForTodo.isSubagent,
-							isCacheBusting: isCacheBustingForTodo,
+                            isCacheBusting: isCacheBustingForTodo,
+                            editAdmission: result.editAdmission,
+                            stableId: (message) => result.postCommitEntryIdByRef.get(message),
 							lastTodoState: sessionMetaForTodo.lastTodoState,
 							messages: outputMessages as unknown as Parameters<
 								typeof injectSyntheticTodowriteForPi
@@ -8131,6 +8132,7 @@ interface RunPipelineResult {
 	prefixBustPermitted: boolean;
 	/** False while a signed-prefix hold defers new host-side work. */
 	prefixMutationAllowed: boolean;
+	editAdmission?: EditAdmission;
 	strictThinkingKept: boolean;
 	signedPrefixRewritten: boolean;
 	/** A missing or cold cache already costs a rebuild; further eligible edits add no extra bust. */
@@ -11052,6 +11054,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			(recoveryNormalized ? "recovery_tail_normalized" : undefined),
 		prefixBustPermitted: isCacheBustingPass,
 		prefixMutationAllowed,
+		editAdmission,
 		strictThinkingKept: protectedSignedPrefix,
 		signedPrefixRewritten: rewritingSignedPrefix,
 		prefixRebuildAlreadyPriced: firstRenderBust || heldIdleExpiryRebuild,

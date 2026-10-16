@@ -36,10 +36,15 @@ import {
 	getPersistedTodoSyntheticAnchor,
 	setPersistedTodoSyntheticAnchor,
 } from "@magic-context/core/features/magic-context/storage-meta";
+import type {
+	EditAdmission,
+	EditCoord,
+} from "@magic-context/core/hooks/magic-context/edit-admission";
 import {
 	buildSyntheticTodoPart,
 	type SyntheticTodoPart,
 } from "@magic-context/core/hooks/magic-context/todo-view";
+import { sessionLog } from "@magic-context/core/shared/logger";
 
 // Pi message shape (mirrors @earendil-works/pi-ai types — kept local because
 // the pi-plugin builds against a stable subset of those types via TypeScript
@@ -248,6 +253,8 @@ export function injectSyntheticTodowriteForPi(args: {
 	isCacheBusting: boolean;
 	lastTodoState: string;
 	messages: PiMessage[];
+	editAdmission?: EditAdmission;
+	stableId?: (message: PiMessage, index: number) => string | undefined;
 }): PiMessage[] {
 	if (args.isSubagent) return args.messages;
 
@@ -256,24 +263,117 @@ export function injectSyntheticTodowriteForPi(args: {
 		args.sessionId,
 	);
 
+	const replay = (): PiMessage[] => {
+		if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
+			const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
+			if (part !== null && part.callID === persistedAnchor.callId) {
+				injectByAssistantId(args.messages, persistedAnchor.messageId, part);
+			}
+		}
+		return args.messages;
+	};
+	const entryId = (anchor: string): string | undefined => {
+		const index = args.messages.findIndex(
+			(message) =>
+				message.role === "assistant" &&
+				getMessageId(message as PiAssistantMessage) === anchor,
+		);
+		return index < 0 ? undefined : args.stableId?.(args.messages[index], index);
+	};
+	const admit = (newAnchor?: string | null): boolean => {
+		const coords: EditCoord[] = [];
+		if (persistedAnchor)
+			coords.push({
+				kind: "message",
+				id: entryId(persistedAnchor.messageId),
+				block: "whole",
+			});
+		let hasSyntheticCall = false;
+		for (let index = 0; index < args.messages.length; index++) {
+			const message = args.messages[index];
+			if (
+				message.role === "assistant" &&
+				Array.isArray(message.content) &&
+				message.content.some((part) => part.syntheticTodoMarker === true)
+			) {
+				hasSyntheticCall = true;
+				coords.push({
+					kind: "message",
+					id: args.stableId?.(message, index),
+					block: "whole",
+				});
+			}
+		}
+		if (
+			!persistedAnchor &&
+			!hasSyntheticCall &&
+			args.messages.some(
+				(message) =>
+					"syntheticTodoMarker" in message &&
+					message.syntheticTodoMarker === true,
+			)
+		) {
+			coords.push({ kind: "prefix" });
+		}
+		if (newAnchor) coords.push({ kind: "append", afterId: entryId(newAnchor) });
+		if (
+			coords.every(
+				(coord) => !args.editAdmission || args.editAdmission.admit(coord),
+			)
+		)
+			return true;
+		if (args.editAdmission?.frame.kind === "boundary") {
+			sessionLog(
+				args.sessionId,
+				`edit admission: held lane=synthetic todo coords=${JSON.stringify(coords)} boundary=${args.editAdmission.frame.messageId ?? "<unresolved>"} held_edits=1`,
+			);
+		}
+		return false;
+	};
+	const removePair = (): void => {
+		for (let index = args.messages.length - 1; index >= 0; index--) {
+			const message = args.messages[index];
+			if (
+				"syntheticTodoMarker" in message &&
+				message.syntheticTodoMarker === true
+			)
+				args.messages.splice(index, 1);
+			else if (message.role === "assistant" && Array.isArray(message.content)) {
+				message.content = message.content.filter(
+					(part) => part.syntheticTodoMarker !== true,
+				);
+			}
+		}
+	};
 	if (args.isCacheBusting) {
 		const part = buildSyntheticTodoPart(args.lastTodoState);
 		if (part === null) {
+			if (!admit()) return replay();
+			removePair();
 			if (persistedAnchor) {
 				clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
 			}
 			return args.messages;
 		}
+		// Preview placement on copies before changing messages or the persisted todo anchor:
+		// a rejected move must replay the previously served todo pair byte-for-byte.
+		const preview = args.messages.map((message) => ({
+			...message,
+			...(Array.isArray(message.content)
+				? { content: [...message.content] }
+				: {}),
+		})) as PiMessage[];
 		if (
 			persistedAnchor &&
 			persistedAnchor.callId === part.callID &&
-			injectByAssistantId(args.messages, persistedAnchor.messageId, part)
+			injectByAssistantId(preview, persistedAnchor.messageId, part)
 		) {
 			// Snapshot unchanged AND persisted anchor still present —
 			// idempotent re-inject; backfill stateJson if it was empty
 			// (legacy row from a build that persisted callID without state).
 			// Mirrors the same self-heal in the OpenCode todo-injection path.
 			if (persistedAnchor.stateJson.length === 0) {
+				if (!admit(persistedAnchor.messageId)) return replay();
 				setPersistedTodoSyntheticAnchor(
 					args.db,
 					args.sessionId,
@@ -282,8 +382,12 @@ export function injectSyntheticTodowriteForPi(args: {
 					args.lastTodoState,
 				);
 			}
+			injectByAssistantId(args.messages, persistedAnchor.messageId, part);
 			return args.messages;
 		}
+		const candidateId = injectIntoLatestAssistant(preview, part);
+		if (!admit(candidateId)) return replay();
+		removePair();
 		const anchoredMessageId = injectIntoLatestAssistant(args.messages, part);
 		if (anchoredMessageId) {
 			setPersistedTodoSyntheticAnchor(
@@ -299,21 +403,8 @@ export function injectSyntheticTodowriteForPi(args: {
 		return args.messages;
 	}
 
-	// Defer pass — byte-identical replay from PERSISTED state, not current
-	// snapshot. The agent may have called todowrite between T0 and T1; if
-	// we rebuilt from the current snapshot we'd inject a different shape
-	// and bust Anthropic prompt cache.
-	if (!persistedAnchor || persistedAnchor.stateJson.length === 0) {
-		return args.messages;
-	}
-	const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
-	if (part === null || part.callID !== persistedAnchor.callId) {
-		return args.messages;
-	}
-	// If the anchor is not in Pi's visible window, skip silently — same
-	// behavior as OpenCode's `injectToolPartIntoAssistantById`. Re-anchoring
-	// on defer would change the message-array position versus prior defer
-	// passes and bust prompt-cache wire shape.
-	injectByAssistantId(args.messages, persistedAnchor.messageId, part);
-	return args.messages;
+	// Replay the persisted todo state rather than the live snapshot: a real todowrite
+	// between passes must not change the synthetic call/result bytes on a defer pass.
+	// If its saved assistant is missing, skip replay instead of moving the pair.
+	return replay();
 }

@@ -118,7 +118,13 @@ import {
     type DroppedTokenReduction,
     estimateDroppedTokensFromTagReductions,
 } from "./dropped-token-estimate";
-import { createEditAdmission, isAdmissionUser, thinkingAnchor } from "./edit-admission";
+import {
+    createEditAdmission,
+    type EditAdmission,
+    type EditCoord,
+    isAdmissionUser,
+    thinkingAnchor,
+} from "./edit-admission";
 import { EmergencyFailClosedError, outgoingContextRefusal } from "./emergency-fail-closed";
 import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
@@ -347,6 +353,7 @@ export async function applyTodoSynthesis(args: {
     fullFeatureMode: boolean;
     compactionOff?: boolean;
     isCacheBustingPass: boolean;
+    editAdmission?: EditAdmission;
     sessionMeta: SessionMeta;
     todowriteAvailability: ToolAvailabilityVerdict;
     client?: PluginContext["client"];
@@ -395,8 +402,50 @@ export async function applyTodoSynthesis(args: {
         logTransformTiming(args.sessionId, "pp.todoPermissionRead", tTodoPermission);
     }
 
+    const replay = (): number => {
+        if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
+            const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
+            if (part !== null && part.callID === persistedAnchor.callId) {
+                return injectPersistedTodoAnchor(
+                    args.messages,
+                    args.sessionId,
+                    persistedAnchor.messageId,
+                    part,
+                ).prependedMessageCount;
+            }
+        }
+        return 0;
+    };
+    const admit = (newAnchor?: string): boolean => {
+        const coords: EditCoord[] = [];
+        if (persistedAnchor) {
+            coords.push({ kind: "message", id: persistedAnchor.messageId, block: "whole" });
+        }
+        for (const message of args.messages) {
+            if (message.parts.some(isSyntheticTodoPart)) {
+                coords.push({ kind: "message", id: message.info.id, block: "whole" });
+            }
+        }
+        if (newAnchor) {
+            coords.push(
+                newAnchor === TODO_HEAD_ANCHOR_ID
+                    ? { kind: "prefix" }
+                    : { kind: "append", afterId: newAnchor },
+            );
+        }
+        if (coords.every((coord) => !args.editAdmission || args.editAdmission.admit(coord)))
+            return true;
+        if (args.editAdmission?.frame.kind === "boundary") {
+            sessionLog(
+                args.sessionId,
+                `edit admission: held lane=synthetic todo coords=${JSON.stringify(coords)} boundary=${args.editAdmission.frame.messageId ?? "<unresolved>"} held_edits=1`,
+            );
+        }
+        return false;
+    };
     const todowriteUnavailable = toolsMapUnavailable || permissionDenied;
     if (args.isCacheBustingPass && todowriteUnavailable) {
+        if (!admit()) return replay();
         removeSyntheticTodoParts(args.messages);
         // Clear the persisted synthetic anchor even if an older row contains only
         // one synthetic field; otherwise stale partial data could keep part of the
@@ -413,21 +462,27 @@ export async function applyTodoSynthesis(args: {
 
     if (args.isCacheBustingPass) {
         const part = buildSyntheticTodoPart(args.sessionMeta.lastTodoState);
+        // Preview placement on copies before changing messages or the persisted todo anchor:
+        // a rejected move must replay the previously served todo pair byte-for-byte.
+        const preview = args.messages.map((message) => ({ ...message, parts: [...message.parts] }));
         const persistedInjection =
             part !== null && persistedAnchor && persistedAnchor.callId === part.callID
                 ? injectPersistedTodoAnchor(
-                      args.messages,
+                      preview,
                       args.sessionId,
                       persistedAnchor.messageId,
                       part,
                   )
                 : null;
         if (part === null) {
+            if (!admit()) return replay();
+            removeSyntheticTodoParts(args.messages);
             if (persistedAnchor) clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
             return 0;
         }
         if (persistedAnchor && persistedInjection?.injected) {
             if (persistedAnchor.stateJson.length === 0) {
+                if (!admit(persistedAnchor.messageId)) return replay();
                 setPersistedTodoSyntheticAnchor(
                     args.db,
                     args.sessionId,
@@ -436,9 +491,17 @@ export async function applyTodoSynthesis(args: {
                     args.sessionMeta.lastTodoState,
                 );
             }
-            return persistedInjection.prependedMessageCount;
+            return injectPersistedTodoAnchor(
+                args.messages,
+                args.sessionId,
+                persistedAnchor.messageId,
+                part,
+            ).prependedMessageCount;
         }
 
+        const candidateId = injectToolPartIntoLatestAssistant(preview, part) ?? TODO_HEAD_ANCHOR_ID;
+        if (!admit(candidateId)) return replay();
+        removeSyntheticTodoParts(args.messages);
         const existingAssistantId = injectToolPartIntoLatestAssistant(args.messages, part);
         const injection =
             existingAssistantId === null
@@ -460,18 +523,7 @@ export async function applyTodoSynthesis(args: {
 
     // Defer pass: rebuild from the persisted snapshot, never from live
     // last_todo_state, so a real todowrite between passes cannot change bytes.
-    if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
-        const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
-        if (part !== null && part.callID === persistedAnchor.callId) {
-            return injectPersistedTodoAnchor(
-                args.messages,
-                args.sessionId,
-                persistedAnchor.messageId,
-                part,
-            ).prependedMessageCount;
-        }
-    }
-    return 0;
+    return replay();
 }
 
 /** An armed binding-recovery flag consumed by one live pass. */
@@ -3984,7 +4036,8 @@ export async function runPostTransformPhase(
             messages: args.messages,
             fullFeatureMode: args.fullFeatureMode,
             compactionOff,
-            isCacheBustingPass: canEditWholePrefix,
+            isCacheBustingPass,
+            editAdmission,
             sessionMeta: args.sessionMeta,
             todowriteAvailability: args.todowriteAvailability,
             client: args.client,

@@ -7587,6 +7587,8 @@ fn apply_once(
             loaded.meta.coverage_ordinal,
             coverage_shrunk_on_bust,
             req,
+            &admission,
+            &loaded.meta,
         )?;
         todo_ms += elapsed_ms(todo_started_at);
     }
@@ -7772,6 +7774,7 @@ fn apply_once(
         .as_ref()
         .and_then(|pair| pair.anchor_mid.as_deref())
         .is_some_and(|anchor| !req.messages.iter().any(|message| message.mid == anchor))
+        && admit_todo_change(&admission, meta.synthetic_todo.as_ref(), None)
     {
         meta.synthetic_todo = None;
     }
@@ -11533,7 +11536,12 @@ fn advance_synthetic_todo(
     old_coverage: Option<u64>,
     coverage_shrunk_on_bust: bool,
     req: &TransformRequest,
+    admission: &crate::edit_admission::EditAdmission,
+    persisted: &ModuleMeta,
 ) -> Result<(), TransformError> {
+    if !is_bust_pass {
+        return Ok(());
+    }
     let existing = meta.synthetic_todo.clone();
     let outcome = advance_injection_from_meta(
         meta,
@@ -11541,16 +11549,19 @@ fn advance_synthetic_todo(
         is_bust_pass,
         todo_synthesis_verdict(req),
     );
+    // Preview the full transition before applying it: removing the old pair and inserting
+    // the new one must both preserve the bytes before retained signed thinking.
+    let mut preview = meta.clone();
     match outcome {
         InjectionOutcome::Replace(next) => {
             let anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
-            meta.synthetic_todo = Some((*next).freeze_at(anchor_mid));
+            preview.synthetic_todo = Some((*next).freeze_at(anchor_mid));
         }
-        InjectionOutcome::Clear => meta.synthetic_todo = None,
+        InjectionOutcome::Clear => preview.synthetic_todo = None,
         InjectionOutcome::Keep => {
             if is_bust_pass {
                 reanchor_kept_synthetic_todo_if_folded_or_shrunk(
-                    meta,
+                    &mut preview,
                     old_coverage,
                     coverage_shrunk_on_bust,
                     req,
@@ -11559,7 +11570,50 @@ fn advance_synthetic_todo(
         }
         InjectionOutcome::None => {}
     }
+    if preview.synthetic_todo != existing
+        && !admit_todo_change(
+            admission,
+            existing.as_ref(),
+            preview.synthetic_todo.as_ref(),
+        )
+    {
+        // Restore the todo state captured on this pass as well as retaining the old pair;
+        // a rejected replacement must not become the durable source for a later pass.
+        meta.last_todo_state = persisted.last_todo_state.clone();
+        meta.last_todo_state_hash = persisted.last_todo_state_hash.clone();
+        meta.last_todo_state_owner_message_id = persisted.last_todo_state_owner_message_id.clone();
+        tracing::info!(session = req.session_id, lane = "synthetic todo", boundary = ?admission.frame,
+            held_edits = 1, "mc-module: held todo move");
+        return Ok(());
+    }
+    meta.synthetic_todo = preview.synthetic_todo;
     Ok(())
+}
+
+fn admit_todo_change(
+    admission: &crate::edit_admission::EditAdmission,
+    old: Option<&mc_store::FrozenSyntheticTodoPair>,
+    new: Option<&mc_store::FrozenSyntheticTodoPair>,
+) -> bool {
+    use crate::edit_admission::{BlockPos, EditCoord};
+    let old_admitted = old.is_none_or(|pair| {
+        admission.admit(match pair.anchor_mid.as_deref() {
+            Some(mid) => EditCoord::Message {
+                mid: Some(mid),
+                block: BlockPos::Whole,
+            },
+            None => EditCoord::Prefix,
+        })
+    });
+    let new_admitted = new.is_none_or(|pair| {
+        admission.admit(match pair.anchor_mid.as_deref() {
+            Some(mid) => EditCoord::Append {
+                after_mid: Some(mid),
+            },
+            None => EditCoord::Prefix,
+        })
+    });
+    old_admitted && new_admitted
 }
 
 fn reanchor_kept_synthetic_todo_if_folded_or_shrunk(
@@ -32680,6 +32734,7 @@ pub(crate) mod tests {
     include!("transform/reasoning_clear_gate_tests.rs");
     include!("transform/stale_reduce_tests.rs");
     include!("transform/image_admission_tests.rs");
+    include!("transform/todo_admission_tests.rs");
     include!("tests/signed_prefix_hold.rs");
     include!("tests/signed_prefix_hold_review.rs");
     include!("tests/signed_prefix_hold_review_r2.rs");

@@ -732,15 +732,6 @@ impl Fixture {
     }
 }
 
-/// Lanes whose mid-loop bust changes the request before a signed thinking block the request
-/// still carries, which a strict-binding provider rejects. Only a primary's Todo lane is
-/// exposed. A primary's HardFold is not: the signed-prefix head freeze replays m0/m1
-/// unchanged for the whole open signed turn, so the fold is held (no edit, no error) and
-/// lands at the next user turn.
-fn exposed(subagent: bool, lane: Lane) -> bool {
-    !subagent && matches!(lane, Lane::Todo)
-}
-
 fn mid_loop(profile: &str, subagent: bool, lane: Lane) {
     let mut f = Fixture::new(profile, subagent, lane, "mid-loop");
     f.prepare();
@@ -774,18 +765,6 @@ fn mid_loop(profile: &str, subagent: bool, lane: Lane) {
     // Under MC_AUDIT_STRICT=1 every lane must behave as held, which is the acceptance bar of
     // .cortexkit/internal-docs/designs/designs/signed-thinking-hold.md.
     let strict = std::env::var("MC_AUDIT_STRICT").as_deref() == Ok("1");
-    if !golden() && !strict && exposed(subagent, lane) {
-        audit_assert!(
-            landed,
-            "{profile} subagent={subagent} {lane:?}: the lane did not land"
-        );
-        audit_assert_eq!(
-            error,
-            Some(PREFIX_ERROR),
-            "{profile} subagent={subagent} {lane:?}"
-        );
-        return;
-    }
     audit_assert_eq!(error, None, "{profile} subagent={subagent} {lane:?}");
     audit_assert!(
         !non_thinking_edit,
