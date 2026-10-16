@@ -7991,6 +7991,30 @@ impl McStore {
             })
     }
 
+    /// Run a snapshot callback with SQLite's query-only enforcement enabled.
+    /// Callers must not change connection settings or re-enter the serialized read domain.
+    /// Retrieval uses this boundary without opening another database connection.
+    pub fn with_context_read<T>(
+        &self,
+        read: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, McStoreError> {
+        self.context_read(|conn| {
+            struct RestoreQueryOnly<'a> {
+                conn: &'a rusqlite::Connection,
+                previous: i64,
+            }
+            impl Drop for RestoreQueryOnly<'_> {
+                fn drop(&mut self) {
+                    let _ = self.conn.pragma_update(None, "query_only", self.previous);
+                }
+            }
+            let previous = conn.pragma_query_value(None, "query_only", |row| row.get(0))?;
+            let _restore = RestoreQueryOnly { conn, previous };
+            conn.pragma_update(None, "query_only", true)?;
+            read(conn)
+        })
+    }
+
     /// Run `read` against `context.db` in one read snapshot.
     fn context_read<T>(
         &self,
@@ -18231,6 +18255,109 @@ fn capped_trace_error(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_read_guard_rejects_insert_and_temp_schema_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .context_read(|conn| {
+                conn.execute_batch("CREATE TEMP TABLE read_guard_probe(value INTEGER)")
+            })
+            .unwrap();
+        for sql in [
+            "INSERT INTO read_guard_probe VALUES (1)",
+            "CREATE TEMP TABLE forbidden_read_guard(value INTEGER)",
+        ] {
+            store
+                .with_context_read(|conn| {
+                    let error = conn
+                        .execute_batch(sql)
+                        .expect_err("the snapshot must reject writes");
+                    assert_eq!(
+                        error.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::ReadOnly)
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let (rows, tables) = store
+            .context_read(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM read_guard_probe", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_temp_master WHERE name='forbidden_read_guard'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((rows, tables), (0, 0));
+    }
+
+    #[test]
+    fn context_read_guard_restores_query_only_after_success_error_and_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .context_read(|conn| {
+                conn.execute_batch("CREATE TEMP TABLE read_guard_probe(value INTEGER)")
+            })
+            .unwrap();
+        store.with_context_read(|_| Ok(())).unwrap();
+        let write = || {
+            store
+                .context_read(|conn| {
+                    assert_eq!(
+                        conn.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?,
+                        0
+                    );
+                    conn.execute("INSERT INTO read_guard_probe VALUES (1)", [])
+                })
+                .unwrap()
+        };
+        assert_eq!(write(), 1);
+        assert!(store
+            .with_context_read::<()>(|_| Err(rusqlite::Error::InvalidQuery))
+            .is_err());
+        assert_eq!(write(), 1);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_context_read::<()>(|_| panic!("read callback panic"))
+        }));
+        assert!(panic.is_err());
+        assert_eq!(write(), 1);
+    }
+
+    #[test]
+    fn context_read_guard_preserves_preexisting_query_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .context_read(|conn| conn.pragma_update(None, "query_only", true))
+            .unwrap();
+        store
+            .with_context_read(|conn| {
+                assert_eq!(
+                    conn.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+        store
+            .context_read(|conn| {
+                assert_eq!(
+                    conn.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?,
+                    1
+                );
+                conn.pragma_update(None, "query_only", false)
+            })
+            .unwrap();
+    }
+
     #[test]
     fn projection_replay_constructor_matches_serde_for_validated_shells() {
         let cases = [

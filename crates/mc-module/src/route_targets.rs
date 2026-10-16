@@ -104,13 +104,15 @@ pub(crate) enum RegisteredRoute {
     SessionResolve,
     HistorianRunner,
     ProviderRunner,
+    SynapseRerank,
 }
 
 impl RegisteredRoute {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
         Self::SessionResolve,
         Self::HistorianRunner,
         Self::ProviderRunner,
+        Self::SynapseRerank,
     ];
 
     fn module_id(self, config: &RouteTargetConfig) -> Option<&str> {
@@ -118,6 +120,7 @@ impl RegisteredRoute {
             Self::SessionResolve => Some(DEFAULT_THALAMUS_MODULE_ID),
             Self::HistorianRunner => config.runner_module_id(),
             Self::ProviderRunner => Some(config.provider_runner_module_id()),
+            Self::SynapseRerank => Some("synapse"),
         }
     }
 
@@ -131,6 +134,9 @@ impl RegisteredRoute {
             // Callbacks and transcript reads spend no provider quota. Declaring this target
             // does not open a connection or require the runner to be registered at startup.
             Self::ProviderRunner => Vec::new(),
+            // Explicit mc.retrieval searches may call Synapse. Declaring this target
+            // neither connects to Synapse nor starts automatic retrieval work.
+            Self::SynapseRerank => Vec::new(),
             // The background runner route carries every model call this module makes, so both
             // callers of it spend the user's provider quota.
             Self::HistorianRunner => vec![
@@ -221,15 +227,27 @@ mod tests {
     fn route_targets_follow_the_resolved_runner() {
         assert_eq!(
             route_targets(&RouteTargetConfig::default()),
-            vec!["thalamus".to_string(), "broca".to_string()]
+            vec![
+                "thalamus".to_string(),
+                "broca".to_string(),
+                "synapse".to_string()
+            ]
         );
         assert_eq!(
             route_targets(&RouteTargetConfig::runner_module("custom-runner")),
-            vec!["thalamus".to_string(), "custom-runner".to_string()]
+            vec![
+                "thalamus".to_string(),
+                "custom-runner".to_string(),
+                "synapse".to_string()
+            ]
         );
         assert_eq!(
             route_targets(&RouteTargetConfig::host_runner()),
-            vec!["thalamus".to_string(), "broca".to_string()]
+            vec![
+                "thalamus".to_string(),
+                "broca".to_string(),
+                "synapse".to_string()
+            ]
         );
     }
 
@@ -257,7 +275,10 @@ mod tests {
             assert!(RegisteredRoute::ProviderRunner.self_signals().is_empty());
         }
         let host = RouteTargetConfig::host_runner().with_provider_runner_module("scripted-runner");
-        assert_eq!(route_targets(&host), vec!["thalamus", "scripted-runner"]);
+        assert_eq!(
+            route_targets(&host),
+            vec!["thalamus", "scripted-runner", "synapse"]
+        );
         assert!(host.target(RegisteredRoute::HistorianRunner).is_none());
         assert!(self_signals(&host).is_empty());
     }
@@ -323,7 +344,11 @@ mod tests {
             );
             assert_eq!(
                 route_targets(&config),
-                vec!["thalamus".to_string(), "broca".to_string()],
+                vec![
+                    "thalamus".to_string(),
+                    "broca".to_string(),
+                    "synapse".to_string()
+                ],
                 "{label}: provider runner remains an optional target"
             );
             assert_eq!(
@@ -352,7 +377,11 @@ mod tests {
         fs::write(&path, r#"{ "historian": { "runner": "host" } }"#).expect("write");
         assert_eq!(
             edges(&path),
-            vec!["thalamus".to_string(), "broca".to_string()]
+            vec![
+                "thalamus".to_string(),
+                "broca".to_string(),
+                "synapse".to_string()
+            ]
         );
         let hosted = RouteTargetConfig::for_configured_runners(
             crate::config::user_configured_runners_at(&path),

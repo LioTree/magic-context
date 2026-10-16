@@ -170,6 +170,7 @@ mod recomp_staging;
 mod reply_pages;
 mod retained_size;
 pub mod retrieval;
+mod retrieval_store;
 mod transport_handler;
 pub use transport_handler::McTransportHandler;
 pub mod edit_admission;
@@ -3948,6 +3949,7 @@ pub struct McHandler {
     store_open: Arc<StoreOpenCoordinator>,
     producer_factory: Arc<dyn HistorianProducerFactory>,
     session_resolver: Arc<dyn SessionResolver>,
+    retrieval_reranker: Option<Arc<dyn retrieval::hybrid::RerankClient>>,
     config: Arc<Mutex<ConfigCache>>,
     historian_runner_refusals: Arc<HistorianRunnerRefusalCache>,
     /// Runs queued for a claimant that a firing task in this process is still
@@ -4654,6 +4656,120 @@ impl HistorianProducerFactory for MissingProducerFactory {
     }
 }
 
+fn retrieval_values<T: Default>(
+    result: parity_contract::CapabilityResult<T>,
+    source: &str,
+    availability: &mut std::collections::BTreeMap<String, parity_contract::Availability>,
+) -> T {
+    use parity_contract::{Availability, CapabilityResult};
+    let status = result.availability();
+    if !availability
+        .get(source)
+        .is_some_and(|s| matches!(s, Availability::Unavailable { .. }))
+    {
+        availability.insert(source.into(), status);
+    }
+    match result {
+        CapabilityResult::Available { value } | CapabilityResult::Degraded { value, .. } => value,
+        CapabilityResult::Unavailable { .. } => T::default(),
+    }
+}
+
+fn retrieval_key(candidate: &retrieval::hybrid::SearchCandidate) -> String {
+    format!("{:?}:{}", candidate.hit.source, candidate.hit.source_id)
+}
+
+fn retrieval_candidate(
+    source: parity_contract::RetrievalSource,
+    source_id: String,
+    ordinal: Option<u64>,
+    text: String,
+    score: f64,
+    scope: &parity_contract::StoreScope,
+) -> retrieval::hybrid::SearchCandidate {
+    use parity_contract::*;
+    retrieval::hybrid::SearchCandidate {
+        hit: RetrievalHit {
+            source,
+            source_id: source_id.clone(),
+            provenance: Provenance {
+                origin: InputOrigin::Core,
+                source_id,
+                source_revision: "snapshot".into(),
+                content_hash: ContentHash(format!(
+                    "{:x}",
+                    <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())
+                )),
+                generation: scope.generation,
+                observed_at_ms: 0,
+            },
+            ordinal: ordinal.map(|value| MessageOrdinal {
+                value,
+                base: OrdinalBase::One,
+            }),
+            score,
+            text,
+        },
+        compartment_range: None,
+    }
+}
+
+/// Combine message and compartment ranks using reciprocal-rank fusion.
+/// Covered messages add evidence to their compartment instead of appearing twice.
+/// This produces fallback search results, not the larger pool sent to the reranker.
+fn retrieval_merge_messages(
+    messages: Vec<retrieval::hybrid::SearchCandidate>,
+    compartments: Vec<retrieval::hybrid::SearchCandidate>,
+    limit: usize,
+) -> Vec<retrieval::hybrid::SearchCandidate> {
+    if compartments.is_empty() {
+        return messages;
+    }
+    if messages.is_empty() {
+        return compartments;
+    }
+    let mut fused = compartments
+        .iter()
+        .enumerate()
+        .map(|(rank, c)| (c.clone(), 1.0 / (60 + rank) as f64))
+        .collect::<Vec<_>>();
+    for (rank, message) in messages.into_iter().enumerate() {
+        let containing = message.hit.ordinal.and_then(|o| {
+            compartments.iter().find(|c| {
+                c.compartment_range
+                    .is_some_and(|(start, end)| o.value >= start && o.value <= end)
+            })
+        });
+        let candidate = containing.unwrap_or(&message);
+        if let Some(row) = fused
+            .iter_mut()
+            .find(|(c, _)| retrieval_key(c) == retrieval_key(candidate))
+        {
+            row.1 += 1.0 / (60 + rank) as f64;
+        } else {
+            fused.push((candidate.clone(), 1.0 / (60 + rank) as f64));
+        }
+    }
+    fused.sort_by(|(a, sa), (b, sb)| {
+        sb.total_cmp(sa).then(
+            a.hit
+                .ordinal
+                .map(|o| o.value)
+                .cmp(&b.hit.ordinal.map(|o| o.value)),
+        )
+    });
+    fused.truncate(limit);
+    let count = fused.len();
+    fused
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (mut c, _))| {
+            c.hit.score = 1.0 - rank as f64 / count as f64;
+            c
+        })
+        .collect()
+}
+
 impl McHandler {
     pub fn new() -> Self {
         Self::new_with_connection_file(None)
@@ -4670,6 +4786,14 @@ impl McHandler {
         connection_file: Option<PathBuf>,
         route_targets: RouteTargetConfig,
     ) -> Self {
+        let retrieval_reranker = connection_file.as_ref().map(|path| {
+            Arc::new(retrieval_store::RerankTransport {
+                connection_file: path.clone(),
+                target: route_targets
+                    .target(route_targets::RegisteredRoute::SynapseRerank)
+                    .expect("rerank route is registered"),
+            }) as Arc<dyn retrieval::hybrid::RerankClient>
+        });
         let producer_factory: Arc<dyn HistorianProducerFactory> = match connection_file.clone() {
             Some(path) => Arc::new(RealHistorianProducerFactory {
                 connection_file: path,
@@ -4699,6 +4823,7 @@ impl McHandler {
             store_open: Arc::new(StoreOpenCoordinator::new()),
             producer_factory,
             session_resolver,
+            retrieval_reranker,
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
@@ -5121,6 +5246,7 @@ impl McHandler {
             store_open: Arc::new(StoreOpenCoordinator::new()),
             producer_factory: factory,
             session_resolver,
+            retrieval_reranker: None,
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
@@ -8231,6 +8357,598 @@ impl McHandler {
             }
         };
         Ok((session_id.to_string(), binding))
+    }
+
+    async fn handle_retrieval(&self, channel: u16, envelope: &Value) -> HandlerOutcome {
+        use parity_contract::*;
+        use retrieval::hybrid::*;
+        let (_, binding) =
+            match self.management_binding(channel, envelope, non_served_contract::RETRIEVAL_METHOD)
+            {
+                Ok(value) => value,
+                Err(outcome) => return outcome,
+            };
+        let Some(store) = self.store.get() else {
+            return HandlerOutcome::Error {
+                code: "store_refusal".into(),
+                message: "mc.retrieval requires a store".into(),
+            };
+        };
+        let project = match self.route_project_identity(store, &binding) {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
+        };
+        let scope = StoreScope {
+            project: ProjectId(project),
+            session: SessionId(binding.session.clone()),
+            generation: Generation(0),
+        };
+        let bad_request = |message: &str| HandlerOutcome::Error {
+            code: "bad_request".into(),
+            message: message.into(),
+        };
+        let op = envelope
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("search");
+        if op == "expand" {
+            use retrieval::hybrid::expand;
+            let Ok(source) = serde_json::from_value::<RetrievalSource>(envelope["source"].clone())
+            else {
+                return bad_request("mc.retrieval expand requires a Rust source id");
+            };
+            if !matches!(
+                source,
+                RetrievalSource::RawMessage | RetrievalSource::Compartment
+            ) {
+                return HandlerOutcome::Error {
+                    code: "expand_unsupported_source".into(),
+                    message: envelope["source"].as_str().unwrap_or_default().into(),
+                };
+            }
+            // Keep recorded object-key order: parsing tool inputs through Value would
+            // sort their keys and change the TypeScript recovery text.
+            let Some(pages_json) = envelope["pages_json"].as_str() else {
+                return bad_request("mc.retrieval expand requires pages_json");
+            };
+            let Ok(pages) = serde_json::from_str::<Vec<Vec<expand::RawMessage>>>(pages_json) else {
+                return bad_request("mc.retrieval expand requires recorded raw-message pages");
+            };
+            if source == RetrievalSource::RawMessage {
+                let Some(ordinal) = envelope["ordinal"].as_i64() else {
+                    return bad_request("expand requires ordinal");
+                };
+                return respond(
+                    json!({"v":1,"text":expand::render_message_by_ordinal(&pages, ordinal)}),
+                );
+            }
+            let (Some(start), Some(end), Some(budget)) = (
+                envelope["start"].as_i64(),
+                envelope["end"].as_i64(),
+                envelope["token_budget"].as_u64(),
+            ) else {
+                return bad_request("compartment expand requires start, end and token_budget");
+            };
+            let overrides = match envelope.get("overrides") {
+                Some(value) => {
+                    match serde_json::from_value::<expand::ToolExpansionMap>(value.clone()) {
+                        Ok(value) => value,
+                        Err(_) => return bad_request("invalid expand preview overrides"),
+                    }
+                }
+                None => Default::default(),
+            };
+            let rendered = expand::render_verbose_range(
+                &pages,
+                start,
+                end,
+                budget.min(usize::MAX as u64) as usize,
+                &overrides,
+            );
+            return respond(
+                json!({"v":1,"text":rendered.text,"lastOrdinal":rendered.last_ordinal,"truncated":rendered.truncated}),
+            );
+        }
+        if !matches!(op, "search" | "auto_hint") {
+            return bad_request("unknown mc.retrieval operation");
+        }
+        let Ok(mut request) =
+            serde_json::from_value::<RetrievalRequest>(envelope["request"].clone())
+        else {
+            return bad_request("mc.retrieval requires a RetrievalRequest");
+        };
+        let Ok(sources) =
+            serde_json::from_value::<Vec<RetrievalSource>>(envelope["sources"].clone())
+        else {
+            return bad_request("mc.retrieval requires Rust source ids");
+        };
+        if request
+            .ordinal_cutoff
+            .is_some_and(|o| o.base != OrdinalBase::One || o.value > i64::MAX as u64)
+            || matches!((request.start_at_ms, request.end_at_ms_inclusive), (Some(a), Some(b)) if a > b)
+        {
+            return bad_request("invalid retrieval bounds");
+        }
+        if op == "auto_hint" {
+            request.intent = RetrievalIntent::Auto;
+        }
+        request.query = trim_query(&request.query).to_owned();
+        let limit = request.limit.clamp(1, 25) as usize;
+        let tier_limit = (limit * 3).max(10);
+        let dates = DateBounds {
+            from_ms: request.start_at_ms,
+            to_ms: request.end_at_ms_inclusive,
+        };
+        let cutoff = request
+            .ordinal_cutoff
+            .map(|o| o.value as i64)
+            .unwrap_or(i64::MAX);
+        let adapter = retrieval_store::RetrievalStore {
+            store,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let mut availability = std::collections::BTreeMap::new();
+        let mut lanes = SearchLanes::default();
+        let mut bodies = HashMap::<String, String>::new();
+        let mut memory_hits = Vec::new();
+        let mut raw_hits = Vec::new();
+        let mut compartment_hits = Vec::new();
+        let mut other_hits = Vec::new();
+        let vector = serde_json::from_value::<Vec<f32>>(envelope["query_vector"].clone()).ok();
+        let query_vector = request
+            .embedding
+            .as_ref()
+            .zip(vector.as_deref())
+            .filter(|(id, v)| {
+                !matches!(id.provider.as_str(), "local" | "transformers")
+                    && id.model != "off"
+                    && id.dimensions > 0
+                    && v.len() == id.dimensions as usize
+                    && v.iter().all(|v| v.is_finite())
+            });
+        let probes = literal_probes(request.intent, &request.query);
+        let has = |source| sources.contains(&source);
+        if has(RetrievalSource::Memory) {
+            let memories = retrieval_values(
+                adapter.read_search_memories(&scope, dates),
+                "memory",
+                &mut availability,
+            );
+            let fts = retrieval_values(
+                adapter.search_memory_fts(&scope, &request.query, dates, FTS_CANDIDATE_LIMIT),
+                "memory",
+                &mut availability,
+            );
+            let visible = retrieval_values(
+                adapter.read_visible_memory_ids(&scope),
+                "memory",
+                &mut availability,
+            )
+            .into_iter()
+            .chain(request.visible_memory_ids.iter().map(|v| *v as i64))
+            .collect();
+            let vectors = query_vector
+                .map(|(id, _)| {
+                    retrieval_values(
+                        adapter.read_memory_vectors(
+                            &scope,
+                            &memories.iter().map(|m| m.id).collect::<Vec<_>>(),
+                            id,
+                        ),
+                        "memory",
+                        &mut availability,
+                    )
+                })
+                .unwrap_or_default();
+            let (ranked, _) = rank_memories(
+                &memories,
+                &fts,
+                &vectors,
+                query_vector,
+                &visible,
+                dates,
+                tier_limit.max(25),
+            );
+            for hit in ranked {
+                let memory = memories
+                    .iter()
+                    .find(|m| m.id == hit.memory_id)
+                    .expect("ranked memory belongs to snapshot");
+                let candidate = retrieval_candidate(
+                    RetrievalSource::Memory,
+                    hit.memory_id.to_string(),
+                    None,
+                    hit.content,
+                    hit.score,
+                    &scope,
+                );
+                bodies.insert(
+                    retrieval_key(&candidate),
+                    candidate_text(
+                        &format!("memory {} {}", hit.memory_id, scope.project.0),
+                        memory.content.lines().next().unwrap_or_default(),
+                        &memory.content,
+                    ),
+                );
+                memory_hits.push(candidate);
+            }
+            let convert = |hit: MemoryHit| {
+                retrieval_candidate(
+                    RetrievalSource::Memory,
+                    hit.memory_id.to_string(),
+                    None,
+                    hit.content,
+                    hit.score,
+                    &scope,
+                )
+            };
+            lanes.memory_fts = rank_memories(&memories, &fts, &[], None, &visible, dates, 25)
+                .0
+                .into_iter()
+                .map(convert)
+                .collect();
+            lanes.memory_vector =
+                rank_memories(&memories, &[], &vectors, query_vector, &visible, dates, 25)
+                    .0
+                    .into_iter()
+                    .map(convert)
+                    .collect();
+            for candidate in lanes.memory_fts.iter().chain(&lanes.memory_vector) {
+                if let Some(memory) = memories
+                    .iter()
+                    .find(|m| m.id.to_string() == candidate.hit.source_id)
+                {
+                    bodies.insert(
+                        retrieval_key(candidate),
+                        candidate_text(
+                            &format!("memory {} {}", memory.id, scope.project.0),
+                            memory.content.lines().next().unwrap_or_default(),
+                            &memory.content,
+                        ),
+                    );
+                }
+            }
+            memory_hits.truncate(tier_limit);
+        }
+        if has(RetrievalSource::RawMessage) {
+            let rows = retrieval_values(
+                adapter.raw_messages(
+                    &scope,
+                    &request.query,
+                    dates,
+                    cutoff,
+                    75,
+                    request.intent == RetrievalIntent::Explicit,
+                ),
+                "raw_message",
+                &mut availability,
+            );
+            for (rank, row) in rows.iter().enumerate() {
+                let candidate = retrieval_candidate(
+                    RetrievalSource::RawMessage,
+                    row.id.clone(),
+                    Some(row.ordinal as u64),
+                    row.content.clone(),
+                    1.0 - rank as f64 / rows.len() as f64,
+                    &scope,
+                );
+                bodies.insert(
+                    retrieval_key(&candidate),
+                    candidate_text(
+                        &format!("message {} {} @{}", row.id, scope.session.0, row.ordinal),
+                        &format!(
+                            "{}: {}",
+                            row.role,
+                            row.content.lines().next().unwrap_or_default()
+                        ),
+                        &row.content,
+                    ),
+                );
+                raw_hits.push(candidate);
+            }
+            if !probes.is_empty() {
+                let corpus = retrieval_values(
+                    adapter.corpus_size(&scope, cutoff),
+                    "raw_message",
+                    &mut availability,
+                );
+                let matches = probes
+                    .iter()
+                    .map(|probe| {
+                        let rows = retrieval_values(
+                            adapter.raw_messages(&scope, probe, dates, cutoff, 75, true),
+                            "raw_message",
+                            &mut availability,
+                        );
+                        let hits = rows
+                            .iter()
+                            .map(|row| {
+                                let c = retrieval_candidate(
+                                    RetrievalSource::RawMessage,
+                                    row.id.clone(),
+                                    Some(row.ordinal as u64),
+                                    row.content.clone(),
+                                    0.0,
+                                    &scope,
+                                );
+                                bodies.insert(
+                                    retrieval_key(&c),
+                                    candidate_text(
+                                        &format!(
+                                            "message {} {} @{}",
+                                            row.id, scope.session.0, row.ordinal
+                                        ),
+                                        &format!(
+                                            "{}: {}",
+                                            row.role,
+                                            row.content.lines().next().unwrap_or_default()
+                                        ),
+                                        &row.content,
+                                    ),
+                                );
+                                c.hit
+                            })
+                            .collect();
+                        ProbeMatches {
+                            probe: probe.clone(),
+                            document_frequency: retrieval_values(
+                                adapter.probe_frequency(&scope, probe, dates, cutoff),
+                                "raw_message",
+                                &mut availability,
+                            ),
+                            hits,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                raw_hits = rank_message_probes(
+                    &raw_hits.iter().map(|c| c.hit.clone()).collect::<Vec<_>>(),
+                    &matches,
+                    corpus,
+                    75,
+                    tier_limit.max(25),
+                )
+                .into_iter()
+                .map(|hit| SearchCandidate {
+                    hit,
+                    compartment_range: None,
+                })
+                .collect();
+            }
+            lanes.message_fts = raw_hits
+                .iter()
+                .take(25)
+                .cloned()
+                .map(|mut c| {
+                    c.hit.text = preview(&c.hit.text);
+                    c
+                })
+                .collect();
+            raw_hits.truncate(tier_limit);
+            let count = raw_hits.len();
+            for (rank, candidate) in raw_hits.iter_mut().enumerate() {
+                candidate.hit.text = preview(&candidate.hit.text);
+                candidate.hit.score = 1.0 - rank as f64 / count as f64;
+            }
+        }
+        if has(RetrievalSource::Compartment) {
+            if let Some((identity, vector)) = query_vector {
+                let chunks = retrieval_values(
+                    adapter.read_compartment_chunks(&scope, dates, identity),
+                    "compartment",
+                    &mut availability,
+                );
+                for hit in retrieval::compartments::rank_compartments(
+                    &chunks,
+                    &scope,
+                    identity,
+                    vector,
+                    dates,
+                    Some(cutoff),
+                    tier_limit.max(25),
+                ) {
+                    let mut candidate = retrieval_candidate(
+                        RetrievalSource::Compartment,
+                        hit.compartment_id.to_string(),
+                        Some(hit.start_ordinal as u64),
+                        hit.content,
+                        hit.score,
+                        &scope,
+                    );
+                    candidate.compartment_range =
+                        Some((hit.start_ordinal as u64, hit.end_ordinal as u64));
+                    let body = adapter.compartment_text(&scope, hit.start_ordinal, hit.end_ordinal);
+                    if let CapabilityResult::Available { value: body }
+                    | CapabilityResult::Degraded { value: body, .. } = body
+                    {
+                        bodies.insert(
+                            retrieval_key(&candidate),
+                            candidate_text(
+                                &format!(
+                                    "compartment {} {} @{}-{}",
+                                    hit.compartment_id,
+                                    scope.session.0,
+                                    hit.start_ordinal,
+                                    hit.end_ordinal
+                                ),
+                                &hit.title,
+                                &body,
+                            ),
+                        );
+                    }
+                    compartment_hits.push(candidate);
+                }
+                lanes.chunk_vector = compartment_hits.iter().take(25).cloned().collect();
+                compartment_hits.truncate(tier_limit);
+            } else {
+                availability.insert(
+                    "compartment".into(),
+                    mc_store::parity_schema_manifest::unavailable("retrieval_lane"),
+                );
+            }
+        }
+        if has(RetrievalSource::GitCommit) {
+            let result = retrieval_values(
+                adapter.git_commits(&scope, &request, query_vector, tier_limit),
+                "git_commit",
+                &mut availability,
+            );
+            let convert = |hit: &mc_store::git_archive::GitCommitSearchHit| {
+                retrieval_candidate(
+                    RetrievalSource::GitCommit,
+                    hit.commit.sha.clone(),
+                    None,
+                    preview(&hit.commit.message),
+                    hit.score,
+                    &scope,
+                )
+            };
+            for hit in result.hits.iter().chain(&result.fts).chain(&result.vector) {
+                let candidate = convert(hit);
+                bodies.insert(
+                    retrieval_key(&candidate),
+                    candidate_text(
+                        &format!("git_commit {} {}", hit.commit.sha, scope.project.0),
+                        &format!(
+                            "{} {}",
+                            hit.commit.short_sha,
+                            hit.commit.message.lines().next().unwrap_or_default()
+                        ),
+                        &hit.commit.message,
+                    ),
+                );
+            }
+            lanes.git_fts = result.fts.iter().map(convert).collect();
+            lanes.git_vector = result.vector.iter().map(convert).collect();
+            other_hits.extend(result.hits.iter().map(convert));
+        }
+        if has(RetrievalSource::Note) {
+            let (hits, rows) = retrieval_values(
+                adapter.notes(&scope, &request, &probes, tier_limit.max(25)),
+                "note",
+                &mut availability,
+            );
+            for hit in hits {
+                let candidate = retrieval_candidate(
+                    RetrievalSource::Note,
+                    hit.note_id.to_string(),
+                    hit.anchor_ordinal.and_then(|o| u64::try_from(o).ok()),
+                    hit.content,
+                    hit.score,
+                    &scope,
+                );
+                if let Some(row) = rows.iter().find(|r| r.id == hit.note_id) {
+                    let body = format!(
+                        "{}{}",
+                        row.content,
+                        row.ready_reason
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!("\nReason: {s}"))
+                            .unwrap_or_default()
+                    );
+                    bodies.insert(
+                        retrieval_key(&candidate),
+                        candidate_text(
+                            &format!("note {} {}", hit.note_id, scope.project.0),
+                            body.lines().next().unwrap_or_default(),
+                            &body,
+                        ),
+                    );
+                }
+                lanes.notes.push(candidate.clone());
+                other_hits.push(candidate);
+            }
+            lanes.notes.truncate(25);
+        }
+        if has(RetrievalSource::Primer) {
+            availability.insert(
+                "primer".into(),
+                mc_store::parity_schema_manifest::unavailable("retrieval_lane"),
+            );
+        }
+        let mut baseline = memory_hits;
+        baseline.extend(retrieval_merge_messages(
+            raw_hits,
+            compartment_hits,
+            tier_limit,
+        ));
+        baseline.extend(other_hits);
+        baseline.sort_by(|a, b| {
+            let boost = |c: &SearchCandidate| match c.hit.source {
+                RetrievalSource::Memory => 1.3,
+                RetrievalSource::RawMessage | RetrievalSource::Compartment => 1.275,
+                RetrievalSource::GitCommit => 1.2,
+                RetrievalSource::Primer => 1.25,
+                RetrievalSource::Note => 1.0,
+            };
+            (b.hit.score * boost(b))
+                .total_cmp(&(a.hit.score * boost(a)))
+                .then_with(|| {
+                    if a.hit.source != b.hit.source {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    match a.hit.source {
+                        RetrievalSource::Memory => a
+                            .hit
+                            .source_id
+                            .parse::<i64>()
+                            .unwrap_or_default()
+                            .cmp(&b.hit.source_id.parse::<i64>().unwrap_or_default()),
+                        RetrievalSource::RawMessage | RetrievalSource::Compartment => a
+                            .hit
+                            .ordinal
+                            .map(|o| o.value)
+                            .cmp(&b.hit.ordinal.map(|o| o.value)),
+                        _ => std::cmp::Ordering::Equal,
+                    }
+                })
+        });
+        baseline.truncate(limit);
+        if request.query.is_empty() {
+            baseline.clear();
+        }
+        let identity = RerankIdentity::new(
+            binding.project_root.to_string_lossy().into_owned(),
+            binding.session.clone(),
+        );
+        let pinned = prepare_reranker(
+            request.intent,
+            &request.query,
+            self.retrieval_reranker.as_deref(),
+            &identity,
+        )
+        .await;
+        let session = pinned
+            .zip(self.retrieval_reranker.as_deref())
+            .map(|(lane, client)| RerankSession {
+                client,
+                lane,
+                identity,
+            });
+        let pool = fuse_search_lanes(&lanes);
+        let texts = pool
+            .iter()
+            .map(|c| bodies.get(&retrieval_key(c)).cloned())
+            .collect::<Option<Vec<_>>>();
+        let hits = if let Some(texts) = texts {
+            rerank_search_results(
+                request.intent,
+                session.as_ref(),
+                &request.query,
+                &baseline,
+                &pool,
+                &texts,
+                limit,
+            )
+            .await
+        } else {
+            baseline
+        };
+        let mut body = json!({"v":1,"hits":hits.into_iter().map(|c| c.hit).collect::<Vec<_>>(),"source_availability":availability,"literal_probes":probes});
+        if envelope["capture_lanes"] == true {
+            body["lanes"] = json!({"git_fts":lanes.git_fts.iter().map(|c|&c.hit).collect::<Vec<_>>(),"git_vector":lanes.git_vector.iter().map(|c|&c.hit).collect::<Vec<_>>()});
+        }
+        respond(body)
     }
 
     fn handle_non_served_method(
@@ -15157,9 +15875,7 @@ impl McHandler {
             Some("mc.notice_currentness") => {
                 return self.handle_non_served_method(channel, &request, "mc.notice_currentness")
             }
-            Some("mc.retrieval") => {
-                return self.handle_non_served_method(channel, &request, "mc.retrieval")
-            }
+            Some("mc.retrieval") => return self.handle_retrieval(channel, &request).await,
             Some("mc.memory") => {
                 return self.handle_non_served_method(channel, &request, "mc.memory")
             }
@@ -19913,6 +20629,7 @@ mod tests {
     mod tool_catalog_conformance;
     // The per-harness default runner, driven through real passes.
     mod default_runner;
+    mod retrieval_parity;
 
     fn owner_prep_methods() -> impl Iterator<Item = &'static str> {
         non_served_contract::UI_METHODS.iter().copied().chain([
@@ -20040,10 +20757,11 @@ mod tests {
         store.set_route_identity_for_test(project.to_str().unwrap(), "git:bound-project");
         ops_facade::attest_ui_fixture(&handler, Some(&store), "git:bound-project");
         let before = store.load("ses").unwrap().row_version;
-        for method in ops_facade::UNPORTED.iter().copied().chain([
-            non_served_contract::RETRIEVAL_METHOD,
-            non_served_contract::MEMORY_METHOD,
-        ]) {
+        for method in ops_facade::UNPORTED
+            .iter()
+            .copied()
+            .chain([non_served_contract::MEMORY_METHOD])
+        {
             match handler
                 .dispatch_value(
                     7,
@@ -20150,7 +20868,11 @@ mod tests {
         assert_eq!(
             custom.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "custom-runner".to_string()],
+                of: vec![
+                    "thalamus".to_string(),
+                    "custom-runner".to_string(),
+                    "synapse".to_string()
+                ],
             }]
         );
 
@@ -20159,7 +20881,11 @@ mod tests {
         assert_eq!(
             hosted.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "broca".to_string()],
+                of: vec![
+                    "thalamus".to_string(),
+                    "broca".to_string(),
+                    "synapse".to_string()
+                ],
             }]
         );
         // Self-signals drop out with the background-completion target, but the field stays declared
@@ -21723,7 +22449,11 @@ mod tests {
         assert_eq!(
             m.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "broca".to_string()]
+                of: vec![
+                    "thalamus".to_string(),
+                    "broca".to_string(),
+                    "synapse".to_string()
+                ]
             }]
         );
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
