@@ -162,6 +162,7 @@ pub mod project_identity;
 pub mod prompt_surface;
 pub mod protection_window;
 mod providers;
+mod recomp_staging;
 mod reply_pages;
 mod retained_size;
 pub mod retrieval;
