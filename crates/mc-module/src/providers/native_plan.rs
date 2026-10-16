@@ -185,7 +185,7 @@ impl McHandler {
         let pins_json =
             String::from_utf8(serde_jcs::to_vec(&pins).map_err(invalid)?).map_err(invalid)?;
         let request = if method == "transform.declare" {
-            declaration(params)?;
+            step_transform::declaration_with_pins(params, &pins)?;
             let request: DeclareRequest = decode(params)?;
             if request
                 .claude_code

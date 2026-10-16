@@ -323,6 +323,36 @@ fn cc_native_identity_signed_turn_holds_preceding_reduction() {
 }
 
 #[test]
+fn cc_native_priced_queued_drop_resets_unprotected_later_thinking() {
+    let signed_b = SIGNED.replace("\"a\"", "\"b\"");
+    let result_b = RESULT.replace("\"a\"", "\"b\"");
+    let (req, mut view) = fixture(&[USER, MIXED, RESULT, ASSISTANT, USER, &signed_b, &result_b]);
+    let pending = BTreeSet::from(["m2#0".into()]);
+    let coverage = native_reductions::apply(&mut view, &req, None, true, &[], &tags(), &pending);
+    assert!(native_reductions::pending_applied(
+        &view,
+        &req,
+        &tags(),
+        &pending,
+        None
+    ));
+    let output = final_bytes(&req, &view, coverage);
+    assert!(serde_json::to_string(&output)
+        .unwrap()
+        .contains("[dropped §42§]"));
+    assert!(output.iter().all(
+        |message| message["content"].as_array().is_none_or(|blocks| {
+            blocks.iter().all(|block| {
+                !matches!(
+                    block["type"].as_str(),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        })
+    ));
+}
+
+#[test]
 fn cc_native_queued_drop_before_kept_thinking_is_held_on_rebuild() {
     let signed_b = SIGNED.replace("\"a\"", "\"b\"");
     let result_b = RESULT.replace("\"a\"", "\"b\"");

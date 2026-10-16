@@ -9033,7 +9033,7 @@ impl McHandler {
             Ok(status) => status,
             Err(outcome) => return outcome,
         };
-        let response = json!({
+        let mut response = json!({
             "ok": true,
             "summary": summary,
             "cc_pending": cc_pending,
@@ -9111,6 +9111,33 @@ impl McHandler {
             },
             "tail_hygiene": tail_hygiene,
         });
+        if !response["step_lane"].is_null() {
+            // The legacy snapshot belongs to the harness session, while native
+            // steps persist in a provider-conversation namespace. Do not present
+            // that unrelated snapshot's empty counters as measured native state.
+            response["pending_drop_count"] =
+                response["step_lane"]["queued_drops"]["total_count"].clone();
+            for field in [
+                "tag_count",
+                "compartment_count",
+                "compartment_tokens",
+                "coverage_ordinal",
+                "row_version",
+                "boundary_present",
+                "usage",
+                "tail_identity_re_adopt_count",
+                "fake_compaction",
+                "tail_hygiene",
+                "historian",
+                "wrapup_rounds",
+            ] {
+                response[field] = Value::Null;
+            }
+            response["summary"] = json!(format!(
+                "Claude Code step lane: {} queued drops; legacy session counters unknown",
+                response["pending_drop_count"]
+            ));
+        }
         respond(response)
     }
 
@@ -13181,7 +13208,7 @@ impl McHandler {
             cortexkit_role_tool_provider::ops::TOOL_CATALOG => {
                 self.handle_tool_catalog_value(channel, &request).await
             }
-            cortexkit_role_tool_provider::ops::ROLE_DESCRIBE => providers::describe_for_discovery(),
+            cortexkit_role_tool_provider::ops::ROLE_DESCRIBE => self.provider_discovery(),
             // A consumer that declared tool-provider/v1 gets the role's refusal for a
             // name Magic Context does not serve; every other route keeps the legacy
             // error code it has always had.
@@ -15060,7 +15087,7 @@ impl McHandler {
         }
         if let Some(method) = method {
             return match method {
-                "role.describe" => providers::describe_for_discovery(),
+                "role.describe" => self.provider_discovery(),
                 "compaction.setup"
                 | "compaction.step"
                 | "compaction.view.read"

@@ -756,6 +756,43 @@ async fn cc_defer_holds_pending_native_drop_without_broca() {
 }
 
 async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
+    queued_native_drop_with_usage(pressure, None, None).await;
+}
+
+#[tokio::test]
+async fn cc_growing_gateway_estimate_applies_drop_on_first_force_crossing() {
+    for previous_usage in [
+        Value::Null,
+        json!({"input":0,"cache_read":0,"cache_write":0}),
+        json!({"input":1000,"cache_read":1504,"cache_write":0}),
+    ] {
+        queued_native_drop_with_usage(Some((21115, 24000)), Some(previous_usage), None).await;
+    }
+}
+
+#[tokio::test]
+async fn cc_attested_status_before_first_step_has_unknown_legacy_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    setup(&h).await;
+    let status = session_status(&h).await;
+    assert_eq!(status["pending_drop_count"], 0);
+    assert_eq!(status["tag_count"], Value::Null);
+    assert_eq!(status["compartment_count"], Value::Null);
+    assert_eq!(status["step_lane"]["applied_drops_last_step"], Value::Null);
+}
+
+#[tokio::test]
+async fn cc_expired_cache_applies_queued_drop_in_same_replacement_then_stays_stable() {
+    queued_native_drop_with_usage(Some((1000, 24000)), None, Some("expired_cache")).await;
+}
+
+async fn queued_native_drop_with_usage(
+    pressure: Option<(u64, u64)>,
+    growing_previous_usage: Option<Value>,
+    rebuild_reason: Option<&str>,
+) {
+    let gateway_shape = growing_previous_usage.is_some() || rebuild_reason.is_some();
     let dir = tempfile::tempdir().unwrap();
     let mut h = handler(dir.path(), thalamus());
     // A 10% threshold admits the roughly 18%-full execute request, below the 85%
@@ -773,6 +810,9 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
     );
     let mut low_threshold_binding = binding(dir.path(), thalamus());
     low_threshold_binding.config = low_threshold_config;
+    if gateway_shape {
+        low_threshold_binding.config.protected_tokens_user = Some(1000);
+    }
     h.bind_route(7, low_threshold_binding);
     let initial = setup(&h).await;
     // The local resolver supplies a session identity for the ctx_reduce tool
@@ -787,11 +827,19 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
             .kind,
         crate::historian_runner::HistorianRunnerKind::Broca
     );
-    let thinking_and_call = r#"{"role":"assistant","content":[{"type":"thinking","thinking":"private reasoning","signature":"sig-turn-1"},{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"notes.txt"}}]}"#;
+    let thinking_and_call = if gateway_shape {
+        r#"{"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"notes.txt"}}]}"#
+    } else {
+        r#"{"role":"assistant","content":[{"type":"thinking","thinking":"private reasoning","signature":"sig-turn-1"},{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"notes.txt"}}]}"#
+    };
     let tool_result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"obsolete output from the first turn"}]}"#;
     let next_call = r#"{"role":"assistant","content":[{"type":"text","text":"Checking another source."},{"type":"tool_use","id":"read-2","name":"Read","input":{"file_path":"next.txt"}}]}"#;
     let next_result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-2","content":"additional output two"}]}"#;
-    let third_call = r#"{"role":"assistant","content":[{"type":"text","text":"Checking one more source."},{"type":"tool_use","id":"read-3","name":"Read","input":{"file_path":"third.txt"}}]}"#;
+    let third_call = if gateway_shape {
+        r#"{"role":"assistant","content":[{"type":"thinking","thinking":"later signed reasoning","signature":"sig-turn-3"},{"type":"tool_use","id":"read-3","name":"Read","input":{"file_path":"third.txt"}}]}"#
+    } else {
+        r#"{"role":"assistant","content":[{"type":"text","text":"Checking one more source."},{"type":"tool_use","id":"read-3","name":"Read","input":{"file_path":"third.txt"}}]}"#
+    };
     let third_result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-3","content":"additional output three"}]}"#;
     let fourth_call = r#"{"role":"assistant","content":[{"type":"text","text":"Checking the final source."},{"type":"tool_use","id":"read-4","name":"Read","input":{"file_path":"fourth.txt"}}]}"#;
     let fourth_result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-4","content":"additional output four"}]}"#;
@@ -809,6 +857,11 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
         json!({"mid":"result","ordinal":2,"message":serde_json::from_str::<Value>(tool_result).unwrap(),"raw_message":tool_result}),
     ]);
     turn_one["newest"] = json!({"mid":"result","ordinal":2});
+    if gateway_shape {
+        turn_one.as_object_mut().unwrap().remove("context_window");
+        turn_one["model"] = json!("claude-sonnet-5-5");
+        turn_one["served_through_ordinal"] = json!(2);
+    }
     let first = response(call(&h, "compaction.step", turn_one).await);
     assert!(matches!(
         first["answer"].as_str(),
@@ -829,27 +882,41 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
     store
         .seed_tags_for_test(
             &key.engine_key(),
-            &[
-                ("result#0", "obsolete output from the first turn"),
-                ("result-2#0", "additional output two"),
-                ("result-3#0", "additional output three"),
-                ("result-4#0", "additional output four"),
-            ]
-            .map(|(block_id, source)| mc_store::TagMintInput {
-                block_id: block_id.into(),
-                kind: "tool_result".into(),
-                token_count: 8000,
-                source_bytes: source.as_bytes().to_vec(),
-            }),
+            &gateway_shape
+                .then_some(("m#0", "Read the note."))
+                .into_iter()
+                .chain([
+                    ("result#0", "obsolete output from the first turn"),
+                    ("result-2#0", "additional output two"),
+                    ("result-3#0", "additional output three"),
+                    ("result-4#0", "additional output four"),
+                ])
+                .map(|(block_id, source)| mc_store::TagMintInput {
+                    block_id: block_id.into(),
+                    kind: "tool_result".into(),
+                    token_count: 8000,
+                    source_bytes: source.as_bytes().to_vec(),
+                })
+                .collect::<Vec<_>>(),
             2,
         )
         .unwrap();
-    let result_tag = store
+    let mut result_tag = store
         .load_tag_numbers_for_session(&key.engine_key())
         .unwrap()
         .into_iter()
         .find(|tag| tag.block_id == "result#0")
         .expect("the first turn exposes a ctx_reduce tag for its tool result");
+    if gateway_shape {
+        result_tag.tag_number = store
+            .load_provider_hook_answers(&key.store_key())
+            .unwrap()
+            .iter()
+            .flat_map(|answer| &answer.answer.tags)
+            .find(|tag| tag.block_id == "result#0")
+            .expect("the native replacement exposes the result tag")
+            .number;
+    }
     let reduced = response(
         h.dispatch_value(
             7,
@@ -858,11 +925,14 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
         .await,
     );
     assert!(reduced.to_string().contains("tag stamped"), "{reduced}");
-    assert!(store
-        .load_pending_agent_drops(&key.engine_key())
-        .unwrap()
-        .iter()
-        .any(|drop| drop.target_id == "result#0"));
+    assert!(
+        gateway_shape
+            || store
+                .load_pending_agent_drops(&key.engine_key())
+                .unwrap()
+                .iter()
+                .any(|drop| drop.target_id == "result#0")
+    );
     let broca_error = match h.producer_factory.connect(dir.path()).await {
         Err(error @ HistorianProducerError::NoEndpoint { .. }) => error,
         _ => panic!("expected the absent Broca route to refuse connection"),
@@ -903,10 +973,24 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
         json!({"mid":"followup","ordinal":10,"message":serde_json::from_str::<Value>(followup).unwrap(),"raw_message":followup}),
     ]);
     turn_two["newest"] = json!({"mid":"followup","ordinal":10});
+    if gateway_shape {
+        turn_two.as_object_mut().unwrap().remove("context_window");
+        turn_two["model"] = json!("claude-sonnet-5-5");
+        turn_two["geometry"] = json!({"usable_soft":24000,"usable_hard":72000,"absolute_wall":200000,"derivation":"gateway"});
+        turn_two["output_reserve"] = json!(128000);
+        turn_two["served_through_ordinal"] = json!(10);
+    }
     let mut normal_geometry = turn_two.clone();
     normal_geometry["request_id"] = json!("normal-geometry");
     normal_geometry["estimate"]["request_tokens"] = json!(1000);
+    normal_geometry
+        .as_object_mut()
+        .unwrap()
+        .remove("output_reserve");
     normal_geometry["mid_turn"] = json!(true);
+    if gateway_shape {
+        normal_geometry["served_through_ordinal"] = json!(2);
+    }
     normal_geometry["geometry"] = json!({"usable_soft":167000,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
     let normal = response(call(&h, "compaction.step", normal_geometry).await);
     let normal_pressure = transform::compaction::LAST_NATIVE_PRESSURE
@@ -931,19 +1015,65 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
         json!([result_tag.tag_number])
     );
     assert_eq!(status["step_lane"]["queued_drops"]["total_count"], 1);
+    assert_eq!(status["pending_drop_count"], 1);
+    assert!(status["tag_count"].is_null());
+    assert!(status["compartment_count"].is_null());
+    assert!(status["usage"].is_null());
     assert_eq!(status["step_lane"]["applied_drops_last_step"], 0);
     assert_eq!(
         status["step_lane"]["protected_tokens"]["provenance"],
-        "derived"
+        if gateway_shape { "user" } else { "derived" }
     );
-    assert!(store
-        .load_pending_agent_drops(&key.engine_key())
-        .unwrap()
-        .iter()
-        .any(|drop| drop.target_id == "result#0"));
+    assert!(
+        gateway_shape
+            || store
+                .load_pending_agent_drops(&key.engine_key())
+                .unwrap()
+                .iter()
+                .any(|drop| drop.target_id == "result#0")
+    );
     let Some((tokens, soft)) = pressure else {
         return;
     };
+    if let Some(previous_usage) = growing_previous_usage {
+        // Tool-boundary checks defer unfinished turns above the Execute threshold.
+        // Keep the below-force steps unfinished to isolate the force crossing;
+        // measure each whole request, not the previous response's token sample.
+        if !previous_usage.is_null() {
+            turn_two["previous_usage"] = previous_usage;
+        }
+        let raw_before = store.load_provider_messages(&key.store_key(), "L").unwrap();
+        for (estimate, previous_input) in [
+            (2504, 3934),
+            (2649, 4043),
+            (2735, 4205),
+            (5352, 4293),
+            (7979, 6922),
+            (10607, 9552),
+            (13234, 12182),
+            (15861, 14813),
+            (18488, 17443),
+            (20399, 20073),
+        ] {
+            let mut growing = turn_two.clone();
+            growing["request_id"] = json!(format!("growing-{estimate}"));
+            growing["estimate"]["request_tokens"] = json!(estimate);
+            growing["estimate"]["previous_input"] = json!(previous_input);
+            growing["mid_turn"] = json!(true);
+            let answer = response(call(&h, "compaction.step", growing).await);
+            assert_eq!(answer["answer"], "noop", "estimate={estimate}: {answer}");
+            assert_eq!(session_status(&h).await["pending_drop_count"], 1);
+            let raw_after = store.load_provider_messages(&key.store_key(), "L").unwrap();
+            assert_eq!(
+                raw_before, raw_after,
+                "noop must not rewrite admitted bytes"
+            );
+        }
+        turn_two["estimate"]["previous_input"] = json!(20073);
+    }
+    if let Some(reason) = rebuild_reason {
+        turn_two["prefix_rebuilding"] = json!({"reason":reason});
+    }
     let second = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         call(&h, "compaction.step", turn_two.clone()),
@@ -964,7 +1094,7 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
     assert_eq!(status["step_lane"]["last_step"]["reason"], "replacement");
     assert_eq!(
         status["step_lane"]["last_step"]["prefix_rebuilding_reason"],
-        Value::Null
+        rebuild_reason.map_or(Value::Null, |reason| json!(reason))
     );
     assert_eq!(
         status["step_lane"]["last_step"]["replacement_range"]["lineage_id"],
@@ -972,6 +1102,8 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
     );
     assert_eq!(status["step_lane"]["queued_drops"]["tag_ids"], json!([]));
     assert_eq!(status["step_lane"]["queued_drops"]["total_count"], 0);
+    assert_eq!(status["pending_drop_count"], 0);
+    assert!(status["tag_count"].is_null());
     assert_eq!(status["step_lane"]["applied_drops_last_step"], 1);
     assert_eq!(second["compaction"]["range"], json!({"from":0,"to":11}));
     assert_eq!(
@@ -981,6 +1113,10 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
 
     let mut repeated = turn_two.clone();
     repeated["request_id"] = json!("same-execute");
+    repeated
+        .as_object_mut()
+        .unwrap()
+        .remove("prefix_rebuilding");
     repeated["last_applied"] = json!({"compaction_id":second["compaction"]["compaction_id"],"version":second["compaction"]["version"]});
     assert_eq!(
         response(call(&h, "compaction.step", repeated).await)["answer"],
@@ -1026,9 +1162,23 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
             .iter()
             .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
             .collect::<Vec<_>>();
+        if gateway_shape {
+            assert!(
+                rendered_messages.iter().all(|message| {
+                    message["content"]
+                        .as_array()
+                        .is_none_or(|blocks| blocks.iter().all(|block| block["type"] != "thinking"))
+                }),
+                "a drop before signed thinking must not retain its signature"
+            );
+        }
         if answer["compaction"]["version"] == second["compaction"]["version"] {
-            assert!(rendered.contains(&thinking_and_call));
-            assert_eq!(rendered[0], r#"{"role":"user","content":"Read the note."}"#);
+            if !gateway_shape {
+                assert!(rendered.contains(&thinking_and_call));
+            }
+            if !gateway_shape {
+                assert_eq!(rendered[0], r#"{"role":"user","content":"Read the note."}"#);
+            }
         } else {
             assert!(rendered_messages.iter().all(|message| {
                 message["content"].as_array().is_none_or(|blocks| {
@@ -1087,6 +1237,9 @@ async fn cc_step_lane_status_reports_user_floor_and_is_null_without_attestation(
         .unwrap();
     let status = session_status(&h).await;
     assert_eq!(status["step_lane"]["protected_tokens"]["floor"], 321);
+    for field in ["tag_count", "compartment_count", "compartment_tokens"] {
+        assert_eq!(status[field], Value::Null, "{field} is not measured here");
+    }
     assert_eq!(
         status["step_lane"]["protected_tokens"]["provenance"],
         "user"
