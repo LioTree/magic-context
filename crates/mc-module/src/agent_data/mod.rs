@@ -1452,7 +1452,10 @@ impl AgentDataService {
                     .map_err(storage)?;
                 self.checkpoint(root, journal)?;
                 #[cfg(test)]
-                if self.crash_after_context_replace.swap(false, Ordering::SeqCst) {
+                if self
+                    .crash_after_context_replace
+                    .swap(false, Ordering::SeqCst)
+                {
                     return Err(storage("simulated crash after context replacement"));
                 }
                 mover

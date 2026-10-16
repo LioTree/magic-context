@@ -149,7 +149,7 @@ function planPiProcessedImageIds(
 			positionTag >= (args.protectedCutoff ?? Infinity)
 		)
 			continue;
-        if (
+		if (
 			args.admitFirstApplication?.(
 				raw,
 				i,

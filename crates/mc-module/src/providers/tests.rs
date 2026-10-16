@@ -68,6 +68,7 @@ fn handler(dir: &Path, runner: Arc<Runner>) -> McHandler {
                 connection_incarnation: 0,
                 native_generation: None,
                 principal: None,
+                scope: None,
                 project_root: dir.to_path_buf(),
                 harness: session_resolver::RUNNER_BIND_HARNESS.into(),
                 session: session.into(),

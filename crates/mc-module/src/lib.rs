@@ -204,6 +204,8 @@ pub struct SessionBinding {
     pub native_generation: Option<mc_store::provider_records::ProviderGeneration>,
     /// Identity stamped by the daemon at bind, never supplied by an RPC body.
     pub principal: Option<subc_protocol::Principal>,
+    /// Daemon-stamped scope owner and authorization, copied from the owner's scope.sync record at bind.
+    pub scope: Option<subc_protocol::scope::ScopeStamp>,
     pub project_root: PathBuf,
     pub harness: String,
     pub session: String,
@@ -15106,6 +15108,7 @@ impl ModuleHandler for McHandler {
                 connection_incarnation: 0,
                 native_generation: None,
                 principal: req.principal.clone(),
+                scope: req.scope.clone(),
                 project_root: req.identity.project_root.clone(),
                 harness: req.identity.harness.clone(),
                 session: req.identity.session.clone(),
@@ -21696,6 +21699,7 @@ mod tests {
             connection_incarnation: 0,
             native_generation: None,
             principal: None,
+            scope: None,
             project_root: PathBuf::from(root),
             harness: harness.to_string(),
             session: session.to_string(),
