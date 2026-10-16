@@ -519,13 +519,13 @@ export interface PiHistorianDeps {
 	memoryLifecycleLane?: TurnOneLane;
 	/** Provider/model/variant/temperature and system-prompt hashes whose recorded replay tests passed. Production Pi sends no reconciliation turn. */
 	validatedProfiles?: readonly ReportedProfile[];
-	/** Headless sessions may release lost reservations, but must not run or apply a historian. */
+	/** Headless sessions may compartment history, but cannot run the experimental memory lifecycle. */
 	hasUI?: boolean;
 }
 
 export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 	recoverLostPiRpcStages(deps.db);
-	if (deps.hasUI === false) return;
+	if (deps.hasUI === false && deps.memoryLifecycleLane === "enabled") return;
 	const {
 		db,
 		sessionId,
