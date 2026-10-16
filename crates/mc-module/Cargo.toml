@@ -44,6 +44,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rusqlite = { workspace = true }
 # subc-protocol is resolved from crates.io, matching the role crate's dependency.
 cortexkit-role-tool-provider = "=0.5.0"
+cortexkit-role-agent-data = "0.1"
+cortexkit-role-llm-runner = "=0.2.1"
 cortexkit-role-compaction-provider = { version = "=0.2.0", git = "https://github.com/cortexkit/commons", rev = "77f10f0fcfe465e6cab567dcf1a1bf8901c54547" }
 cortexkit-role-step-transform-provider = { version = "=0.2.0", git = "https://github.com/cortexkit/commons", rev = "77f10f0fcfe465e6cab567dcf1a1bf8901c54547" }
 # RFC 8785 (JCS) canonical JSON for tool.catalog's answer bytes and digests: the
@@ -55,6 +57,11 @@ serde_jcs = "0.2"
 nix = { version = "0.31.3", features = ["fs"] }
 
 [features]
+# Advertise agent-data/v1 only after Magic Context can transfer session bytes
+# through Engram and resolve their destination through Entorhinal. Until those
+# services are verified together, leave the capability undeclared. Released
+# sessions still refuse local turns when the feature is disabled.
+agent-data = []
 # Joint CC rig-drive fault injection. DEFAULT OFF.
 #
 # A default (deploy) build does not contain the corruption path at all: every line
@@ -79,6 +86,7 @@ drive-fault = []
 # Zlib decoding in tests compares stored message policy facts with the serving
 # snapshot without using the serving code's policy resolver.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+cortexkit-role-agent-data = { version = "0.1", features = ["test-vectors"] }
 cpu-time = "1"
 subc-core = { workspace = true }
 # Embedded real-daemon coverage of HELLO_ACK/open versus the first plan fetch.

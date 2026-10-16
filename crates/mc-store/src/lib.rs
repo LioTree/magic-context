@@ -30,6 +30,7 @@ pub use historian_telemetry::{HistorianInvocation, HistorianRunTelemetry};
 pub mod memory_history;
 pub mod memory_lifecycle;
 pub mod memory_projection;
+pub mod move_context;
 pub mod move_inventory;
 pub mod move_snapshot;
 pub mod move_store;
