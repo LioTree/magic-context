@@ -294,11 +294,13 @@ describe("Rust-mode compaction target recording under cross-process write conten
                 "A concurrent recovery requires a declared prefix rebuild",
             );
             const revision = lkgDirtyRevision(sessionId);
-            expect(saveLkgSlotToDb(db, sessionId, latest, undefined, {
-                ownDirtyRevision: revision,
-                requiredRevision: revision,
-                cleanDigest: lkgServedArrayDigest(latest.jsonPrefix),
-            })).toBe(true);
+            expect(
+                saveLkgSlotToDb(db, sessionId, latest, undefined, {
+                    ownDirtyRevision: revision,
+                    requiredRevision: revision,
+                    cleanDigest: lkgServedArrayDigest(latest.jsonPrefix),
+                }),
+            ).toBe(true);
             expect(checkLkgDurability(db, sessionId)).toEqual({
                 durable: true,
                 servedCaptureId: null,

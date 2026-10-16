@@ -101,7 +101,6 @@ import {
     noteLkgProviderResponse,
 } from "./lkg-measured-request";
 import { createDbLkgPersistence, loadPersistedLkgSlot, saveLkgSlotToDb } from "./lkg-persist";
-import { checkLkgDurability, readServedMarker } from "./lkg-served-marker";
 import {
     certifyCommittedLkgCapture,
     hasCleanLkgRecoveryFence,
@@ -109,6 +108,7 @@ import {
     lkgServedArrayDigest,
 } from "./lkg-recovery-fence";
 import { lkgDirtyRevision } from "./lkg-recovery-prefix";
+import { checkLkgDurability, readServedMarker } from "./lkg-served-marker";
 import * as lkgSlot from "./lkg-slot";
 import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
 import { MODULE_ORDINAL_PAGE_SIZE, MODULE_PAGE_MAX_BYTES } from "./module-wire";
@@ -6136,11 +6136,13 @@ describe("Rust mode authority adapter", () => {
         );
         const pendingSlot = getSlot(sessionId)!;
         const dirtyRevision = lkgDirtyRevision(sessionId);
-        expect(saveLkgSlotToDb(db, sessionId, pendingSlot, undefined, {
-            ownDirtyRevision: dirtyRevision,
-            requiredRevision: dirtyRevision,
-            cleanDigest: lkgServedArrayDigest(pendingSlot.jsonPrefix),
-        })).toBe(true);
+        expect(
+            saveLkgSlotToDb(db, sessionId, pendingSlot, undefined, {
+                ownDirtyRevision: dirtyRevision,
+                requiredRevision: dirtyRevision,
+                cleanDigest: lkgServedArrayDigest(pendingSlot.jsonPrefix),
+            }),
+        ).toBe(true);
         expect(checkLkgDurability(db, sessionId)).toEqual({
             durable: true,
             servedCaptureId: null,
@@ -6168,11 +6170,13 @@ describe("Rust mode authority adapter", () => {
         ).rejects.toBeInstanceOf(LkgRecoveryFenceError);
         beforeSave.dispose();
         // Recovery returned these exact bytes, but restart requires their matching save.
-        expect(saveLkgSlotToDb(db, sessionId, recoverySlot, undefined, {
-            ownDirtyRevision: recoveryRevision,
-            requiredRevision: recoveryRevision,
-            cleanDigest: lkgServedArrayDigest(recoverySlot.jsonPrefix),
-        })).toBe(true);
+        expect(
+            saveLkgSlotToDb(db, sessionId, recoverySlot, undefined, {
+                ownDirtyRevision: recoveryRevision,
+                requiredRevision: recoveryRevision,
+                cleanDigest: lkgServedArrayDigest(recoverySlot.jsonPrefix),
+            }),
+        ).toBe(true);
 
         resetLkgSlotsForTest();
         registerLkgPersistence(createDbLkgPersistence(db));

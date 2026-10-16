@@ -2,11 +2,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LiveConfigReader } from "@magic-context/core/config/live-snapshot";
 import {
 	MURAL_MODEL_DEPRECATION_WARNING,
 	WINDOW_OVERLAY_PATH_DEPRECATION_WARNING,
 } from "@magic-context/core/config/deprecated-config";
+import { LiveConfigReader } from "@magic-context/core/config/live-snapshot";
 import { getProtectedTokensTierOverrides } from "@magic-context/core/config/project-security";
 import { REMOVED_AGENT_CONFIG_WARNING } from "@magic-context/core/config/removed-agent-config";
 import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";

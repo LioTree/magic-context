@@ -333,15 +333,17 @@ export function stripPiDroppedPlaceholderMessages(args: {
 			const id = idOf(messages[i], i);
 			if (!id) continue;
 			presentIds?.add(id);
-            if (
-                persistedIds.has(id) ||
-                !(((isCacheBusting || args.forceDiscovery) &&
-                    messageIsPlaceholderOnly(messages[i])) ||
-                    (discoverOrphans &&
-                        !isPairedResult(messages[i], calls) &&
-                        isRetiredResult(messages[i])))
-            )
-                continue;
+			if (
+				persistedIds.has(id) ||
+				!(
+					((isCacheBusting || args.forceDiscovery) &&
+						messageIsPlaceholderOnly(messages[i])) ||
+					(discoverOrphans &&
+						!isPairedResult(messages[i], calls) &&
+						isRetiredResult(messages[i]))
+				)
+			)
+				continue;
 			const legacyId = args.forceDiscovery
 				? legacyIdOf(messages[i], i)
 				: undefined;
@@ -419,8 +421,8 @@ export function stripPiDroppedPlaceholderMessages(args: {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const id = idOf(messages[i], i);
 		if (!id || !idsToStrip.has(id)) continue;
-        if (protectedIds.has(id)) continue;
-        if (discovered > 0 && discoveredIds.includes(id) && !rekeyedIds.has(id))
+		if (protectedIds.has(id)) continue;
+		if (discovered > 0 && discoveredIds.includes(id) && !rekeyedIds.has(id))
 			args.onFirstApplication?.(messages[i], i);
 		messages.splice(i, 1);
 		removed++;

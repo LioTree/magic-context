@@ -67,9 +67,15 @@ for (const provider of [false, true]) {
                         providerKey: "openai",
                     });
                     if (
-                        !saveLkgSlotToDb(db, "ses-v2-lkg-order", getSlot("ses-v2-lkg-order")!, undefined, {
-                            rebuild: true,
-                        })
+                        !saveLkgSlotToDb(
+                            db,
+                            "ses-v2-lkg-order",
+                            getSlot("ses-v2-lkg-order")!,
+                            undefined,
+                            {
+                                rebuild: true,
+                            },
+                        )
                     )
                         throw new Error("Fixture LKG did not commit");
                 },

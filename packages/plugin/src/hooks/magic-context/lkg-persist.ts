@@ -7,8 +7,8 @@ import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
-import { readServedMarker, recordServedSlotState } from "./lkg-served-marker";
 import { clearLkgRecoveryFence, commitLkgWithRecoveryFence } from "./lkg-recovery-fence";
+import { readServedMarker, recordServedSlotState } from "./lkg-served-marker";
 import type { LkgPersistenceBackend, LkgSlot } from "./lkg-slot";
 
 /**
@@ -245,7 +245,11 @@ function persistLkgSlot(
     const { force, publishMetadata } =
         typeof options === "function" ? { publishMetadata: options, force: false } : options;
     const fingerprint = slotFingerprint(slot);
-    if (!force && !publishMetadata && persistedFingerprints.get(db)?.get(sessionId) === fingerprint) {
+    if (
+        !force &&
+        !publishMetadata &&
+        persistedFingerprints.get(db)?.get(sessionId) === fingerprint
+    ) {
         const durable = loadPersistedLkgSlot(db, sessionId);
         if (durable && slotFingerprint(durable) === fingerprint) return true;
     }
