@@ -10,6 +10,8 @@ mod late_descent_tests;
 mod native_endpoint_tests;
 #[path = "pending_hook_pairing_tests.rs"]
 mod pending_hook_pairing_tests;
+#[path = "tag_high_water_tests.rs"]
+mod tag_high_water_tests;
 
 pub(super) fn binding(root: &Path, principal: Option<subc_protocol::Principal>) -> SessionBinding {
     SessionBinding {

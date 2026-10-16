@@ -1,0 +1,77 @@
+{
+  "hooks": [
+    {
+      "sequence": 6,
+      "params": {
+        "blocks": ["It lists three colors."],
+        "harness": "claude-code",
+        "hook": "post_assistant",
+        "lineage_id": "L",
+        "message": {"content": [{"text": "It lists three colors.", "type": "text"}], "role": "assistant"},
+        "params": {"observation": "answer", "serializer_profile": "claude-code-anthropic"},
+        "raw_message": "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"It lists three colors.\"}]}",
+        "served_through_ordinal": 4,
+        "session": "cc",
+        "step_id": "ccl-c1a2ba5816bb82c181a85a582dd4915b7f551bbd7bdcf9474f03f2a743328948-hook-5",
+        "subject_mid": "ccs-b5c0c6c40b5a6104bafa4e12a81f520546a6677324fa4ecd42d53a54729a717c",
+        "subject_ordinal": 5
+      },
+      "answer": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§7§ \"}]}"
+    },
+    {
+      "sequence": 7,
+      "params": {
+        "blocks": ["Confirm the colors are harmless."],
+        "harness": "claude-code",
+        "hook": "pre_user",
+        "lineage_id": "L",
+        "message": {"content": [{"text": "Confirm the colors are harmless.", "type": "text"}], "role": "user"},
+        "params": {"observation": "answer", "serializer_profile": "claude-code-anthropic"},
+        "raw_message": "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Confirm the colors are harmless.\"}]}",
+        "served_through_ordinal": 4,
+        "session": "cc",
+        "subject_mid": "ccs-e2175a093e0bb283dd3317a7df19478c714408b633fe2f819fb4f803cea917c3",
+        "subject_ordinal": 6
+      },
+      "answer": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§8§ \"}]}"
+    },
+    {
+      "sequence": 8,
+      "params": {
+        "blocks": ["Fork: the note lists three colors."],
+        "descends_from": {"lineage_id": "L", "through_ordinal": 2},
+        "harness": "claude-code",
+        "hook": "post_assistant",
+        "lineage_id": "L2",
+        "message": {"content": [{"text": "Fork: the note lists three colors.", "type": "text"}], "role": "assistant"},
+        "params": {"observation": "answer", "serializer_profile": "claude-code-anthropic"},
+        "raw_message": "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Fork: the note lists three colors.\"}]}",
+        "served_through_ordinal": 2,
+        "session": "cc",
+        "step_id": "ccl-1ba4d90d0c922c667414e6ebc3c8fa4eee13d4611cd20dfaee686c4b393d3e96-hook-3",
+        "subject_mid": "ccs-1b444c6adec53761831331c56101584227288c3dae58b6914ff2ac1588a68961",
+        "subject_ordinal": 3
+      },
+      "answer": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§7§ \"}]}"
+    },
+    {
+      "sequence": 9,
+      "params": {
+        "blocks": ["Use this alternate summary."],
+        "descends_from": {"lineage_id": "L", "through_ordinal": 2},
+        "harness": "claude-code",
+        "hook": "pre_user",
+        "lineage_id": "L2",
+        "message": {"content": [{"text": "Use this alternate summary.", "type": "text"}], "role": "user"},
+        "params": {"observation": "answer", "serializer_profile": "claude-code-anthropic"},
+        "raw_message": "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Use this alternate summary.\"}]}",
+        "served_through_ordinal": 2,
+        "session": "cc",
+        "subject_mid": "ccs-045dfc496772d31cbd8f4fe03f4d41f2b02352e363d74c422095e0b8553fdd5c",
+        "subject_ordinal": 4,
+        "unserved_subjects": [{"hook": "post_assistant", "subject_mid": "ccs-1b444c6adec53761831331c56101584227288c3dae58b6914ff2ac1588a68961"}]
+      },
+      "answer": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§8§ \"}]}"
+    }
+  ]
+}
