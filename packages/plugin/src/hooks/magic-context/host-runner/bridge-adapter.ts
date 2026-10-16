@@ -19,6 +19,7 @@ import { SubcModuleTransport } from "../module-transport";
 import { hasRawMessageProvider } from "../read-session-chunk";
 import { createRustModeTransform } from "../rust-mode-transform";
 import type { TransformDeps } from "../transform";
+import { createBridgeHostFacts } from "./bridge-host-facts";
 import { type BridgeMarkerOutcome, createBridgeReceiptStore } from "./bridge-marker";
 import { openCodeCutProblem, openCodeCutSources } from "./bridge-native-cut";
 import type { BridgeReceipt, BridgeRequestCompletion } from "./bridge-receipt";
@@ -26,6 +27,7 @@ import { BridgeStep } from "./bridge-step";
 import {
     type BridgeAdapterOptions,
     type BridgeFallbackInputs,
+    type BridgeHostFact,
     type BridgeOutcomeListener,
     BridgeRefusalError,
     type BridgeRunInput,
@@ -81,6 +83,7 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                 executeThresholdPercentage: config.execute_threshold_percentage,
             }),
             contextUsageMap: new Map(),
+            liveModelBySession: new Map(),
             historyRefreshSessions: new Set(),
             pendingMaterializationSessions: new Set(),
             lastHeuristicsTurnId: new Map(),
@@ -149,6 +152,7 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
         throw error;
     }
     let disposed = false;
+    const hostFacts = createBridgeHostFacts(deps, config);
     let disposal: Promise<void> | undefined;
     const runs = new Set<Promise<void>>();
     const activeSessions = new Set<string>();
@@ -156,6 +160,32 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
         if (disposed) throw new Error("Bridge adapter is disposed");
     }
     return {
+        /** Observe host state without certifying delivery or removing history from the host store. */
+        async recordHostFact(fact: BridgeHostFact) {
+            assertOpen();
+            if (activeSessions.has(fact.sessionId))
+                throw new Error("Bridge pass already in flight");
+            const receipt = createBridgeReceiptStore(db, fact.sessionId, harness).current();
+            if (
+                !receipt ||
+                receipt.lineage_id !== fact.lineageId ||
+                (fact.kind === "provider_response" && receipt.request_id !== fact.requestId)
+            )
+                return { accepted: false };
+            activeSessions.add(fact.sessionId);
+            const pending = hostFacts(fact);
+            const observing = pending.then(
+                () => {},
+                () => {},
+            );
+            observations.add(observing);
+            try {
+                return await pending;
+            } finally {
+                activeSessions.delete(fact.sessionId);
+                observations.delete(observing);
+            }
+        },
         async run({ sessionId: id, messages, kind }: BridgeRunInput): Promise<BridgeView> {
             const startedAt = performance.now();
             assertOpen();

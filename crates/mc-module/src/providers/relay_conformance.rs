@@ -83,6 +83,10 @@ async fn oracle() {
                 mc = handler(dir.path());
                 String::new()
             }
+            Some("scheduler") => {
+                serde_json::to_string(&crate::scheduler::ORACLE_OUTCOME.lock().unwrap().take())
+                    .unwrap()
+            }
             Some("publish") => {
                 let ordinal = request["ordinal"].as_u64().unwrap() as i64;
                 mc.store
