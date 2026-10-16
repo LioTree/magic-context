@@ -22,6 +22,8 @@ pub(crate) mod fold_prefix;
 mod fold_working;
 mod historian;
 pub(crate) mod historian_budget;
+#[cfg(test)]
+pub(crate) mod hook_probe;
 pub(crate) mod hygiene_memo;
 mod native_cut;
 mod native_plan;
@@ -43,7 +45,11 @@ use codec::{checked_view, decode_message};
 use codec::{encode_message, validate_replacement};
 pub(crate) use historian::RunCompletion;
 pub(crate) use native_plan::NativeConnectionPlan;
-use records::{frontier, ingest, scan, HookRecord, HookState, Key, Record, Setup};
+#[cfg(test)]
+pub(crate) use records::Key;
+#[cfg(not(test))]
+use records::Key;
+use records::{frontier, ingest, scan, HookRecord, HookState, Record, Setup};
 pub(crate) use records::{Catalog, Storage};
 use step_transform::declaration;
 

@@ -122,6 +122,36 @@ async fn provider_ingest_obeys_shared_budget_and_queued_hook_does_not_wait() {
 }
 
 #[tokio::test]
+async fn warm_hook_does_not_wait_for_admitted_historian_ingest() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = handler(dir.path());
+    h.provider_resident = Arc::new(super::super::resident_hooks::ResidentHooks::enabled(true));
+    declare(&h).await;
+    let entries = corpus();
+    review_sync(&h, &entries, json!({"usage":{"current_total_input_tokens":45000,"context_limit_tokens":50000}}));
+    bounded_prefix(&h, 40);
+    h.provider_resident.load_for_test(h.store.get().unwrap(), &key(&h).store_key());
+    let before = h.provider_resident.stats();
+    let worker = h.provider_historian_worker();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    *worker.provider_historian_ingest_pause.lock().unwrap() = Some((entered, held));
+    let b = binding(&h);
+    let k = key(&h);
+    let task = tokio::spawn(async move { worker.prepare_provider_historian(&b, &k).await });
+    tokio::time::timeout(Duration::from_secs(30), started).await.unwrap().unwrap();
+    assert_eq!(h.provider_historian_budget.stats()["active"], 1);
+    // The decoder is still admitted and paused. Completing the hook before
+    // releasing it proves ingestion does not own the serving conversation lock.
+    let outcome = tokio::time::timeout(Duration::from_secs(1),
+        h.handle_provider_value(7, "transform.hook", &hook(entries.last().unwrap(), true))).await;
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), task).await.unwrap().unwrap().unwrap();
+    assert!(matches!(outcome, Ok(HandlerOutcome::Response(_))), "admitted ingestion must not block a warm hook: {outcome:?}");
+    assert_eq!(h.provider_resident.stats()["rebuilt_parts"], before["rebuilt_parts"], "the hook remained warm");
+}
+
+#[tokio::test]
 async fn current_resident_decoded_tail_avoids_native_reads_and_stale_tail_pages() {
     let dir = tempfile::tempdir().unwrap();
     let reference_dir = tempfile::tempdir().unwrap();

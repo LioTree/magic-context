@@ -805,6 +805,8 @@ impl McHandler {
         call: &hooks::hook::HookCall,
         params: &Value,
     ) -> Result<Vec<u8>, HandlerOutcome> {
+        #[cfg(test)]
+        let mut probe = super::hook_probe::Probe::new();
         use hooks::{
             answer::{HookAnswer, Operation},
             subscription::Hook,
@@ -878,7 +880,11 @@ impl McHandler {
             .provider_resident
             .begin(store.tag_cache_namespace(), &key)
             .map_err(transient)?;
+        #[cfg(test)]
+        probe.stage("resident_begin");
         let _serial = self.provider_serial.lock_for(&key).await;
+        #[cfg(test)]
+        probe.stage("serial_wait");
         if let Some(lease) = resident.as_mut().filter(|lease| lease.cold) {
             let started = Instant::now();
             // Initialize token counting during the first hook's database rebuild;
@@ -925,6 +931,8 @@ impl McHandler {
                 .and_then(Value::as_str)
                 .unwrap_or(""),
         );
+        #[cfg(test)]
+        probe.stage("cold_rebuild");
         let c = store
             .load_provider_conversation(&key.store_key())
             .map_err(transient)?
@@ -964,6 +972,8 @@ impl McHandler {
             ordinal,
             message: message.clone(),
         };
+        #[cfg(test)]
+        probe.stage("conversation_lineage_read");
         let decoded = super::codec_opencode::decode_messages(&[entry])?;
         let ingress = &decoded.messages[0];
         let projection = ck_wire::project_messages(&decoded.messages).map_err(transient)?;
@@ -1088,6 +1098,8 @@ impl McHandler {
         }
         // The store owns P1's newest-held/monotonic confirmation check. Descent,
         // message admission and the revert clamp share that transaction.
+        #[cfg(test)]
+        probe.stage("decode_policy");
         let (answer, preparation_consumed) = store
             .commit_provider_hook_with_preparation(
                 &key.store_key(),
@@ -1247,6 +1259,8 @@ impl McHandler {
                 },
             )
             .map_err(provider_policy_error)?;
+        #[cfg(test)]
+        probe.stage("transaction");
         if fields.consume_prepared_policy {
             tracing::info!(session_id = %key.session, harness = %key.harness,
                 request_id = params.get("request_id").and_then(|value| value.as_str()).unwrap_or(""),
@@ -1256,6 +1270,8 @@ impl McHandler {
         if let Some(lease) = resident {
             lease.publish();
         }
+        #[cfg(test)]
+        probe.stage("resident_publish");
         if fields.pass_complete == Some(true) {
             self.schedule_provider_historian(binding, key);
         }

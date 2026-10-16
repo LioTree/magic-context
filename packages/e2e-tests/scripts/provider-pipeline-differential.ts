@@ -87,7 +87,7 @@ fn provider_pipeline_driver() {
             }
         }
         struct Rig {
-            handler: McHandler,
+            handler: Arc<McHandler>,
             store: Arc<McStore>,
             sql: rusqlite::Connection,
             _dir: Option<tempfile::TempDir>,
@@ -104,6 +104,7 @@ fn provider_pipeline_driver() {
         }
         let mut rigs: HashMap<String, Rig> = HashMap::new();
         let mut resident_pools:HashMap<String,Arc<crate::providers::resident_hooks::ResidentHooks>>=HashMap::new();
+        let mut historian_budgets = HashMap::new();
         for line in std::io::stdin().lock().lines() {
             let cmd: Value = serde_json::from_str(&line.unwrap()).unwrap();
             let name = cmd["rig"].as_str().unwrap_or("default");
@@ -139,6 +140,10 @@ fn provider_pipeline_driver() {
                     handler.provider_resident=resident_pools.entry(pool.into()).or_insert_with(||
                         Arc::new(crate::providers::resident_hooks::ResidentHooks::enabled(resident_enabled).with_process_cap(resident_process_cap))).clone();
                 }
+                if let Some(concurrency) = cmd["historian_concurrency"].as_u64() {
+                    handler.provider_historian_budget = historian_budgets.entry(concurrency).or_insert_with(||
+                        crate::providers::historian_budget::Budget::new(concurrency as usize, 512)).clone();
+                }
                 handler.store.set(store.clone()).ok().unwrap();
                 let binding = SessionBinding {
                     connection_incarnation: 0, native_generation: None, principal: None,
@@ -151,8 +156,42 @@ fn provider_pipeline_driver() {
                 let reads = Arc::new(ReadTrap::default());
                 handler.provider_runner = reads.clone();
                 let sql = rusqlite::Connection::open(root.join("store.db")).unwrap();
-                rigs.insert(name.into(), Rig {handler, store, sql, _dir: dir, binding, reads, namespaces:HashMap::new(), resident_enabled,resident_process_cap});
+                rigs.insert(name.into(), Rig {handler:Arc::new(handler), store, sql, _dir: dir, binding, reads, namespaces:HashMap::new(), resident_enabled,resident_process_cap});
                 json!({"created": true})
+            } else if op == "concurrent_calls" {
+                let calls = cmd["calls"].as_array().unwrap();
+                let barrier = Arc::new(tokio::sync::Barrier::new(calls.len()));
+                let submitted = std::time::Instant::now();
+                let mut tasks = Vec::new();
+                for call in calls {
+                    let handler = Arc::clone(&rigs[call["rig"].as_str().unwrap()].handler);
+                    let body = call["body"].clone();
+                    let kind = body["method"].clone();
+                    let barrier = Arc::clone(&barrier);
+                    tasks.push(tokio::spawn(async move {
+                        barrier.wait().await;
+                        let before = handler.provider_historian_budget.stats();
+                        crate::providers::hook_probe::take();
+                        let started = std::time::Instant::now();
+                        let scheduler_before = scheduler_wait_ms();
+                        let outcome = handler.dispatch_value(7, body).await;
+                        let module_ms = started.elapsed().as_secs_f64()*1000.0;
+                        let submitted_to_response_ms = submitted.elapsed().as_secs_f64()*1000.0;
+                        let stages = crate::providers::hook_probe::take();
+                        let (acquire,callback,finish) = mc_store::provider_meters::last_transaction_timing();
+                        match outcome {
+                            HandlerOutcome::Response(bytes) => json!({"kind":kind,"module_ms":module_ms,"submitted_to_response_ms":submitted_to_response_ms,"hook_stages":stages,
+                                "db_acquire_ms":acquire,"db_callback_ms":callback,"db_finish_ms":finish,
+                                "scheduler_wait_ms":(scheduler_wait_ms()-scheduler_before).max(0.0),
+                                "historian_before":before,"historian_after":handler.provider_historian_budget.stats(),
+                                "ok":serde_json::from_slice::<Value>(&bytes).unwrap()}),
+                            other => panic!("concurrent call refused: {other:?}"),
+                        }
+                    }));
+                }
+                let mut rows = Vec::new();
+                for task in tasks { rows.push(tokio::time::timeout(Duration::from_secs(30), task).await.expect("concurrent call deadline").unwrap()); }
+                json!({"rows":rows})
             } else {
                 let rig = rigs.get_mut(name).expect("created rig");
                 if op == "event" {
@@ -226,7 +265,24 @@ fn provider_pipeline_driver() {
                     json!({"changed":true})
                  } else if op == "settle" {
                      tokio::task::yield_now().await;
-                     json!({"settled":true})
+                      json!({"settled":true})
+                 } else if op == "historian_mode" {
+                     if cmd["held"] == true { std::env::set_var("MC_TEST_HISTORIAN_HOLD", "1"); }
+                     else { std::env::remove_var("MC_TEST_HISTORIAN_HOLD"); }
+                     json!({"held":cmd["held"]})
+                 } else if op == "historian_requeue" {
+                     for rig in rigs.values() {
+                         let key = crate::providers::Key::new(&rig.binding, "session", &rig.binding.harness).unwrap();
+                         if let Some(mut conversation) = rig.store.load_provider_conversation(&key.store_key()).unwrap() {
+                             let mut counters: Value = serde_json::from_str(&conversation.hook_counters_json).unwrap();
+                             counters["historian_evaluation_due"] = json!(true);
+                             conversation.hook_counters_json = counters.to_string();
+                             rig.store.save_provider_conversation(&key.store_key(), &conversation).unwrap();
+                             rig.handler.schedule_provider_historian(rig.binding.clone(), key);
+                         }
+                     }
+                     tokio::task::yield_now().await;
+                     json!({"queued":true})
                 } else if op == "reads" {
                     json!(rig.reads.0.load(Ordering::SeqCst))
                 } else if op == "historian_stats" || op == "historian_drain" {
@@ -382,7 +438,7 @@ fn provider_pipeline_driver() {
                     for (namespace, channel) in &rig.namespaces {
                         h.bind_route(*channel, SessionBinding {session: namespace.clone(), ..rig.binding.clone()});
                     }
-                    rig.handler = h;
+                    rig.handler = Arc::new(h);
                     json!({"restarted": true})
                 } else if op == "autocheckpoint" {
                     let frames = cmd["frames"].as_u64().unwrap();
@@ -444,6 +500,7 @@ fn provider_pipeline_driver() {
                         }
                     }
                     let historian_before = rig.handler.provider_historian_budget.stats();
+                    if cmd["timing"] == true { crate::providers::hook_probe::take(); }
                     let module_started = std::time::Instant::now();
                     let cpu_started = cpu_time::ProcessTime::now();
                     let scheduler_before = scheduler_wait_ms();
@@ -458,7 +515,7 @@ fn provider_pipeline_driver() {
                                 let historian_during = historian_before["active"] != 0 || historian_before["queued"] != 0
                                     || historian_after["active"] != 0 || historian_after["queued"] != 0
                                     || historian_after["completed"] != historian_before["completed"];
-                                println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{},\"module_ms\":{},\"cpu_ms\":{},\"scheduler_wait_ms\":{},\"db_acquire_ms\":{},\"db_callback_ms\":{},\"db_finish_ms\":{},\"historian_during\":{}}}", raw, serde_json::to_string(&raw).unwrap(), module_ms, cpu_started.elapsed().as_secs_f64()*1000.0,(scheduler_wait_ms()-scheduler_before).max(0.0),acquire,callback,finish,historian_during);
+                                println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{},\"module_ms\":{},\"cpu_ms\":{},\"scheduler_wait_ms\":{},\"db_acquire_ms\":{},\"db_callback_ms\":{},\"db_finish_ms\":{},\"historian_during\":{},\"historian_before\":{},\"historian_after\":{},\"hook_stages\":{}}}", raw, serde_json::to_string(&raw).unwrap(), module_ms, cpu_started.elapsed().as_secs_f64()*1000.0,(scheduler_wait_ms()-scheduler_before).max(0.0),acquire,callback,finish,historian_during,historian_before,historian_after,serde_json::to_string(&crate::providers::hook_probe::take()).unwrap());
                                 std::io::stdout().flush().unwrap();
                                 continue;
                             }
@@ -654,7 +711,7 @@ export class Driver {
                         const ms = /preparation_ms=([0-9.eE+-]+)/.exec(line)?.[1];
                         if (request && prepared && ms) this.preparationCompletions.push({ request_id: request, prepared: prepared === "true", preparation_ms: Number(ms) });
                     }
-                    process.stderr.write(`${line}\n`);
+                    if (process.env.MC_PROVIDER_DRIVER_QUIET !== "1") process.stderr.write(`${line}\n`);
                 }
             }
         }
