@@ -362,6 +362,8 @@ export interface SessionChunk {
      * joins with ` / `, and the offset in `text` where the line ends. A historian
      * fact's source anchor names these ranges, and the matching records become the
      * fact's stored evidence.
+     * Internal metadata: readable by historian consumers, but not serialized as
+     * part of the stable chunk payload.
      */
     printedBlocks?: Array<{
         role: string;
@@ -1550,7 +1552,7 @@ export function readSessionChunk(
         estimateBlockTokens(text) > tokenBudget &&
         completedToolArcs.some((arc) => arc.start <= lastOrdinal && arc.end >= startOrdinal);
 
-    return {
+    const chunk: SessionChunk = {
         startIndex: startOrdinal,
         endIndex: lastOrdinal,
         startMessageId: firstMessageId,
@@ -1572,8 +1574,16 @@ export function readSessionChunk(
         toolOnlyRanges,
         completedToolArcs,
         toolResultBoundaries,
-        printedBlocks,
     };
+    // Evidence bookkeeping must not change the serialized reader contract used
+    // by older hosts. Historian callers read this metadata directly on the chunk.
+    Object.defineProperty(chunk, "printedBlocks", {
+        value: printedBlocks,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+    });
+    return chunk;
 }
 
 export function getRawSessionMessageIdsThrough(sessionId: string, endOrdinal: number): string[] {

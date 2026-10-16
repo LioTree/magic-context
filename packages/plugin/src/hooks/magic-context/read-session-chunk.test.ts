@@ -316,6 +316,30 @@ describe("raw message provider lifecycle", () => {
 });
 
 describe("readSessionChunk", () => {
+    it("retains historian evidence without extending the serialized chunk payload", () => {
+        const chunk = withRawMessageProvider(
+            "ses-evidence-metadata",
+            {
+                readMessages: () => [
+                    {
+                        id: "evidence-1",
+                        role: "user",
+                        ordinal: 1,
+                        createdAt: 1,
+                        parts: [{ type: "text", text: "Evidence α" }],
+                    },
+                ],
+            },
+            () => readSessionChunk("ses-evidence-metadata", 10_000, 1),
+        );
+        expect(chunk.printedBlocks?.map((block) => block.parts)).toEqual([["Evidence α"]]);
+        expect(chunk.printedBlocks?.[0]?.startOrdinal).toBe(1);
+        expect(chunk.printedBlocks?.[0]?.endOrdinal).toBe(1);
+        expect(chunk.printedBlocks?.[0]?.textEnd).toBe(chunk.text.length);
+        expect(Object.keys(chunk)).not.toContain("printedBlocks");
+        expect(JSON.parse(JSON.stringify(chunk))).not.toHaveProperty("printedBlocks");
+    });
+
     it("reads raw OpenCode messages with stable ordinals and ids", () => {
         useTempDataHome("read-session-chunk-");
         createOpenCodeDb("ses-raw");
