@@ -49,3 +49,11 @@ subc-os = { version = "=0.1.5" }
 subc-protocol = { version = "=0.29.1" }
 subc-transport = { version = "=0.10.0" }
 subc-uptime = { version = "=0.1.1" }
+
+# Keep test safety checks while reducing CPU-heavy differential runtime.
+[profile.ci-test]
+inherits = "test"
+opt-level = 1
+debug = "line-tables-only"
+debug-assertions = true
+overflow-checks = true

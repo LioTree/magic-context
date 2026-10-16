@@ -312,12 +312,22 @@ struct CorpusRun {
     real_reduce: bool,
 }
 
-async fn drive_overlay_corpus_with(queued: bool, calibrated: bool, run: &CorpusRun) -> usize {
+#[derive(Default)]
+struct CorpusCounts {
+    passes: usize,
+    comparisons: usize,
+}
+
+async fn drive_overlay_corpus_with(
+    queued: bool,
+    calibrated: bool,
+    run: &CorpusRun,
+) -> CorpusCounts {
     let frozen: BTreeMap<String, Vec<String>> = serde_json::from_str(include_str!(
         "../../testdata/provider-overlay-reference.json"
     ))
     .unwrap();
-    let mut comparisons = 0;
+    let mut counts = CorpusCounts::default();
     for &seed in run.seeds {
         let host_dir = tempfile::tempdir().unwrap();
         let full_dir = tempfile::tempdir().unwrap();
@@ -443,7 +453,7 @@ async fn drive_overlay_corpus_with(queued: bool, calibrated: bool, run: &CorpusR
                     })
                     .collect::<Vec<_>>();
                 assert!(actual==expected[&message.mid],"seed={seed:x} pass={pass} mid={} actual prefixes={:?} expected prefixes={:?} actual suffixes={:?} expected suffixes={:?}",message.mid,actual.iter().map(|(_,s)|s.chars().take(100).collect::<String>()).collect::<Vec<_>>(),expected[&message.mid].iter().map(|(_,s)|s.chars().take(100).collect::<String>()).collect::<Vec<_>>(),actual.iter().map(|(_,s)|s.chars().rev().take(180).collect::<String>()).collect::<Vec<_>>(),expected[&message.mid].iter().map(|(_,s)|s.chars().rev().take(180).collect::<String>()).collect::<Vec<_>>());
-                comparisons += 1;
+                counts.comparisons += 1;
             }
             if run.frozen_reference && !queued && !calibrated {
                 assert_eq!(
@@ -452,10 +462,11 @@ async fn drive_overlay_corpus_with(queued: bool, calibrated: bool, run: &CorpusR
                     "full engine changed after pure extraction: seed={seed:x} pass={pass}"
                 );
             }
+            counts.passes += 1;
         }
     }
-    println!("overlay parity: queued={queued}, calibrated={calibrated}, {} seeds {:?}, {} passes, {comparisons} per-message byte comparisons",run.seeds.len(),run.seeds,run.seeds.len()*run.passes);
-    comparisons
+    println!("overlay parity: queued={queued}, calibrated={calibrated}, {} seeds {:?}, {} passes, {} per-message byte comparisons",run.seeds.len(),run.seeds,counts.passes,counts.comparisons);
+    counts
 }
 
 #[tokio::test]
@@ -1146,27 +1157,73 @@ async fn exact_hard_model_adoption_shows_and_omits_reminders_like_full_engine() 
     assert_eq!(omitted, 0, "neutral model calibration is below the floor");
 }
 
-#[tokio::test]
-async fn r2_review_720_pass_differential_with_new_seeds_and_real_reduce() {
-    const REVIEW_SEEDS: [u64; 4] = [0x81ac0023, 0x519e72a0, 0x9c340162, 0xa107d891];
-    let run = CorpusRun {
-        seeds: &REVIEW_SEEDS,
-        passes: 60,
-        mixed_tool: "ctx_reduce",
-        frozen_reference: false,
-        real_reduce: true,
-    };
-    let replays = super::super::policy_summary::replay_checks();
-    let mut comparisons = 0;
-    for (queued, calibrated) in [(false, false), (true, false), (false, true)] {
-        comparisons += drive_overlay_corpus_with(queued, calibrated, &run).await;
+mod r2_review_720_pass_differential_with_new_seeds_and_real_reduce {
+    use super::*;
+
+    const REVIEW_PASSES: usize = 60;
+    const CONFIGURATIONS: [(bool, bool); 3] = [(false, false), (true, false), (false, true)];
+
+    // Generate the test functions and coverage manifest together, so removing a
+    // seed test also removes its contribution to the independently pinned totals.
+    macro_rules! seed_tests {
+        ($($name:ident => ($seed:expr, $comparisons:expr)),+ $(,)?) => {
+            const CASES: &[(u64, usize)] = &[$(($seed, $comparisons)),+];
+
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    run_seed(&[$seed], $comparisons).await;
+                }
+            )+
+        };
     }
-    assert_eq!(comparisons, 46980);
-    // Hooks replay the stored policy summary; each replay was checked against
-    // the full computation, so the corpus covers that path too.
-    let replays = super::super::policy_summary::replay_checks() - replays;
-    assert!(replays > 0, "the corpus never replayed a policy summary");
-    println!("r2 review append differential: 720 passes, 46980 per-message comparisons, {replays} checked summary replays, seeds={REVIEW_SEEDS:x?}");
+
+    seed_tests! {
+        seed_81ac0023 => (0x81ac0023, 11364),
+        seed_519e72a0 => (0x519e72a0, 11187),
+        seed_9c340162 => (0x9c340162, 12162),
+        seed_a107d891 => (0xa107d891, 12267),
+    }
+
+    #[test]
+    fn coverage_totals() {
+        assert_eq!(CASES.len() * REVIEW_PASSES * CONFIGURATIONS.len(), 720);
+        assert_eq!(CASES.iter().map(|(_, count)| count).sum::<usize>(), 46980);
+        assert_eq!(
+            CASES.iter().map(|(seed, _)| *seed).collect::<Vec<_>>(),
+            [0x81ac0023, 0x519e72a0, 0x9c340162, 0xa107d891],
+        );
+        assert_eq!(REVIEW_PASSES, 60);
+        assert_eq!(
+            CONFIGURATIONS,
+            [(false, false), (true, false), (false, true)]
+        );
+        println!("r2 review coverage: 4 seed tests, 720 passes, 46980 per-message comparisons");
+    }
+
+    async fn run_seed(seeds: &'static [u64], expected_comparisons: usize) {
+        let run = CorpusRun {
+            seeds,
+            passes: REVIEW_PASSES,
+            mixed_tool: "ctx_reduce",
+            frozen_reference: false,
+            real_reduce: true,
+        };
+        let replays = super::super::super::policy_summary::replay_checks();
+        let mut counts = CorpusCounts::default();
+        for (queued, calibrated) in CONFIGURATIONS {
+            let observed = drive_overlay_corpus_with(queued, calibrated, &run).await;
+            counts.passes += observed.passes;
+            counts.comparisons += observed.comparisons;
+        }
+        assert_eq!(counts.passes, 180);
+        assert_eq!(counts.comparisons, expected_comparisons);
+        // Hooks replay the stored policy summary; each replay was checked against
+        // the full computation on this test's thread, not another seed's thread.
+        let replays = super::super::super::policy_summary::replay_checks() - replays;
+        assert!(replays > 0, "the corpus never replayed a policy summary");
+        println!("r2 review append differential: {} passes, {} per-message comparisons, {replays} checked summary replays, seeds={seeds:x?}",counts.passes,counts.comparisons);
+    }
 }
 
 #[tokio::test]
