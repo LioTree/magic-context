@@ -31,3 +31,21 @@ regression("restarted WAL sync delay is paid at startup, not by the first hook",
         delete process.env.MC_COLD_HOOK_SYNC_DELAY_MS;
     }
 }, 300_000);
+
+const restart = process.env.MC_RUN_WAL_RESTART_REGRESSION === "1" ? test : test.skip;
+restart("warm hook after drained maintenance checkpoint does not sync a WAL header", async () => {
+    process.env.MC_WARM_WAL_PROBE = "1";
+    process.env.MC_WARM_WAL_PAIR = "1";
+    try {
+        const result = await historianHookTiming(5, 0);
+        for (const batch of result.batches as any[]) {
+            expect(batch.checkpoint.checkpoint[1]).toBeGreaterThan(0);
+            expect(batch.checkpoint.checkpoint[1]).toBe(batch.checkpoint.checkpoint[2]);
+            const syncs = batch.drained.commit_probe.calls.wal_sync_flags_2 ?? 0;
+            expect(syncs).toBe(batch.lane.startsWith("before-") ? 1 : 0);
+        }
+    } finally {
+        delete process.env.MC_WARM_WAL_PROBE;
+        delete process.env.MC_WARM_WAL_PAIR;
+    }
+}, 300_000);

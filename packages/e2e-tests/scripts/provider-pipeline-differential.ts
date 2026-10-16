@@ -105,6 +105,7 @@ fn provider_pipeline_driver() {
             namespaces: HashMap<String,u16>,
             resident_enabled: bool,
             resident_process_cap: usize,
+            commit_probe: Option<mc_store::commit_probe::Guard>,
         }
         let mut rigs: HashMap<String, Rig> = HashMap::new();
         let mut resident_pools:HashMap<String,Arc<crate::providers::resident_hooks::ResidentHooks>>=HashMap::new();
@@ -176,7 +177,7 @@ fn provider_pipeline_driver() {
                 let sql = rusqlite::Connection::open(root.join("store.db")).unwrap();
                 let handler = Arc::new(handler);
                 transports[usize::from(resident_enabled)].register(&format!("{name}-7"), handler.clone(), binding.clone());
-                rigs.insert(name.into(), Rig {handler, store, sql, _dir: dir, binding, reads, namespaces:HashMap::new(), resident_enabled,resident_process_cap});
+                rigs.insert(name.into(), Rig {handler, store, sql, _dir: dir, binding, reads, namespaces:HashMap::new(), resident_enabled,resident_process_cap,commit_probe:None});
                 json!({"created": true, "startup_ms": startup_ms, "startup_io": startup_io})
             } else if op == "concurrent_calls" {
                 let calls = cmd["calls"].as_array().unwrap();
@@ -453,7 +454,27 @@ fn provider_pipeline_driver() {
                      rig.handler = Arc::new(h);
                     transports[usize::from(rig.resident_enabled)].register(&format!("{name}-7"), rig.handler.clone(), rig.binding.clone());
                     json!({"restarted": true})
-                } else if op == "autocheckpoint" {
+                 } else if op == "probe_on" {
+                     assert!(rig.commit_probe.is_none());
+                     rig.commit_probe = Some(mc_store::commit_probe::Guard::install(rig.store.clone()));
+                     mc_store::commit_probe::take();
+                     json!({"probe":true})
+                 } else if op == "wal_prime_mode" {
+                     rig.store.prepare_provider_wal();
+                     rig.store.set_provider_wal_prime_for_test(cmd["enabled"] == true);
+                     json!({"enabled":cmd["enabled"]})
+                 } else if op == "wal_restart" {
+                     rig.store.prepare_provider_wal();
+                     rig.store.stall_provider_wal_for_test(true);
+                     for _ in 0..1100 { rig.store.prime_wal_for_serving().unwrap(); }
+                     rig.store.stall_provider_wal_for_test(false);
+                     rig.store.finish_provider_wal();
+                     rig.store.flush_provider_wal_for_test();
+                     json!({"checkpoint":rig.store.provider_wal_checkpoint_for_test()})
+                 } else if op == "wal_flush" {
+                     rig.store.flush_provider_wal_for_test();
+                     json!({"checkpoint":rig.store.provider_wal_checkpoint_for_test()})
+                 } else if op == "autocheckpoint" {
                     let frames = cmd["frames"].as_u64().unwrap();
                     let sql = format!("PRAGMA wal_autocheckpoint={frames}");
                     rig.store.execute_tag_sql_for_test(&sql).unwrap();
@@ -527,13 +548,13 @@ fn provider_pipeline_driver() {
                     // Commit probes below check direct-dispatch correctness only;
                     // end-to-end timings always use the shipping transport above.
                     let _commit_probe = (cmd["commit_probe"] == true).then(|| mc_store::commit_probe::Guard::install(rig.store.clone()));
-                    if _commit_probe.is_some() { mc_store::commit_probe::take(); }
+                    if _commit_probe.is_some() || rig.commit_probe.is_some() { mc_store::commit_probe::take(); }
                     let module_started = std::time::Instant::now();
                     let cpu_started = cpu_time::ProcessTime::now();
                     match rig.handler.dispatch_value(channel, request).await {
                         HandlerOutcome::Response(bytes) => {
                             if cmd["settle_tasks"] == true { tokio::task::yield_now().await; }
-                            if _commit_probe.is_some() {
+                            if _commit_probe.is_some() || rig.commit_probe.is_some() {
                                 let raw = String::from_utf8(bytes).unwrap();
                                 println!("PROVIDER_DRIVER={{\"ok\":{},\"raw\":{},\"correctness_probe\":true,\"commit_probe\":{}}}", raw, serde_json::to_string(&raw).unwrap(),serde_json::to_string(&mc_store::commit_probe::take()).unwrap());
                                 std::io::stdout().flush().unwrap();
@@ -591,11 +612,21 @@ export function buildDriver(directory: string): string {
         if (name !== "src") link(join(storeOriginal, name), join(storeGenerated, name));
     }
     for (const name of readdirSync(join(storeOriginal, "src"))) {
-        if (name !== "lib.rs") link(join(storeOriginal, "src", name), join(storeGenerated, "src", name));
+        if (name !== "lib.rs" && name !== "provider_wal.rs") link(join(storeOriginal, "src", name), join(storeGenerated, "src", name));
     }
     const storeLib = readFileSync(join(storeOriginal, "src/lib.rs"), "utf8");
     assert.equal(storeLib.split("#![forbid(unsafe_code)]").length, 2);
-    writeCurrent(join(storeGenerated, "src/lib.rs"), storeLib.replace("#![forbid(unsafe_code)]", "") +
+    const walGenerated = join(storeGenerated, "src/provider_wal.rs");
+    if (existsSync(walGenerated) && lstatSync(walGenerated).isSymbolicLink()) rmSync(walGenerated);
+    const walSource = readFileSync(join(storeOriginal, "src/provider_wal.rs"), "utf8");
+    assert.equal(walSource.split("use cortexkit_store::SqliteStore;").length, 2);
+    writeCurrent(walGenerated, walSource.replace("use cortexkit_store::SqliteStore;", "use crate::commit_probe::ObservedStore as SqliteStore;"));
+    assert.equal(storeLib.split("open_sqlite, Migration, SqliteStore, StoreError").length, 2);
+    assert.equal(storeLib.split("inner: Arc::new(inner)").length, 2);
+    writeCurrent(join(storeGenerated, "src/lib.rs"), storeLib.replace("#![forbid(unsafe_code)]", "")
+        .replace("open_sqlite, Migration, SqliteStore, StoreError", "open_sqlite, Migration, StoreError")
+        .replace("inner: Arc::new(inner)", "inner: Arc::new(commit_probe::ObservedStore::new(inner))") +
+        '\nuse commit_probe::ObservedStore as SqliteStore;\n' +
         `\n#[path = ${JSON.stringify(join(ROOT, "packages/e2e-tests/scripts/provider-commit-probe.rs"))}]\npub mod commit_probe;\n`);
     const original = join(ROOT, "crates/mc-module");
     const generated = join(overlay, "crates/mc-module");

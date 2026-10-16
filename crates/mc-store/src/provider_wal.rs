@@ -1,9 +1,9 @@
 //! Resident providers move routine WAL checkpoint I/O off the serving connection.
 //! The default store policy is unchanged until an authorized provider opts in.
 use crate::{single_store_domain, McStore, McStoreError};
+use cortexkit_store::SqliteStore;
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
-#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 use std::sync::{mpsc, Mutex};
 use std::thread::JoinHandle;
@@ -11,6 +11,11 @@ use std::thread::JoinHandle;
 const SOFT_BYTES: u64 = 4 * 1024 * 1024;
 const HARD_BYTES: u64 = 64 * 1024 * 1024;
 const WARNING_BYTES: u64 = 256 * 1024 * 1024;
+
+fn prime_tx(conn: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    conn.pragma_update(None, "user_version", version)
+}
 
 fn wal_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
@@ -52,6 +57,10 @@ pub(crate) struct ProviderWal {
     episodes: Mutex<Episodes>,
     #[cfg(any(test, feature = "test-support"))]
     stalled: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
+    checkpoint: Arc<Mutex<Option<(i64, i64, i64)>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    prime_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn passive(conn: &Connection) -> rusqlite::Result<(i64, i64, i64)> {
@@ -61,8 +70,9 @@ fn passive(conn: &Connection) -> rusqlite::Result<(i64, i64, i64)> {
 }
 
 impl ProviderWal {
-    fn start(path: &Path) -> Result<Self, McStoreError> {
-        // No schema creation, migrations or application writes occur here.
+    fn start(path: &Path, writer: Arc<SqliteStore>) -> Result<Self, McStoreError> {
+        // The worker owns the fenced writer, not McStore, so joining it during
+        // McStore teardown cannot create an ownership cycle.
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -80,6 +90,14 @@ impl ProviderWal {
         let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(any(test, feature = "test-support"))]
         let worker_stalled = stalled.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let checkpoint = Arc::new(Mutex::new(None));
+        #[cfg(any(test, feature = "test-support"))]
+        let worker_checkpoint = checkpoint.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let prime_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        #[cfg(any(test, feature = "test-support"))]
+        let worker_prime_enabled = prime_enabled.clone();
         let worker = std::thread::Builder::new()
             .name("mc-provider-wal".into())
             .spawn(move || {
@@ -94,6 +112,8 @@ impl ProviderWal {
                         }
                         match passive(&conn) {
                             Ok((busy, frames, copied)) => {
+                                #[cfg(any(test, feature = "test-support"))]
+                                { *worker_checkpoint.lock().unwrap() = Some((busy, frames, copied)); }
                                 tracing::debug!(
                                     busy,
                                     frames,
@@ -113,6 +133,19 @@ impl ProviderWal {
                                         [],
                                         |row| row.get::<_, i64>(0),
                                     );
+                                }
+                                #[cfg(any(test, feature = "test-support"))]
+                                if !worker_prime_enabled.load(std::sync::atomic::Ordering::Acquire) { return; }
+                                if busy == 0 && frames > 0 && frames == copied {
+                                    // Restart the drained log on this dedicated OS thread,
+                                    // never a Tokio serving worker. Acquiring the fenced
+                                    // writer can wait for an in-flight request; a request
+                                    // arriving during this prime can still wait for its
+                                    // header fsync. Attempt once, never retry on failure.
+                                    let result = writer.with_conn_fenced(prime_tx);
+                                    if let Err(error) = result {
+                                        tracing::debug!(%error, "provider WAL post-checkpoint prime skipped");
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -136,6 +169,10 @@ impl ProviderWal {
             episodes: Mutex::new(Episodes::default()),
             #[cfg(any(test, feature = "test-support"))]
             stalled,
+            #[cfg(any(test, feature = "test-support"))]
+            checkpoint,
+            #[cfg(any(test, feature = "test-support"))]
+            prime_enabled,
         })
     }
 
@@ -213,11 +250,7 @@ impl McStore {
             conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
         })?;
         if wal.eq_ignore_ascii_case("wal") {
-            self.inner.with_conn_fenced(|conn| {
-                let version: i64 =
-                    conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-                conn.pragma_update(None, "user_version", version)
-            })?;
+            self.inner.with_conn_fenced(prime_tx)?;
         }
         Ok(())
     }
@@ -231,7 +264,7 @@ impl McStore {
             let Some(path) = &self.move_path else {
                 return;
             };
-            let opened = ProviderWal::start(path).and_then(|worker| {
+            let opened = ProviderWal::start(path, Arc::clone(&self.inner)).and_then(|worker| {
                 self.inner.with_conn(configure_shared_writer)?;
                 Ok(worker)
             });
@@ -278,6 +311,22 @@ mod tests;
 
 #[cfg(any(test, feature = "test-support"))]
 impl McStore {
+    pub fn set_provider_wal_prime_for_test(&self, enabled: bool) {
+        self.provider_wal
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .prime_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn provider_wal_checkpoint_for_test(&self) -> Option<(i64, i64, i64)> {
+        let state = self.provider_wal.lock().unwrap();
+        let checkpoint = *state.as_ref().unwrap().checkpoint.lock().unwrap();
+        checkpoint
+    }
+
     pub fn flush_provider_wal_for_test(&self) {
         let state = self.provider_wal.lock().expect("provider WAL state");
         let state = state.as_ref().expect("provider WAL enabled");

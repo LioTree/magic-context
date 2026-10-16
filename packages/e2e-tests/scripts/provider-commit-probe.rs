@@ -8,6 +8,113 @@ use std::ffi::{c_int, c_void, CStr};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[derive(Default)]
+struct Ownership {
+    active: Option<Instant>,
+    completed: std::collections::VecDeque<(Instant, Instant)>,
+}
+
+/// Driver-only forwarding wrapper. It observes connection acquisition for both
+/// reads and writes; timing only the hook's final transaction misses read waits.
+pub struct ObservedStore {
+    inner: cortexkit_store::SqliteStore,
+    enabled: std::sync::atomic::AtomicBool,
+    ownership: std::sync::Mutex<Ownership>,
+}
+impl std::ops::Deref for ObservedStore {
+    type Target = cortexkit_store::SqliteStore;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl ObservedStore {
+    pub fn new(inner: cortexkit_store::SqliteStore) -> Self {
+        Self {
+            inner,
+            enabled: false.into(),
+            ownership: Default::default(),
+        }
+    }
+    fn acquired(&self, maintenance: bool) {
+        if maintenance {
+            self.ownership.lock().unwrap().active = Some(Instant::now());
+        }
+    }
+    fn release_marker(&self) {
+        let mut ownership = self.ownership.lock().unwrap();
+        if let Some(started) = ownership.active.take() {
+            if ownership.completed.len() == 32 {
+                ownership.completed.pop_front();
+            }
+            ownership.completed.push_back((started, Instant::now()));
+        }
+    }
+    fn finished(&self, maintenance: bool, before: Instant, acquired: Instant) {
+        let now = Instant::now();
+        let mut ownership = self.ownership.lock().unwrap();
+        if maintenance {
+            if let Some(started) = ownership.active.take() {
+                if ownership.completed.len() == 32 {
+                    ownership.completed.pop_front();
+                }
+                ownership.completed.push_back((started, now));
+            }
+        } else {
+            let overlap = |start: Instant, end: Instant| {
+                end.min(acquired)
+                    .saturating_duration_since(start.max(before))
+                    .as_secs_f64()
+                    * 1000.0
+            };
+            let wait = ownership
+                .completed
+                .iter()
+                .map(|&(start, end)| overlap(start, end))
+                .sum::<f64>()
+                + ownership.active.map_or(0.0, |start| overlap(start, now));
+            if wait > 0.0 {
+                record("maintenance_writer_wait".into(), wait);
+            }
+        }
+    }
+    pub fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, cortexkit_store::StoreError> {
+        if !self.enabled.load(std::sync::atomic::Ordering::Acquire) {
+            return self.inner.with_conn(f);
+        }
+        let before = Instant::now();
+        let mut acquired = before;
+        let maintenance = std::thread::current().name() == Some("mc-provider-wal");
+        let result = self.inner.with_conn(|conn| {
+            acquired = Instant::now();
+            self.acquired(maintenance);
+            f(conn)
+        });
+        self.finished(maintenance, before, acquired);
+        result
+    }
+    pub fn with_conn_fenced<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> Result<T, cortexkit_store::StoreError> {
+        if !self.enabled.load(std::sync::atomic::Ordering::Acquire) {
+            return self.inner.with_conn_fenced(f);
+        }
+        let before = Instant::now();
+        let mut acquired = before;
+        let maintenance = std::thread::current().name() == Some("mc-provider-wal");
+        let result = self.inner.with_conn_fenced(|conn| {
+            acquired = Instant::now();
+            self.acquired(maintenance);
+            f(conn)
+        });
+        self.finished(maintenance, before, acquired);
+        result
+    }
+}
+
 #[derive(Default, serde::Serialize)]
 pub struct Snapshot {
     pub milliseconds: BTreeMap<String, f64>,
@@ -39,7 +146,7 @@ fn record(name: String, elapsed: f64) {
 }
 unsafe extern "C" fn trace(
     event: u32,
-    _: *mut c_void,
+    observer: *mut c_void,
     statement: *mut c_void,
     _: *mut c_void,
 ) -> c_int {
@@ -59,6 +166,12 @@ unsafe extern "C" fn trace(
         let measured =
             STATE.with(|state| state.borrow_mut().statements.remove(&(statement as usize)));
         if let Some((started, sql)) = measured {
+            // PROFILE fires before SQLite returns and releases the connection
+            // mutex. Ending ownership here avoids charging a hook for the few
+            // microseconds between mutex release and the worker's return.
+            if sql == "COMMIT" && std::thread::current().name() == Some("mc-provider-wal") {
+                (&*observer.cast::<ObservedStore>()).release_marker();
+            }
             record(
                 format!("sql:{sql}"),
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -216,7 +329,7 @@ impl Guard {
                             conn.handle(),
                             (ffi::SQLITE_TRACE_STMT | ffi::SQLITE_TRACE_PROFILE) as u32,
                             Some(trace),
-                            std::ptr::null_mut()
+                            Arc::as_ptr(&guard.store.inner).cast_mut().cast()
                         ),
                         ffi::SQLITE_OK
                     );
@@ -225,10 +338,19 @@ impl Guard {
             })
             .unwrap();
         guard
+            .store
+            .inner
+            .enabled
+            .store(true, std::sync::atomic::Ordering::Release);
+        guard
     }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
+        self.store
+            .inner
+            .enabled
+            .store(false, std::sync::atomic::Ordering::Release);
         self.store
             .inner
             .with_conn(|conn| {

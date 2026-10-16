@@ -52,12 +52,13 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
     }
     const batches: unknown[] = [];
     if (process.env.MC_COLD_HOOK_STRACE_OUT) process.env.MC_COMMIT_STRACE_OUT = process.env.MC_COLD_HOOK_STRACE_OUT;
-    const paired = process.env.MC_COLD_HOOK_PAIR === "1";
+    const warmPair = process.env.MC_WARM_WAL_PAIR === "1";
+    const paired = process.env.MC_COLD_HOOK_PAIR === "1" || warmPair;
     for (const lane of paired
         ? ["before-held", "after-held", "before-budget2", "after-budget2", "before-budget1", "after-budget1"]
         : ["held", "budget2", "budget1"]) {
         const mode = lane.replace(/^(before|after)-/, "");
-        const skipPrime = lane.startsWith("before-");
+        const skipPrime = !warmPair && lane.startsWith("before-");
         // Each fresh driver starts cold. The second batch uses only the caches
         // populated by the first batch, never a rebuild or an eviction.
         if (mode === "held") process.env.MC_TEST_HISTORIAN_HOLD = "1";
@@ -105,6 +106,56 @@ export async function historianHookTiming(sessions = 75, samples = 600) {
                 }
             }
             const coldAfter = systemSample();
+            if (process.env.MC_WARM_WAL_PROBE === "1") {
+                for (let index = 0; index < sessions; index++) await driver.send({ op: "wal_prime_mode", rig: `fleet-${index}`, enabled: !lane.startsWith("before-") });
+                const foldApplied = new Map<string, typeof applied>();
+                for (let index = 1; samples > 0 && index <= 4; index++) {
+                    const rig = `fleet-${index}`;
+                    const first = await driver.send({ op: "call", rig, body: { method: "compaction.step", params: { ...base, messages: [],
+                        request_id: `wal-prime-fold-${index}`, step_id: `wal-prime-fold-${index}`, last_applied: applied } } });
+                    assert.ok(!first.error, JSON.stringify(first));
+                    foldApplied.set(rig, first.ok.answer === "compaction_message" ? { compaction_id: first.ok.compaction.compaction_id, version: first.ok.compaction.version } : applied);
+                }
+                // Install once before sampling, not per call: setup must not
+                // acquire the writer mutex and hide a hook's maintenance wait.
+                await driver.send({ op: "probe_on", rig: "fleet-0" });
+                const before = systemSample();
+                const checkpoint = await driver.send({ op: "wal_restart", rig: "fleet-0" });
+                assert.ok(checkpoint.checkpoint[1] > 0 && checkpoint.checkpoint[1] === checkpoint.checkpoint[2], "maintenance must fully drain WAL");
+                const drained = await driver.send({ op: "call", rig: "fleet-0", timing: true,
+                    body: { method: "transform.hook", params: { ...hook, request_id: "after-drain" } } });
+                assert.ok(!drained.error && drained.hook_stages.cold_rebuild < 1, "after-drain hook must be warm");
+                const warm: any[] = [], folds: any[] = [];
+                for (let index = 0; index < samples; index++) {
+                    if (mode !== "held" && index % 10 === 0) await driver.send({ op: "historian_requeue", rig: "fleet-1", prefix: "fleet-1" });
+                    if (index % 10 === 0) {
+                        const rig = `fleet-${index / 10 % 4 + 1}`;
+                        await driver.send({ op: "event", rig, event: "realistic_visible_delta", sample: index });
+                        const fold = await driver.send({ op: "call", rig, timing: true, commit_probe: true,
+                            body: { method: "compaction.step", params: { ...base, messages: [], request_id: `wal-fold-${index}`,
+                                step_id: `wal-fold-${index}`, last_applied: foldApplied.get(rig) } } });
+                        assert.ok(!fold.error, JSON.stringify(fold));
+                        if (fold.ok.answer === "compaction_message") foldApplied.set(rig, { compaction_id: fold.ok.compaction.compaction_id, version: fold.ok.compaction.version });
+                        folds.push(fold);
+                    }
+                    await driver.send({ op: "settle", rig: "fleet-0" });
+                    const row = await driver.send({ op: "call", rig: "fleet-0", timing: true,
+                        body: { method: "transform.hook", params: { ...hook, request_id: `wal-warm-${index}` } } });
+                    assert.ok(!row.error && row.hook_stages.cold_rebuild < 1, "recurrence samples must remain warm");
+                    warm.push(row);
+                }
+                const maintenance = await driver.send({ op: "wal_flush", rig: "fleet-0" });
+                const waits = warm.map(row => row.commit_probe.milliseconds.maintenance_writer_wait ?? 0).filter(ms => ms > 0);
+                const batch = { lane, mode, samples, checkpoint, drained: { ...drained, ok: undefined, raw: undefined },
+                    warm: quantiles(warm.map(row => row.module_ms)), fold: quantiles(folds.map(row => row.module_ms)),
+                    maintenance_wait: quantiles(waits), maintenance_wait_total_ms: waits.reduce((a, b) => a + b, 0), maintenance_wait_max_ms: Math.max(0, ...waits),
+                    header_syncs: warm.filter(row => row.commit_probe.calls.wal_sync_flags_2 > 0).map(({ ok, raw, ...row }) => row),
+                    active: warm.filter(row => row.historian_before.active > 0 || row.historian_after.active > 0).length,
+                    maintenance, before, after: systemSample() };
+                batches.push(batch);
+                console.log(`WARM_WAL_BATCH=${JSON.stringify(batch)}`);
+                continue;
+            }
             if (process.env.MC_COLD_HOOK_ONLY === "1") {
                 const active = cold.filter(row => row.historian_before?.active > 0 || row.historian_after?.active > 0);
                 if (paired && mode !== "held") assert.ok(active.length > 0, "cold batch must overlap admitted historians");

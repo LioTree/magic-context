@@ -7638,7 +7638,7 @@ impl<'a> FacadeMutationTxn<'a> {
 /// The Magic Context cache-state store: one single-writer SQLite handle on `store.db` for
 /// the module's lifetime, plus the installed [`ContextDomain`] for the rows in `context.db`.
 pub struct McStore {
-    inner: SqliteStore,
+    inner: Arc<SqliteStore>,
     move_path: Option<std::path::PathBuf>,
     provider_wal: Mutex<Option<provider_wal::ProviderWal>>,
     // Distinguishes independent stores in the process-local tag baseline cache. Production
@@ -8297,7 +8297,7 @@ impl McStore {
             })?;
         }
         let store = McStore {
-            inner,
+            inner: Arc::new(inner),
             move_path: match &descriptor.backend {
                 cortexkit_store_types::StorageBackend::Sqlite { path } => {
                     Some(std::path::PathBuf::from(path))
