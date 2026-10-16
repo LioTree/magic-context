@@ -758,6 +758,61 @@ fn answer_receipt(answer: &Value) -> String {
     receipt.to_string()
 }
 
+fn step_lane_pending_tag_ids(
+    store: &McStore,
+    key: &Key,
+    engine_namespace: &str,
+) -> Result<Vec<i64>, HandlerOutcome> {
+    let mut numbers = store
+        .load_provider_pending_drops(&key.store_key())
+        .map_err(transient)?;
+    let pending_blocks = store
+        .load_pending_agent_drops(engine_namespace)
+        .map_err(transient)?
+        .into_iter()
+        .map(|drop| drop.target_id)
+        .collect::<BTreeSet<_>>();
+    if !pending_blocks.is_empty() {
+        numbers.extend(
+            store
+                .load_tag_numbers_for_session(engine_namespace)
+                .map_err(transient)?
+                .into_iter()
+                .filter(|tag| pending_blocks.contains(&tag.block_id))
+                .map(|tag| tag.tag_number),
+        );
+    }
+    numbers.sort_unstable();
+    numbers.dedup();
+    Ok(numbers)
+}
+
+fn replacement_applied_drop_count(
+    view: &transform::compaction::View,
+    queued_tag_ids: &[i64],
+) -> usize {
+    queued_tag_ids
+        .iter()
+        .filter(|number| view_contains_drop_tag(view, **number))
+        .count()
+}
+
+fn view_contains_drop_tag(view: &transform::compaction::View, number: i64) -> bool {
+    let placeholder = format!("[dropped §{number}§]");
+    view.replacement.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(
+                &block.kind,
+                ck_wire::CkKind::ToolResult { output, .. }
+                    if matches!(
+                        &output.kind,
+                        ck_wire::CkOutputKind::Text { text } if text == &placeholder
+                    )
+            )
+        })
+    })
+}
+
 fn save_host_setup(
     store: &McStore,
     key: &Key,
@@ -2176,7 +2231,25 @@ impl McHandler {
             stability: setup.setup.stability.clone(),
             call_when: Some(setup.setup.call_when.clone()),
         };
-        conversation.last_answer_json = Some(serde_json::to_string(&answer).map_err(transient)?);
+        if codec == Codec::ClaudeCodeAnthropic {
+            let mut receipt: Value = serde_json::to_value(&answer).map_err(transient)?;
+            if let Some(step_lane) = conversation
+                .last_answer_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|previous| previous.get("step_lane").cloned())
+                .filter(|step_lane| {
+                    step_lane.get("lineage_id").and_then(Value::as_str)
+                        == Some(conversation.lineage_id.as_str())
+                })
+            {
+                receipt["step_lane"] = step_lane;
+            }
+            conversation.last_answer_json = Some(receipt.to_string());
+        } else {
+            conversation.last_answer_json =
+                Some(serde_json::to_string(&answer).map_err(transient)?);
+        }
         save_host_setup(store, key, &mut conversation, &setup)?;
         fault("AnswerRecorded");
         match raw_replacement {
@@ -2514,6 +2587,18 @@ impl McHandler {
             }
         }
         let mut raw_replacement = None;
+        let queued_tag_ids = if codec == Codec::ClaudeCodeAnthropic {
+            step_lane_pending_tag_ids(store, &work.key, &conversation.engine_namespace)?
+        } else {
+            Vec::new()
+        };
+        let mut applied_drops_last_step = 0;
+        let mut step_reason = if incomplete {
+            "awaiting_messages"
+        } else {
+            "no_change"
+        };
+        let mut replacement_range = Value::Null;
         let answer = if incomplete {
             // Host paging never owns asynchronous wait work or a ready callback.
             // The lock's guard belongs to the request and drops at this return.
@@ -2585,6 +2670,11 @@ impl McHandler {
                 counters["channel1_hook_append_pending"] = json!(false);
                 conversation.hook_counters_json = counters.to_string();
                 if let Some((view, healing)) = view {
+                    step_reason = "replacement";
+                    replacement_range =
+                        serde_json::to_value(&view.engine.range).map_err(transient)?;
+                    applied_drops_last_step =
+                        replacement_applied_drop_count(&view.engine, &queued_tag_ids);
                     raw_replacement = view.raw_replacement.clone();
                     save_host_view(
                         store,
@@ -2613,6 +2703,7 @@ impl McHandler {
                     }
                     answer
                 } else {
+                    step_reason = "no_replacement";
                     json!({"answer":"noop","request_id":request.request_id})
                 }
             }
@@ -2626,7 +2717,32 @@ impl McHandler {
         }
         conversation.cursor_frontier = frontier;
         conversation.wait_request = None;
-        conversation.last_answer_json = Some(answer_receipt(&answer));
+        let mut receipt: Value =
+            serde_json::from_str(&answer_receipt(&answer)).map_err(transient)?;
+        if codec == Codec::ClaudeCodeAnthropic {
+            let protected = work
+                .binding
+                .config
+                .resolve_protected_tokens(normalized.context_window);
+            receipt["step_lane"] = json!({
+                "lineage_id": lineage.lineage_id,
+                "last_step": {
+                    "outcome": answer.get("answer").and_then(Value::as_str),
+                    "reason": step_reason,
+                    "prefix_rebuilding_reason": params
+                        .pointer("/prefix_rebuilding/reason")
+                        .and_then(Value::as_str),
+                    "replacement_range": replacement_range,
+                    "at_ms": now_ms(),
+                },
+                "protected_tokens": {
+                    "floor": protected.floor,
+                    "provenance": protected.provenance,
+                },
+                "applied_drops_last_step": applied_drops_last_step,
+            });
+        }
+        conversation.last_answer_json = Some(receipt.to_string());
         save_host_setup(store, &work.key, &mut conversation, &setup)?;
         fault("AnswerRecorded");
         match raw_replacement {
@@ -2982,6 +3098,92 @@ impl McHandler {
         self.provider_store.save(&key, &record)?;
         fault("AnswerRecorded");
         bytes(&answer)
+    }
+
+    pub(crate) fn claude_code_step_lane_status(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<Value, HandlerOutcome> {
+        if !attested_claude_code(binding) {
+            return Ok(Value::Null);
+        }
+        let mut scoped = binding.clone();
+        if scoped.native_generation.is_none() {
+            let pins = self.native_pins();
+            scoped.native_generation = Some(mc_store::provider_records::ProviderGeneration {
+                profile: pins.profile_generation,
+                provider: pins.provider_generation,
+            });
+        }
+        let key = Key::new(&scoped, &scoped.session, &scoped.harness)?;
+        let store = self.store.get().ok_or_else(|| self.store_refusal())?;
+        let conversation = store
+            .load_provider_conversation(&key.store_key())
+            .map_err(transient)?;
+        let engine_namespace = conversation
+            .as_ref()
+            .map(|conversation| conversation.engine_namespace.as_str())
+            .filter(|namespace| !namespace.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| key.engine_key());
+        let mut queued_tag_ids = step_lane_pending_tag_ids(store, &key, &engine_namespace)?;
+        if let Some(conversation) = &conversation {
+            if let Some(raw_setup) = &conversation.setup_json {
+                let setup: HostSetup = serde_json::from_str(raw_setup).map_err(transient)?;
+                for summary in [setup.produced.as_ref(), setup.applied.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let view = load_host_view(store, &key, summary)?;
+                    if view.engine.range.lineage_id == conversation.lineage_id {
+                        queued_tag_ids
+                            .retain(|number| !view_contains_drop_tag(&view.engine, *number));
+                    }
+                }
+            }
+        }
+        let step_record = conversation
+            .as_ref()
+            .filter(|conversation| !conversation.lineage_id.is_empty())
+            .and_then(|conversation| {
+                conversation
+                    .last_answer_json
+                    .as_deref()
+                    .map(|answer| (conversation, answer))
+            })
+            .map(|(conversation, answer)| {
+                let answer: Value = serde_json::from_str(answer).map_err(transient)?;
+                Ok::<_, HandlerOutcome>(
+                    answer
+                        .get("step_lane")
+                        .filter(|record| {
+                            record.get("lineage_id").and_then(Value::as_str)
+                                == Some(conversation.lineage_id.as_str())
+                        })
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+            })
+            .transpose()?
+            .unwrap_or(Value::Null);
+        let last_step = step_record.get("last_step").cloned().unwrap_or(Value::Null);
+        let protected_tokens = step_record
+            .get("protected_tokens")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let applied_drops_last_step = step_record
+            .get("applied_drops_last_step")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        Ok(json!({
+            "last_step": last_step,
+            "protected_tokens": protected_tokens,
+            "queued_drops": {
+                "tag_ids": queued_tag_ids.iter().take(64).copied().collect::<Vec<_>>(),
+                "total_count": queued_tag_ids.len(),
+            },
+            "applied_drops_last_step": applied_drops_last_step,
+        }))
     }
 }
 
