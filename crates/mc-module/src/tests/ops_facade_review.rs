@@ -5,7 +5,7 @@ fn attested_fixture() -> (McHandler, Arc<McStore>, tempfile::TempDir) {
     let mut binding = handler.bindings.lock().unwrap().get(&7).unwrap().clone();
     binding.harness = "opencode".into();
     binding.principal = Some(subc_protocol::Principal::Reserved {
-        module_id: "thalamus".into(),
+        module_id: "thalamus-harness".into(),
     });
     handler.bind_route(7, binding);
     (handler, store, dir)
@@ -28,7 +28,7 @@ async fn review_ops_requires_attested_caller_before_any_ui_arm() {
         req["event_id"] = page["events"][0]["event_id"].clone();
         req["acked_position"] = json!(0);
         // A request-supplied identity cannot replace daemon attestation.
-        req["principal"] = json!({"type":"reserved","module_id":"thalamus"});
+        req["principal"] = json!({"type":"reserved","module_id":"thalamus-harness"});
         match handler.dispatch_value(7, req).await {
             HandlerOutcome::Error { code, .. }
                 if !matches!(

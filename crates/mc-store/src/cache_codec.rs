@@ -374,6 +374,37 @@ pub(crate) struct StoredRow {
     pub section_index: String,
 }
 
+pub(crate) enum BoundedSmallRow {
+    Missing,
+    Oversized,
+    Present(StoredRow),
+}
+
+/// Check byte lengths and fetch in one read snapshot, before allocating strings
+/// in the caller. An oversized row is distinct from an absent row; no substring
+/// or partially decoded metadata is returned.
+pub(crate) fn read_small_row_bounded(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    byte_limit: usize,
+) -> rusqlite::Result<BoundedSmallRow> {
+    let tx = conn.unchecked_transaction()?;
+    let oversized = tx.query_row(
+        "SELECT length(CAST(meta AS BLOB)) > ?2 OR length(CAST(core_state AS BLOB)) > ?2 FROM mc_cache_state WHERE session_id=?1",
+        params![session_id,byte_limit as i64], |row| row.get::<_,bool>(0),
+    ).optional()?;
+    let result = match oversized {
+        None => BoundedSmallRow::Missing,
+        Some(true) => BoundedSmallRow::Oversized,
+        Some(false) => match read_small_row(&tx, session_id)? {
+            Some(row) => BoundedSmallRow::Present(row),
+            None => BoundedSmallRow::Missing,
+        },
+    };
+    tx.commit()?;
+    Ok(result)
+}
+
 /// The split rows of one session as stored.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StoredSections {

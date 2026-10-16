@@ -131,6 +131,10 @@ fn admit_host_lane(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
     if !matches!(binding.harness.as_str(), "opencode" | "opencode2") {
         return Ok(());
     }
+    admit_harness_module(binding)
+}
+
+pub(super) fn admit_harness_module(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
     if !matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "thalamus-harness")
     {
         return Err(error(

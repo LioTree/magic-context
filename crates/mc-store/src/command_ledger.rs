@@ -6,6 +6,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+// Leave half of the 1 MiB UI reply budget for envelopes and derived fields,
+// and reject larger raw cache blobs before allocating or decoding their JSON.
+const OPS_SNAPSHOT_BLOB_MAX_BYTES: usize = 512 * 1024;
+
 pub const EVENT_RETENTION: i64 = 256;
 pub const EVENT_PAGE_LIMIT: usize = 64;
 
@@ -14,12 +18,14 @@ fn initialize(tx: &Connection) -> rusqlite::Result<()> {
         "CREATE TABLE IF NOT EXISTS mc_ops_commands (
           session_id TEXT NOT NULL, command_id TEXT NOT NULL, job_id TEXT NOT NULL,
           parameters TEXT NOT NULL, job TEXT NOT NULL,
-          PRIMARY KEY(session_id, command_id), UNIQUE(session_id, job_id));
+          project_identity TEXT NOT NULL,
+          PRIMARY KEY(project_identity, session_id, command_id), UNIQUE(project_identity, session_id, job_id));
          CREATE TABLE IF NOT EXISTS mc_ops_stream (
-          session_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, acked INTEGER NOT NULL, active_command TEXT);
+          session_id TEXT NOT NULL UNIQUE, sequence INTEGER NOT NULL, acked INTEGER NOT NULL, active_command TEXT,
+          project_identity TEXT NOT NULL, PRIMARY KEY(project_identity,session_id));
          CREATE TABLE IF NOT EXISTS mc_ops_events (
           session_id TEXT NOT NULL, sequence INTEGER NOT NULL, event TEXT NOT NULL,
-          PRIMARY KEY(session_id, sequence));
+          project_identity TEXT NOT NULL, PRIMARY KEY(project_identity, session_id, sequence));
          CREATE TRIGGER IF NOT EXISTS mc_ops_retire AFTER DELETE ON mc_cache_state BEGIN
           DELETE FROM mc_ops_commands WHERE session_id=OLD.session_id;
           DELETE FROM mc_ops_events WHERE session_id=OLD.session_id;
@@ -40,18 +46,79 @@ fn decode(text: String) -> rusqlite::Result<Value> {
     serde_json::from_str(&text).map_err(crate::serde_to_sql_error)
 }
 
-fn job_id(session: &str, command: &str) -> String {
+fn job_id(project: &str, session: &str, command: &str) -> String {
     let mut hash = Sha256::new();
+    hash.update((project.len() as u64).to_be_bytes());
+    hash.update(project.as_bytes());
     hash.update((session.len() as u64).to_be_bytes());
     hash.update(session.as_bytes());
     hash.update(command.as_bytes());
     format!("ops-{:x}", hash.finalize())
 }
 
+fn scope_matches(conn: &Connection, project: &str, session: &str) -> rusqlite::Result<bool> {
+    if !exists(conn)? {
+        return Ok(true);
+    }
+    // Older ledgers identify sessions but not their projects. Refuse them rather
+    // than expose retained jobs to a project that may not own them.
+    let scoped: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('mc_ops_stream') WHERE name='project_identity')",[],|r| r.get(0))?;
+    if !scoped {
+        return Ok(false);
+    }
+    let owner = conn
+        .query_row(
+            "SELECT project_identity FROM mc_ops_stream WHERE session_id=?1",
+            [session],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(owner.is_none_or(|owner| owner == project))
+}
+
+fn require_scope(conn: &Connection, project: &str, session: &str) -> rusqlite::Result<()> {
+    if scope_matches(conn, project, session)? {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::InvalidQuery)
+    }
+}
+
 impl McStore {
+    fn ops_project(&self, session: &str) -> Result<String, McStoreError> {
+        self.session_project_identity(session)?
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| McStoreError::Serde("ops_project_unbound".into()))
+    }
+
+    pub fn ops_check_project(&self, project: &str, session: &str) -> Result<bool, McStoreError> {
+        if self.ops_project(session)? != project {
+            return Ok(false);
+        }
+        Ok(self
+            .inner
+            .with_conn(|conn| scope_matches(conn, project, session))?)
+    }
+
+    fn require_ops_project(&self, project: &str, session: &str) -> Result<(), McStoreError> {
+        if self.ops_check_project(project, session)? {
+            Ok(())
+        } else {
+            Err(McStoreError::Serde("ops_project_mismatch".into()))
+        }
+    }
     /// Read only small cache fields and a capped compartment-count projection.
     /// Counts over the scan bound are unknown rather than truncated truth.
     pub fn ops_snapshot(&self, session: &str) -> Result<Value, McStoreError> {
+        self.ops_snapshot_in_project(&self.ops_project(session)?, session)
+    }
+
+    pub fn ops_snapshot_in_project(
+        &self,
+        project: &str,
+        session: &str,
+    ) -> Result<Value, McStoreError> {
+        self.require_ops_project(project, session)?;
         let count = self.context_read(|conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM (SELECT 1 FROM compartments WHERE session_id=?1 LIMIT 4097)",
@@ -59,20 +126,34 @@ impl McStore {
                 |r| r.get::<_, i64>(0),
             )
         })?;
-        let (version, meta, boundary) =
-            self.inner
-                .with_conn(|conn| match cache_codec::read_small_row(conn, session)? {
-                    Some(row) => {
-                        let meta = cache_codec::decode_small_meta(&row.meta)
-                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                        let core = cache_codec::decode_small_core(&row.core_state)
-                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                        Ok((Some(row.row_version), meta, !core.boundary_id.is_empty()))
-                    }
-                    None => Ok((None, crate::ModuleMeta::default(), false)),
-                })?;
+        let row = self.inner.with_conn(|conn| {
+            require_scope(conn, project, session)?;
+            cache_codec::read_small_row_bounded(conn, session, OPS_SNAPSHOT_BLOB_MAX_BYTES)
+        })?;
+        let (version, meta, boundary) = match row {
+            cache_codec::BoundedSmallRow::Oversized => {
+                return Ok(json!({"error":"ui_snapshot_too_large"}))
+            }
+            cache_codec::BoundedSmallRow::Missing => (None, crate::ModuleMeta::default(), false),
+            cache_codec::BoundedSmallRow::Present(row) => {
+                let meta = cache_codec::decode_small_meta(&row.meta)
+                    .map_err(|e| McStoreError::Serde(e.to_string()))?;
+                let core = cache_codec::decode_small_core(&row.core_state)
+                    .map_err(|e| McStoreError::Serde(e.to_string()))?;
+                (Some(row.row_version), meta, !core.boundary_id.is_empty())
+            }
+        };
+        // Only these diagnostic fields belong in UI replies. The durable
+        // historian record also contains a secret claim token and producer
+        // inputs that the UI must never receive.
+        let public_meta = json!({
+            "coverage_ordinal":meta.coverage_ordinal,"last_usage":meta.last_usage,
+            "last_todo_state":meta.last_todo_state,"cache_ttl_policy":meta.cache_ttl_policy,
+            "protected_tokens_effective":meta.protected_tokens_effective,
+            "historian":{"phase":meta.historian.state,"consecutive_publish_failures":meta.historian.consecutive_publish_failures}
+        });
         Ok(
-            json!({"row_version":version,"meta":meta,"boundary_present":boundary,"compartment_count":if count <= 4096 { Some(count) } else { None }}),
+            json!({"row_version":version,"meta":public_meta,"boundary_present":boundary,"compartment_count":if count <= 4096 { Some(count) } else { None }}),
         )
     }
 
@@ -83,7 +164,25 @@ impl McStore {
         compaction: bool,
         now: i64,
     ) -> Result<Value, McStoreError> {
-        self.ops_flush_parameters(
+        self.ops_flush_in_project(
+            &self.ops_project(session)?,
+            session,
+            command,
+            compaction,
+            now,
+        )
+    }
+
+    pub fn ops_flush_in_project(
+        &self,
+        project: &str,
+        session: &str,
+        command: &str,
+        compaction: bool,
+        now: i64,
+    ) -> Result<Value, McStoreError> {
+        self.ops_flush_parameters_in_project(
+            project,
             session,
             command,
             compaction,
@@ -92,6 +191,7 @@ impl McStore {
         )
     }
 
+    #[cfg(test)]
     fn ops_flush_parameters(
         &self,
         session: &str,
@@ -100,8 +200,29 @@ impl McStore {
         now: i64,
         parameters: &str,
     ) -> Result<Value, McStoreError> {
+        self.ops_flush_parameters_in_project(
+            &self.ops_project(session)?,
+            session,
+            command,
+            compaction,
+            now,
+            parameters,
+        )
+    }
+
+    fn ops_flush_parameters_in_project(
+        &self,
+        project: &str,
+        session: &str,
+        command: &str,
+        compaction: bool,
+        now: i64,
+        parameters: &str,
+    ) -> Result<Value, McStoreError> {
+        self.require_ops_project(project, session)?;
         Ok(self.inner.with_conn_fenced(|tx| {
             crate::move_store::check_writer(tx,session)?;
+            require_scope(tx,project,session)?;
             let has_ledger = exists(tx)?;
             let existing = if has_ledger { tx.query_row("SELECT parameters,job FROM mc_ops_commands WHERE session_id=?1 AND command_id=?2", params![session,command], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? } else { None };
             if let Some((prior,job)) = existing {
@@ -137,20 +258,30 @@ impl McStore {
             }
             let mut result = json!({"queued_drops":{"state":"pending","count":targets.len(),"target_tag_ids":targets},"soft_refresh_pending":meta.soft_refresh_pending,"bridge_refresh_obligations":if compaction { vec!["materialization","history","system"] } else {vec![]},"history_rebuilt":false});
             if !compaction { result["reason"] = json!("compaction_off"); }
-            let id = job_id(session,command);
-            let job = json!({"v":1,"command_id":command,"job_id":id,"state":if compaction {"armed"} else {"no_op"},"result":result,"created_at_ms":now});
-            let inserted = tx.execute("INSERT OR IGNORE INTO mc_ops_commands(session_id,command_id,job_id,parameters,job) VALUES(?1,?2,?3,?4,?5)",params![session,command,id,parameters,job.to_string()])?;
+            let id = job_id(project,session,command);
+            let job = json!({"v":1,"project_identity":project,"session_id":session,"command_id":command,"job_id":id,"state":if compaction {"armed"} else {"no_op"},"result":result,"created_at_ms":now});
+            let inserted = tx.execute("INSERT OR IGNORE INTO mc_ops_commands(session_id,command_id,job_id,parameters,job,project_identity) VALUES(?1,?2,?3,?4,?5,?6)",params![session,command,id,parameters,job.to_string(),project])?;
             if inserted != 1 { return Err(rusqlite::Error::InvalidQuery); }
-            let event = json!({"v":1,"event_id":format!("{id}:{}",sequence+1),"sequence":sequence+1,"session_id":session,"command_id":command,"job_id":id,"kind":if compaction {"job.armed"} else {"job.terminal"},"invalidates":["mc.read_sidebar","mc.read_status"],"currentness":{"policy":"current_until_withdrawn","current":true},"job":job});
+            let event = json!({"v":1,"event_id":format!("{id}:{}",sequence+1),"sequence":sequence+1,"project_identity":project,"session_id":session,"command_id":command,"job_id":id,"kind":if compaction {"job.armed"} else {"job.terminal"},"invalidates":["mc.read_sidebar","mc.read_status"],"currentness":{"policy":"current_until_withdrawn","current":true},"job":job});
             if event.to_string().len() > 512 * 1024 { return Err(rusqlite::Error::InvalidQuery); }
-            tx.execute("INSERT INTO mc_ops_events(session_id,sequence,event) VALUES(?1,?2,?3)",params![session,sequence+1,event.to_string()])?;
-            tx.execute("INSERT INTO mc_ops_stream(session_id,sequence,acked,active_command) VALUES(?1,?2,0,?3) ON CONFLICT(session_id) DO UPDATE SET sequence=excluded.sequence,active_command=COALESCE(excluded.active_command,active_command)",params![session,sequence+1,if compaction {Some(command)} else {None}])?;
+            tx.execute("INSERT INTO mc_ops_events(session_id,sequence,event,project_identity) VALUES(?1,?2,?3,?4)",params![session,sequence+1,event.to_string(),project])?;
+            tx.execute("INSERT INTO mc_ops_stream(session_id,sequence,acked,active_command,project_identity) VALUES(?1,?2,0,?3,?4) ON CONFLICT(session_id) DO UPDATE SET sequence=excluded.sequence,active_command=COALESCE(excluded.active_command,active_command)",params![session,sequence+1,if compaction {Some(command)} else {None},project])?;
             Ok(job)
         })?)
     }
 
     pub fn ops_jobs(&self, session: &str) -> Result<Vec<Value>, McStoreError> {
+        self.ops_jobs_in_project(&self.ops_project(session)?, session)
+    }
+
+    pub fn ops_jobs_in_project(
+        &self,
+        project: &str,
+        session: &str,
+    ) -> Result<Vec<Value>, McStoreError> {
+        self.require_ops_project(project, session)?;
         Ok(self.inner.with_conn(|conn| {
+            require_scope(conn,project,session)?;
             if !exists(conn)? { return Ok(Vec::new()); }
             let text = conn.query_row("SELECT c.job FROM mc_ops_stream s JOIN mc_ops_commands c ON c.session_id=s.session_id AND c.command_id=s.active_command WHERE s.session_id=?1",[session],|r| r.get::<_,String>(0)).optional()?;
             text.map(decode).transpose().map(|v| v.into_iter().collect())
@@ -163,7 +294,19 @@ impl McStore {
         command: Option<&str>,
         job: Option<&str>,
     ) -> Result<Option<Value>, McStoreError> {
+        self.ops_job_in_project(&self.ops_project(session)?, session, command, job)
+    }
+
+    pub fn ops_job_in_project(
+        &self,
+        project: &str,
+        session: &str,
+        command: Option<&str>,
+        job: Option<&str>,
+    ) -> Result<Option<Value>, McStoreError> {
+        self.require_ops_project(project, session)?;
         Ok(self.inner.with_conn(|conn| {
+            require_scope(conn,project,session)?;
             if !exists(conn)? { return Ok(None); }
             let text = match (command,job) {
                 (Some(command),job) => conn.query_row("SELECT job FROM mc_ops_commands WHERE session_id=?1 AND command_id=?2 AND (?3 IS NULL OR job_id=?3)", params![session,command,job], |r| r.get::<_,String>(0)).optional()?,
@@ -177,7 +320,19 @@ impl McStore {
     /// Acknowledgement means the module durably spooled the events, not that a
     /// host displayed them. Unacknowledged terminal notices are never evicted.
     pub fn ops_events(&self, session: &str, ack: i64, limit: usize) -> Result<Value, McStoreError> {
+        self.ops_events_in_project(&self.ops_project(session)?, session, ack, limit)
+    }
+
+    pub fn ops_events_in_project(
+        &self,
+        project: &str,
+        session: &str,
+        ack: i64,
+        limit: usize,
+    ) -> Result<Value, McStoreError> {
+        self.require_ops_project(project, session)?;
         Ok(self.inner.with_conn_fenced(|tx| {
+            require_scope(tx,project,session)?;
             if !exists(tx)? {
                 return Ok(if ack == 0 { event_page(0,0,Vec::new(),false) } else { json!({"error":"invalid_ack"}) });
             }
@@ -203,7 +358,18 @@ impl McStore {
     }
 
     pub fn ops_currentness(&self, session: &str, id: &str) -> Result<bool, McStoreError> {
+        self.ops_currentness_in_project(&self.ops_project(session)?, session, id)
+    }
+
+    pub fn ops_currentness_in_project(
+        &self,
+        project: &str,
+        session: &str,
+        id: &str,
+    ) -> Result<bool, McStoreError> {
+        self.require_ops_project(project, session)?;
         Ok(self.inner.with_conn(|conn| {
+            require_scope(conn,project,session)?;
             if !exists(conn)? { return Ok(false); }
             conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_ops_events WHERE session_id=?1 AND json_extract(event,'$.currentness.current')=1 AND json_extract(event,'$.event_id')=?2)", params![session,id], |r| r.get(0))
         })?)
@@ -219,7 +385,7 @@ mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
-    fn fixture() -> (McStore, tempfile::TempDir) {
+    pub(super) fn fixture() -> (McStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context".into(),
@@ -230,6 +396,12 @@ mod tests {
             },
         })
         .unwrap();
+        store.with_context_conn_for_test(|conn| {
+            for session in ["a","b","other-session"] {
+                conn.execute("INSERT INTO session_projects(session_id,harness,project_path,updated_at) VALUES(?1,'opencode','project-a',1)",[session])?;
+            }
+            Ok(())
+        }).unwrap();
         (store, dir)
     }
 
@@ -350,5 +522,176 @@ mod tests {
     mod review {
         use super::*;
         include!("command_ledger_review_tests.rs");
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    #[test]
+    fn convenience_apis_require_canonical_project_without_creating_state() {
+        let (store, _dir) = super::tests::fixture();
+        assert!(store.ops_flush("unbound", "one", true, 1).is_err());
+        assert!(store.ops_job("unbound", Some("one"), None).is_err());
+        assert!(store.ops_events("unbound", 0, 64).is_err());
+        assert!(store.ops_currentness("unbound", "unknown").is_err());
+        assert!(!store.inner.with_conn(exists).unwrap());
+        assert!(store.load_meta("unbound").unwrap().row_version.is_none());
+    }
+
+    #[test]
+    fn project_scope_is_checked_inside_each_ledger_api() {
+        let (store, _dir) = super::tests::fixture();
+        let original = store.ops_flush("a", "one", true, 1).unwrap();
+        store
+            .with_context_conn_for_test(|conn| {
+                conn.execute(
+                    "UPDATE session_projects SET project_path='project-b' WHERE session_id='a'",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        assert!(store
+            .ops_flush_in_project("project-b", "a", "one", true, 2)
+            .is_err());
+        assert!(store
+            .ops_job_in_project("project-b", "a", Some("one"), None)
+            .is_err());
+        assert!(store.ops_jobs_in_project("project-b", "a").is_err());
+        assert!(store
+            .ops_events_in_project("project-b", "a", 0, 64)
+            .is_err());
+        assert!(store
+            .ops_currentness_in_project("project-b", "a", "unknown")
+            .is_err());
+        store
+            .with_context_conn_for_test(|conn| {
+                conn.execute(
+                    "UPDATE session_projects SET project_path='project-a' WHERE session_id='a'",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        assert_eq!(
+            store.ops_job("a", Some("one"), None).unwrap(),
+            Some(original)
+        );
+        assert_eq!(
+            store.ops_events("a", 0, 64).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn old_session_only_ledger_is_not_adopted_by_a_project() {
+        let (store, _dir) = super::tests::fixture();
+        store.inner.with_conn(|conn| conn.execute_batch("CREATE TABLE mc_ops_commands(session_id TEXT,command_id TEXT,job TEXT); CREATE TABLE mc_ops_stream(session_id TEXT,sequence INTEGER,acked INTEGER); INSERT INTO mc_ops_commands VALUES('a','old','{\"private\":true}');")).unwrap();
+        assert!(!store.ops_check_project("project-a", "a").unwrap());
+        assert!(store.ops_job("a", Some("old"), None).is_err());
+        assert!(store.ops_flush("a", "old", true, 1).is_err());
+        assert_eq!(
+            store
+                .inner
+                .with_conn(
+                    |conn| conn.query_row("SELECT count(*) FROM mc_ops_commands", [], |r| r
+                        .get::<_, i64>(0))
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn lazy_inventory_validates_present_tables_and_rejects_unknown_names() {
+        use crate::move_inventory::{self, Class, RowSelector, Store};
+        let (store, _dir) = super::tests::fixture();
+        store
+            .inner
+            .with_conn(|conn| {
+                move_inventory::validate_schema(conn, Store::Module).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        store.ops_flush("a", "one", true, 1).unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                move_inventory::validate_schema(conn, Store::Module).unwrap();
+                for name in ["mc_ops_commands", "mc_ops_events", "mc_ops_stream"] {
+                    let entry = move_inventory::entry(Store::Module, name).unwrap();
+                    assert_eq!(entry.class, Class::LocalReset);
+                    assert_eq!(entry.rows, RowSelector::None);
+                    let schema = conn
+                        .prepare(&format!("PRAGMA table_info({name})"))?
+                        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    assert_eq!(
+                        schema
+                            .iter()
+                            .map(|(name, _)| name.as_str())
+                            .collect::<Vec<_>>(),
+                        entry.columns
+                    );
+                    let mut keys = schema
+                        .iter()
+                        .filter(|(_, order)| *order > 0)
+                        .map(|(name, order)| (*order, name.as_str()))
+                        .collect::<Vec<_>>();
+                    keys.sort();
+                    assert_eq!(
+                        keys.into_iter().map(|(_, name)| name).collect::<Vec<_>>(),
+                        entry.primary_key
+                    );
+                }
+                conn.execute_batch("CREATE TABLE mc_ops_unknown_lazy(session_id TEXT)")?;
+                let failure = move_inventory::validate_schema(conn, Store::Module).unwrap_err();
+                assert!(failure.to_string().contains("mc_ops_unknown_lazy"));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn move_payload_excludes_local_ui_ledger_but_preserves_refresh_arm() {
+        let (store, dir) = super::tests::fixture();
+        store.ops_flush("a", "local-ui-job", true, 1).unwrap();
+        let mut conn = Connection::open(dir.path().join("store.db")).unwrap();
+        let mut bytes = Vec::new();
+        crate::move_snapshot::capture_half(
+            &mut conn,
+            crate::move_inventory::Store::Module,
+            "a",
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("mc_ops_"));
+        let mut input = std::io::Cursor::new(bytes);
+        let mut refresh = None;
+        for table in crate::move_snapshot::ship_tables(crate::move_inventory::Store::Module) {
+            for _ in 0..crate::move_snapshot::read_section(&mut input, table).unwrap() {
+                let row = crate::move_snapshot::read_row(&mut input, table).unwrap();
+                if table.table == "mc_cache_state" {
+                    let index = table
+                        .shipped_columns()
+                        .iter()
+                        .position(|c| *c == "meta")
+                        .unwrap();
+                    let rusqlite::types::Value::Text(meta) = &row[index] else {
+                        panic!("missing meta")
+                    };
+                    refresh = Some(
+                        serde_json::from_str::<Value>(meta).unwrap()["soft_refresh_pending"]
+                            .clone(),
+                    );
+                }
+            }
+        }
+        assert_eq!(refresh, Some(json!(true)));
     }
 }
