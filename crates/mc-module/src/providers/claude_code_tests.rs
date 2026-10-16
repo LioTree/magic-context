@@ -746,7 +746,7 @@ async fn cc_emergency_band_applies_queued_native_drop_without_broca() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn cc_below_force_execute_holds_pending_native_drop_without_broca() {
+async fn cc_below_force_execute_applies_pending_native_drop_without_broca() {
     queued_native_drop_without_broca(Some((30000, 167000))).await;
 }
 
@@ -1036,8 +1036,9 @@ async fn queued_native_drop_with_usage(
         return;
     };
     if let Some(previous_usage) = growing_previous_usage {
-        // These are successive whole-request estimates from a gateway with a
-        // 24k soft budget. Previous-response usage must not pin their pressure.
+        // Tool-boundary checks defer unfinished turns above the Execute threshold.
+        // Keep the below-force steps unfinished to isolate the force crossing;
+        // measure each whole request, not the previous response's token sample.
         if !previous_usage.is_null() {
             turn_two["previous_usage"] = previous_usage;
         }
@@ -1058,6 +1059,7 @@ async fn queued_native_drop_with_usage(
             growing["request_id"] = json!(format!("growing-{estimate}"));
             growing["estimate"]["request_tokens"] = json!(estimate);
             growing["estimate"]["previous_input"] = json!(previous_input);
+            growing["mid_turn"] = json!(true);
             let answer = response(call(&h, "compaction.step", growing).await);
             assert_eq!(answer["answer"], "noop", "estimate={estimate}: {answer}");
             assert_eq!(session_status(&h).await["pending_drop_count"], 1);
@@ -1083,14 +1085,6 @@ async fn queued_native_drop_with_usage(
         .with(|slot| slot.borrow_mut().take())
         .expect("the CC engine measured the request against usable_soft");
     assert!((pressure.0 - (tokens as f64 / soft as f64 * 100.0)).abs() < 0.001);
-    if rebuild_reason.is_none() && tokens * 100 < soft * 85 {
-        assert_eq!(
-            second["answer"], "noop",
-            "Execute alone must hold: {second}"
-        );
-        assert_eq!(session_status(&h).await["pending_drop_count"], 1);
-        return;
-    }
     assert_eq!(second["answer"], "compaction_message", "{second}");
     let status = session_status(&h).await;
     assert_eq!(

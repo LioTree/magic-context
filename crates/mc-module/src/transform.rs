@@ -703,9 +703,9 @@ impl BoundaryState {
 /// back to CK messages at egress.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransformRequest {
-    /// Allow queued native-step edits to share a requested prefix rebuild or
-    /// pressure relief at the force threshold, never an ordinary Execute pass.
-    /// Set internally, not accepted from the transform wire.
+    /// Let queued Claude Code edits accompany a requested cache-prefix rebuild
+    /// or a request reaching the force threshold. Execute permission is added
+    /// after scheduling. Set internally, not read from serialized requests.
     #[serde(skip)]
     pub(crate) native_step_bust: bool,
     #[serde(default)]
@@ -2535,6 +2535,15 @@ pub mod compaction {
         pub prefix_bust_permitted: bool,
     }
 
+    /// Permit queued edits and a native replacement when the scheduler chooses
+    /// Execute after checking tool-turn boundaries. A high token estimate alone
+    /// must not override a decision to defer an unfinished turn.
+    pub(super) fn native_step_bust(req: &TransformRequest, pass: scheduler::PassDecision) -> bool {
+        req.kind == PASS_KIND
+            && req.serializer_profile == "claude-code-anthropic"
+            && (req.native_step_bust || pass == scheduler::PassDecision::Execute)
+    }
+
     /// Produce Setup's full initial view. Setup is the only call that can initialize
     /// the served head without a previous view; ordinary steps require that view.
     pub fn setup(
@@ -2699,7 +2708,8 @@ pub mod compaction {
             }
         });
         let engine = transform_with_projection(store, &req, ctx)?;
-        let permitted = engine.response.prefix_bust_permitted || req.native_step_bust;
+        let permitted =
+            engine.response.prefix_bust_permitted || native_step_bust(&req, engine.scheduler_pass);
         let mut answer = Answer::Noop;
         // The host may already be serving a whole-request transform. When it
         // switches to compaction messages, return those same frozen prompt bytes
@@ -5602,7 +5612,8 @@ fn apply_once(
     // full provider-cache write anyway (an expired cache, discarded cache sections, a head
     // that cannot be replayed): queued work is then applied in this same pass. For a primary
     // with a replayable head, the head itself still replays unchanged.
-    let signed_drains_released = req.native_step_bust
+    let native_step_bust = compaction::native_step_bust(req, scheduler_outcome.pass);
+    let signed_drains_released = native_step_bust
         || force_band_active
         || scheduler_outcome.pass == scheduler::PassDecision::Emergency95
         || scheduler_outcome.idle_ttl_fired
@@ -5810,7 +5821,7 @@ fn apply_once(
     // held subagent pass also replays its previous bytes.
     let subagent_execute_permitted =
         !signed_prefix_hold && scheduler_outcome.pass != scheduler::PassDecision::Defer;
-    let supersession_ride_available = req.native_step_bust
+    let supersession_ride_available = native_step_bust
         || independent_rebuild
         // Subagents cannot fold history. Execute is their one shared permission
         // for queued drops and automatic cleanup, not a request to change bytes.

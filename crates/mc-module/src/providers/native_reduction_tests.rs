@@ -495,7 +495,7 @@ async fn cc_native_force_and_emergency_hold_drops_before_active_thinking() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn cc_native_execute_holds_then_force_drops_after_kept_thinking_preserve_prefix_bytes() {
+async fn cc_native_execute_drops_after_kept_thinking_preserve_prefix_bytes() {
     drop_after_kept_thinking(30000, 167000).await;
 }
 
@@ -560,9 +560,6 @@ async fn drop_after_kept_thinking(tokens: u64, soft: u64) {
     status["context_window"] = json!(200000);
     status["estimate"]["request_tokens"] = json!(tokens);
     status["geometry"] = json!({"usable_soft":soft,"usable_hard":200000,"absolute_wall":200000,"derivation":"gateway"});
-    assert_eq!(step_answer(&h, &status, &pins).await["answer"], "noop");
-    status["request_id"] = json!("force-drop-after-kept-thinking");
-    status["estimate"]["request_tokens"] = json!((soft * 85).div_ceil(100));
     let answer = step_answer(&h, &status, &pins).await;
     assert_eq!(answer["answer"], "compaction_message", "{answer}");
     assert_eq!(answer["coverage"]["ordinal"], 20);

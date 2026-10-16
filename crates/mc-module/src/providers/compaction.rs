@@ -1200,8 +1200,9 @@ fn execute_host_with_healing(
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
     setup.setup.state.rebuild_epoch = state.rebuild_epoch;
-    // Queue draining and replacement publication share the engine's permission.
-    // Execute alone does not pay for a provider-cache rewrite.
+    // Apply queued edits and publish their replacement using one shared permission.
+    // Execute, Force85 and Emergency95 all display as "execute", so permission
+    // must come from the actual scheduler decision, not its display string.
     let promoted = codec == Codec::ClaudeCodeAnthropic
         && !native_pending.is_empty()
         && output.prefix_bust_permitted
