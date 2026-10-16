@@ -275,7 +275,7 @@ async fn admission_spoofs_and_rebind_matrix() {
     h.bind_route(7, other);
     assert_eq!(
         error_code(cc::call(&h, "compaction.step", cc::step(raw)).await),
-        "claude_code_lane_profile_mismatch"
+        "host_lane_requires_harness_module"
     );
     h.bind_route(7, cc::binding(dir.path(), cc::thalamus()));
     let mut status = cc::step(raw);

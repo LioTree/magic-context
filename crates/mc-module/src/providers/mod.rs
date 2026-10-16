@@ -19,6 +19,8 @@ mod codec_claude_code;
 mod codec_opencode;
 mod compaction;
 mod historian;
+#[cfg(test)]
+mod host_lane_tests;
 mod native_cut;
 mod native_plan;
 mod native_view;
@@ -123,6 +125,29 @@ fn attested_claude_code(binding: &SessionBinding) -> bool {
 
 fn host_binding(binding: &SessionBinding) -> bool {
     matches!(binding.harness.as_str(), "opencode" | "opencode2") || attested_claude_code(binding)
+}
+
+fn admit_host_lane(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
+    if !matches!(binding.harness.as_str(), "opencode" | "opencode2") {
+        return Ok(());
+    }
+    if !matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "thalamus-harness")
+    {
+        return Err(error(
+            "host_lane_requires_harness_module",
+            "OpenCode provider lane requires reserved:thalamus-harness",
+        ));
+    }
+    if !binding.scope.as_ref().is_some_and(|scope| {
+        scope.owner_authorized
+            && matches!(&scope.owner, subc_protocol::Principal::Reserved { module_id } if module_id == "prefrontal-core")
+    }) {
+        return Err(error(
+            "host_lane_scope_missing",
+            "OpenCode provider lane requires an authorized reserved:prefrontal-core scope",
+        ));
+    }
+    Ok(())
 }
 
 /// Claude Code requires the daemon-confirmed Thalamus caller and a plan choosing
@@ -287,11 +312,14 @@ impl McHandler {
                 )
             }
         };
+        if let Err(error) = admit_host_lane(&binding) {
+            return error;
+        }
         if let Err(error) = admit_claude_code(&binding, method, params) {
             return error;
         }
-        // OpenCode keeps its existing authorization by bound harness. Claude Code
-        // also requires the caller identity confirmed by the daemon at route bind.
+        // Harness strings select a codec, not authorization. OpenCode checks the
+        // bound principal and scope; Claude Code still requires reserved:thalamus.
         let host = host_binding(&binding);
         if !host && binding.harness != session_resolver::RUNNER_BIND_HARNESS {
             return error(
