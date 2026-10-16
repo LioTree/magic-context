@@ -147,11 +147,11 @@ describe("migration 98", () => {
 
             runMigrations(db);
 
-            expect(LATEST_MIGRATION_VERSION).toBe(100);
-            expect(LATEST_SUPPORTED_VERSION).toBe(100);
+            expect(LATEST_MIGRATION_VERSION).toBe(101);
+            expect(LATEST_SUPPORTED_VERSION).toBe(101);
             expect(
                 db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get(),
-            ).toEqual({ version: 100 });
+            ).toEqual({ version: 101 });
             expect(db.prepare("SELECT * FROM compartments ORDER BY id").all()).toEqual(
                 compartments,
             );

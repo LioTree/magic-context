@@ -2,7 +2,8 @@
 
 import { describe, expect, spyOn, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
-import { markTagsCompactedByMessageIds } from "./storage-tags";
+import { installTrimSourceIndexes } from "./migration-v101-trim-indexes";
+import { markTagsCompactedByMessageIds, TRIM_SOURCE_CANDIDATES_SQL } from "./storage-tags";
 
 function fixture(): Database {
     const db = new Database(":memory:");
@@ -14,6 +15,7 @@ function fixture(): Database {
         CREATE INDEX idx_tags_session_message_id ON tags(session_id, message_id);
         CREATE TABLE pending_ops (session_id TEXT, tag_id INTEGER);
         CREATE INDEX idx_pending_ops_session_tag ON pending_ops(session_id, tag_id);`);
+    installTrimSourceIndexes(db);
     return db;
 }
 
@@ -35,6 +37,52 @@ function legacy(db: Database, session: string, ids: string[]): number {
 }
 
 describe("trimmed-message tag retirement", () => {
+    test("one new trimmed source seeks four indexed ranges independently of persisted history", () => {
+        const db = fixture();
+        try {
+            const insert = db.prepare(
+                "INSERT INTO tags(id,session_id,message_id,tool_owner_message_id,status) VALUES (?,'s',?,?,'dropped')",
+            );
+            db.transaction(() => {
+                for (let id = 1; id <= 160_000; id++) insert.run(id, `old-${id}:p0`, null);
+                insert.run(160_001, "new:p0", null);
+                insert.run(160_002, "NEW:FILE1", null);
+                insert.run(160_003, "call", "new");
+            })();
+            const prepare = db.prepare.bind(db);
+            let discovered = 0;
+            const intercept = spyOn(db, "prepare").mockImplementation((sql: string) => {
+                if (sql === TRIM_SOURCE_CANDIDATES_SQL) {
+                    const params = ["s", '["new"]'];
+                    const plan = prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as {
+                        detail: string;
+                    }[];
+                    const tagSearches = plan.filter((row) => row.detail.includes("SEARCH t"));
+                    expect(tagSearches).toHaveLength(4);
+                    expect(
+                        tagSearches.every((row) =>
+                            /message_id=\?|message_id>\?|tool_owner_message_id=\?/.test(row.detail),
+                        ),
+                    ).toBe(true);
+                    expect(prepare(sql).all(...params)).toHaveLength(3);
+                    discovered++;
+                }
+                return prepare(sql);
+            });
+            try {
+                expect(markTagsCompactedByMessageIds(db, "s", ["new"])).toBe(3);
+                expect(discovered).toBe(1);
+                expect(
+                    prepare("SELECT count(*) AS n FROM tags WHERE status='dropped'").get(),
+                ).toEqual({ n: 160_000 });
+            } finally {
+                intercept.mockRestore();
+            }
+        } finally {
+            db.close();
+        }
+    });
+
     test("protected trim discovery seeks only eligible tag numbers and preserves retired state", () => {
         const db = fixture();
         try {
@@ -81,7 +129,7 @@ describe("trimmed-message tag retirement", () => {
         }
     });
 
-    test("retires 100k tags with 4000 trimmed ids within two seconds", () => {
+    test("retires only matching tags among 100k tags with 4000 trimmed ids", () => {
         const db = fixture();
         try {
             const insert = db.prepare(
@@ -117,7 +165,6 @@ describe("trimmed-message tag retirement", () => {
                 ),
             );
             console.log(`trim regression: 100000 tags, 4000 ids, ${elapsed.toFixed(1)}ms`);
-            expect(elapsed).toBeLessThan(2000);
             expect(markTagsCompactedByMessageIds(db, "s", ["m1", "m1"])).toBe(0);
         } finally {
             db.close();

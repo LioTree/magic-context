@@ -2626,6 +2626,34 @@ export function adoptPiFallbackMessageTag(
     };
 }
 
+export const TRIM_SOURCE_CANDIDATES_SQL = `WITH ids AS MATERIALIZED (
+    SELECT value AS source_id, ? AS session_id FROM json_each(?)
+)
+SELECT t.id, t.tag_number, t.message_id, t.tool_owner_message_id
+FROM ids CROSS JOIN tags t INDEXED BY idx_tags_session_message_nocase
+WHERE t.session_id = ids.session_id AND t.message_id = ids.source_id COLLATE NOCASE
+    AND t.status IN ('active', 'dropped')
+UNION
+SELECT t.id, t.tag_number, t.message_id, t.tool_owner_message_id
+FROM ids CROSS JOIN tags t INDEXED BY idx_tags_session_tool_owner
+WHERE t.session_id = ids.session_id AND t.tool_owner_message_id = ids.source_id
+    AND t.status IN ('active', 'dropped')
+UNION
+SELECT t.id, t.tag_number, t.message_id, t.tool_owner_message_id
+FROM ids CROSS JOIN tags t INDEXED BY idx_tags_session_message_nocase
+WHERE t.session_id = ids.session_id
+    AND t.message_id >= (ids.source_id || ':p') COLLATE NOCASE
+    AND t.message_id < (ids.source_id || ':q') COLLATE NOCASE
+    AND t.status IN ('active', 'dropped')
+UNION
+SELECT t.id, t.tag_number, t.message_id, t.tool_owner_message_id
+FROM ids CROSS JOIN tags t INDEXED BY idx_tags_session_message_nocase
+WHERE t.session_id = ids.session_id
+    AND t.message_id >= (ids.source_id || ':file') COLLATE NOCASE
+    AND t.message_id < (ids.source_id || ':filf') COLLATE NOCASE
+    AND t.status IN ('active', 'dropped')
+ORDER BY tag_number`;
+
 /**
  * Retire tags minted from rows removed by an in-memory compartment trim. The
  * rows never reach the served tail, so leaving them active would leak into
@@ -2673,18 +2701,25 @@ export function markTagsCompactedByMessageIds(
         return false;
     };
 
-    // Discover candidates once, WITHOUT a writer transaction. The former OR /
-    // LIKE update used only the session prefix of the index once per source id.
-    // Scan in tag-number order: the message-id index visits the table in random
-    // source-id order, making even a single read expensive on a large store.
-    // Materialize the id sets once inside SQLite so ordinary unmatched rows
-    // never cross the JS boundary. Delimiter-bearing and NUL-bearing source ids
-    // use the general matcher above rather than assuming a single base id.
-    // All subsequent writes are primary-key lookups, not session scans.
-    // Protected-tool retirement already supplies an eligibility set. Seek those
-    // tag numbers before matching source ids; discarded history is not new work.
+    // Discover candidates outside the writer transaction; updates below recheck
+    // identity and status by primary key after acquiring the writer lock.
+    const params = [
+        JSON.stringify(Array.from(ids)),
+        sessionId,
+        ...(eligibleTagNumbers ? [JSON.stringify([...eligibleTagNumbers])] : []),
+        Array.from(ids).some((id) => id.includes(":")) ? 1 : 0,
+        nulPrefixes.size > 0 ? 1 : 0,
+    ];
+    // Each ordinary source ID drives equality and NOCASE prefix-range seeks.
+    // NOCASE preserves LIKE's ASCII folding without lower() on every stored row.
+    // NUL patterns retain the general matcher because LIKE truncates the pattern
+    // before its suffix; protected retirement already has bounded tag-number keys.
+    const indexedSources = eligibleTagNumbers === undefined && nulPrefixes.size === 0;
     const rows = db
-        .prepare(`WITH ids AS MATERIALIZED (
+        .prepare(
+            indexedSources
+                ? TRIM_SOURCE_CANDIDATES_SQL
+                : `WITH ids AS MATERIALIZED (
             SELECT value AS source_id, lower(value) AS folded_id FROM json_each(?)
         )
         SELECT id, tag_number, message_id, tool_owner_message_id FROM tags INDEXED BY ${tagOrderConstraintIndex(db)}
@@ -2698,14 +2733,9 @@ export function markTagsCompactedByMessageIds(
                 lower(substr(message_id, 1, instr(lower(message_id), ':file') - 1)) IN (SELECT folded_id FROM ids))
             OR (? AND instr(message_id, ':') > 0)
             OR ?
-        )`)
-        .all(
-            JSON.stringify(Array.from(ids)),
-            sessionId,
-            ...(eligibleTagNumbers ? [JSON.stringify([...eligibleTagNumbers])] : []),
-            Array.from(ids).some((id) => id.includes(":")) ? 1 : 0,
-            nulPrefixes.size > 0 ? 1 : 0,
-        ) as {
+        )`,
+        )
+        .all(...(indexedSources ? [sessionId, params[0]] : params)) as {
         id: number;
         tag_number: number;
         message_id: string | null;

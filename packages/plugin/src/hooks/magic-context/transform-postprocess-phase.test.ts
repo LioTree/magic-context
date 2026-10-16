@@ -63,6 +63,7 @@ import {
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
+import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -1349,86 +1350,169 @@ function serializeAnthropicVisibleRoleGroups(messages: MessageLike[]): string {
 }
 
 describe("stripped placeholder replay across temporary marker windows", () => {
-    it("sends byte-identical postprocess output with linear and legacy trimmed-tag retirement", async () => {
-        const sessionId = "ses-trim-wire-differential";
-        const served = [
-            {
-                info: { id: "tail-user", role: "user", sessionID: sessionId },
-                parts: [{ type: "text", text: "continue" }],
-            },
-            {
-                info: { id: "tail-assistant", role: "assistant", sessionID: sessionId },
-                parts: [{ type: "text", text: "visible answer" }],
-            },
-        ] as MessageLike[];
-        const trimmed = [
-            {
-                info: { id: "trim", role: "assistant", sessionID: sessionId },
-                parts: [{ type: "text", text: "archived output" }],
-            },
-        ] as MessageLike[];
-        const run = async () => {
-            db = new Database(":memory:");
-            initializeDatabase(db);
-            insertTag(db, sessionId, "trim:p0", "message", 10, 1);
-            insertTag(db, sessionId, "call-trim", "tool", 10, 2, 0, "read", 0, "trim");
-            insertTag(db, sessionId, "tail-user:p0", "message", 10, 3);
-            const messages = structuredClone(served);
-            await runPostTransformPhase(
-                basePostTransformArgs(db, sessionId, messages, {
-                    schedulerDecision: "execute",
-                    pendingMaterializationSessions: new Set([sessionId]),
-                    schedulerDeferReason: null,
-                    resolvedProviderID: "anthropic",
-                    trimmedMessagesAtCompactionBoundary: structuredClone(trimmed),
-                }),
-            );
-            expect(getTagsBySession(db, sessionId).map((tag) => tag.status)).toEqual([
-                "compacted",
-                "compacted",
-                "active",
-            ]);
-            const bytes = Buffer.from(JSON.stringify(messages));
-            db.close();
-            return bytes;
-        };
-        const linear = await run();
-        let legacyCalls = 0;
-        const old = spyOn(storageTags, "markTagsCompactedByMessageIds").mockImplementation(
-            (store, session, ids) => {
-                legacyCalls++;
-                const update = store.prepare(`UPDATE tags SET status = 'compacted'
+    for (const host of ["opencode", "opencode2"] as const) {
+        for (let seed = 1; seed <= 120; seed++) {
+            it(`${host} randomized trimmed-source differential ${seed}: fold, 4096 sentinels, seam and defer replay`, async () => {
+                _resetHarnessForTesting();
+                setHarness(host);
+                let state = seed;
+                const random = () => {
+                    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+                    return state;
+                };
+                const source = ["trim", "a%_\\b", "MiXeD", "源", "nested:p1:file2"][random() % 5];
+                const sessionId = `ses-trim-wire-${host}-${seed}`;
+                const served = [
+                    {
+                        info: { id: "tail-user", role: "user", sessionID: sessionId },
+                        parts: [{ type: "text", text: "continue" }],
+                    },
+                    {
+                        info: { id: "tail-assistant", role: "assistant", sessionID: sessionId },
+                        parts: [{ type: "text", text: `visible answer ${random()}` }],
+                    },
+                ] as MessageLike[];
+                const trimmed = [
+                    {
+                        info: { id: source, role: "assistant", sessionID: sessionId },
+                        parts: [{ type: "text", text: "archived output" }],
+                    },
+                ] as MessageLike[];
+                const historical = Array.from({ length: 12 + (random() % 24) }, (_, index) => ({
+                    messageId: [
+                        source,
+                        `${source}:p${index}`,
+                        `${source.toUpperCase()}:FILE${index}`,
+                        `old-${random()}:p0`,
+                        `${source}:mc-text-v1:${index}`,
+                    ][random() % 5],
+                    owner: random() % 3 === 0 ? source : null,
+                    status: ["active", "dropped", "compacted"][random() % 3] as
+                        | "active"
+                        | "dropped"
+                        | "compacted",
+                }));
+                const run = async () => {
+                    db = new Database(":memory:");
+                    initializeDatabase(db);
+                    applyStrippedPlaceholderDelta(db, sessionId, {
+                        add: Array.from({ length: 4096 }, (_, i) => `persisted-${i}`),
+                    });
+                    insertTag(db, sessionId, `${source}:p0`, "message", 10, 1);
+                    insertTag(db, sessionId, "call-trim", "tool", 10, 2, 0, "read", 0, source);
+                    insertTag(db, sessionId, "tail-user:p0", "message", 10, 3);
+                    for (const [index, row] of historical.entries()) {
+                        const number = index + 4;
+                        insertTag(
+                            db,
+                            sessionId,
+                            row.messageId,
+                            "tool",
+                            10,
+                            number,
+                            0,
+                            "read",
+                            0,
+                            row.owner,
+                        );
+                        updateTagStatus(db, sessionId, number, row.status);
+                    }
+                    const messages = structuredClone(served);
+                    const hidden = {
+                        info: { id: "hidden-new", role: "assistant", sessionID: sessionId },
+                        parts: [{ type: "text", text: "[dropped §4§]" }],
+                    } as MessageLike;
+                    await runPostTransformPhase(
+                        basePostTransformArgs(db, sessionId, messages, {
+                            schedulerDecision: "execute",
+                            pendingMaterializationSessions: new Set([sessionId]),
+                            schedulerDeferReason: null,
+                            resolvedProviderID: "anthropic",
+                            trimmedMessagesAtCompactionBoundary: structuredClone(trimmed),
+                            hiddenMessagesAtCompactionSeam: [structuredClone(hidden)],
+                        }),
+                    );
+                    expect(
+                        getTagsBySession(db, sessionId)
+                            .slice(0, 3)
+                            .map((tag) => tag.status),
+                    ).toEqual(["compacted", "compacted", "active"]);
+                    const persisted = getStrippedPlaceholderIds(db, sessionId);
+                    expect(persisted.size).toBe(4096);
+                    expect(persisted.has("hidden-new")).toBe(true);
+                    const absent = structuredClone(served);
+                    await runPostTransformPhase(
+                        basePostTransformArgs(db, sessionId, absent, {
+                            schedulerDecision: "defer",
+                            resolvedProviderID: "anthropic",
+                        }),
+                    );
+                    const replay = [...structuredClone(served), structuredClone(hidden)];
+                    await runPostTransformPhase(
+                        basePostTransformArgs(db, sessionId, replay, {
+                            schedulerDecision: "defer",
+                            resolvedProviderID: "anthropic",
+                        }),
+                    );
+                    expect(replay.at(-1)?.parts).toEqual([{ type: "text", text: "" }]);
+                    const bytes = Buffer.from(
+                        JSON.stringify({
+                            fold: messages,
+                            absent,
+                            replay,
+                            tags: getTagsBySession(db, sessionId).map(
+                                ({ tag_number, message_id, tool_owner_message_id, status }) => ({
+                                    tag_number,
+                                    message_id,
+                                    tool_owner_message_id,
+                                    status,
+                                }),
+                            ),
+                        }),
+                    );
+                    db.close();
+                    return bytes;
+                };
+                const linear = await run();
+                let legacyCalls = 0;
+                const old = spyOn(storageTags, "markTagsCompactedByMessageIds").mockImplementation(
+                    (store, session, ids) => {
+                        legacyCalls++;
+                        const update = store.prepare(`UPDATE tags SET status = 'compacted'
                 WHERE session_id = ? AND status IN ('active','dropped')
                 AND (message_id = ? OR message_id LIKE ? ESCAPE '\\'
                     OR message_id LIKE ? ESCAPE '\\' OR tool_owner_message_id = ?) RETURNING id`);
-                return store
-                    .transaction(() => {
-                        let count = 0;
-                        for (const id of new Set(ids)) {
-                            const escaped = id.replace(/[\\%_]/g, "\\$&");
-                            count += update.all(
-                                session,
-                                id,
-                                `${escaped}:p%`,
-                                `${escaped}:file%`,
-                                id,
-                            ).length;
-                        }
-                        return count;
-                    })
-                    .immediate();
-            },
-        );
-        try {
-            const legacyBytes = await run();
-            expect(legacyCalls).toBe(1);
-            expect(linear.equals(legacyBytes)).toBe(true);
-            expect(linear.includes("visible answer")).toBe(true);
-            expect(linear.includes("archived output")).toBe(false);
-        } finally {
-            old.mockRestore();
+                        return store
+                            .transaction(() => {
+                                let count = 0;
+                                for (const id of new Set(ids)) {
+                                    const escaped = id.replace(/[\\%_]/g, "\\$&");
+                                    count += update.all(
+                                        session,
+                                        id,
+                                        `${escaped}:p%`,
+                                        `${escaped}:file%`,
+                                        id,
+                                    ).length;
+                                }
+                                return count;
+                            })
+                            .immediate();
+                    },
+                );
+                try {
+                    const legacyBytes = await run();
+                    expect(legacyCalls).toBe(1);
+                    expect(linear.equals(legacyBytes)).toBe(true);
+                    expect(linear.includes("visible answer")).toBe(true);
+                    expect(linear.includes("archived output")).toBe(false);
+                } finally {
+                    old.mockRestore();
+                    _resetHarnessForTesting();
+                }
+            });
         }
-    });
+    }
 
     for (const providerID of ["anthropic", "openai-compatible"]) {
         it(`freezes a marker-only final assistant across a priced pass and appended defer (${providerID})`, async () => {

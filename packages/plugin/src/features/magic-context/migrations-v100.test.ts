@@ -53,9 +53,8 @@ describe("migration 100", () => {
             ).toEqual({ version: 99 });
 
             runMigrations(db);
-            expect(LATEST_SUPPORTED_VERSION).toBe(100);
-            expect(LATEST_MIGRATION_VERSION).toBe(100);
-            expect(MIGRATIONS.slice(-2).map((entry) => entry.version)).toEqual([99, 100]);
+            expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
+            expect(MIGRATIONS.filter((entry) => entry.version === 100)).toHaveLength(1);
             expect(prefixColumns(db)).toEqual([
                 { name: "held_release", type: "TEXT", notnull: 0, dflt_value: null },
                 { name: "served_prefix", type: "TEXT", notnull: 0, dflt_value: null },
@@ -69,7 +68,7 @@ describe("migration 100", () => {
             ).toEqual({ counter: 42, served_prefix: null, held_release: null });
             expect(
                 db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get(),
-            ).toEqual({ version: 100 });
+            ).toEqual({ version: LATEST_MIGRATION_VERSION });
             initializeDatabase(fresh);
             expect(prefixColumns(fresh)).toEqual(prefixColumns(db));
             runMigrations(fresh);
@@ -107,7 +106,7 @@ describe("migration 100", () => {
             initializeDatabase(db);
             runMigrations(db);
             expect(enforceSchemaFence(db, ":previous-binary:", 99)).toBe(false);
-            expect(enforceSchemaFence(db, ":current-binary:", 100)).toBe(true);
+            expect(enforceSchemaFence(db, ":current-binary:", LATEST_SUPPORTED_VERSION)).toBe(true);
         } finally {
             db.close();
         }

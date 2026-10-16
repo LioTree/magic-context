@@ -27,7 +27,7 @@ const { insertTag } = await import(join(root, "packages/plugin/src/features/magi
 const { writeReplayDocument } = await import(join(root, "packages/plugin/src/features/magic-context/storage-replay-document.ts"));
 
 // Use the historical initializer from schema-version-87 commit ceeed793b5bf873d94768de20358bc84a44d3fad.
-// The current initializer preinstalls v93-99 schema before running migrations,
+// The current initializer preinstalls v93-101 schema before running migrations,
 // so it would conceal missing historical upgrade steps in a differential test.
 const historicalSource = readFileSync(join(here, "storage-db-v87.source.txt"), "utf8");
 const historicalJs = new Bun.Transpiler({ loader: "ts", target: "bun" }).transformSync(
@@ -99,7 +99,7 @@ if (process.argv[3] === "--assets") {
     writeFileSync(join(here, "lkg_chunks.sql"), LKG_SLOT_CHUNKS_DDL);
     writeFileSync(join(here, "lkg_slots.sql"), LKG_SLOTS_DDL.replaceAll("lkg_slots", "lkg_slots_v94").trimEnd() + "\n");
     assetDb.close();
-    console.log(`Captured ${steps.length} real TypeScript migration SQL plans (88-100)`);
+    console.log(`Captured ${steps.length} real TypeScript migration SQL plans (88-101)`);
     process.exit(0);
 }
 
@@ -161,7 +161,7 @@ function data(db: Db, startingVersion: number): unknown {
         });
 }
 
-for (let version = 87; version <= 100; version++) {
+for (let version = 87; version <= 101; version++) {
     const start = join(output, `v${version}.db`);
     copyFileSync(base, start);
     const fixture = new Database(start);
@@ -176,4 +176,4 @@ for (let version = 87; version <= 100; version++) {
     writeFileSync(join(output, `v${version}.json`), JSON.stringify({ now, snapshot: snapshot(reference), data: data(reference, version) }));
     reference.close();
 }
-console.log("TypeScript historical differential fixtures: 14 populated starting versions (87-100), 13 upgrade steps, fence 100");
+console.log("TypeScript historical differential fixtures: 15 populated starting versions (87-101), 14 upgrade steps, fence 101");
