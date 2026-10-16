@@ -248,6 +248,7 @@ fn admit_policy_parts_tx(
     repeat: Option<&ProviderSubject>,
     rearm_all: bool,
     reuse_held: bool,
+    pending_tags: &[ProviderAnswerTag],
 ) -> rusqlite::Result<()> {
     for part in parts {
         let mut part = part.clone();
@@ -268,11 +269,33 @@ fn admit_policy_parts_tx(
                         _ => part.tag_kind.as_deref() == Some("message"),
                     }
             });
-            if held.active || (!rearm_all && !matches_repeat) {
+            let pending_tag = pending_tags.iter().find(|tag| {
+                reuse_held
+                    && matches_repeat
+                    && tag.block_id == part.block_id
+                    && part.tag_kind.as_deref() == Some(tag.kind.as_str())
+            });
+            // Engine measurements can mark a row active without reserving a number.
+            // Its first native hook must still be allowed to allocate one.
+            let unreserved_cc_hook = reuse_held
+                && matches_repeat
+                && held.tag_number.is_none()
+                && part.tag_kind.is_some();
+            if let Some(tag) = pending_tag.filter(|_| !held.retired) {
+                // Engine snapshots can replace a policy row with measurement-only
+                // data. The pending answer still owns this subject's reservation.
+                part.tag_number = Some(tag.number);
+                part.active = true;
+            } else if (held.active && !unreserved_cc_hook) || (!rearm_all && !matches_repeat) {
                 continue;
             }
             retired = held.retired;
-            if reuse_held && matches_repeat && !held.retired && held.tag_kind == part.tag_kind {
+            if part.tag_number.is_none()
+                && reuse_held
+                && matches_repeat
+                && !held.retired
+                && held.tag_kind == part.tag_kind
+            {
                 part.tag_number = held.tag_number;
             }
         }
@@ -1714,7 +1737,8 @@ impl McStore {
                  // Replayed or inherited answers already own their policy rows.
                  // Do not shadow an ancestor reservation in the child lineage.
                  if !repeat_answer.as_ref().is_some_and(|a|a.state=="live" || a.lineage_id!=request.lineage.lineage_id) {
-                     admit_policy_parts_tx(conn,&conv,&request.lineage.lineage_id,&c.engine_namespace,parts,&mut reserved_high,request.repeat_subject,pass_context.is_some(),reuse_held)?;
+                      let pending_tags = repeat_answer.as_ref().filter(|a| a.state=="pending" && a.lineage_id==request.lineage.lineage_id && !replay_heal).map_or(&[][..], |a| a.answer.tags.as_slice());
+                      admit_policy_parts_tx(conn,&conv,&request.lineage.lineage_id,&c.engine_namespace,parts,&mut reserved_high,request.repeat_subject,pass_context.is_some(),reuse_held,pending_tags)?;
                  }
                 counters["reserved_tag_high_water"]=json!(reserved_high);
                 if let Some(context)=pass_context {counters["pass_context"]=context.clone();}
@@ -2199,6 +2223,188 @@ mod policy_tests {
             created_at_ms: None,
             completed_at_ms: None,
         }
+    }
+
+    fn cc_retry_fixture(dir: &std::path::Path) -> (McStore, ProviderSessionKey, ProviderLineage) {
+        let (store, mut key, lineage) = fixture(dir);
+        key.harness = "claude-code".into();
+        key.generation = Some(crate::provider_records::ProviderGeneration {
+            profile: "profile".into(),
+            provider: "provider".into(),
+        });
+        store
+            .save_provider_conversation(
+                &key,
+                &ProviderConversation {
+                    engine_namespace: "cc-retry".into(),
+                    params_json:
+                        json!({"serializer_profile":"claude-code-anthropic","observation":"answer"})
+                            .to_string(),
+                    native_pins_json: Some(
+                        json!({"profile_generation":"profile","provider_generation":"provider"})
+                            .to_string(),
+                    ),
+                    native_plan_json: Some("{}".into()),
+                    hook_counters_json: json!({"reserved_tag_high_water":40}).to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        (store, key, lineage)
+    }
+
+    fn cc_retry_subject(part: &ProviderPolicyPart) -> ProviderSubject {
+        ProviderSubject {
+            subject_mid: part.mid.clone(),
+            hook: "post_tool".into(),
+            subject_part: part.subject_part.clone(),
+        }
+    }
+
+    fn cc_retry_hook(
+        store: &McStore,
+        key: &ProviderSessionKey,
+        lineage: &ProviderLineage,
+        part: &ProviderPolicyPart,
+        unserved: &[ProviderSubject],
+    ) -> (i64, String) {
+        let subject = cc_retry_subject(part);
+        let message = ProviderMessage {
+            mid: part.mid.clone(),
+            ordinal: part.ordinal,
+            message_bytes: br#"{ "text":"p\u0061yload" }"#.to_vec(),
+        };
+        store
+            .commit_provider_hook_with_parts(
+                key,
+                ProviderHookRequest {
+                    lineage,
+                    message: Some(&message),
+                    served_through_ordinal: None,
+                    unserved_subjects: unserved,
+                    repeat_subject: Some(&subject),
+                },
+                std::slice::from_ref(part),
+                |ctx| {
+                    let answer = if let Some(held) = &ctx.repeat_answer {
+                        held.answer.clone()
+                    } else {
+                        let number = ctx
+                            .parts
+                            .iter()
+                            .find(|p| p.block_id == part.block_id)
+                            .and_then(|p| p.tag_number)
+                            .expect("hook reservation");
+                        ProviderHookAnswer {
+                            subject: subject.clone(),
+                            ordinal: part.ordinal,
+                            ops_json:
+                                json!([{"op":"prepend","block":0,"text":format!("§{number}§ ")}])
+                                    .to_string(),
+                            tags: vec![ProviderAnswerTag {
+                                number,
+                                block_id: part.block_id.clone(),
+                                kind: "tool_result".into(),
+                                source: "payload".into(),
+                                token_count: 10,
+                                created_at_ms: 0,
+                            }],
+                        }
+                    };
+                    let result = (answer.tags[0].number, answer.ops_json.clone());
+                    Ok((
+                        ProviderHookWrite {
+                            answer: Some(answer),
+                            counters: ctx.counters.clone(),
+                            policy_summary: None,
+                        },
+                        result,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    fn rewrite_cc_retry_measurement(store: &McStore, part: &ProviderPolicyPart) {
+        let mut measured = part.clone();
+        measured.tag_number = None;
+        measured.served = true;
+        // Use the same writer as a compaction.step engine commit, not a direct
+        // row mutation. Its measurements contain no pending admission number.
+        store
+            .inner
+            .with_conn_fenced(|conn| {
+                save_engine_policy_tx(
+                    conn,
+                    "cc-retry",
+                    &ProviderEnginePolicy {
+                        parts: vec![measured],
+                        settings: json!({}),
+                    },
+                )
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn cc_pending_retry_after_step_keeps_reservation_then_unserved_allocates_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, key, lineage) = cc_retry_fixture(dir.path());
+        let mut first = lifecycle_part("m1", 1, 0);
+        first.tag_number = None;
+        let original = cc_retry_hook(&store, &key, &lineage, &first, &[]);
+        assert_eq!(original.0, 41);
+        rewrite_cc_retry_measurement(&store, &first);
+        let rewritten = lifecycle_parts(&store, &key);
+        assert!(rewritten[0].active && rewritten[0].served);
+        assert_eq!(rewritten[0].tag_number, None);
+        let retry = cc_retry_hook(&store, &key, &lineage, &first, &[]);
+        assert_eq!(retry, original);
+        let served = |ops: &str| {
+            let ops: Value = serde_json::from_str(ops).unwrap();
+            assert_eq!(ops.as_array().unwrap().len(), 1);
+            assert_eq!(ops[0]["op"], "prepend");
+            assert_eq!(ops[0]["block"], 0);
+            let prefix = ops[0]["text"].as_str().unwrap();
+            r#"{ "text":"p\u0061yload" }"#.replacen("\"p", &format!("\"{prefix}p"), 1)
+        };
+        assert_eq!(served(&retry.1), served(&original.1));
+        assert_eq!(served(&retry.1), r#"{ "text":"§41§ p\u0061yload" }"#);
+        let answers = store.load_provider_hook_answers(&key).unwrap();
+        assert_eq!(
+            answers.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
+            ["burned", "pending"]
+        );
+        assert_eq!(answers[0].answer.ops_json, answers[1].answer.ops_json);
+        let mut other = lifecycle_part("m2", 2, 0);
+        other.tag_number = None;
+        assert_eq!(
+            cc_retry_hook(&store, &key, &lineage, &other, &[cc_retry_subject(&first)]).0,
+            42
+        );
+        let fresh = cc_retry_hook(&store, &key, &lineage, &first, &[]);
+        assert_eq!(fresh.0, 43);
+        assert_ne!(fresh.1, original.1);
+        let answers = store.load_provider_hook_answers(&key).unwrap();
+        assert!(answers
+            .iter()
+            .filter(|a| a.state != "burned")
+            .flat_map(|a| &a.answer.tags)
+            .all(|tag| tag.number != 41));
+        assert_eq!(lifecycle_parts(&store, &key)[0].tag_number, Some(43));
+    }
+
+    #[test]
+    fn cc_first_hook_reserves_after_measurement_only_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, key, lineage) = cc_retry_fixture(dir.path());
+        store
+            .commit_provider_status(&key, &lineage, &[], None, &[])
+            .unwrap();
+        let mut part = lifecycle_part("m1", 1, 0);
+        part.tag_number = None;
+        rewrite_cc_retry_measurement(&store, &part);
+        assert_eq!(cc_retry_hook(&store, &key, &lineage, &part, &[]).0, 41);
     }
 
     fn seed_lifecycle_parts(store: &McStore, key: &ProviderSessionKey) {

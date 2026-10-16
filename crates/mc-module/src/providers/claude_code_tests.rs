@@ -50,6 +50,68 @@ pub(super) fn handler(root: &Path, principal: Option<subc_protocol::Principal>) 
     h.bind_route(7, binding(root, principal));
     h
 }
+
+pub(super) fn handler_with_admission_tags(root: &Path, enabled: bool) -> McHandler {
+    let h = handler(root, thalamus());
+    let mut pins = h.native_pins();
+    pins.canonical_reduce = enabled;
+    pins.guidance = enabled;
+    *h.native_bundle_override.lock().unwrap() = Some(pins);
+    h
+}
+
+pub(super) fn assert_admission_answer(answer: &Value, enabled: bool, tags: &[(usize, u64)]) {
+    let expected = if enabled && !tags.is_empty() {
+        json!({"answer":"ops","ops": tags.iter().map(|(block, number)| {
+            json!({"op":"prepend","block":block,"text":format!("§{number}§ ")})
+        }).collect::<Vec<_>>()})
+    } else {
+        json!({"answer":"pass"})
+    };
+    assert_eq!(answer, &expected);
+}
+
+pub(super) fn assert_stored_and_served_raw(
+    h: &McHandler,
+    mid: &str,
+    ingress_raw: &str,
+    served_raw: &str,
+) {
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    let store = h.store.get().unwrap();
+    let messages = store.load_provider_messages(&key.store_key(), "L").unwrap();
+    let message = messages.iter().find(|message| message.mid == mid).unwrap();
+    let stored: Value = serde_json::from_slice(&message.message_bytes).unwrap();
+    assert_eq!(stored["raw_message"], ingress_raw);
+    let decoded = codec::Codec::ClaudeCodeAnthropic
+        .decode_message(&compact::status::StatusMessage {
+            raw_message: None,
+            mid: mid.into(),
+            ordinal: message.ordinal,
+            message: stored,
+        })
+        .unwrap();
+    let tags = store
+        .load_provider_hook_answers(&key.store_key())
+        .unwrap()
+        .into_iter()
+        .filter(|answer| {
+            answer.answer.subject.subject_mid == mid
+                && matches!(answer.state.as_str(), "pending" | "live")
+        })
+        .flat_map(|answer| {
+            answer
+                .answer
+                .tags
+                .into_iter()
+                .map(|tag| (tag.block_id, tag.number as u64))
+        })
+        .collect();
+    assert_eq!(
+        codec_claude_code::admission_served_bytes(ingress_raw.into(), &decoded.ck, &tags).unwrap(),
+        served_raw
+    );
+}
 struct LocalSessionResolver;
 
 #[async_trait::async_trait]
@@ -307,30 +369,48 @@ async fn cc_required_head_edit_before_kept_thinking_is_held_on_non_rebuild() {
 
 #[tokio::test]
 async fn cc_hook_pass_is_durable_and_raw_retries_do_not_rewrite_signed_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = handler(dir.path(), thalamus());
-    setup(&h).await;
-    let raw = r#"{"content":[{ "signature":"s", "thinking":"p\u0072ivate", "type":"thinking" },{"type":"text","text":"answer"}],"role":"assistant"}"#;
-    let params = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"s","params":plan(),"subject_mid":"m","subject_ordinal":0,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw,
+    for tags_on in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler_with_admission_tags(dir.path(), tags_on);
+        setup(&h).await;
+        let raw = r#"{"content":[{ "signature":"s", "thinking":"p\u0072ivate", "type":"thinking" },{"type":"text","text":"answer"}],"role":"assistant"}"#;
+        let params = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"s","params":plan(),"subject_mid":"m","subject_ordinal":0,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw,
         "hook":"post_assistant","blocks":["answer"]});
-    let answer = response(call(&h, "transform.hook", params.clone()).await);
-    assert_eq!(answer["answer"], "pass");
-    assert_eq!(response(call(&h, "transform.hook", params).await), answer);
-    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
-    let store = h.store.get().unwrap();
-    let held = store.load_provider_messages(&key.store_key(), "L").unwrap();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&held[0].message_bytes).unwrap()["raw_message"],
-        raw
-    );
-    let answers = store.load_provider_hook_answers(&key.store_key()).unwrap();
-    assert_eq!(
-        answers.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
-        vec!["burned", "pending"]
-    );
-    assert!(answers
-        .iter()
-        .all(|a| a.answer.ops_json == "[]" && a.answer.tags.is_empty()));
+        let answer = response(call(&h, "transform.hook", params.clone()).await);
+        assert_admission_answer(&answer, tags_on, &[(0, 1)]);
+        assert_eq!(response(call(&h, "transform.hook", params).await), answer);
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        let held = store.load_provider_messages(&key.store_key(), "L").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&held[0].message_bytes).unwrap()["raw_message"],
+            raw
+        );
+        let answers = store.load_provider_hook_answers(&key.store_key()).unwrap();
+        assert_eq!(
+            answers.iter().map(|a| a.state.as_str()).collect::<Vec<_>>(),
+            vec!["burned", "pending"]
+        );
+        for stored in &answers {
+            assert_eq!(
+                serde_json::from_str::<Value>(&stored.answer.ops_json).unwrap(),
+                answer.get("ops").cloned().unwrap_or_else(|| json!([]))
+            );
+            if tags_on {
+                assert_eq!(stored.answer.tags.len(), 1);
+                assert_eq!(stored.answer.tags[0].number, 1);
+                assert_eq!(stored.answer.tags[0].block_id, "m#1");
+            } else {
+                assert!(stored.answer.tags.is_empty());
+            }
+        }
+        let served = if tags_on {
+            raw.replacen(r#""answer""#, r#""§1§ answer""#, 1)
+        } else {
+            raw.into()
+        };
+        assert_stored_and_served_raw(&h, "m", raw, &served);
+    }
 }
 
 #[tokio::test]
@@ -1299,111 +1379,132 @@ async fn cc_known_mid_blocks_then_string_keeps_first_bytes() {
 }
 
 async fn form_flip_sequence(first: &str, flipped: &str) {
-    let dir = tempfile::tempdir().unwrap();
-    let h = handler(dir.path(), thalamus());
-    setup(&h).await;
-    response(call(&h, "compaction.step", step(first)).await);
-    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
-    let store = h.store.get().unwrap();
-    let original = store.load_provider_messages(&key.store_key(), "L").unwrap();
-    for (turn, raw) in [flipped, first, flipped, first].into_iter().enumerate() {
-        let mut status = step(raw);
-        status["request_id"] = json!(format!("flip-{turn}"));
-        // `message` can describe the first-stored form while `raw_message`
-        // carries the form received from Claude Code on this turn.
-        status["messages"][0]["message"] = serde_json::from_str::<Value>(first).unwrap();
-        response(call(&h, "compaction.step", status).await);
-        assert_eq!(
-            store.load_provider_messages(&key.store_key(), "L").unwrap(),
-            original
-        );
-    }
-    let scalar = r#"{ "role":"assistant", "content":"hook text" }"#;
-    let blocks = r#"{ "role":"assistant", "content":[{"type":"text","text":"hook text"}] }"#;
-    let hook_first = if first == FORM_SCALAR { scalar } else { blocks };
-    let hook_flip = if first == FORM_SCALAR { blocks } else { scalar };
-    for (turn, raw) in [hook_first, hook_flip, hook_first, hook_flip]
-        .into_iter()
-        .enumerate()
-    {
-        let hook = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":format!("hook-{turn}"),"params":plan(),"subject_mid":"hook","subject_ordinal":1,"message":serde_json::from_str::<Value>(hook_first).unwrap(),"raw_message":raw,"hook":"post_assistant","blocks":["hook text"]});
-        assert_eq!(
-            response(call(&h, "transform.hook", hook).await)["answer"],
-            "pass"
-        );
-        let mut status = step(first);
-        status["request_id"] = json!(format!("after-hook-{turn}"));
-        status["messages"].as_array_mut().unwrap().push(json!({"mid":"hook","ordinal":1,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw}));
-        status["newest"] = json!({"mid":"hook","ordinal":1});
-        response(call(&h, "compaction.step", status).await);
-        let held = store.load_provider_messages(&key.store_key(), "L").unwrap();
-        assert_eq!(held[0], original[0]);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&held[1].message_bytes).unwrap()["raw_message"],
-            hook_first
-        );
-    }
-}
-
-#[tokio::test]
-async fn cc_known_mid_non_equivalent_changes_remain_conflicts() {
-    for first in [FORM_SCALAR, FORM_BLOCKS] {
+    for tags_on in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let h = handler(dir.path(), thalamus());
+        let h = handler_with_admission_tags(dir.path(), tags_on);
         setup(&h).await;
         response(call(&h, "compaction.step", step(first)).await);
         let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
         let store = h.store.get().unwrap();
         let original = store.load_provider_messages(&key.store_key(), "L").unwrap();
-        for raw in [
-            r#"{ "role":"system", "content":"changed text" }"#,
-            r#"{ "role":"user", "content":"cache marker text" }"#,
-            r#"{ "role":"system", "content":[{"type":"text","text":"cache marker text","extra":true}] }"#,
-            r#"{ "role":"system", "content":[{"type":"text","text":"cache marker text"},{"type":"text","text":""}] }"#,
-            r#"{ "role":"system", "content":"cache marker text", "extra":true }"#,
-            if first == FORM_SCALAR {
-                r#"{ "content":[{"type":"text","text":"cache marker text"}], "role":"system" }"#
-            } else {
-                r#"{ "content":"cache marker text", "role":"system" }"#
-            },
-            if first == FORM_SCALAR {
-                r#"{ "role":"system",  "content":[{"type":"text","text":"cache marker text"}] }"#
-            } else {
-                r#"{ "role":"system",  "content":"cache marker text" }"#
-            },
-            if first == FORM_SCALAR {
-                r#"{"role":"system","content":"cache marker text"}"#
-            } else {
-                r#"{"role":"system","content":[{"type":"text","text":"cache marker text"}]}"#
-            },
-        ] {
+        for (turn, raw) in [flipped, first, flipped, first].into_iter().enumerate() {
+            let mut status = step(raw);
+            status["request_id"] = json!(format!("flip-{turn}"));
+            // `message` can describe the first-stored form while `raw_message`
+            // carries the form received from Claude Code on this turn.
+            status["messages"][0]["message"] = serde_json::from_str::<Value>(first).unwrap();
+            response(call(&h, "compaction.step", status).await);
             assert_eq!(
-                code(call(&h, "compaction.step", step(raw)).await),
+                store.load_provider_messages(&key.store_key(), "L").unwrap(),
+                original
+            );
+        }
+        let scalar = r#"{ "role":"assistant", "content":"hook text" }"#;
+        let blocks = r#"{ "role":"assistant", "content":[{"type":"text","text":"hook text"}] }"#;
+        let hook_first = if first == FORM_SCALAR { scalar } else { blocks };
+        let hook_flip = if first == FORM_SCALAR { blocks } else { scalar };
+        let mut first_answer = None;
+        for (turn, raw) in [hook_first, hook_flip, hook_first, hook_flip]
+            .into_iter()
+            .enumerate()
+        {
+            let hook = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":format!("hook-{turn}"),"params":plan(),"subject_mid":"hook","subject_ordinal":1,"message":serde_json::from_str::<Value>(hook_first).unwrap(),"raw_message":raw,"hook":"post_assistant","blocks":["hook text"]});
+            let answer = response(call(&h, "transform.hook", hook).await);
+            assert_admission_answer(&answer, tags_on, &[(0, 1)]);
+            if let Some(first) = &first_answer {
+                assert_eq!(&answer, first);
+            } else {
+                first_answer = Some(answer);
+            }
+            let mut status = step(first);
+            status["request_id"] = json!(format!("after-hook-{turn}"));
+            status["messages"].as_array_mut().unwrap().push(json!({"mid":"hook","ordinal":1,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw}));
+            status["newest"] = json!({"mid":"hook","ordinal":1});
+            response(call(&h, "compaction.step", status).await);
+            let held = store.load_provider_messages(&key.store_key(), "L").unwrap();
+            assert_eq!(held[0], original[0]);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&held[1].message_bytes).unwrap()["raw_message"],
+                hook_first
+            );
+            let served = if tags_on {
+                hook_first.replacen(r#""hook text""#, r#""§1§ hook text""#, 1)
+            } else {
+                hook_first.into()
+            };
+            assert_stored_and_served_raw(&h, "hook", hook_first, &served);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cc_known_mid_non_equivalent_changes_remain_conflicts() {
+    for tags_on in [false, true] {
+        for first in [FORM_SCALAR, FORM_BLOCKS] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = handler_with_admission_tags(dir.path(), tags_on);
+            setup(&h).await;
+            response(call(&h, "compaction.step", step(first)).await);
+            let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+            let store = h.store.get().unwrap();
+            let original = store.load_provider_messages(&key.store_key(), "L").unwrap();
+            for raw in [
+                r#"{ "role":"system", "content":"changed text" }"#,
+                r#"{ "role":"user", "content":"cache marker text" }"#,
+                r#"{ "role":"system", "content":[{"type":"text","text":"cache marker text","extra":true}] }"#,
+                r#"{ "role":"system", "content":[{"type":"text","text":"cache marker text"},{"type":"text","text":""}] }"#,
+                r#"{ "role":"system", "content":"cache marker text", "extra":true }"#,
+                if first == FORM_SCALAR {
+                    r#"{ "content":[{"type":"text","text":"cache marker text"}], "role":"system" }"#
+                } else {
+                    r#"{ "content":"cache marker text", "role":"system" }"#
+                },
+                if first == FORM_SCALAR {
+                    r#"{ "role":"system",  "content":[{"type":"text","text":"cache marker text"}] }"#
+                } else {
+                    r#"{ "role":"system",  "content":"cache marker text" }"#
+                },
+                if first == FORM_SCALAR {
+                    r#"{"role":"system","content":"cache marker text"}"#
+                } else {
+                    r#"{"role":"system","content":[{"type":"text","text":"cache marker text"}]}"#
+                },
+            ] {
+                assert_eq!(
+                    code(call(&h, "compaction.step", step(raw)).await),
+                    "invalid_params"
+                );
+                assert_eq!(
+                    store.load_provider_messages(&key.store_key(), "L").unwrap()[0],
+                    original[0]
+                );
+            }
+            let hook_raw = r#"{ "role":"assistant", "content":"original hook" }"#;
+            let mut hook = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"hook-original","params":plan(),"subject_mid":"hook","subject_ordinal":1,"message":serde_json::from_str::<Value>(hook_raw).unwrap(),"raw_message":hook_raw,"hook":"post_assistant","blocks":["original hook"]});
+            assert_admission_answer(
+                &response(call(&h, "transform.hook", hook.clone()).await),
+                tags_on,
+                &[(0, 1)],
+            );
+            let held = store.load_provider_messages(&key.store_key(), "L").unwrap();
+            let changed = r#"{ "role":"assistant", "content":[{"type":"text","text":"original hook","extra":true}] }"#;
+            hook["message"] = serde_json::from_str::<Value>(changed).unwrap();
+            hook["raw_message"] = json!(changed);
+            assert_eq!(
+                code(call(&h, "transform.hook", hook).await),
                 "invalid_params"
             );
             assert_eq!(
-                store.load_provider_messages(&key.store_key(), "L").unwrap()[0],
-                original[0]
+                store.load_provider_messages(&key.store_key(), "L").unwrap(),
+                held
             );
+            let served = if tags_on {
+                hook_raw.replacen(r#""original hook""#, r#""§1§ original hook""#, 1)
+            } else {
+                hook_raw.into()
+            };
+            assert_stored_and_served_raw(&h, "hook", hook_raw, &served);
         }
-        let hook_raw = r#"{ "role":"assistant", "content":"original hook" }"#;
-        let mut hook = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"hook-original","params":plan(),"subject_mid":"hook","subject_ordinal":1,"message":serde_json::from_str::<Value>(hook_raw).unwrap(),"raw_message":hook_raw,"hook":"post_assistant","blocks":["original hook"]});
-        assert_eq!(
-            response(call(&h, "transform.hook", hook.clone()).await)["answer"],
-            "pass"
-        );
-        let held = store.load_provider_messages(&key.store_key(), "L").unwrap();
-        let changed = r#"{ "role":"assistant", "content":[{"type":"text","text":"original hook","extra":true}] }"#;
-        hook["message"] = serde_json::from_str::<Value>(changed).unwrap();
-        hook["raw_message"] = json!(changed);
-        assert_eq!(
-            code(call(&h, "transform.hook", hook).await),
-            "invalid_params"
-        );
-        assert_eq!(
-            store.load_provider_messages(&key.store_key(), "L").unwrap(),
-            held
-        );
     }
 }
 

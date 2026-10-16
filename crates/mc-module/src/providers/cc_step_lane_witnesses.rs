@@ -86,83 +86,132 @@ fn fuzz_raw(seed: usize) -> String {
 
 #[tokio::test]
 async fn raw_fuzz_setup_step_admission_hook_and_identity_replacement() {
-    for seed in 0..36 {
-        let raw = fuzz_raw(seed);
-        let dir = tempfile::tempdir().unwrap();
-        let h = cc::handler(dir.path(), cc::thalamus());
-        assert_eq!(cc::setup(&h).await["initial"]["replacement"], json!([]));
-        let mut status = cc::step(&raw);
-        if serde_json::from_str::<Value>(&raw).unwrap()["role"] == "assistant" {
-            status["step_kind"] = json!("tool_step");
-        }
-        if seed % 6 == 5 {
-            let result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"result"}]}"#;
-            status["messages"].as_array_mut().unwrap().push(json!({"mid":"tool-result","ordinal":1,"message":serde_json::from_str::<Value>(result).unwrap(),"raw_message":result}));
-            status["newest"] = json!({"mid":"tool-result","ordinal":1});
-        }
-        let (answer, _) = response(cc::call(&h, "compaction.step", status).await);
-        assert!(
-            matches!(
-                answer["answer"].as_str(),
-                Some("noop" | "compaction_message")
-            ) || (matches!(seed % 6, 2 | 3)
-                && answer["answer"] == "refuse"
-                && answer["provider_code"] == "signed_prefix_edit"),
-            "seed {seed}: {answer}"
-        );
-        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
-        let held = h
-            .store
-            .get()
-            .unwrap()
-            .load_provider_messages(&key.store_key(), "L")
+    for tags_on in [false, true] {
+        for seed in 0..36 {
+            let raw = fuzz_raw(seed);
+            let dir = tempfile::tempdir().unwrap();
+            let h = cc::handler_with_admission_tags(dir.path(), tags_on);
+            assert_eq!(cc::setup(&h).await["initial"]["replacement"], json!([]));
+            let mut status = cc::step(&raw);
+            if serde_json::from_str::<Value>(&raw).unwrap()["role"] == "assistant" {
+                status["step_kind"] = json!("tool_step");
+            }
+            if seed % 6 == 5 {
+                let result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"result"}]}"#;
+                status["messages"].as_array_mut().unwrap().push(json!({"mid":"tool-result","ordinal":1,"message":serde_json::from_str::<Value>(result).unwrap(),"raw_message":result}));
+                status["newest"] = json!({"mid":"tool-result","ordinal":1});
+            }
+            let (answer, _) = response(cc::call(&h, "compaction.step", status).await);
+            assert!(
+                matches!(
+                    answer["answer"].as_str(),
+                    Some("noop" | "compaction_message")
+                ) || (matches!(seed % 6, 2 | 3)
+                    && answer["answer"] == "refuse"
+                    && answer["provider_code"] == "signed_prefix_edit"),
+                "seed {seed}: {answer}"
+            );
+            let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+            let held = h
+                .store
+                .get()
+                .unwrap()
+                .load_provider_messages(&key.store_key(), "L")
+                .unwrap();
+            let stored: Value = serde_json::from_slice(&held[0].message_bytes).unwrap();
+            assert_eq!(stored["raw_message"], raw, "seed {seed}");
+            assert_eq!(
+                stored["message"],
+                serde_json::from_str::<Value>(&raw).unwrap()
+            );
+            let request = request(&[compact::status::StatusMessage {
+                raw_message: None,
+                mid: "m".into(),
+                ordinal: 0,
+                message: stored,
+            }]);
+            let (wire, encoded) =
+                codec_claude_code::encode_view(&view(&request), &request, None).unwrap();
+            assert_eq!(encoded, vec![raw.clone()], "seed {seed}");
+            let bytes = codec_claude_code::answer_bytes(
+                &json!({"answer":"compaction_message","compaction":wire}),
+                &encoded,
+            )
             .unwrap();
-        let stored: Value = serde_json::from_slice(&held[0].message_bytes).unwrap();
-        assert_eq!(stored["raw_message"], raw, "seed {seed}");
-        assert_eq!(
-            stored["message"],
-            serde_json::from_str::<Value>(&raw).unwrap()
-        );
-        let request = request(&[compact::status::StatusMessage {
-            raw_message: None,
-            mid: "m".into(),
-            ordinal: 0,
-            message: stored,
-        }]);
-        let (wire, encoded) =
-            codec_claude_code::encode_view(&view(&request), &request, None).unwrap();
-        assert_eq!(encoded, vec![raw.clone()], "seed {seed}");
-        let bytes = codec_claude_code::answer_bytes(
-            &json!({"answer":"compaction_message","compaction":wire}),
-            &encoded,
-        )
-        .unwrap();
-        let bytes = String::from_utf8(bytes).unwrap();
-        assert!(
-            bytes.contains(&format!("\"replacement\":[{raw}]")),
-            "raw answer seed {seed}"
-        );
-        let hook = if request.messages[0].ck.role == "user" {
-            "pre_user"
-        } else {
-            "post_assistant"
-        };
-        let blocks = request.messages[0]
-            .ck
-            .content
-            .iter()
-            .filter_map(|block| match &block.kind {
-                CkKind::Text { text } => Some(text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let params = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"hook","subject_mid":"m","subject_ordinal":0,"message":serde_json::from_str::<Value>(&raw).unwrap(),"raw_message":raw,"hook":hook,"blocks":blocks});
-        assert_eq!(
-            response(cc::call(&h, "transform.hook", params).await).0["answer"],
-            "pass"
-        );
+            let bytes = String::from_utf8(bytes).unwrap();
+            assert!(
+                bytes.contains(&format!("\"replacement\":[{raw}]")),
+                "raw answer seed {seed}"
+            );
+            let hook = if request.messages[0].ck.role == "user" {
+                "pre_user"
+            } else {
+                "post_assistant"
+            };
+            let blocks = request.messages[0]
+                .ck
+                .content
+                .iter()
+                .filter_map(|block| match &block.kind {
+                    CkKind::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let params = json!({"session":"cc","harness":"claude-code","lineage_id":"L","step_id":"hook","subject_mid":"m","subject_ordinal":0,"message":serde_json::from_str::<Value>(&raw).unwrap(),"raw_message":raw,"hook":hook,"blocks":blocks});
+            let tagged = tags_on && matches!(seed % 6, 0..=3);
+            let answer = response(cc::call(&h, "transform.hook", params.clone()).await).0;
+            cc::assert_admission_answer(&answer, tagged, &[(0, 1)]);
+            assert_eq!(
+                response(cc::call(&h, "transform.hook", params).await).0,
+                answer
+            );
+            let expected = if tagged {
+                prefixed_fuzz_raw(&raw, seed, 1)
+            } else {
+                raw.clone()
+            };
+            cc::assert_stored_and_served_raw(&h, "m", &raw, &expected);
+            let tags = if tagged {
+                BTreeMap::from([(
+                    format!("m#{}", if matches!(seed % 6, 2 | 3) { 1 } else { 0 }),
+                    1,
+                )])
+            } else {
+                BTreeMap::new()
+            };
+            let (wire, encoded) = codec_claude_code::encode_view_with_baseline(
+                &view(&request),
+                &request,
+                None,
+                &tags,
+            )
+            .unwrap();
+            assert_eq!(
+                encoded.as_slice(),
+                std::slice::from_ref(&expected),
+                "served seed {seed}"
+            );
+            let served = codec_claude_code::answer_bytes(
+                &json!({"answer":"compaction_message","compaction":wire}),
+                &encoded,
+            )
+            .unwrap();
+            assert!(String::from_utf8(served)
+                .unwrap()
+                .contains(&format!("\"replacement\":[{expected}]")));
+        }
     }
-    eprintln!("REVIEW raw fuzz: 36 setup/step-admission/store/identity-encode/hook cases; 589824-byte escaped signature at seed 26; signed steps may safely refuse");
+    eprintln!("REVIEW raw fuzz: 36 setup/step-admission/store/identity-encode/hook/retry cases each with tags off and on; 589824-byte escaped signature at seed 26; signed steps may safely refuse");
+}
+
+fn prefixed_fuzz_raw(raw: &str, seed: usize, number: i64) -> String {
+    let needle = if matches!(seed % 6, 2 | 3) {
+        "\"after"
+    } else {
+        r#""a\u0062"#
+    };
+    assert_eq!(raw.matches(needle).count(), 1);
+    raw.replacen(needle, &format!("\"§{number}§ {}", &needle[1..]), 1)
 }
 
 #[test]
@@ -355,67 +404,97 @@ fn whole_message_cuts_and_opaque_thinking_preserve_fences() {
 
 #[tokio::test]
 async fn provider_committed_replacement_keeps_noncanonical_unsigned_tail() {
-    for seed in [0, 1, 4, 12, 13, 16] {
-        let raw = fuzz_raw(seed);
-        let dir = tempfile::tempdir().unwrap();
-        let h = cc::handler(dir.path(), cc::thalamus());
-        cc::setup(&h).await;
-        let mut status = cc::step(r#"{"role":"user","content":"settled history"}"#);
-        status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        status["messages"].as_array_mut().unwrap().push(json!({"mid":"tail","ordinal":1,"message":serde_json::from_str::<Value>(&raw).unwrap(),"raw_message":raw}));
-        status["newest"] = json!({"mid":"tail","ordinal":1});
-        let (first, _) = response(cc::call(&h, "compaction.step", status.clone()).await);
-        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
-        let store = h.store.get().unwrap();
-        store
-            .replace_compartments(
-                &key.engine_key(),
-                &[mc_store::StoredCompartment {
-                    sequence: 1,
-                    start_message: 0,
-                    end_message: 0,
-                    end_message_id: "m#0".into(),
-                    title: "history".into(),
-                    content: "summary".into(),
-                    p1: Some("summary".into()),
-                    importance: 50,
-                    ..Default::default()
-                }],
-            )
-            .unwrap();
-        status["request_id"] = json!("cold");
-        status["prefix_rebuilding"] = json!({"reason":"expired_cache"});
-        if first["answer"] == "compaction_message" {
-            status["last_applied"] = json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
-        }
-        let (answer, bytes) = response(cc::call(&h, "compaction.step", status).await);
-        assert_eq!(
-            answer["answer"], "compaction_message",
-            "seed {seed}: {answer}"
-        );
-        let committed = store
-            .load_provider_view(
-                &key.store_key(),
-                answer["compaction"]["version"].as_u64().unwrap(),
-            )
-            .unwrap()
-            .unwrap();
-        let frozen: Value = serde_json::from_str(&committed.replacement_json).unwrap();
-        assert!(frozen["raw_replacement"]
-            .as_array()
-            .unwrap()
-            .contains(&json!(raw)));
-        let wire = String::from_utf8(bytes).unwrap();
-        assert!(
-            wire.contains(&raw),
-            "seed {seed} committed raw absent from wire"
-        );
-        assert_eq!(frozen["head_slots"].as_array().unwrap().len(), 2);
-        for slot in frozen["head_slots"].as_array().unwrap() {
-            let index = slot["index"].as_u64().unwrap() as usize;
-            let committed_raw = frozen["raw_replacement"][index].as_str().unwrap();
-            assert_eq!(slot["bytes_sha256"], sha256_hex(committed_raw.as_bytes()));
-            assert_eq!(slot["byte_length"], committed_raw.len());
+    for tags_on in [false, true] {
+        for seed in [0, 1, 4, 12, 13, 16] {
+            let raw = fuzz_raw(seed);
+            let dir = tempfile::tempdir().unwrap();
+            let h = cc::handler_with_admission_tags(dir.path(), tags_on);
+            cc::setup(&h).await;
+            let mut status = cc::step(r#"{"role":"user","content":"settled history"}"#);
+            status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+            status["messages"].as_array_mut().unwrap().push(json!({"mid":"tail","ordinal":1,"message":serde_json::from_str::<Value>(&raw).unwrap(),"raw_message":raw}));
+            status["newest"] = json!({"mid":"tail","ordinal":1});
+            let (first, _) = response(cc::call(&h, "compaction.step", status.clone()).await);
+            let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+            let store = h.store.get().unwrap();
+            store
+                .replace_compartments(
+                    &key.engine_key(),
+                    &[mc_store::StoredCompartment {
+                        sequence: 1,
+                        start_message: 0,
+                        end_message: 0,
+                        end_message_id: "m#0".into(),
+                        title: "history".into(),
+                        content: "summary".into(),
+                        p1: Some("summary".into()),
+                        importance: 50,
+                        ..Default::default()
+                    }],
+                )
+                .unwrap();
+            status["request_id"] = json!("cold");
+            status["prefix_rebuilding"] = json!({"reason":"expired_cache"});
+            if first["answer"] == "compaction_message" {
+                status["last_applied"] = json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
+            }
+            let (answer, bytes) = response(cc::call(&h, "compaction.step", status).await);
+            assert_eq!(
+                answer["answer"], "compaction_message",
+                "seed {seed}: {answer}"
+            );
+            let committed = store
+                .load_provider_view(
+                    &key.store_key(),
+                    answer["compaction"]["version"].as_u64().unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            let frozen: Value = serde_json::from_str(&committed.replacement_json).unwrap();
+            // Replacing old history with a summary also permits first tag prefixes
+            // on kept unsigned text. Whitespace, escapes and field order must stay intact.
+            let expected_raw = if tags_on && seed % 6 != 4 {
+                let answers = store.load_provider_hook_answers(&key.store_key()).unwrap();
+                let tags = answers
+                    .iter()
+                    .filter(|answer| answer.state != "burned")
+                    .flat_map(|answer| &answer.answer.tags)
+                    .filter(|tag| tag.block_id == "tail#0")
+                    .collect::<Vec<_>>();
+                assert_eq!(tags.len(), 1);
+                prefixed_fuzz_raw(&raw, seed, tags[0].number)
+            } else {
+                raw.clone()
+            };
+            assert_eq!(
+                frozen["raw_replacement"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap(),
+                &json!(expected_raw)
+            );
+            let messages = store.load_provider_messages(&key.store_key(), "L").unwrap();
+            let tail = messages
+                .iter()
+                .find(|message| message.mid == "tail")
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&tail.message_bytes).unwrap()["raw_message"],
+                raw
+            );
+            let wire = String::from_utf8(bytes).unwrap();
+            assert!(
+                wire.contains(&expected_raw),
+                "seed {seed} committed raw absent from wire"
+            );
+            assert_eq!(frozen["head_slots"].as_array().unwrap().len(), 2);
+            for slot in frozen["head_slots"].as_array().unwrap() {
+                let index = slot["index"].as_u64().unwrap() as usize;
+                let committed_raw = frozen["raw_replacement"][index].as_str().unwrap();
+                assert_eq!(slot["bytes_sha256"], sha256_hex(committed_raw.as_bytes()));
+                assert_eq!(slot["byte_length"], committed_raw.len());
+            }
         }
     }
     eprintln!("REVIEW actual provider wire: 6 cold-rebuild committed replacements preserve unsigned raw tail and hash committed head bytes");

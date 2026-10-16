@@ -162,13 +162,22 @@ async fn check_case(name: &str) {
             );
         } else {
             let answer = accepted(outcome);
-            assert!(
-                matches!(
-                    answer["answer"].as_str(),
-                    Some("ready" | "noop" | "compaction_message" | "pass")
-                ),
-                "{name} call {index}: {answer}"
-            );
+            if method == "transform.hook" {
+                let pins = h.native_pins();
+                crate::providers::claude_code_tests::assert_admission_answer(
+                    &answer,
+                    pins.canonical_reduce && pins.guidance,
+                    &[(0, 1)],
+                );
+            } else {
+                assert!(
+                    matches!(
+                        answer["answer"].as_str(),
+                        Some("ready" | "noop" | "compaction_message" | "pass")
+                    ),
+                    "{name} call {index}: {answer}"
+                );
+            }
         }
         HISTORY_CHECKS.with(|count| {
             assert_eq!(
