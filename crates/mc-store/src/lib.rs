@@ -18336,6 +18336,7 @@ mod tests {
     // Adversarial gate over the claim-lane migration and the single-store marker
     // migration as one merged chain.
     mod gate_a1_b0;
+    mod migration_train;
     mod perf_audit;
     mod tag_cache_migration;
 
