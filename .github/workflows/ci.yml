@@ -810,7 +810,7 @@ jobs:
 
       # drive-fault compiles the crash point used by the real-daemon retry case.
       - name: Test Broca conformance
-        run: cargo test -p mc-module --test broca_conformance --features drive-fault
+        run: cargo test --locked -p mc-module --test broca_conformance --features drive-fault --no-fail-fast
 
   rust-workspace-crates:
     name: Rust (remaining crates)
@@ -843,9 +843,9 @@ jobs:
         run: |
           mkdir -p ci-rust-lib
           cargo nextest --version
-          cargo nextest archive --locked -p mc-module --lib --archive-file ci-rust-lib/archive.tar.zst
-          cargo test --locked -p mc-module --lib -- --list > ci-rust-lib/cargo-list.txt
-          cargo test --locked -p mc-module --lib -- --list --ignored > ci-rust-lib/cargo-ignored.txt
+          cargo nextest archive --locked -p mc-module --lib --cargo-profile ci-test --archive-file ci-rust-lib/archive.tar.zst
+          cargo test --locked -p mc-module --lib --profile ci-test -- --list > ci-rust-lib/cargo-list.txt
+          cargo test --locked -p mc-module --lib --profile ci-test -- --list --ignored > ci-rust-lib/cargo-ignored.txt
           cargo nextest list --archive-file ci-rust-lib/archive.tar.zst --run-ignored all --message-format json > ci-rust-lib/all.json
           for shard in 1 2 3 4; do
             cargo nextest list --archive-file ci-rust-lib/archive.tar.zst --run-ignored all --partition "hash:$shard/4" -E "not ($MC_PARITY_FILTER)" --message-format json > "ci-rust-lib/lib-$shard.json"

@@ -71,7 +71,6 @@ afterEach(() => {
 	if (originalConfigPath === undefined)
 		delete process.env.MAGIC_CONTEXT_CONFIG_PATH;
 	else process.env.MAGIC_CONTEXT_CONFIG_PATH = originalConfigPath;
-	setWindowOverlayPath(undefined);
 	if (originalHome === undefined) {
 		delete process.env.HOME;
 	} else {

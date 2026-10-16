@@ -48,7 +48,6 @@ pub fn executable_root_for_tmpdir(
     }
 }
 
-
 struct StageFailure {
     kind: io::ErrorKind,
     message: String,

@@ -29,6 +29,8 @@ import {
 } from "../../shared/sqlite-write-locker-test-support";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { createDbLkgPersistence, saveLkgSlotToDb } from "./lkg-persist";
+import { lkgServedArrayDigest } from "./lkg-recovery-fence";
+import { lkgDirtyRevision } from "./lkg-recovery-prefix";
 import { checkLkgDurability, readServedMarker } from "./lkg-served-marker";
 import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
 import { setRawMessageProvider } from "./read-session-chunk";
@@ -288,7 +290,15 @@ describe("Rust-mode compaction target recording under cross-process write conten
             expect(latest.servedCaptureId).toBeUndefined();
             // The lock is now released, allowing the deferred row to carry its
             // null id durably. A move must rebuild rather than borrow a marker.
-            expect(saveLkgSlotToDb(db, sessionId, latest)).toBe(true);
+            expect(() => saveLkgSlotToDb(db, sessionId, latest)).toThrow(
+                "A concurrent recovery requires a declared prefix rebuild",
+            );
+            const revision = lkgDirtyRevision(sessionId);
+            expect(saveLkgSlotToDb(db, sessionId, latest, undefined, {
+                ownDirtyRevision: revision,
+                requiredRevision: revision,
+                cleanDigest: lkgServedArrayDigest(latest.jsonPrefix),
+            })).toBe(true);
             expect(checkLkgDurability(db, sessionId)).toEqual({
                 durable: true,
                 servedCaptureId: null,

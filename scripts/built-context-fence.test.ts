@@ -5,7 +5,7 @@ import { join } from "node:path";
 // Inspect emitted declarations rather than source imports: a stale cached chunk
 // can ship a different schema ceiling even when the source fence is correct.
 for (const pkg of ["plugin", "pi-plugin", "cli"]) {
-    test(`built ${pkg} context fence is 92`, () => {
+    test(`built ${pkg} context fence is 100`, () => {
         const dist = join(import.meta.dir, "..", "packages", pkg, "dist");
         const declarations: { file: string; version: number }[] = [];
         for (const file of new Bun.Glob("**/*.js").scanSync(dist)) {
@@ -15,6 +15,6 @@ for (const pkg of ["plugin", "pi-plugin", "cli"]) {
             }
         }
         expect(declarations.length).toBeGreaterThan(0);
-        expect(declarations.filter(({ version }) => version !== 92)).toEqual([]);
+        expect(declarations.filter(({ version }) => version !== 100)).toEqual([]);
     });
 }

@@ -36,8 +36,10 @@ fn todo_admission_holds_replacement_clear_and_captured_state_then_releases() {
         true,
     );
     let release = EditAdmission::new(&[], true);
-    let mut persisted = ModuleMeta::default();
-    persisted.last_todo_state = Some(old_state);
+    let mut persisted = ModuleMeta {
+        last_todo_state: Some(old_state),
+        ..ModuleMeta::default()
+    };
     let seed = persisted.clone();
     advance_synthetic_todo(&mut persisted, true, None, false, &req, &release, &seed).unwrap();
     persisted.synthetic_todo.as_mut().unwrap().anchor_mid = Some("old".into());
@@ -88,9 +90,12 @@ fn todo_admission_prices_both_anchors_and_missing_anchor_clears() {
         ],
         true,
     );
-    let mut meta = ModuleMeta::default();
-    meta.last_todo_state =
-        Some(json!([{"content":"Work","status":"pending","priority":"high"}]).to_string());
+    let meta = ModuleMeta {
+        last_todo_state: Some(
+            json!([{"content":"Work","status":"pending","priority":"high"}]).to_string(),
+        ),
+        ..ModuleMeta::default()
+    };
     let InjectionOutcome::Replace(pair) =
         advance_injection_from_meta(&meta, None, true, Some(true))
     else {

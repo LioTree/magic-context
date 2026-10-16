@@ -1867,6 +1867,7 @@ fn composed_own_lines(fixture: &Fixture, project: &str) -> BTreeMap<String, usiz
         covered_system_messages: &[],
         memory_enabled: true,
         memory_budget_tokens: 1e15,
+        score_selector: mc_store::ScoreSelector::Base,
         user_profile_budget_tokens: 0.0,
         inject_docs: false,
         temporal_awareness: true,
