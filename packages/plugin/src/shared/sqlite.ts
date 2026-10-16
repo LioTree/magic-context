@@ -400,6 +400,10 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             }
             if (WRITER_TRANSACTION_END.test(sql) && openWriterTransactions.has(db))
                 return endWriterTransaction(db, () => nativeExec(sql), sql);
+            // A deferred BEGIN only opens a read snapshot; it acquires no writer.
+            // Do not spend or rewrite the foreground writer timeout for that read.
+            if (/^\s*BEGIN(?:\s+DEFERRED)?(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql))
+                return nativeExec(sql);
             if (
                 !/^\s*(?:SELECT|EXPLAIN|PRAGMA|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(sql)
             ) {

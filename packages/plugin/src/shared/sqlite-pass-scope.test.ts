@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -115,6 +115,25 @@ test("a foreground in-pass writer has bounded 250ms tolerance and restores its t
     } finally {
         blocker.exec("ROLLBACK");
         blocker.close();
+        close();
+    }
+});
+
+test("foreground deferred read snapshots do not change the writer timeout", () => {
+    const { db, close } = fixture();
+    const exec = spyOn(db, "exec");
+    try {
+        withSqliteTransformPass(() => {
+            const read = () => db.prepare("SELECT COUNT(*) AS count FROM context_privilege_state").get();
+            expect(db.transaction(read).deferred()).toEqual({ count: 0 });
+            db.exec("BEGIN");
+            expect(read()).toEqual({ count: 0 });
+            db.exec("COMMIT");
+        });
+        expect(exec.mock.calls.filter(([sql]) => /^PRAGMA busy_timeout=/i.test(sql))).toEqual([]);
+        expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+    } finally {
+        exec.mockRestore();
         close();
     }
 });
