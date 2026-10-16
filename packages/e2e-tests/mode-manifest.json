@@ -19,6 +19,14 @@
             "hosts": ["opencode2"]
         },
         {
+            "path": "tests/processed-images.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 1 user and tool images reach the mock provider first, then lose their bytes only after an admitted positive-watermark rewrite and remain stripped on replay. OpenCode 2, Pi and Rust have adapter and module unit coverage.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/pi-tree-history.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

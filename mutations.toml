@@ -107,8 +107,8 @@ guards = 'processed images are newly stripped only when the current mode permits
 file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
 old = '''
                 detect:
-                    (holdEnabled ? isCacheBustingPass : canEditWholePrefix) && args.watermark > 0,'''
-new = 'detect: args.watermark > 0,'
+                    (holdEnabled ? isCacheBustingPass : canEditWholePrefix) && imageWatermark > 0,'''
+new = 'detect: imageWatermark > 0,'
 test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
 runner = 'command'
 command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']

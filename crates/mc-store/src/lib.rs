@@ -65,6 +65,7 @@ pub mod score_projection;
 pub mod single_store_domain;
 pub mod single_store_schema;
 pub use score_projection::{CompartmentScoreSnapshot, ScoreSelector, RESCORE_RUBRIC_VERSION};
+pub mod writer_diagnostics;
 
 pub use single_store_domain::{ContextDomain, SqliteContextDomain};
 

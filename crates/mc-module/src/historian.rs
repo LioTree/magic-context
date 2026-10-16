@@ -4365,6 +4365,8 @@ mod tests {
             native_fold_hygiene: None,
             native_fold_output: None,
             native_fold_projection: None,
+            raw_replay_rebuild: None,
+            served_raw_block_ids: Vec::new(),
             cache_ttl: None,
             effective_execute_threshold: None,
             auto_search_enabled: true,
