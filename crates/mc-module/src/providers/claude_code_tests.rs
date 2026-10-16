@@ -210,6 +210,15 @@ fn response(outcome: HandlerOutcome) -> Value {
     };
     serde_json::from_slice(&bytes).unwrap()
 }
+async fn session_status(h: &McHandler) -> Value {
+    response(
+        h.dispatch_value(
+            7,
+            json!({"method":"session.status","v":1,"session_id":"cc"}),
+        )
+        .await,
+    )
+}
 fn code(outcome: HandlerOutcome) -> String {
     match outcome {
         HandlerOutcome::Error { code, .. } | HandlerOutcome::ErrorWithDetail { code, .. } => code,
@@ -903,6 +912,28 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
         .expect("the defer CC pass reaches the engine");
     assert!((normal_pressure.0 - (1_000.0 / 167_000.0 * 100.0)).abs() < 0.001);
     assert_eq!(normal["answer"], "noop", "{normal}");
+    let status = session_status(&h).await;
+    assert_eq!(status["step_lane"]["last_step"]["outcome"], "noop");
+    assert_eq!(status["step_lane"]["last_step"]["reason"], "no_replacement");
+    assert_eq!(
+        status["step_lane"]["last_step"]["prefix_rebuilding_reason"],
+        Value::Null
+    );
+    assert_eq!(
+        status["step_lane"]["last_step"]["replacement_range"],
+        Value::Null
+    );
+    assert!(status["step_lane"]["last_step"]["at_ms"].as_i64().is_some());
+    assert_eq!(
+        status["step_lane"]["queued_drops"]["tag_ids"],
+        json!([result_tag.tag_number])
+    );
+    assert_eq!(status["step_lane"]["queued_drops"]["total_count"], 1);
+    assert_eq!(status["step_lane"]["applied_drops_last_step"], 0);
+    assert_eq!(
+        status["step_lane"]["protected_tokens"]["provenance"],
+        "derived"
+    );
     assert!(store
         .load_pending_agent_drops(&key.engine_key())
         .unwrap()
@@ -923,6 +954,23 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
         .expect("the CC engine measured the request against usable_soft");
     assert!((pressure.0 - (tokens as f64 / soft as f64 * 100.0)).abs() < 0.001);
     assert_eq!(second["answer"], "compaction_message", "{second}");
+    let status = session_status(&h).await;
+    assert_eq!(
+        status["step_lane"]["last_step"]["outcome"],
+        "compaction_message"
+    );
+    assert_eq!(status["step_lane"]["last_step"]["reason"], "replacement");
+    assert_eq!(
+        status["step_lane"]["last_step"]["prefix_rebuilding_reason"],
+        Value::Null
+    );
+    assert_eq!(
+        status["step_lane"]["last_step"]["replacement_range"]["lineage_id"],
+        "L"
+    );
+    assert_eq!(status["step_lane"]["queued_drops"]["tag_ids"], json!([]));
+    assert_eq!(status["step_lane"]["queued_drops"]["total_count"], 0);
+    assert_eq!(status["step_lane"]["applied_drops_last_step"], 1);
     assert_eq!(second["compaction"]["range"], json!({"from":0,"to":11}));
     assert_eq!(
         second["coverage"],
@@ -1004,6 +1052,63 @@ async fn queued_native_drop_without_broca(pressure: Option<(u64, u64)>) {
                 block["type"] == "tool_result" && block["tool_use_id"] == "read-1"
             })));
     }
+}
+
+#[tokio::test]
+async fn cc_step_lane_status_reports_user_floor_and_is_null_without_attestation() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), thalamus());
+    let mut binding = binding(dir.path(), thalamus());
+    binding.config.protected_tokens_user = Some(321);
+    h.bind_route(7, binding.clone());
+    setup(&h).await;
+    let answer = response(
+        call(
+            &h,
+            "compaction.step",
+            step(r#"{"role":"user","content":"floor provenance"}"#),
+        )
+        .await,
+    );
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+
+    let status_key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    let before = h
+        .store
+        .get()
+        .unwrap()
+        .load_provider_conversation(&status_key.store_key())
+        .unwrap()
+        .unwrap();
+    let status = session_status(&h).await;
+    assert_eq!(status["step_lane"]["protected_tokens"]["floor"], 321);
+    assert_eq!(
+        status["step_lane"]["protected_tokens"]["provenance"],
+        "user"
+    );
+    let after = h
+        .store
+        .get()
+        .unwrap()
+        .load_provider_conversation(&status_key.store_key())
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.last_answer_json, after.last_answer_json);
+    assert_eq!(before.hook_counters_json, after.hook_counters_json);
+    let last_step = status["step_lane"]["last_step"].clone();
+    setup(&h).await;
+    assert_eq!(
+        session_status(&h).await["step_lane"]["last_step"],
+        last_step
+    );
+
+    let mut unattested = binding;
+    unattested.principal = None;
+    h.bind_route(7, unattested);
+    assert_eq!(session_status(&h).await["step_lane"], Value::Null);
 }
 
 async fn fold_with_catalog(db_root: &Path, route_root: &Path, window: Option<u64>) -> Vec<Value> {

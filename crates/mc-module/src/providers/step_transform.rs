@@ -402,23 +402,6 @@ impl McHandler {
             }
         }
         let count: usize = reasons.values().sum();
-        if count > 0 {
-            let first = store
-                .update_provider_hook_counters(&key.store_key(), |counters| {
-                    let first = counters["pending_logged"] != true;
-                    counters["pending_logged"] = json!(true);
-                    first
-                })
-                .map_err(transient)?;
-            if first == Some(true) {
-                tracing::info!(
-                    "mc-module: cc_pending session={} count={} reasons={:?}",
-                    key.session,
-                    count,
-                    reasons
-                );
-            }
-        }
         Ok(json!({"count":count,"reasons":reasons}))
     }
 
@@ -3009,7 +2992,7 @@ mod admission_hook_tests {
             pending(&h),
             json!({"count":2,"reasons":{"freshness_unproven":2}})
         );
-        assert_eq!(counters(&h, &key)["pending_logged"], true);
+        assert!(counters(&h, &key).get("pending_logged").is_none());
     }
 
     #[tokio::test]
@@ -3174,7 +3157,7 @@ mod admission_hook_tests {
     }
 
     #[tokio::test]
-    async fn cc_pending_log_line_is_once_across_events_and_restart() {
+    async fn cc_pending_status_is_read_only_across_events_and_restart() {
         #[derive(Clone)]
         struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Writer {
@@ -3211,13 +3194,13 @@ mod admission_hook_tests {
             );
             assert_eq!(pending(&h)["count"], 2);
             assert_eq!(pending(&h)["count"], 2);
-            assert_eq!(counters(&h, &key)["pending_logged"], true);
+            assert!(counters(&h, &key).get("pending_logged").is_none());
             drop(h);
             let restarted = handler(dir.path(), thalamus());
             assert_eq!(pending(&restarted)["count"], 2);
         });
         let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        assert_eq!(log.matches("mc-module: cc_pending").count(), 1, "{log}");
+        assert!(!log.contains("mc-module: cc_pending"), "{log}");
     }
 
     #[tokio::test]
@@ -3291,7 +3274,7 @@ mod admission_hook_tests {
             )
             .unwrap();
         assert_eq!(pending(&h), first);
-        assert_eq!(counters(&h, &key)["pending_logged"], true);
+        assert!(counters(&h, &key).get("pending_logged").is_none());
         assert_eq!(
             h.claude_code_pending_status(&super::super::claude_code_tests::binding(
                 std::path::Path::new("/unrelated"),

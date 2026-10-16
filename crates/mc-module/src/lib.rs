@@ -9029,11 +9029,16 @@ impl McHandler {
             Ok(status) => status,
             Err(outcome) => return outcome,
         };
+        let step_lane = match self.claude_code_step_lane_status(&binding) {
+            Ok(status) => status,
+            Err(outcome) => return outcome,
+        };
         let response = json!({
             "ok": true,
             "summary": summary,
             "cc_pending": cc_pending,
             "admission_tags": admission_tags,
+            "step_lane": step_lane,
             "wrapup_active": wrapup_active.is_some(),
             "wrapup_rounds": wrapup_active,
             "coverage_ordinal": loaded.meta.coverage_ordinal,
