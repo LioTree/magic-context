@@ -77,9 +77,21 @@ pub(super) fn assert_stored_and_served_raw(
     ingress_raw: &str,
     served_raw: &str,
 ) {
+    assert_stored_and_served_raw_in_lineage(h, "L", mid, ingress_raw, served_raw);
+}
+
+pub(super) fn assert_stored_and_served_raw_in_lineage(
+    h: &McHandler,
+    lineage: &str,
+    mid: &str,
+    ingress_raw: &str,
+    served_raw: &str,
+) {
     let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
     let store = h.store.get().unwrap();
-    let messages = store.load_provider_messages(&key.store_key(), "L").unwrap();
+    let messages = store
+        .load_provider_messages(&key.store_key(), lineage)
+        .unwrap();
     let message = messages.iter().find(|message| message.mid == mid).unwrap();
     let stored: Value = serde_json::from_slice(&message.message_bytes).unwrap();
     assert_eq!(stored["raw_message"], ingress_raw);

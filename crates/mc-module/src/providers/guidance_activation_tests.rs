@@ -355,3 +355,102 @@ async fn compiled_candidate_controls_new_plan_tagging() {
     )
     .await;
 }
+
+async fn retained_auto_tag_conversation(auto_tag: Option<bool>, descend: bool) {
+    let enabled = auto_tag == Some(true);
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = pins("retained-auto-tag");
+    p.canonical_reduce = true;
+    p.guidance = true;
+    let h = handler(dir.path(), &p);
+    cc::setup(&h).await;
+    let k = key(&h);
+    h.store
+        .get()
+        .unwrap()
+        .update_provider_hook_counters(&k.store_key(), |c| {
+            if let Some(value) = auto_tag {
+                c["auto_tag"] = json!(value);
+            } else {
+                c.as_object_mut().unwrap().remove("auto_tag");
+            }
+        })
+        .unwrap();
+    let raw = r#"{"role":"user","content":"prefix"}"#;
+    let hook = |lineage: &str, mid: &str, ordinal: u64| {
+        json!({
+            "session":"cc","harness":"claude-code","lineage_id":lineage,"step_id":"hook",
+            "params":{"serializer_profile":"claude-code-anthropic","observation":"answer"},
+            "subject_mid":mid,"subject_ordinal":ordinal,"message":{"role":"user","content":"prefix"},
+            "raw_message":raw,"hook":"pre_user","blocks":["prefix"]
+        })
+    };
+    let first = value(cc::call(&h, "transform.hook", hook("L", "prefix", 0)).await);
+    cc::assert_admission_answer(&first, enabled, &[(0, 1)]);
+    cc::assert_stored_and_served_raw(
+        &h,
+        "prefix",
+        raw,
+        if enabled {
+            r#"{"role":"user","content":"§1§ prefix"}"#
+        } else {
+            raw
+        },
+    );
+    if descend {
+        let mut ingest = cc::step(raw);
+        ingest["messages"] = json!([
+            {"mid":"prefix","ordinal":0,"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw},
+            {"mid":"suffix","ordinal":1,"message":{"role":"user","content":"suffix"},"raw_message":r#"{"role":"user","content":"suffix"}"#}
+        ]);
+        ingest["newest"] = json!({"mid":"suffix","ordinal":1});
+        ingest["served_through_ordinal"] = json!(0);
+        let produced = value(cc::call(&h, "compaction.step", ingest.clone()).await);
+        assert_eq!(produced["compaction"]["range"], json!({"from":0,"to":2}));
+        ingest["last_applied"] = json!({"compaction_id":produced["compaction"]["compaction_id"],"version":produced["compaction"]["version"]});
+        ingest["request_id"] = json!("ack");
+        value(cc::call(&h, "compaction.step", ingest).await);
+    }
+    h.bind_route(7, cc::binding(dir.path(), cc::thalamus()));
+    cc::setup(&h).await;
+    if descend {
+        value(cc::call(&h, "compaction.setup", json!({
+            "session":"cc","harness":"claude-code","request_id":"fork",
+            "params":{"serializer_profile":"claude-code-anthropic","observation":"answer"},
+            "preset":"head","model":"fixture","context_window":100000,"composition":{},
+            "lineage_id":"child","descends_from":{"lineage_id":"L","through_ordinal":0},"now":3
+        })).await);
+    }
+    assert_eq!(
+        status(&h).await,
+        json!({"enabled":enabled,"reason":if enabled {"enabled"} else {"plan_predates_auto_tag"}})
+    );
+    let lineage = if descend { "child" } else { "L" };
+    let answer = value(cc::call(&h, "transform.hook", hook(lineage, "new", 1)).await);
+    cc::assert_admission_answer(&answer, enabled, &[(0, 2)]);
+    cc::assert_stored_and_served_raw_in_lineage(
+        &h,
+        lineage,
+        "new",
+        raw,
+        if enabled {
+            r#"{"role":"user","content":"§2§ prefix"}"#
+        } else {
+            raw
+        },
+    );
+}
+
+#[tokio::test]
+async fn auto_tag_survives_new_client_redeclare() {
+    for auto_tag in [Some(true), Some(false), None] {
+        retained_auto_tag_conversation(auto_tag, false).await;
+    }
+}
+
+#[tokio::test]
+async fn auto_tag_descendant_inherits_enabled_and_disabled() {
+    for auto_tag in [Some(true), Some(false), None] {
+        retained_auto_tag_conversation(auto_tag, true).await;
+    }
+}

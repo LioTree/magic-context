@@ -2036,7 +2036,16 @@ impl McHandler {
                         .reset_session_for_recomp(&conversation.engine_namespace, row_version)
                         .map_err(transient)?;
                 }
-                conversation.hook_counters_json = "{}".into();
+                // Automatic tagging belongs to the conversation's frozen plan,
+                // not the engine prefix being discarded. Preserve absence too:
+                // legacy conversations must not opt in during a lineage switch.
+                let counters: Value =
+                    serde_json::from_str(&conversation.hook_counters_json).map_err(transient)?;
+                let mut retained = json!({});
+                if let Some(auto_tag) = counters.get("auto_tag") {
+                    retained["auto_tag"] = auto_tag.clone();
+                }
+                conversation.hook_counters_json = retained.to_string();
                 conversation.historian_model_chain_json = "[]".into();
                 conversation.lineage_id = lineage.lineage_id.clone();
                 conversation.cursor_frontier = 0;

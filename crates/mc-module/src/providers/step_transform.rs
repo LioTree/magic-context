@@ -703,6 +703,39 @@ impl McHandler {
                 &lineage,
                 std::slice::from_mut(&mut input),
             )?;
+            // Hooks precede the full step ingest, so absence of evidence is not
+            // freshness. Suppress only assistants already proven to have crossed
+            // the provider boundary or to belong to a retained parent transcript.
+            let parent_message = if hook == Hook::PostAssistant {
+                lineage
+                    .descends_from
+                    .as_deref()
+                    .map(|parent| {
+                        store
+                            .load_provider_message_by_mid(&key.store_key(), parent, mid)
+                            .map_err(transient)
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            let pairing_only = hook == Hook::PostAssistant
+                && (fields
+                    .served_through_ordinal
+                    .is_some_and(|served| ordinal <= served)
+                    || (held.lineage_id == lineage_id
+                        && held
+                            .served_through_ordinal
+                            .is_some_and(|served| ordinal <= served))
+                    || lineage.through_ordinal.is_some_and(|cut| ordinal <= cut)
+                    || parent_message
+                        .is_some_and(|parent| parent.message_bytes == input.message_bytes));
+            if pairing_only {
+                // Keep immutable ingest for post_tool pairing, but do not reserve
+                // numbers for text that the gateway must send unchanged.
+                parts.clear();
+            }
             let answer = store
                 .commit_provider_hook_with_parts(
                     &key.store_key(),
@@ -715,6 +748,16 @@ impl McHandler {
                     },
                     &parts,
                     |ctx| {
+                        if pairing_only {
+                            return Ok((
+                                ProviderHookWrite {
+                                    answer: None,
+                                    counters: ctx.counters.clone(),
+                                    policy_summary: Default::default(),
+                                },
+                                HookAnswer::Pass,
+                            ));
+                        }
                         if let Some(held) = &ctx.repeat_answer {
                             let ops: Vec<Operation> = serde_json::from_str(&held.answer.ops_json)
                                 .map_err(|e| {
@@ -3544,6 +3587,50 @@ mod admission_hook_tests {
         let raw = r#"{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}},{"type":"text","text":"one"},{"type":"image","source":{}},{"type":"text","text":""}]}"#;
         let answer = run(&h, hook(raw, "user", 0, "pre_user", &["one", ""])).await;
         assert_prepends(&h, &key, answer, "user", &[(0, 1, 41), (1, 3, 42)]);
+    }
+
+    #[tokio::test]
+    async fn admission_hook_prompt_and_system_reminder_use_distinct_text_blocks() {
+        let (_dir, h, key) = fixture(true, None).await;
+        let raw = r#"{ "role":"user", "content":[{"type":"text","text":"typed prompt"},{"type":"text","text":"<system-reminder>remember</system-reminder>"}] }"#;
+        let answer = run(
+            &h,
+            hook(
+                raw,
+                "user",
+                0,
+                "pre_user",
+                &[
+                    "typed prompt",
+                    "<system-reminder>remember</system-reminder>",
+                ],
+            ),
+        )
+        .await;
+        assert_prepends(&h, &key, answer.clone(), "user", &[(0, 0, 41), (1, 1, 42)]);
+        assert_eq!(
+            run(
+                &h,
+                hook(
+                    raw,
+                    "user",
+                    0,
+                    "pre_user",
+                    &[
+                        "typed prompt",
+                        "<system-reminder>remember</system-reminder>"
+                    ]
+                )
+            )
+            .await,
+            answer
+        );
+        super::super::claude_code_tests::assert_stored_and_served_raw(
+            &h,
+            "user",
+            raw,
+            r#"{ "role":"user", "content":[{"type":"text","text":"§41§ typed prompt"},{"type":"text","text":"§42§ <system-reminder>remember</system-reminder>"}] }"#,
+        );
     }
 
     #[tokio::test]

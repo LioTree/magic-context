@@ -267,3 +267,229 @@ async fn cc_burned_post_assistant_keeps_immutable_ingest_for_pairing() {
         assert_stored_and_served_raw(&h, "result", RESULT, &served);
     }
 }
+
+#[tokio::test]
+async fn cc_first_managed_bulk_arcs_pair_and_retire_unserved_assistants() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler_with_admission_tags(dir.path(), true);
+    setup(&h).await;
+    let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    let assistants = [
+        r#"{"role":"assistant","content":[{"type":"text","text":"old zero"},{"type":"tool_use","id":"call-a","name":"Read","input":{}}]}"#,
+        r#"{"role":"assistant","content":[{"type":"text","text":"held"},{"type":"thinking","thinking":"private","signature":"signed"},{"type":"text","text":"old one"},{"type":"tool_use","id":"call-a","name":"Read","input":{}}]}"#,
+        r#"{"role":"assistant","content":[{"type":"text","text":"newest"},{"type":"tool_use","id":"call-a","name":"Read","input":{}}]}"#,
+    ];
+    for (arc, raw) in assistants.iter().enumerate() {
+        let mid = format!("a{arc}");
+        let text = ["old zero", "old one", "newest"][arc];
+        let blocks = if arc == 1 {
+            vec!["held", text]
+        } else {
+            vec![text]
+        };
+        let answer = response(
+            call(
+                &h,
+                "transform.hook",
+                hook(raw, &mid, (arc * 2) as u64, "post_assistant", &blocks),
+            )
+            .await,
+        );
+        assert_admission_answer(
+            &answer,
+            true,
+            &[(if arc == 1 { 1 } else { 0 }, [1, 4, 6][arc])],
+        );
+        let mut tool = post_tool(RESULT, "call-a", "file a");
+        tool["subject_mid"] = json!(format!("r{arc}"));
+        tool["subject_ordinal"] = json!(arc * 2 + 1);
+        if arc < 2 {
+            tool["unserved_subjects"] = json!([{"subject_mid":mid,"hook":"post_assistant"}]);
+        }
+        admission_answer(call(&h, "transform.hook", tool).await, true, [2, 5, 7][arc]);
+        assert_stored_and_served_raw(
+            &h,
+            &mid,
+            raw,
+            &if arc < 2 {
+                raw.to_string()
+            } else {
+                raw.replacen(text, &format!("§{}§ {text}", [1, 4, 6][arc]), 1)
+            },
+        );
+        assert_stored_and_served_raw(
+            &h,
+            &format!("r{arc}"),
+            RESULT,
+            &RESULT.replacen("file a", &format!("§{}§ file a", [2, 5, 7][arc]), 1),
+        );
+    }
+    let store = h.store.get().unwrap();
+    let burned = store
+        .load_provider_hook_answers(&key.store_key())
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.state == "burned")
+        .collect::<Vec<_>>();
+    assert_eq!(burned.len(), 2);
+    assert_eq!(
+        burned
+            .iter()
+            .flat_map(|a| a.answer.tags.iter().map(|t| t.number))
+            .collect::<Vec<_>>(),
+        [1, 4]
+    );
+    for (arc, raw) in assistants.iter().take(2).enumerate() {
+        let blocks = if arc == 1 {
+            vec!["held", "old one"]
+        } else {
+            vec!["old zero"]
+        };
+        let mut retry = hook(
+            raw,
+            &format!("a{arc}"),
+            (arc * 2) as u64,
+            "post_assistant",
+            &blocks,
+        );
+        retry["served_through_ordinal"] = json!(5);
+        assert_eq!(
+            response(call(&h, "transform.hook", retry).await),
+            json!({"answer":"pass"})
+        );
+    }
+    let counters: Value = serde_json::from_str(
+        &store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap()
+            .hook_counters_json,
+    )
+    .unwrap();
+    assert_eq!(counters["reserved_tag_high_water"], 7);
+}
+
+#[tokio::test]
+async fn cc_assistant_watermarks_pass_without_reserving_and_keep_pairing() {
+    for held_watermark in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler_with_admission_tags(dir.path(), true);
+        setup(&h).await;
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        if held_watermark {
+            let mut held = h
+                .store
+                .get()
+                .unwrap()
+                .load_provider_conversation(&key.store_key())
+                .unwrap()
+                .unwrap();
+            held.served_through_ordinal = Some(0);
+            h.store
+                .get()
+                .unwrap()
+                .save_provider_conversation(&key.store_key(), &held)
+                .unwrap();
+        }
+        let mut params = hook(CALL, "assistant", 0, "post_assistant", &["reading"]);
+        if !held_watermark {
+            params["served_through_ordinal"] = json!(0);
+        }
+        assert_eq!(
+            response(call(&h, "transform.hook", params).await),
+            json!({"answer":"pass"})
+        );
+        assert_stored_and_served_raw(&h, "assistant", CALL, CALL);
+        let counters: Value = serde_json::from_str(
+            &h.store
+                .get()
+                .unwrap()
+                .load_provider_conversation(&key.store_key())
+                .unwrap()
+                .unwrap()
+                .hook_counters_json,
+        )
+        .unwrap();
+        assert_eq!(counters["reserved_tag_high_water"], 0);
+        let mut result = post_tool(RESULT, "call-a", "file a");
+        result["subject_ordinal"] = json!(1);
+        admission_answer(call(&h, "transform.hook", result).await, true, 1);
+        assert_stored_and_served_raw(
+            &h,
+            "result",
+            RESULT,
+            &RESULT.replacen("file a", "§1§ file a", 1),
+        );
+    }
+}
+
+#[tokio::test]
+async fn cc_fork_assistant_cut_and_parent_mid_pass_but_new_reply_tags() {
+    for retained_assistant in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler_with_admission_tags(dir.path(), true);
+        setup(&h).await;
+        let parent_user = hook(USER, "user", 0, "pre_user", &["read files"]);
+        admission_answer(call(&h, "transform.hook", parent_user).await, true, 1);
+        assert_stored_and_served_raw(
+            &h,
+            "user",
+            USER,
+            &USER.replacen("read files", "§1§ read files", 1),
+        );
+        admission_answer(
+            call(
+                &h,
+                "transform.hook",
+                hook(CALL, "assistant", 1, "post_assistant", &["reading"]),
+            )
+            .await,
+            true,
+            2,
+        );
+        assert_stored_and_served_raw(
+            &h,
+            "assistant",
+            CALL,
+            &CALL.replacen("reading", "§2§ reading", 1),
+        );
+        let cut = if retained_assistant { 1 } else { 0 };
+        response(call(&h, "compaction.setup", json!({
+            "session":"cc","harness":"claude-code","request_id":"fork","params":plan(),
+            "preset":"head","model":"fixture","context_window":100000,"composition":{},
+            "lineage_id":"child","descends_from":{"lineage_id":"L","through_ordinal":cut},"now":3
+        })).await);
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let store = h.store.get().unwrap();
+        let high = || -> Value {
+            let c: Value = serde_json::from_str(
+                &store
+                    .load_provider_conversation(&key.store_key())
+                    .unwrap()
+                    .unwrap()
+                    .hook_counters_json,
+            )
+            .unwrap();
+            c["reserved_tag_high_water"].clone()
+        };
+        let before = high();
+        let mut old = hook(CALL, "assistant", 1, "post_assistant", &["reading"]);
+        old["lineage_id"] = json!("child");
+        assert_eq!(
+            response(call(&h, "transform.hook", old).await),
+            json!({"answer":"pass"})
+        );
+        assert_eq!(high(), before);
+        let mut new = hook(CALL, "new-assistant", 2, "post_assistant", &["reading"]);
+        new["lineage_id"] = json!("child");
+        let answer = response(call(&h, "transform.hook", new).await);
+        assert_admission_answer(&answer, true, &[(0, 3)]);
+        assert_stored_and_served_raw_in_lineage(
+            &h,
+            "child",
+            "new-assistant",
+            CALL,
+            &CALL.replacen("reading", "§3§ reading", 1),
+        );
+    }
+}

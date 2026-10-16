@@ -1817,6 +1817,30 @@ impl McStore {
             Ok(message.filter(|message| message.mid == mid))
         })?)
     }
+    /// Find a MID in a lineage's visible history without assuming its current ordinal.
+    /// A fork can resend a discarded parent message at a new child position.
+    pub fn load_provider_message_by_mid(
+        &self,
+        key: &ProviderSessionKey,
+        lineage: &str,
+        mid: &str,
+    ) -> Result<Option<ProviderMessage>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let conv = key.conversation_key();
+            for (row, through) in ancestry_tx(conn, &conv, lineage)? {
+                let message = conn.query_row(
+                    "SELECT ordinal,mid,message_bytes FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND mid=?3 AND ordinal<=?4",
+                    params![conv, row.lineage_id, mid, as_i64(through)?],
+                    |r| Ok(ProviderMessage { ordinal:r.get(0)?, mid:r.get(1)?, message_bytes:r.get(2)? }),
+                ).optional()?;
+                if message.is_some() {
+                    return Ok(message);
+                }
+            }
+            Ok(None)
+        })?)
+    }
+
     pub fn provider_frontier(
         &self,
         key: &ProviderSessionKey,
@@ -2133,6 +2157,56 @@ mod policy_tests {
             },
         )
     }
+    #[test]
+    fn message_by_mid_follows_retained_ancestry_without_exposing_discarded_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, key, parent) = fixture(dir.path());
+        let messages = [
+            ProviderMessage {
+                mid: "prefix".into(),
+                ordinal: 1,
+                message_bytes: br#"{ "role":"assistant", "content":"prefix" }"#.to_vec(),
+            },
+            ProviderMessage {
+                mid: "suffix".into(),
+                ordinal: 2,
+                message_bytes: br#"{"role":"assistant","content":"suffix"}"#.to_vec(),
+            },
+        ];
+        store
+            .commit_provider_status(&key, &parent, &messages, None, &[])
+            .unwrap();
+        let child = ProviderLineage {
+            lineage_id: "child".into(),
+            first_ordinal: 2,
+            descends_from: Some("L".into()),
+            through_ordinal: Some(1),
+        };
+        store
+            .start_provider_descendant_lineage(&key, &child)
+            .unwrap();
+        let prefix = store
+            .load_provider_message_by_mid(&key, "child", "prefix")
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.ordinal, 1);
+        assert_eq!(prefix.message_bytes, messages[0].message_bytes);
+        assert!(store
+            .load_provider_message_by_mid(&key, "child", "suffix")
+            .unwrap()
+            .is_none());
+        let suffix = store
+            .load_provider_message_by_mid(&key, "L", "suffix")
+            .unwrap()
+            .unwrap();
+        assert_eq!(suffix.ordinal, 2);
+        assert_eq!(suffix.message_bytes, messages[1].message_bytes);
+        assert!(store
+            .load_provider_message_by_mid(&key, "L", "unknown")
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn cc_pending_failed_subjects_are_capped_counters_only_and_require_a_row() {
         let dir = tempfile::tempdir().unwrap();
