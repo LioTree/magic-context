@@ -102,6 +102,10 @@ interface PiLkgSessionState {
 	syncCaptureRequired: boolean;
 	acceptedInputs: readonly PiLkgInputSnapshot[] | null;
 	acceptedSlot: LkgSlot | null;
+	portableDigests?: {
+		inputs: readonly { id: string; fields: readonly LkgContentField[] }[];
+		digests: readonly string[];
+	};
 	outputSnapshot: {
 		inputs: { id: string; fields: readonly LkgContentField[] }[];
 		jsonMessages: string[];
@@ -1189,6 +1193,11 @@ export function createPiLkgCoordinator(
 				const reusablePrefix = reusePrior
 					? exactReusablePrefix(plan.inputs, state.acceptedInputs)
 					: 0;
+				const portablePrior = state.portableDigests;
+				const portablePrefix = exactReusablePrefix(
+					plan.inputs,
+					portablePrior?.inputs ?? null,
+				);
 				const inputContentSignatures = [
 					...(reusePrior ? reusePrior.signatures.slice(0, reusablePrefix) : []),
 					...plan.inputs
@@ -1273,9 +1282,14 @@ export function createPiLkgCoordinator(
 					captureSequence: plan.captureSequence,
 					servedCaptureId: plan.servedCaptureId,
 					fullCoverage: true,
-					inputMoveDigests: plan.inputs.map((input) =>
-						moveMessageDigestFromFields(input.fields),
-					),
+					// Only locally computed digests enter this memo. A
+					// hydrated or externally replaced slot cannot supply its values.
+					inputMoveDigests: plan.inputs.map((input, index) => {
+						const digest = portablePrior?.digests[index];
+						return index < portablePrefix && digest !== undefined
+							? digest
+							: moveMessageDigestFromFields(input.fields);
+					}),
 				};
 				args.assertCurrentPass?.();
 				if (args.publishServedNumbers) {
@@ -1309,6 +1323,21 @@ export function createPiLkgCoordinator(
 				}
 				state.acceptedInputs = plan.inputs;
 				state.acceptedSlot = slot;
+				// Pass snapshots are caller-visible. Retain private tokens only
+				// when inputs change, so later snapshot edits cannot rewrite proof.
+				if (
+					!portablePrior ||
+					portablePrefix !== plan.inputs.length ||
+					portablePrior.inputs.length !== plan.inputs.length
+				) {
+					state.portableDigests = {
+						inputs: plan.inputs.map((input) => ({
+							id: input.id,
+							fields: [...input.fields],
+						})),
+						digests: [...slot.inputMoveDigests],
+					};
+				}
 				if (state.recoveryPrefix) {
 					state.recoveryPrefix = args.releaseRecovery
 						? undefined

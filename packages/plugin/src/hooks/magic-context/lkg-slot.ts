@@ -944,6 +944,7 @@ interface LkgEntryCacheEntry {
     /** Exact tokens of the pristine message; never handed out. */
     fields: LkgContentField[];
     digest: string;
+    moveDigest?: string;
     bytes: number;
 }
 
@@ -960,7 +961,8 @@ export interface LkgEntryDigestStats {
 
 /** Estimated heap bytes one retained entry holds, counting strings at two bytes per character. */
 function lkgEntryBytes(id: string, fields: readonly LkgContentField[]): number {
-    let bytes = id.length * 2 + 166;
+    // Reserve space for the lazily computed portable SHA-256 digest as well.
+    let bytes = id.length * 2 + 310;
     for (const field of fields) {
         bytes += 16;
         if (typeof field === "string") bytes += field.length * 2;
@@ -1003,7 +1005,12 @@ export class LkgEntryDigestCache {
     digests(
         sessionId: string,
         messages: readonly MessageLike[],
-    ): { digests: (string | null)[]; stats: LkgEntryDigestStats } {
+        portableDigest?: (fields: readonly LkgContentField[]) => string,
+    ): {
+        digests: (string | null)[];
+        moveDigests: Array<(() => string) | undefined>;
+        stats: LkgEntryDigestStats;
+    } {
         const prior = this.sessions.get(sessionId);
         const sessionCount = this.sessions.size + (prior ? 0 : 1);
         const share = Math.min(
@@ -1012,6 +1019,7 @@ export class LkgEntryDigestCache {
         );
         const retained = new Map<string, LkgEntryCacheEntry>();
         const digests: (string | null)[] = [];
+        const moveDigests: Array<(() => string) | undefined> = [];
         let reused = 0;
         let size = 0;
         for (const message of messages) {
@@ -1039,12 +1047,27 @@ export class LkgEntryDigestCache {
                 }
             }
             digests.push(entry?.digest ?? null);
+            if (portableDigest) {
+                // These tokens predate tagging edits. contentMatchesFields
+                // compared every current provider-visible field to them before
+                // either digest could be reused; ids alone never authorize reuse.
+                const pristine = entry;
+                moveDigests.push(
+                    pristine
+                        ? () => (pristine.moveDigest ??= portableDigest(pristine.fields))
+                        : undefined,
+                );
+            }
             if (!entry || retained.has(id) || size + entry.bytes > share) continue;
             retained.set(id, entry);
             size += entry.bytes;
         }
         this.store(sessionId, retained, size, share);
-        return { digests, stats: { reused, retained: retained.size, retainedBytes: size } };
+        return {
+            digests,
+            moveDigests,
+            stats: { reused, retained: retained.size, retainedBytes: size },
+        };
     }
 
     private store(
