@@ -4,6 +4,8 @@
 use super::*;
 #[path = "context_fixture_tests.rs"]
 mod context_fixture_tests;
+#[path = "g8_replay_tests.rs"]
+mod g8_replay_tests;
 #[path = "late_descent_tests.rs"]
 mod late_descent_tests;
 #[path = "native_endpoint_tests.rs"]
