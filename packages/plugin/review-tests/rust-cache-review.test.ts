@@ -380,7 +380,13 @@ test.skipIf(!currentBinary || !baseBinary || !baseAdapter)(
             baselineFactory,
             baseRoot,
         );
-        const counts: { arm: string; envelopeSelects: number; changes: number }[] = [];
+        const counts: {
+            arm: string;
+            envelopeSelects: number;
+            changes: number;
+            servedMarkerWrites: number;
+            servedMarkerChanges: number;
+        }[] = [];
         for (const [arm, fixture] of [
             ["current", current],
             ["master", baseline],
@@ -388,29 +394,56 @@ test.skipIf(!currentBinary || !baseBinary || !baseAdapter)(
             const input = [user(fixture.sid, "warmup")];
             await fixture.run(input);
             let reads = 0;
+            let servedMarkerWrites = 0;
+            let servedMarkerChanges = 0;
             const original = fixture.db.prepare.bind(fixture.db);
             const spy = spyOn(fixture.db, "prepare").mockImplementation(((sql: string) => {
                 if (
                     sql === "SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?"
                 )
                     reads++;
-                return original(sql);
+                const statement = original(sql);
+                // Session-move and signed-thinking durability records which capture was served
+                // each pass, independently of raw replay. Normalize only this exact table;
+                // retain every other write and bound marker writes separately below.
+                if (
+                    /^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:lkg_served_markers|"lkg_served_markers")(?=\s|\()/i.test(
+                        sql,
+                    )
+                ) {
+                    const run = statement.run.bind(statement);
+                    statement.run = (...args) => {
+                        const result = run(...args);
+                        servedMarkerWrites++;
+                        servedMarkerChanges += result.changes;
+                        return result;
+                    };
+                }
+                return statement;
             }) as typeof fixture.db.prepare);
             const before = (
                 fixture.db.prepare("SELECT total_changes() AS n").get() as { n: number }
             ).n;
             for (let pass = 0; pass < 5; pass++) {
+                const markerWritesBefore = servedMarkerWrites;
                 input.push(
                     user(fixture.sid, `question-${pass}`),
                     tool(fixture.sid, `result-${pass}`),
                 );
                 await fixture.run(input);
+                expect(servedMarkerWrites - markerWritesBefore).toBeLessThanOrEqual(1);
                 expect(fixture.host.getState(fixture.sid).lkgRepresentationFrozen).toBe(false);
             }
             const after = (fixture.db.prepare("SELECT total_changes() AS n").get() as { n: number })
                 .n;
             spy.mockRestore();
-            counts.push({ arm, envelopeSelects: reads, changes: after - before });
+            counts.push({
+                arm,
+                envelopeSelects: reads,
+                changes: after - before - servedMarkerChanges,
+                servedMarkerWrites,
+                servedMarkerChanges,
+            });
         }
         console.info(
             JSON.stringify({

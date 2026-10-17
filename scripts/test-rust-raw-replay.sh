@@ -2,6 +2,10 @@
 # Offline host/module/provider-byte regressions; no daemon or live store is used.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+if [[ ${MC_RAW_REPLAY_REQUIRED:-0} == 1 && -z ${MC_RAW_REPLAY_BASELINE_ARCHIVE:-} ]]; then
+    echo "Required MC_RAW_REPLAY_BASELINE_ARCHIVE (pinned released baseline sources) is missing" >&2
+    exit 1
+fi
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
@@ -10,20 +14,20 @@ if [[ -n ${MC_RAW_REPLAY_BASELINE_ARCHIVE:-} ]]; then
     tar -xf "$MC_RAW_REPLAY_BASELINE_ARCHIVE" -C "$scratch/base"
     ln -s "$PWD/node_modules" "$scratch/base/node_modules"
     ln -s "$PWD/packages/plugin/node_modules" "$scratch/base/packages/plugin/node_modules"
-    cp crates/mc-module/src/transform.rs "$scratch/current-transform.rs"
-    restore() { cp "$scratch/current-transform.rs" crates/mc-module/src/transform.rs; touch crates/mc-module/src/transform.rs; }
-    trap 'restore; rm -rf "$scratch"' EXIT
-    cp "$scratch/base/crates/mc-module/src/transform.rs" crates/mc-module/src/transform.rs
+    # Keep the release's transform, included helper files and types together:
+    # copying only transform.rs into the current checkout mixes incompatible private APIs.
+    # Add the offline example driver, but leave all release library sources intact.
+    cp scripts/rust-raw-replay-baseline.rs "$scratch/base/crates/mc-module/examples/transform_replay.rs"
+    baseline_build=(cargo build --locked --manifest-path "$scratch/base/Cargo.toml"
+        --target-dir "$scratch/baseline-target" -p mc-module --example transform_replay)
     if [[ ${MC_RAW_REPLAY_BASELINE_RELEASE:-0} == 1 ]]; then
-        cargo build --release -p mc-module --example transform_replay
-        baseline_probe="${CARGO_TARGET_DIR:-target}/release/examples/transform_replay"
+        "${baseline_build[@]}" --release
+        baseline_probe="$scratch/baseline-target/release/examples/transform_replay"
     else
-        cargo build -p mc-module --example transform_replay
-        baseline_probe="${CARGO_TARGET_DIR:-target}/debug/examples/transform_replay"
+        "${baseline_build[@]}"
+        baseline_probe="$scratch/baseline-target/debug/examples/transform_replay"
     fi
     cp "$baseline_probe" "$scratch/baseline-probe"
-    restore
-    trap 'rm -rf "$scratch"' EXIT
     export MC_RAW_REPLAY_BASELINE="$scratch/baseline-probe"
     export MC_RAW_REPLAY_BASELINE_ADAPTER="$scratch/base/packages/plugin/src/hooks/magic-context/rust-mode-transform.ts"
     export MC_REVIEW_BASELINE_ROOT="$scratch/base"

@@ -1174,7 +1174,7 @@ jobs:
           git cat-file -e "${baseline_commit}^{commit}"
           baseline_archive="$RUNNER_TEMP/rust-raw-replay-baseline.tar"
           git archive --format=tar "$baseline_commit" \
-            crates/mc-module/src packages/plugin/src packages/plugin/package.json \
+            Cargo.toml Cargo.lock crates packages/plugin/src packages/plugin/package.json \
             packages/retina-local-fs/src packages/retina-local-fs/package.json package.json \
             > "$baseline_archive"
           test -s "$baseline_archive"
