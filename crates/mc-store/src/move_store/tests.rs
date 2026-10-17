@@ -1365,3 +1365,115 @@ fn inventory_versions_six_and_seven_refuse_cross_order_before_writes() {
         "v7 into v6 may not write either"
     );
 }
+
+fn provider_reference_snapshot(path: &Path, revision_namespace: &str, owner: &str) {
+    let mut out = File::create(path).unwrap();
+    for table in codec::ship_tables(Store::Module) {
+        let columns = table.shipped_columns();
+        let values: Option<Vec<Value>> = match table.table {
+            "mc_provider_policy_revisions_v1" => Some(vec![
+                Value::Text(revision_namespace.into()),
+                Value::Integer(1),
+                Value::Text("ses_move".into()),
+            ]),
+            "mc_provider_conversations_v2" => Some(
+                columns
+                    .iter()
+                    .map(|column| match *column {
+                        "conv_key" => {
+                            Value::Text(r#"["git:snapshot","ses_move","opencode"]"#.into())
+                        }
+                        "session" => Value::Text(owner.into()),
+                        "engine_namespace" => Value::Text("snapshot-engine".into()),
+                        _ => Value::Null,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        };
+        codec::write_count(&mut out, table.table.len() as u64).unwrap();
+        out.write_all(table.table.as_bytes()).unwrap();
+        codec::write_count(&mut out, columns.len() as u64).unwrap();
+        for column in columns {
+            codec::write_count(&mut out, column.len() as u64).unwrap();
+            out.write_all(column.as_bytes()).unwrap();
+        }
+        codec::write_count(&mut out, u64::from(values.is_some())).unwrap();
+        if let Some(values) = values {
+            for value in values {
+                codec::write_value(&mut out, &value).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn provider_selectors_use_snapshot_conversations_on_empty_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = open(directory.path());
+    let path = directory.path().join("provider.bin");
+    provider_reference_snapshot(&path, "snapshot-engine", "ses_move");
+    let mut mover = store.move_store().unwrap();
+    mover
+        .reserve_install(&binding("provider-catalogue"), "digest", &path)
+        .unwrap();
+    assert_eq!(
+        mover
+            .writer
+            .query_row(
+                "SELECT count(*) FROM mc_provider_conversations_v2",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "preflight must not install catalogue rows into the destination"
+    );
+}
+
+#[test]
+fn policy_revision_missing_snapshot_conversation_refuses_even_if_destination_has_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = open(directory.path());
+    let path = directory.path().join("missing-reference.bin");
+    provider_reference_snapshot(&path, "destination-only-engine", "ses_move");
+    let mover = store.move_store().unwrap();
+    // A destination conversation must not lend ownership to an orphaned source row.
+    mover.writer.execute(
+        "INSERT INTO mc_provider_conversations_v2
+         (conv_key,project_root,session,harness,lineage_id,preset,params_json,setup_json,engine_namespace)
+         VALUES (json_array('git:fixture','ses_move','opencode'),'git:fixture','ses_move','opencode','L','default','{}','{}','destination-only-engine')",
+        [],
+    ).unwrap();
+    let before = mover.writer.total_changes();
+    let error = preflight(&mover.writer, "ses_move", &path).unwrap_err();
+    assert!(matches!(
+        error,
+        MoveError::Refused {
+            code: "snapshot_reference_missing",
+            table: Some(table)
+        } if table == "mc_provider_policy_revisions_v1"
+    ));
+    assert_eq!(mover.writer.total_changes(), before);
+}
+
+#[test]
+fn foreign_snapshot_conversation_owner_refuses_before_provider_selectors() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = open(directory.path());
+    let path = directory.path().join("foreign-owner.bin");
+    provider_reference_snapshot(&path, "snapshot-engine", "foreign-session");
+    let mut mover = store.move_store().unwrap();
+    let before = mover.writer.total_changes();
+    let error = mover
+        .reserve_install(&binding("foreign-owner"), "digest", &path)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MoveError::Refused {
+            code: "identity_mismatch",
+            ..
+        }
+    ));
+    assert_eq!(mover.writer.total_changes(), before);
+}

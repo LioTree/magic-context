@@ -116,6 +116,8 @@ export interface PiRunResult {
 }
 
 export interface PiRunnerOptions {
+  mockModelID?: string;
+  reasoning?: boolean;
   host?: PiRunnerHost;
   mockProviderURL: string;
   env?: PiIsolatedEnv;
@@ -191,7 +193,8 @@ export function ensurePluginAvailable(env: PiIsolatedEnv): void {
 export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {
   ensurePluginAvailable(env);
   const host = opts.host ?? "pi";
-  const modelRef = host === "omp" ? "mock/mock-model" : "anthropic/claude-haiku-4-5";
+  const modelID = opts.mockModelID ?? (host === "omp" ? "mock-model" : "claude-haiku-4-5");
+  const modelRef = `${host === "omp" ? "mock" : "anthropic"}/${modelID}`;
   if (opts.historianModel && host !== "pi") throw new Error("historianModel is wired for plain Pi only");
   const historianRef = opts.historianModel
     ? `${opts.historianModel.provider}/${opts.historianModel.id}`
@@ -203,7 +206,8 @@ export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {
     // Scripted provider replies call tools directly, not through OMP's xd:// transport.
     ...(host === "omp" ? { tools: { xdev: false, intentTracing: false } } : {}),
     defaultProvider: host === "omp" ? "mock" : "anthropic",
-    defaultModel: host === "omp" ? "mock-model" : "claude-haiku-4-5",
+    defaultModel: modelID,
+    ...(opts.reasoning ? { defaultThinkingLevel: "low" } : {}),
     enabledModels: historianRef ? [modelRef, historianRef] : [modelRef],
     compaction: { enabled: false },
     retry: { enabled: false },
@@ -224,12 +228,12 @@ export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {
             apiKey: "test-key-not-real",
             models: [
               {
-                id: "mock-model",
+                id: modelID,
                 name: "Mock Model",
                 input: ["text"],
                 contextWindow: opts.modelContextLimit ?? 200000,
                 maxTokens: 8192,
-                reasoning: false,
+                reasoning: opts.reasoning ?? false,
                 cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
               },
             ],
@@ -241,11 +245,17 @@ export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {
           anthropic: {
             baseUrl: opts.mockProviderURL,
             apiKey: "test-key-not-real",
+            ...(opts.mockModelID ? { models: [{
+              id: modelID, name: modelID, api: "anthropic-messages", input: ["text"],
+              contextWindow: opts.modelContextLimit ?? 200000, maxTokens: 8192,
+              reasoning: opts.reasoning ?? false,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            }] } : {}),
             modelOverrides: {
-              "claude-haiku-4-5": {
+              [modelID]: {
                 contextWindow: opts.modelContextLimit ?? 200000,
                 maxTokens: 8192,
-                reasoning: false,
+                reasoning: opts.reasoning ?? false,
               },
             },
           },
@@ -312,7 +322,7 @@ export function childEnv(env: PiIsolatedEnv): Record<string, string> {
     if (key === "NODE_ENV") continue;
     result[key] = value;
   }
-  result.TMPDIR = hostExtractCache();
+  result.TMPDIR = process.env.MC_E2E_PRIVATE_TMPDIR ?? hostExtractCache();
   result.PI_CODING_AGENT_DIR = env.agentDir;
   result.HOME = env.baseDir;
   // macOS Foundation may create an HTTP-cache database independently of XDG.

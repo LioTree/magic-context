@@ -12,7 +12,11 @@ import { createCtxStatusSender, resolveSessionId } from "./pi-command-utils";
 
 export function registerCtxFlushCommand(
 	pi: ExtensionAPI,
-	deps: { db: ContextDatabase; compactionOff?: boolean },
+	deps: {
+		db: ContextDatabase;
+		compactionOff?: boolean;
+		signedThinkingHold?: "off" | "on";
+	},
 ): void {
 	pi.registerCommand("ctx-flush", {
 		description:
@@ -38,7 +42,11 @@ export function registerCtxFlushCommand(
 			}
 
 			const pendingBefore = getPendingOps(deps.db, sessionId).length;
-			const result = executeFlush(deps.db, sessionId);
+			const result = executeFlush(
+				deps.db,
+				sessionId,
+				deps.signedThinkingHold === "on",
+			);
 
 			// Mirrors OpenCode `hook.ts:438-441` `onFlush`: explicit
 			// flush is a "force everything to refresh" semantic, so we

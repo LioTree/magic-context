@@ -7,6 +7,7 @@ import {
 } from "../../hooks/magic-context/host-runner/opencode-adapter";
 import { providerNativePart } from "../../hooks/magic-context/provider-visible-parts";
 import { modelAcceptsEmptyContent } from "../../hooks/magic-context/sentinel";
+import { getEmptyImageParts } from "../../hooks/magic-context/strip-content";
 import type { MessageLike } from "../../hooks/magic-context/tag-messages";
 import { log, sessionLog } from "../../shared/logger";
 import { hostMediaAsset } from "../fold/host-media";
@@ -53,8 +54,9 @@ function placeCacheHint(content: Part[], hint: unknown): void {
 }
 
 /**
- * Final guard for canonical Anthropic: take every text part whose text is
- * exactly empty out of `content`, and return how many it took. Anthropic
+ * Take eligible empty text parts out of `content` and return how many were
+ * removed. For provider `anthropic`, remove all empty text parts; otherwise,
+ * remove only image replacements whose saved marker is empty. Anthropic
  * rejects an empty text block with HTTP 400, and OpenCode 2 forwards one in a
  * `system` row as is (see `wholeMessageNeutralizationRemoves` in
  * hooks/magic-context/sentinel.ts, which keeps the pipeline from producing
@@ -63,12 +65,16 @@ function placeCacheHint(content: Part[], hint: unknown): void {
  * moves to this message, or to the previous rendered message when nothing is
  * left here (`placeCacheHint`).
  */
-function removeEmptyTextParts(content: Part[], rendered: V2Message[]): number {
+function removeEmptyTextParts(
+    content: Part[],
+    rendered: V2Message[],
+    mayRemove: (part: Part) => boolean,
+): number {
     let hint: unknown;
     let removed = 0;
     for (let index = content.length - 1; index >= 0; index -= 1) {
         const part = content[index];
-        if (part?.type !== "text" || part.text !== "") continue;
+        if (part?.type !== "text" || part.text !== "" || !mayRemove(part)) continue;
         if (hint === undefined) hint = part.cache;
         content.splice(index, 1);
         removed += 1;
@@ -225,11 +231,21 @@ function contentValueAttachments(value: Part[]): Part[] {
  * result loses its files too: a drop exists to take the result out of the context, and an
  * image kept next to its drop placeholder would still be billed.
  */
-function rebuildFileContent(value: Part[], output: string): Part {
+function rebuildFileContent(value: Part[], output: string, attachments?: unknown): Part {
     if (isDroppedToolOutput(output)) return { type: "text", value: output };
     const rebuilt: Part[] = [];
     let placed = false;
     for (const item of value) {
+        // Processed-image stripping removes projected attachments. Honor that
+        // decision without reconstructing or changing any surviving host file.
+        if (
+            item?.type === "file" &&
+            Array.isArray(attachments) &&
+            !attachments.some(
+                (attachment) => attachment?.url === item.uri && attachment?.mime === item.mime,
+            )
+        )
+            continue;
         if (item?.type !== "text") {
             rebuilt.push(item);
             continue;
@@ -512,9 +528,11 @@ export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<str
             let head = 0;
             const rendered: V2Message[] = [];
             const nextRendered = new Map<string, { native: MessageLike; messages: V2Message[] }>();
-            // Provider `anthropic` is the only one Magic Context gives empty-text
-            // placeholders (see `modelAcceptsEmptyContent`), so only it is guarded.
+            // Only Anthropic gets the general empty-text guard. Images whose
+            // saved replacement is empty must be omitted on every provider so
+            // switching providers cannot change an already served image marker.
             const emptyTextGuard = modelAcceptsEmptyContent(draft.model.providerID);
+            const imageOmissions = getEmptyImageParts(messages);
             let omitted = 0;
             let emptyTextParts = 0;
             for (const message of messages) {
@@ -544,13 +562,14 @@ export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<str
                     ? HEAD_IDS[head++]
                     : (original?.id ?? (saved ? mid : undefined));
                 const content: Part[] = [];
+                const emptyImages = new Set<Part>();
                 const following: V2Message[] = [];
-                for (const [index, candidate] of message.parts.entries()) {
+                for (const [partIndex, candidate] of message.parts.entries()) {
                     const part = candidate as Part;
                     const bridge =
                         bridges.get(part) ??
                         (saved && mid && part.type === "tool"
-                            ? saved.bridges.get(mid)?.get(providerSubjectPart(part, index))
+                            ? saved.bridges.get(mid)?.get(providerSubjectPart(part, partIndex))
                             : undefined) ??
                         (part.type === "tool" && typeof part.callID === "string"
                             ? bridgesFor(message)?.get(part.callID)
@@ -635,7 +654,10 @@ export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<str
                             !containsHostInstance(clean)
                                 ? (remembered?.parts ?? hostParts).get(contentKey(clean))
                                 : undefined;
-                        content.push(original ?? clean);
+                        const projected = original ?? clean;
+                        if (imageOmissions.get(message.info.id ?? "")?.has(partIndex))
+                            emptyImages.add(projected);
+                        content.push(projected);
                         continue;
                     }
                     const state = part.state as Part;
@@ -673,7 +695,11 @@ export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<str
                                 state.output === bridge.output
                                     ? bridge.result.result
                                     : bridge.files && typeof state.output === "string"
-                                      ? rebuildFileContent(bridge.files, state.output)
+                                      ? rebuildFileContent(
+                                            bridge.files,
+                                            state.output,
+                                            state.attachments,
+                                        )
                                       : {
                                             type: state.status === "error" ? "error" : "text",
                                             value: state.output,
@@ -684,7 +710,11 @@ export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<str
                         else following.push({ ...bridge.resultMessage, content: [result] });
                     }
                 }
-                const guarded = emptyTextGuard ? removeEmptyTextParts(content, rendered) : 0;
+                const guarded = removeEmptyTextParts(
+                    content,
+                    rendered,
+                    (part) => emptyTextGuard || emptyImages.has(part),
+                );
                 if (
                     content.length ||
                     (!(saved ? template : original)?.content.length && guarded === 0)
@@ -697,7 +727,7 @@ export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<str
                     };
                     const existing = id ? existingHeads.get(id) : undefined;
                     rendered.push(existing ? Object.assign(existing, { content }) : value);
-                } else if (emptyTextGuard) {
+                } else if (emptyTextGuard || guarded > 0) {
                     omitted += 1;
                 }
                 emptyTextParts += guarded;
@@ -726,7 +756,7 @@ export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<str
                 emptyTextOmissionLogged.add(draft.sessionID);
                 sessionLog(
                     draft.sessionID,
-                    `v2 payload: left out ${omitted} emptied messages and ${emptyTextParts} empty text parts, because Anthropic rejects an empty text block (logged once per session)`,
+                    `v2 payload: left out ${omitted} emptied messages and ${emptyTextParts} empty text parts, ${emptyTextGuard ? "because Anthropic rejects an empty text block" : "to replay frozen image omissions"} (logged once per session)`,
                 );
             }
             draft.messages.splice(0, draft.messages.length, ...published);

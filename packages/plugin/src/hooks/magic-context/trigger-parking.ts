@@ -1,13 +1,55 @@
+import type { Database } from "../../shared/sqlite";
+
 /**
- * Remembers, in memory, cache-busting requests whose work was held because the current
+ * Remembers cache-busting requests whose work was held because the current
  * turn still keeps signed thinking: an explicit flush, the context-pressure force band and
  * Pi's history refresh. A parked request leaves its queue or pressure flag in place but
  * permits no rebuild until a pass without that thinking.
  */
 export class ParkedBustTriggers {
-    private materialization = false;
-    private force = false;
-    private history = false;
+    private obligations: Partial<Record<"materialization" | "force" | "history", string>> = {};
+    private saved: string | null = null;
+
+    static load(db: Database, sessionId: string): ParkedBustTriggers {
+        const result = new ParkedBustTriggers();
+        const row = db
+            .prepare("SELECT held_release FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { held_release: string | null } | null;
+        result.saved = row?.held_release ?? null;
+        if (result.saved !== null) {
+            const value = JSON.parse(result.saved) as { obligations?: Record<string, unknown> };
+            for (const key of ["materialization", "force", "history"] as const) {
+                const reason = value.obligations?.[key];
+                if (typeof reason === "string") result.obligations[key] = reason;
+            }
+        }
+        return result;
+    }
+
+    /** Refuse to overwrite session_meta.held_release if another writer changed it since load(). */
+    persist(db: Database, sessionId: string): void {
+        const value = this.pending
+            ? JSON.stringify({ version: 1, obligations: this.obligations })
+            : null;
+        if (value === this.saved) return;
+        db.transaction(() => {
+            const result = db
+                .prepare(
+                    "UPDATE session_meta SET held_release = ? WHERE session_id = ? AND held_release IS ?",
+                )
+                .run(value, sessionId, this.saved);
+            if (result.changes !== 1) throw new Error("Held release changed during transform");
+        }).immediate();
+        this.saved = value;
+    }
+
+    reason(trigger: "materialization" | "force" | "history"): string | undefined {
+        return this.obligations[trigger];
+    }
+
+    get reasons(): string[] {
+        return [...new Set(Object.values(this.obligations))];
+    }
 
     /**
      * `historyPending` is the Pi plugin's history-refresh signal; the OpenCode transform
@@ -21,35 +63,34 @@ export class ParkedBustTriggers {
         forceEligible: boolean,
         historyPending = false,
     ) {
-        if (!materializationPending) this.materialization = false;
-        if (!forceEligible) this.force = false;
-        if (!historyPending) this.history = false;
+        this.settle(materializationPending, forceEligible, historyPending);
         return {
-            materialization: materializationPending && !(boundary && this.materialization),
-            force: forceEligible && !(boundary && this.force),
-            history: historyPending && !(boundary && this.history),
+            materialization:
+                materializationPending && !(boundary && this.obligations.materialization),
+            force: forceEligible && !(boundary && this.obligations.force),
+            history: historyPending && !(boundary && this.obligations.history),
         };
     }
 
-    holdMaterialization(): void {
-        this.materialization = true;
+    holdMaterialization(reason = "thinking_hold"): void {
+        this.obligations.materialization ??= reason;
     }
 
     holdForce(): void {
-        this.force = true;
+        this.obligations.force ??= "force";
     }
 
     holdHistory(): void {
-        this.history = true;
+        this.obligations.history ??= "history_refresh";
     }
 
     settle(materializationPending: boolean, forceUnspent: boolean, historyPending = false): void {
-        if (!materializationPending) this.materialization = false;
-        if (!forceUnspent) this.force = false;
-        if (!historyPending) this.history = false;
+        if (!materializationPending) delete this.obligations.materialization;
+        if (!forceUnspent) delete this.obligations.force;
+        if (!historyPending) delete this.obligations.history;
     }
 
     get pending(): boolean {
-        return this.materialization || this.force || this.history;
+        return Object.keys(this.obligations).length > 0;
     }
 }

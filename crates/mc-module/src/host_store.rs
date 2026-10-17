@@ -39,6 +39,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::time::Instant;
 
 use mc_store::memory_lifecycle::applier::{
@@ -66,7 +67,7 @@ pub const SINGLE_STORE_CAPABLE: bool = mc_store::SINGLE_STORE_CAPABLE;
 /// this binary was built; whether that migration changed anything these writers depend
 /// on is answered per table by the fingerprints, so a migration that touched only tables
 /// the module never writes does not stop the module writing.
-pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 100;
+pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 101;
 
 /// Versions at or above this number belong to downstream forks and are excluded when
 /// reading the persisted lane, matching the host's own fence arithmetic.
@@ -986,8 +987,14 @@ fn with_privileged_transaction<T>(
     tables: &[&str],
     writes: impl FnOnce(&Transaction<'_>) -> Result<T, HostStoreError>,
 ) -> Result<(T, i64), HostStoreError> {
-    let started_at = Instant::now();
-    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let transaction = mc_store::writer_diagnostics::WriterTransaction::immediate(
+        conn,
+        "host_domain",
+        "ck-mc",
+        "domain",
+        |line| tracing::info!("{line}"),
+    )?
+    .with_tables(tables);
 
     // Recheck inside the transaction, not only at open. A host migration can land
     // between opening the file and writing to it, and a stale open-time answer would let
@@ -1029,8 +1036,8 @@ fn with_privileged_transaction<T>(
         "UPDATE context_privilege_state SET enabled = 0 WHERE id = 1",
         [],
     )?;
-    transaction.commit()?;
-    let elapsed_us = i64::try_from(started_at.elapsed().as_micros()).unwrap_or(i64::MAX);
+    let elapsed = transaction.commit_timed()?;
+    let elapsed_us = i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX);
     Ok((result, elapsed_us))
 }
 

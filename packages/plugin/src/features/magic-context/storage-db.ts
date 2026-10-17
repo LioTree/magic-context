@@ -14,7 +14,7 @@ import {
     getMagicContextStorageDir,
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
-import { harnessOwnsOpenCodeStore } from "../../shared/harness";
+import { getHarness, harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
     type AsyncProcessInspection,
@@ -66,6 +66,7 @@ import {
 import { installV95PerfSchema } from "./migration-v95-perf-indexes";
 import { installCompartmentRescoreSchema } from "./migration-v98-compartment-rescore";
 import { installMemoryLifecycleSchema } from "./migration-v99-memory-lifecycle";
+import { installTrimSourceIndexes } from "./migration-v101-trim-indexes";
 import { runMigrationsOffThread } from "./migration-worker-client";
 import {
     FORK_MIGRATION_VERSION_FLOOR,
@@ -89,7 +90,7 @@ import { runToolOwnerBackfill } from "./tool-owner-backfill";
 // this module, so registering here covers privileged writes and writer
 // acquisition/hold diagnostics on both runtimes.
 registerSlowWriteReporter(logSlowWriteTransaction);
-registerSqliteDiagnosticSink((message) => log(message));
+registerSqliteDiagnosticSink((message) => log(message), getHarness);
 
 // Re-exported so existing `from "./storage-db"` importers (and tests) keep
 // resolving these; the definitions live in the leaf module to break the
@@ -166,7 +167,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastUnconfirmedMigrationHolders = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 100;
+export const LATEST_SUPPORTED_VERSION = 101;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -2563,6 +2564,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // rescored; new historian compartments inserted by callers are not eligible.
     if (version === 0 || version >= 98) installCompartmentRescoreSchema(db);
     if (version === 0 || version >= 99) installMemoryLifecycleSchema(db);
+    if (version === 0 || version >= 101) installTrimSourceIndexes(db);
     // A TEMP trigger on this connection that bumps a per-session revision row
     // whenever this connection rewrites a tag's identity or reasoning count;
     // other connections' tag caches compare that row after each foreign commit

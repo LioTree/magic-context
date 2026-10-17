@@ -16,6 +16,11 @@ import {
     resolveIsSubagentFromOpenCodeDb,
 } from "./resolve-subagent-fallback";
 import {
+    getPendingPiCompactionMarkerState,
+    logPiCompactionMarkerClear,
+    type PendingPiCompactionMarker,
+} from "./storage-meta-persisted";
+import {
     BOOLEAN_META_KEYS,
     ensureSessionMetaRow,
     getDefaultSessionMeta,
@@ -338,11 +343,13 @@ export function clearSession(
 ): void {
     cancelAutoSearchWork(sessionId);
     let transactionStartedAt = 0;
+    let clearedMarker: PendingPiCompactionMarker | null = null;
     withoutSqliteTransformPass(() =>
         withSqliteBackgroundWriter(() =>
             db
                 .transaction(() => {
                     transactionStartedAt = performance.now();
+                    clearedMarker = getPendingPiCompactionMarkerState(db, sessionId);
                     deleteSessionScopedRows(db, [sessionId], harness, {
                         rustModuleCleanupAcknowledged,
                         preserveTagRevisionTombstones: !permanentlyDeleted,
@@ -358,6 +365,7 @@ export function clearSession(
                 .immediate(),
         ),
     );
+    if (clearedMarker) logPiCompactionMarkerClear(sessionId, clearedMarker, "session-reset");
     clearUnpublishedAutoSearchNoHints(sessionId);
     logSlowWriteTransaction("clear-session", transactionStartedAt);
 }

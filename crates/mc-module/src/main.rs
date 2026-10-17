@@ -48,10 +48,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let args: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(mc_module::single_store_repair::cli_main(&args));
     }
-    let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
+    let module_id = effective_module_id();
 
     let logger = match cortexkit_log::init_from_env() {
         Ok(logger) => logger,
@@ -91,9 +88,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             smart_notes_enabled,
         ),
         McTransportHandler::new(
-            McHandler::new_with_connection_file_and_route_targets(
+            McHandler::new_with_connection_file_route_targets_and_module_id(
                 Some(connection_file.clone()),
                 route_targets,
+                module_id,
             )
             .with_startup_smart_notes_enabled(smart_notes_enabled)
             .with_startup_provider_resident_enabled(resident_enabled)
@@ -106,6 +104,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     )
     .await?;
     Ok(())
+}
+
+fn effective_module_id() -> String {
+    std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODULE_ID.into())
 }
 
 fn parse_subc_arg<I>(mut args: I) -> Result<PathBuf, Box<dyn Error + Send + Sync>>
@@ -121,4 +126,45 @@ where
         }
     }
     Err("missing --subc <connection-file>".into())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn module_id_override_is_the_registered_principal() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::module_id_override_child"])
+            .env("MC_MODULE_ID_TEST_CHILD", "1")
+            .env(subc_protocol::SUBC_MODULE_ID_ENV, "custom-magic-context")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    fn module_id_override_child() {
+        if std::env::var_os("MC_MODULE_ID_TEST_CHILD").is_none() {
+            return;
+        }
+        let module_id = super::effective_module_id();
+        assert_eq!(module_id, "custom-magic-context");
+        let handler = mc_module::McHandler::new_with_connection_file_route_targets_and_module_id(
+            None,
+            mc_module::route_targets::RouteTargetConfig::default(),
+            module_id.clone(),
+        );
+        assert_eq!(handler.registered_module_id(), module_id);
+        assert_eq!(
+            mc_module::agent_data::stream(handler.registered_module_id()),
+            "reserved:custom-magic-context"
+        );
+        let manifest = mc_module::manifest(&module_id);
+        assert_eq!(
+            serde_json::to_value(manifest).unwrap()["module_id"],
+            module_id
+        );
+    }
 }

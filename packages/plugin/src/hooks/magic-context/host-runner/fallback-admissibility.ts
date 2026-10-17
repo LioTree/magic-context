@@ -2,6 +2,8 @@ import { providerMass, resolveDecisionCalibration } from "../decision-calibratio
 import { measureLkgReplay } from "../lkg-fit-measure";
 import type { MessageLike } from "../transform-operations";
 import { estimateByteBoundedMessageTokens, hasCountableParts } from "../wire-content";
+import type { BridgeNativeCut } from "./bridge-marker";
+import { openCodeCutProblem, openCodeCutSources } from "./bridge-native-cut";
 import { type RunnerRecord, sourceDigest } from "./record";
 
 export interface FallbackInputs {
@@ -57,6 +59,8 @@ export function recordProviderUsage<P>(
 export function isFallbackAdmissible<P>(
     record: RunnerRecord<MessageLike, P>,
     input: FallbackInputs,
+    /** Native boundary saved by Magic Context's receipt owner after the host write commits. */
+    nativeCut?: BridgeNativeCut,
 ): FallbackAdmissibility {
     const changed = (detail: string): FallbackAdmissibility => ({
         admissible: false,
@@ -84,8 +88,28 @@ export function isFallbackAdmissible<P>(
     let ordinal = input.firstOrdinal ?? record.first_ordinal;
     if (!Number.isSafeInteger(ordinal) || ordinal < 1)
         return changed("Invalid host window ordinal");
+    let source = input.messages;
+    let firstKept: number | undefined;
+    if (nativeCut) {
+        if (nativeCut.kind === "opencode") {
+            const problem = openCodeCutProblem(source, nativeCut);
+            if (problem) return changed(problem);
+            const ordered = openCodeCutSources(source, nativeCut, record.ids);
+            if (!ordered) return changed("native-cut-source-order-unproven");
+            source = ordered;
+        }
+        const firstKeptMid =
+            nativeCut.kind === "pi"
+                ? nativeCut.first_kept_id
+                : (nativeCut.tail_start_id ?? nativeCut.boundary_mid);
+        firstKept = record.ids.get(firstKeptMid);
+        if (firstKept === undefined || firstKept > to || source[0]?.info.id !== firstKeptMid)
+            return changed("Native cut cannot be placed in the recorded covered range");
+    }
+    let firstVisible = ordinal;
+    let anchored = false;
     try {
-        for (const message of input.messages) {
+        for (const message of source) {
             const id = message.info.id;
             // Synthetic heads without ids and host compaction markers do not
             // count toward append-order positions in the provider conversation.
@@ -108,6 +132,14 @@ export function isFallbackAdmissible<P>(
                 continue;
             }
             const held = record.ids.get(id);
+            if (!anchored) {
+                anchored = true;
+                // The native boundary omits summarized source messages. Recover
+                // the retained window's positions from the runner's original IDs.
+                if (firstKept !== undefined && input.firstOrdinal === undefined)
+                    ordinal = held ?? firstKept;
+                firstVisible = ordinal;
+            }
             if (compacted && ordinal >= from && ordinal < to) {
                 if (
                     seen.has(id) ||
@@ -132,8 +164,15 @@ export function isFallbackAdmissible<P>(
             ordinal++;
         }
         if (compacted) {
+            const hiddenByCut = (held: number) =>
+                firstKept !== undefined && held < firstKept && held < firstVisible;
+            const hiddenOrdinals = new Set<number>();
             for (const [id, held] of record.ids) {
                 if (held >= from && held < to && !seen.has(id)) {
+                    if (hiddenByCut(held) && record.source_digests.has(id)) {
+                        hiddenOrdinals.add(held);
+                        continue;
+                    }
                     return changed(`Covered message ${id} at ordinal ${held} was removed`);
                 }
             }
@@ -141,6 +180,7 @@ export function isFallbackAdmissible<P>(
             // replaced by compaction still exist at their original positions.
             for (let covered = Math.max(from, record.first_ordinal); covered < to; covered++) {
                 if (!seenOrdinals.has(covered)) {
+                    if (hiddenOrdinals.has(covered)) continue;
                     return changed(`No source evidence for covered ordinal ${covered}`);
                 }
             }

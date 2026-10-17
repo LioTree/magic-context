@@ -41,12 +41,14 @@ fn processed_image_admission_holds_unit_minting_without_freezing_and_admits_tail
         new_frozen_strip_units(
             core,
             &request,
-            &BTreeMap::new(),
+            &BTreeMap::from([("before".into(), 1), ("tail".into(), 2)]),
             None,
             true,
             StripSelectionScope {
                 reasoning: ReasoningBudgetScope::default(),
                 image_watermark: 5,
+                image_protected_cutoff: None,
+                image_emergency: false,
             },
             &HashSet::new(),
             &frame(held),

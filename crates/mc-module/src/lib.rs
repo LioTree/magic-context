@@ -35,6 +35,7 @@ mod per_pass_profile;
 #[cfg(test)]
 mod private_permissions_source_test;
 
+pub mod agent_data;
 mod agent_fragments;
 pub mod boundary;
 pub mod caveman;
@@ -203,6 +204,8 @@ pub struct SessionBinding {
     pub native_generation: Option<mc_store::provider_records::ProviderGeneration>,
     /// Identity stamped by the daemon at bind, never supplied by an RPC body.
     pub principal: Option<subc_protocol::Principal>,
+    /// Daemon-stamped scope owner and authorization, copied from the owner's scope.sync record at bind.
+    pub scope: Option<subc_protocol::scope::ScopeStamp>,
     pub project_root: PathBuf,
     pub harness: String,
     pub session: String,
@@ -3851,6 +3854,9 @@ struct RuntimeStoreError {
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
+    agent_data: Option<agent_data::AgentDataService>,
+    move_visibility: Arc<agent_data::MoveVisibility>,
+    registered_module_id: String,
     store: Arc<OnceLock<Arc<McStore>>>,
     log_directory: Option<PathBuf>,
     store_open: Arc<StoreOpenCoordinator>,
@@ -4587,6 +4593,18 @@ impl McHandler {
         connection_file: Option<PathBuf>,
         route_targets: RouteTargetConfig,
     ) -> Self {
+        Self::new_with_connection_file_route_targets_and_module_id(
+            connection_file,
+            route_targets,
+            DEFAULT_MODULE_ID.into(),
+        )
+    }
+
+    pub fn new_with_connection_file_route_targets_and_module_id(
+        connection_file: Option<PathBuf>,
+        route_targets: RouteTargetConfig,
+        module_id: String,
+    ) -> Self {
         let producer_factory: Arc<dyn HistorianProducerFactory> = match connection_file.clone() {
             Some(path) => Arc::new(RealHistorianProducerFactory {
                 connection_file: path,
@@ -4601,6 +4619,14 @@ impl McHandler {
             )),
             None => Arc::new(MissingSessionResolver),
         };
+        let move_visibility = Arc::new(agent_data::MoveVisibility::default());
+        let agent_data = agent_data::ENABLED.then(|| {
+            agent_data::AgentDataService::new(
+                connection_file.clone(),
+                module_id.clone(),
+                Arc::clone(&move_visibility),
+            )
+        });
         let provider_runner: Arc<dyn session_resolver::ProviderRunner> = match connection_file {
             Some(path) => Arc::new(session_resolver::RealProviderRunner::new(
                 path,
@@ -4611,6 +4637,9 @@ impl McHandler {
         let store = Arc::new(OnceLock::new());
         let provider_store = Arc::new(providers::Storage::new(Arc::clone(&store)));
         McHandler {
+            agent_data,
+            move_visibility,
+            registered_module_id: module_id,
             store,
             log_directory: None,
             store_open: Arc::new(StoreOpenCoordinator::new()),
@@ -5044,7 +5073,18 @@ impl McHandler {
     ) -> Self {
         let store = Arc::new(OnceLock::new());
         let provider_store = Arc::new(providers::Storage::new(Arc::clone(&store)));
+        let move_visibility = Arc::new(agent_data::MoveVisibility::default());
+        let agent_data = agent_data::ENABLED.then(|| {
+            agent_data::AgentDataService::new(
+                None,
+                DEFAULT_MODULE_ID.into(),
+                Arc::clone(&move_visibility),
+            )
+        });
         McHandler {
+            agent_data,
+            move_visibility,
+            registered_module_id: DEFAULT_MODULE_ID.into(),
             store,
             log_directory: None,
             store_open: Arc::new(StoreOpenCoordinator::new()),
@@ -14994,6 +15034,15 @@ impl ModuleHandler for McHandler {
     /// predecessor's live single-writer lease cannot block transform dispatch.
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
         let (descriptor, origin) = resolve_descriptor_with_origin(ack.storage.as_ref());
+        if let StorageBackend::Sqlite { path } = &descriptor.backend {
+            let configured = match &self.agent_data {
+                Some(service) => service.configure(Path::new(path)),
+                None => self.move_visibility.configure_readonly(Path::new(path)),
+            };
+            if let Err(error) = configured {
+                tracing::error!(message=%error.message, "MC move journal could not be opened");
+            }
+        }
         if let Some(log_directory) = &self.log_directory {
             warn_if_log_directory_differs(&descriptor, log_directory);
         }
@@ -15018,6 +15067,46 @@ impl ModuleHandler for McHandler {
     /// project from the daemon-controlled channel (never a per-pass request field). Accept
     /// every route — project resolution, not authorization, is the concern here.
     async fn on_bind(&self, req: &RouteBindRequest) -> subc_client_rs::BindDecision {
+        if let Some(service) = &self.agent_data {
+            service
+                .channels
+                .lock()
+                .expect("agent data channels")
+                .remove(&req.handle.channel);
+        }
+        if let subc_protocol::RouteTarget::InternalService {
+            module_id,
+            service_id,
+        } = &req.target
+        {
+            if service_id == cortexkit_role_agent_data::SERVICE_ID {
+                let Some(service) = &self.agent_data else {
+                    return subc_client_rs::BindDecision::reject(
+                        "unavailable",
+                        "agent-data service is disabled",
+                    );
+                };
+                if module_id != &self.registered_module_id {
+                    tracing::error!(target=%module_id, registered=%self.registered_module_id, "MC agent-data target differs from its registered identity");
+                    return subc_client_rs::BindDecision::reject(
+                        "agent_data_target_mismatch",
+                        "agent-data target differs from the registered module",
+                    );
+                }
+                if !matches!(&req.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "entorhinal")
+                {
+                    return subc_client_rs::BindDecision::reject(
+                        "caller_forbidden",
+                        "only reserved:entorhinal may bind agent-data",
+                    );
+                }
+                service
+                    .channels
+                    .lock()
+                    .expect("agent data channels")
+                    .insert(req.handle.channel);
+            }
+        }
         let config = self.effective_config(&req.identity.project_root);
         self.bind_route(
             req.handle.channel,
@@ -15025,6 +15114,7 @@ impl ModuleHandler for McHandler {
                 connection_incarnation: 0,
                 native_generation: None,
                 principal: req.principal.clone(),
+                scope: req.scope.clone(),
                 project_root: req.identity.project_root.clone(),
                 harness: req.identity.harness.clone(),
                 session: req.identity.session.clone(),
@@ -15036,16 +15126,74 @@ impl ModuleHandler for McHandler {
             },
         );
         self.record_route_role_versions(req.handle.channel, req.role_versions.as_ref());
+        if let Ok(binding) = self.facade_binding(req.handle.channel) {
+            if let Some(service) = &self.agent_data {
+                if let Err(error) = service.observe(&binding) {
+                    self.unbind_route(req.handle.channel);
+                    return subc_client_rs::BindDecision::reject("unavailable", error.message);
+                }
+            }
+        }
         subc_client_rs::BindDecision::accept()
     }
 
     /// Drop the route's binding on teardown so a reused channel can't resolve a stale
     /// project and the map doesn't leak.
     async fn on_route_gone(&self, handle: &RouteHandle) {
+        if let Some(service) = &self.agent_data {
+            service
+                .channels
+                .lock()
+                .expect("agent data channels")
+                .remove(&handle.channel);
+        }
         self.unbind_route(handle.channel);
     }
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        let channel = ctx.route_handle().channel;
+        if self.agent_data.as_ref().is_some_and(|service| {
+            service
+                .channels
+                .lock()
+                .expect("agent data channels")
+                .contains(&channel)
+        }) {
+            let admitted = self.bindings.lock().expect("route bindings").get(&channel).is_some_and(|binding|
+                matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "entorhinal"));
+            if !admitted {
+                return HandlerOutcome::Error {
+                    code: "caller_forbidden".into(),
+                    message: "only reserved:entorhinal may move MC data".into(),
+                };
+            }
+            if body.len() > 3 * 1024 * 1024 {
+                return HandlerOutcome::Error {
+                    code: "invalid_request".into(),
+                    message: "agent-data request exceeds its frame budget".into(),
+                };
+            }
+            let request = match serde_json::from_slice::<Value>(&body) {
+                Ok(request) => request,
+                Err(_) => {
+                    return HandlerOutcome::Error {
+                        code: "invalid_request".into(),
+                        message: "agent-data request is not JSON".into(),
+                    }
+                }
+            };
+            return self
+                .agent_data
+                .as_ref()
+                .expect("admitted move service")
+                .handle(
+                    self,
+                    channel,
+                    request.get("method").and_then(Value::as_str).unwrap_or(""),
+                    request.get("params").unwrap_or(&Value::Null),
+                )
+                .await;
+        }
         if let Err(outcome) = enforce_request_byte_cap(&body) {
             return outcome;
         }
@@ -15079,6 +15227,29 @@ impl McHandler {
             .get("method")
             .and_then(Value::as_str)
             .or_else(|| request.get("kind").and_then(Value::as_str));
+        if let Some(method) = method.filter(|method| method.starts_with("agent_data.")) {
+            let Some(service) = &self.agent_data else {
+                return HandlerOutcome::Error {
+                    code: "unavailable".into(),
+                    message: "agent-data service is disabled".into(),
+                };
+            };
+            return service
+                .handle(
+                    self,
+                    channel,
+                    method,
+                    request.get("params").unwrap_or(&Value::Null),
+                )
+                .await;
+        }
+        let _move_pass = match self
+            .move_visibility
+            .request_pass(self, channel, &request, method)
+        {
+            Ok(pass) => pass,
+            Err(refusal) => return refusal,
+        };
         let provider_operation = if method == Some("tools/call") {
             request.pointer("/params/name").and_then(Value::as_str)
         } else {
@@ -19719,28 +19890,40 @@ pub fn manifest_with_route_targets_and_smart_notes(
     if !smart_notes_enabled {
         prompt_surface::disable_smart_notes_in_tools(&mut tools, PromptSurfacePreset::Full);
     }
-    // Constructed via the subc-protocol builder (never a struct literal): ModuleManifest is
-    // #[non_exhaustive], so builder methods are the only construction path that survives additive
-    // field landings. Every field below is set to the exact value the pre-builder struct literal
-    // produced, so the serialized HELLO is byte-identical to the pre-migration wire shape.
-    // Each optional manifest field is declared in whichever direction is TRUE of this
-    // module, and a test pins both directions on the struct and on the wire because the
-    // compiler stopped requiring them in subc-protocol 0.19. trust_tier stays: this module
-    // is first-party. bindings is absent: the only storage scope the enum can express is
-    // `Project`, but the store at ~/.local/share/cortexkit/magic-context/store.db is one per
-    // MACHINE (every project on the host shares it, rows are project-keyed inside), so any
-    // bindings block would assert a partition that does not exist. The daemon hands this
-    // module its StorageDescriptor from its own config and never reads the binding.
+    // Use the builder because ModuleManifest can acquire new optional fields.
+    // Keep the existing model tools separate from the opt-in internal move service.
+    // Leave ModuleManifest.bindings unset: it can request separate stores per
+    // project, whereas MC uses one machine-wide store with project-keyed rows.
+    let mut capabilities = vec![
+        cortexkit_role_compaction_provider::PROVIDES.to_string(),
+        cortexkit_role_step_transform_provider::PROVIDES.to_string(),
+    ];
+    let mut provides = vec![ProviderRole::ToolProvider {
+        tools,
+        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        concurrency: Concurrency::ModuleManaged,
+        emits_push: false,
+        sub_supervises: false,
+    }];
+    if agent_data::ENABLED {
+        capabilities.push(cortexkit_role_agent_data::PROVIDES.to_string());
+        provides.push(ProviderRole::InternalService {
+            service_id: cortexkit_role_agent_data::SERVICE_ID.to_string(),
+            transport: subc_protocol::manifest::InternalTransport::Bulk,
+            agent_facing: false,
+            operations: cortexkit_role_agent_data::REQUIRED_OPS
+                .iter()
+                .map(|op| op.to_string())
+                .collect(),
+        });
+    }
     ModuleManifest::builder(module_id.to_string(), env!("CARGO_PKG_VERSION").to_string())
     .trust_tier(Some(TrustTier::FirstParty))
     .protocol_ver(PROTOCOL_VERSION)
     // The provider majors are protocol capabilities, not model-facing tools.
     // Runner groups are discovered through role.describe, never required here.
     .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
-        provides: vec![
-            cortexkit_role_compaction_provider::PROVIDES.to_string(),
-            cortexkit_role_step_transform_provider::PROVIDES.to_string(),
-        ],
+        provides: capabilities,
         requires: vec![],
         must_never_reach: vec![],
     }))
@@ -19772,13 +19955,7 @@ pub fn manifest_with_route_targets_and_smart_notes(
             None
         }
     })
-    .provides(vec![ProviderRole::ToolProvider {
-        tools,
-        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-        concurrency: Concurrency::ModuleManaged,
-        emits_push: false,
-        sub_supervises: false,
-    }])
+    .provides(provides)
     .consumes(vec![ConsumerRole::ServiceClient {
         // ServiceClient is a route declaration, not a capability requirement. The provider
         // runner may be absent: only an incoming provider call needs its callback/read route.
@@ -19868,7 +20045,7 @@ mod tests {
         assert_eq!(
             custom.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "custom-runner".to_string()],
+                of: route_targets::expected_routes_for_tests("custom-runner"),
             }]
         );
 
@@ -19877,7 +20054,7 @@ mod tests {
         assert_eq!(
             hosted.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "broca".to_string()],
+                of: route_targets::expected_routes_for_tests("broca"),
             }]
         );
         // Self-signals drop out with the background-completion target, but the field stays declared
@@ -21397,7 +21574,7 @@ mod tests {
         let line = supported_fences_line();
         assert_eq!(
             line,
-            format!("context.db=100 store.db={LATEST_MIGRATION_VERSION}")
+            format!("context.db=101 store.db={LATEST_MIGRATION_VERSION}")
         );
     }
 
@@ -21473,7 +21650,7 @@ mod tests {
         assert_eq!(
             m.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string(), "broca".to_string()]
+                of: route_targets::expected_routes_for_tests("broca")
             }]
         );
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
@@ -21528,6 +21705,7 @@ mod tests {
             connection_incarnation: 0,
             native_generation: None,
             principal: None,
+            scope: None,
             project_root: PathBuf::from(root),
             harness: harness.to_string(),
             session: session.to_string(),
@@ -43716,3 +43894,9 @@ fn render_tag_expand(tag: &mc_store::McTagRow, messages: &[ck_wire::CkIngressMes
 #[cfg(test)]
 #[path = "../tests/support/perf_audit.rs"]
 mod perf_audit;
+
+impl McHandler {
+    pub fn registered_module_id(&self) -> &str {
+        &self.registered_module_id
+    }
+}

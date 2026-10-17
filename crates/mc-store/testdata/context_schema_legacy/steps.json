@@ -145,5 +145,12 @@
       "ALTER TABLE session_meta ADD COLUMN served_prefix TEXT",
       "ALTER TABLE session_meta ADD COLUMN held_release TEXT"
     ]
+  },
+  {
+    "version": 101,
+    "description": "indexed trimmed-source tag retirement",
+    "sql": [
+      "CREATE INDEX IF NOT EXISTS idx_tags_session_message_nocase\n        ON tags(session_id, message_id COLLATE NOCASE);\n        CREATE INDEX IF NOT EXISTS idx_tags_session_tool_owner\n        ON tags(session_id, tool_owner_message_id);"
+    ]
   }
 ]

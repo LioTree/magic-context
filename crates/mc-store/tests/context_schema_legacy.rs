@@ -145,15 +145,15 @@ fn compare(db: &Connection, version: u32, golden: &Value) {
 }
 
 #[test]
-fn populated_versions_87_through_100_match_typescript() {
-    for version in 87..=100 {
+fn populated_versions_87_through_101_match_typescript() {
+    for version in 87..=101 {
         let temp = throwaway();
         let path = copy_fixture(version, &temp);
         let golden = expected(version);
         let mut db = Connection::open(path).unwrap();
         db.pragma_update(None, "foreign_keys", true).unwrap();
         let report = upgrade(&mut db, golden["now"].as_i64().unwrap()).unwrap();
-        assert_eq!(report.schema_version, 100);
+        assert_eq!(report.schema_version, 101);
         assert_eq!(
             report.schema_fingerprint.0,
             fingerprint(&schema_snapshot(&db).unwrap())
@@ -231,9 +231,9 @@ fn concurrent_startup_serializes_and_does_not_duplicate_migrations() {
 
 #[test]
 fn unsupported_upstream_versions_are_refused_byte_for_byte() {
-    for version in [0, 86, 101, 9999] {
+    for version in [0, 86, 102, 9999] {
         let temp = throwaway();
-        let path = copy_fixture(100, &temp);
+        let path = copy_fixture(101, &temp);
         let db = Connection::open(&path).unwrap();
         db.execute("DELETE FROM schema_migrations WHERE version<10000", [])
             .unwrap();
@@ -257,13 +257,13 @@ fn unsupported_upstream_versions_are_refused_byte_for_byte() {
 #[test]
 fn current_store_is_read_only_even_while_a_writer_holds_the_lock() {
     let temp = throwaway();
-    let path = copy_fixture(100, &temp);
+    let path = copy_fixture(101, &temp);
     let holder = Connection::open(&path).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
     let before = fs::read(&path).unwrap();
     let mut db = Connection::open(&path).unwrap();
     upgrade(&mut db, 1_800_000_000_000).unwrap();
-    compare(&db, 100, &expected(100));
+    compare(&db, 101, &expected(101));
     assert_eq!(fs::read(path).unwrap(), before);
     holder.execute_batch("ROLLBACK").unwrap();
 }
