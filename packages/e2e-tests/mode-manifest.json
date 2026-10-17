@@ -3,6 +3,14 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
         {
+            "path": "tests/prefix-binding-validator.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "CI-fast unit guard for the strict prefix-binding mock: accepted request prefixes, signed thinking, tool pairing and captured refusals. It needs no host and runs once in the OpenCode 1 lane.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/rust-provider-pipeline-opencode1.test.ts",
             "tier": "excluded",
             "invocation": { "ts": false, "rust": false },
