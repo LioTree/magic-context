@@ -119,12 +119,34 @@ pub struct TaskConfig {
     pub legacy_last_run_at: Option<i64>,
 }
 
+/// The schedule fields of the TypeScript dreamer's `task_schedule_state` row for
+/// one project and task. The TypeScript scheduler runs a task only once
+/// `next_due_at` has passed and moves it past the slot it ran, so the later of the
+/// two runtimes' `next_due_at` values is the progress both must respect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacySchedule {
+    pub last_run_at: Option<i64>,
+    pub next_due_at: Option<i64>,
+    pub schedule: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Completed,
     Failed,
     Skipped,
+}
+
+impl RunStatus {
+    /// The spelling both schedulers store in `last_status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
