@@ -319,10 +319,6 @@ export function buildTurnTwoPrompt(input: {
 }): string {
     const lines: string[] = [
         "Turn two: reconcile each candidate fact with existing project memory.",
-        'Reply with exactly one JSON object: {"decisions":[...],"scores":[...]}.',
-        "One decision per fact_id. Actions: new, covered, conflict, edit, merge, replaces, abstain.",
-        "covered needs target_id, revision and clauses; conflict needs target_id; edit and replaces need target_id, revision, removed, replaced, kept, added and final_text; merge needs sources, survivor_id, removed, replaced, kept, added and final_text.",
-        "Every removed, replaced and added clause cites a block start ordinal of that fact's own blocks and an exact excerpt.",
     ];
     if (input.lexicalOnly) lines.push(LEXICAL_ONLY_NOTICE);
     if (input.deferred && (input.deferred.facts > 0 || input.deferred.items > 0))
@@ -344,7 +340,7 @@ export function buildTurnTwoPrompt(input: {
         for (const neighbour of fact.neighbours) lines.push(renderNeighbour(neighbour));
     }
     if (input.items.length > 0) {
-        lines.push("", "## Agent memories to score (importance 1-100 and a proposed decay class)");
+        lines.push("", "## Agent memories to score");
         for (const item of input.items)
             lines.push(
                 "",

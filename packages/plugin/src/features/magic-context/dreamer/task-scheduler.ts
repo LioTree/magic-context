@@ -91,10 +91,13 @@ export interface TaskExecutorContext {
     leaseAcquisition?: LeaseAcquisition;
 }
 
-export type TaskExecutor = (
+export type TaskExecutor = ((
     task: DreamTaskRuntimeConfig,
     ctx: TaskExecutorContext,
-) => Promise<TaskExecOutcome>;
+) => Promise<TaskExecOutcome>) & {
+    /** TTL maintenance runs independently of model-task schedules and gates. */
+    expireMemories?: (ctx: TaskExecutorContext) => Promise<number>;
+};
 
 export interface RunDueTasksDeps {
     db: Database;
@@ -686,6 +689,24 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
     // rotation). An identity with no memories and nothing else to do loses its
     // rows to the daily idle prune instead.
     if (deps.projectMemoryEnabled === false) return 0;
+    if (deps.executor.expireMemories) {
+        const holderId = crypto.randomUUID();
+        const leaseKey = leaseKeyFor("curate", deps.projectIdentity);
+        const leaseAcquisition = acquireLeaseWithAcquisition(deps.db, holderId, leaseKey);
+        if (leaseAcquisition) {
+            try {
+                await deps.executor.expireMemories({
+                    db: deps.db,
+                    projectIdentity: deps.projectIdentity,
+                    holderId,
+                    leaseKey,
+                    leaseAcquisition,
+                });
+            } finally {
+                releaseLease(deps.db, holderId, leaseKey);
+            }
+        }
+    }
     const now = deps.now ?? Date.now();
     const due = planDueTasks(deps.db, deps.projectIdentity, deps.tasks, now);
     if (due.length === 0) return 0;

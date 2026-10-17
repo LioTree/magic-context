@@ -66,7 +66,7 @@ import {
     writeDocsProposal,
 } from "./docs-proposals";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
-import { archiveExpiredMemories } from "./expire-memories";
+import { archiveExpiredMemories, getExpiredActiveMemoryIds } from "./expire-memories";
 import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import {
     acquireLeaseWithAcquisition,
@@ -512,7 +512,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         return parentSessionIdPromise;
     };
 
-    return async (
+    const executor: TaskExecutor = async (
         config: DreamTaskRuntimeConfig,
         ctx: TaskExecutorContext,
     ): Promise<TaskExecOutcome> => {
@@ -1161,6 +1161,37 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             deps.onProgress?.(null, config.task);
         }
     };
+    executor.expireMemories = async (ctx) => {
+        const { db, projectIdentity, holderId, leaseKey, leaseAcquisition } = ctx;
+        if (projectNeedsSingleStoreMigration(db, projectIdentity)) return 0;
+        if (getExpiredActiveMemoryIds(db, projectIdentity).length === 0) return 0;
+        if (!leaseAcquisition) throw new Error("Expiry requires a memory-domain lease");
+        let leaseLost = false;
+        const heartbeat = startLeaseHeartbeat(
+            db,
+            holderId,
+            leaseKey,
+            () => {
+                leaseLost = true;
+            },
+            leaseAcquisition,
+        );
+        try {
+            const moduleRoute = await resolveDreamerModuleRoute({
+                db,
+                projectIdentity,
+                projectRoot: deps.sessionDirectory,
+                transformMode: deps.transformMode,
+                moduleClient: deps.moduleClient,
+                commandId: `${Date.now()}:${holderId}:expiry`,
+            });
+            if (leaseLost) throw new Error("Dream lease lost during expiry setup");
+            return await archiveExpiredMemories({ ...ctx, leaseAcquisition, moduleRoute });
+        } finally {
+            heartbeat.stop();
+        }
+    };
+    return executor;
 }
 
 function resolveRetrospectiveProvider(
@@ -1887,9 +1918,8 @@ async function runAgenticTask(
     let promptSettled = false;
     let expiredArchived = 0;
     try {
-        // Curate owns the TTL lifecycle transition. It runs after the memory-domain
-        // lease heartbeat starts and uses the same authority-specific archive path
-        // as curate's ctx_memory operations.
+        // Manual curate runs also sweep expiry before taking their category snapshot.
+        // Scheduled expiry runs independently, even when every task is disabled.
         let curateMemories: ReturnType<typeof loadActiveMemoryPromptMemories> | undefined;
         let curateCategory: CurateMemoryCategory | undefined;
         if (task === "curate") {
@@ -1975,6 +2005,7 @@ async function runAgenticTask(
         for (const batch of batches) {
             const taskPrompt = buildDreamTaskPrompt(task, {
                 projectPath: projectIdentity,
+                memoryInjectionBudgetTokens: deps.memoryInjectionBudgetTokens,
                 lastDreamAt: lastRunAt ? String(lastRunAt) : null,
                 existingDocs,
                 docsChangeSet: changes?.text,

@@ -55,7 +55,7 @@ A user instruction like "always commit + build after every fix" describes how th
   - **Dedup awareness**: do not re-emit them; do not duplicate U: lines or facts already captured in them.
   - **Continuity**: if the new messages follow on from earlier work, name it the same way.
   When the session is young, this block may be small or absent — `<compartment_examples_from_other_projects>` carries the calibration job alone in that case.
-- `<project_memory>` — facts already promoted to stable project memory by the dreamer (after consolidation across sessions). Use these for:
+- `<project-memory>` — facts already promoted to stable project memory by the dreamer (after consolidation across sessions). Use these for:
   - **Dedup**: do not re-emit a fact already in project memory unless you have evidence it has changed.
   - **Contradiction awareness**: if the new chunk's evidence conflicts with a project memory, you do not need to resolve the contradiction yourself — emit the new fact as you observe it, and the dreamer will handle the resolution. Don't try to write "X was Y but now Z" framing; the dreamer does that.
 - `<new_messages>` — the raw history to compartmentalize, with absolute ordinals.
@@ -397,7 +397,7 @@ Facts capture stable properties of the project that survive past any single comp
 ### General rules
 
 - Facts are editable, not append-only. Rewrite, normalize, deduplicate, or drop existing facts whenever needed.
-- **Before emitting any fact, scan `<project_memory>` and silently skip any fact that overlaps a memory you can already see there.** A fact is "already covered" if a memory in the same category states the same underlying knowledge — even with different wording. Examples of facts to skip because they're already covered:
+- **Before emitting any fact, scan `<project-memory>` and silently skip any fact that overlaps a memory you can already see there.** A fact is "already covered" if a memory in the same category states the same underlying knowledge — even with different wording. Examples of facts to skip because they're already covered:
   - You see in memory: "After every fix, commit + build both Rust binary and TypeScript plugin." Your candidate: "Every fix followed by commit + build both Rust binary and TypeScript plugin." → **skip**, same rule, different words.
   - You see in memory: "Bridge idle timeout: Infinity." Your candidate: "Bridges stay alive for entire opencode session." → **skip**, same config knob, different framing.
   - You see in memory: "Use only AFT tools (no read/edit/write/patch)." Your candidate: "Dogfood AFT tools." → **skip**, same rule, weaker wording.
@@ -407,7 +407,7 @@ Facts capture stable properties of the project that survive past any single comp
 - Keep only high-signal facts. Omit greetings, status, one-off sequencing, branch-local tactics, task-local cleanup notes.
 - Facts must be present tense and operational. Do not use chronology wording: initially, currently, previously, later, then, was implemented, used to.
 - One fact bullet = exactly one rule/default/constraint/decision/name.
-- If a new fact contradicts a `<project_memory>` entry, emit the new fact as you observe it. **Do not write "X was Y but now Z" framing — the dreamer handles contradiction resolution.** Your job is to report what is true in this chunk; the dreamer reconciles.
+- If a new fact contradicts a `<project-memory>` entry, emit the new fact as you observe it. **Do not write "X was Y but now Z" framing — the dreamer handles contradiction resolution.** Your job is to report what is true in this chunk; the dreamer reconciles.
 
 ### The 5 categories
 
@@ -702,7 +702,33 @@ If no candidates, omit the `<primer_candidates>` section entirely.
 
 ## Output
 
+<!-- historian:xml:start -->
 Output valid XML only in this shape:
+<!-- historian:xml:end -->
+<!-- historian:combined:start -->
+Reply with exactly one JSON object under a `result` wrapper. Its `step` must match the current turn. The same system contract governs both turns; the historian prose above remains in force on turn two. Do not replace the system or emit bare XML or an unwrapped decisions object.
+
+- Turn one: `{"result":{"step":"turn_one","xml":"..."}}`. The `xml` string contains the complete XML document below, with JSON string escaping.
+- Turn two: `{"result":{"step":"turn_two","decisions":[...],"scores":[...]}}`. Reconcile candidate facts with existing project memory. Do not emit compartments on turn two.
+
+### Turn-two fields
+
+One decision per `fact_id`. Actions: `new`, `covered`, `conflict`, `edit`, `merge`, `replaces`, `abstain`. Do not retire memories or promote rules.
+
+- Every decision requires integer `fact_id` and string `action`.
+- `new` and `abstain` need no other fields.
+- `conflict` requires integer `target_id`.
+- `covered` requires integer `target_id`, integer `revision` and a nonempty `clauses` array of integer clause indices; string `excerpt` is optional.
+- `edit` and `replaces` require integer `target_id`, integer `revision`, arrays `kept` and string `final_text`; arrays `removed`, `replaced` and `added` are optional (absent means empty).
+- `merge` requires `sources` (at least two objects with integer `id` and `revision`), integer `survivor_id`, arrays `kept` and string `final_text`; arrays `removed`, `replaced` and `added` are optional (absent means empty).
+- Each `removed` or `replaced` entry requires integer `memory_id`, integer `clause`, integer `block`, and string `excerpt`. Each `kept` entry requires integer `memory_id` and integer `clause`. Each `added` entry requires string `text`, integer `block`, and string `excerpt`.
+- Every removed, replaced and added clause cites a block start ordinal of that fact's own blocks and an exact excerpt.
+- `scores` is optional; absent means empty. Each score requires integer `item`, integer `importance` from 1 to 100, and `class`, a free nonempty string of at most 64 characters proposing a decay class. There is no decay-class taxonomy.
+
+### Turn-one XML document
+
+The following XML shape and rules apply to the `xml` string on turn one only:
+<!-- historian:combined:end -->
 
 Closing tags must match their opening tier tag (e.g. `<p1>...</p1>`, never `<p1>...</p2>`).
 

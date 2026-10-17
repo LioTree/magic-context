@@ -1,0 +1,131 @@
+import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { buildHiddenAgentRegistrations } from "../../agents/hidden-agent-registrations";
+import {
+    DREAMER_SYSTEM_PROMPT,
+    FRICTION_GATE_SYSTEM_PROMPT,
+    RETROSPECTIVE_SYSTEM_PROMPT,
+} from "../../features/magic-context/dreamer/task-prompts";
+import {
+    buildTurnTwoPrompt,
+    parseTurnTwoEnvelope,
+} from "../../features/magic-context/memory/turn-two-envelope";
+import { COMPRESS_CUES_SYSTEM_PROMPT } from "../../features/magic-context/mural/compress-cues-prompt";
+import { COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT } from "./compartment-prompt";
+import { renderHistorianSystemPrompt } from "./historian-prompt-render";
+import { isMagicContextInternalAgent } from "./system-prompt-hash";
+
+const source = readFileSync(new URL("./historian-prompt.source.md", import.meta.url), "utf8");
+const xml = renderHistorianSystemPrompt(source, "xml");
+const combined = renderHistorianSystemPrompt(source, "combined");
+const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+
+test("C5 row 1: combined contract retains turn-one prose and specifies both steps", () => {
+    expect(combined.split("## Output")[0]).toBe(xml.split("## Output")[0]);
+    expect(combined).toContain('{"result":{"step":"turn_one","xml":"..."}}');
+    expect(combined).toContain('{"result":{"step":"turn_two","decisions":[...],"scores":[...]}}');
+    expect(combined).toContain("the historian prose above remains in force on turn two");
+    expect(xml).toContain("Output valid XML only in this shape:");
+    expect(xml).not.toContain('"step":"turn_two"');
+    expect(hash(xml)).not.toBe(hash(combined));
+    expect(xml).not.toContain("<!-- historian:");
+    expect(combined).not.toContain("<!-- historian:");
+});
+
+test("turn-two user content carries notices and data, not a second format schema", () => {
+    const prompt = buildTurnTwoPrompt({
+        lexicalOnly: true,
+        deferred: { facts: 2, items: 1 },
+        facts: [
+            {
+                factId: 4,
+                category: "PROJECT_RULES",
+                content: "Keep a backup.",
+                sourceSessionId: "source",
+                anchorKnown: false,
+                blocks: [],
+                neighbours: [],
+                backlog: false,
+            },
+        ],
+        items: [{ item: 5, memoryId: 8, content: "Preserve data.", excerpt: "Save first." }],
+    });
+    expect(prompt).toContain("## Fact 4");
+    expect(prompt).toContain("## Agent memories to score");
+    expect(prompt).toContain("Save first.");
+    for (const format of [
+        "Reply with",
+        "JSON",
+        "fact_id",
+        "target_id",
+        "1-100",
+        "decay class",
+        "final_text",
+    ])
+        expect(prompt).not.toContain(format);
+});
+
+test("C5 row 3: a proposed decay class stays a free string with no taxonomy", () => {
+    expect(combined).toContain("a free nonempty string of at most 64 characters");
+    const result = parseTurnTwoEnvelope(
+        JSON.stringify({
+            decisions: [],
+            scores: [{ item: 7, importance: 40, class: "an entirely new class" }],
+        }),
+        false,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok)
+        expect(result.scores).toEqual([
+            { item: 7, importance: 40, proposedClass: "an entirely new class" },
+        ]);
+});
+
+test("C5 row 4: both contracts name the actual project-memory input block", () => {
+    for (const prompt of [xml, combined]) {
+        expect(prompt).toContain("<project-memory>");
+        expect(prompt).not.toContain("<project_memory>");
+    }
+});
+
+test("C5 row 7: detection relies on the unchanged dreamer registration, not reworded tasks", () => {
+    for (const [prompt, digest] of [
+        [
+            FRICTION_GATE_SYSTEM_PROMPT,
+            "071b13b154610b1267176fd25b0e9cb76cb0aaa238491e28f1b16c0379f71286",
+        ],
+        [
+            RETROSPECTIVE_SYSTEM_PROMPT,
+            "42883574843ef1c1ac7651cb2753200fa771e240ade20786dceb0274639ffc23",
+        ],
+        [
+            COMPRESS_CUES_SYSTEM_PROMPT,
+            "b3169cfae83d07a312b8d59fa402ec02b873c75182a71ccea325fef944ed56f0",
+        ],
+    ])
+        expect(hash(prompt)).toBe(digest);
+    expect(hash(DREAMER_SYSTEM_PROMPT)).toBe(
+        "190e22ed2f0c3734efe7c82e8f1fa05889cc3629e8571c0d1ab6f65221585fe1",
+    );
+    expect(DREAMER_SYSTEM_PROMPT).toContain("for the magic-context system");
+    const registrations = buildHiddenAgentRegistrations({
+        dreamerPrompt: DREAMER_SYSTEM_PROMPT,
+        historianPrompt: xml,
+        historianEditorPrompt: "unused",
+        historianDisallowed: [],
+    });
+    for (const id of ["dreamer-retrospective", "dreamer-classifier"]) {
+        const registration = registrations.find((entry) => entry.id === id);
+        expect(registration?.prompt).toBe(DREAMER_SYSTEM_PROMPT);
+        expect(isMagicContextInternalAgent(registration!.prompt!)).toBe(true);
+    }
+});
+
+test("C5 row 8: every historian rendering preserves the exact persona sentence", () => {
+    const persona = "You are Historian — the hippocampus of a long-running coding agent.";
+    for (const prompt of [xml, combined, COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT]) {
+        expect(prompt).toContain(persona);
+        expect(isMagicContextInternalAgent(prompt)).toBe(true);
+    }
+});
