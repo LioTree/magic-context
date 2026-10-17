@@ -21,7 +21,7 @@ describe("mode manifest validator", () => {
         // Bump this with the manifest whenever a tests/**/*.test.ts file is added or
         // removed. Moving a file between excluded and ts-only changes the invocation
         // counts and excluded list below, but not the total number of files.
-        expect(validation.files.length).toBe(194);
+        expect(validation.files.length).toBe(196);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -54,7 +54,7 @@ describe("mode manifest validator", () => {
         expect(ts).toContain("tests/reasoning-token-budget.test.ts");
         expect(rust).not.toContain("tests/reasoning-token-budget.test.ts");
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(30);
-        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(43);
+        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(44);
         // These OpenCode 2 files are ts-only with hosts ["opencode2"], so only the
         // OpenCode 2 host lane runs them; the other host lanes never select them.
         for (const path of [
@@ -159,6 +159,7 @@ describe("mode manifest validator", () => {
             "tests/rust-provider-pipeline-opencode1.test.ts",
             "tests/rust-provider-pipeline-opencode2.test.ts",
             "tests/system-prompt-change-order.test.ts",
+            "tests/zen-primary-surface.test.ts",
         ]);
         for (const path of [
             "tests/rust-provider-pipeline-opencode1.test.ts",

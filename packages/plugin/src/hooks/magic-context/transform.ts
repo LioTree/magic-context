@@ -214,7 +214,10 @@ import {
 } from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
 import { isClearlyOverWindow, UnmanagedOverWindowError } from "./unmanaged-over-window";
-import { UnresolvedHistoryBoundaryError } from "./unresolved-history-boundary";
+import {
+    storedHistoryBoundaryPresence,
+    UnresolvedHistoryBoundaryError,
+} from "./unresolved-history-boundary";
 
 export { EmergencyFailClosedError } from "./emergency-fail-closed";
 
@@ -2910,6 +2913,7 @@ export function createTransform(deps: TransformDeps) {
 
         const tPostProcess = performance.now();
         const postTransformResult = await runPostTransformPhase({
+            opencode2: deps.storeGeneration === "v2",
             normalizeRecoveryTail,
             compactionMarkerStrategy:
                 deps.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy,
@@ -3185,6 +3189,7 @@ export function createTransform(deps: TransformDeps) {
                     throw new UnresolvedHistoryBoundaryError(
                         untrimmed.tokens,
                         boundaryContextLimit,
+                        storedHistoryBoundaryPresence(db, sessionId),
                     );
                 }
             }

@@ -305,15 +305,17 @@ class StatusDialogComponent implements Component {
 		);
 		this.detail = this.detailRefresh.refresh();
 		openStatusDialogs.add(this);
-		this.refreshTimer = setInterval(() => {
-			if (this.closed) return;
-			try {
-				this.detail = this.detailRefresh.refresh();
-				this.props.tui.requestRender();
-			} catch {
-				// best effort; keep previous detail
-			}
-		}, REFRESH_INTERVAL_MS);
+		this.refreshTimer = inRootAsyncContext(() =>
+			setInterval(() => {
+				if (this.closed) return;
+				try {
+					this.detail = this.detailRefresh.refresh();
+					this.props.tui.requestRender();
+				} catch {
+					// best effort; keep previous detail
+				}
+			}, REFRESH_INTERVAL_MS),
+		);
 	}
 
 	handleInput(data: string): void {
@@ -1433,3 +1435,4 @@ function colorHex(hex: string, text: string): string {
 }
 
 import { readCompartmentScoreVisibility } from "@magic-context/core/hooks/magic-context/score-visibility";
+import { inRootAsyncContext } from "@magic-context/core/shared/sqlite";

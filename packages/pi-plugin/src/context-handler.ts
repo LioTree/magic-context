@@ -256,8 +256,9 @@ import { admitTemporalCandidates } from "@magic-context/core/hooks/magic-context
 import { readServedTemporalDecisions } from "@magic-context/core/hooks/magic-context/temporal-served-projection";
 import { protectToolBatchMutations } from "@magic-context/core/hooks/magic-context/tool-arc-admission";
 import {
-	advanceToolReclaimWatermarkToCurrentMax,
+	advanceToolReclaimWatermarkByDistance,
 	buildSyntheticToolReclaimOps,
+	toolReclaimDistanceEntries,
 } from "@magic-context/core/hooks/magic-context/tool-reclaim";
 import { ParkedBustTriggers } from "@magic-context/core/hooks/magic-context/trigger-parking";
 import { getUnpublishedAutoSearchNoHint } from "@magic-context/core/shared/auto-search-lifecycle";
@@ -439,6 +440,7 @@ import {
 	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
 	frozenBindingEntryIds,
+	hasUnfrozenPiThinking,
 	resolvePiBindingStripOrder,
 	shouldRunPiProactiveThinkingStrip,
 } from "./provider-error-recovery-pi";
@@ -579,6 +581,32 @@ let mutationGateObserverForTests:
 	  }) => void)
 	| undefined;
 let lkgRecoveryLogObserverForTests: ((message: string) => void) | undefined;
+let pipelineResultObserverForTests:
+	| ((
+			sessionId: string,
+			result: Readonly<
+				Pick<
+					RunPipelineResult,
+					| "prefixBustPermitted"
+					| "bustedThisPass"
+					| "identityRebuilt"
+					| "signedPrefixRewritten"
+				>
+			>,
+	  ) => void)
+	| undefined;
+
+function observePipelineResultForTests(
+	sessionId: string,
+	result: RunPipelineResult,
+): void {
+	pipelineResultObserverForTests?.(sessionId, {
+		prefixBustPermitted: result.prefixBustPermitted,
+		bustedThisPass: result.bustedThisPass,
+		identityRebuilt: result.identityRebuilt,
+		signedPrefixRewritten: result.signedPrefixRewritten,
+	});
+}
 
 let variantChangeLogObserverForTests: ((message: string) => void) | undefined;
 let beforePipelineForTests: (() => Promise<void>) | undefined;
@@ -702,6 +730,15 @@ export const __test = {
 		lkgRecoveryLogObserverForTests = fn;
 		return () => {
 			lkgRecoveryLogObserverForTests = undefined;
+		};
+	},
+	setPipelineResultObserverForTests(
+		fn: typeof pipelineResultObserverForTests,
+	): () => void {
+		const previous = pipelineResultObserverForTests;
+		pipelineResultObserverForTests = fn;
+		return () => {
+			pipelineResultObserverForTests = previous;
 		};
 	},
 };
@@ -4258,7 +4295,7 @@ export function registerPiContextHandler(
 		const passGuard = { assert: assertCurrentPass, wait: guardAwait };
 		guardSqliteTransformPass({
 			assert: assertCurrentPass,
-			remainingMs: () => budget.remainingWork(),
+			remainingMs: budget.remainingWork,
 		});
 		budget.stage = "schema";
 		const toolWireSchema = await guardAwait(loadPiToolWireSchema());
@@ -5465,6 +5502,8 @@ export function registerPiContextHandler(
 				signedThinkingHold: options.signedThinkingHold,
 				protectedTokenTierOverrides: options.protectedTokenTierOverrides,
 				usableSoft: windowGeometry?.usableSoft ?? usageContextLimit ?? 200_000,
+				reclaimUsableWindow:
+					windowGeometry?.usableSoft ?? usageContextLimit ?? 0,
 				heuristics: options.heuristics,
 				emergencyCeilingTokens,
 				injection: options.injection
@@ -5591,6 +5630,7 @@ export function registerPiContextHandler(
 			};
 			let result = await budget.waitMandatory(runPipeline(pipelineArgs));
 			const historyRefreshThisPass = result.historyRefreshPermitted;
+			observePipelineResultForTests(sessionId, result);
 			logTransformTiming(sessionId, "runPipeline", tRunPipeline);
 			if (result.identityRebuilt || result.lkgFrozenReleaseReason)
 				schedulerDecision = "execute";
@@ -5663,7 +5703,7 @@ export function registerPiContextHandler(
 			if (historian && !options.compactionOff && budget.remainingWork() > 0) {
 				guardSqliteTransformPass({
 					assert: budget.assert,
-					remainingMs: () => budget.remainingWork(),
+					remainingMs: budget.remainingWork,
 				});
 				try {
 					budget.assert();
@@ -5785,7 +5825,7 @@ export function registerPiContextHandler(
 			) {
 				guardSqliteTransformPass({
 					assert: budget.assert,
-					remainingMs: () => budget.remainingWork(),
+					remainingMs: budget.remainingWork,
 				});
 				try {
 					outputMessages = await guardAwait(
@@ -5914,7 +5954,8 @@ export function registerPiContextHandler(
 					bindingEntryIdByRef.get(message),
 			).map((entryId) => entryId ?? undefined);
 			const thinkingBindingRecoveryApplied =
-				bindingStripOrder === "end" && !result.signedPrefixRewritten
+				bindingStripOrder === "end" &&
+				(!result.signedPrefixRewritten || !result.prefixBustPermitted)
 					? applyPiThinkingBindingRecovery({
 							db: options.db,
 							sessionId,
@@ -5945,15 +5986,14 @@ export function registerPiContextHandler(
 						// signatures bind all preceding bytes. A permitted prefix rewrite
 						// omits every signed block, including those in the active turn.
 						cacheBustingPass:
-							!!recovery.rebuildReason ||
-							result.signedPrefixRewritten ||
-							(result.prefixBustPermitted &&
-								!result.strictThinkingKept &&
-								(isCacheBusting ||
-									result.prefixRebuildAlreadyPriced ||
-									(result.executedWorkThisPass &&
-										(result.prefixEditBesidesReasoningTrim ||
-											hostEditBeforeNewestThinking)))),
+							result.prefixBustPermitted &&
+							!result.strictThinkingKept &&
+							(result.signedPrefixRewritten ||
+								isCacheBusting ||
+								result.prefixRebuildAlreadyPriced ||
+								(result.executedWorkThisPass &&
+									(result.prefixEditBesidesReasoningTrim ||
+										hostEditBeforeNewestThinking))),
 						stripActiveTurn: result.signedPrefixRewritten,
 						requirePersistence: !!recovery.rebuildReason,
 						report: (line) => sessionLog(sessionId, line),
@@ -6028,6 +6068,7 @@ export function registerPiContextHandler(
 					const previousBaseline = getPiChannel1Baseline(sessionId);
 					const baseline = refreshPiTailHygieneBaseline({
 						messages: outputMessages,
+						providerApi: ctx.model?.api,
 						tags,
 						tagCacheKey: result.channelBaselineSnapshot.tagCacheKey,
 						protectedTagNumbers,
@@ -6308,6 +6349,7 @@ export function registerPiContextHandler(
 							},
 						}),
 					);
+					observePipelineResultForTests(sessionId, result);
 					fitReclaimedThisPass = true;
 					// This input was consumed by the retry; it is no longer pristine.
 					inputForFitReclaim = undefined;
@@ -6326,7 +6368,7 @@ export function registerPiContextHandler(
 						entryIds: retryIds.map((id) => id ?? undefined),
 						provider: ctx.model?.provider,
 						model: ctx.model?.id,
-						cacheBustingPass: true,
+						cacheBustingPass: result.prefixBustPermitted,
 						stripActiveTurn: true,
 					});
 					estimate = estimatePiOutgoingInputTokens(
@@ -6518,6 +6560,7 @@ export function registerPiContextHandler(
 									}),
 								);
 								outputMessages = result.messages as PiAgentMessage[];
+								observePipelineResultForTests(sessionId, result);
 								// Reclaim replaces the postprocessed output with a pristine-input
 								// rebuild. Restore the todo pair before stripping and measuring it.
 								injectTodo();
@@ -6541,7 +6584,7 @@ export function registerPiContextHandler(
 									).map((id) => id ?? undefined),
 									provider: ctx.model?.provider,
 									model: ctx.model?.id,
-									cacheBustingPass: result.bustedThisPass,
+									cacheBustingPass: result.prefixBustPermitted,
 									stripActiveTurn: result.signedPrefixRewritten,
 								});
 								estimate = estimatePiOutgoingInputTokens(
@@ -6594,8 +6637,7 @@ export function registerPiContextHandler(
 			budget.assertOutcome();
 			guardSqliteTransformPass({
 				assert: budget.assertOutcome,
-				remainingMs: () =>
-					Math.max(0, PI_CONTEXT_BUDGET.outcomeMs - budget.elapsed()),
+				remainingMs: budget.remainingOutcome,
 			});
 			// Empty host history has neither new identities nor an input prefix to publish.
 			if (
@@ -7206,22 +7248,24 @@ function startPiCompartmentLeaseRenewal(
 	sessionId: string,
 	holderId: string,
 ): ReturnType<typeof setInterval> {
-	return setInterval(() => {
-		try {
-			if (!renewCompartmentLease(db, sessionId, holderId)) {
+	return inRootAsyncContext(() =>
+		setInterval(() => {
+			try {
+				if (!renewCompartmentLease(db, sessionId, holderId)) {
+					sessionLog(
+						sessionId,
+						"compartment lease renewal failed; publish will be skipped if holder is stale",
+					);
+				}
+			} catch (err) {
+				// A missed renewal is safe because the compartment lease has a five-minute TTL.
 				sessionLog(
 					sessionId,
-					"compartment lease renewal failed; publish will be skipped if holder is stale",
+					`compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`,
 				);
 			}
-		} catch (err) {
-			// A missed renewal is safe because the compartment lease has a five-minute TTL.
-			sessionLog(
-				sessionId,
-				`compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`,
-			);
-		}
-	}, COMPARTMENT_LEASE_RENEWAL_MS);
+		}, COMPARTMENT_LEASE_RENEWAL_MS),
+	);
 }
 
 function ensureRunnablePiBoundaryForTests(
@@ -7328,7 +7372,7 @@ function spawnPiHistorianRun(args: {
 	const holderId = crypto.randomUUID();
 	const controller = new AbortController();
 	historianAbortControllers.set(sessionId, controller);
-	const runPromise = withoutSqliteTransformPass(() =>
+	const runPromise = inRootAsyncContext(() =>
 		(async () => {
 			// Defer the runner's synchronous prefix until the context handler has returned.
 			await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -8070,6 +8114,7 @@ interface RunPipelineArgs {
 	protectedTokens?: number;
 	protectedTokenTierOverrides?: ProtectedTokensTierOverrides;
 	usableSoft: number;
+	reclaimUsableWindow?: number;
 	/** Heuristic-cleanup config — when omitted, defaults to OpenCode parity values. */
 	heuristics?: {
 		caveman?: {
@@ -8464,29 +8509,56 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			args.sessionId,
 		);
 	let rewritingSignedPrefix = false;
+	// A changed recovery input or a new thinking omission rewrites the request.
+	// A restart that only replays already recorded decisions does not price cleanup.
+	let isCacheBustingPass =
+		args.recoveryRebuildReason === "lkg_recovery_input_rebuild" ||
+		((!!args.recoveryRebuildReason || args.forceSignedRebuildForFit === true) &&
+			hasUnfrozenPiThinking({
+				messages: args.messages,
+				entryIds: args.messages.map(
+					(message, index) =>
+						args.lkgEntryIds?.[index] ??
+						resolvePiRealStableId(
+							message,
+							index,
+							args.entryIds,
+							args.entryIdByRef ?? undefined,
+						),
+				),
+				frozen: frozenBindingEntryIds(args.db, args.sessionId),
+				provider: args.resolvedProviderID,
+				model: args.resolvedModelID,
+			}));
 	let workingForRewrite: unknown[] | undefined;
-	const stripForPrefixRewrite = () => {
+	const stripForPrefixRewrite = (permitRewrite = true) => {
+		// Required prefix rewrites permit queued drops and cleanup on this request.
+		// Recovery that only replays stored decisions passes false instead, so it
+		// cannot introduce a fresh edit into an otherwise unchanged saved request.
+		isCacheBustingPass ||= permitRewrite;
 		const messages = workingForRewrite ?? args.messages;
 		const result = applyPiProactiveThinkingStrip({
 			db: args.db,
 			sessionId: args.sessionId,
 			messages: messages as unknown[],
-			entryIds: messages.map((message, index) =>
-				resolvePiStableId(
-					message,
-					index,
-					args.entryIds,
-					args.entryIdByRef ?? undefined,
-				),
+			entryIds: messages.map(
+				(message, index) =>
+					args.lkgEntryIds?.[index] ??
+					resolvePiRealStableId(
+						message,
+						index,
+						args.entryIds,
+						args.entryIdByRef ?? undefined,
+					),
 			),
 			provider: args.resolvedProviderID,
 			model: args.resolvedModelID,
-			cacheBustingPass: true,
+			cacheBustingPass: isCacheBustingPass,
 			stripActiveTurn: true,
 			persistOnly: true,
 			requirePersistence: !!args.recoveryRebuildReason,
 		});
-		if (activeThinkingTurn && !result)
+		if (activeThinkingTurn && isCacheBustingPass && !result)
 			throw new Error(
 				"Cannot persist signed thinking omission before prefix rewrite",
 			);
@@ -8498,7 +8570,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		args.recoveryRebuildReason ||
 		(!holdEnabled && args.forceSignedRebuildForFit && protectedSignedPrefix)
 	)
-		stripForPrefixRewrite();
+		stripForPrefixRewrite(isCacheBustingPass);
 	// Messages without a real entry id get a position-independent fallback id
 	// computed once from this pass's input, before any stage edits content.
 	// Every stage below resolves by the index it was given into this same array
@@ -9033,7 +9105,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		subagentExecute:
 			args.sessionMeta.isSubagent && args.schedulerDecision === "execute",
 		hardFold:
-			foldBustsServedPrefixThisPass || firstRenderBust || heldIdleExpiryRebuild,
+			foldBustsServedPrefixThisPass ||
+			firstRenderBust ||
+			heldIdleExpiryRebuild ||
+			isCacheBustingPass,
 		force:
 			(args.forceMaterialization === true || emergencyDropEligible) &&
 			(args.contextUsage.percentage >= 95 ||
@@ -9055,7 +9130,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		firstRenderBust ||
 		heldIdleExpiryRebuild ||
 		emergencyDropEligible;
-	let isCacheBustingPass = prefixMutationAllowed && hasReclaimRide(rideSignals);
+	isCacheBustingPass = prefixMutationAllowed && hasReclaimRide(rideSignals);
 	const materializationHeld =
 		holdEnabled && protectedSignedPrefix && piM0State !== undefined;
 	if (materializationHeld && rideSignals.explicitFlush) {
@@ -9087,6 +9162,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			foldBustsServedPrefixThisPass ||
 			firstRenderBust ||
 			heldIdleExpiryRebuild ||
+			(args.recoveryRebuildReason !== undefined && isCacheBustingPass) ||
 			rideSignals.subagentExecute ||
 			(args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn));
 	if (protectedSignedPrefix && rideSignals.force && shouldRunHeuristics)
@@ -9658,6 +9734,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		signalPiPendingMaterialization(args.sessionId);
 		parkedTriggers?.holdMaterialization(heldMaterializationReason);
 	}
+	const reclaimDistance = isCacheBustingPass
+		? toolReclaimDistanceEntries(mutationView, targets)
+		: [];
 	const protectedToolTags = protectedToolTagNumbers(
 		getActiveTagsBySession(args.db, args.sessionId),
 		args.protectedTools,
@@ -10335,6 +10414,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				}
 			}
 			const editReclaim = buildEditSupersessionReclaim({
+				watermark: reclaimMeta.toolReclaimWatermark ?? 0,
 				db: args.db,
 				sessionId: args.sessionId,
 				targets: newTargets,
@@ -10579,7 +10659,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 	if (toolReclaimApplicationOpportunity) {
-		advanceToolReclaimWatermarkToCurrentMax(args.db, args.sessionId);
+		advanceToolReclaimWatermarkByDistance(
+			args.db,
+			args.sessionId,
+			reclaimDistance,
+			args.reclaimUsableWindow ?? 0,
+		);
 	}
 	if (autoReclaimTargetCount > 0) {
 		sessionLog(
@@ -11273,7 +11358,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		editAdmission,
 		strictThinkingKept: protectedSignedPrefix,
 		signedPrefixRewritten: rewritingSignedPrefix,
-		prefixRebuildAlreadyPriced: firstRenderBust || heldIdleExpiryRebuild,
+		prefixRebuildAlreadyPriced:
+			firstRenderBust ||
+			heldIdleExpiryRebuild ||
+			(!!args.recoveryRebuildReason && isCacheBustingPass),
 		identityRebuilt: identityRebuild,
 		historyRefreshPermitted,
 		servedTagNumbers,
@@ -11971,6 +12059,7 @@ import {
 	deferDeliveredSystemRefresh,
 	recordSystemRefreshOwnership,
 } from "@magic-context/core/hooks/magic-context/system-prompt-delivery";
+import { inRootAsyncContext } from "@magic-context/core/shared/sqlite";
 import { PI_FALLBACK_PREFIXES_JSON } from "../../plugin/src/shared/tag-owner-id";
 import {
 	beginPiSystemPromptRequest,

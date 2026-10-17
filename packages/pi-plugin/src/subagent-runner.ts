@@ -54,6 +54,13 @@ import type {
 import { logTemperatureDecision } from "@magic-context/core/shared/subagent-temperature";
 import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 import { type PiHarnessKind, resolvePiHarnessKind } from "./pi-harness-kind";
+import {
+	classifyZenFreeTierFailure,
+	isZenFreeTierRefusal,
+	isZenModel,
+	ZEN_FREE_TIER_FAILURE,
+	zenFreeTierMessage,
+} from "./pi-zen-free-tier";
 import { SubagentTelemetry, subagentStepCap } from "./subagent-telemetry";
 
 const PI_CODING_AGENT_MODULE = "@earendil-works/pi-coding-agent";
@@ -1288,6 +1295,10 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 		retainedRpc?: RetainedRpcCallbacks,
 	): Promise<SubagentRunResult> {
 		const startTime = Date.now();
+		const zenChild =
+			STRICT_TOOL_ALLOWLIST.has(options.agent) && isZenModel(options.model);
+		let deferredZenStderr = "";
+		let reportedZenStderr = false;
 		let recordedAccounting = false;
 		const cap = subagentStepCap(options.agent);
 		const budget = options.tokenBudget
@@ -1325,14 +1336,16 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 				startedAt: startTime,
 				status: result.ok
 					? "completed"
-					: result.reason === "abort"
-						? "aborted"
-						: result.reason === "timeout"
-							? "timed_out"
-							: result.reason === "no_assistant" ||
-									result.reason === "truncated"
-								? "empty"
-								: "failed",
+					: result.meta?.failureClass === ZEN_FREE_TIER_FAILURE
+						? "failed"
+						: result.reason === "abort"
+							? "aborted"
+							: result.reason === "timeout"
+								? "timed_out"
+								: result.reason === "no_assistant" ||
+										result.reason === "truncated"
+									? "empty"
+									: "failed",
 				messages,
 				providerId: hasProvider
 					? modelRef?.slice(0, providerSeparator)
@@ -1549,6 +1562,33 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 					};
 				}
 				settled = true;
+				if (zenChild) {
+					const classified = classifyZenFreeTierFailure(
+						result,
+						options.model,
+						options.agent,
+						this.invocation.targetHarness,
+					);
+					if (classified !== result && !classified.ok) {
+						sessionLog(
+							options.accountingSessionId ?? "subagent",
+							classified.error,
+						);
+					}
+					result = classified;
+					if (deferredZenStderr && !reportedZenStderr) {
+						emitProgress({
+							type: "stderr",
+							chunk:
+								result.meta?.failureClass === ZEN_FREE_TIER_FAILURE
+									? zenFreeTierMessage(
+											options.agent,
+											this.invocation.targetHarness,
+										)
+									: deferredZenStderr,
+						});
+					}
+				}
 				rpcAlive = false;
 				pendingTurn?.(
 					result.ok
@@ -1563,7 +1603,10 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 				pendingTurn = undefined;
 				// Mapping emits decisions between tool turns. Preserve those turns on
 				// every settlement so a timeout cannot erase already located files.
-				if (isMemoryMapper) {
+				if (
+					isMemoryMapper &&
+					result.meta?.failureClass !== ZEN_FREE_TIER_FAILURE
+				) {
 					result = {
 						...result,
 						meta: { ...result.meta, mappingMessages: [...mappingMessages] },
@@ -1632,6 +1675,16 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 			// log handlers must not be allowed to crash the runner.
 			const emitProgress = (event: SubagentProgressEvent) => {
 				if (!options.onProgress) return;
+				if (
+					zenChild &&
+					event.type === "raw_event" &&
+					isZenFreeTierRefusal(JSON.stringify(event.event))
+				) {
+					event = {
+						...event,
+						event: { type: event.eventType, error: { type: "FreeTierError" } },
+					};
+				}
 				try {
 					options.onProgress(event);
 				} catch {
@@ -1644,53 +1697,55 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 			// Calibration belongs to this invocation, not to a spawning historian child.
 			delete parentEnv.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
 			try {
-				child = this.spawnImpl(
-					this.invocation.command,
-					[...this.invocation.prefixArgs, ...this.extraArgs, ...args],
-					{
-						windowsHide: true,
-						cwd: options.cwd,
-						// Merge over the parent env so PATH/HOME/auth variables flow
-						// through for provider extensions. The guard only disables Magic
-						// Context's full entry; it must not replace the process env.
-						env: {
-							...parentEnv,
-							[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
-							MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
-							MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE: budgetGuardFile,
-							MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
-								options.agent === "rescore" ||
-								/^(magic-context-)?historian(?:-recomp|-editor)?$/.test(
-									options.agent,
-								)
-									? undefined
-									: "1",
-							...(options.temperature !== undefined
-								? {
-										MAGIC_CONTEXT_HISTORIAN_TEMPERATURE: String(
-											options.temperature,
-										),
-									}
-								: {}),
-							...(options.maxOutputTokens !== undefined
-								? {
-										MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS: String(
-											options.maxOutputTokens,
-										),
-									}
-								: {}),
+				child = inRootAsyncContext(() =>
+					this.spawnImpl(
+						this.invocation.command,
+						[...this.invocation.prefixArgs, ...this.extraArgs, ...args],
+						{
+							windowsHide: true,
+							cwd: options.cwd,
+							// Merge over the parent env so PATH/HOME/auth variables flow
+							// through for provider extensions. The guard only disables Magic
+							// Context's full entry; it must not replace the process env.
+							env: {
+								...parentEnv,
+								[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
+								MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
+								MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE: budgetGuardFile,
+								MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
+									options.agent === "rescore" ||
+									/^(magic-context-)?historian(?:-recomp|-editor)?$/.test(
+										options.agent,
+									)
+										? undefined
+										: "1",
+								...(options.temperature !== undefined
+									? {
+											MAGIC_CONTEXT_HISTORIAN_TEMPERATURE: String(
+												options.temperature,
+											),
+										}
+									: {}),
+								...(options.maxOutputTokens !== undefined
+									? {
+											MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS: String(
+												options.maxOutputTokens,
+											),
+										}
+									: {}),
+							},
+							// stdout = JSON events; stderr = diagnostics. stdin is a pipe
+							// when we deliver the user message there (always on Windows, or
+							// for oversized prompts elsewhere). Otherwise it stays closed
+							// because the message rides in argv and print-mode would block
+							// reading an open, idle stdin.
+							stdio: [
+								deliverViaStdin || rpcBudget ? "pipe" : "ignore",
+								"pipe",
+								"pipe",
+							],
 						},
-						// stdout = JSON events; stderr = diagnostics. stdin is a pipe
-						// when we deliver the user message there (always on Windows, or
-						// for oversized prompts elsewhere). Otherwise it stays closed
-						// because the message rides in argv and print-mode would block
-						// reading an open, idle stdin.
-						stdio: [
-							deliverViaStdin || rpcBudget ? "pipe" : "ignore",
-							"pipe",
-							"pipe",
-						],
-					},
+					),
 				);
 				childCreated = true;
 			} catch (error) {
@@ -1795,10 +1850,9 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 
 			// Capture stderr so we can attach it to error reasons. Pi prints
 			// unrecoverable errors (auth failures, network) here before the
-			// process exits. Also forward each chunk to the progress channel
-			// so historian failure logs see the message immediately rather
-			// than only at child exit (a hung child wouldn't surface this
-			// otherwise).
+			// process exits. Outside Zen, also forward each chunk to the progress
+			// channel so historian failure logs see the message immediately.
+			// Zen stderr is buffered below until refusal text can be classified.
 			let stderr = "";
 			let stderrLine = "";
 			// Pipe chunks split anywhere, including inside a multibyte UTF-8
@@ -1832,7 +1886,21 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 				if (stderr.length > 16_000) {
 					stderr = `…[truncated]${stderr.slice(-16_000)}`;
 				}
-				emitProgress({ type: "stderr", chunk: text });
+				if (zenChild) {
+					// Buffer arbitrary chunk boundaries so a split refusal body cannot
+					// reach the caller's log before its error class is recognized.
+					deferredZenStderr = stderr;
+					if (!reportedZenStderr && isZenFreeTierRefusal(stderr)) {
+						reportedZenStderr = true;
+						emitProgress({
+							type: "stderr",
+							chunk: zenFreeTierMessage(
+								options.agent,
+								this.invocation.targetHarness,
+							),
+						});
+					}
+				} else emitProgress({ type: "stderr", chunk: text });
 			});
 			// A pipe 'error' (EPIPE/ECONNRESET on the child's stderr, e.g. child
 			// died mid-write) emits on the stream; with no listener Node rethrows
@@ -3294,3 +3362,5 @@ export const __test = {
 		loggedUnavailableBuiltinTools.clear();
 	},
 };
+
+import { inRootAsyncContext } from "@magic-context/core/shared/sqlite";
