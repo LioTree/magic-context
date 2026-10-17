@@ -19,22 +19,6 @@
             "hosts": ["opencode2"]
         },
         {
-            "path": "tests/dream-child-claimant-oc1.test.ts",
-            "tier": "excluded",
-            "invocation": { "ts": false, "rust": false },
-            "rationale": "Opt-in host-boundary probe for the TypeScript dream-child claimant (dream-claim-v1) on real OpenCode 1: run with MC_E2E_DREAM_CLAIMANT_OC1=1 bun test tests/dream-child-claimant-oc1.test.ts. A scripted claim peer stands in for ck-mc; enforcement of tools, steps, tokens and stop is asserted in the real host. Skipped unless enabled, so it is not a default shard gate until Stage D switches the claimant on.",
-            "contract_refs": ["DREAM-CLAIM-V1"],
-            "hosts": ["opencode"]
-        },
-        {
-            "path": "tests/opencode2/dream-child-claimant.test.ts",
-            "tier": "excluded",
-            "invocation": { "ts": false, "rust": false },
-            "rationale": "Opt-in host-boundary probe for the TypeScript dream-child claimant (dream-claim-v1) on real OpenCode 2: run with MC_E2E_DREAM_CLAIMANT_OC2=1 bun test tests/opencode2/dream-child-claimant.test.ts. A scripted claim peer stands in for ck-mc; enforcement is asserted in the real host. Skipped unless enabled, so it is not a default shard gate until Stage D switches the claimant on.",
-            "contract_refs": ["DREAM-CLAIM-V1"],
-            "hosts": ["opencode2"]
-        },
-        {
             "path": "tests/latest-turn-thinking.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

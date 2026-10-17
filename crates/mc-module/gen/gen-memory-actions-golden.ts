@@ -16,7 +16,7 @@ const goldenPath = resolve(root, "crates/mc-module/testdata/memory_actions/golde
 const oracleSources = [
   [
     "packages/plugin/src/tools/ctx-memory/tools.ts",
-    "e50938f04378317f29ccc990f6abd9f6f447f811f5f2acc5c9c243c4ee19a78d",
+    "5741d13960d469571b642c2470b45c3102a4ee92e75e6163fd4f11c68593cab6",
   ],
   [
     "packages/plugin/src/features/magic-context/memory/lifecycle-applier.ts",
