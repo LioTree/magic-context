@@ -187,12 +187,6 @@ const RESTART_LANES: Lane[] = [
 	"HARD fold after historian publication",
 ];
 
-/**
- * Restart lanes whose release is lost today: the release signal lives only in process memory
- * (`signalPiPendingMaterialization`, `signalPiHistoryRefresh`).
- */
-const RESTART_GAP = new Set<Lane>(["/ctx-flush"]);
-
 // Pi discovers placeholder-only messages on a history refresh, which a
 // subagent (no historian) does not receive; subagents also get no synthetic
 // todo, caveman, m[0]/m[1] or /ctx-flush.
@@ -859,10 +853,6 @@ for (const subagent of [false, true]) {
 							`AUDIT-RESTART Pi/OMP | next user turn after a restart | ${lane}: ${f.mock.check(released) ?? "accepted"}; laneLanded=${edit}`,
 						);
 						expect(f.mock.check(released)).toBeNull();
-						if (!GOLDEN && !STRICT_AUDIT && RESTART_GAP.has(lane)) {
-							expect(edit).toBe(false);
-							return;
-						}
 						expect(edit).toBe(true);
 					},
 					"restart",
@@ -1115,7 +1105,7 @@ describe("signed prefix parking: Pi/OMP", () => {
 	);
 
 	it(
-		"a parked history refresh clears with its signal",
+		"a parked history refresh survives process-state reset",
 		withFixture(
 			false,
 			"frozen-sentinel first application",
@@ -1124,16 +1114,18 @@ describe("signed prefix parking: Pi/OMP", () => {
 				signalPiHistoryRefresh(f.sessionId);
 				f.served = (await f.pass()).messages;
 				expect(hasPiParkedBustTrigger(f.sessionId)).toBe(true);
-				// A session reset drops the in-memory history-refresh signal. The next pass
-				// sees no signal and clears the parked flag, so nothing waits for a user
-				// turn that may never come.
+				// Clearing in-memory signals is not cancellation: session_meta.held_release
+				// still records the withheld history refresh and why it must run later.
 				clearContextHandlerSession(f.sessionId);
 				const next = await f.pass();
 				expect(next.bustedThisPass).toBe(false);
 				expect(f.mock.check(wire(next.messages))).toBeNull();
-				expect(hasPiParkedBustTrigger(f.sessionId)).toBe(false);
+				expect(hasPiParkedBustTrigger(f.sessionId)).toBe(true);
 				f.userTurn("history-cleared", "Continue the parser work.");
-				expect((await f.pass()).bustedThisPass).toBe(false);
+				const released = await f.pass();
+				expect(released.bustedThisPass).toBe(true);
+				expect(f.mock.check(wire(released.messages))).toBeNull();
+				expect(hasPiParkedBustTrigger(f.sessionId)).toBe(false);
 			},
 			"parking-history-cleared",
 		),

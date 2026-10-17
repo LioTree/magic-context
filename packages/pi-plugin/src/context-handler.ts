@@ -8443,6 +8443,24 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let protectedSignedPrefix =
 		activeThinkingTurn && args.reasoningClearing?.prefixBound === true;
 	const holdEnabled = args.signedThinkingHold === "on";
+	const coldParkedTriggers = !parkedBustTriggersBySession.has(args.sessionId);
+	const parkedTriggers = holdEnabled
+		? ParkedBustTriggers.load(args.db, args.sessionId)
+		: undefined;
+	const parkedReleaseReasons = parkedTriggers?.reasons ?? [];
+	if (parkedTriggers) {
+		parkedBustTriggersBySession.set(args.sessionId, parkedTriggers);
+		if (coldParkedTriggers && parkedTriggers.reason("materialization"))
+			pendingMaterializationSessions.add(args.sessionId);
+		if (coldParkedTriggers && parkedTriggers.reason("history"))
+			historyRefreshSessions.add(args.sessionId);
+	} else parkedBustTriggersBySession.delete(args.sessionId);
+	const heldMaterializationReason =
+		parkedTriggers?.reason("materialization") ??
+		pendingMaterializationOrigin(
+			pendingMaterializationSessions,
+			args.sessionId,
+		);
 	let rewritingSignedPrefix = false;
 	let workingForRewrite: unknown[] | undefined;
 	const stripForPrefixRewrite = () => {
@@ -8981,13 +8999,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			injectionPassSnapshot?.cachedRow?.cached_m0_bytes &&
 			injectionPassSnapshot.cachedRow.cached_m1_bytes
 		);
-	if (!holdEnabled) parkedBustTriggersBySession.delete(args.sessionId);
-	const parkedTriggers = holdEnabled
-		? (parkedBustTriggersBySession.get(args.sessionId) ??
-			new ParkedBustTriggers())
-		: undefined;
-	if (parkedTriggers)
-		parkedBustTriggersBySession.set(args.sessionId, parkedTriggers);
 	let hasPendingMaterializeSignal =
 		(holdEnabled || !protectedSignedPrefix) &&
 		hasPendingMaterialization(args.sessionId);
@@ -8996,7 +9007,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		hasPendingMaterializeSignal ||
 			deferredMaterializationSessions.has(args.sessionId),
 		emergencyDropEligible,
-		args.isCacheBusting,
+		args.isCacheBusting ||
+			(coldParkedTriggers && parkedTriggers?.reason("history") !== undefined),
 	) ?? { materialization: true, force: true, history: args.isCacheBusting };
 	// The history-refresh signal as this pass may use it. It differs from
 	// `args.isCacheBusting` only after a held pass parked the signal: later passes
@@ -9006,7 +9018,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		parkedTriggers?.holdHistory();
 	if (firstRenderHeld) {
 		signalPiPendingMaterialization(args.sessionId);
-		parkedTriggers?.holdMaterialization();
+		parkedTriggers?.holdMaterialization(heldMaterializationReason);
 	}
 	// Subagents have no history fold to ride. Their execute pass admits every
 	// eligible cleanup lane together, without rewriting bytes when none acts.
@@ -9044,8 +9056,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let isCacheBustingPass = prefixMutationAllowed && hasReclaimRide(rideSignals);
 	const materializationHeld =
 		holdEnabled && protectedSignedPrefix && piM0State !== undefined;
-	if (materializationHeld && rideSignals.explicitFlush)
-		parkedTriggers?.holdMaterialization();
+	if (materializationHeld && rideSignals.explicitFlush) {
+		parkedTriggers?.holdMaterialization(heldMaterializationReason);
+	}
 	let publishedWorkDrainAllowed = isCacheBustingPass;
 	const usesTokenProtection =
 		args.protectedTokenTierOverrides !== undefined ||
@@ -9402,6 +9415,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				),
 		});
 	let editAdmission = makeEditAdmission();
+	if (materializationHeld && rideSignals.explicitFlush)
+		sessionLog(
+			args.sessionId,
+			`edit admission: held lane=materialization coords=prefix boundary=${editAdmission.frame.kind === "boundary" ? editAdmission.frame.messageId : "<unresolved>"} held_edits=1`,
+		);
 	let newTargets = new Map(
 		protectNewTagMutations(
 			mutationView.map((message) => ({
@@ -9624,7 +9642,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		rideSignals.explicitFlush &&
 		pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
 	)
-		parkedTriggers?.holdMaterialization();
+		parkedTriggers?.holdMaterialization(heldMaterializationReason);
 	if (
 		holdEnabled &&
 		args.schedulerDecision === "execute" &&
@@ -9632,7 +9650,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
 	) {
 		signalPiPendingMaterialization(args.sessionId);
-		parkedTriggers?.holdMaterialization();
+		parkedTriggers?.holdMaterialization(heldMaterializationReason);
 	}
 	const protectedToolTags = protectedToolTagNumbers(
 		getActiveTagsBySession(args.db, args.sessionId),
@@ -11225,6 +11243,17 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			getEmergencyInputSample(args.db, args.sessionId) === 0,
 		historyRefreshSessions.has(args.sessionId),
 	);
+	if (
+		!protectedSignedPrefix &&
+		bustedThisPass &&
+		!parkedTriggers?.pending &&
+		parkedReleaseReasons.length
+	)
+		sessionLog(
+			args.sessionId,
+			`edit admission: release reason=${parkedReleaseReasons.join(",")}`,
+		);
+	parkedTriggers?.persist(args.db, args.sessionId);
 	if (!parkedTriggers?.pending)
 		parkedBustTriggersBySession.delete(args.sessionId);
 	return {

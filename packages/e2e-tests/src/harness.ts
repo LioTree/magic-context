@@ -26,6 +26,7 @@ import { spawnOpencode, type SpawnedOpencode, type SpawnOptions } from "./openco
 export interface TestHarnessOptions {
     mockModelID?: string;
     thinkingScope?: (body: Record<string, unknown>) => string | undefined;
+    prefixBinding?: boolean;
     /** Use a canonical provider id when testing provider-specific replay lanes. */
     mockProviderID?: string;
     /** magic-context config overrides. Merged onto test defaults. */
@@ -143,7 +144,7 @@ export class TestHarness implements HostHarness {
 
     static async create(options: TestHarnessOptions = {}): Promise<TestHarness> {
         const mock = new MockProvider();
-        const { baseURL } = await mock.start({ thinkingScope: options.thinkingScope });
+        const { baseURL } = await mock.start({ thinkingScope: options.thinkingScope, prefixBinding: options.prefixBinding });
 
         // Always install a default so unexpected extra requests don't 500.
         mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);
@@ -388,6 +389,7 @@ export class TestHarness implements HostHarness {
         // multi-step assistant turns while still catching genuinely stuck
         // prompts. Individual tests can still pass a smaller timeoutMs.
         const timeoutMs = options.timeoutMs ?? 180_000;
+        this.mock.newUserTurn();
         const promptPromise = this.client.session.prompt({
             path: { id: sessionId },
             body: {

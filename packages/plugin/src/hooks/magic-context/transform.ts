@@ -2572,7 +2572,13 @@ export function createTransform(deps: TransformDeps) {
         // OpenCode filters them before the wire. Other providers keep native
         // structural parts so an empty text block cannot break tool adjacency.
         const strippedStructuralNoise =
-            canUseEmptySentinels && !compactionOff ? stripStructuralNoise(messages) : 0;
+            canUseEmptySentinels && !compactionOff
+                ? stripStructuralNoise(messages, {
+                      preserveNativeSteps:
+                          deps.signedThinkingHold === "on" &&
+                          isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID),
+                  })
+                : 0;
         logTransformTiming(
             sessionId,
             "stripStructuralNoise",

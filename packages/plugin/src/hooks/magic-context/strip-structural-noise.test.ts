@@ -16,6 +16,20 @@ function message(id: string, role: string, parts: unknown[]): MessageLike {
 }
 
 describe("stripStructuralNoise", () => {
+    it("preserves native step markers rather than inserting text before prefix-bound thinking", () => {
+        const msg = message("signed", "assistant", [
+            { type: "step-start", snapshot: "snapshot" },
+            {
+                type: "reasoning",
+                text: "original thinking",
+                metadata: { anthropic: { signature: "signature" } },
+            },
+            { type: "step-finish", reason: "tool-calls" },
+        ]);
+        const original = structuredClone(msg.parts);
+        stripStructuralNoise([msg], { preserveNativeSteps: true });
+        expect(msg.parts).toEqual(original);
+    });
     it("replaces meta, step markers, and cleared reasoning with empty-text sentinels (length preserved)", () => {
         const msg = message("m-1", "assistant", [
             { type: "meta", data: { trace: true } },

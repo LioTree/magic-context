@@ -474,6 +474,28 @@ describe("createMagicContextCommandHandler", () => {
     });
 
     describe("ctx-flush", () => {
+        it("leaves queued tag statuses to transform admission when signed holds are enabled", async () => {
+            insertTag(db, "ses-held-flush", 1, 500);
+            insertPendingOp(db, "ses-held-flush", 1);
+            const onFlush = mock(() => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                signedThinkingHold: "on",
+                onFlush,
+                sendNotification: mock(async () => {}),
+            });
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-flush", sessionID: "ses-held-flush", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-FLUSH_HANDLED__",
+            );
+            expect(getPendingOpsCount(db, "ses-held-flush")).toBe(1);
+            expect(getTagStatus(db, "ses-held-flush", 1)).toBe("active");
+            expect(onFlush).toHaveBeenCalledWith("ses-held-flush");
+        });
         it("reports an empty queue", async () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({

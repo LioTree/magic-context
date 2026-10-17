@@ -171,12 +171,6 @@ const RESTART_LANES: Lane[] = [
     "HARD fold after historian publication",
 ];
 
-/**
- * Restart lanes whose release is lost today: the release signal lives only in process memory
- * (`pendingMaterializationSessions`, `historyRefreshSessions`).
- */
-const RESTART_GAP = new Set<Lane>(["/ctx-flush"]);
-
 // Subagents have no m[0]/m[1], synthetic todo, caveman or /ctx-flush, and no
 // later user turn to anchor a processed-image watermark.
 const SUBAGENT_LANES: Lane[] = [
@@ -892,10 +886,6 @@ for (const generation of ["v1", "v2"] as const) {
                                 `AUDIT-RESTART ${host} | next user turn after a restart | ${lane}: ${f.mock.check(released) ?? "accepted"}; laneLanded=${edit}`,
                             );
                             expect(f.mock.check(released)).toBeNull();
-                            if (!GOLDEN && !STRICT_AUDIT && RESTART_GAP.has(lane)) {
-                                expect(edit).toBe(false);
-                                return;
-                            }
                             expect(edit).toBe(true);
                         },
                         "restart",
