@@ -11,7 +11,7 @@
  *
  * Only the default export, in the real entry's `{ id, server }` shape.
  */
-import { realpathSync, writeFileSync } from "node:fs";
+import { realpathSync, renameSync, writeFileSync } from "node:fs";
 import type { Plugin } from "@opencode-ai/plugin";
 import { openDatabase } from "../../plugin/src/features/magic-context/storage-db";
 import type { DreamChildHost } from "../../plugin/src/hooks/magic-context/dream-child-claimant";
@@ -42,7 +42,9 @@ const server: Plugin = async (ctx, options) => {
             }
         },
     });
-    writeFileSync(controlFile, JSON.stringify({ port: server.port, pid: process.pid }));
+    // Written whole, then renamed, so the test never reads half a file.
+    writeFileSync(`${controlFile}.tmp`, JSON.stringify({ port: server.port, pid: process.pid }));
+    renameSync(`${controlFile}.tmp`, controlFile);
     return hooks;
 };
 
