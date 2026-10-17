@@ -624,7 +624,37 @@ pub(super) fn fold_structure(
     hash.finalize().into()
 }
 
-pub(super) fn prime_resident_fold(
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch that makes the next `prime_resident_fold` on this thread
+    /// fail after it has partly filled the fold arena, as a corrupt stored view
+    /// would. Thread-local, so tests running in parallel do not see each other's
+    /// switch.
+    pub(super) static FAIL_NEXT_RESIDENT_FOLD_RESTORE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Restores the resident fold state from the stored view. If the restore fails,
+/// it logs the failure and drops every partly built fold structure, so the next
+/// fold replays the stored native rows in full. A restore failure never fails
+/// the request: those stored rows remain the source of truth either way.
+pub(super) fn prime_resident_fold_or_clear(
+    store: &McStore,
+    key: &Key,
+    state: &mut super::policy_summary::ResidentPolicy,
+) {
+    if let Err(error) = prime_resident_fold(store, key, state) {
+        tracing::warn!(session_id = %key.session, harness = %key.harness, ?error,
+            "resident fold restore failed; the next fold uses the full rebuild");
+        state.fold_structure = None;
+        state.fold_view = None;
+        state.fold_working = None;
+        state.fold_arena = Default::default();
+    }
+}
+
+/// Prefer `prime_resident_fold_or_clear`: callers must not fail on a restore error.
+fn prime_resident_fold(
     store: &McStore,
     key: &Key,
     state: &mut super::policy_summary::ResidentPolicy,
@@ -774,6 +804,10 @@ pub(super) fn prime_resident_fold(
     )?;
     let saved =
         super::resident_view::ResidentView::store(&mut state.fold_arena, &view, None, None)?;
+    #[cfg(test)]
+    if FAIL_NEXT_RESIDENT_FOLD_RESTORE.with(|fail| fail.replace(false)) {
+        return Err(transient("injected resident fold restore failure"));
+    }
     if store
         .compartment_source_revision(&conversation.engine_namespace)
         .ok()
@@ -827,12 +861,7 @@ fn execute_host(
             .map_err(transient)?;
         if let Some(rebuilt) = rebuilt {
             lease.state = rebuilt;
-            if prime_resident_fold(store, &work.key, &mut lease.state).is_err() {
-                lease.state.fold_structure = None;
-                lease.state.fold_view = None;
-                lease.state.fold_working = None;
-                lease.state.fold_arena = Default::default();
-            }
+            prime_resident_fold_or_clear(store, &work.key, &mut lease.state);
         } else {
             resident = None;
         }

@@ -402,7 +402,9 @@ impl McHandler {
                     )
                 })
                 .map_err(transient)?;
-            super::compaction::prime_resident_fold(&store, &key, &mut lease.state)?;
+            // A failed restore falls back to the full rebuild; it must not
+            // fail the hook.
+            super::compaction::prime_resident_fold_or_clear(&store, &key, &mut lease.state);
         }
         let held = store
             .load_provider_conversation(&key.store_key())
@@ -945,13 +947,8 @@ impl McHandler {
                     )
                 })
                 .map_err(transient)?;
-            if matches!(key.harness.as_str(), "opencode" | "opencode2")
-                && super::compaction::prime_resident_fold(&store, &key, &mut lease.state).is_err()
-            {
-                lease.state.fold_structure = None;
-                lease.state.fold_view = None;
-                lease.state.fold_working = None;
-                lease.state.fold_arena = Default::default();
+            if matches!(key.harness.as_str(), "opencode" | "opencode2") {
+                super::compaction::prime_resident_fold_or_clear(&store, &key, &mut lease.state);
             }
             let rebuild_ms = started.elapsed().as_secs_f64() * 1000.0;
             tracing::info!(session_id = %key.session, harness = %key.harness, rebuild_ms,

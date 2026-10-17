@@ -429,25 +429,22 @@ async fn claude_resident_fold_with_tool_result_boundary_matches_full_rebuild() {
     );
 }
 
-/// After a process restart, a Claude Code fold restores its resident state from
-/// the stored view of the previous fold instead of replaying the whole native
-/// history. The stored view here ends at a `tool_result` boundary, which the
-/// restore must accept, and the restored fold must serve exactly what the full
-/// rebuild (the non-resident oracle) serves.
-#[tokio::test]
-async fn claude_resident_restart_primes_from_stored_view_and_matches_full_rebuild() {
-    let root = synthetic();
-    let a = root.path().join("on");
-    let b = root.path().join("off");
-    std::fs::create_dir_all(&a).unwrap();
-    std::fs::create_dir_all(&b).unwrap();
-    let project = root.path().join("project");
-    let mut on = claude(&a, &project, true);
-    let mut off = claude(&b, &project, false);
+/// Runs a Claude Code fold whose stored view ends at a `tool_result` boundary
+/// (ordinal 81 of 100 messages) on a resident handler and on the non-resident
+/// oracle, acknowledges it, then restarts both processes on the same stores and
+/// repeats the host's declare and Setup. Returns the restarted resident handler,
+/// the restarted oracle, and the `last_applied` value naming the Setup's view.
+async fn claude_restarted_after_tool_result_fold(
+    a: &Path,
+    b: &Path,
+    project: &Path,
+) -> (McHandler, McHandler, Value) {
+    let on = claude(a, project, true);
+    let off = claude(b, project, false);
     let ready = super::super::claude_code_tests::setup(&on).await;
     assert_eq!(ready, super::super::claude_code_tests::setup(&off).await);
     let boundary = 81;
-    let mut newest = 100;
+    let newest = 100;
     for h in [&on, &off] {
         let store = h.store.get().unwrap();
         let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
@@ -490,11 +487,31 @@ async fn claude_resident_restart_primes_from_stored_view_and_matches_full_rebuil
 
     drop(on);
     drop(off);
-    on = claude(&a, &project, true);
-    off = claude(&b, &project, false);
+    let on = claude(a, project, true);
+    let off = claude(b, project, false);
     let ready = super::super::claude_code_tests::setup(&on).await;
     assert_eq!(ready, super::super::claude_code_tests::setup(&off).await);
-    let mut applied = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    let applied = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    (on, off, applied)
+}
+
+/// After a process restart, a Claude Code fold restores its resident state from
+/// the stored view of the previous fold instead of replaying the whole native
+/// history. The stored view here ends at a `tool_result` boundary, which the
+/// restore must accept, and the restored fold must serve exactly what the full
+/// rebuild (the non-resident oracle) serves.
+#[tokio::test]
+async fn claude_resident_restart_primes_from_stored_view_and_matches_full_rebuild() {
+    let root = synthetic();
+    let a = root.path().join("on");
+    let b = root.path().join("off");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let project = root.path().join("project");
+    let (mut on, mut off, mut applied) =
+        claude_restarted_after_tool_result_fold(&a, &b, &project).await;
+    let boundary = 81;
+    let mut newest = 100;
     // The history compartments are not rewritten here, so the compartment source
     // revision recorded with the last fold's cut still equals the current one;
     // prime_resident_fold restores only when those two revisions match.
@@ -648,6 +665,103 @@ async fn claude_resident_restart_primes_from_stored_view_and_matches_full_rebuil
     assert_eq!(
         lease.state.fold_tail_passes, 1,
         "the fold after the restoring hook must run on the restored state"
+    );
+    lease.publish();
+}
+
+/// A restored fold state is an optimization. If restoring it from the stored view
+/// fails after a restart, the first Claude Code hook must still answer, using the
+/// full-rebuild path and the oracle's bytes, and the next fold replays the
+/// stored rows in full.
+#[tokio::test]
+async fn claude_hook_after_failed_resident_restore_serves_the_full_rebuild() {
+    let root = synthetic();
+    let a = root.path().join("on");
+    let b = root.path().join("off");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let project = root.path().join("project");
+    let (on, off, applied) = claude_restarted_after_tool_result_fold(&a, &b, &project).await;
+    let boundary = 81;
+    let mut newest = 100;
+    let store = on.store.get().unwrap();
+    let key = Key::new(&on.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    // A message id (mid) already stored cannot be resent with a different
+    // raw_message, so the hook repeats the newest message's stored raw_message.
+    let held = store
+        .load_provider_messages_since(&key.store_key(), "L", newest)
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&held[0].message_bytes).unwrap();
+    let hook = json!({"session":"cc","harness":"claude-code","step_id":"hook-after-failed-restore","lineage_id":"L",
+        "params":{"serializer_profile":"claude-code-anthropic","observation":"answer"},"hook":"pre_user",
+        "subject_mid":format!("m{newest}"),"subject_ordinal":newest,"message":envelope["message"],
+        "raw_message":envelope["raw_message"],"blocks":[envelope["message"]["content"]]});
+    super::super::compaction::FAIL_NEXT_RESIDENT_FOLD_RESTORE.with(|fail| fail.set(true));
+    let served = on
+        .dispatch_value(7, json!({"method":"transform.hook","params":&hook}))
+        .await;
+    assert!(
+        !super::super::compaction::FAIL_NEXT_RESIDENT_FOLD_RESTORE.with(|fail| fail.get()),
+        "the hook's cold rebuild must have attempted the restore"
+    );
+    let HandlerOutcome::Response(served) = served else {
+        panic!("a failed restore must not fail the hook: {served:?}")
+    };
+    assert_eq!(
+        served,
+        invoke(&off, "transform.hook", &hook).await,
+        "hook after the failed restore"
+    );
+    let lease = on
+        .provider_resident
+        .begin(store.tag_cache_namespace(), &key)
+        .unwrap()
+        .unwrap();
+    assert!(
+        lease.state.fold_view.is_none() && lease.state.fold_working.is_none(),
+        "a failed restore must drop the partly built fold state"
+    );
+    lease.publish();
+    for h in [&on, &off] {
+        let store = h.store.get().unwrap();
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let namespace = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap()
+            .engine_namespace;
+        store
+            .replace_compartments(&namespace, &compartments(1, boundary))
+            .unwrap();
+        store.arm_soft_refresh(&namespace).unwrap();
+    }
+    newest += 1;
+    let mut request = step(
+        "cc",
+        vec![cc_message(newest, "after failed restore")],
+        Some(newest),
+    );
+    request["harness"] = json!("claude-code");
+    request["request_id"] = json!("after-failed-restore");
+    request["now"] = json!(2000);
+    request["served_through_ordinal"] = json!(newest);
+    request["last_applied"] = applied;
+    let response = invoke(&on, "compaction.step", &request).await;
+    assert_eq!(
+        String::from_utf8_lossy(&response),
+        String::from_utf8_lossy(&invoke(&off, "compaction.step", &request).await),
+        "fold after the failed restore"
+    );
+    let response: Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(response["answer"], "compaction_message", "{response}");
+    let lease = on
+        .provider_resident
+        .begin(store.tag_cache_namespace(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lease.state.fold_tail_passes, 0,
+        "without a restored state the fold must replay the stored rows in full"
     );
     lease.publish();
 }
