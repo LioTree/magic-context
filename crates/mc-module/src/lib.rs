@@ -8513,8 +8513,10 @@ impl McHandler {
                 code: "route_unbound".to_string(),
                 message: format!("{operation} on a channel with no session binding"),
             })?;
-        // The in-process plugin keeps its legacy lane. Every other route must carry
-        // the same daemon attestations as the bridge host lane.
+        // The in-process plugin's route keeps its project-wide access (see
+        // historian_plugin_lane). Every other route must carry the same daemon
+        // attestations (reserved:thalamus-harness plus an authorized
+        // prefrontal-core scope) as the bridge host lane.
         if !historian_plugin_lane(&binding) {
             if !matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi") {
                 return Err(HandlerOutcome::Error {
@@ -15524,15 +15526,17 @@ fn unrecognized_request_error(request: &Value) -> HandlerOutcome {
 /// the wire keeps an oversized body from reaching the parser at all.
 const MAX_HISTORIAN_REPORT_BYTES: usize = MAX_FACADE_FRAME_BYTES;
 
-/// Whether a historian claim-lane route is the in-process plugin's own lane, which
-/// polls and claims across its bound project as it always has.
+/// Whether a historian claim-op route belongs to the in-process Magic Context
+/// plugin, which may list and claim queued historian runs for any session of its
+/// bound project, as it could before harness routes were admitted.
 ///
 /// The plugin opens its route without a consumer identity, so the daemon stamps
-/// `Principal::Direct` on it and requests no scope; a daemon that predates
-/// attestation stamps no principal at all. Both are the plugin lane. A Direct
-/// route that asked the daemon for a scope is presenting itself as a harness
-/// participant, and a reserved or unverified principal is a module caller: those
-/// go through the attested harness check and stay confined to their session.
+/// `Principal::Direct` on the bind and no scope (the plugin never asks for one).
+/// A daemon that predates principal stamping sends no principal at all. Both
+/// shapes are the plugin. Any other binding is treated as a harness module: a
+/// Direct route that asked the daemon for a scope, or a reserved or unverified
+/// principal. Those must pass `providers::admit_host_lane` and may only touch
+/// the run of their own bound session.
 fn historian_plugin_lane(binding: &SessionBinding) -> bool {
     match &binding.principal {
         None => true,

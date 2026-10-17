@@ -118,9 +118,12 @@ export function currentLkgRequestIdentity(sessionId: string): LkgRequestIdentity
 }
 
 /** True when `request` is the session's current request identity or the one it
- * directly replaced. Material a host hook records late in one request is read early
- * in the next on OpenCode 1, whose messages transform runs before its system hook;
- * OpenCode 2 starts a second identity between its system stage and its transform. */
+ * directly replaced. The system-prompt hook records each request's final system
+ * strings under the identity current at that moment, and the messages transform
+ * reads them back. On OpenCode 1 the messages transform runs before the system
+ * hook, so it can only read what the previous request's hook recorded. On
+ * OpenCode 2 the context hook starts a second identity after its system stage and
+ * before the transform, so the recording carries the identity just replaced. */
 export function isCurrentOrPreviousLkgRequest(
     sessionId: string,
     request: LkgRequestIdentity | undefined,

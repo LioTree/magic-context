@@ -71,8 +71,9 @@ test("standalone marker requires raw material from the current or previous reque
         responseId: "second",
         inputTokens: 0,
     });
-    // OpenCode 1 records a request's final system only after its messages
-    // transform, so the request directly before this one still supplies it.
+    // OpenCode 1 records a request's final system strings only after its messages
+    // transform, so a transform can only measure with the system strings the
+    // request directly before it recorded.
     expect(measureStandaloneMarker(args).fit).toBe("under");
     noteLkgProviderResponse({
         sessionId: args.sessionId,

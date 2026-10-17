@@ -573,9 +573,10 @@ fn historian_claim_vectors_concurrent_claimants_have_one_winner() {
 
 /// The in-process plugin opens its route with no consumer identity, so the daemon
 /// stamps `Principal::Direct` and no scope on its bind (`McHandler::on_bind` copies
-/// both onto the binding). That route keeps the plugin's project-wide lane on every
-/// host harness; asking the daemon for a scope makes a Direct route a harness
-/// participant again, which the attested harness check refuses.
+/// both onto the binding). On every host harness that route may still list and
+/// claim queued runs for any session of its project. Once the same Direct route
+/// carries a scope it is treated as a harness module, and `admit_host_lane`
+/// refuses it because it is not reserved:thalamus-harness.
 #[test]
 fn historian_claim_plugin_direct_route_keeps_project_wide_lane() {
     struct Reset;
