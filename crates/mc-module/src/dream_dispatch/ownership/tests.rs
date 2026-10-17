@@ -221,7 +221,11 @@ fn file_reading_tasks_are_published_only_to_a_claimant_declaring_file_reads() {
     });
     assert_eq!(
         ownership.published,
-        [TaskName::Curate, TaskName::Classify],
+        [
+            TaskName::Curate,
+            TaskName::Classify,
+            TaskName::ReviewUserMemories
+        ],
         "{:?}",
         ownership.withheld
     );
@@ -271,7 +275,11 @@ fn broca_publishes_file_reading_tasks_only_when_it_declares_file_reads() {
     });
     assert_eq!(
         memory_only.published,
-        [TaskName::Curate, TaskName::Classify]
+        [
+            TaskName::Curate,
+            TaskName::Classify,
+            TaskName::ReviewUserMemories
+        ]
     );
     for task in [TaskName::Map, TaskName::Verify, TaskName::VerifyBroad] {
         assert!(memory_only
@@ -295,7 +303,8 @@ fn broca_publishes_file_reading_tasks_only_when_it_declares_file_reads() {
             TaskName::Verify,
             TaskName::VerifyBroad,
             TaskName::Curate,
-            TaskName::Classify
+            TaskName::Classify,
+            TaskName::ReviewUserMemories
         ]
     );
 }
