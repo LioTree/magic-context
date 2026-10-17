@@ -84,6 +84,148 @@ fn require_scope(conn: &Connection, project: &str, session: &str) -> rusqlite::R
     }
 }
 
+pub(crate) struct FlushProgress {
+    project: String,
+    command: String,
+    job: Value,
+    targets: std::collections::HashSet<String>,
+    frozen_before: std::collections::HashSet<String>,
+}
+
+fn frozen_drop_targets(
+    tx: &Connection,
+    session: &str,
+) -> rusqlite::Result<std::collections::HashSet<String>> {
+    tx.prepare(
+        "SELECT substr(json_extract(unit.value,'$.key'),5)
+           FROM mc_cache_frozen_chunks AS chunks, json_each(chunks.body) AS unit
+          WHERE chunks.session_id=?1 AND json_extract(unit.value,'$.key') LIKE 'red:%'",
+    )?
+    .query_map([session], |row| row.get(0))?
+    .collect()
+}
+
+/// Snapshot the active flush before the accepted transform changes frozen units.
+/// A flush snapshots target ids, which need not share the flush command's id.
+/// Queued rows can be retired without applying a reduction, so their count alone
+/// cannot be used as an applied-effect count.
+pub(crate) fn prepare_flush_progress_tx(
+    tx: &Connection,
+    session: &str,
+) -> rusqlite::Result<Option<FlushProgress>> {
+    if !exists(tx)? {
+        return Ok(None);
+    }
+    let scoped: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('mc_ops_stream') WHERE name='project_identity')", [], |r| r.get(0))?;
+    if !scoped {
+        return Ok(None);
+    }
+    let row = tx
+        .query_row(
+            "SELECT c.project_identity,c.command_id,c.job FROM mc_ops_commands c
+         JOIN mc_ops_stream s ON s.session_id=c.session_id
+           AND s.project_identity=c.project_identity AND s.active_command=c.command_id
+         WHERE c.session_id=?1 AND json_extract(c.job,'$.state')='armed'",
+            [session],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    decode(r.get(2)?)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((project, command, job)) = row else {
+        return Ok(None);
+    };
+    let targets: std::collections::HashSet<String> = job["result"]["queued_drops"]
+        ["target_tag_ids"]
+        .as_array()
+        .ok_or(rusqlite::Error::InvalidQuery)?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or(rusqlite::Error::InvalidQuery)
+        })
+        .collect::<rusqlite::Result<_>>()?;
+    if targets.len() > 512 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let frozen_before = if targets.is_empty() {
+        Default::default()
+    } else {
+        frozen_drop_targets(tx, session)?
+    };
+    Ok(Some(FlushProgress {
+        project,
+        command,
+        job,
+        targets,
+        frozen_before,
+    }))
+}
+
+/// Called after the successful cache CAS and queue consumption, in that same
+/// transaction. Count only newly frozen snapshot targets; already-frozen or
+/// obsolete queue entries are not new effects. A partial flush remains armed.
+pub(crate) fn finish_flush_progress_tx(
+    tx: &Connection,
+    session: &str,
+    progress: Option<FlushProgress>,
+    refresh_pending: bool,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let Some(mut progress) = progress else {
+        return Ok(());
+    };
+    let frozen_after = if progress.targets.is_empty() {
+        Default::default()
+    } else {
+        frozen_drop_targets(tx, session)?
+    };
+    let applied = progress
+        .targets
+        .iter()
+        .filter(|target| {
+            !progress.frozen_before.contains(*target) && frozen_after.contains(*target)
+        })
+        .count() as u64;
+    let mut remaining = 0;
+    for target in &progress.targets {
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_agent_drops WHERE session_id=?1 AND target_id=?2)",
+            params![session, target],
+            |r| r.get(0),
+        )?;
+        if pending {
+            remaining += 1;
+        }
+    }
+    let result = &mut progress.job["result"];
+    let total = result["queued_drops"]["applied_count"]
+        .as_u64()
+        .unwrap_or(0)
+        .checked_add(applied)
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    result["queued_drops"]["applied_count"] = json!(total);
+    result["queued_drops"]["remaining_count"] = json!(remaining);
+    result["soft_refresh_pending"] = json!(refresh_pending);
+    let complete = remaining == 0 && !refresh_pending;
+    if complete {
+        result["queued_drops"]["state"] = json!("drained");
+        progress.job["state"] = json!("drained");
+        progress.job["completed_at_ms"] = json!(now);
+    }
+    tx.execute("UPDATE mc_ops_commands SET job=?4 WHERE project_identity=?1 AND session_id=?2 AND command_id=?3", params![progress.project,session,progress.command,progress.job.to_string()])?;
+    // Retained events carry the same current job snapshot. Do not allocate a new
+    // sequence here: transform completion must not overflow the acknowledged
+    // stream's admission bound or discard an unacknowledged event.
+    tx.execute("UPDATE mc_ops_events SET event=json_set(event,'$.job',json(?4)) WHERE project_identity=?1 AND session_id=?2 AND json_extract(event,'$.command_id')=?3",params![progress.project,session,progress.command,progress.job.to_string()])?;
+    Ok(())
+}
+
 impl McStore {
     fn ops_project(&self, session: &str) -> Result<String, McStoreError> {
         self.session_project_identity(session)?
@@ -524,6 +666,10 @@ mod tests {
         include!("command_ledger_review_tests.rs");
     }
 }
+
+#[cfg(test)]
+#[path = "command_ledger_flush_tests.rs"]
+mod flush_tests;
 
 #[cfg(test)]
 mod repair_tests {
