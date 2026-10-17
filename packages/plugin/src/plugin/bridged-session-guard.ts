@@ -145,7 +145,7 @@ export function dropBridgedSessionCreatedRows(db: Database, sessionId: string): 
             sessionId,
             harness,
         );
-    })();
+    }).immediate();
 }
 
 /** Refuse Magic Context tool calls that arrive for an enrolled session. */
