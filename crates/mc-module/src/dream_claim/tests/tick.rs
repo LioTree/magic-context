@@ -161,7 +161,8 @@ impl Project {
             .unwrap()
     }
 
-    /// Ten unclassified memories of this project.
+    /// Store ten not-yet-classified memories in `category`, under the fixture
+    /// project's key.
     pub fn memories(&self, category: &str) {
         self.handler
             .store
@@ -358,7 +359,8 @@ async fn a_declared_claimant_runs_classify_through_rust_and_its_effect_lands() {
         p.scalar("SELECT COUNT(*) FROM memories WHERE classified_at IS NOT NULL"),
         10
     );
-    // The TypeScript row now carries Rust's progress past the slot it ran.
+    // The TypeScript scheduler's task_schedule_state row for classify-memories now
+    // has a next_due_at past the slot Rust ran, so TypeScript will not run it again.
     assert!(
         p.scalar(&format!(
             "SELECT next_due_at FROM task_schedule_state WHERE project_path='{}' AND task='classify-memories'",
@@ -624,7 +626,8 @@ async fn killed_ck_mc_during_a_rust_dream_recovers_without_a_duplicate_effect() 
     assert_eq!(p.handler.dream_queue().retired_attempts(), 1);
     assert_eq!(p.scalar(classified), 10);
     assert!(p.scalar(&due) > slot);
-    // Domain released after the run: TypeScript could acquire it now.
+    // No holder of the memory domain lease remains after the run, so the
+    // TypeScript dreamer (which shares this lease) could acquire it now.
     assert_eq!(
         p.scalar("SELECT COUNT(*) FROM dream_state WHERE key LIKE 'lease:memory:%:holder'"),
         0

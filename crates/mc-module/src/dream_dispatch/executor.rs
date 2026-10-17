@@ -194,7 +194,8 @@ impl<P: BrocaPort> CurateCarrier for CurateTaskCarrier<P> {
     }
 }
 
-/// The tasks this build runs end to end in Rust. Publication never names another.
+/// The tasks this build runs end to end in Rust. Publication never names a task
+/// outside this list.
 pub const OPERATIONAL: &[TaskName] = super::dispatcher::OPERATIONAL_TASKS;
 
 /// The production executor for one project's dream tick or manual run.
