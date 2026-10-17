@@ -81,7 +81,7 @@ describe("createCtxNoteTools", () => {
             toolContext(),
         );
         expect(reply).toBe(
-            "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+            "Magic Context needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
         );
         expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
         db.exec("DELETE FROM authority_managed");

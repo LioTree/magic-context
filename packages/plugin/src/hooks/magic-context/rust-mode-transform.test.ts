@@ -7363,7 +7363,7 @@ describe("Rust mode authority adapter", () => {
                 const error = await failure;
                 expect(error).toBeInstanceOf(EmergencyFailClosedError);
                 expect((error as Error).message).toBe(
-                    "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+                    "Magic Context needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
                 );
                 expect(moduleCalls).toBeGreaterThan(callsBefore);
             }

@@ -133,7 +133,7 @@ On upgrade, Magic Context removes children recorded by older hosts through the n
 
 - **Command output** from the `/ctx-*` commands appears only in a connected terminal UI. The commands themselves run from any client.
 - **The sidebar is hidden by default.** Toggle it with `ctrl+x b`.
-- **`transform_mode: "rust"` runs the Rust module here too.** OpenCode 2 has no compaction row for Magic Context to write, so the module's fold boundary is recorded in Magic Context's own store and the host's compaction request is answered from the module's history.
+- **`transform_mode` has no effect.** Rust transform mode is retired. Magic Context ignores the setting and writes one warning to its log. OpenCode 2 runs the TypeScript transform, the same as OpenCode 1.
 
 ## Where logs live
 

@@ -64,7 +64,7 @@ function undo(backup: string, data: string, print: (line: string) => void): void
         `  cp ${quote(join(backup, "context.db"))} ${quote(join(backup, "store.db"))} ${quote(data + "/")}`,
     );
     print(
-        "This restores the unmigrated stores. Keep the current plugin and ck-mc: TypeScript mode works as before, and Rust mode will refuse with MC-C14 until you run this command again.",
+        "This restores the unmigrated stores. Keep the current plugin and ck-mc. Until you run this command again, ck-mc and the plugin refuse with MC-C14 where they need the migrated store.",
     );
 }
 

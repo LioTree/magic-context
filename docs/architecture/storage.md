@@ -78,18 +78,19 @@ transaction is not generally recreated from that cache. A memory, note or other
 context-owned update can remain absent unless its writer retries it. Restore both
 files from the same backup set; never mix snapshots or restore just one.
 
-There are other persisted cross-store boundaries. In Rust mode the replay-blocking
-marker-admission fence and the LKG slot are in `context.db`, while OpenCode's
-compaction marker rows are in `opencode.db`. The fence is committed before a
-marker move, but NORMAL can still lose that recent fence at power loss even if
-the separate host-store update survives. Startup's marker consistency probe is
-diagnostic-only: it retains state and waits for a priced publication to replace
-inconsistent marker rows. A lost latest LKG capture likewise leaves only an older
-slot or none; the loader checks its stored pieces and the replay path checks the
-input ids/content and model/provider before using it. If no valid LKG remains,
-Rust mode may serve raw input only when its conservative fit check succeeds;
-otherwise it refuses rather than replaying an unverified snapshot. These checks
-bound the recovery behavior, but they do not make the recent writes durable.
+There are other persisted cross-store boundaries. The TypeScript transform keeps
+its LKG slots (`lkg_slots`), its served markers (`lkg_served_markers`) and its
+compaction-marker state in `context.db`, while OpenCode's compaction marker rows
+are in `opencode.db`. No transaction spans the two files, so `synchronous=NORMAL`
+can lose a recent `context.db` write at power loss even if the separate host-store update
+survives. Startup's marker consistency probe is diagnostic-only: it retains state
+and waits for a priced publication to replace inconsistent marker rows. A lost
+latest LKG capture likewise leaves only an older slot or none; the loader checks
+its stored pieces and the replay path checks the input ids/content and
+model/provider before using it. If no valid LKG remains, a failed managed pass
+refuses the turn rather than replaying an unverified snapshot or sending raw input.
+These checks bound the recovery behavior, but they do not make the recent writes
+durable.
 
 ## Session-scoped tables
 
