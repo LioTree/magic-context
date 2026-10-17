@@ -1276,7 +1276,8 @@ export interface ModuleStateSyncClient {
             | "historian.pending"
             | "historian.claim"
             | "historian.heartbeat"
-            | "historian.complete";
+            | "historian.complete"
+            | import("./dream-child-claimant").DreamChildMethod;
         body: unknown;
         signal?: AbortSignal;
         generationSensitive?: boolean;

@@ -477,7 +477,8 @@ export class SubcModuleTransport {
             | "historian.pending"
             | "historian.claim"
             | "historian.heartbeat"
-            | "historian.complete";
+            | "historian.complete"
+            | import("./dream-child-claimant").DreamChildMethod;
         body: unknown;
         /** Per-call durations; responseWait includes the client's opaque receive and decode. */
         onTimings?: (timings: ModuleCallTimings) => void;
@@ -536,7 +537,10 @@ export class SubcModuleTransport {
             // must also never queue behind a transform: a heartbeat that waited out a
             // 15 s pass would let the lease lapse and hand a live run to a second
             // claimant, which is the exact failure the lease exists to prevent.
-            const outsideSessionOrder = args.method.startsWith("historian.");
+            // Dream-child operations are addressed by entry and child the same way, and
+            // a child's step or tool admission must not wait behind its parent's pass.
+            const outsideSessionOrder =
+                args.method.startsWith("historian.") || args.method.startsWith("dream.child.");
             if (!args.bypassSessionLane && !outsideSessionOrder) {
                 releaseLane = await this.acquireCorrectnessLane(
                     args.sessionId,

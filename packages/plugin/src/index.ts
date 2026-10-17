@@ -42,6 +42,10 @@ import {
     COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT,
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./hooks/magic-context/compartment-prompt";
+import {
+    admitDreamChildStep,
+    dreamChildToolRefusal,
+} from "./hooks/magic-context/dream-child-claimant";
 import { recordToolParameters } from "./hooks/magic-context/dropped-input-guard";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
 import {
@@ -914,6 +918,11 @@ const server: Plugin = async (ctx) => {
             },
         }),
         "chat.params": async (input, output) => {
+            // OpenCode 1 runs this before every model call. A claimed dream child's
+            // step is admitted here (its own cap, its recorded usage, the module's
+            // step ack); a refusal throws, which ends the child's turn before the
+            // provider is called. Any other session passes straight through.
+            await admitDreamChildStep(input.sessionID);
             dreamerCap.apply(input, output);
             applyHiddenSubagentTemperature(input, output, log);
         },
@@ -1006,6 +1015,10 @@ const server: Plugin = async (ctx) => {
             );
         },
         "tool.execute.before": async (input, output) => {
+            // A claimed dream child may run only the tools its gate admits, whatever
+            // the user's permissions allow; the throw keeps the tool from executing.
+            const dreamRefusal = dreamChildToolRefusal(input.sessionID, input.tool);
+            if (dreamRefusal !== undefined) throw new Error(dreamRefusal);
             await magicContextRuntime.magicContext?.["tool.execute.before"]?.(input, output);
         },
         "tool.execute.after": async (input, output) => {
