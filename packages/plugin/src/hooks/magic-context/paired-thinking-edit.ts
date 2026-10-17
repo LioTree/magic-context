@@ -84,20 +84,17 @@ function restoreCaller(
 ): void {
     // SQL rollback does not restore the caller's render. A failed pair must
     // leave the same source bytes available to its refusal/replay fallback.
-    // Each message keeps its object identity: hosts map message objects to
-    // their stable entry ids, and a rerun must still resolve them.
-    args.messages.splice(0, args.messages.length, ...before.items);
-    before.items.forEach((item, index) => {
-        const copy = before.copies[index];
-        if (!isPlainContainer(item) || !isPlainContainer(copy)) return;
-        for (const key of Reflect.ownKeys(item))
-            if (!(Array.isArray(item) && key === "length")) Reflect.deleteProperty(item, key);
-        for (const key of Reflect.ownKeys(copy))
-            if (!(Array.isArray(copy) && key === "length"))
-                (item as Record<PropertyKey, unknown>)[key] = (
-                    copy as Record<PropertyKey, unknown>
-                )[key];
-    });
+    // Every message, part and nested container is restored in place, keeping
+    // its object identity: hosts map message objects to stable entry ids and
+    // later lanes hold part references, so a rerun must find the same objects.
+    for (const [container, saved] of before) {
+        const record = container as Record<PropertyKey, unknown>;
+        if (Array.isArray(container)) container.length = 0;
+        for (const key of Reflect.ownKeys(container))
+            if (!(Array.isArray(container) && key === "length"))
+                Reflect.deleteProperty(record, key);
+        for (const [key, value] of saved) record[key] = value;
+    }
     if (args.state && state) {
         for (const key of Object.keys(args.state))
             if (!(key in state)) Reflect.deleteProperty(args.state, key);
@@ -106,45 +103,29 @@ function restoreCaller(
     args.onRollback?.();
 }
 
-interface RenderSnapshot {
-    items: unknown[];
-    copies: unknown[];
-}
-
-function isPlainContainer(value: unknown): value is object {
-    if (value === null || typeof value !== "object") return false;
-    const prototype = Object.getPrototypeOf(value);
-    return Array.isArray(value) || prototype === Object.prototype || prototype === null;
-}
+/** Each reachable JSON container with its own properties as they were. */
+type RenderSnapshot = Map<object, [PropertyKey, unknown][]>;
 
 function snapshotRender(messages: unknown[]): RenderSnapshot {
-    return { items: [...messages], copies: copyRender(messages) };
-}
-
-function copyRender(messages: unknown[]): unknown[] {
-    const copies = new Map<object, unknown>();
-    const copy = (value: unknown): unknown => {
-        if (value === null || typeof value !== "object") return value;
-        const previous = copies.get(value);
-        if (previous !== undefined) return previous;
+    const saved: RenderSnapshot = new Map();
+    const visit = (value: unknown): void => {
+        if (value === null || typeof value !== "object" || saved.has(value)) return;
         const prototype = Object.getPrototypeOf(value);
         // These lanes edit JSON containers, not opaque extension instances.
-        // Preserve opaque values and callbacks rather than rejecting a valid host render.
-        if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null)
-            return value;
-        const result: Record<PropertyKey, unknown> | unknown[] = Array.isArray(value)
-            ? new Array(value.length)
-            : Object.create(prototype);
-        copies.set(value, result);
+        // Leave opaque values and callbacks as they are rather than rejecting a
+        // valid host render.
+        if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return;
+        const entries: [PropertyKey, unknown][] = [];
+        saved.set(value, entries);
         for (const key of Reflect.ownKeys(value)) {
             if (Array.isArray(value) && key === "length") continue;
-            (result as Record<PropertyKey, unknown>)[key] = copy(
-                (value as Record<PropertyKey, unknown>)[key],
-            );
+            const child = (value as Record<PropertyKey, unknown>)[key];
+            entries.push([key, child]);
+            visit(child);
         }
-        return result;
     };
-    return copy(messages) as unknown[];
+    visit(messages);
+    return saved;
 }
 
 export function todoCompanionRequired(
