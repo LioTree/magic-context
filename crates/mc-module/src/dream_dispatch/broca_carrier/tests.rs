@@ -112,6 +112,8 @@ struct Step {
     hang: bool,
     /// The provider reported no usage for this step.
     unreported: bool,
+    cache_read: u64,
+    cache_write: u64,
 }
 
 struct Run {
@@ -159,6 +161,14 @@ struct FakeBroca {
 }
 
 const TOOL_CHANNEL: u16 = 41;
+
+/// Broca 0.3.212's wire goldens, vendored with their checksums in `golden/README.md`.
+const GOLDEN_DESCRIBE: &[u8] = include_bytes!("golden/role_describe.json");
+const GOLDEN_DESCRIBE_SHA256: &str =
+    "b02c1aeba85bfc1ad3a6dde615ba049c047e1f5f2ced66f90043c4fe34a5b0a2";
+const GOLDEN_EXHAUSTED: &[u8] = include_bytes!("golden/run_status.budget_exhausted.json");
+const GOLDEN_EXHAUSTED_SHA256: &str =
+    "45452b91e62fa53be019c22c3bd5f1db3af487d73bf8645c5516b2f53648955f";
 
 /// One step's tool calls to dispatch and its final text.
 type Batch = (Vec<(&'static str, Value)>, Option<&'static str>);
@@ -324,13 +334,16 @@ impl FakeBroca {
             return None;
         }
         run.done += 1;
-        run.spent += step.input;
+        // The cap counts input, cache-read and cache-write tokens, never output.
+        let measured = step.input + step.cache_read + step.cache_write;
+        run.spent += measured;
         let mid = format!("m{}", run.done);
         run.units.push_back(json!({"kind": "control", "unit": {"type": "assistant_message",
             "run_id": run.id, "mid": mid, "message": {"content": [{"type": "text", "text": step.text.unwrap_or("")}]}}}));
         let mut finished = json!({"type": "step_finished", "run_id": run.id, "mid": mid});
         if !step.unreported {
-            finished["usage"] = json!({"input_tokens": step.input, "output_tokens": 500});
+            finished["usage"] = json!({"input_tokens": step.input, "output_tokens": 500,
+                "cached_input_tokens": step.cache_read, "cache_write_tokens": step.cache_write});
         }
         run.units
             .push_back(json!({"kind": "control", "unit": finished}));
@@ -338,7 +351,7 @@ impl FakeBroca {
         // closed without being counted, and a cap of N stops at exactly N.
         let exhausted = match run.cap {
             Some(cap) if step.unreported => {
-                run.spent -= step.input;
+                run.spent -= measured;
                 Some(BudgetExhaustedDetail::new(
                     cap,
                     run.spent,
@@ -480,7 +493,7 @@ impl BrocaPort for FakeBroca {
                     .ok_or_else(|| refused("unknown_run", Value::Null))?;
                 let mut status = RunStatus::new("active");
                 if let Some(result) = &run.terminal {
-                    status = RunStatus::new(result.state.clone());
+                    status = RunStatus::new(result.state.clone()).with_undelivered_steers(vec![]);
                     if let Some(detail) = result.detail.clone() {
                         status = status.with_detail(detail);
                     }
@@ -564,12 +577,6 @@ const BASE: &[&str] = &[
     "retract",
 ];
 
-fn with_cap() -> Vec<&'static str> {
-    let mut caps = BASE.to_vec();
-    caps.push("input_token_cap");
-    caps
-}
-
 struct Fixture {
     _root: tempfile::TempDir,
     handler: Arc<McHandler>,
@@ -581,6 +588,13 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// A fixture whose runner answers `role.describe` with Broca's golden.
+    fn golden() -> Self {
+        let f = Self::new(&[]);
+        f.broca.state().describe = serde_json::from_slice(GOLDEN_DESCRIBE).unwrap();
+        f
+    }
+
     fn new(capabilities: &[&str]) -> Self {
         // Throwaway roots only; no live store is touched.
         let base = std::env::temp_dir().join("magic-context/i5-c3");
@@ -822,7 +836,7 @@ async fn broca_child_step_overflow_starts_no_next_step() {
 
 #[tokio::test]
 async fn broca_child_token_cap_stops_run_budget_exhausted() {
-    let f = Fixture::new(&with_cap());
+    let f = Fixture::golden();
     let write = || ("ctx_memory", json!({"action": "write"}));
     f.script(vec![
         step(60, vec![write()]),
@@ -1121,7 +1135,7 @@ async fn status(f: &Fixture) -> Value {
 
 #[tokio::test]
 async fn broca_child_budget_exhausted_is_the_task_budget_failure() {
-    let f = Fixture::new(&with_cap());
+    let f = Fixture::golden();
     let write = || ("ctx_memory", json!({"action": "write"}));
     // 50 + 50 reaches the cap of 100 exactly, which stops the run.
     f.script(vec![
@@ -1170,13 +1184,14 @@ async fn broca_child_budget_exhausted_is_the_task_budget_failure() {
     assert_eq!(f.effects.executed().len(), 1);
     assert_eq!(
         status(&f).await,
-        json!({"state": "budget_exhausted", "detail": {"limit": 100, "spent": 100, "cause": "limit_reached"}})
+        json!({"state": "budget_exhausted", "detail": {"limit": 100, "spent": 100, "cause": "limit_reached"},
+            "undelivered_steers": []})
     );
 }
 
 #[tokio::test]
 async fn broca_child_usage_unreported_stops_without_a_guessed_charge() {
-    let f = Fixture::new(&with_cap());
+    let f = Fixture::golden();
     let write = || ("ctx_memory", json!({"action": "write"}));
     f.script(vec![
         step(30, vec![write()]),
@@ -1209,7 +1224,7 @@ async fn broca_child_usage_unreported_stops_without_a_guessed_charge() {
 
 #[tokio::test]
 async fn broca_child_never_executed_results_produce_no_effect() {
-    let f = Fixture::new(&with_cap());
+    let f = Fixture::golden();
     f.script(vec![
         step(
             120,
@@ -1235,4 +1250,64 @@ async fn broca_child_never_executed_results_produce_no_effect() {
         .unwrap()
         .iter()
         .any(|(_, e)| matches!(e, ChildEvent::Receipt(_))));
+}
+
+#[test]
+fn broca_goldens_match_their_pinned_checksums() {
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        format!("{:x}", Sha256::digest(GOLDEN_DESCRIBE)),
+        GOLDEN_DESCRIBE_SHA256
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(GOLDEN_EXHAUSTED)),
+        GOLDEN_EXHAUSTED_SHA256
+    );
+    let describe = check_describe(&serde_json::from_slice(GOLDEN_DESCRIBE).unwrap()).unwrap();
+    assert!(describe.declares(caps::INPUT_TOKEN_CAP));
+}
+
+#[tokio::test]
+async fn broca_child_golden_runner_stops_at_exactly_the_cap() {
+    let f = Fixture::golden();
+    // Broca's golden exhausted run: 5 input + 2 cache-read + 3 cache-write = cap 10.
+    f.script(vec![
+        Step {
+            input: 5,
+            cache_read: 2,
+            cache_write: 3,
+            calls: vec![("ctx_memory", json!({"action": "write"}))],
+            ..Step::default()
+        },
+        answer("never"),
+    ]);
+    let mut request = f.request(&["ctx_memory"], 10);
+    request.token_budget = Some(10);
+    // The golden runner deletes within an hour, so even a private dream is admitted.
+    let private = BrocaPolicy {
+        privacy_sensitive: true,
+        require_hard_cap: true,
+        ..policy()
+    };
+    let (completion, _) = run(&f, &mut f.carrier(private), &request).await;
+    let failure = completion.unwrap_err();
+    assert_eq!(
+        failure.message,
+        "token_budget: budget_exhausted limit 10 spent 10 cause limit_reached"
+    );
+    assert!(!failure.retryable);
+    assert_eq!(f.sent()[0]["budget"], json!({"max_input_tokens": 10}));
+    assert!(f.effects.executed().is_empty());
+    assert_eq!(f.broca.state().never_executed.len(), 1);
+    let charged = f.control.charges.lock().unwrap()[0].1.clone();
+    assert_eq!(
+        (charged.input, charged.cache_read, charged.cache_write),
+        (5, 2, 3)
+    );
+    // The fake's run.status agrees with Broca's golden on every role field.
+    let golden: RunStatus = serde_json::from_slice(GOLDEN_EXHAUSTED).unwrap();
+    let fake: RunStatus = serde_json::from_value(status(&f).await).unwrap();
+    assert_eq!(fake.state, golden.state);
+    assert_eq!(fake.detail, golden.detail);
+    assert_eq!(fake.undelivered_steers, golden.undelivered_steers);
 }
