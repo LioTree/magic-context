@@ -51,6 +51,7 @@ class FakeRun implements DreamChildRun {
     taskOutputs: string[] = [];
     refusals: string[] = [];
     aborted = false;
+    abortedAt = 0;
     retired = false;
     readonly messages: DreamChildTranscriptMessage[] = [];
 
@@ -113,6 +114,7 @@ class FakeRun implements DreamChildRun {
 
     async abort(): Promise<boolean> {
         this.aborted = true;
+        this.abortedAt ||= Date.now();
         return true;
     }
 
@@ -198,6 +200,36 @@ function setup(args: {
         await claimant.settled();
     };
     return { peer, host, claimant, entryId, logs, run };
+}
+
+
+/**
+ * A module that admits every step and applies every tool call: the claimant's
+ * own guards are then the only thing between the child and the next step or
+ * effect, which is what these tests pin.
+ */
+function permissive(peer: DreamClaimPeer, options: { leaseLostOnSecondTool?: boolean } = {}): void {
+    const original = peer.route.bind(peer);
+    let tools = 0;
+    peer.route = (session, method, body) => {
+        const event = body.event as { kind?: string } | undefined;
+        if (method === "dream.child.event" && event?.kind === "step") {
+            const entry = peer.entry(String(body.entry_id));
+            entry.nextSeq += 1;
+            entry.steps += 1;
+            return { ok: true };
+        }
+        if (method === "dream.child.event" && (event as { kind?: string })?.kind === "usage") {
+            return original(session, method, body);
+        }
+        if (method === "dream.child.tool") {
+            tools += 1;
+            if (options.leaseLostOnSecondTool && tools === 2) return { ok: false, refusal: "LeaseLost" };
+            peer.effects.push({ child: "", tool: String(body.tool), args: body.arguments });
+            return { ok: true, output: { effect: "applied" }, receipt: null };
+        }
+        return original(session, method, body);
+    };
 }
 
 function methods(peer: DreamClaimPeer): string[] {
@@ -491,6 +523,92 @@ describe("dream child claimant", () => {
         expect(host.runs).toHaveLength(0);
         expect(methods(peer)).toEqual(["dream.child.pending", "dream.child.claim"]);
     });
+
+
+    it("refuses a task tool its descriptor does not allow, even one the host carries", async () => {
+        const { peer, host, run } = setup({
+            script: [{ tools: [{ name: "ctx_memory", args: { action: "archive", ids: [1] } }] }, { text: "done" }],
+            descriptor: { allowedTools: [] },
+        });
+        await run();
+        expect(peer.effects).toEqual([]);
+        expect(peer.requests.some((request) => request.method === "dream.child.tool")).toBe(false);
+        expect(host.runs[0]?.refusals.some((refusal) => refusal.includes("ctx_memory refused"))).toBe(true);
+    });
+
+    it("keeps its own step cap against a module that would admit another step", async () => {
+        const { peer, host, run } = setup({
+            script: [{ text: "1" }, { text: "2" }, { text: "3" }],
+            descriptor: { maxSteps: 2 },
+        });
+        permissive(peer);
+        await run();
+        expect(host.runs[0]?.providerCalls).toBe(2);
+    });
+
+    it("keeps its own budget stop against a module that would admit another step", async () => {
+        const { peer, host, run } = setup({
+            script: [
+                { text: "expensive", usage: { input: 150, output: 0, cache_read: 0, cache_write: 0 } },
+                { text: "never" },
+            ],
+            descriptor: { tokenBudget: 100 },
+        });
+        permissive(peer);
+        await run();
+        expect(host.runs[0]?.providerCalls).toBe(1);
+    });
+
+    it("keeps tools blocked after finalize against a module that would run them", async () => {
+        const { peer, host, run } = setup({
+            script: [
+                { text: "most", usage: { input: 85, output: 0, cache_read: 0, cache_write: 0 } },
+                { tools: [{ name: "ctx_memory", args: { action: "archive", ids: [1] } }] },
+                { text: "final answer" },
+            ],
+            descriptor: { tokenBudget: 100 },
+        });
+        permissive(peer);
+        await run();
+        expect(host.runs[0]?.providerCalls).toBe(3);
+        expect(peer.effects).toEqual([]);
+    });
+
+    it("stops on a terminal tool refusal against a module that would admit more steps", async () => {
+        const { peer, host, run } = setup({
+            script: [
+                { tools: [{ name: "ctx_memory", args: { action: "archive", ids: [1] } }] },
+                { tools: [{ name: "ctx_memory", args: { action: "archive", ids: [2] } }] },
+                { tools: [{ name: "ctx_memory", args: { action: "archive", ids: [3] } }] },
+            ],
+        });
+        permissive(peer, { leaseLostOnSecondTool: true });
+        await run();
+        expect(peer.effects).toHaveLength(1);
+        expect(host.runs[0]?.providerCalls).toBe(2);
+        expect(host.runs[0]?.aborted).toBe(true);
+    });
+
+    it("stops at its deadline when the module can no longer be reached", async () => {
+        const { peer, host, entryId, claimant } = setup({
+            script: [{ hang: true }],
+            descriptor: { deadlineMs: Date.now() + 2_500 },
+        });
+        const original = peer.route.bind(peer);
+        peer.route = (session, method, body) => {
+            // Once the prompt is out, the module goes silent.
+            if (host.runs[0]?.prompts) throw new Error("connection lost");
+            return original(session, method, body);
+        };
+        const started = Date.now();
+        await claimant.pump("parent");
+        await claimant.settled();
+        expect(host.runs[0]?.aborted).toBe(true);
+        expect(host.runs[0]?.retired).toBe(true);
+        // Aborted by its own deadline, not by anything the silent module said.
+        expect((host.runs[0]?.abortedAt ?? 0) - started).toBeLessThan(4_000);
+        expect(peer.entry(entryId).completion).toBeNull();
+    }, 20_000);
 
     it("leaves every other session's steps and tools alone", async () => {
         await admitDreamChildStep("an-ordinary-session");
