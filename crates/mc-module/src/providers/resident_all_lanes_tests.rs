@@ -428,3 +428,136 @@ async fn claude_resident_fold_with_tool_result_boundary_matches_full_rebuild() {
         "must fold through the resident tail that renders the boundary: {stats}"
     );
 }
+
+/// After a process restart, a Claude Code fold restores its resident state from
+/// the stored view of the previous fold instead of replaying the whole native
+/// history. The stored view here ends at a `tool_result` boundary, which the
+/// restore must accept, and the restored fold must serve exactly what the full
+/// rebuild (the non-resident oracle) serves.
+#[tokio::test]
+async fn claude_resident_restart_primes_from_stored_view_and_matches_full_rebuild() {
+    let root = synthetic();
+    let a = root.path().join("on");
+    let b = root.path().join("off");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let project = root.path().join("project");
+    let mut on = claude(&a, &project, true);
+    let mut off = claude(&b, &project, false);
+    let ready = super::super::claude_code_tests::setup(&on).await;
+    assert_eq!(ready, super::super::claude_code_tests::setup(&off).await);
+    let boundary = 81;
+    let mut newest = 100;
+    for h in [&on, &off] {
+        let store = h.store.get().unwrap();
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let namespace = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap()
+            .engine_namespace;
+        store
+            .replace_compartments(&namespace, &compartments(0, boundary))
+            .unwrap();
+        store.arm_soft_refresh(&namespace).unwrap();
+    }
+    let mut request = step("cc", cc_tool_history(newest, boundary - 1), Some(newest));
+    request["harness"] = json!("claude-code");
+    request["request_id"] = json!("before-restart");
+    request["now"] = json!(1000);
+    request["served_through_ordinal"] = json!(newest);
+    let response = invoke(&on, "compaction.step", &request).await;
+    assert_eq!(
+        String::from_utf8_lossy(&response),
+        String::from_utf8_lossy(&invoke(&off, "compaction.step", &request).await),
+        "fold before restart"
+    );
+    let response: Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(response["answer"], "compaction_message", "{response}");
+    // The host acknowledges the fold on its next step, so the fold's view is
+    // the applied view that a restarted process restores from.
+    let mut request = step("cc", vec![], Some(newest));
+    request["harness"] = json!("claude-code");
+    request["request_id"] = json!("acknowledge");
+    request["now"] = json!(1500);
+    request["served_through_ordinal"] = json!(newest);
+    request["last_applied"] = json!({"compaction_id":response["compaction"]["compaction_id"],"version":response["compaction"]["version"]});
+    assert_eq!(
+        String::from_utf8_lossy(&invoke(&on, "compaction.step", &request).await),
+        String::from_utf8_lossy(&invoke(&off, "compaction.step", &request).await),
+        "acknowledgement before restart"
+    );
+
+    drop(on);
+    drop(off);
+    on = claude(&a, &project, true);
+    off = claude(&b, &project, false);
+    let ready = super::super::claude_code_tests::setup(&on).await;
+    assert_eq!(ready, super::super::claude_code_tests::setup(&off).await);
+    let applied = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    // The compartments are left unchanged, so the stored cut still matches the
+    // current history source and the restarted fold may restore from it.
+    for h in [&on, &off] {
+        let store = h.store.get().unwrap();
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let namespace = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap()
+            .engine_namespace;
+        store.arm_soft_refresh(&namespace).unwrap();
+    }
+    let store = on.store.get().unwrap();
+    let key = Key::new(&on.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    // The first fold after the restart restores the resident state; the second
+    // rewrites the history text (same compartment boundaries) so the restored
+    // state has to serve a real replacement, not only a noop.
+    for pass in 1..=2u64 {
+        if pass == 2 {
+            for h in [&on, &off] {
+                let store = h.store.get().unwrap();
+                let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+                let namespace = store
+                    .load_provider_conversation(&key.store_key())
+                    .unwrap()
+                    .unwrap()
+                    .engine_namespace;
+                store
+                    .replace_compartments(&namespace, &compartments(pass, boundary))
+                    .unwrap();
+                store.arm_soft_refresh(&namespace).unwrap();
+            }
+        }
+        newest += 1;
+        let mut request = step(
+            "cc",
+            vec![cc_message(newest, &format!("after restart {pass}"))],
+            Some(newest),
+        );
+        request["harness"] = json!("claude-code");
+        request["request_id"] = json!(format!("after-restart-{pass}"));
+        request["now"] = json!(2000 + pass * 1000);
+        request["served_through_ordinal"] = json!(newest);
+        request["last_applied"] = applied.clone();
+        let response = invoke(&on, "compaction.step", &request).await;
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            String::from_utf8_lossy(&invoke(&off, "compaction.step", &request).await),
+            "fold {pass} after restart"
+        );
+        let lease = on
+            .provider_resident
+            .begin(store.tag_cache_namespace(), &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lease.state.fold_tail_passes, pass,
+            "a restarted Claude Code fold must restore from its stored view, not replay native history"
+        );
+        lease.publish();
+        if pass == 2 {
+            let response: Value = serde_json::from_slice(&response).unwrap();
+            assert_eq!(response["answer"], "compaction_message", "{response}");
+        }
+    }
+}

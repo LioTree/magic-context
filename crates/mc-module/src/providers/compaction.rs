@@ -675,15 +675,6 @@ pub(super) fn prime_resident_fold(
     {
         return Ok(());
     }
-    // Only OpenCode restores a resident fold from its stored view after a
-    // restart. Claude Code and Broca host views used to be whole copies that this
-    // reader could not see, so those lanes rebuilt from the full request; their
-    // views are recipes now, and keeping that rebuild keeps their served bytes.
-    // (Restoring a Claude fold whose covered boundary is a tool result would
-    // refuse the fold as splitting that tool exchange.)
-    if !matches!(key.harness.as_str(), "opencode" | "opencode2") {
-        return Ok(());
-    }
     let Some(metadata) = store
         .provider_native_view_metadata(&key.store_key(), applied.version)
         .map_err(transient)?
