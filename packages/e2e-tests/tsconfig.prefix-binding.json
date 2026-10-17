@@ -1,0 +1,8 @@
+{
+    "extends": "./tsconfig.json",
+    "compilerOptions": { "resolveJsonModule": true, "allowImportingTsExtensions": true },
+    "include": [
+        "scripts/prefix-restart-host-probe.ts",
+        "tests/prefix-binding-validator.test.ts"
+    ]
+}

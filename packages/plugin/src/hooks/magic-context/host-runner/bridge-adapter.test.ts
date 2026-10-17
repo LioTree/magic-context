@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SubcClient } from "@cortexkit/subc-client";
+import * as markerCandidates from "../../../features/magic-context/compaction-marker";
 import { computeNormalizedHash } from "../../../features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../../features/magic-context/memory/project-identity";
 import { runMigrations } from "../../../features/magic-context/migrations";
@@ -14,20 +15,27 @@ import {
 } from "../../../features/magic-context/storage-db";
 import * as runnerStorage from "../../../features/magic-context/storage-host-runner";
 import { getOrCreateSessionMeta } from "../../../features/magic-context/storage-meta";
+import {
+    setPendingCompactionMarkerState,
+    setPersistedCompactionMarkerState,
+} from "../../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../../features/magic-context/tagger";
 import {
     BridgeRefusalError,
+    type BridgeTransportError,
     createBridgeAdapter,
     StoreVersionMismatchError,
 } from "../../../host-runner";
 import { Database } from "../../../shared/sqlite";
 import { createTestTempDir } from "../../../shared/test-temp-dir";
+import * as markerManager from "../compaction-marker-manager";
 import { SubcModuleTransport } from "../module-transport";
 import { setRawMessageProvider } from "../read-session-chunk";
 import { createRustModeTransform } from "../rust-mode-transform";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
 import { defaultCompactionMarkerStrategy } from "../transform-postprocess-phase";
+import { createBridgeReceiptStore } from "./bridge-marker";
 import { createOpenCodeProviderTransform } from "./opencode-adapter";
 
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -48,6 +56,32 @@ function message(id: string): MessageLike {
 function firstText(row: MessageLike | undefined): string | undefined {
     const block = row?.parts[0] as { text?: unknown } | undefined;
     return typeof block?.text === "string" ? block.text : undefined;
+}
+function persistNativePair(db: Database, boundary: MessageLike, ordinal: number) {
+    setPersistedCompactionMarkerState(db, "session", {
+        boundaryMessageId: boundary.info.id!,
+        summaryMessageId: "native-summary",
+        compactionPartId: "native-part",
+        summaryPartId: "native-text",
+        boundaryOrdinal: ordinal,
+        targetEndMessageId: boundary.info.id!,
+    });
+    return [
+        {
+            ...boundary,
+            parts: [...boundary.parts, { id: "native-part", type: "compaction", auto: true }],
+        },
+        {
+            info: {
+                id: "native-summary",
+                role: "assistant",
+                parentID: boundary.info.id,
+                summary: true,
+                finish: "stop",
+            },
+            parts: [{ id: "native-text", type: "text", text: "native summary" }],
+        },
+    ] as MessageLike[];
 }
 function fixture(version = LATEST_SUPPORTED_VERSION) {
     const scratch = createTestTempDir("mc-bridge-constructor-");
@@ -113,6 +147,7 @@ function recordSnapshot(path: string) {
 }
 function fakeModule() {
     const calls: Record<string, any>[] = [];
+    const payloads: Uint8Array[] = [];
     const binds: any[] = [];
     const close = mock(() => {});
     let version = 1;
@@ -181,8 +216,10 @@ function fakeModule() {
                     binds.push({ target, identity, options });
                     return { channel: binds.length, epoch: 1 };
                 },
-                request: async (_route: unknown, body: Uint8Array) =>
-                    answer(JSON.parse(Buffer.from(body).toString())),
+                request: async (_route: unknown, body: Uint8Array) => {
+                    payloads.push(body.slice());
+                    return answer(JSON.parse(Buffer.from(body).toString()));
+                },
                 close,
             }) as any,
     );
@@ -192,6 +229,8 @@ function fakeModule() {
     });
     return {
         calls,
+        payloads,
+        answer,
         binds,
         close,
         connect,
@@ -202,6 +241,333 @@ function fakeModule() {
 }
 
 describe("supported bridge constructor", () => {
+    test("OpenCode durable applied pending view advances and post-cut fallback serves replacement plus raw tail", async () => {
+        const options = fixture();
+        const preparation = spyOn(
+            markerCandidates,
+            "prepareCompactionMarkerCandidates",
+        ).mockImplementation(async () => {
+            expect(db.inTransaction).toBe(false);
+            return true;
+        });
+        cleanups.push(() => preparation.mockRestore());
+        const wire = fakeModule();
+        wire.setReply((request) => {
+            if (request.method !== "compaction.step") return;
+            return {
+                answer: "compaction_message",
+                request_id: request.params.request_id,
+                compaction: {
+                    compaction_id: "covering-pending",
+                    version: 2,
+                    range: { from: 1, to: 3 },
+                    replacement: [message("summary")],
+                },
+                coverage: { end_mid: "first", ordinal: 2 },
+            };
+        });
+        const rows = [message("prefix"), message("first"), message("second")];
+        canonicalRows(rows);
+        const adapter = await createBridgeAdapter(options);
+        cleanups.push(() => adapter.dispose());
+        const view = await adapter.run({ sessionId: "session", messages: rows, kind: "model" });
+        const db = new Database(options.dbPath);
+        cleanups.push(() => db.close());
+        setPendingCompactionMarkerState(db, "session", {
+            endMessageId: "first",
+            ordinal: 2,
+            publishedAt: 1,
+        });
+        let pair: MessageLike[] = [];
+        const marker = spyOn(markerManager, "applyDeferredCompactionMarker").mockImplementation(
+            (writerDb) => {
+                const durable = createBridgeReceiptStore(db, "session", "opencode");
+                expect(durable.current()).toEqual(view.receipt);
+                expect(durable.cutState()).toBe("unknown");
+                pair = persistNativePair(writerDb, rows[1], 2);
+                return { kind: "applied", markerOrdinal: 2 };
+            },
+        );
+        cleanups.push(() => marker.mockRestore());
+        const inputs = {
+            messages: rows,
+            model: "openai/gpt-5.6",
+            envelope: "complete",
+            contextWindow: 100_000,
+            systemPromptTokens: 100,
+            toolDefinitionTokens: 0,
+        };
+        expect(view.receipt.delivery).toBe("pending");
+        expect((await adapter.advanceNativeMarker("session", view.receipt, inputs)).kind).toBe(
+            "applied",
+        );
+        expect(marker).toHaveBeenCalledTimes(1);
+        expect(preparation).toHaveBeenCalledTimes(1);
+        expect(adapter.receipt("session")).toMatchObject({
+            delivery: "pending",
+            served_through_ordinal: 0,
+        });
+        await adapter.dispose();
+        const restarted = await createBridgeAdapter(options);
+        cleanups.push(() => restarted.dispose());
+        const append = message("third");
+        expect(
+            restarted.isFallbackAdmissible("session", {
+                ...inputs,
+                messages: [...pair, rows[2], append],
+            }),
+        ).toEqual({ admissible: true, view: [...view.messages, append] });
+        setPendingCompactionMarkerState(db, "session", {
+            endMessageId: "first",
+            ordinal: 2,
+            publishedAt: 2,
+        });
+        marker.mockReturnValue({ kind: "already-current" });
+        expect(
+            (
+                await restarted.advanceNativeMarker("session", view.receipt, {
+                    ...inputs,
+                    messages: [...pair, rows[2]],
+                })
+            ).kind,
+        ).toBe("applied");
+        expect(marker).toHaveBeenCalledTimes(2);
+        expect(preparation).toHaveBeenCalledTimes(2);
+        expect(
+            restarted.isFallbackAdmissible("session", {
+                ...inputs,
+                messages: [pair[0], rows[2]],
+            }),
+        ).toMatchObject({
+            admissible: false,
+            reason: "covered_range_changed",
+            detail: "native-cut-summary-missing",
+        });
+        await expect(
+            restarted.run({
+                sessionId: "session",
+                messages: [pair[0], rows[2]],
+                kind: "model",
+            }),
+        ).rejects.toMatchObject({ reason: "covered_range_changed" });
+    });
+    test("applied bridge receipt round-trips and acknowledges only a clean carrying response", async () => {
+        const preparation = spyOn(
+            markerCandidates,
+            "prepareCompactionMarkerCandidates",
+        ).mockResolvedValue(true);
+        cleanups.push(() => preparation.mockRestore());
+        const options = fixture();
+        const wire = fakeModule();
+        wire.setReply((request) => {
+            if (request.method !== "compaction.step") return;
+            const p = request.params;
+            return {
+                answer: "compaction_message",
+                request_id: p.request_id,
+                compaction: {
+                    compaction_id: "covering",
+                    version: 2,
+                    range: { from: 1, to: 2 },
+                    replacement: [message("summary")],
+                },
+                coverage: { end_mid: "first", ordinal: 1 },
+            };
+        });
+        const rows = [message("first"), message("second")];
+        canonicalRows(rows);
+        const adapter = await createBridgeAdapter(options);
+        const view = await adapter.run({ sessionId: "session", messages: rows, kind: "model" });
+        expect(view.receipt).toMatchObject({
+            delivery: "pending",
+            served_through_ordinal: 0,
+            last_applied: { compaction_id: "covering", version: 2, range: { from: 1, to: 2 } },
+            coverage: { end_mid: "first", ordinal: 1 },
+        });
+        expect(
+            adapter.completeRequest("session", view.receipt.request_id, {
+                status: 200,
+                cleanEnd: false,
+            })?.served_through_ordinal,
+        ).toBe(0);
+        const clean = adapter.completeRequest("session", view.receipt.request_id, {
+            status: 200,
+            cleanEnd: true,
+        });
+        expect(clean).toMatchObject({ delivery: "clean", served_through_ordinal: 2 });
+        await adapter.dispose();
+        const restarted = await createBridgeAdapter(options);
+        cleanups.push(() => restarted.dispose());
+        expect(restarted.receipt("session")).toEqual(clean);
+        expect(
+            (
+                await restarted.advanceNativeMarker("session", clean!, {
+                    messages: rows,
+                    model: "openai/gpt-5.6",
+                    envelope: "complete",
+                })
+            ).kind,
+        ).toBe("deferred");
+        const markerDb = new Database(options.dbPath);
+        setPendingCompactionMarkerState(markerDb, "session", {
+            endMessageId: "first",
+            ordinal: 1,
+            publishedAt: 1,
+        });
+        cleanups.push(() => markerDb.close());
+        const marker = spyOn(markerManager, "applyDeferredCompactionMarker").mockImplementation(
+            (writerDb) => {
+                persistNativePair(writerDb, rows[0], 1);
+                return { kind: "applied", markerOrdinal: 1 };
+            },
+        );
+        cleanups.push(() => marker.mockRestore());
+        expect(
+            (
+                await restarted.advanceNativeMarker("session", clean!, {
+                    messages: rows,
+                    model: "openai/gpt-5.6",
+                    envelope: "complete",
+                    contextWindow: 100_000,
+                    systemPromptTokens: 100,
+                    toolDefinitionTokens: 0,
+                })
+            ).kind,
+        ).toBe("applied");
+        expect(marker).toHaveBeenCalledTimes(1);
+        expect(
+            wire.calls
+                .filter((c) => c.method === "compaction.step")
+                .every((c) => c.params.served_through_ordinal === 0),
+        ).toBe(true);
+    });
+    test("injected bridge uses only the relay and matches the direct bridge view and method sequence", async () => {
+        const options = fixture();
+        const wire = fakeModule();
+        const rows = [message("first")];
+        canonicalRows(rows);
+        const direct = await createBridgeAdapter(options);
+        const first = await direct.run({
+            sessionId: "session",
+            messages: rows.slice(),
+            kind: "model",
+        });
+        rows.push(message("second"));
+        const second = await direct.run({
+            sessionId: "session",
+            messages: rows.slice(),
+            kind: "model",
+        });
+        await direct.dispose();
+        const methods = wire.calls.map((call) => call.method);
+        const relayed = fakeModule();
+        relayed.connect.mockClear();
+        const requests: { method: string; body: Uint8Array; deadlineMs: number }[] = [];
+        const injected = await createBridgeAdapter({
+            ...fixture(),
+            transport: {
+                async request(method, body, opts) {
+                    expect(opts.deadlineMs).toBeGreaterThan(Date.now());
+                    expect(opts.signal).toBeInstanceOf(AbortSignal);
+                    requests.push({ method, body: body.slice(), deadlineMs: opts.deadlineMs });
+                    return Buffer.from(
+                        JSON.stringify(relayed.answer(JSON.parse(Buffer.from(body).toString()))),
+                    );
+                },
+            },
+        });
+        cleanups.push(() => injected.dispose());
+        for (const [messages, expected] of [
+            [rows.slice(0, 1), first],
+            [rows.slice(), second],
+        ] as const) {
+            const actual = await injected.run({
+                sessionId: "session",
+                messages: [...messages],
+                kind: "model",
+            });
+            // Independent adapters allocate different conversation and request IDs.
+            expect({ ...actual, receipt: undefined }).toEqual({ ...expected, receipt: undefined });
+            expect({ ...actual.receipt, request_id: "", lineage_id: "" }).toEqual({
+                ...expected.receipt,
+                request_id: "",
+                lineage_id: "",
+            });
+        }
+        expect(requests.map((call) => call.method)).toEqual(methods);
+        expect(new Set(methods)).toEqual(
+            new Set([
+                "state_sync",
+                "transform.declare",
+                "compaction.setup",
+                "transform.hook",
+                "compaction.step",
+            ]),
+        );
+        expect(relayed.connect).not.toHaveBeenCalled();
+        await injected.dispose();
+        expect(relayed.close).not.toHaveBeenCalled();
+    });
+
+    for (const code of [
+        "relay_unavailable",
+        "session_scope_missing",
+        "deadline",
+        "aborted",
+    ] as const) {
+        test(`injected relay ${code} keeps bootstrap fail closed`, async () => {
+            const wire = fakeModule();
+            canonicalRows([]);
+            const adapter = await createBridgeAdapter({
+                ...fixture(),
+                transport: {
+                    async request(method, body) {
+                        if (method === "transform.declare")
+                            throw { source: "relay", code } satisfies BridgeTransportError;
+                        return Buffer.from(
+                            JSON.stringify(wire.answer(JSON.parse(Buffer.from(body).toString()))),
+                        );
+                    },
+                },
+            });
+            cleanups.push(() => adapter.dispose());
+            await expect(
+                adapter.run({ sessionId: "session", messages: [], kind: "model" }),
+            ).rejects.toMatchObject({ code: "EMERGENCY_FAIL_CLOSED" });
+        });
+        test(`injected relay ${code} keeps ordinary hooks fail closed without record writes`, async () => {
+            const wire = fakeModule();
+            const options = fixture();
+            const rows = [message("first")];
+            canonicalRows(rows);
+            let refuse = false;
+            const adapter = await createBridgeAdapter({
+                ...options,
+                transport: {
+                    async request(method, body) {
+                        if (refuse && method === "transform.hook")
+                            throw { source: "relay", code } satisfies BridgeTransportError;
+                        return Buffer.from(
+                            JSON.stringify(wire.answer(JSON.parse(Buffer.from(body).toString()))),
+                        );
+                    },
+                },
+            });
+            cleanups.push(() => adapter.dispose());
+            await adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" });
+            const before = recordSnapshot(options.dbPath);
+            const observe = mock(() => {});
+            adapter.onOutcome(observe);
+            refuse = true;
+            rows.push(message("second"));
+            await expect(
+                adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" }),
+            ).rejects.toMatchObject({ code: "EMERGENCY_FAIL_CLOSED" });
+            expect(recordSnapshot(options.dbPath)).toEqual(before);
+            expect(observe).not.toHaveBeenCalled();
+        });
+    }
+
     test("state-sync barriers use the flat module envelope on bootstrap and no-tail ordinary passes", async () => {
         const options = fixture();
         const wire = fakeModule();

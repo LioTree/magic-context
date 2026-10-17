@@ -4,8 +4,12 @@ import { createEditAdmission, isAdmissionUser, thinkingAnchor } from "./edit-adm
 import { stripProcessedImages } from "./strip-content";
 import type { MessageLike } from "./tag-messages";
 
-it("processed images match Rust's dropped-watermark golden, independent of reasoning retention", () => {
+it("processed images preserve dropped-watermark golden cases except superseded age-zero eligibility", () => {
     for (const scenario of golden.cases) {
+        // This historical case assigned untagged images age zero. Their next
+        // tagged message is 200, so a dropped watermark of 1 must now retain them.
+        const changedAgeCase =
+            scenario.name === "an untagged answered image retires when a drop watermark exists";
         const messages = scenario.steps.map((step) => ({
             info: { id: step.id, role: step.role },
             parts: step.image
@@ -28,7 +32,7 @@ it("processed images match Rust's dropped-watermark golden, independent of reaso
         });
         expect({ name: scenario.name, selected: outcome.newlyStrippedIds }).toEqual({
             name: scenario.name,
-            selected: scenario.selected,
+            selected: changedAgeCase ? [] : scenario.selected,
         });
         const after = messages
             .filter(
@@ -39,7 +43,7 @@ it("processed images match Rust's dropped-watermark golden, independent of reaso
             .map((message) => message.info.id);
         expect({ name: scenario.name, after }).toEqual({
             name: scenario.name,
-            after: scenario.removed_after,
+            after: changedAgeCase ? [] : scenario.removed_after,
         });
     }
 });
@@ -64,6 +68,7 @@ it("processed image admission holds all parts without freezing an id, admits the
         { info: { id: "reply", role: "assistant" }, parts: [{ type: "text", text: "processed" }] },
     ];
     const frozen = new Set<string>();
+    const frozenMarkers = new Map<string, "" | "[image stripped]">();
     const applied: string[] = [];
     const pass = (detect: boolean, enabled = true) => {
         const messages = structuredClone(raw);
@@ -80,7 +85,12 @@ it("processed image admission holds all parts without freezing an id, admits the
         const result = stripProcessedImages(messages, frozen, {
             detect,
             watermark: 5,
-            messageTagNumbers: new Map(),
+            messageTagNumbers: new Map(messages.map((message) => [message, 1])),
+            frozenMarkers,
+            persistNewIds: (_ids, markers) => {
+                for (const [id, marker] of markers) frozenMarkers.set(id, marker);
+                return true;
+            },
             admitFirstApplication: enabled
                 ? (m, block) => {
                       coords.push(`${m.info.id}:${block}`);
@@ -132,7 +142,7 @@ it("processed image admission precedes persistence and a refused commit leaves b
         const result = stripProcessedImages(messages, new Set(), {
             detect: true,
             watermark: 2,
-            messageTagNumbers: new Map(),
+            messageTagNumbers: new Map(messages.map((message) => [message, 1])),
             admitFirstApplication: (message) => {
                 events.push(`admit:${message.info.id}`);
                 return message.info.id === "tail";

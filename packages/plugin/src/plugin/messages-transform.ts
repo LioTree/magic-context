@@ -27,6 +27,7 @@ import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-repla
 import { lkgReplayFits, lkgReplayLimit } from "../hooks/magic-context/lkg-replay-fit";
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
+import { replayCommittedDrops } from "../hooks/magic-context/replay-committed-drops";
 import {
     noteExternalLkgReplay,
     type RustLkgReplayParticipant,
@@ -288,7 +289,6 @@ export function tryMessagesTransformLkgReplay(args: {
                 sessionLog(sessionId, "lkg_emergency_armed");
             } else {
                 const inputMessages = output.messages as MessageLike[];
-                const inputCount = inputMessages.length;
                 const keys = resolveLkgModelKeys(inputMessages);
                 const replay = replayLkg({
                     sessionId,
@@ -308,6 +308,12 @@ export function tryMessagesTransformLkgReplay(args: {
                 });
                 if (replay.ok && !rust && lkgRecoveryReplayUnproven(sessionId)) {
                     sessionLog(sessionId, "lkg_restart_rebuild_required");
+                    return false;
+                }
+                // A failed batch may already have committed earlier drops. The
+                // fallback must serve that subset before a later defer replays it.
+                if (replay.ok && !rust && !replayCommittedDrops(db, sessionId, replay.messages)) {
+                    sessionLog(sessionId, "lkg_reasoning_prefix_changed");
                     return false;
                 }
                 // TypeScript mode has no Rust result to check, but replaying
@@ -372,14 +378,13 @@ export function tryMessagesTransformLkgReplay(args: {
                         return false;
                     retirePendingSystemPromptDelivery(sessionId);
                     args.onLkgReplay?.();
+                    // Record raw-part visibility before installing bytes that a later
+                    // healthy Rust pass must preserve, even if the module has already tagged them.
+                    noteExternalLkgReplay(rust, sessionId, inputMessages, replay.messages);
                     replaceMessagesInPlace(
                         output,
                         replay.messages as unknown as MessageWithParts[],
                     );
-                    // The provider has now cached the replayed bytes. Tell a Rust
-                    // adapter, so its next successful pass keeps serving them instead
-                    // of switching to module output, which would bust that cache.
-                    noteExternalLkgReplay(rust, sessionId, inputCount);
                     sessionLog(sessionId, "lkg_replay_served");
                     return true;
                 } else {

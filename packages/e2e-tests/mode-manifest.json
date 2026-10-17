@@ -3,6 +3,14 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
         {
+            "path": "tests/prefix-binding-validator.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "CI-fast unit guard for the strict prefix-binding mock: accepted request prefixes, signed thinking, tool pairing and captured refusals. It needs no host and runs once in the OpenCode 1 lane.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/rust-provider-pipeline-opencode1.test.ts",
             "tier": "excluded",
             "invocation": { "ts": false, "rust": false },
@@ -17,6 +25,14 @@
             "rationale": "Opt-in provider-pipeline measurement probe: invoke directly with bun test tests/rust-provider-pipeline-opencode2.test.ts, a pinned OpenCode 2.0.x host and matching prebuilt module/daemon/fault binaries. Not a default hermetic-shard gate; its pinned version preflight has not passed with the shard host. Missing inputs fail explicitly. P1-P4 cutover measurements remain blocked.",
             "contract_refs": ["PROVIDER-PIPELINE-T2"],
             "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/processed-images.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 1 user and tool images reach the mock provider first, then lose their bytes only after an admitted positive-watermark rewrite and remain stripped on replay. OpenCode 2, Pi and Rust have adapter and module unit coverage.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
         },
         {
             "path": "tests/pi-tree-history.test.ts",
@@ -2985,6 +3001,14 @@
             "rationale": "manual regression probe on a real OpenCode 2.0.22 host (MC_E2E_MAPPER_STEP_PROBE=1): before the native 60-step ceiling the mapper is asked for its manifest with tools removed, so a verify-broad batch keeps a partial result; throwaway root with host PID lsof containment",
             "contract_refs": ["OC2-S1"],
             "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/zen-primary-surface.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "Opt-in probe on real OpenCode 1 and 2 hosts that an ordinary session never exposes the Zen hidden summarizer variants (system prompt, Task tool, agent lists). Set MC_PRIMARY_PROBE_ROOT, MC_PRIMARY_BASE_PLUGIN, MC_PRIMARY_OC1 and MC_PRIMARY_OC2; without them the host tests skip and the carrier-leak guard tests run as plain unit tests.",
+            "contract_refs": ["ZEN-PRIMARY-SURFACE"],
+            "hosts": ["opencode", "opencode2"]
         }
     ]
 }

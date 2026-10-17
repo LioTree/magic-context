@@ -162,7 +162,7 @@ test("classify migration leaves every existing memory safety assessment NULL", (
     const f = fixture();
     try {
         f.db.exec(
-            "ALTER TABLE memories DROP COLUMN safety_critical; DELETE FROM schema_migrations WHERE version=101",
+            "ALTER TABLE memories DROP COLUMN safety_critical; DELETE FROM schema_migrations WHERE version=102",
         );
         runMigrations(f.db);
         expect(

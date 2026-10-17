@@ -841,8 +841,26 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
             ).toEqual({ state: "retryable", fact_attempts: 0 });
             populateModuleOwnedRows(db, version, state);
             return;
+        case 101:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(
+                db
+                    .prepare(`SELECT name FROM sqlite_master WHERE name IN (
+                    'idx_tags_session_message_nocase', 'idx_tags_session_tool_owner'
+                ) ORDER BY name`)
+                    .all(),
+            ).toEqual([
+                { name: "idx_tags_session_message_nocase" },
+                { name: "idx_tags_session_tool_owner" },
+            ]);
+            populateModuleOwnedRows(db, version, state);
+            return;
         case 100:
             if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            // Fresh initialization already has the latest indexes. Remove them so
+            // the next step must install them on this populated, armed store.
+            db.exec(`DROP INDEX idx_tags_session_message_nocase;
+                DROP INDEX idx_tags_session_tool_owner;`);
             db.prepare(`INSERT INTO session_meta(session_id, served_prefix, held_release)
                 VALUES ('armed-v100', ?, ?)`).run(
                 '{"prefix":"armed-v100"}',
@@ -860,7 +878,7 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
             });
             populateModuleOwnedRows(db, version, state);
             return;
-        case 101:
+        case 102:
             expect(
                 db
                     .prepare("SELECT COUNT(*) n FROM memories WHERE safety_critical IS NOT NULL")

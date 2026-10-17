@@ -7,7 +7,11 @@ import {
 } from "@magic-context/core/hooks/magic-context/edit-admission";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
-import { assistantMessage, createTestDb } from "./test-utils.test";
+import {
+	assistantMessage,
+	assistantToolCall,
+	createTestDb,
+} from "./test-utils.test";
 
 const IMAGE_DATA = "a".repeat(240);
 
@@ -45,6 +49,7 @@ describe("stripPiProcessedImages", () => {
 					...assistantMessage("kept", 2),
 					content: [
 						{ type: "thinking", thinking: "kept", signature: "signed" },
+						...assistantToolCall("call-3", "screenshot", {}, 2).content,
 					],
 				},
 				imageMessage("toolResult", 3),
@@ -75,7 +80,10 @@ describe("stripPiProcessedImages", () => {
 					messages,
 					detect,
 					watermark: 5,
-					messageIdToMaxTag: new Map(),
+					messageIdToMaxTag: new Map([
+						["entry-1", 1],
+						["entry-3", 3],
+					]),
 					stableId: idByTimestamp,
 					admitFirstApplication: (m, _index, block) => {
 						const id = idByTimestamp(m);
@@ -120,7 +128,7 @@ describe("stripPiProcessedImages", () => {
 		try {
 			const buildMessages = () => [
 				imageMessage("user", 1),
-				assistantMessage("processed user image", 2),
+				assistantToolCall("call-3", "screenshot", {}, 2),
 				imageMessage("toolResult", 3),
 				assistantMessage("processed tool image", 4),
 			];
@@ -170,7 +178,11 @@ describe("stripPiProcessedImages", () => {
 					...imageMessage("toolResult", 3),
 					content: [{ type: "image", data: IMAGE_DATA, mimeType: "image/png" }],
 				};
-				return [toolResult, assistantMessage("processed tool image", 4)];
+				return [
+					assistantToolCall("call-3", "screenshot", {}, 2),
+					toolResult,
+					assistantMessage("processed tool image", 4),
+				];
 			};
 
 			const first = buildMessages();
@@ -201,7 +213,7 @@ describe("stripPiProcessedImages", () => {
 				newlyStrippedIds: ["entry-3"],
 			});
 			expect(replayed.stripped).toBe(1);
-			expect((first[0] as { content: unknown[] }).content).toEqual([
+			expect((first[1] as { content: unknown[] }).content).toEqual([
 				{ type: "text", text: "[image stripped]" },
 			]);
 			expect(JSON.stringify(replay)).toBe(firstWire);

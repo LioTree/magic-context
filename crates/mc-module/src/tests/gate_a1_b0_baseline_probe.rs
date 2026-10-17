@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 /// Digest of the system prompt, user prompt, and model sent to the provider.
 const EXPECTED_REQUEST_DIGEST: &str =
-    "297ecdb7d65bd894b72d532032378d5c808e37e838fbd5209b01d5d9d4ab343b";
+    "9da0ff5bd934e7ac0332804f38aa825c8d73ac3882a575dfefb8de13a4fa1cb8";
 
 /// Digest of the message array returned by a fold pass.
 const BASELINE_SERVED_DIGEST: &str =

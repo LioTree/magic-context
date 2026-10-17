@@ -69,6 +69,8 @@ fn stale_reduce_minting_keys(
         StripSelectionScope {
             reasoning: ReasoningBudgetScope::default(),
             image_watermark: 0,
+            image_protected_cutoff: None,
+            image_emergency: false,
         },
         &HashSet::new(),
         &admission,

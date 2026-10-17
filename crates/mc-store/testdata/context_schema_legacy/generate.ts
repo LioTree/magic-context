@@ -26,8 +26,8 @@ const { addNote } = await import(join(root, "packages/plugin/src/features/magic-
 const { insertTag } = await import(join(root, "packages/plugin/src/features/magic-context/storage-tags.ts"));
 const { writeReplayDocument } = await import(join(root, "packages/plugin/src/features/magic-context/storage-replay-document.ts"));
 
-// Use the historical initializer from schema-version-87 commit ceeed793b5bf873d94768de20358bc84a44d3fad.
-// The current initializer preinstalls v93-99 schema before running migrations,
+// Use the schema-version-87 initializer saved in storage-db-v87.source.txt.
+// The current initializer preinstalls newer schema before running migrations,
 // so it would conceal missing historical upgrade steps in a differential test.
 const historicalSource = readFileSync(join(here, "storage-db-v87.source.txt"), "utf8");
 const historicalJs = new Bun.Transpiler({ loader: "ts", target: "bun" }).transformSync(

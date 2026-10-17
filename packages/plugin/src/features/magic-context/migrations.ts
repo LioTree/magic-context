@@ -7,6 +7,7 @@ import { splitLkgSlotPrefixes, splitReplayDecisions } from "./migration-v94-writ
 import { installV95PerfSchema } from "./migration-v95-perf-indexes";
 import { installCompartmentRescoreSchema } from "./migration-v98-compartment-rescore";
 import { installMemoryLifecycleSchema } from "./migration-v99-memory-lifecycle";
+import { installTrimSourceIndexes } from "./migration-v101-trim-indexes";
 import { repairOpenCode2HarnessLabels } from "./opencode2-relabel";
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { installHostRunnerSchema } from "./storage-host-runner";
@@ -3269,6 +3270,14 @@ export const MIGRATIONS: Migration[] = [
     },
     {
         version: 101,
+        description: "indexed trimmed-source tag retirement",
+        up(db: Database): void {
+            if (!tableExists(db, "tags")) return;
+            installTrimSourceIndexes(db);
+        },
+    },
+    {
+        version: 102,
         description: "nullable safety-critical memory assessment",
         up(db: Database): void {
             if (!tableExists(db, "memories")) return;

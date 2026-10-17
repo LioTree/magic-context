@@ -13,6 +13,7 @@
  * that sends nothing for 10 s).
  */
 import { LatestTurnThinkingValidator } from "./latest-turn-thinking";
+import { PrefixBindingValidator } from "./prefix-binding";
 
 const STREAM_PING_INTERVAL_MS = 5_000;
 
@@ -108,6 +109,9 @@ export interface MockResponse {
 }
 
 export interface CapturedRequest {
+    /** Whether signed reasoning was checked for latest-turn retention alone or also prefix equality. */
+    thinkingChecked?: "latest-turn" | "prefix-binding";
+    responseStatus?: number;
     /** Provider-side rejection, recorded before request matchers run. */
     thinkingViolation?: string;
     receivedAt: number;
@@ -128,6 +132,8 @@ export interface CapturedRequest {
 }
 
 export interface MockServerOptions {
+    /** Also reject edits to messages preceding a resent signed reasoning block. */
+    prefixBinding?: boolean;
     port?: number;
     /** Stable caller identity for the provider's latest-turn thinking oracle. */
     thinkingScope?: (body: Record<string, unknown>) => string | undefined;
@@ -157,10 +163,14 @@ export class MockProvider {
     private misses = 0;
     private thinkingScope?: MockServerOptions["thinkingScope"];
     private thinkingValidator = new LatestTurnThinkingValidator();
+    private prefixValidator = new PrefixBindingValidator();
+    private prefixBinding = false;
+    private requestTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
 
     async start(options: MockServerOptions = {}): Promise<{ port: number; baseURL: string }> {
         const port = options.port ?? 0; // 0 = pick any available port
         this.thinkingScope = options.thinkingScope;
+        this.prefixBinding = options.prefixBinding ?? false;
         this.server = Bun.serve({
             port,
             // Bind the address advertised to the child. A localhost listener can
@@ -207,6 +217,15 @@ export class MockProvider {
         this.thinkingValidator.resumeLegacy(scope, userTurns, returnedThinking);
     }
 
+    newUserTurn(): void {
+        this.prefixValidator.newUserTurn();
+    }
+
+    /** Inject a transport fault before provider validation, without changing product code. */
+    setRequestTransform(transform: (body: Record<string, unknown>) => Record<string, unknown>): void {
+        this.requestTransform = transform;
+    }
+
     /** All captured requests, in order. */
     requests(): CapturedRequest[] {
         return [...this.captured];
@@ -224,6 +243,8 @@ export class MockProvider {
         this.defaultResponse = null;
         this.matchers = [];
         this.thinkingValidator = new LatestTurnThinkingValidator();
+        this.prefixValidator = new PrefixBindingValidator();
+        this.requestTransform = undefined;
     }
 
     private async handle(req: Request): Promise<Response> {
@@ -254,6 +275,7 @@ export class MockProvider {
             } catch {
                 body = {};
             }
+            if (isMessages && this.requestTransform) body = this.requestTransform(body);
 
             const headers: Record<string, string> = {};
             req.headers.forEach((value, key) => {
@@ -271,10 +293,14 @@ export class MockProvider {
             this.captured.push(captured);
 
             const scope = isMessages ? this.thinkingScope?.(body) : undefined;
+            const acceptedMessages = structuredClone(body.messages) as Array<{ role: string; content: unknown }>;
             if (scope !== undefined) {
-                const error = this.thinkingValidator.check(scope, body.messages as Array<{ role: string; content: unknown }>);
+                captured.thinkingChecked = this.prefixBinding ? "prefix-binding" : "latest-turn";
+                const validator = this.prefixBinding ? this.prefixValidator : this.thinkingValidator;
+                const error = validator.check(scope, body.messages as Array<{ role: string; content: unknown }>);
                 if (error) {
                     captured.thinkingViolation = error;
+                    captured.responseStatus = 400;
                     captured.responseCompletedAt = Date.now();
                     return Response.json({ type: "error", error: { type: "invalid_request_error", message: error } }, { status: 400 });
                 }
@@ -345,10 +371,14 @@ export class MockProvider {
                 );
             }
 
-            const content =
+            let content =
                 scripted.content ??
                 [{ type: "text", text: scripted.text ?? "OK" }];
-            if (scope !== undefined) this.thinkingValidator.returned(scope, content);
+            if (scope !== undefined) {
+                if (this.prefixBinding) content = this.prefixValidator.returned(scope, acceptedMessages, content);
+                else this.thinkingValidator.returned(scope, content);
+            }
+            captured.responseStatus = 200;
 
             const respModel =
                 scripted.model ??

@@ -50,6 +50,7 @@ fn fixture(
         connection_incarnation: 0,
         native_generation: None,
         principal: None,
+        scope: None,
         project_root: dir.into(),
         harness: "opencode".into(),
         session: "s".into(),

@@ -1409,6 +1409,12 @@ CREATE TABLE memory_agent_fragments (
 
 CREATE INDEX idx_memory_agent_fragments_session ON memory_agent_fragments(session_id,harness,project_path,id);
 
+CREATE INDEX idx_tags_session_message_nocase
+        ON tags(session_id, message_id COLLATE NOCASE);
+
+CREATE INDEX idx_tags_session_tool_owner
+        ON tags(session_id, tool_owner_message_id);
+
 CREATE TABLE schema_migrations (
 			version INTEGER PRIMARY KEY,
 			description TEXT NOT NULL,
@@ -1934,7 +1940,8 @@ INSERT INTO schema_migrations (version, description, applied_at) VALUES
 (98, 'score revision sidecar, selection history and project rescore jobs', :applied_at),
 (99, 'memory lifecycle evidence, attempts, receipts and applied snapshots', :applied_at),
 (100, 'durable served thinking prefix and held release request', :applied_at),
-(101, 'nullable safety-critical memory assessment', :applied_at);
+(101, 'indexed trimmed-source tag retirement', :applied_at),
+(102, 'nullable safety-critical memory assessment', :applied_at);
 
 INSERT INTO "message_fts_rowid_map_backfill_state" ("completed", "id", "updated_at", "watermark_rowid") VALUES
 (0, 1, 0, 0);

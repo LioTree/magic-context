@@ -15,6 +15,9 @@ type OpenCode2Host = Awaited<ReturnType<typeof spawnOpencode2>>;
 type OpenCode2Client = ReturnType<typeof OpenCode.make>;
 
 export interface OpenCode2TestHarnessOptions {
+    mockModelID?: string;
+    thinkingScope?: (body: Record<string, unknown>) => string | undefined;
+    prefixBinding?: boolean;
     magicContextConfig?: Record<string, unknown>;
     openCodeConfigExtra?: Record<string, unknown>;
     modelContextLimit?: number;
@@ -71,6 +74,9 @@ export class OpenCode2TestHarness implements HostHarness {
 
     static async create(options: OpenCode2TestHarnessOptions = {}): Promise<OpenCode2TestHarness> {
         const spawnOptions: OpenCode2SpawnOptions = {
+            defaultModelID: options.mockModelID,
+            thinkingScope: options.thinkingScope,
+            prefixBinding: options.prefixBinding,
             magicContextConfig: options.magicContextConfig ?? {},
             extraConfig: options.openCodeConfigExtra,
             modelContextLimit: options.modelContextLimit,
@@ -171,6 +177,7 @@ export class OpenCode2TestHarness implements HostHarness {
             offset: this.mock.requests().length,
             prompt: text,
         });
+        this.mock.newUserTurn();
         const prompt = await this.clientInstance.session.prompt({ sessionID: sessionId, text });
         await this.clientInstance.session.wait(
             { sessionID: sessionId },

@@ -118,6 +118,29 @@ fn sql(store: &McStore, statements: &str) {
         .unwrap();
 }
 
+fn freeze_fixture(store: &McStore, mover: &mut crate::move_store::MoveStore, cut: &str) {
+    if scalar::<u32>(
+        store,
+        "SELECT count(*) FROM sqlite_master WHERE name='mc_provider_conversations_v2'",
+    ) == 0
+    {
+        // These historical schemas predate provider launch records. Seed their frozen
+        // phase directly; the current freeze API checks tables introduced later.
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE mc_move_fences SET phase='frozen' WHERE cut_id=?1 AND phase='draining'",
+                    [cut],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    } else {
+        mover.freeze(cut).unwrap();
+    }
+}
+
 fn core() -> CoreState {
     let mut core = CoreState::default();
     core.frozen_units.push(FrozenUnit {
@@ -258,7 +281,7 @@ fn seed(descriptor: &StorageDescriptor, version: u32) -> Snapshot {
             mc_start_offset: 100,
         })
         .unwrap();
-    mover.freeze("populated-cut").unwrap();
+    freeze_fixture(&store, &mut mover, "populated-cut");
     store_snapshot(&store)
 }
 
@@ -846,7 +869,7 @@ fn assert_move_guards(store: &McStore) {
                 mc_start_offset: 100,
             })
             .unwrap();
-        mover.freeze(&cut).unwrap();
+        freeze_fixture(store, &mut mover, &cut);
     }
     let before = store_snapshot(store);
     assert!(samples

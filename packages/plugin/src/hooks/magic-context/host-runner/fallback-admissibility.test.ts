@@ -78,6 +78,143 @@ function measuredFixture() {
 }
 
 describe("host-runner fallback admissibility", () => {
+    test("OpenCode retained pre-C tail serves the applied view and raw tail in append order", () => {
+        const { record, messages } = fixture();
+        const cut = {
+            kind: "opencode" as const,
+            boundary_mid: "tail-3",
+            summary_mid: "native-S",
+            compaction_part_id: "native-part",
+            tail_start_id: "source-2",
+        };
+        const c = {
+            ...messages[2]!,
+            parts: [
+                ...messages[2]!.parts,
+                { id: "native-part", type: "compaction", auto: true, tail_start_id: "source-2" },
+            ],
+        } as MessageLike;
+        const s = {
+            info: {
+                id: "native-S",
+                role: "assistant",
+                parentID: "tail-3",
+                summary: true,
+                finish: "stop",
+            },
+            parts: [{ type: "text", text: "native summary" }],
+        } as MessageLike;
+        const append = message("new-4");
+        expect(
+            isFallbackAdmissible(
+                record,
+                { ...defaults, messages: [c, s, messages[1]!, append] },
+                cut,
+            ),
+        ).toEqual({ admissible: true, view: [...assemble(record), append] });
+    });
+
+    test("broken effective cuts refuse dangling T, fork at S and edited C tail by name", () => {
+        const { record, messages } = fixture();
+        const cut = {
+            kind: "opencode" as const,
+            boundary_mid: "tail-3",
+            summary_mid: "native-S",
+            compaction_part_id: "native-part",
+            tail_start_id: "source-2",
+        };
+        const c = {
+            ...messages[2]!,
+            parts: [
+                ...messages[2]!.parts,
+                { id: "native-part", type: "compaction", auto: true, tail_start_id: "source-2" },
+            ],
+        } as MessageLike;
+        const s = {
+            info: {
+                id: "native-S",
+                role: "assistant",
+                parentID: "tail-3",
+                summary: true,
+                finish: "stop",
+            },
+            parts: [{ type: "text", text: "native summary" }],
+        } as MessageLike;
+        for (const [host, detail] of [
+            [[c, messages[1]!], "native-cut-summary-missing"],
+            [[c, s, messages[0]!], "native-cut-tail-dangling"],
+            [
+                [
+                    {
+                        ...c,
+                        parts: [
+                            ...messages[2]!.parts,
+                            {
+                                id: "native-part",
+                                type: "compaction",
+                                auto: true,
+                                tail_start_id: "source-1",
+                            },
+                        ],
+                    },
+                    s,
+                    messages[0]!,
+                    messages[1]!,
+                ],
+                "native-cut-tail-edited",
+            ],
+        ] as const) {
+            expect(
+                isFallbackAdmissible(record, { ...defaults, messages: host as MessageLike[] }, cut),
+            ).toMatchObject({ admissible: false, reason: "covered_range_changed", detail });
+        }
+    });
+    test("committed native cut uses recorded prefix evidence with a shorter host window", () => {
+        const { record, messages } = fixture();
+        const append = message("new-4");
+        expect(
+            isFallbackAdmissible(
+                record,
+                { ...defaults, messages: [messages[2]!, append] },
+                { kind: "pi", compaction_id: "native", first_kept_id: "tail-3" },
+            ),
+        ).toEqual({ admissible: true, view: [...assemble(record), append] });
+    });
+
+    test("native cut never excuses changed visible source or a missing uncovered suffix", () => {
+        const { record, messages } = fixture();
+        for (const input of [
+            { ...defaults, messages: [message("source-2", "edited"), messages[2]!] },
+            { ...defaults, messages: [messages[2]!] },
+        ]) {
+            expect(
+                isFallbackAdmissible(record, input, {
+                    kind: "pi",
+                    compaction_id: "native",
+                    first_kept_id: "source-2",
+                }),
+            ).toMatchObject({ admissible: false, reason: "covered_range_changed" });
+        }
+        record.source_digests.delete("source-1");
+        expect(
+            isFallbackAdmissible(
+                record,
+                { ...defaults, messages: [messages[2]!] },
+                { kind: "pi", compaction_id: "native", first_kept_id: "tail-3" },
+            ),
+        ).toMatchObject({ admissible: false, reason: "covered_range_changed" });
+    });
+
+    test("native cut retains source validation between the cut and applied coverage", () => {
+        const { record, messages } = fixture();
+        expect(
+            isFallbackAdmissible(
+                record,
+                { ...defaults, messages: messages.slice(1) },
+                { kind: "pi", compaction_id: "native", first_kept_id: "source-2" },
+            ),
+        ).toEqual({ admissible: true, view: assemble(record) });
+    });
     test("accepts an append as the last replacement and raw tail using measured usage", () => {
         const { record, messages } = measuredFixture();
         const append = message("new-4", "new tail");

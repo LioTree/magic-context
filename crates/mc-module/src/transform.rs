@@ -703,6 +703,88 @@ impl BoundaryState {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawReplayRebuild {
+    pub identity: String,
+    pub reason: String,
+    pub message_ids: Vec<String>,
+}
+
+fn raw_replay_rebuild(req: &TransformRequest) -> Option<&RawReplayRebuild> {
+    req.raw_replay_rebuild.as_ref().filter(|request| {
+        req.serializer_profile == "opencode-aisdk"
+            && request.identity.len() == 64
+            && request
+                .identity
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && [
+                "source_removed",
+                "source_changed",
+                "candidate_loss",
+                "candidate_conflict",
+            ]
+            .contains(&request.reason.as_str())
+            && req
+                .render_config
+                .contains(&format!("raw_replay:{}", request.identity))
+    })
+}
+
+fn raw_replay_rebuild_core(
+    req: &TransformRequest,
+    meta: &ModuleMeta,
+    core: &CoreState,
+    projection: &FlatProjection,
+) -> Option<CoreState> {
+    let recovery = raw_replay_rebuild(req)?;
+    let mut rebuilt = core.clone();
+    for mid in &recovery.message_ids {
+        let covered = req
+            .messages
+            .iter()
+            .find(|message| message.mid == *mid)
+            .is_some_and(|message| !is_tail(message.ordinal, meta.coverage_ordinal));
+        let anchor = core.boundary_id == *mid
+            || split_block_id(&core.boundary_id).is_some_and(|(id, _)| id == mid);
+        if covered
+            || anchor
+            || meta.block_identity_by_mid.get(mid) == projection.identity_by_mid.get(mid)
+        {
+            continue;
+        }
+        // Forget reduction/strip payloads tied to this changed, unsummarized message.
+        // Unrelated messages and the summarized-history boundary keep their checks.
+        let suffix = format!(":{mid}");
+        rebuilt.frozen_units.retain(|unit| {
+            if !frozen_unit_targets_message(unit, mid, &suffix) {
+                return true;
+            }
+            let block = unit
+                .key
+                .strip_prefix(RED_KEY_PREFIX)
+                .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX))
+                .or_else(|| {
+                    unit.key
+                        .starts_with(CHANNEL1_KEY_PREFIX)
+                        .then_some(unit.reset_rule.as_str())
+                });
+            if let Some((_, index)) = block.and_then(split_block_id) {
+                return meta
+                    .block_identity_by_mid
+                    .get(mid)
+                    .and_then(|blocks| blocks.get(index))
+                    == projection
+                        .identity_by_mid
+                        .get(mid)
+                        .and_then(|blocks| blocks.get(index));
+            }
+            false
+        });
+    }
+    Some(rebuilt)
+}
+
 /// A transform pass request. `boundary_present` is deliberately NOT a field: it is a
 /// cache-correctness decision (replay-frozen vs reconcile) that the module computes
 /// from its own durable state, never caller-supplied (a caller-supplied value would be
@@ -747,6 +829,14 @@ pub struct TransformRequest {
     /// It can acknowledge only a system-only identity delta, never other render inputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_system_prompt_hash: Option<String>,
+    /// Block IDs (`message_id#block_index`) the host already sent without tag prefixes.
+    /// Recording provider visibility does not authorize rewriting the cached prefix.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub served_raw_block_ids: Vec<String>,
+    /// The host refused a missing/changed raw-served part and persisted this request.
+    /// Its declared render identity requests a rebuild; the module plan grants permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_replay_rebuild: Option<RawReplayRebuild>,
     /// Identity of the materializer's upgrade state, stored so a change is detected as a
     /// render-configuration change consistently with the TypeScript materializer.
     #[serde(default)]
@@ -1045,6 +1135,10 @@ fn present_deprecated_value<'de, D: serde::Deserializer<'de>>(
 #[derive(Deserialize)]
 struct TransformRequestWire {
     #[serde(default)]
+    raw_replay_rebuild: Option<RawReplayRebuild>,
+    #[serde(default)]
+    served_raw_block_ids: Vec<String>,
+    #[serde(default)]
     kind: String,
     #[serde(default = "default_wire_version")]
     v: u32,
@@ -1214,6 +1308,8 @@ impl<'de> Deserialize<'de> for TransformRequest {
             native_fold_hygiene: None,
             native_fold_output: None,
             native_fold_projection: None,
+            raw_replay_rebuild: wire.raw_replay_rebuild,
+            served_raw_block_ids: wire.served_raw_block_ids,
             kind: wire.kind,
             v: wire.v,
             serializer_profile: wire.serializer_profile.unwrap_or_default(),
@@ -4990,13 +5086,15 @@ fn apply_once(
                 req.session_id,
                 fingerprint
             );
+            let mut pending_tags = loaded.meta.pending_tag_block_ids.clone();
+            pending_tags.extend(req.served_raw_block_ids.iter().cloned());
             let passthrough_overlay = tagging_active.then(|| {
                 tag_overlay_state(
                     &tag_rows,
                     &temporal_marks,
                     &user_hints,
                     &channel1_appends,
-                    &loaded.meta.pending_tag_block_ids,
+                    &pending_tags,
                     &loaded.meta.pending_user_hint_block_ids,
                 )
             });
@@ -5016,6 +5114,7 @@ fn apply_once(
                 .as_ref()
                 .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
             let mut next_meta = loaded.meta.clone();
+            next_meta.pending_tag_block_ids = pending_tags;
             next_meta.served_output_fingerprint = served_fingerprints;
             next_meta.served_output_generation = Some(reasoning_generation(&next_meta));
             let fingerprint_changed = next_meta != loaded.meta;
@@ -5089,6 +5188,8 @@ fn apply_once(
 
         let core = loaded.core.clone();
         let mut meta = loaded.meta.clone();
+        meta.pending_tag_block_ids
+            .extend(req.served_raw_block_ids.iter().cloned());
         let mut trip_count = meta.pending_rewrite_trip_count;
         if trip_count > 0 {
             trip_count = trip_count.saturating_add(1);
@@ -5214,11 +5315,13 @@ fn apply_once(
     profile_end!(perf_coverage);
     profile_start!(perf_identity, "identity_enforce");
     let identity_enforce_started_at = Instant::now();
+    let recovery_core = raw_replay_rebuild_core(req, &loaded.meta, &loaded.core, &projection);
+    let identity_core = recovery_core.as_ref().unwrap_or(&loaded.core);
     let tail_identity_re_adoptions = enforce_block_identity(
         &loaded.meta,
         req,
         &projection,
-        &loaded.core,
+        identity_core,
         provisional_tail_mid,
         lineage_anchor_mid,
     )
@@ -5240,7 +5343,7 @@ fn apply_once(
             &legacy_meta,
             req,
             &projection,
-            &loaded.core,
+            identity_core,
             provisional_tail_mid,
             lineage_anchor_mid,
         )?;
@@ -5583,7 +5686,8 @@ fn apply_once(
         false,
         scheduler_outcome.idle_ttl_fired,
     );
-    let render_config_changed = render_config_changed && !system_identity_adopted;
+    let raw_rebuild = raw_replay_rebuild(req).is_some();
+    let render_config_changed = (render_config_changed && !system_identity_adopted) || raw_rebuild;
     let reconcile_hard_due = loaded.core.reconcile_pending && !boundary_present;
     // If Claude-code coverage advances over system messages, force a HARD render so the
     // messages move into the m0 prefix before the byte-splice profile suppresses their
@@ -5690,7 +5794,8 @@ fn apply_once(
     let head_rebuild_forced = !req.is_subagent
         && (!loaded.meta.initialized
             || cached_m1_missing(&loaded.core)
-            || lineage_state.force_hard);
+            || lineage_state.force_hard
+            || raw_rebuild);
     // `classify` also makes bootstrap-seed and legacy-baseline passes HARD whatever is queued:
     // neither has an m0/m1 pair matching the stored coverage to replay.
     let head_replay_impossible = head_rebuild_forced
@@ -5801,7 +5906,8 @@ fn apply_once(
     let identity_changed = |last: &str, current: Option<&str>| {
         !last.is_empty() && current.is_some_and(|current| current != last)
     };
-    let hard_fold_loses_provider_cache = scheduler_outcome.idle_ttl_fired
+    let hard_fold_loses_provider_cache = raw_rebuild
+        || scheduler_outcome.idle_ttl_fired
         || profile_transition
         || identity_changed(&loaded.meta.last_provider_id, req.provider_id.as_deref())
         || identity_changed(&loaded.meta.last_model_key, req.model_key.as_deref())
@@ -5882,7 +5988,7 @@ fn apply_once(
     // emergency minimum: the force-band edge and the 95% backstop below permit a rewrite
     // but do not pay for one. Both flags derive from this one expression so they cannot
     // drift apart.
-    let independent_rebuild = (prefix_materialization_enabled
+    let independent_rebuild = raw_rebuild || (prefix_materialization_enabled
         && (!loaded.meta.initialized
             || render_config_changed
             || cached_m1_missing(&loaded.core)
@@ -6226,6 +6332,11 @@ fn apply_once(
                     &loaded.core.frozen_units,
                     &selected_reductions,
                 ),
+                image_protected_cutoff: protection_window
+                    .cutoff
+                    .cutoff
+                    .and_then(|tag| u64::try_from(tag.0).ok()),
+                image_emergency: scheduler_outcome.pass == scheduler::PassDecision::Emergency95,
             },
             &selection_outcome.protected_tool_block_ids,
             &admission,
@@ -6302,7 +6413,10 @@ fn apply_once(
             // independent Soft pass selected by the scheduler.
             // A subagent under the signed-prefix hold defers this transition until the hold
             // lifts: tagging old blocks would edit content before its kept signed thinking.
-            plan = if (surface_transition && !signed_prefix_hold) || subagent_execute_permitted {
+            plan = if raw_rebuild
+                || (surface_transition && !signed_prefix_hold)
+                || subagent_execute_permitted
+            {
                 PassPlan::Soft
             } else {
                 PassPlan::Defer
@@ -6405,6 +6519,9 @@ fn apply_once(
     if cache_sections_discarded {
         materialize_reason = Some("cache_sections_discarded".to_string());
     }
+    if raw_rebuild {
+        materialize_reason = Some("raw_replay_identity_rebuild".to_string());
+    }
     if boundary_divergence_recut.is_some() {
         materialize_reason = Some("boundary_divergence_recut".to_string());
     }
@@ -6424,7 +6541,7 @@ fn apply_once(
     profile_end!(perf_planning);
     let state_clone_started_at = Instant::now();
     profile_start!(perf_clone, "state_clone");
-    let mut core = loaded.core.clone();
+    let mut core = recovery_core.unwrap_or_else(|| loaded.core.clone());
     log_reasoning_drop_seed_skips(&core, &live, &req.session_id);
     let mut meta = loaded.meta.clone();
     if trigger_holds_enabled && protected_signed_prefix {
@@ -6618,6 +6735,10 @@ fn apply_once(
         serializer_profile,
         Some(SerializerProfile::OpencodeAiSdk | SerializerProfile::OwnedBroca)
     ) {
+        // The host may have sent raw bytes instead of an earlier successful
+        // transform's output. Hide tags for all reported blocks, even older rows.
+        meta.pending_tag_block_ids
+            .extend(req.served_raw_block_ids.iter().cloned());
         // Broca can serve a message the module never rendered (its last-known-good array
         // plus the raw tail after a failed transform), so it needs the same hold.
         let mint_end = pending_overlays
@@ -6711,6 +6832,16 @@ fn apply_once(
     let unit_mint_started_at = Instant::now();
     let new_strip_units = if is_bust_pass {
         planned_strip_units
+    } else if req.is_subagent && subagent_execute_permitted && is_provider_prefix_mutation_pass {
+        planned_strip_units
+            .into_iter()
+            .filter(|unit| {
+                matches!(
+                    unit.kind.as_str(),
+                    "image" | "strip_processed_image" | "strip_processed_tool_image"
+                )
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -6835,8 +6966,9 @@ fn apply_once(
                 None,
                 suppress_bootstrap_reduction_tag_overlay,
             );
-            // A subagent's only strip units: a signed-thinking reset's removals, which its
-            // output replays on every later pass like a primary's.
+            // The child's scheduler-authorized cleanup persists image and tool reductions
+            // together before returning the modified request.
+            rendered_units.extend(new_strip_units.iter().cloned());
             rendered_units.extend(signed_thinking_reset_units.iter().cloned());
             core.step(PassInput {
                 proposed: Some(mc_core::Action::Soft),
@@ -9075,7 +9207,16 @@ fn enforce_block_identity(
         if trailing_blank_identity_replays_stored(req, core, mid, stored) {
             continue;
         }
-        if identity_drift_requires_reject(meta, req, core, mid) {
+        let declared_tail_rebuild = raw_replay_rebuild(req)
+            .is_some_and(|recovery| recovery.message_ids.contains(mid))
+            && !req
+                .messages
+                .iter()
+                .find(|message| message.mid == *mid)
+                .is_some_and(|message| !is_tail(message.ordinal, meta.coverage_ordinal))
+            && core.boundary_id != *mid
+            && !split_block_id(&core.boundary_id).is_some_and(|(anchor, _)| anchor == mid);
+        if identity_drift_requires_reject(meta, req, core, mid) && !declared_tail_rebuild {
             return Err(TransformError::IdentityDrift(mid.clone()));
         }
         re_adoptions.push(TailIdentityReAdoption {
@@ -9129,22 +9270,26 @@ fn identity_drift_requires_reject(
 fn frozen_unit_targets_mid(core: &CoreState, mid: &str) -> bool {
     profile_start!(_perf_scan, "rt15_frozen_mid_scan");
     let strip_suffix = format!(":{mid}");
-    core.frozen_units.iter().any(|unit| {
-        let target = unit
-            .key
-            .strip_prefix(RED_KEY_PREFIX)
-            .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX));
-        if target.is_some_and(|target| {
-            split_block_id(target).is_some_and(|(unit_mid, _)| unit_mid == mid)
-        }) || (unit.key.starts_with(CHANNEL1_KEY_PREFIX)
+    core.frozen_units
+        .iter()
+        .any(|unit| frozen_unit_targets_message(unit, mid, &strip_suffix))
+}
+
+fn frozen_unit_targets_message(unit: &FrozenUnit, mid: &str, strip_suffix: &str) -> bool {
+    let target = unit
+        .key
+        .strip_prefix(RED_KEY_PREFIX)
+        .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX));
+    if target
+        .is_some_and(|target| split_block_id(target).is_some_and(|(unit_mid, _)| unit_mid == mid))
+        || (unit.key.starts_with(CHANNEL1_KEY_PREFIX)
             && split_block_id(&unit.reset_rule).is_some_and(|(unit_mid, _)| unit_mid == mid))
-        {
-            return true;
-        }
-        unit.key
-            .strip_prefix("strip:")
-            .is_some_and(|key| key.ends_with(&strip_suffix))
-    })
+    {
+        return true;
+    }
+    unit.key
+        .strip_prefix("strip:")
+        .is_some_and(|key| key.ends_with(strip_suffix))
 }
 
 fn block_identity_hash_prefix(vector: &[BlockIdentity]) -> String {
@@ -15868,6 +16013,10 @@ fn image_block_is_large(block: &CkWireBlock) -> bool {
     let ck_wire::CkKind::Media(media) = &block.kind else {
         return false;
     };
+    image_media_is_large(media)
+}
+
+fn image_media_is_large(media: &ck_wire::MediaBlock) -> bool {
     if media.kind != ck_wire::MediaKind::Image || !media.media_type.starts_with("image/") {
         return false;
     }
@@ -15884,6 +16033,43 @@ fn image_block_is_large(block: &CkWireBlock) -> bool {
     // OpenCode's TS strip checks the original data URL length, so include the
     // MIME/prefix bytes rather than treating a remote URL as image payload.
     data.len() + format!("data:{};base64,", media.media_type).len() > 200
+}
+
+fn tool_image_block_is_large(block: &CkWireBlock) -> bool {
+    let ck_wire::CkKind::ToolResult { output, .. } = &block.kind else {
+        return false;
+    };
+    match &output.kind {
+        ck_wire::CkOutputKind::Content { blocks }
+        | ck_wire::CkOutputKind::ErrorContent { blocks } => blocks.iter().any(|block| {
+            matches!(&block.kind, ck_wire::ResultBlockKind::Media { media } if image_media_is_large(media))
+        }),
+        _ => false,
+    }
+}
+
+fn strip_tool_images(block: &mut CkWireBlock, marker: &str) {
+    let ck_wire::CkKind::ToolResult { output, .. } = &mut block.kind else {
+        return;
+    };
+    let (ck_wire::CkOutputKind::Content { blocks }
+    | ck_wire::CkOutputKind::ErrorContent { blocks }) = &mut output.kind
+    else {
+        return;
+    };
+    for child in blocks {
+        if matches!(&child.kind, ck_wire::ResultBlockKind::Media { media } if image_media_is_large(media))
+        {
+            *child = ck_wire::ResultBlock {
+                kind: ck_wire::ResultBlockKind::Text {
+                    text: marker.to_string(),
+                },
+                // Native image fields must not survive as extras on the replacement text.
+                provider_extras: Default::default(),
+            };
+        }
+    }
+    block.mark_modified();
 }
 
 fn replace_with_sentinel(block: &mut CkWireBlock, text: &str) {
@@ -15939,6 +16125,49 @@ include!("transform/reasoning_clear.rs");
 struct StripSelectionScope<'a> {
     reasoning: ReasoningBudgetScope<'a>,
     image_watermark: u64,
+    image_protected_cutoff: Option<u64>,
+    image_emergency: bool,
+}
+
+/// 1. Position tag: the image's message's own maximum positive tag; if it has none,
+///    the first positive tag of any LATER message; if neither exists, the image is
+///    INELIGIBLE (retained, never age 0, never a preceding-tag fallback).
+/// 2. Age gate (unchanged): eligible only if position tag ≤ dropped-tag watermark
+///    (watermark > 0), plus the existing answered, admitted-bust, signed-prefix,
+///    stable-unit and persist-first rules.
+/// 3. Protected range: if position tag ≥ the protected cutoff (the same newest-tag
+///    window cutoff Rust's drops use), no new strip, below 95%.
+/// 4. At ≥95%: waive ONLY the protected-range check, exactly as the emergency drop
+///    does. Every other exclusion stays.
+fn processed_image_eligible(
+    message: &CkIngressMessage,
+    tag_numbers: &BTreeMap<String, u64>,
+    next_tag: Option<u64>,
+    answered: bool,
+    unsafe_content: &HashSet<String>,
+    scope: StripSelectionScope<'_>,
+) -> bool {
+    let position_tag = tag_numbers
+        .get(&message.mid)
+        .copied()
+        .filter(|tag| *tag > 0)
+        .or(next_tag);
+    let Some(position_tag) = position_tag else {
+        return false;
+    };
+    answered
+        && !message
+            .ck
+            .content
+            .iter()
+            .enumerate()
+            .any(|(index, _)| unsafe_content.contains(&ck_wire::block_id(&message.mid, index)))
+        && scope.image_watermark > 0
+        && position_tag <= scope.image_watermark
+        && (scope.image_emergency
+            || scope
+                .image_protected_cutoff
+                .is_none_or(|cutoff| position_tag < cutoff))
 }
 
 /// Processed images follow the shared dropped-tag watermark, not reasoning retention.
@@ -16041,9 +16270,18 @@ fn new_frozen_strip_units(
         let target = ck_wire::block_id(&message.mid, first);
         (admit_block_id(admission, &target), target)
     };
+    let mut next_image_tag = None;
 
     for index in (0..req.messages.len()).rev() {
         let message = &req.messages[index];
+        let later_image_tag = next_image_tag;
+        if let Some(tag) = tag_numbers
+            .get(&message.mid)
+            .copied()
+            .filter(|tag| *tag > 0)
+        {
+            next_image_tag = Some(tag);
+        }
         if message.ck.meta.synthetic
             || message.mid.is_empty()
             || lineage_anchor_mid == Some(message.mid.as_str())
@@ -16054,6 +16292,7 @@ fn new_frozen_strip_units(
         let protected_reduce = blocks.iter().enumerate().any(|(index, block)| {
             is_reduce_block(block) && protected_tools.contains(&format!("{}#{index}", message.mid))
         });
+        let had_later_assistant = has_assistant_response;
         if message.ck.role == "assistant" {
             // The reverse image scan in TS treats any assistant message as evidence
             // that older user content has already reached the model.
@@ -16158,7 +16397,9 @@ fn new_frozen_strip_units(
                     }
                 }
             }
-            continue;
+            if !blocks.iter().any(tool_image_block_is_large) {
+                continue;
+            }
         }
         let is_stale_reduce = request_accepts_empty_content(req)
             && index < protected_start
@@ -16175,36 +16416,54 @@ fn new_frozen_strip_units(
                 }
             }
         }
-        if has_assistant_response
-            && request_accepts_empty_content(req)
-            && selection_scope.image_watermark > 0
-            && {
-                // Missing tags are age zero in the TypeScript lane. This decision is still
-                // minted only on a bust and then frozen by message/block id for stable replay.
-                message_tag_number(message, tag_numbers) <= selection_scope.image_watermark
-            }
-            && blocks.iter().any(image_block_is_large)
-        {
-            let marker = strip_unit("processed_image", &message.mid, &sentinel);
-            if !existing_keys.contains(marker.key.as_str()) {
-                let first = blocks.iter().position(image_block_is_large).unwrap();
-                let target = ck_wire::block_id(&message.mid, first);
-                if !admit_block_id(admission, &target) {
-                    held_blocks.push(format!("processed_image:{target}"));
-                    continue;
-                }
-                units.insert(marker.key.clone(), marker);
+        if processed_image_eligible(
+            message,
+            tag_numbers,
+            later_image_tag,
+            had_later_assistant,
+            &unsafe_content,
+            selection_scope,
+        ) && blocks.iter().any(|block| {
+            (message.ck.role == "user" && image_block_is_large(block))
+                || tool_image_block_is_large(block)
+        }) {
+            let image_marker = if request_accepts_empty_content(req) {
+                ""
+            } else {
+                "[image stripped]"
+            };
+            let first = blocks
+                .iter()
+                .position(|block| {
+                    (message.ck.role == "user" && image_block_is_large(block))
+                        || tool_image_block_is_large(block)
+                })
+                .unwrap();
+            let target = ck_wire::block_id(&message.mid, first);
+            if !admit_block_id(admission, &target) {
+                held_blocks.push(format!("processed_image:{target}"));
+                continue;
             }
             for (block_index, block) in blocks.iter().enumerate() {
-                if !image_block_is_large(block) {
-                    continue;
+                let (seed_kind, marker_text) =
+                    if message.ck.role == "user" && image_block_is_large(block) {
+                        ("processed_image", image_marker)
+                    } else if tool_image_block_is_large(block) {
+                        // An image-only tool result must not become empty when its media is removed.
+                        ("processed_tool_image", "[image stripped]")
+                    } else {
+                        continue;
+                    };
+                let marker = strip_unit(seed_kind, &message.mid, marker_text);
+                if !existing_keys.contains(marker.key.as_str()) {
+                    units.insert(marker.key.clone(), marker);
                 }
                 // Images are reductions of individual media blocks, not whole-message
                 // strips. Reusing red:* keeps image replay in the same durable machinery
                 // as tool reductions while the message marker keeps replay stable if
                 // unrelated parts change their block index.
                 let target = format!("{}#{block_index}", message.mid);
-                let unit = red_unit(&target, "image", &sentinel);
+                let unit = red_unit(&target, "image", marker_text);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
                 }
@@ -16410,8 +16669,9 @@ fn apply_surface_strips(
 
     let stale_reduce =
         output_message_strip_unit(frozen_units, "stale_reduce", &message.mid).is_some();
-    let image_seed =
-        output_message_strip_unit(frozen_units, "processed_image", &message.mid).is_some();
+    let image_seed = output_message_strip_unit(frozen_units, "processed_image", &message.mid);
+    let tool_image_seed =
+        output_message_strip_unit(frozen_units, "processed_tool_image", &message.mid);
     let message_tag = message_tag_number(message, tag_numbers);
     let aged = message_tag > 0 && message_tag <= reasoning_policy.watermark;
     let mut touched = false;
@@ -16434,16 +16694,28 @@ fn apply_surface_strips(
             }
         }
 
+        // Reuse the replacement text saved when this image was removed, even after a
+        // provider switch. Older Anthropic decisions saved empty text and keep those bytes.
+        let image_unit = image_seed
+            .filter(|_| image_block_is_large(block.wire_shape()))
+            .or_else(|| tool_image_seed.filter(|_| tool_image_block_is_large(block.wire_shape())))
+            .or_else(|| {
+                frozen_units
+                    .red_by_block_id(block.id())
+                    .filter(|unit| unit.kind == "image")
+            });
+        if let Some(unit) = image_unit {
+            if tool_image_block_is_large(block.wire_shape()) {
+                strip_tool_images(&mut rebuilt.content[index], &unit.frozen_payload);
+            } else {
+                replace_with_sentinel(&mut rebuilt.content[index], &unit.frozen_payload);
+            }
+            touched = true;
+            continue;
+        }
         let should_strip = (request_accepts_empty_content(req)
             && stale_reduce
             && is_reduce_block(&message.ck.content[index]))
-            || ((image_seed
-                && request_accepts_empty_content(req)
-                && image_block_is_large(block.wire_shape()))
-                || (request_accepts_empty_content(req)
-                    && frozen_units
-                        .red_by_block_id(block.id())
-                        .is_some_and(|unit| unit.kind == "image")))
             || (request_accepts_empty_content(req)
                 && is_structural_noise(&message.ck.content[index]));
         if should_strip {
@@ -22277,7 +22549,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn untagged_answered_image_strips_on_bust_and_replays() {
+    fn untagged_answered_image_inherits_recent_reply_tag_and_stays_on_bust_and_defer() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let image = CkIngressMessage {
@@ -22330,12 +22602,20 @@ pub(crate) mod tests {
         store
             .seed_tags_for_test(
                 "untagged-image",
-                &[mc_store::TagMintInput {
-                    block_id: "dropper#0".into(),
-                    kind: "message".into(),
-                    token_count: 1,
-                    source_bytes: b"spent".to_vec(),
-                }],
+                &[
+                    mc_store::TagMintInput {
+                        block_id: "dropper#0".into(),
+                        kind: "message".into(),
+                        token_count: 1,
+                        source_bytes: b"spent".to_vec(),
+                    },
+                    mc_store::TagMintInput {
+                        block_id: "image-answer#0".into(),
+                        kind: "message".into(),
+                        token_count: 1,
+                        source_bytes: b"processed".to_vec(),
+                    },
+                ],
                 0,
             )
             .unwrap();
@@ -22347,19 +22627,28 @@ pub(crate) mod tests {
         request.render_config = "cfg1".into();
         let bust = run(&store, &request, &drops);
         assert_eq!(bust.action, "HARD");
-        assert_eq!(tail_bytes(&bust, "image-user"), "");
+        assert!(bust
+            .messages()
+            .iter()
+            .any(|message| message.content.iter().any(image_block_is_large)));
         let frozen = store.load("untagged-image").unwrap();
-        assert!(frozen
+        assert!(!frozen
             .core
             .frozen_units
             .iter()
             .any(|unit| unit.key == "strip:processed_image:image-user"));
 
         let stabilization = run(&store, &request, &spine());
-        assert_eq!(tail_bytes(&stabilization, "image-user"), "");
+        assert!(stabilization
+            .messages()
+            .iter()
+            .any(|message| message.content.iter().any(image_block_is_large)));
         let replay = run(&store, &request, &spine());
         assert_eq!(replay.action, "SOFT+");
-        assert_eq!(tail_bytes(&replay, "image-user"), "");
+        assert!(replay
+            .messages()
+            .iter()
+            .any(|message| message.content.iter().any(image_block_is_large)));
     }
 
     /// Models copy the tag notation they see in history onto their own replies.
@@ -22617,6 +22906,8 @@ pub(crate) mod tests {
             render_config: cfg.to_string(),
             system_prompt_hash: String::new(),
             adopted_system_prompt_hash: None,
+            served_raw_block_ids: Vec::new(),
+            raw_replay_rebuild: None,
             upgrade_state: String::new(),
             is_subagent: false,
             protected_tags: 20,
@@ -32964,6 +33255,10 @@ pub(crate) mod tests {
     include!("transform/temporal_admission_tests.rs");
     include!("tests/signed_prefix_hold.rs");
     include!("tests/signed_prefix_hold_review.rs");
+    include!("tests/image_stripping_review_witness.rs");
+    include!("tests/processed_images.rs");
+    include!("tests/image_anthropic_differential.rs");
+    include!("tests/independent_image_review.rs");
     include!("tests/signed_prefix_hold_review_r2.rs");
     include!("tests/signed_prefix_hold_review_r3.rs");
 
@@ -38603,6 +38898,210 @@ pub(crate) mod tests {
             .any(|row| row.block_id == "target#1"));
         assert!(s
             .load("opencode-late-tag-bust")
+            .unwrap()
+            .meta
+            .pending_tag_block_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn raw_replay_rebuild_requires_declared_identity_and_returns_to_defer() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = active_opencode_req(
+            "raw-rebuild-admission",
+            "cfg0",
+            vec![
+                item("u1", 1, "inspect"),
+                unstamped_opencode_tool_pair("raw", 2, "call"),
+                item("u2", 3, "continue"),
+            ],
+        );
+        run(&s, &request, &spine());
+        request.raw_replay_rebuild = Some(RawReplayRebuild {
+            identity: "a".repeat(64),
+            reason: "candidate_loss".into(),
+            message_ids: vec!["raw".into()],
+        });
+        assert!(!run(&s, &request, &spine()).prefix_bust_permitted);
+        request
+            .render_config
+            .push_str(&format!("|raw_replay:{}", "a".repeat(64)));
+        let rebuilt = run(&s, &request, &spine());
+        assert!(rebuilt.prefix_bust_permitted);
+        assert_eq!(
+            rebuilt.materialize_reason.as_deref(),
+            Some("raw_replay_identity_rebuild")
+        );
+        request.raw_replay_rebuild = None;
+        let stable = run(&s, &request, &spine());
+        assert!(!stable.prefix_bust_permitted);
+        assert_eq!(
+            opencode_native_bytes(&rebuilt, "raw-rebuild-admission"),
+            opencode_native_bytes(&stable, "raw-rebuild-admission")
+        );
+    }
+
+    #[test]
+    fn raw_replay_rebuild_retires_only_decisions_for_changed_tail_identities() {
+        let original = active_opencode_req(
+            "raw-rebuild-source",
+            "cfg0",
+            vec![
+                two_block_item("raw", 1, "stable sibling", "old"),
+                item("other", 2, "unchanged"),
+            ],
+        );
+        let before = project_messages(&original.messages).unwrap();
+        let meta = ModuleMeta {
+            block_identity_by_mid: before.identity_by_mid.clone(),
+            ..ModuleMeta::default()
+        };
+        let core = CoreState {
+            frozen_units: vec![
+                red_unit("raw#0", "message", "stable reduction"),
+                red_unit("raw#1", "message", "stale"),
+                strip_unit("reasoning_age", "other", ""),
+            ],
+            ..CoreState::default()
+        };
+        let mut request = active_opencode_req(
+            "raw-rebuild-source",
+            "cfg0",
+            vec![
+                two_block_item("raw", 1, "stable sibling", "new"),
+                item("other", 2, "unchanged"),
+            ],
+        );
+        let projected = project_messages(&request.messages).unwrap();
+        assert!(enforce_block_identity(&meta, &request, &projected, &core, None, None).is_err());
+        assert!(raw_replay_rebuild_core(&request, &meta, &core, &projected).is_none());
+        request
+            .render_config
+            .push_str(&format!("|raw_replay:{}", "b".repeat(64)));
+        request.raw_replay_rebuild = Some(RawReplayRebuild {
+            identity: "b".repeat(64),
+            reason: "source_changed".into(),
+            message_ids: vec!["raw".into()],
+        });
+        let rebuilt = raw_replay_rebuild_core(&request, &meta, &core, &projected).unwrap();
+        assert!(!rebuilt
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:raw#1"));
+        assert!(rebuilt
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:raw#0"));
+        assert!(rebuilt
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "strip:reasoning_age:other"));
+        let adoptions =
+            enforce_block_identity(&meta, &request, &projected, &rebuilt, None, None).unwrap();
+        assert_eq!(adoptions.len(), 1);
+        assert_eq!(adoptions[0].mid, "raw");
+        assert_eq!(core.frozen_units.len(), 3);
+    }
+
+    #[test]
+    fn external_raw_replay_pending_rewrite_holds_existing_tags_before_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let session = "external-raw-pending";
+        s.replace_compartments(session, &[comp(1, 1, 2, "t2#0", "summary")])
+            .unwrap();
+        let present = active_opencode_req(
+            session,
+            "cfg0",
+            vec![item("t2", 2, "covered"), item("t3", 3, "tail")],
+        );
+        run(&s, &present, &spine());
+        let mut absent = active_opencode_req(session, "cfg0", vec![item("t3", 3, "tail")]);
+        absent.served_raw_block_ids = vec!["t3#0".into()];
+        for _ in 0..2 {
+            let response = run(&s, &absent, &spine());
+            assert_eq!(response.action, "PASSTHROUGH");
+            assert_eq!(tail_bytes(&response, "t3"), "tail");
+            assert!(s
+                .load(session)
+                .unwrap()
+                .meta
+                .pending_tag_block_ids
+                .contains("t3#0"));
+        }
+    }
+
+    #[test]
+    fn external_raw_replay_holds_existing_and_new_rows_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let session = "external-raw-replay";
+        let mut request = active_opencode_req(session, "cfg0", vec![item("u1", 1, "inspect")]);
+        run(&s, &request, &spine());
+        request
+            .messages
+            .push(unstamped_opencode_tool_pair("reduce", 2, "reduce-call"));
+        request.messages.push(item("u2", 3, "continue"));
+        let minted = run(&s, &request, &spine());
+        assert!(!minted.prefix_bust_permitted);
+        assert!(s
+            .load_tags_for_session(session)
+            .unwrap()
+            .iter()
+            .any(|r| r.block_id == "reduce#1"));
+
+        // The host reports sending this block raw after its tag row was created;
+        // it never sent the transformed output. That older tag must stay hidden too.
+        request.served_raw_block_ids = vec!["reduce#1".into(), "ordinary#1".into()];
+        request
+            .messages
+            .push(unstamped_opencode_tool_pair("ordinary", 4, "ordinary-call"));
+        request.messages.push(item("u3", 5, "next"));
+        for _ in 0..3 {
+            let response = run(&s, &request, &spine());
+            assert!(!response.prefix_bust_permitted);
+            for mid in ["reduce", "ordinary"] {
+                let message = response
+                    .messages()
+                    .iter()
+                    .find(|m| m.meta.harness_id.as_deref() == Some(mid))
+                    .unwrap();
+                assert!(!first_block_text(&message.content[1])
+                    .unwrap()
+                    .starts_with('§'));
+                assert!(s
+                    .load(session)
+                    .unwrap()
+                    .meta
+                    .pending_tag_block_ids
+                    .contains(&format!("{mid}#1")));
+            }
+        }
+        drop(s);
+        let s = store(dir.path());
+        request.served_raw_block_ids.clear();
+        let response = run(&s, &request, &spine());
+        assert!(!response.prefix_bust_permitted);
+        assert!(s
+            .load(session)
+            .unwrap()
+            .meta
+            .pending_tag_block_ids
+            .contains("reduce#1"));
+        request.render_config = "cfg1".into();
+        let rebuilt = run(&s, &request, &spine());
+        assert!(rebuilt.prefix_bust_permitted);
+        let result = rebuilt
+            .messages()
+            .iter()
+            .find(|m| m.meta.harness_id.as_deref() == Some("reduce"))
+            .unwrap();
+        assert!(first_block_text(&result.content[1])
+            .unwrap()
+            .starts_with('§'));
+        assert!(s
+            .load(session)
             .unwrap()
             .meta
             .pending_tag_block_ids

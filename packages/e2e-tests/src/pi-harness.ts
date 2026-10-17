@@ -29,6 +29,10 @@ import {
 } from "./pi-runner/rpc-client";
 
 export interface PiTestHarnessOptions {
+  thinkingScope?: (body: Record<string, unknown>) => string | undefined;
+  prefixBinding?: boolean;
+  mockModelID?: string;
+  reasoning?: boolean;
   host?: PiRunnerHost;
   magicContextConfig?: Record<string, unknown>;
   piSettingsExtra?: Record<string, unknown>;
@@ -225,7 +229,7 @@ export class PiTestHarness implements PiHostHarness {
 
   static async create(options: PiTestHarnessOptions = {}): Promise<PiTestHarness> {
     const mock = new MockProvider();
-    await mock.start();
+    await mock.start({ thinkingScope: options.thinkingScope, prefixBinding: options.prefixBinding });
     mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);
     const host = options.host ?? "pi";
     const env = createPiIsolatedEnv(options.sharedDataDir, host);
@@ -248,6 +252,8 @@ export class PiTestHarness implements PiHostHarness {
       magicContextConfig: options.magicContextConfig,
       piSettingsExtra: options.piSettingsExtra,
       modelContextLimit: options.modelContextLimit,
+      mockModelID: options.mockModelID,
+      reasoning: options.reasoning,
       extensionsBeforeMagicContext: options.extensionsBeforeMagicContext,
       extensionsAfterMagicContext: options.extensionsAfterMagicContext,
       historianModel: options.historianModel,
@@ -429,6 +435,7 @@ export class PiTestHarness implements PiHostHarness {
 
     const submitPrompt = async (label: string): Promise<PromptSubmission> => {
       if (this.host === "omp") await this.waitForOmpIdle(deadline, label);
+      this.mock.newUserTurn();
       const refused = new Promise<OmpPromptRefusal>((resolve) => { notifyRefusal = resolve; });
       const promptResponse = await this.rpc.sendCommand(
         "prompt",
