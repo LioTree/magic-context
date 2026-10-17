@@ -2585,9 +2585,6 @@ export function createRustModeTransform(
             capturedAt: Date.now(),
             rowVersion: responseRowVersion,
             captureSequence: state.lkgCaptureSequence,
-            servedCaptureId: deps.compactionOff
-                ? undefined
-                : recordServedCapture(deps.db, sessionId, true),
             requestIdentity: claimLkgRequestIdentity(sessionId),
             systemPromptTokens,
             agentName: deps.getNotificationParams?.(sessionId)?.agent,
@@ -2648,6 +2645,9 @@ export function createRustModeTransform(
                 fullCoverage: true,
                 inputMoveDigests: inputs.map((input) => moveMessageDigestFromFields(input.fields)),
             };
+            slot.servedCaptureId = plan.servedCaptureId = deps.compactionOff
+                ? undefined
+                : recordServedCapture(deps.db, plan.sessionId, true, slot);
             plan.prepared = { slot, inputs, reusedPrefix };
         }
         const { slot, inputs, reusedPrefix } = plan.prepared;

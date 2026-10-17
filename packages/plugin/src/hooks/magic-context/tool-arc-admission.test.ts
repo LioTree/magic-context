@@ -37,6 +37,28 @@ function guarded(
 }
 
 describe("OpenCode compound tool admission", () => {
+    it("builds tool coordinates only when prefix admission is held", () => {
+        const messages = [message("assistant", "assistant", [thinking, call("a")])];
+        const targets = new Map<number, TagTarget>();
+        let builds = 0;
+        for (const prefixBound of [false, true]) {
+            const admission = createEditAdmission({
+                messages,
+                stableId: (m) => m.info.id,
+                partsOf: (m) => m.parts,
+                isRealUser: isAdmissionUser,
+                prefixBound,
+                isRetainedThinking: (_m, part) => part === thinking,
+                anchorOf: thinkingAnchor,
+            });
+            const result = protectToolBatchMutations(targets, admission, () => {
+                builds++;
+                return openCodeToolBatchCoordinates(messages);
+            });
+            expect(builds).toBe(prefixBound ? 1 : 0);
+            if (!prefixBound) expect(result).toBe(targets);
+        }
+    });
     it("holds a straddling parallel batch at its earliest call, not its result", () => {
         const owner = message("assistant", "assistant", [call("a"), thinking, call("b")]);
         const tail = message("results", "user", [result("a"), result("b")]);

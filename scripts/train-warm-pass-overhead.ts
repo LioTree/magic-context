@@ -1,13 +1,17 @@
 #!/usr/bin/env bun
 /**
- * Compare complete warm host requests, never user stores. Export revisions with
+ * Compare repeated OpenCode/Pi transform calls after initialization, never user
+ * data. Temporary SQLite databases contain synthetic history, tags and memories.
+ * Export revisions with
  * `git archive <ref> | tar -x -C <dir>` first, then pass --master and --train.
  * The current checkout is the candidate. All stores and instrumented source
  * copies live below $TMPDIR/magic-context/train-overhead/. Run on Linux only.
  *
  * bun scripts/train-warm-pass-overhead.ts --master <export> --train <export>
- *   --output .cortexkit/internal-docs/reports/train-overhead-results.json
- * Defaults: three blocks of 120 defers per source, alternating master/train/candidate
+ *   --output .cortexkit/internal-docs/investigations/train-overhead-results.json
+ * --output writes the measurements and comparisons as JSON to the supplied path.
+ * Defaults: three blocks of 120 ordinary DEFER calls (no priced prefix rewrite)
+ * per source, alternating master/train/candidate
  * and its reverse per request, then 400 randomized requests against the unmodified
  * train. Preparation and deferred drains are not
  * included in handler wall time. No model, embedding or host network calls run.
@@ -45,6 +49,8 @@ const targets: Record<string, string[]> = {
     "hooks/magic-context/lkg-served-marker.ts": ["recordServedCapture"],
     "hooks/magic-context/lkg-recovery-fence.ts": ["known", "commitLkgWithRecoveryFence"],
     "features/magic-context/store-generation-rebase.ts": ["rebaseSessionCoordinatesAsync"],
+    "hooks/magic-context/lkg-slot.ts": ["getSlot", "getInMemorySlot", "exactReusablePrefix", "signatureForFields"],
+    "hooks/magic-context/lkg-persist.ts": ["slotFingerprint", "persistLkgSlot"],
 };
 function instrument(path: string, symbols: string[]): void {
     if (!existsSync(path)) return;
@@ -78,6 +84,8 @@ function prepare(label: string, source: string): string {
     }
     symlinkSync(join(checkout, "node_modules"), join(dest, "node_modules"));
     for (const [path, symbols] of Object.entries(targets)) instrument(join(dest, "packages/plugin/src", path), symbols);
+    instrument(join(dest, "packages/pi-plugin/src/pi-lkg.ts"), ["snapshotInputs", "sameAcceptedContent", "equalSlotValues", "retainPiLkgMemo"]);
+    instrument(join(dest, "packages/plugin/src/hooks/magic-context/tool-arc-admission.ts"), ["openCodeToolBatchCoordinates", "protectToolBatchMutations"]);
     const logger = join(dest, "packages/plugin/src/hooks/magic-context/transform-stage-logger.ts");
     const text = readFileSync(logger, "utf8");
     assert(text.includes("const elapsed ="));
@@ -159,19 +167,27 @@ function summarize(rows: Pass[]) {
     return { n: rows.length, median: quantile(rows.map((r) => r.ms), 0.5), p95: quantile(rows.map((r) => r.ms), 0.95), stages: summarizeKeys("stages"), spans: summarizeKeys("spans") };
 }
 const report: Record<string, unknown> = { bun: Bun.version, scratch, blocks, passes, randomPasses, hosts: {} };
+function pressure() {
+    return { at: new Date().toISOString(), cpu: readFileSync("/proc/pressure/cpu", "utf8").trim(), loadavg: readFileSync("/proc/loadavg", "utf8").trim() };
+}
 for (const host of ["opencode1", "opencode2", "pi"]) {
     const children = await Promise.all(Object.entries(sources).map(async ([label, source]) => [label, await start(source, host, false)] as const));
     const byLabel = Object.fromEntries(children);
     const results: Record<string, Pass[][]> = { master: [], train: [], candidate: [] };
+    const pressureObservations = [];
     try {
         for (let block = 0; block < blocks; block++) {
             const rows: Record<string, Pass[]> = { master: [], train: [], candidate: [] };
+            const before = pressure();
             console.error(`${host} paired block ${block + 1}`);
             for (let pass = 0; pass < passes; pass++) {
                 const order = (block + pass) % 2 ? ["candidate", "train", "master"] : ["master", "train", "candidate"];
                 for (const label of order) rows[label]?.push(...await byLabel[label]!.run(1));
             }
             for (const label of Object.keys(rows)) results[label]?.push(rows[label]!);
+            const observation = { block: block + 1, before, after: pressure() };
+            pressureObservations.push(observation);
+            console.log(`PRESSURE ${host} ${JSON.stringify(observation)}`);
         }
     } finally { for (const [, child] of children) await child.close(); }
     const randomized: Record<string, Pass[]> = {};
@@ -180,7 +196,7 @@ for (const host of ["opencode1", "opencode2", "pi"]) {
         try { randomized[label] = await child.run(randomPasses); } finally { await child.close(); }
     }
     for (let i = 0; i < randomPasses; i++) assert.equal(randomized.train?.[i]?.wire, randomized.candidate?.[i]?.wire, `${host} randomized request ${i + 1} served bytes changed`);
-    const hostReport = { corpus: Object.fromEntries(children.map(([label, child]) => [label, child.corpus])), timing: Object.fromEntries(Object.entries(results).map(([label, rows]) => [label, { pooled: summarize(rows.flat()), blocks: rows.map(summarize) }])), differential: { requests: randomPasses, identical: true }, raw: results };
+    const hostReport = { pressureObservations, corpus: Object.fromEntries(children.map(([label, child]) => [label, child.corpus])), timing: Object.fromEntries(Object.entries(results).map(([label, rows]) => [label, { pooled: summarize(rows.flat()), blocks: rows.map(summarize) }])), differential: { requests: randomPasses, identical: true }, raw: results };
     (report.hosts as Record<string, unknown>)[host] = hostReport;
     mkdirSync(dirname(output), { recursive: true });
     writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`);

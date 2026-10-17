@@ -2218,7 +2218,7 @@ export async function runPostTransformPhase(
                 args.thinkingBindingRecoveryEnabledForModel === true,
             ),
             editAdmission,
-            openCodeToolBatchCoordinates(args.messages),
+            () => openCodeToolBatchCoordinates(args.messages),
         );
     let newTargets = protectTargets();
     let maxReasoningTag = 0;

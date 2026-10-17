@@ -3439,7 +3439,12 @@ export function createTransform(deps: TransformDeps) {
                 onPrepared: deps.compactionOff
                     ? undefined
                     : (slot, fullCoverage) => {
-                          slot.servedCaptureId = recordServedCapture(db, sessionId, fullCoverage);
+                          slot.servedCaptureId = recordServedCapture(
+                              db,
+                              sessionId,
+                              fullCoverage,
+                              slot,
+                          );
                       },
             });
             if (captured) {
