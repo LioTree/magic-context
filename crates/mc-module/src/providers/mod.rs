@@ -17,6 +17,7 @@ mod claude_code_tests;
 mod codec;
 mod codec_claude_code;
 mod codec_opencode;
+mod codec_pi;
 mod compaction;
 pub(crate) mod fold_prefix;
 mod fold_working;
@@ -127,7 +128,7 @@ fn invalid_field(field: &str, message: impl ToString) -> HandlerOutcome {
 fn answer_observation(params: &Value) -> bool {
     matches!(
         params.get("serializer_profile").and_then(Value::as_str),
-        Some("opencode-aisdk" | "claude-code-anthropic")
+        Some("opencode-aisdk" | "claude-code-anthropic" | "pi")
     ) && params.get("observation").and_then(Value::as_str) == Some("answer")
 }
 
@@ -138,18 +139,19 @@ fn attested_claude_code(binding: &SessionBinding) -> bool {
 }
 
 fn host_binding(binding: &SessionBinding) -> bool {
-    matches!(binding.harness.as_str(), "opencode" | "opencode2") || attested_claude_code(binding)
+    matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi")
+        || attested_claude_code(binding)
 }
 
 fn admit_host_lane(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
-    if !matches!(binding.harness.as_str(), "opencode" | "opencode2") {
+    if !matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi") {
         return Ok(());
     }
     if !matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "thalamus-harness")
     {
         return Err(error(
             "host_lane_requires_harness_module",
-            "OpenCode provider lane requires reserved:thalamus-harness",
+            "OpenCode/Pi provider lane requires reserved:thalamus-harness",
         ));
     }
     if !binding.scope.as_ref().is_some_and(|scope| {
@@ -158,7 +160,7 @@ fn admit_host_lane(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
     }) {
         return Err(error(
             "host_lane_scope_missing",
-            "OpenCode provider lane requires an authorized reserved:prefrontal-core scope",
+            "OpenCode/Pi provider lane requires an authorized reserved:prefrontal-core scope",
         ));
     }
     Ok(())
@@ -332,7 +334,7 @@ impl McHandler {
         if let Err(error) = admit_claude_code(&binding, method, params) {
             return error;
         }
-        // Harness strings select a codec, not authorization. OpenCode checks the
+        // Harness strings select a codec, not authorization. OpenCode and Pi check the
         // bound principal and scope; Claude Code still requires reserved:thalamus.
         let host = host_binding(&binding);
         if !host && binding.harness != session_resolver::RUNNER_BIND_HARNESS {

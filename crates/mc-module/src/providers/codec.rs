@@ -10,6 +10,7 @@ use serde::Deserialize;
 pub(super) enum Codec {
     OwnedBroca,
     OpencodeAiSdk,
+    Pi,
     ClaudeCodeAnthropic,
 }
 
@@ -21,6 +22,7 @@ impl Codec {
             None => Ok(Self::OwnedBroca),
             Some(Value::String(profile)) if profile == "owned-broca" => Ok(Self::OwnedBroca),
             Some(Value::String(profile)) if profile == "opencode-aisdk" => Ok(Self::OpencodeAiSdk),
+            Some(Value::String(profile)) if profile == "pi" => Ok(Self::Pi),
             Some(Value::String(profile)) if profile == "claude-code-anthropic" => {
                 Ok(Self::ClaudeCodeAnthropic)
             }
@@ -36,6 +38,7 @@ impl Codec {
         match self {
             Self::OwnedBroca => SerializerProfile::OwnedBroca,
             Self::OpencodeAiSdk => SerializerProfile::OpencodeAiSdk,
+            Self::Pi => SerializerProfile::Pi,
             Self::ClaudeCodeAnthropic => SerializerProfile::ClaudeCodeAnthropic,
         }
     }
@@ -46,6 +49,13 @@ impl Codec {
     ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
         match self {
             Self::OwnedBroca => decode_message(message),
+            Self::Pi => Ok(
+                super::codec_pi::decode_messages(std::slice::from_ref(message))?
+                    .messages
+                    .into_iter()
+                    .next()
+                    .expect("one Pi message"),
+            ),
             Self::ClaudeCodeAnthropic => super::codec_claude_code::decode_message(message),
             Self::OpencodeAiSdk => {
                 let decoded =
@@ -67,6 +77,10 @@ impl Codec {
         messages: &[compact::status::StatusMessage],
     ) -> Result<(), HandlerOutcome> {
         let (ingress, native) = match self {
+            Self::Pi => (
+                super::codec_pi::decode_messages(messages)?.messages,
+                Some(messages.iter().map(|m| m.message.clone()).collect()),
+            ),
             Self::ClaudeCodeAnthropic => (
                 messages
                     .iter()
@@ -109,6 +123,7 @@ impl Codec {
     ) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
         match self {
             Self::OwnedBroca => encode_view(view),
+            Self::Pi => super::codec_pi::encode_view(view, request),
             Self::ClaudeCodeAnthropic => {
                 super::codec_claude_code::encode_view(view, request, None).map(|v| v.0)
             }
@@ -512,13 +527,15 @@ mod dispatch_tests {
         let codec = Codec::from_params(&json!({"serializer_profile":"opencode-aisdk"})).unwrap();
         assert_eq!(codec, Codec::OpencodeAiSdk);
         assert_eq!(codec.serializer_profile(), SerializerProfile::OpencodeAiSdk);
+        let codec = Codec::from_params(&json!({"serializer_profile":"pi"})).unwrap();
+        assert_eq!(codec, Codec::Pi);
+        assert_eq!(codec.serializer_profile(), SerializerProfile::Pi);
     }
 
     #[test]
     fn unknown_serializer_profile_refuses_invalid_params_with_field() {
         for profile in [
             json!("unknown"),
-            json!("pi"),
             json!("owned-llmrunner"),
             json!(null),
             json!(3),

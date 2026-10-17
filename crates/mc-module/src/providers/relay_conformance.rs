@@ -72,6 +72,13 @@ async fn oracle() {
     for line in std::io::stdin().lock().lines() {
         let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
         let answer = match request["control"].as_str() {
+            Some("bind") => {
+                let mut binding = mc.bindings.lock().unwrap().get(&7).unwrap().clone();
+                binding.harness = request["harness"].as_str().unwrap().into();
+                binding.session = request["session"].as_str().unwrap().into();
+                mc.bind_route(7, binding);
+                String::new()
+            }
             Some("reset") => {
                 drop(mc);
                 dir = tempfile::tempdir().unwrap();
@@ -108,7 +115,7 @@ async fn oracle() {
                     .get()
                     .unwrap()
                     .replace_compartments(
-                        "relay-v1",
+                        request["session"].as_str().unwrap_or("relay-v1"),
                         &[mc_store::StoredCompartment {
                             sequence: 0,
                             start_message: 1,
@@ -126,6 +133,8 @@ async fn oracle() {
             }
             _ => match mc.dispatch_value(7, request).await {
                 HandlerOutcome::Response(bytes) => String::from_utf8(bytes).unwrap(),
+                HandlerOutcome::Error { code, message } => json!({"oracle_error":{"source":"module","code":code,"message":message}}).to_string(),
+                HandlerOutcome::ErrorWithDetail { code, message, detail } => json!({"oracle_error":{"source":"module","code":code,"message":message,"detail":detail}}).to_string(),
                 other => panic!("relay oracle request failed: {other:?}"),
             },
         };
