@@ -7,6 +7,7 @@ import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { measureLkgReplay } from "./lkg-fit-measure";
 import {
     currentLkgRequestIdentity,
+    isSameOrPreviousLkgRequest,
     type LkgMarkerIdentity,
     type LkgRequestIdentity,
     lkgMarkerReading,
@@ -57,7 +58,12 @@ export function standaloneMarkerIdentity(
     agentName: string | undefined,
 ): LkgMarkerIdentity | undefined {
     const system = systems.get(sessionId);
-    if (!request || !system || system.request !== request || system.model !== request.modelKey)
+    if (
+        !request ||
+        !system ||
+        !isSameOrPreviousLkgRequest(request, system.request) ||
+        system.model !== request.modelKey
+    )
         return undefined;
     const slash = system.model.indexOf("/");
     if (slash <= 0) return undefined;
@@ -126,7 +132,7 @@ export function measureStandaloneMarker(args: {
     const slash = args.model.indexOf("/");
     const current =
         system?.request &&
-        system.request === currentLkgRequestIdentity(args.sessionId) &&
+        isSameOrPreviousLkgRequest(currentLkgRequestIdentity(args.sessionId), system.request) &&
         system.model === args.model &&
         system.hash === args.systemHash;
     const tools = getMarkerToolDefinitions(

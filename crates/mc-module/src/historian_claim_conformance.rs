@@ -570,3 +570,80 @@ fn historian_claim_vectors_concurrent_claimants_have_one_winner() {
         1
     );
 }
+
+/// The in-process plugin opens its route with no consumer identity, so the daemon
+/// stamps `Principal::Direct` and no scope on its bind (`McHandler::on_bind` copies
+/// both onto the binding). On every host harness that route may still list and
+/// claim queued runs for any session of its project. Once the same Direct route
+/// carries a scope it is treated as a harness module, and `admit_host_lane`
+/// refuses it because it is not reserved:thalamus-harness.
+#[test]
+fn historian_claim_plugin_direct_route_keeps_project_wide_lane() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CLOCK.with(|slot| slot.set(None));
+        }
+    }
+    let _reset = Reset;
+    // The fixture queues its runs at START; read the lane at that time so none
+    // of them has expired.
+    CLOCK.with(|slot| slot.set(Some(START)));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let body = |outcome: HandlerOutcome| match outcome {
+        HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+        other => panic!("unexpected historian outcome: {other:?}"),
+    };
+    for harness in ["opencode", "opencode2", "pi"] {
+        let f = Fixture::new(false);
+        f.rebind(|b| {
+            b.harness = harness.into();
+            b.principal = Some(subc_protocol::Principal::Direct);
+            b.scope = None;
+        });
+        let pending = body(
+            runtime.block_on(
+                f.handler
+                    .dispatch_value(7, json!({"method":"historian.pending","v":1})),
+            ),
+        );
+        let mut runs: Vec<&str> = pending["runs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{harness}: {pending}"))
+            .iter()
+            .map(|run| run["run_id"].as_str().unwrap())
+            .collect();
+        runs.sort_unstable();
+        // Both sessions of the bound project, never the foreign project's run.
+        assert_eq!(runs, ["run-a", "run-sibling"], "{harness}");
+        let sibling = body(
+            runtime.block_on(
+                f.handler
+                    .dispatch_value(7, request("historian.claim", "run-sibling", "")),
+            ),
+        );
+        assert_eq!(sibling["ok"], true, "{harness}: {sibling}");
+        assert_eq!(sibling["session_id"], "session-b", "{harness}: {sibling}");
+        let foreign = body(
+            runtime.block_on(
+                f.handler
+                    .dispatch_value(7, request("historian.claim", "run-foreign", "")),
+            ),
+        );
+        assert_eq!(foreign["ok"], false, "{harness}: {foreign}");
+
+        f.rebind(|b| b.scope = Some(scope()));
+        match runtime.block_on(
+            f.handler
+                .dispatch_value(7, json!({"method":"historian.pending","v":1})),
+        ) {
+            HandlerOutcome::Error { code, .. } => {
+                assert_eq!(code, "host_lane_requires_harness_module", "{harness}")
+            }
+            other => panic!("{harness}: scoped Direct route was admitted: {other:?}"),
+        }
+    }
+}

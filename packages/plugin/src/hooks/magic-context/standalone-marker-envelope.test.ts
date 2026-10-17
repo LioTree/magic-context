@@ -13,10 +13,15 @@ import {
 } from "../../features/magic-context/tool-definition-tokens";
 import { Database } from "../../shared/sqlite";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
+import {
+    clearCtxReduceAvailability,
+    resolveCtxReduceAvailabilityFromMessages,
+} from "./ctx-reduce-availability";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
 import { measureLkgReplay } from "./lkg-fit-measure";
 import {
     __setLkgMarkerReadingForTests,
+    beginV2LkgRequest,
     clearLkgMeasuredRequest,
     currentLkgRequestIdentity,
     noteCapturedLkgRequest,
@@ -31,6 +36,7 @@ import {
     recordMarkerSystem,
     standaloneMarkerIdentity,
 } from "./standalone-marker-envelope";
+import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import type { MessageLike } from "./transform-operations";
 import {
     type CompactionMarkerStrategy,
@@ -181,6 +187,160 @@ function complete(
         error,
     });
 }
+
+test("standalone marker reads system strings from the current or previous request only", () => {
+    const args = {
+        sessionId: "marker-envelope-session",
+        model: "unknown/model",
+        systemHash: "hash",
+        messages: [{ info: { id: "m", role: "user" }, parts: [{ type: "text", text: "hello" }] }],
+        limit: 10000,
+    };
+    recordToolDefinition("unknown", "model", undefined, "read", "Read file", { type: "object" });
+    // The first request records its final system strings, is served and completes,
+    // so its usage is a reading for the same envelope.
+    noteLkgProviderResponse({
+        sessionId: args.sessionId,
+        modelKey: args.model,
+        responseId: "first",
+        inputTokens: 0,
+    });
+    recordMarkerSystem(args.sessionId, args.model, args.systemHash, ["Final system"]);
+    serveCurrent(args.sessionId, args.messages);
+    complete(args.sessionId, args.model, "first", 800);
+    noteLkgProviderResponse({
+        sessionId: args.sessionId,
+        modelKey: args.model,
+        responseId: "second",
+        inputTokens: 0,
+    });
+    // OpenCode 1 records a request's final system strings only after its messages
+    // transform, so a transform can only measure with the system strings the
+    // request directly before it recorded.
+    expect(measureStandaloneMarker(args).fit).toBe("under");
+    noteLkgProviderResponse({
+        sessionId: args.sessionId,
+        modelKey: args.model,
+        responseId: "third",
+        inputTokens: 0,
+    });
+    expect(measureStandaloneMarker(args).fit).toBe("unproven");
+});
+
+function markerHandlerFixture(sessionId: string) {
+    const db = new Database(":memory:");
+    initializeDatabase(db);
+    runMigrations(db);
+    getOrCreateSessionMeta(db, sessionId);
+    resolveCtxReduceAvailabilityFromMessages(sessionId, [
+        { info: { id: "u", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+    ] as never);
+    recordToolDefinition("unknown", "model", undefined, "read", "Read file", { type: "object" });
+    const system = createSystemPromptHashHandler({
+        db,
+        dreamerEnabled: false,
+        resolveModel: () => ({ providerID: "unknown", modelID: "model" }),
+        systemPromptRefreshSessions: new Set<string>(),
+        historyRefreshSessions: new Set<string>(),
+        pendingMaterializationSessions: new Set<string>(),
+        lastHeuristicsTurnId: new Map<string, string>(),
+    });
+    const measure = () =>
+        measureStandaloneMarker({
+            sessionId,
+            model: "unknown/model",
+            systemHash: getOrCreateSessionMeta(db, sessionId).systemPromptHash,
+            messages: [
+                { info: { id: "m", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+            ],
+            limit: 100_000,
+        }).fit;
+    return {
+        runSystemHook: () =>
+            system.handler(
+                { sessionID: sessionId, model: { providerID: "unknown", modelID: "model" } },
+                { system: ["Host instructions for the marker fixture."] },
+            ),
+        measure,
+        close: () => {
+            clearCtxReduceAvailability(sessionId);
+            clearLkgMeasuredRequest(sessionId);
+            db.close();
+        },
+    };
+}
+
+/** Install a completed-request reading whose envelope identity is the one the
+ * current request resolves. Resolving it is the request-identity check under test:
+ * without admissible system strings there is no identity, so no reading. */
+function installCurrentReading(sessionId: string) {
+    const marker = standaloneMarkerIdentity(
+        sessionId,
+        currentLkgRequestIdentity(sessionId),
+        undefined,
+    );
+    expect(marker).toBeDefined();
+    if (!marker) return;
+    __setLkgMarkerReadingForTests(sessionId, {
+        responseId: "completed",
+        inputTokens: 800,
+        jsonPrefix: JSON.stringify([
+            { info: { id: "m", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+        ]),
+        marker,
+    });
+}
+
+test("OpenCode 1 order admits the final system its system hook recorded on the previous request", async () => {
+    const sessionId = "marker-envelope-session";
+    const fixture = markerHandlerFixture(sessionId);
+    try {
+        // Request 1: the assistant row exists before either hook runs, and the
+        // system hook runs after the messages transform.
+        noteLkgProviderResponse({
+            sessionId,
+            modelKey: "unknown/model",
+            responseId: "assistant-1",
+            inputTokens: 0,
+        });
+        await fixture.runSystemHook();
+        // Request 2: its messages transform measures before its system hook runs.
+        noteLkgProviderResponse({
+            sessionId,
+            modelKey: "unknown/model",
+            responseId: "assistant-2",
+            inputTokens: 0,
+        });
+        installCurrentReading(sessionId);
+        expect(fixture.measure()).toBe("under");
+    } finally {
+        fixture.close();
+    }
+});
+
+test("OpenCode 2 order admits the system stage's final system after the transform starts its request", async () => {
+    const sessionId = "marker-envelope-session";
+    const fixture = markerHandlerFixture(sessionId);
+    try {
+        // The context hook starts a request, runs the system stage, then starts
+        // the transform's own request identity for a non-provider session.
+        beginV2LkgRequest(sessionId, "unknown/model", undefined, 0);
+        await fixture.runSystemHook();
+        beginV2LkgRequest(sessionId, "unknown/model");
+        installCurrentReading(sessionId);
+        expect(fixture.measure()).toBe("under");
+        // A further request whose system stage did not record anything must not
+        // reuse material from two requests back, even with a reading installed.
+        beginV2LkgRequest(sessionId, "unknown/model", undefined, 1);
+        beginV2LkgRequest(sessionId, "unknown/model");
+        expect(
+            standaloneMarkerIdentity(sessionId, currentLkgRequestIdentity(sessionId), undefined),
+        ).toBeUndefined();
+        expect(fixture.measure()).toBe("unproven");
+    } finally {
+        fixture.close();
+    }
+});
 
 test("standalone randomized marker timing preserves full defer bytes and attributes inherited summary differences", () => {
     const next = markerRandom(0x5e12beef);

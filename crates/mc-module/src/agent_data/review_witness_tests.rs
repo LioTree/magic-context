@@ -753,24 +753,8 @@ async fn review_feature_off_normal_dispatch_preserves_business_write_footprints(
         before_historian = row_counts(h, false);
     }
     let claim = json!({"method":"historian.claim","v":1,"run_id":"review-run","claimant_instance_id":"review-host"});
-    // The historian claim handler refuses a channel bound with
-    // `Principal::Direct` (as `observe` binds channel 1): only the in-process
-    // plugin, whose binding has no principal, or the daemon-attested
-    // `reserved:thalamus-harness` module with an authorized scope may claim.
-    // This test compares the SQL footprints of a direct handler call and the
-    // dispatcher, not who may claim, so both handlers claim with no principal
-    // and channel 1 gets its `Principal::Direct` binding back afterwards.
-    let set_principal = |h: &McHandler, principal: Option<Principal>| {
-        h.bindings.lock().unwrap().get_mut(&1).unwrap().principal = principal;
-    };
-    for h in [&old, &new] {
-        set_principal(h, None);
-    }
     let direct = reply(old.handle_historian_claim_value(1, &claim));
     let dispatched = reply(new.dispatch_value(1, claim).await);
-    for h in [&old, &new] {
-        set_principal(h, Some(Principal::Direct));
-    }
     assert_eq!(direct["ok"], true, "{direct}");
     assert_eq!(dispatched["ok"], true, "{dispatched}");
     assert!(direct["token"]

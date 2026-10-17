@@ -21,6 +21,29 @@ export type LkgRequestIdentity =
 
 const requests = new BoundedSessionMap<LkgRequestIdentity>(1000);
 const claimedRequests = new WeakSet<LkgRequestIdentity>();
+/** The identity each session's current request replaced. Only the newest link is
+ * kept: the replaced identity's own link is dropped, so older identities are not
+ * retained through a chain. */
+const predecessors = new WeakMap<LkgRequestIdentity, LkgRequestIdentity>();
+
+function setRequest(sessionId: string, request: LkgRequestIdentity): void {
+    const previous = requests.get(sessionId);
+    if (previous) {
+        predecessors.set(request, previous);
+        predecessors.delete(previous);
+    }
+    requests.set(sessionId, request);
+}
+
+/** True when `candidate` is `request` or the identity `request` directly replaced
+ * as its session's current request. */
+export function isSameOrPreviousLkgRequest(
+    request: LkgRequestIdentity | undefined,
+    candidate: LkgRequestIdentity | undefined,
+): boolean {
+    if (!request || !candidate) return false;
+    return candidate === request || candidate === predecessors.get(request);
+}
 /** Identity of a served request's system/tool envelope, compared before its usage
  * may bound a later request's envelope (see standalone-marker-envelope.ts). */
 export interface LkgMarkerIdentity {
@@ -92,7 +115,7 @@ export function beginV2LkgRequest(
     previousResponseId?: string,
     responseAfterSequence?: number,
 ): void {
-    requests.set(sessionId, {
+    setRequest(sessionId, {
         kind: "v2",
         previousResponseId,
         startedAt: Date.now(),
@@ -114,6 +137,22 @@ export function claimLkgRequestIdentity(sessionId: string): LkgRequestIdentity |
 
 export function currentLkgRequestIdentity(sessionId: string): LkgRequestIdentity | undefined {
     return requests.get(sessionId);
+}
+
+/** True when `request` is the session's current request identity or the one it
+ * directly replaced. The system-prompt hook records each request's final system
+ * strings under the identity current at that moment, and the messages transform
+ * reads them back. On OpenCode 1 the messages transform runs before the system
+ * hook, so it can only read what the previous request's hook recorded. On
+ * OpenCode 2 the context hook starts a second identity after its system stage and
+ * before the transform, so the recording carries the identity just replaced. */
+export function isCurrentOrPreviousLkgRequest(
+    sessionId: string,
+    request: LkgRequestIdentity | undefined,
+): boolean {
+    const current = requests.get(sessionId);
+    if (!request || !current) return false;
+    return request === current || request === predecessors.get(current);
 }
 
 export function noteCapturedLkgRequest(args: {
@@ -191,7 +230,7 @@ export function noteLkgProviderResponse(args: {
             previous.modelKey === args.modelKey
         )
             return;
-        requests.set(args.sessionId, {
+        setRequest(args.sessionId, {
             kind: "v1",
             responseId: args.responseId,
             modelKey: args.modelKey,
