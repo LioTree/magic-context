@@ -15,6 +15,7 @@ use subc_transport::{
 use tokio::net::TcpListener;
 
 struct Observer {
+    started: Instant,
     handler: Arc<McHandler>,
     gate: Arc<Notify>,
     release_on_catalog: bool,
@@ -26,16 +27,21 @@ struct Observer {
 #[async_trait]
 impl ModuleHandler for Observer {
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
+        eprintln!("CATALOG {:?} hello ack", self.started.elapsed());
         self.handler.on_hello_ack(ack).await;
     }
 
     async fn on_bind(&self, request: &RouteBindRequest) -> subc_client_rs::BindDecision {
+        eprintln!("CATALOG {:?} bind enter", self.started.elapsed());
         self.bind_before_open
             .store(self.handler.store.get().is_none(), Ordering::Release);
-        self.handler.on_bind(request).await
+        let result = self.handler.on_bind(request).await;
+        eprintln!("CATALOG {:?} bind exit", self.started.elapsed());
+        result
     }
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        eprintln!("CATALOG {:?} handler enter phase={}", self.started.elapsed(), self.handler.store_open.phase.load(Ordering::Acquire));
         let request: Value = serde_json::from_slice(&body).unwrap();
         if request.get("name").and_then(Value::as_str) == Some("tool.catalog") {
             self.catalog_before_open
@@ -52,7 +58,9 @@ impl ModuleHandler for Observer {
         {
             self.transforms.fetch_add(1, Ordering::Relaxed);
         }
-        self.handler.handle(ctx, body).await
+        let result = self.handler.handle(ctx, body).await;
+        eprintln!("CATALOG {:?} handler exit phase={}", self.started.elapsed(), self.handler.store_open.phase.load(Ordering::Acquire));
+        result
     }
 }
 
@@ -64,6 +72,7 @@ enum StoreCondition {
 }
 
 struct LiveRoute {
+    started: Instant,
     consumer: SubcConsumer,
     handler: Arc<McHandler>,
     identity: BindIdentity,
@@ -87,6 +96,8 @@ impl Drop for LiveRoute {
 
 impl LiveRoute {
     async fn start(condition: StoreCondition) -> Self {
+        let started = Instant::now();
+        eprintln!("CATALOG {:?} route start", started.elapsed());
         let dir = tempfile::tempdir().unwrap();
         // The authenticated transport rejects a group-writable parent. Tempfile
         // inherits the host umask, so tighten only this owned throwaway root.
@@ -174,6 +185,7 @@ impl LiveRoute {
         let catalog_before_open = Arc::new(AtomicBool::new(false));
         let transforms = Arc::new(AtomicU64::new(0));
         let observer = Observer {
+            started,
             handler: Arc::clone(&handler),
             gate: Arc::clone(&gate),
             release_on_catalog: !matches!(condition, StoreCondition::Delayed),
@@ -201,6 +213,7 @@ impl LiveRoute {
             .await
             .unwrap();
         Self {
+            started,
             consumer,
             handler,
             identity: BindIdentity::new(project, session_resolver::RUNNER_BIND_HARNESS, "s"),
@@ -215,7 +228,8 @@ impl LiveRoute {
     }
 
     async fn call(&self, request: Value) -> Result<Vec<u8>, subc_client_rs::CallError> {
-        self.consumer
+        eprintln!("CATALOG {:?} call enter {}", self.started.elapsed(), request.get("name").or(request.get("method")).unwrap());
+        let result = self.consumer
             .call(
                 crate::route_targets::catalog_provider_target_for_test(),
                 self.identity.clone(),
@@ -225,7 +239,9 @@ impl LiveRoute {
                     ..Default::default()
                 },
             )
-            .await
+            .await;
+        eprintln!("CATALOG {:?} call exit result={:?} bind={} catalog={} phase={}", self.started.elapsed(), result.as_ref().map(|b| b.len()), self.bind_before_open.load(Ordering::Acquire), self.catalog_before_open.load(Ordering::Acquire), self.handler.store_open.phase.load(Ordering::Acquire));
+        result
     }
 
     async fn catalog(&self) -> Vec<u8> {
@@ -263,7 +279,7 @@ impl LiveRoute {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn first_composition_catalog_on_a_real_route_awaits_the_startup_open_without_transform() {
+pub(crate) async fn first_composition_catalog_on_a_real_route_awaits_the_startup_open_without_transform() {
     let route = LiveRoute::start(StoreCondition::Fresh).await;
     route.catalog().await;
     route.assert_catalog_before_store_and_transform();
@@ -282,7 +298,7 @@ async fn first_composition_catalog_on_a_real_route_awaits_the_startup_open_witho
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catalog_store_faults_preserve_pin_bytes_and_refuse_provider_by_name() {
+pub(crate) async fn catalog_store_faults_preserve_pin_bytes_and_refuse_provider_by_name() {
     for condition in [StoreCondition::Ahead, StoreCondition::Damaged] {
         let route = LiveRoute::start(condition).await;
         route.catalog().await;
@@ -300,7 +316,7 @@ async fn catalog_store_faults_preserve_pin_bytes_and_refuse_provider_by_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unpersisted_catalog_blocks_provider_even_after_open_until_a_full_refetch() {
+pub(crate) async fn unpersisted_catalog_blocks_provider_even_after_open_until_a_full_refetch() {
     let route = LiveRoute::start(StoreCondition::Delayed).await;
     route.catalog().await;
     route.assert_catalog_before_store_and_transform();
