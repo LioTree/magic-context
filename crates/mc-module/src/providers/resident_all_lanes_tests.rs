@@ -495,8 +495,9 @@ async fn claude_resident_restart_primes_from_stored_view_and_matches_full_rebuil
     let ready = super::super::claude_code_tests::setup(&on).await;
     assert_eq!(ready, super::super::claude_code_tests::setup(&off).await);
     let mut applied = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
-    // The compartments are left unchanged, so the stored cut still matches the
-    // current history source and the restarted fold may restore from it.
+    // The history compartments are not rewritten here, so the compartment source
+    // revision recorded with the last fold's cut still equals the current one;
+    // prime_resident_fold restores only when those two revisions match.
     for h in [&on, &off] {
         let store = h.store.get().unwrap();
         let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
@@ -562,8 +563,9 @@ async fn claude_resident_restart_primes_from_stored_view_and_matches_full_rebuil
         }
     }
 
-    // Acknowledge that replacement, restart again, and make a hook the first
-    // call. The Claude Code hook path restores the fold state on its own cold
+    // Acknowledge the replacement served by the second fold above, restart the
+    // process a second time, and make a Claude Code hook the first call after
+    // that restart. The hook path restores the fold state on its own cold
     // rebuild, and the next fold runs on that restored state.
     let mut request = step("cc", vec![], Some(newest));
     request["harness"] = json!("claude-code");
@@ -585,8 +587,8 @@ async fn claude_resident_restart_primes_from_stored_view_and_matches_full_rebuil
     let applied = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
     let store = on.store.get().unwrap();
     let key = Key::new(&on.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
-    // A stored MID cannot name different native bytes, so the hook repeats the
-    // newest message's stored raw_message.
+    // A message id (mid) already stored cannot be resent with a different
+    // raw_message, so the hook repeats the newest message's stored raw_message.
     let held = store
         .load_provider_messages_since(&key.store_key(), "L", newest)
         .unwrap();
