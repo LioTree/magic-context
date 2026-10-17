@@ -50,13 +50,16 @@ fn wall_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// A hook to run once, and the clock reading (1-based) it runs on.
+type ClockHook = (usize, Box<dyn FnOnce() + Send>);
+
 /// A wall clock that can run one hook on a chosen call, so a test can act at an
 /// exact point inside the dispatcher (its second reading is taken just before it
 /// asks for the domain lease).
 #[derive(Default)]
 struct HookClock {
     calls: AtomicUsize,
-    hook: Mutex<Option<(usize, Box<dyn FnOnce() + Send>)>>,
+    hook: Mutex<Option<ClockHook>>,
 }
 
 impl Clock for HookClock {
