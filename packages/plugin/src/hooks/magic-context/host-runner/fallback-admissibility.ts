@@ -224,9 +224,12 @@ export function isFallbackAdmissible<P>(
             slash > 0 ? input.model.slice(slash + 1) : input.model,
         );
         if (input.material) {
-            // Post-cut bound: max(envelope_upper from a qualifying usage reading,
-            // visible-material bound) + message rows at the largest ratio. Without a
-            // qualifying reading, unobserved tool schemas leave the envelope unbounded.
+            // Bound the post-cut request as: the larger of (a) total input of a
+            // qualifying earlier request minus a lower bound on its messages (same
+            // model, tool names, system and visible tools) and (b) the bound counted
+            // from visible material; plus message rows at the model's largest
+            // calibration ratio. Unobserved tool schemas have no size bound at all
+            // without such a reading.
             const visible = boundMarkerEnvelope(input.material, input.model);
             const derived = qualifyingMarkerEnvelopeUpper(usage, input.material, input.model);
             if (

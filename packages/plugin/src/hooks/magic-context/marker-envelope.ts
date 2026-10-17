@@ -24,8 +24,9 @@ function warnByteBound(error: unknown): void {
         .catch(() => {});
 }
 
-/** `bytes` falls back to an upper bound when the tokenizer is unavailable; `zero`
- * falls back to the only safe lower bound (used when subtracting message text). */
+/** When the tokenizer is unavailable, `bytes` counts UTF-8 bytes (an upper bound on
+ * tokens) and `zero` counts nothing (the only safe lower bound, used for message
+ * text that is subtracted from provider usage). */
 function materialCounter(fallback: "bytes" | "zero" = "bytes"): (text: string) => number {
     let active = tokenizer;
     try {

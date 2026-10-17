@@ -222,6 +222,7 @@ test("usage-derived post-cut bound covers every serializer with unobserved tool 
     let comparisons = 0;
     let wrapperPerRow = 0;
     let tightest = Number.POSITIVE_INFINITY;
+    const missingReadings: string[] = [];
     for (let round = 0; round < 90; round++) {
         const full = randomMarkerEnvelope(next);
         const observed = splitEnvelope(full, next);
@@ -271,7 +272,12 @@ test("usage-derived post-cut bound covers every serializer with unobserved tool 
                         totalInput: Math.ceil(prevLocal * ratio),
                         model,
                     });
-                    expect(reading, `${model} ${provider} ${round}`).toBeDefined();
+                    // The true envelope is positive, so a correct subtraction always
+                    // leaves a reading; count misses and assert after the bound checks.
+                    if (!reading) {
+                        missingReadings.push(`${model} ${provider} round ${round} ratio ${ratio}`);
+                        continue;
+                    }
                     const derived = qualifyingMarkerEnvelopeUpper(
                         { model, envelope_reading: reading },
                         observed,
@@ -292,6 +298,7 @@ test("usage-derived post-cut bound covers every serializer with unobserved tool 
             }
         }
     }
+    expect(missingReadings).toEqual([]);
     console.log(
         `marker-usage-bound: ${comparisons} comparisons; max wrapper tokens per message/part=${wrapperPerRow.toFixed(2)}; tightest bound/actual with a non-empty post-cut view=${tightest.toFixed(4)}`,
     );

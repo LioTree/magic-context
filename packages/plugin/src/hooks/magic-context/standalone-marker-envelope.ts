@@ -136,7 +136,9 @@ export function measureStandaloneMarker(args: {
     );
     // The plugin cannot see MCP tools, and on OpenCode 1.18.35 the hook's
     // parameters are not the JSON schema sent. The envelope is therefore bounded
-    // only by a qualifying usage reading; exact visible material can raise it.
+    // only by the most recent completed request with the same model, system strings
+    // and hook-visible tool names: its provider input usage minus a lower bound on
+    // the messages it carried. Exact visible material can only raise that bound.
     const derived = current
         ? standaloneEnvelopeUpper(args.sessionId, args.model, args.agentName)
         : undefined;

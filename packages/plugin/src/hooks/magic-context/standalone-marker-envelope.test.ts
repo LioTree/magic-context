@@ -55,8 +55,8 @@ test("standalone marker needs a completed-request reading for the current envelo
     expect(measureStandaloneMarker(args).fit).toBe("unproven");
     startRequest(args.sessionId, args.model, "first", ["Final system"]);
     expect(measureStandaloneMarker(args).fit).toBe("unproven");
-    // Even complete-looking JSON definitions cannot prove the set: MCP tools never
-    // reach the hook, so a reading is required.
+    // Even complete-looking JSON definitions cannot prove which tools were sent:
+    // MCP tools never reach the hook, so a completed request's usage is required.
     recordToolDefinition("unknown", "model", undefined, "read", "Read file", { type: "object" });
     expect(measureStandaloneMarker(args).fit).toBe("unproven");
     serveCurrent(args.sessionId, args.messages);
@@ -64,7 +64,7 @@ test("standalone marker needs a completed-request reading for the current envelo
     complete(args.sessionId, args.model, "first", 800);
     startRequest(args.sessionId, args.model, "second", ["Final system"]);
     expect(measureStandaloneMarker(args).fit).toBe("under");
-    // The reading's usage is enforced: 800 input tokens leave no room in 700.
+    // The first request's 800 input tokens bound the envelope, so a 700 window fails.
     expect(measureStandaloneMarker({ ...args, limit: 700 }).fit).toBe("over");
     expect(measureStandaloneMarker({ ...args, model: "different/model" }).fit).toBe("unproven");
     expect(measureStandaloneMarker({ ...args, systemHash: "different" }).fit).toBe("unproven");
@@ -105,14 +105,15 @@ describe("standalone fresh-reading rule", () => {
         qualified();
         serveCurrent(args.sessionId, args.messages);
         expect(measureStandaloneMarker(args).fit).toBe("under");
-        // Repeated updates of the reading's own response (finish, then completed) keep it.
+        // Repeated updates of the first response (finish, then completed) keep its reading.
         complete(args.sessionId, args.model, "first", 800);
         expect(measureStandaloneMarker(args).fit).toBe("under");
     });
 
     test("a later completion without a known served array clears the reading", () => {
         qualified();
-        // The second request completes, but its returned array was never captured.
+        // The second request completes, but its returned array was never captured,
+        // so its usage cannot bound anything and the older reading is dropped too.
         complete(args.sessionId, args.model, "second", 900);
         startRequest(args.sessionId, args.model, "third", ["Final system"]);
         expect(measureStandaloneMarker(args).fit).toBe("unproven");
@@ -143,7 +144,7 @@ function startRequest(sessionId: string, model: string, responseId: string, syst
     recordMarkerSystem(sessionId, model, "hash", system);
 }
 
-/** The rust transform's capture of the array it returned for the current request. */
+/** Record the message array the Rust transform returned to OpenCode for the current request. */
 function serveCurrent(sessionId: string, messages: unknown[]) {
     const request = currentLkgRequestIdentity(sessionId);
     noteCapturedLkgRequest({
@@ -343,8 +344,8 @@ test("standalone randomized marker timing preserves full defer bytes and attribu
                     inputTokens: 0,
                 });
                 recordMarkerSystem(sessionId, model, `hash-${ordinal}`, system);
-                // A completed earlier request with this envelope; its usage stands
-                // in for the provider's count of the same system and tools.
+                // An earlier completed request with this ordinal's system and tools;
+                // its usage stands in for the provider's count of that envelope.
                 __setLkgMarkerReadingForTests(sessionId, {
                     responseId: `random-${pass}-completed`,
                     inputTokens: boundMarkerEnvelope({ system, tools }, model)!,

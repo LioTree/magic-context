@@ -122,7 +122,8 @@ export function noteCapturedLkgRequest(args: {
     request?: LkgRequestIdentity;
     systemPromptTokens: number;
     agentName?: string;
-    /** Only for the array actually returned to the host; enables envelope readings. */
+    /** Only for the array actually returned to the host. Once this request completes,
+     * its usage can bound the system/tool envelope of later requests. */
     marker?: LkgMarkerIdentity;
 }): void {
     const request = args.request;
