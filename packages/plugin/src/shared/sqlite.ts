@@ -39,7 +39,7 @@
  * `run()` → {changes,lastInsertRowid}) is identical and was verified directly.
  */
 
-import { AsyncLocalStorage } from "node:async_hooks";
+import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 import { statSync } from "node:fs";
 
 // Type import only — runtime is loaded dynamically below. @types/better-sqlite3
@@ -47,6 +47,16 @@ import { statSync } from "node:fs";
 // we use, so calls typed against BetterSqlite3 work under bun:sqlite and
 // node:sqlite at runtime (both expose prepare/run/get/all/exec/close).
 import type BetterSqlite3 from "better-sqlite3";
+
+// Capture the root before creating request-local AsyncLocalStorage scopes.
+// Shared workers and timers must not inherit callbacks that reject stale
+// database writes: those callbacks can retain an obsolete request's inputs.
+const resourceRoot = new AsyncResource("magic-context:root");
+
+/** Create host-owned resources without inheriting request-local state. */
+export function inRootAsyncContext<T>(operation: () => T): T {
+    return resourceRoot.runInAsyncScope(operation);
+}
 
 /**
  * Slow-write reporting is injected rather than imported: this module is also
@@ -420,7 +430,9 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
                 !/^\s*(?:SELECT|EXPLAIN|PRAGMA|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(sql)
             ) {
                 try {
-                    return withAutocommitTimeout(db, () => nativeExec(sql));
+                    // exec can commit a script prefix before BUSY. Run it once;
+                    // only prepared statements are safe to probe and retry.
+                    return withAutocommitTimeout(db, () => nativeExec(sql), false);
                 } finally {
                     if (mayChangeTagIdentity(sql)) tagIdentityWriteGeneration += 1;
                 }
@@ -587,7 +599,9 @@ function trackSqliteConnection(
 
 const TrackedDatabase = new Proxy(DatabaseImpl, {
     construct(target, args) {
-        const db = Reflect.construct(target, args, target) as BetterSqlite3.Database;
+        const db = inRootAsyncContext(
+            () => Reflect.construct(target, args, target) as BetterSqlite3.Database,
+        );
         return trackSqliteConnection(db, args[0], args[1]);
     },
 }) as typeof BetterSqlite3;
@@ -1000,33 +1014,60 @@ function foregroundWaitLease() {
         : undefined;
 }
 
-/** Bound implicit writer admission too, including prepared INSERT OR IGNORE and
- * writes with RETURNING. Charge successful execution time conservatively: the
- * native API cannot separate lock waiting from statement execution. Exhaustion
- * switches to zero-wait acquisition, not a refusal when the writer is free. */
-function withAutocommitTimeout<T>(db: Database, operation: () => T): T {
+/** Probe a prepared statement's writer lock without charging uncontended work
+ * against the foreground lock-wait budget. An exec script may commit some of
+ * its statements before failing, so it cannot be retried without duplicating
+ * writes; conservatively charge its single attempt's full execution time. */
+function withAutocommitTimeout<T>(db: Database, operation: () => T, singleStatement = true): T {
     assertTransformWrite();
     const lease = foregroundWaitLease();
     if (isInTransaction(db)) return operation();
     const scoped = lease || backgroundWriterScope.getStore();
     const previous = scoped ? pragmaNumber(db, "busy_timeout") : null;
-    if (scoped)
-        db.exec(
-            `PRAGMA busy_timeout=${lease ? Math.floor(Math.min(lease.remainingWaitMs, lease.guard?.remainingMs() ?? Infinity)) : SHORT_BUSY_TIMEOUT_MS}`,
-        );
     const started = performance.now();
     let completed = false;
-    try {
+    const execute = () => {
         const result = operation();
         completed = true;
         return result;
+    };
+    try {
+        if (!scoped) return execute();
+        if (singleStatement) {
+            db.exec("PRAGMA busy_timeout=0");
+            try {
+                return execute();
+            } catch (error) {
+                if (!isTransientSqliteError(error) || isInTransaction(db)) throw error;
+            }
+            assertTransformWrite();
+        }
+        const timeout = Math.floor(
+            Math.min(
+                lease?.remainingWaitMs ?? SHORT_BUSY_TIMEOUT_MS,
+                lease?.guard?.remainingMs() ?? Infinity,
+            ),
+        );
+        db.exec(`PRAGMA busy_timeout=${timeout}`);
+        const waitStarted = performance.now();
+        try {
+            return execute();
+        } finally {
+            // Deduct the prepared statement's contended retry or the exec
+            // script's execution from the remaining foreground wait budget;
+            // the native API cannot separate lock waiting from execution.
+            if (lease)
+                lease.remainingWaitMs = Math.max(
+                    0,
+                    lease.remainingWaitMs - (performance.now() - waitStarted),
+                );
+        }
     } catch (error) {
         if (lease && isTransientSqliteError(error))
             throw new SqliteAcquisitionBusyError(error, "autocommit");
         throw error;
     } finally {
         const elapsed = performance.now() - started;
-        if (lease) lease.remainingWaitMs = Math.max(0, lease.remainingWaitMs - elapsed);
         if (previous !== null) db.exec(`PRAGMA busy_timeout=${previous}`);
         // Native autocommit does not expose the instant its lock was acquired.
         // Label the upper bound so a waiting statement is not blamed as a holder.

@@ -469,6 +469,10 @@ function installAvailabilityDb(sessionId: string, firstUserTools?: Record<string
     const dbPath = join(dataHome, "opencode", "opencode.db");
     mkdirSync(dirname(dbPath), { recursive: true });
     const opencodeDb = new Database(dbPath);
+    // Create the fixture in WAL mode like OpenCode. Schema writes create the
+    // -wal/-shm files; without them, macOS SQLite can reject a readonly worker's
+    // first read after a late switch from rollback journaling to WAL.
+    opencodeDb.exec("PRAGMA journal_mode=WAL");
     opencodeDb.exec(`
         CREATE TABLE message (
             id TEXT PRIMARY KEY,
@@ -7839,28 +7843,32 @@ describe("delta prefix-mutation guard", () => {
         }
     });
 
-    it("checks a 1,400-message multi-megabyte prefix within the steady-pass budget", () => {
+    it("checks each field in a 1,400-message multi-megabyte prefix once per pass", () => {
         const text = "x".repeat(2_048);
         const messages = Array.from({ length: 1_400 }, (_, index) => ({
             info: { id: `m-${index}`, role: "user" },
             parts: [{ type: "text", text }],
         })) as MessageLike[];
         const snapshots = __rustModeTransformTest.contentSnapshotsFor(messages);
-        const samples: number[] = [];
-        for (let sample = 0; sample < 7; sample += 1) {
-            const startedAt = performance.now();
-            expect(
-                messages.every((message, index) =>
-                    __rustModeTransformTest.messageMatchesContentSnapshot(
-                        message,
-                        snapshots[index],
+        const expectedVisits =
+            snapshots.reduce((sum, snapshot) => sum + snapshot.fields.length, 0) * 7;
+        let visitedFields = 0;
+        __rustModeTransformTest.setContentSnapshotFieldVisitObserverForTests(() => visitedFields++);
+        try {
+            for (let sample = 0; sample < 7; sample += 1) {
+                expect(
+                    messages.every((message, index) =>
+                        __rustModeTransformTest.messageMatchesContentSnapshot(
+                            message,
+                            snapshots[index],
+                        ),
                     ),
-                ),
-            ).toBe(true);
-            samples.push(performance.now() - startedAt);
+                ).toBe(true);
+            }
+        } finally {
+            __rustModeTransformTest.setContentSnapshotFieldVisitObserverForTests(null);
         }
-        samples.sort((left, right) => left - right);
-        expect(samples[3]).toBeLessThan(10);
+        expect(visitedFields).toBe(expectedVisits);
     });
 
     it("recovers after a queued user message is mutated in place and the module rejects twice", async () => {

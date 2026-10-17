@@ -2291,6 +2291,13 @@ export async function registerContext(context: V2Context) {
             : lateHiddenExecutor,
         compactionMarkerStrategy: v2CompactionMarkerStrategy,
         prepareHistorySession,
+        readSessionDirectory: async (sessionID) => {
+            try {
+                return (await context.session.get({ sessionID })).location?.directory ?? null;
+            } catch {
+                return null;
+            }
+        },
         storageDir,
     });
     // The v2 TUI reaches manual dreaming through RPC because this host has no
@@ -2400,12 +2407,14 @@ export async function registerContext(context: V2Context) {
     });
     // Start the RPC server asynchronously after plugin construction returns so
     // Bun.serve and its discovery-file write do not consume the host's deadline.
-    setTimeout(() => {
-        if (rpcStopped) return;
-        void rpcServer
-            .start()
-            .catch((error) => log("[magic-context] v2 RPC server failed to start", error));
-    }, 0);
+    inRootAsyncContext(() =>
+        setTimeout(() => {
+            if (rpcStopped) return;
+            void rpcServer
+                .start()
+                .catch((error) => log("[magic-context] v2 RPC server failed to start", error));
+        }, 0),
+    );
     return {
         async dispose() {
             rpcStopped = true;
@@ -2434,3 +2443,4 @@ import {
     bindSystemDateRequestIdentity,
     registerSystemDateRefresh,
 } from "../../hooks/magic-context/system-date-refresh";
+import { inRootAsyncContext } from "../../shared/sqlite";
