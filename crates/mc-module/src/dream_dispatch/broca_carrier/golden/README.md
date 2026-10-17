@@ -24,6 +24,8 @@ crates.io package `cortexkit-role-llm-runner-conformance` 0.4.0 (crate checksum
 
 It holds the six cap cases BROCA runs (`input_token_cap_at_limit`, `_crossing_tools`,
 `_usage_unreported`, `_raise_refused`, `_closed_members`, `_restart_between_episodes`).
+The first five are matched by name in this file; the restart case is the file's
+`restart` function, which the crate's `src/runner.rs` runs under that case name.
 The crate itself is not a dependency: taking it would add a second commons provider
 pin to Cargo.lock. It is kept as text (`.rs.txt`) so it is never compiled; the carrier
 tests replay its numbers against the fake Broca.

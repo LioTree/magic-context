@@ -1325,10 +1325,12 @@ fn broca_conformance_cap_cases_are_pinned() {
         "input_token_cap_usage_unreported",
         "input_token_cap_raise_refused",
         "input_token_cap_closed_members",
-        "input_token_cap_restart_between_episodes",
     ] {
         assert!(CAP_CASES.contains(&format!("\"{case}\"")), "{case}");
     }
+    // The sixth case, input_token_cap_restart_between_episodes, is named in the
+    // crate's src/runner.rs, which calls this file's `restart` function.
+    assert!(CAP_CASES.contains("pub async fn restart<S>("));
 }
 
 /// One capped attempt on the golden runner; answers the failure, the number of
