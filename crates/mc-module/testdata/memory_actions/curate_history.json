@@ -1,0 +1,381 @@
+[
+  {
+    "args": {
+      "action": "write",
+      "category": "CONFIG_VALUES",
+      "content": "Request limit is 12 per minute."
+    },
+    "reply": "Saved memory [ID: 1] in CONFIG_VALUES.",
+    "memories": [
+      {
+        "id": 1,
+        "category": "CONFIG_VALUES",
+        "content": "Request limit is 12 per minute.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      }
+    ],
+    "history": []
+  },
+  {
+    "args": {
+      "action": "write",
+      "category": "CONFIG_VALUES",
+      "content": "Retries are capped at 3 attempts."
+    },
+    "reply": "Saved memory [ID: 2] in CONFIG_VALUES.",
+    "memories": [
+      {
+        "id": 1,
+        "category": "CONFIG_VALUES",
+        "content": "Request limit is 12 per minute.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 2,
+        "category": "CONFIG_VALUES",
+        "content": "Retries are capped at 3 attempts.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      }
+    ],
+    "history": []
+  },
+  {
+    "args": {
+      "action": "write",
+      "category": "CONFIG_VALUES",
+      "content": "The retry cap is 3 attempts per call."
+    },
+    "reply": "Saved memory [ID: 3] in CONFIG_VALUES.",
+    "memories": [
+      {
+        "id": 1,
+        "category": "CONFIG_VALUES",
+        "content": "Request limit is 12 per minute.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 2,
+        "category": "CONFIG_VALUES",
+        "content": "Retries are capped at 3 attempts.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 3,
+        "category": "CONFIG_VALUES",
+        "content": "The retry cap is 3 attempts per call.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      }
+    ],
+    "history": []
+  },
+  {
+    "args": {
+      "action": "write",
+      "category": "CONFIG_VALUES",
+      "content": "Timeout is 30 seconds for each request."
+    },
+    "reply": "Saved memory [ID: 4] in CONFIG_VALUES.",
+    "memories": [
+      {
+        "id": 1,
+        "category": "CONFIG_VALUES",
+        "content": "Request limit is 12 per minute.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 2,
+        "category": "CONFIG_VALUES",
+        "content": "Retries are capped at 3 attempts.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 3,
+        "category": "CONFIG_VALUES",
+        "content": "The retry cap is 3 attempts per call.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 4,
+        "category": "CONFIG_VALUES",
+        "content": "Timeout is 30 seconds for each request.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      }
+    ],
+    "history": []
+  },
+  {
+    "args": {
+      "action": "update",
+      "ids": [
+        1
+      ],
+      "content": "Request limit is 12 requests per minute per project.",
+      "reason": "clarify the unit"
+    },
+    "reply": "Updated memory [ID: 1] in CONFIG_VALUES.",
+    "memories": [
+      {
+        "id": 1,
+        "category": "CONFIG_VALUES",
+        "content": "Request limit is 12 requests per minute per project.",
+        "status": "active",
+        "revision": 2,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 2,
+        "category": "CONFIG_VALUES",
+        "content": "Retries are capped at 3 attempts.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 3,
+        "category": "CONFIG_VALUES",
+        "content": "The retry cap is 3 attempts per call.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 4,
+        "category": "CONFIG_VALUES",
+        "content": "Timeout is 30 seconds for each request.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      }
+    ],
+    "history": [
+      {
+        "memory_id": 1,
+        "revision": 1,
+        "previous_text": "Request limit is 12 per minute.",
+        "after_text": "Request limit is 12 requests per minute per project.",
+        "before_json": "{\"id\":1,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Request limit is 12 per minute.\",\"normalized_hash\":\"750f3d1fdf028d5c30aad1210dac4f3e\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":1,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "after_json": "{\"id\":1,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Request limit is 12 requests per minute per project.\",\"normalized_hash\":\"ca12c33d77a811ddc236b8ee46b20a52\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":2,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "applied_at": 1700000000000,
+        "reason": "clarify the unit",
+        "evidence_json": "[]",
+        "source_ids_json": "[1]"
+      }
+    ]
+  },
+  {
+    "args": {
+      "action": "merge",
+      "ids": [
+        2,
+        3
+      ],
+      "content": "Retries are capped at 3 attempts per call.",
+      "category": "CONFIG_VALUES",
+      "reason": "same retry cap"
+    },
+    "reply": "Merged memories [2, 3] into canonical memory [ID: 5] in CONFIG_VALUES; superseded [2, 3].",
+    "memories": [
+      {
+        "id": 1,
+        "category": "CONFIG_VALUES",
+        "content": "Request limit is 12 requests per minute per project.",
+        "status": "active",
+        "revision": 2,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 2,
+        "category": "CONFIG_VALUES",
+        "content": "Retries are capped at 3 attempts.",
+        "status": "archived",
+        "revision": 2,
+        "superseded_by_memory_id": 5
+      },
+      {
+        "id": 3,
+        "category": "CONFIG_VALUES",
+        "content": "The retry cap is 3 attempts per call.",
+        "status": "archived",
+        "revision": 2,
+        "superseded_by_memory_id": 5
+      },
+      {
+        "id": 4,
+        "category": "CONFIG_VALUES",
+        "content": "Timeout is 30 seconds for each request.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 5,
+        "category": "CONFIG_VALUES",
+        "content": "Retries are capped at 3 attempts per call.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      }
+    ],
+    "history": [
+      {
+        "memory_id": 1,
+        "revision": 1,
+        "previous_text": "Request limit is 12 per minute.",
+        "after_text": "Request limit is 12 requests per minute per project.",
+        "before_json": "{\"id\":1,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Request limit is 12 per minute.\",\"normalized_hash\":\"750f3d1fdf028d5c30aad1210dac4f3e\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":1,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "after_json": "{\"id\":1,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Request limit is 12 requests per minute per project.\",\"normalized_hash\":\"ca12c33d77a811ddc236b8ee46b20a52\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":2,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "applied_at": 1700000000000,
+        "reason": "clarify the unit",
+        "evidence_json": "[]",
+        "source_ids_json": "[1]"
+      },
+      {
+        "memory_id": 2,
+        "revision": 1,
+        "previous_text": "Retries are capped at 3 attempts.",
+        "after_text": "Retries are capped at 3 attempts.",
+        "before_json": "{\"id\":2,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Retries are capped at 3 attempts.\",\"normalized_hash\":\"e622d496796a935282185cce6d8ae021\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":1,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "after_json": "{\"id\":2,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Retries are capped at 3 attempts.\",\"normalized_hash\":\"e622d496796a935282185cce6d8ae021\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"archived\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":5,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":2,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "applied_at": 1700000000000,
+        "reason": "same retry cap",
+        "evidence_json": "[]",
+        "source_ids_json": "[2,3]"
+      },
+      {
+        "memory_id": 3,
+        "revision": 1,
+        "previous_text": "The retry cap is 3 attempts per call.",
+        "after_text": "The retry cap is 3 attempts per call.",
+        "before_json": "{\"id\":3,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"The retry cap is 3 attempts per call.\",\"normalized_hash\":\"a6815697a96d68ed005d50d0cdef1d72\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":1,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "after_json": "{\"id\":3,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"The retry cap is 3 attempts per call.\",\"normalized_hash\":\"a6815697a96d68ed005d50d0cdef1d72\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"archived\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":5,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":2,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "applied_at": 1700000000000,
+        "reason": "same retry cap",
+        "evidence_json": "[]",
+        "source_ids_json": "[2,3]"
+      }
+    ]
+  },
+  {
+    "args": {
+      "action": "archive",
+      "ids": [
+        4
+      ],
+      "superseded_by": 1,
+      "reason": "covered by the request limit memory"
+    },
+    "reply": "Archived memory [ID: 4] (covered by the request limit memory).",
+    "memories": [
+      {
+        "id": 1,
+        "category": "CONFIG_VALUES",
+        "content": "Request limit is 12 requests per minute per project.",
+        "status": "active",
+        "revision": 2,
+        "superseded_by_memory_id": null
+      },
+      {
+        "id": 2,
+        "category": "CONFIG_VALUES",
+        "content": "Retries are capped at 3 attempts.",
+        "status": "archived",
+        "revision": 2,
+        "superseded_by_memory_id": 5
+      },
+      {
+        "id": 3,
+        "category": "CONFIG_VALUES",
+        "content": "The retry cap is 3 attempts per call.",
+        "status": "archived",
+        "revision": 2,
+        "superseded_by_memory_id": 5
+      },
+      {
+        "id": 4,
+        "category": "CONFIG_VALUES",
+        "content": "Timeout is 30 seconds for each request.",
+        "status": "archived",
+        "revision": 2,
+        "superseded_by_memory_id": 1
+      },
+      {
+        "id": 5,
+        "category": "CONFIG_VALUES",
+        "content": "Retries are capped at 3 attempts per call.",
+        "status": "active",
+        "revision": 1,
+        "superseded_by_memory_id": null
+      }
+    ],
+    "history": [
+      {
+        "memory_id": 1,
+        "revision": 1,
+        "previous_text": "Request limit is 12 per minute.",
+        "after_text": "Request limit is 12 requests per minute per project.",
+        "before_json": "{\"id\":1,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Request limit is 12 per minute.\",\"normalized_hash\":\"750f3d1fdf028d5c30aad1210dac4f3e\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":1,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "after_json": "{\"id\":1,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Request limit is 12 requests per minute per project.\",\"normalized_hash\":\"ca12c33d77a811ddc236b8ee46b20a52\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":2,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "applied_at": 1700000000000,
+        "reason": "clarify the unit",
+        "evidence_json": "[]",
+        "source_ids_json": "[1]"
+      },
+      {
+        "memory_id": 2,
+        "revision": 1,
+        "previous_text": "Retries are capped at 3 attempts.",
+        "after_text": "Retries are capped at 3 attempts.",
+        "before_json": "{\"id\":2,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Retries are capped at 3 attempts.\",\"normalized_hash\":\"e622d496796a935282185cce6d8ae021\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":1,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "after_json": "{\"id\":2,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Retries are capped at 3 attempts.\",\"normalized_hash\":\"e622d496796a935282185cce6d8ae021\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"archived\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":5,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":2,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "applied_at": 1700000000000,
+        "reason": "same retry cap",
+        "evidence_json": "[]",
+        "source_ids_json": "[2,3]"
+      },
+      {
+        "memory_id": 3,
+        "revision": 1,
+        "previous_text": "The retry cap is 3 attempts per call.",
+        "after_text": "The retry cap is 3 attempts per call.",
+        "before_json": "{\"id\":3,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"The retry cap is 3 attempts per call.\",\"normalized_hash\":\"a6815697a96d68ed005d50d0cdef1d72\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":1,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "after_json": "{\"id\":3,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"The retry cap is 3 attempts per call.\",\"normalized_hash\":\"a6815697a96d68ed005d50d0cdef1d72\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"archived\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":5,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":2,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "applied_at": 1700000000000,
+        "reason": "same retry cap",
+        "evidence_json": "[]",
+        "source_ids_json": "[2,3]"
+      },
+      {
+        "memory_id": 4,
+        "revision": 1,
+        "previous_text": "Timeout is 30 seconds for each request.",
+        "after_text": "Timeout is 30 seconds for each request.",
+        "before_json": "{\"id\":4,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Timeout is 30 seconds for each request.\",\"normalized_hash\":\"48570c4435701104671330b9ea1935e4\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"active\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":null,\"merged_from\":null,\"metadata_json\":null,\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":1,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "after_json": "{\"id\":4,\"project_path\":\"project-a\",\"category\":\"CONFIG_VALUES\",\"content\":\"Timeout is 30 seconds for each request.\",\"normalized_hash\":\"48570c4435701104671330b9ea1935e4\",\"importance\":50,\"scope\":\"project\",\"shareable\":0,\"source_session_id\":\"session-a\",\"source_type\":\"dreamer\",\"seen_count\":1,\"retrieval_count\":0,\"first_seen_at\":1700000000000,\"created_at\":1700000000000,\"updated_at\":1700000000000,\"last_seen_at\":1700000000000,\"last_retrieved_at\":null,\"status\":\"archived\",\"expires_at\":null,\"verification_status\":\"unverified\",\"verified_at\":null,\"classified_at\":null,\"superseded_by_memory_id\":1,\"merged_from\":null,\"metadata_json\":\"{\\\"archive_reason\\\":\\\"covered by the request limit memory\\\"}\",\"mural_cue\":null,\"mural_cue_hash\":null,\"mural_cue_at\":null,\"mural_cue_rejection_count\":0,\"revision\":2,\"verify_result\":null,\"verify_files_json\":null,\"verify_commit\":null}",
+        "applied_at": 1700000000000,
+        "reason": "covered by the request limit memory",
+        "evidence_json": "[]",
+        "source_ids_json": "[4]"
+      }
+    ]
+  }
+]

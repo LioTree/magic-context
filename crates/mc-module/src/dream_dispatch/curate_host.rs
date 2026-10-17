@@ -321,6 +321,12 @@ impl TaskToolRouter for CurateRouter {
             serde_json::to_string(&args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
         let key = format!("curate:{}:{}", self.run, mc_store::md5_hex(&request));
         let ctx = &self.context;
+        // Every edit commits with its memory_history row and revision bump, the same
+        // rows the TypeScript dreamer writes (see
+        // curate_update_merge_archive_history_matches_the_typescript_dreamer).
+        // Integration debt: when parity-w3 merges into the train, add a test that
+        // undoes a Rust curate edit (update, merge, archive) through the train's
+        // audited undo.
         let applied = self.store.commit_dream_curate(&ctx.scope.project.0, &key, &expected, |tx| self.check_commit_fence(tx), |tx| {
             let replay: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM memory_decision_receipts WHERE decision_key=?1)", [&key], |r| r.get(0))?;
             let reply = state.actions.execute_tx(tx, &EmbeddingQueue, &MemoryActionContext {
