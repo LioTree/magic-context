@@ -11,7 +11,7 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 	// `globalThis[Symbol.for("cortexkit.standalone-plugins")]`, the Map shared by
 	// standalone plugins. The `packages/plugin/src/index.ts` pin changed when a
 	// comment there stopped pointing at a report that moved out of `docs/`.
-	// index.ts pin abdb2483…: covers the Rust background ownership passthrough (`rustBackgroundEnabled`).
+	// The current index.ts pin (abdb2483…) covers the `rustBackgroundEnabled` lines that pass the Rust background ownership switch from the plugin config to the dreamer.
 	for (const [path, expected] of Object.entries(pins)) {
 		let bytes = readFileSync(resolve(root, path), "utf8");
 		if (path === "packages/plugin/src/index.ts") {
