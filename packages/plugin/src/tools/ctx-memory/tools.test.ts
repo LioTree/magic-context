@@ -31,7 +31,10 @@ import type {
     EmbeddingPurpose,
 } from "../../features/magic-context/memory/embedding-provider";
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
-import { getMemoriesForList } from "../../features/magic-context/memory/storage-memory";
+import {
+    getMemoriesForList,
+    ModuleMemoryAuthorityError,
+} from "../../features/magic-context/memory/storage-memory";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -437,18 +440,11 @@ describe("createCtxMemoryTools", () => {
     });
 
     it("refuses unmigrated memory writes with MC-C14 and otherwise writes the shared store", async () => {
-        let moduleCalls = 0;
         const localTools = createCtxMemoryTools({
             db,
             resolveProjectPath: () => "/repo/project",
             memoryEnabled: true,
             embeddingEnabled: false,
-            rustToolBackends: {
-                memory: async () => {
-                    moduleCalls++;
-                    throw new Error("module memory route must not be called");
-                },
-            },
         });
         db.prepare("INSERT INTO authority_managed VALUES (?, 'old-store', 1)").run("/repo/project");
         const reply = await localTools.ctx_memory.execute(
@@ -469,7 +465,6 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoriesByProject(db, "/repo/project").map((row) => row.content)).toEqual([
             "shared",
         ]);
-        expect(moduleCalls).toBe(0);
     });
 
     describe("#given write action", () => {
@@ -501,48 +496,6 @@ describe("createCtxMemoryTools", () => {
             });
             expect(getProjectMemoryEpoch(db, "/repo/project")).toBe(0);
         });
-        it("triggers one rust memory sync after a write while keeping the TS write authority", async () => {
-            const syncSessions: string[] = [];
-            const rustTools = createCtxMemoryTools({
-                db,
-                resolveProjectPath: () => "/repo/project",
-                memoryEnabled: true,
-                embeddingEnabled: false,
-                rustToolBackends: {
-                    memorySync: (sessionId) => syncSessions.push(sessionId),
-                },
-            });
-
-            const result = await rustTools.ctx_memory.execute(
-                {
-                    action: "write",
-                    category: "USER_DIRECTIVES",
-                    content: "Keep the context database authoritative.",
-                },
-                toolContext(),
-            );
-
-            expect(result).toContain("Saved memory [ID:");
-            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(1);
-            expect(syncSessions).toEqual(["ses-memory"]);
-
-            const tsTools = createCtxMemoryTools({
-                db,
-                resolveProjectPath: () => "/repo/project",
-                memoryEnabled: true,
-                embeddingEnabled: false,
-            });
-            await tsTools.ctx_memory.execute(
-                {
-                    action: "write",
-                    category: "USER_DIRECTIVES",
-                    content: "TS mode has no module sync trigger.",
-                },
-                toolContext(),
-            );
-            expect(syncSessions).toEqual(["ses-memory"]);
-        });
-
         it("creates a new memory with agent source type", async () => {
             const result = await tools.ctx_memory.execute(
                 {
@@ -1410,7 +1363,7 @@ describe("createCtxMemoryTools", () => {
 
     describe("#given update action", () => {
         for (const agent of ["general", "explore"])
-            it(`applies an update immediately for ${agent} and syncs only after history commits`, async () => {
+            it(`applies an update immediately for ${agent}`, async () => {
                 const memory = insertMemory(db, {
                     projectPath: "/repo/project",
                     category: "CONFIG_VALUES",
@@ -1418,24 +1371,11 @@ describe("createCtxMemoryTools", () => {
                 });
                 setMemoryClassification(db, memory.id, { shareable: true, importance: 70 });
                 recordMemoryMapping(db, memory.id, ["old.ts"], 42, "mapper");
-                const syncSessions: string[] = [];
                 const localTools = createCtxMemoryTools({
                     db,
                     resolveProjectPath: () => "/repo/project",
                     memoryEnabled: true,
                     embeddingEnabled: false,
-                    rustToolBackends: {
-                        memorySync: (sessionId) => {
-                            expect(db.inTransaction).toBe(false);
-                            expect(
-                                db.prepare("SELECT COUNT(*) AS n FROM memory_history").get(),
-                            ).toEqual({ n: 1 });
-                            expect(
-                                db.prepare("SELECT COUNT(*) AS n FROM memory_journal").get(),
-                            ).toEqual({ n: 1 });
-                            syncSessions.push(sessionId);
-                        },
-                    },
                 });
                 const result = await localTools.ctx_memory.execute(
                     { action: "update", ids: [memory.id], content: "cache_ttl=10m" },
@@ -1457,7 +1397,6 @@ describe("createCtxMemoryTools", () => {
                     },
                 ]);
                 expect(getProjectMemoryEpoch(db, "/repo/project")).toBe(0);
-                expect(syncSessions).toEqual(["agent-session"]);
                 expect(db.prepare("SELECT COUNT(*) AS n FROM memory_tool_proposals").get()).toEqual(
                     { n: 0 },
                 );
@@ -2106,13 +2045,11 @@ describe("createCtxMemoryTools", () => {
                     category: "CONSTRAINTS",
                     content: "Use bun for test scripts",
                 });
-                const syncSessions: string[] = [];
                 const localTools = createCtxMemoryTools({
                     db,
                     resolveProjectPath: () => "/repo/project",
                     memoryEnabled: true,
                     embeddingEnabled: false,
-                    rustToolBackends: { memorySync: (sessionId) => syncSessions.push(sessionId) },
                 });
                 const result = await localTools.ctx_memory.execute(
                     {
@@ -2149,7 +2086,6 @@ describe("createCtxMemoryTools", () => {
                     n: 3,
                 });
                 expect(getProjectMemoryEpoch(db, "/repo/project")).toBe(0);
-                expect(syncSessions).toEqual(["merge-session"]);
             });
         it("agent merge updates the existing canonical bytes and queues the update delta", async () => {
             const canonical = insertMemory(db, {
@@ -2390,27 +2326,17 @@ describe("createCtxMemoryTools", () => {
     });
 
     describe("#given archive action", () => {
-        it("subagent archive applies immediately and requests Rust sync after audit commit", async () => {
+        it("subagent archive applies immediately and records the audit row", async () => {
             const memory = insertMemory(db, {
                 projectPath: "/repo/project",
                 category: "KNOWN_ISSUES",
                 content: "Old issue",
             });
-            const syncSessions: string[] = [];
             const localTools = createCtxMemoryTools({
                 db,
                 resolveProjectPath: () => "/repo/project",
                 memoryEnabled: true,
                 embeddingEnabled: false,
-                rustToolBackends: {
-                    memorySync: (sessionId) => {
-                        expect(db.inTransaction).toBe(false);
-                        expect(
-                            db.prepare("SELECT COUNT(*) AS n FROM memory_history").get(),
-                        ).toEqual({ n: 1 });
-                        syncSessions.push(sessionId);
-                    },
-                },
             });
             const result = await localTools.ctx_memory.execute(
                 { action: "archive", ids: [memory.id] },
@@ -2418,7 +2344,6 @@ describe("createCtxMemoryTools", () => {
             );
             expect(result).toBe(`Archived memory [ID: ${memory.id}].`);
             expect(getMemoryById(db, memory.id)?.status).toBe("archived");
-            expect(syncSessions).toEqual(["archive-session"]);
             expect(getMutationRows(db, "/repo/project", [memory.id])).toMatchObject([
                 { mutationType: "archive", targetMemoryId: memory.id },
             ]);
@@ -3121,7 +3046,7 @@ describe("createCtxMemoryTools", () => {
 });
 
 for (const operation of ["update", "merge", "archive"] as const) {
-    it(`module-owned curate ${operation} refuses an unavailable backend without a TypeScript fallback`, async () => {
+    it(`curate ${operation} refuses a project pending authority repair without writing`, async () => {
         const db = createTestDb();
         try {
             const first = insertMemory(db, {
@@ -3138,18 +3063,11 @@ for (const operation of ["update", "merge", "archive"] as const) {
                 "/repo/project",
             );
             const before = db.prepare("SELECT * FROM memories ORDER BY id").all();
-            let calls = 0;
             const tools = createCtxMemoryTools({
                 db,
                 resolveProjectPath: () => "/repo/project",
                 memoryEnabled: true,
                 embeddingEnabled: false,
-                rustToolBackends: {
-                    curateMemory: async () => {
-                        calls++;
-                        throw new Error("module unavailable");
-                    },
-                },
             });
             await expect(
                 tools.ctx_memory.execute(
@@ -3161,8 +3079,7 @@ for (const operation of ["update", "merge", "archive"] as const) {
                     },
                     dreamerToolContext("/repo/project"),
                 ),
-            ).rejects.toThrow("module unavailable");
-            expect(calls).toBe(1);
+            ).rejects.toThrow(ModuleMemoryAuthorityError);
             expect(db.prepare("SELECT * FROM memories ORDER BY id").all()).toEqual(before);
             for (const table of [
                 "memory_history",

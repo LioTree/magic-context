@@ -20,7 +20,6 @@ import {
     type StatusSection,
     type StatusTone,
 } from "../../shared/status-view"
-import { RUST_MODE_HOST_PATHS_LINE } from "../../shared/rust-mode-status"
 import type { StatusDetailResult } from "../data/context-db"
 
 const R = (props: { t: TuiThemeCurrent; l: string; v: string; fg?: string }) => (
@@ -97,7 +96,6 @@ export const StatusDialog = (props: { api: TuiPluginApi; status: StatusDetailRes
     const ready = () => (props.status.state === "ready" ? props.status : null)
     const compactionOff = () => ready()?.source.compaction_enabled === false
     const recompProgress = () => ready()?.extras.recompProgress ?? null
-    const hostBackendsModuleSide = () => ready()?.extras.hostBackendsModuleSide === true
 
     // Which rows exist, what they are called and which colour they carry is
     // decided by the shared model, so this dialog and Pi's overlay cannot drift
@@ -234,13 +232,6 @@ export const StatusDialog = (props: { api: TuiPluginApi; status: StatusDetailRes
                 </box>
                 )
             })()}
-
-            {hostBackendsModuleSide() && (
-                <box marginTop={1} width="100%" flexDirection="column">
-                    <text fg={t().text}><b>Rust Mode</b></text>
-                    <text fg={t().textMuted}>{RUST_MODE_HOST_PATHS_LINE}</text>
-                </box>
-            )}
 
             {/* Each column asks for the width its sections need, but may
                 shrink: until the dialog has measured itself the grid is chosen

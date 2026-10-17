@@ -1,5 +1,4 @@
 import type { MemorySourceType } from "../../features/magic-context/memory";
-import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
 import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 
@@ -58,9 +57,6 @@ export interface CtxMemoryToolDeps {
     embeddingEnabled?: boolean;
     allowedActions?: CtxMemoryAction[];
     sourceType?: MemorySourceType;
-    rustToolBackends?: RustToolBackends;
-    /** Module-owned automated edits are refused if the module callback is unavailable. */
-    memoryAuthority?: "ts" | "module";
     /**
      * Where an agent's save happened, for the historian's agent-memory scoring; null
      * (or absent) when this lane does not score agent saves, so no classification

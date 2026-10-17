@@ -17,7 +17,6 @@ import { closeDatabase, openDatabase } from "../features/magic-context/storage";
 import { createTagger } from "../features/magic-context/tagger";
 import { createMagicContextHook, type MagicContextDeps } from "../hooks/magic-context/hook";
 import { closeReadOnlySessionDb } from "../hooks/magic-context/read-session-db";
-import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
 import { __ignoredNotificationTest } from "../hooks/magic-context/send-session-notification";
 import { BRIDGED_SESSIONS_KEY } from "../shared/bridged-sessions";
 import { Database } from "../shared/sqlite";
@@ -164,11 +163,7 @@ function reconciliationSettled(sessionIds: string[]): Promise<void> {
  * createMessagesTransformHandler, the whole thing behind the stand-down guard,
  * and the session.deleted row drop the entry installs.
  */
-function opencodeEntry(
-    directory: string,
-    options: { moduleCalls?: Array<Record<string, unknown>> } = {},
-) {
-    const rust = options.moduleCalls !== undefined;
+function opencodeEntry(directory: string) {
     const hook = createMagicContextHook({
         client: {
             session: {
@@ -185,20 +180,7 @@ function opencodeEntry(
         config: {
             protected_tokens: 0,
             cache_ttl: "5m",
-            ...(rust
-                ? { transform_mode: "rust" as const, historian: { runner: "broca" as const } }
-                : {}),
         } as MagicContextDeps["config"],
-        ...(rust
-            ? {
-                  rustModeModuleClient: {
-                      call: async (request: Record<string, unknown>) => {
-                          options.moduleCalls?.push(request);
-                          throw new Error("test module refuses every call");
-                      },
-                  } as unknown as RustModeModuleClient,
-              }
-            : {}),
     });
     if (!hook) throw new Error("hook construction failed");
     const transform = createMessagesTransformHandler({ magicContext: hook as never });
@@ -337,29 +319,6 @@ describe("a session enrolled after its session.created", () => {
         const controlRows = rowsByTable("ses-control");
         expect(controlRows.message_history_fts ?? 0).toBeGreaterThan(0);
         expect(controlRows.tags ?? 0).toBeGreaterThan(0);
-    });
-
-    test("in Rust mode its turns make no module calls", async () => {
-        const home = useTempDataHome("bridged-late-enroll-rust-");
-        const project = join(home, "project");
-        mkdirSync(project, { recursive: true });
-        const moduleCalls: Array<Record<string, unknown>> = [];
-        const entry = opencodeEntry(project, { moduleCalls });
-
-        await entry.event("session.created", created("ses-late", project));
-        enroll("ses-late");
-        const callsAtEnrollment = moduleCalls.length;
-        await runTurn(entry, "ses-late");
-        await runTurn(entry, "ses-late");
-        expect(moduleCalls.slice(callsAtEnrollment)).toEqual([]);
-
-        // Control: an unenrolled session on the same entry reaches the module.
-        await entry.event("session.created", created("ses-control", project));
-        await runTurn(entry, "ses-control").catch(() => undefined);
-        expect(moduleCalls.some((call) => call.sessionId === "ses-control")).toBe(true);
-        expect(moduleCalls.slice(callsAtEnrollment).every((c) => c.sessionId !== "ses-late")).toBe(
-            true,
-        );
     });
 
     test("its session.deleted removes exactly session.created's two rows and nothing else", async () => {

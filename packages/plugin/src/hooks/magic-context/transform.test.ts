@@ -1460,36 +1460,14 @@ describe("createTransform", () => {
         expect(bySession.get(shortSession)?.tool_call_tokens).toBe(0);
         expect(bySession.get(toolSession)?.tool_call_tokens).toBeGreaterThan(0);
 
-        const moduleStatus = {
-            usage: { current_total_input_tokens: 10_000, context_limit_tokens: 100_000 },
-        };
-        const shortSnapshot = buildSidebarSnapshot(
-            db,
-            shortSession,
-            process.cwd(),
-            undefined,
-            undefined,
-            undefined,
-            moduleStatus,
-        );
-        const longSnapshot = buildSidebarSnapshot(
-            db,
-            longSession,
-            process.cwd(),
-            undefined,
-            undefined,
-            undefined,
-            moduleStatus,
-        );
-        const toolSnapshot = buildSidebarSnapshot(
-            db,
-            toolSession,
-            process.cwd(),
-            undefined,
-            undefined,
-            undefined,
-            moduleStatus,
-        );
+        // The sidebar spreads the last measured input over its buckets, so give
+        // each session a reading to spread.
+        db.prepare(
+            "UPDATE session_meta SET last_input_tokens = 10000, last_context_percentage = 10 WHERE session_id IN (?, ?, ?)",
+        ).run(shortSession, longSession, toolSession);
+        const shortSnapshot = buildSidebarSnapshot(db, shortSession, process.cwd());
+        const longSnapshot = buildSidebarSnapshot(db, longSession, process.cwd());
+        const toolSnapshot = buildSidebarSnapshot(db, toolSession, process.cwd());
         expect(shortSnapshot.toolCallTokens).toBe(0);
         expect(toolSnapshot.toolCallTokens).toBeGreaterThan(0);
         expect(shortSnapshot.conversationTokens).not.toBe(toolSnapshot.conversationTokens);
@@ -5209,7 +5187,7 @@ for (const { modelID, prefixBound } of [
                 expect(
                     logs.mock.calls.filter((call) => String(call[1]).includes("m[0]/m[1] frozen:")),
                 ).toHaveLength(2);
-                await transform.clearRustSession(sessionId);
+                transform.clearSessionLogState(sessionId);
                 await pass();
                 expect(
                     logs.mock.calls.filter((call) => String(call[1]).includes("m[0]/m[1] frozen:")),

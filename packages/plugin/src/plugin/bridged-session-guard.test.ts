@@ -8,7 +8,6 @@ import type { Hooks, ToolDefinition } from "@opencode-ai/plugin";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
 import { createTagger } from "../features/magic-context/tagger";
 import type { ContextUsage } from "../features/magic-context/types";
-import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
 import { createTransform } from "../hooks/magic-context/transform";
 import { BRIDGED_SESSIONS_KEY } from "../shared/bridged-sessions";
 import { drainNotifications } from "../shared/rpc-notifications";
@@ -436,8 +435,8 @@ describe("Desktop notices", () => {
 // Tests against the real OpenCode 1 messages-transform pipeline:
 // createTransform behind createMessagesTransformHandler, wired the way
 // src/index.ts wires it, over a real context database. They check that an
-// enrolled session gets no tag prefixes, no database rows and no Rust module
-// calls from the very code that would otherwise produce them.
+// enrolled session gets no tag prefixes and no database rows from the very
+// code that would otherwise produce them.
 // ---------------------------------------------------------------------------
 
 type TestMessage = {
@@ -461,10 +460,7 @@ function sessionMessages(sessionId: string): TestMessage[] {
     ];
 }
 
-function realPipeline(
-    sessionIds: string[],
-    options: { rustModuleCall?: (request: Record<string, unknown>) => Promise<unknown> } = {},
-) {
+function realPipeline(sessionIds: string[]) {
     const db = openDatabase();
     const transform = createTransform({
         tagger: createTagger(),
@@ -481,15 +477,6 @@ function realPipeline(
         lastHeuristicsTurnId: new Map<string, string>(),
         clearReasoningAge: 50,
         protectedTokens: 0,
-        ...(options.rustModuleCall
-            ? {
-                  transformMode: "rust" as const,
-                  historianRunner: "broca" as const,
-                  rustModeModuleClient: {
-                      call: options.rustModuleCall,
-                  } as unknown as RustModeModuleClient,
-              }
-            : {}),
     });
     const handler = createMessagesTransformHandler({
         magicContext: { "experimental.chat.messages.transform": transform } as never,
@@ -569,30 +556,6 @@ describe("standDownForBridgedSessions: real messages transform", () => {
         // not from a pipeline that writes nothing.
         expect(plain[0].parts[0].text).toStartWith("§1§ ");
         expect(rowsForSession(db, "ses-plain")).toBeGreaterThan(0);
-    });
-
-    test("an enrolled session makes no Rust-mode module calls", async () => {
-        useTempDataHome("bridged-real-rust-");
-        enroll("ses-bridged");
-        const calls: Array<Record<string, unknown>> = [];
-        const rustModuleCall = async (request: Record<string, unknown>) => {
-            calls.push(request);
-            throw new Error("test module refuses every call");
-        };
-        const { run } = realPipeline(["ses-bridged", "ses-plain"], { rustModuleCall });
-
-        const bridged = sessionMessages("ses-bridged");
-        const before = JSON.stringify(bridged);
-        await run(bridged);
-        expect(calls).toEqual([]);
-        expect(JSON.stringify(bridged)).toBe(before);
-
-        // Control: in the same Rust-mode pipeline an unenrolled session does
-        // call the Rust module client, so the enrolled session's empty call
-        // list shows the guard stopped those calls.
-        await run(sessionMessages("ses-plain")).catch(() => undefined);
-        expect(calls.length).toBeGreaterThan(0);
-        expect(calls.every((call) => call.sessionId !== "ses-bridged")).toBe(true);
     });
 });
 

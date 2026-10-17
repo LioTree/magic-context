@@ -23,7 +23,6 @@ import type { StatusDetail } from "../../shared/rpc-types";
 import { statusSummaryFromDetail } from "../../shared/status-summary";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { recordV2ToolDefinitions } from "./context";
-import { resolveV2RustModeModuleClient } from "./rust-mode";
 import type { SessionContext } from "./types";
 
 function draft(overrides: Partial<SessionContext> = {}): SessionContext {
@@ -50,20 +49,7 @@ describe("v2 transform-mode resolution", () => {
         __resetHostLimitations();
     });
 
-    it("builds a module client for Rust mode and none for TypeScript mode", () => {
-        const directory = "/tmp/magic-context-v2-rust-mode";
-        expect(resolveV2RustModeModuleClient({ transform_mode: "ts" }, directory)).toBeUndefined();
-        expect(resolveV2RustModeModuleClient({}, directory)).toBeUndefined();
-        const client = resolveV2RustModeModuleClient({ transform_mode: "rust" }, directory);
-        expect(client).toBeDefined();
-        // Every method the RPC status handlers and the transform reach for must be
-        // present; a missing one reads as "Rust module status unavailable" at runtime.
-        for (const method of ["call", "stateSyncCapabilities", "deleteSession", "closeSession"]) {
-            expect(typeof (client as unknown as Record<string, unknown>)[method]).toBe("function");
-        }
-    });
-
-    it("an OpenCode 2 seat config with transform_mode rust loads as ts and builds no module client", () => {
+    it("an OpenCode 2 seat config with transform_mode rust loads as ts", () => {
         const xdg = createTestTempDirFromPath(join(tmpdir(), "mc-v2-seat-config-"));
         const project = createTestTempDirFromPath(join(tmpdir(), "mc-v2-seat-project-"));
         mkdirSync(join(xdg, "cortexkit"), { recursive: true });
@@ -86,7 +72,6 @@ describe("v2 transform-mode resolution", () => {
                 const config = loadPluginConfigDetailed(project, false).config;
                 expect(config.transform_mode).toBe("ts");
                 expect(config.rust_pipeline).toBe("full_request");
-                expect(resolveV2RustModeModuleClient(config, project)).toBeUndefined();
             }
             expect(
                 log.mock.calls.filter(
@@ -100,21 +85,6 @@ describe("v2 transform-mode resolution", () => {
             else process.env.XDG_CONFIG_HOME = original;
             rmSync(xdg, { recursive: true, force: true });
             rmSync(project, { recursive: true, force: true });
-        }
-    });
-
-    it("declares no limitation for a Rust-mode session", () => {
-        const warnings: string[] = [];
-        const original = console.warn;
-        console.warn = (...args: unknown[]) => {
-            warnings.push(args.map(String).join(" "));
-        };
-        try {
-            resolveV2RustModeModuleClient({ transform_mode: "rust" }, "/tmp/magic-context-v2-rust");
-            expect(activeHostLimitations()).toEqual([]);
-            expect(warnings).toEqual([]);
-        } finally {
-            console.warn = original;
         }
     });
 

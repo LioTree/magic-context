@@ -1,10 +1,6 @@
-import {
-    projectNeedsSingleStoreMigration,
-    SingleStoreMigrationRequiredError,
-} from "../../../hooks/magic-context/single-store-refusal";
+import { SingleStoreMigrationRequiredError } from "../../../hooks/magic-context/single-store-refusal";
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
-import type { ClassifyModuleClient } from "./classify";
 
 const loggedNotOwnerProjects = new Set<string>();
 
@@ -25,36 +21,23 @@ export class DreamerModuleFailureError extends Error {
     }
 }
 
-export type DreamerModuleClient = ClassifyModuleClient;
+/** The module transport a dreamer write route calls. */
+export interface DreamerModuleClient {
+    call(args: {
+        sessionId: string;
+        projectRoot: string;
+        method: string;
+        body: unknown;
+        signal?: AbortSignal;
+        timeoutMs?: number;
+    }): Promise<unknown>;
+}
 
 export interface DreamerModuleRoute {
     moduleClient: DreamerModuleClient;
     moduleSessionId: string;
     moduleProjectRoot: string;
     moduleCommandId: string;
-}
-
-/** Both writers use the same rows; routing no longer changes ownership or row ids. */
-export async function resolveDreamerModuleRoute(args: {
-    db: Database;
-    projectIdentity: string;
-    projectRoot: string;
-    transformMode?: "ts" | "rust";
-    moduleClient?: DreamerModuleClient;
-    commandId: string;
-}): Promise<DreamerModuleRoute | undefined> {
-    if (projectNeedsSingleStoreMigration(args.db, args.projectIdentity)) {
-        throw new SingleStoreMigrationRequiredError();
-    }
-    if (args.transformMode === "rust" && !args.moduleClient)
-        throw new DreamerModuleFailureError("memory route", new Error("module client unavailable"));
-    if (args.transformMode === "ts" || !args.moduleClient) return undefined;
-    return {
-        moduleClient: args.moduleClient,
-        moduleSessionId: args.projectIdentity,
-        moduleProjectRoot: args.projectRoot,
-        moduleCommandId: args.commandId,
-    };
 }
 
 export interface ModuleMemoryIdentity {

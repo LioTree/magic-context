@@ -25,7 +25,6 @@ import {
     FULL_PARAMETER_DESCRIPTIONS,
     LIGHT_PARAMETER_DESCRIPTIONS,
 } from "../tools/parameter-descriptions";
-import type { RustToolBackends } from "./rust-tool-backends";
 import { createToolRegistry, getCompactionOffRemovedToolIds } from "./tool-registry";
 import type { PluginContext } from "./types";
 
@@ -65,7 +64,6 @@ const ctx = { directory: process.cwd() } as unknown as PluginContext;
 
 function buildRegistry(
     config: Partial<MagicContextPluginConfig>,
-    rustToolBackends?: RustToolBackends,
     promptSurfaceRuntime?: PromptSurfaceRuntime,
     registrationPromptSurface?: MagicContextPluginConfig["prompt_surface"],
     includeDreamerOnlyTools = false,
@@ -73,7 +71,6 @@ function buildRegistry(
     return createToolRegistry({
         ctx,
         pluginConfig: { enabled: true, ...config } as MagicContextPluginConfig,
-        rustToolBackends,
         promptSurfaceRuntime,
         registrationPromptSurface,
         includeDreamerOnlyTools,
@@ -134,42 +131,12 @@ describe("createToolRegistry — memory gating", () => {
 
     it("registers ctx_memory_list only for the permission-filtered runtime map", () => {
         isolateDb();
-        const tools = buildRegistry({}, undefined, undefined, undefined, true);
+        const tools = buildRegistry({}, undefined, undefined, true);
         expect(Object.keys(tools)).toContain("ctx_memory_list");
         const listSchema = tool.schema.toJSONSchema(
             tool.schema.object(tools.ctx_memory_list?.args ?? {}),
         ) as { properties?: Record<string, unknown> };
         expect(Object.keys(listSchema.properties ?? {}).sort()).toEqual(["category", "limit"]);
-    });
-
-    it("keeps ctx_note on context.db in rust mode", async () => {
-        isolateDb();
-        let moduleCalls = 0;
-        const tools = buildRegistry(
-            { transform_mode: "rust" },
-            {
-                reduce: async () => {
-                    moduleCalls += 1;
-                    return { ok: true, queued: 1 };
-                },
-                memorySync: () => {
-                    moduleCalls += 1;
-                },
-            },
-        );
-
-        const result = await tools.ctx_note.execute(
-            { action: "write", content: "Notes remain on the OpenCode leg." },
-            { sessionID: "ses-note-rust", directory: process.cwd() },
-        );
-        const db = openDatabase();
-        const row = db
-            ?.prepare("SELECT content FROM notes WHERE session_id = ?")
-            .get("ses-note-rust") as { content: string } | undefined;
-
-        expect(result).toContain("Saved session note");
-        expect(row?.content).toBe("Notes remain on the OpenCode leg.");
-        expect(moduleCalls).toBe(0);
     });
 
     it("omits ctx_memory when memory.enabled is false, but keeps ctx_search", () => {
@@ -358,7 +325,6 @@ describe("createToolRegistry — prompt-surface registration", () => {
                     tool_descriptions: { ctx_search: "Custom search surface" },
                 },
             } as Partial<MagicContextPluginConfig>,
-            undefined,
             runtime,
         );
 
@@ -383,7 +349,6 @@ describe("createToolRegistry — prompt-surface registration", () => {
         isolateDb();
         const light = buildRegistry(
             { prompt_surface: { default: "light" } } as Partial<MagicContextPluginConfig>,
-            undefined,
             runtime,
         );
 
@@ -429,7 +394,6 @@ describe("createToolRegistry — user-owned registration default", () => {
                     tool_descriptions: { ctx_search: "User-owned search description" },
                 },
             } as Partial<MagicContextPluginConfig>,
-            undefined,
             runtime,
             {
                 default: "full",

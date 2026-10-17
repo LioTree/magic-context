@@ -132,7 +132,6 @@ if (mode === "compare") {
             writeFileSync(join(output, `${host}-${pass}.wire`), JSON.stringify(served.messages));
         }
         unregister();
-        transform.disposeRust();
     } else if (host === "pi") {
         const { registerPiContextHandler } = await load(
             "packages/pi-plugin/src/context-handler.ts",

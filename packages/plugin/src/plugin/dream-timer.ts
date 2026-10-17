@@ -1,7 +1,6 @@
 import { statSync } from "node:fs";
 
 import type { DreamerConfig } from "../config/schema/magic-context";
-import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { logDreamerNotOwnerOnce } from "../features/magic-context/dreamer/module-apply";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
@@ -160,16 +159,7 @@ interface ProjectRegistration {
     primerRawProviderFactory?: (
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
-    transformMode?: "ts" | "rust";
     onDreamerProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
-    moduleClient?: ClassifyModuleClient & {
-        authorityStatus?: (args: {
-            context_store_uuid: string;
-            project: string;
-            projectRoot?: string;
-            domain: "memories" | "notes";
-        }) => Promise<{ authority: { state?: string; generation?: number } | null }>;
-    };
     sessionCleanupModuleClient?: {
         deleteSession(sessionId: string, projectRoot: string): Promise<void>;
         closeSession?(sessionId: string): void;
@@ -687,8 +677,6 @@ async function sweepProject(
             memoryInjectionBudgetTokens: reg.memoryInjectionBudgetTokens,
             retinaHandoff: reg.retinaHandoff,
             smartNotesEnabled: reg.smartNotesEnabled,
-            transformMode: reg.transformMode,
-            moduleClient: reg.moduleClient,
             onProgress: (progress, completedTask) =>
                 reg.onDreamerProgress?.(progress, completedTask),
         });

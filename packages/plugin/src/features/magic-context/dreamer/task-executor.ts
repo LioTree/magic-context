@@ -51,7 +51,7 @@ import { runCompressCues } from "../mural/compress-cues";
 import { detectOverflow } from "../overflow-detection";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
-import { type ClassifyModuleClient, runClassify } from "./classify";
+import { runClassify } from "./classify";
 import {
     beginCurateCategoryRun,
     type CurateMemoryCategory,
@@ -77,17 +77,11 @@ import {
 } from "./lease";
 import { snapshotMaintainDocsFiles } from "./maintain-docs-protected-enforcement";
 import { mapMemories } from "./map-memories";
-import {
-    DreamerModuleFailureError,
-    type DreamerModuleRoute,
-    resolveDreamerModuleRoute,
-} from "./module-apply";
 import { promotePrimers } from "./promote-primers";
 import { refreshPrimers } from "./refresh-primers";
 import {
     applyRetrospectiveLearnings,
     parseRetrospectiveLearnings,
-    validateRetrospectiveLearningText,
 } from "./retrospective-learnings";
 import {
     type RetrospectiveRawMessage,
@@ -170,9 +164,6 @@ export interface DreamTaskExecutorDeps {
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
     language?: string;
-    /** Resolved project transform mode; an explicit TS mode always stays on TS. */
-    transformMode?: "ts" | "rust";
-    /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
     mural?: { enabled: boolean };
     memoryInjectionBudgetTokens?: number;
     retinaHandoff?: boolean;
@@ -185,14 +176,6 @@ export interface DreamTaskExecutorDeps {
     ) => { spent: number; finalizeFired: boolean } | undefined;
     /** Optional callback for tests and host integrations to resolve the smallest usable input window across child model attempts. */
     resolveRetrospectiveUsableInputTokens?: (models: readonly ModelInput[]) => number | undefined;
-    moduleClient?: ClassifyModuleClient & {
-        authorityStatus?: (args: {
-            context_store_uuid: string;
-            project: string;
-            projectRoot?: string;
-            domain: "memories" | "notes";
-        }) => Promise<{ authority: { state?: string; generation?: number } | null }>;
-    };
 }
 
 /** A failed task either hot-retries (transient: provider/network/rate-limit/
@@ -547,31 +530,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             return `${config.task} incomplete: ${remaining} remain (was ${backlogAtStart.pending} at run start; processed ${processed} this run)`;
         };
         const migrationRequired = projectNeedsSingleStoreMigration(db, projectIdentity);
-        let moduleRoute: Awaited<ReturnType<typeof resolveDreamerModuleRoute>>;
-        if (
-            !migrationRequired &&
-            !config.modelChainUnavailable &&
-            (config.task === "curate" ||
-                config.task === "map-memories" ||
-                config.task === "compress-cues" ||
-                config.task === "classify-memories" ||
-                config.task === "verify" ||
-                config.task === "verify-broad" ||
-                config.task === "retrospective")
-        ) {
-            try {
-                moduleRoute = await resolveDreamerModuleRoute({
-                    db,
-                    projectIdentity,
-                    projectRoot: deps.sessionDirectory,
-                    transformMode: deps.transformMode,
-                    moduleClient: deps.moduleClient,
-                    commandId: `${startedAt}:${holderId}:${config.task}`,
-                });
-            } catch (error) {
-                throw new DreamerModuleFailureError("store admission", error);
-            }
-        }
         const parent =
             migrationRequired || config.modelChainUnavailable
                 ? deps.parentSessionId
@@ -795,7 +753,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseAcquisition,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
-                    moduleRoute,
                     onProgress: (processed) => reportProgress(processed),
                 });
                 log(
@@ -850,7 +807,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseAcquisition,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
-                    moduleRoute,
                     tokenBudget: config.tokenBudget,
                     onBudgetUpdate,
                     onProgress: (processed) => reportProgress(processed),
@@ -902,7 +858,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
-                    moduleRoute,
                     tokenBudget: config.tokenBudget,
                     onBudgetUpdate,
                     onProgress: (processed, refused) => reportProgress(processed, refused),
@@ -959,23 +914,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "classify-memories") {
                 // Cache-neutral metadata write (classified_at/importance/scope/
                 // shareable) — no memory_changes telemetry (status counts unchanged).
-                let moduleArgs:
-                    | Pick<
-                          import("./classify").ClassifyArgs,
-                          | "moduleClient"
-                          | "moduleSessionId"
-                          | "moduleProjectRoot"
-                          | "moduleCommandId"
-                      >
-                    | undefined;
-                if (moduleRoute) {
-                    moduleArgs = {
-                        moduleClient: moduleRoute.moduleClient,
-                        moduleSessionId: moduleRoute.moduleSessionId,
-                        moduleProjectRoot: moduleRoute.moduleProjectRoot,
-                        moduleCommandId: moduleRoute.moduleCommandId,
-                    };
-                }
                 const result = await runClassify({
                     db,
                     client: deps.client,
@@ -990,7 +928,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
-                    ...moduleArgs,
                     onProgress: (processed) => reportProgress(processed),
                 });
                 log(
@@ -1089,7 +1026,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     parent,
                     invocationStartedAt: startedAt,
-                    moduleRoute,
                 });
                 if (retro.skipReason) return skip(retro.skipReason);
                 recordRun("completed", null, {
@@ -1132,7 +1068,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 computeMemoryDelta,
                 reportProgress,
                 leaseAcquisition,
-                moduleRoute,
             });
         } catch (error) {
             if (error instanceof DreamTokenBudgetExceeded) {
@@ -1397,7 +1332,6 @@ async function runRetrospectiveTask(
         parent: string | undefined;
         invocationStartedAt: number;
         onBudgetUpdate: (state: { spent: number; finalizeFired: boolean }) => void;
-        moduleRoute?: DreamerModuleRoute;
     },
 ): Promise<{
     retrospectiveWatermarkMs: number | null;
@@ -1667,53 +1601,6 @@ async function runRetrospectiveTask(
         const sourceSessionId =
             flagged[0]?.sessionId ?? userMessages[0]?.sessionId ?? "retrospective";
         const learnings = parseRetrospectiveLearnings(deepenRun.validated);
-        let moduleMemoryWritten = 0;
-        const moduleRejected: Array<{ content: string; reason: string }> = [];
-        let hostLearnings = learnings;
-        if (helpers.moduleRoute) {
-            const moduleLearnings = learnings.filter((learning) => {
-                if (learning.route !== "memory") return false;
-                const reason = validateRetrospectiveLearningText(
-                    learning.content,
-                    userMessages.map((message) => message.text ?? ""),
-                );
-                if (reason || !learning.category) {
-                    if (reason) moduleRejected.push({ content: learning.content, reason });
-                    return false;
-                }
-                return true;
-            });
-            hostLearnings = learnings.filter((learning) => learning.route !== "memory");
-            for (const learning of moduleLearnings) {
-                try {
-                    const response = await helpers.moduleRoute.moduleClient.call({
-                        sessionId: helpers.moduleRoute.moduleSessionId,
-                        projectRoot: helpers.moduleRoute.moduleProjectRoot,
-                        method: "ctx_memory",
-                        body: {
-                            name: "ctx_memory",
-                            arguments: {
-                                action: "write",
-                                memory_project: projectIdentity,
-                                category: learning.category,
-                                content: learning.content,
-                                command_id: `${helpers.moduleRoute.moduleCommandId}:${moduleMemoryWritten}`,
-                            },
-                        },
-                    });
-                    const body = ((response as { result?: unknown })?.result ?? response) as {
-                        ok?: unknown;
-                        error?: unknown;
-                    };
-                    if (body?.ok === false || body?.error)
-                        throw new Error("module rejected retrospective memory");
-                    moduleMemoryWritten += 1;
-                } catch (error) {
-                    throw new DreamerModuleFailureError("ctx_memory retrospective write", error);
-                }
-            }
-            // Invalid memory learnings remain rejected, but never reach a TypeScript memory insert.
-        }
         // Apply learnings AND record the processed-window key in ONE transaction
         // so a crash between them can't leave the window un-recorded (which would
         // re-deepen + risk a duplicate observation next run, since
@@ -1727,7 +1614,7 @@ async function runRetrospectiveTask(
                     db,
                     projectIdentity,
                     sourceSessionId,
-                    learnings: hostLearnings,
+                    learnings,
                     userMemoryCollectionEnabled: deps.userMemoryCollectionEnabled === true,
                     // Source user lines for the near-transcription reject: a learning
                     // that echoes a long verbatim run of the user's words is a
@@ -1736,8 +1623,6 @@ async function runRetrospectiveTask(
                         .map((message) => message.text ?? "")
                         .filter((text) => text.length > 0),
                 });
-                result.memoryWritten += moduleMemoryWritten;
-                result.rejected.push(...moduleRejected);
                 recordRetrospectiveWindowProcessed(db, projectIdentity, windowKey);
                 return result;
             },
@@ -1839,7 +1724,6 @@ async function runAgenticTask(
         reportProgress: (processed: number, refused?: number) => void;
         onBudgetUpdate: (state: { spent: number; finalizeFired: boolean }) => void;
         leaseAcquisition: LeaseAcquisition;
-        moduleRoute?: DreamerModuleRoute;
     },
 ): Promise<TaskExecOutcome> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
@@ -1899,7 +1783,6 @@ async function runAgenticTask(
                 holderId,
                 leaseKey,
                 leaseAcquisition: helpers.leaseAcquisition,
-                moduleRoute: helpers.moduleRoute,
             });
             if (leaseLost) throw new Error("Dream lease lost during expired-memory archive");
             const scope = beginCurateCategoryRun(

@@ -249,7 +249,6 @@ test.skipIf(process.env.REVIEW_OUTPUT === undefined)(
 				}),
 			);
 		} finally {
-			transform.disposeRust();
 			resetLkgSlotsForTest();
 			resetCtxReduceRegisteredGloballyForTest();
 			closeDatabase();

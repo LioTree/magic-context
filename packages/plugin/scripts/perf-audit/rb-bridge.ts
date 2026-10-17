@@ -28,7 +28,6 @@ const { __rustModeTransformTest: rust } = await import("../../src/hooks/magic-co
 const { captureSlot, noteEntry, resetLkgSlotsForTest, messageContentSnapshot } = await import("../../src/hooks/magic-context/lkg-slot");
 const { saveLkgSlotToDb, loadPersistedLkgSlot } = await import("../../src/hooks/magic-context/lkg-persist");
 const { computeM0BlockTokens } = await import("../../src/hooks/magic-context/m0-token-breakdown");
-const { servedModuleM0Text } = await import("../../src/hooks/magic-context/rust-served-m0");
 const { todowritePermissionDenied } = await import("../../src/hooks/magic-context/ctx-reduce-availability");
 const { _resetDreamTimerForTests, _setDreamTimerStagesForTests, startDreamScheduleTimer } = await import("../../src/plugin/dream-timer");
 const { flushLogger } = await import("../../src/shared/logger");
@@ -100,7 +99,7 @@ try {
         const tokens = computeM0BlockTokens(db, sessionId, m0Args);
         const blob = Buffer.alloc(Math.min(n * 300, 24_000_000), 65);
         db.prepare("UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?").run(blob, sessionId);
-        rows.push({ n, jsonBytes: Buffer.byteLength(jsonPrefix), rb1StringifyMs: measure(() => JSON.stringify(messages)), rb1PersistMs: persistMs, rb1WritesPerCapture: (changesAfter - changesBefore) / 8, rb1PersistedHash: hash(loadPersistedLkgSlot(db, sessionId)), rb2PageAndTransportMs: pageMs, rb2WireHash: hash(pages.map(({ page }) => JSON.stringify({ ...page, accept_reply_pages: true }))), rb3NoteEntryMs: noteMs, rb4CloneMs: measure(() => cloneModuleNativeOutput(messages)), rb5PrefixGuardMs: compareMs, rb7DuplicateMuralBytes: 300_000, rb7MuralProbeMs: measure(() => JSON.stringify([body.pass_inputs])), rb8SelectAllMs: measure(() => db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(sessionId)), rb8BpeMs: measure(() => computeM0BlockTokens(db, sessionId, m0Args)), rb8TokenHash: hash(tokens), rb16ParseM0Ms: measure(() => servedModuleM0Text(sessionId, () => slot)) });
+        rows.push({ n, jsonBytes: Buffer.byteLength(jsonPrefix), rb1StringifyMs: measure(() => JSON.stringify(messages)), rb1PersistMs: persistMs, rb1WritesPerCapture: (changesAfter - changesBefore) / 8, rb1PersistedHash: hash(loadPersistedLkgSlot(db, sessionId)), rb2PageAndTransportMs: pageMs, rb2WireHash: hash(pages.map(({ page }) => JSON.stringify({ ...page, accept_reply_pages: true }))), rb3NoteEntryMs: noteMs, rb4CloneMs: measure(() => cloneModuleNativeOutput(messages)), rb5PrefixGuardMs: compareMs, rb7DuplicateMuralBytes: 300_000, rb7MuralProbeMs: measure(() => JSON.stringify([body.pass_inputs])), rb8SelectAllMs: measure(() => db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(sessionId)), rb8BpeMs: measure(() => computeM0BlockTokens(db, sessionId, m0Args)), rb8TokenHash: hash(tokens) });
 
         db.transaction(() => { for (let i = 0; i < n; i++) queuePendingOp(db, sessionId, i, "drop", i); })();
         rows.push({ n, rb11PendingRowsMs: measure(() => getPendingOps(db, sessionId)), rb11ProbeMs: measure(() => hasPendingDropOps(db, sessionId)), rb11OverflowTwoReadsMs: measure(() => { getOverflowState(db, sessionId); getOverflowState(db, sessionId); }), rb11UnknownOperationPreserved: true });

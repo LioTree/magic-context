@@ -31,7 +31,6 @@ import { CTX_NOTE_LIGHT_DESCRIPTION } from "../tools/light-descriptions";
 import { parameterDescriptionsFor } from "../tools/parameter-descriptions";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
-import type { RustToolBackends } from "./rust-tool-backends";
 import { guardSubagentTools } from "./subagent-tool-policy";
 import type { PluginContext } from "./types";
 
@@ -64,13 +63,12 @@ export function getCompactionOffRemovedToolIds(): readonly string[] {
 export function createToolRegistry(args: {
     ctx: PluginContext;
     pluginConfig: MagicContextPluginConfig;
-    rustToolBackends?: RustToolBackends;
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     registrationPromptSurface?: PromptSurfaceConfig;
     includeDreamerOnlyTools?: boolean;
     internalChildSessions?: ReadonlySet<string>;
 }): Record<string, ToolDefinition> {
-    const { ctx, pluginConfig, rustToolBackends } = args;
+    const { ctx, pluginConfig } = args;
 
     if (pluginConfig.enabled !== true) {
         return {};
@@ -154,7 +152,6 @@ export function createToolRegistry(args: {
                           sessionId,
                           getObservedEpochFloor(db, sessionId),
                       ),
-                  rustToolBackends,
               })),
         ...createCtxExpandTools({ db, expandTools: pluginConfig.historian?.expand_tools }),
         ...createCtxNoteTools({
@@ -162,7 +159,6 @@ export function createToolRegistry(args: {
             dreamerEnabled: isDreamerRunnable(pluginConfig),
             smartNotesEnabled: pluginConfig.smart_notes?.enabled,
             resolveProjectPath,
-            rustToolBackends,
         }),
         ...createCtxSearchTools({
             db,
@@ -181,8 +177,6 @@ export function createToolRegistry(args: {
                   // enumeration) stays dreamer-only (runtime-gated via
                   // toolContext.agent in tools.ts).
                   allowedActions: [...CTX_MEMORY_ACTIONS],
-                  memoryAuthority: pluginConfig.transform_mode === "rust" ? "module" : "ts",
-                  rustToolBackends,
                   agentSaveClassificationAnchor: (location) =>
                       agentSaveClassificationAnchor(location),
               })
@@ -192,7 +186,6 @@ export function createToolRegistry(args: {
                   db,
                   resolveProjectPath,
                   ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
-                  rustToolBackends,
               })
             : {}),
     };

@@ -79,7 +79,7 @@ OpenCode 2.0.22 or newer is required: startup checks for `session.remove` and `s
 
 ## Host limitations
 
-A host limitation is a capability the current host lacks for the life of the process. `declareHostLimitation` (`shared/host-limitations.ts`) records it once; status surfaces keep printing it with its `MC-*` code. The OpenCode 2 adapter uses native session cleanup and supports Rust transform mode, so neither requires a host limitation.
+A host limitation is a capability the current host lacks for the life of the process. `declareHostLimitation` (`shared/host-limitations.ts`) records it once; status surfaces keep printing it with its `MC-*` code. The OpenCode 2 adapter uses the host's native session cleanup, so session cleanup is not a host limitation there.
 
 ## Moving between OpenCode 1 and 2 stores
 

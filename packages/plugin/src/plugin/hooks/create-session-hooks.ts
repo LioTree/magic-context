@@ -9,7 +9,6 @@ import type { DatabaseBootTimings } from "../../features/magic-context/storage-d
 import { createTagger } from "../../features/magic-context/tagger";
 import { createMagicContextHook, createMagicContextHookAsync } from "../../hooks/magic-context";
 import type { LiveSessionState } from "../../hooks/magic-context/live-session-state";
-import type { RustModeModuleClient } from "../../hooks/magic-context/rust-mode-transform";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import type { PluginContext } from "../types";
 /**
@@ -46,14 +45,13 @@ export function createSessionHooks(args: {
     pluginConfig: MagicContextPluginConfig;
     liveConfigReader?: LiveConfigReader<MagicContextPluginConfig>;
     liveSessionState: LiveSessionState;
-    rustModeModuleClient?: RustModeModuleClient;
     promptSurfaceRuntime?: PromptSurfaceRuntime;
 }) {
     const { ctx, pluginConfig, liveSessionState } = args;
     const liveConfigReader = args.liveConfigReader;
 
     if (pluginConfig.enabled !== true) {
-        return { magicContext: null, rustToolBackends: undefined };
+        return { magicContext: null };
     }
 
     const tagger = createTagger();
@@ -70,7 +68,6 @@ export function createSessionHooks(args: {
         scheduler,
         compactionHandler,
         liveSessionState,
-        rustModeModuleClient: args.rustModeModuleClient,
         promptSurfaceRuntime: args.promptSurfaceRuntime,
         config: buildMagicContextHookConfig(pluginConfig),
         sampleHistorianConfig: liveConfigReader
@@ -87,10 +84,7 @@ export function createSessionHooks(args: {
             : undefined,
     });
 
-    return {
-        magicContext: hookResult,
-        rustToolBackends: hookResult?.rustToolBackends,
-    };
+    return { magicContext: hookResult };
 }
 
 export async function createSessionHooksAsync(args: {
@@ -98,7 +92,6 @@ export async function createSessionHooksAsync(args: {
     pluginConfig: MagicContextPluginConfig;
     liveConfigReader?: LiveConfigReader<MagicContextPluginConfig>;
     liveSessionState: LiveSessionState;
-    rustModeModuleClient?: RustModeModuleClient;
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     onStorageBootTimings?: (timings: DatabaseBootTimings) => void;
 }) {
@@ -106,7 +99,7 @@ export async function createSessionHooksAsync(args: {
     const liveConfigReader = args.liveConfigReader;
 
     if (pluginConfig.enabled !== true) {
-        return { magicContext: null, rustToolBackends: undefined };
+        return { magicContext: null };
     }
 
     const tagger = createTagger();
@@ -123,7 +116,6 @@ export async function createSessionHooksAsync(args: {
         scheduler,
         compactionHandler,
         liveSessionState,
-        rustModeModuleClient: args.rustModeModuleClient,
         promptSurfaceRuntime: args.promptSurfaceRuntime,
         onStorageBootTimings: args.onStorageBootTimings,
         config: buildMagicContextHookConfig(pluginConfig),
@@ -141,8 +133,5 @@ export async function createSessionHooksAsync(args: {
             : undefined,
     });
 
-    return {
-        magicContext: hookResult,
-        rustToolBackends: hookResult?.rustToolBackends,
-    };
+    return { magicContext: hookResult };
 }

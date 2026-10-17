@@ -649,7 +649,7 @@ export const DreamerConfigSchema = AgentMetadataSchema.extend({
         .enum(["broca", "host"])
         .optional()
         .describe(
-            'Which side runs the dreamer completions the Rust module routes (classify-memories) in Rust transform mode: "host" runs them on this process\'s carrier, "broca" routes them to the Broca module. When unset, historian.runner applies, and when that is unset too the harness decides the same way it does for the historian. User-level config only.',
+            'Only for sessions the ck-mc module serves (through the CortexKit bridge, Broca or the Claude Code gateway): which side runs the dreamer completions the module routes (classify-memories). "host" runs them on the host\'s own carrier, "broca" routes them to the Broca module. When unset, historian.runner applies, and when that is unset too the harness decides the same way it does for the historian. The TypeScript dreamer runs its tasks in this process and does not read this setting. User-level config only.',
         ),
     opencode: DreamerOpenCodeHarnessBlockSchema.optional(),
     pi: DreamerPiHarnessBlockSchema.optional(),
@@ -691,7 +691,7 @@ export const HistorianConfigSchema = AgentMetadataSchema.extend({
         .enum(["broca", "host"])
         .optional()
         .describe(
-            'Which side runs the historian completion in Rust transform mode: "host" queues it for this process to run on the configured historian model, "broca" routes it to the Broca module. When unset the harness decides: OpenCode 1 and OpenCode 2 use "host", Claude Code (through the Thalamus gateway, which has no host to run a completion) uses "broca". User-level config only — it decides whose provider account pays for the call.',
+            'Only for sessions the ck-mc module serves (through the CortexKit bridge, Broca or the Claude Code gateway): which side runs the historian completion. "host" queues it for a host process to run on the configured historian model, "broca" routes it to the Broca module. When unset the harness decides: OpenCode 1 and OpenCode 2 use "host", Claude Code (through the Thalamus gateway, which has no host to run a completion) uses "broca". The TypeScript historian runs in this process and does not read this setting. User-level config only — it decides whose provider account pays for the call.',
         ),
     host_runner: z
         .object({
@@ -1328,7 +1328,7 @@ export const MagicContextConfigSchema = z
             .min(60_000)
             .default(DEFAULT_HISTORIAN_TIMEOUT_MS)
             .describe(
-                "Timeout for each historian prompt call in both TypeScript and Rust transform modes, in milliseconds (default: 600000)",
+                "Timeout for each historian prompt call, in milliseconds (default: 600000). It applies to the TypeScript historian, and to historian runs the ck-mc module queues for this host to answer.",
             ),
         commit_cluster_trigger: z
             .object({

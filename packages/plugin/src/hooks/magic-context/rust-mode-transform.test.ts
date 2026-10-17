@@ -148,7 +148,6 @@ import { registerSystemDateRefresh } from "./system-date-refresh";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import { buildSyntheticTodoPart } from "./todo-view";
 import type { TransformDeps } from "./transform";
-import { createTransform } from "./transform";
 import type { MessageLike } from "./transform-operations";
 import { reconcileMarkerRepresentation } from "./transform-postprocess-phase";
 
@@ -3296,98 +3295,6 @@ describe("Rust mode authority adapter", () => {
         expect(stateSyncBodies.every((body) => "seed_id" in body)).toBe(true);
         expect(transform.getState(sessionId).initialized).toBe(true);
         expect(transform.getState(sessionId).seedPassPending).toBe(false);
-    });
-
-    it("gates the transform before any TypeScript mutation", async () => {
-        const sessionId = `rust-gate-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const input = makeMessages(sessionId);
-        const native = [{ role: "user", parts: [{ type: "text", text: "unchanged" }] }];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native }
-                    : { ok: true },
-        };
-        const deps = makeDeps(db, moduleClient);
-        const transform = createTransform(deps);
-        const output = { messages: input as unknown[] };
-        await transform({}, output);
-        expect(output.messages).toEqual(native);
-        expect(input).toEqual(native);
-    });
-
-    it("skips TypeScript entry projection in Rust mode", async () => {
-        const sessionId = `rust-no-entry-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const native = [{ role: "user", parts: [{ type: "text", text: "unchanged" }] }];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native }
-                    : { ok: true },
-        };
-        const fullDigest = spyOn(lkgSlot, "lkgContentDigest");
-        const fields = spyOn(lkgSlot, "lkgContentFields");
-        try {
-            const transform = createTransform(makeDeps(db, moduleClient));
-            const output = { messages: makeMessages(sessionId) as unknown[] };
-            await transform({}, output);
-            expect(output.messages).toEqual(native);
-            expect(fullDigest).not.toHaveBeenCalled();
-            expect(fields).not.toHaveBeenCalled();
-        } finally {
-            fullDigest.mockRestore();
-            fields.mockRestore();
-        }
-    });
-
-    it("applies module output through the OpenCode hook array reference", async () => {
-        const sessionId = `rust-hook-array-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const input = makeMessages(sessionId);
-        const native = [
-            {
-                info: { role: "user", sessionID: sessionId },
-                parts: [{ type: "text", text: "<project-docs>m0</project-docs>", synthetic: true }],
-            },
-            {
-                info: { id: "m1", role: "user", sessionID: sessionId },
-                parts: [{ type: "text", text: "tail" }],
-            },
-        ];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          action: "CACHE_HIT",
-                          served_from: "transform",
-                          boundary_id: "m1#0",
-                          native_messages: native,
-                      }
-                    : { ok: true },
-        };
-        const transform = createTransform(makeDeps(db, moduleClient));
-        const handler = createMessagesTransformHandler({
-            magicContext: {
-                "experimental.chat.messages.transform": transform as never,
-            },
-        });
-        const output = { messages: input as unknown[] };
-        const callerHeldMessages = output.messages;
-
-        const returned = await handler({}, output as never);
-
-        expect(returned).toEqual(native);
-        expect(output.messages).toEqual(native);
-        expect(callerHeldMessages).toEqual(native);
-        expect(output.messages).toBe(callerHeldMessages);
     });
 
     it("fails the pass when a present boundary lacks a synthetic session-scoped m0", async () => {

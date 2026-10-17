@@ -247,26 +247,10 @@ function getDisabledMessage(): string {
     return "Cross-session memory is disabled for this project.";
 }
 
-function requestRustMemorySync(deps: CtxMemoryToolDeps, sessionId: string): void {
-    try {
-        deps.rustToolBackends?.memorySync?.(sessionId);
-    } catch (error) {
-        sessionLog(sessionId, "rust memory sync trigger failed (ignored):", error);
-    }
-}
-
 async function applyCurateMutation(
     deps: CtxMemoryToolDeps,
-    directory: string,
     request: AgentMemoryMutation,
 ): Promise<ApplierReceipt> {
-    // Moving both writers into context.db removes the old authority_managed markers,
-    // but Rust-mode automated edits still belong to the module. A failed module call
-    // never grants permission to write through the local TypeScript path.
-    if (deps.rustToolBackends?.curateMemory)
-        return deps.rustToolBackends.curateMemory({ ...request, projectRoot: directory });
-    if (deps.memoryAuthority === "module")
-        throw new ModuleMemoryAuthorityError(request.projectPath);
     const projects = new Set([
         request.projectPath,
         ...request.targets.map((target) => getMemoryById(deps.db, target.id)!.projectPath),
@@ -498,7 +482,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
             // categories the workspace explicitly shares. Mutations by primary
             // agents use memoryOwnedByTool so shared visibility never grants
             // write access to another project. Both predicates come from the
-            // shared policy the Rust-mode facade uses, so the two surfaces
+            // shared policy the ck-mc ctx_memory facade uses, so the two surfaces
             // cannot drift apart on who may read or edit what.
             const targetIdentityForStoredPath = (rawProjectPath: string): string =>
                 visibility.identityFor(rawProjectPath);
@@ -567,7 +551,6 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     memoryId: receipt.memoryId!,
                     content,
                 });
-                requestRustMemorySync(deps, toolContext.sessionID);
                 return `Saved memory [ID: ${receipt.memoryId}] in ${category}.`;
             }
 
@@ -680,10 +663,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         memoryId: memory.id,
                         content,
                     });
-                    requestRustMemorySync(deps, toolContext.sessionID);
                     return `Updated memory [ID: ${memory.id}] in ${category}.`;
                 }
-                const receipt = await applyCurateMutation(deps, toolContext.directory, {
+                const receipt = await applyCurateMutation(deps, {
                     key: randomUUID(),
                     projectPath: targetIdentityForStoredPath(rawProjectPath),
                     sourceSessionId: toolContext.sessionID,
@@ -695,14 +677,13 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 });
                 if (receipt.state !== "applied")
                     return `Error: ${receipt.reason}; memory [ID: ${memory.id}] is unchanged.`;
-                if (!deps.rustToolBackends?.curateMemory)
-                    queueMemoryEmbedding({
-                        deps,
-                        sessionId: toolContext.sessionID,
-                        projectPath,
-                        memoryId: memory.id,
-                        content,
-                    });
+                queueMemoryEmbedding({
+                    deps,
+                    sessionId: toolContext.sessionID,
+                    projectPath,
+                    memoryId: memory.id,
+                    content,
+                });
                 return `Updated memory [ID: ${memory.id}] in ${getValidatedCategory(args.category) ?? memory.category}.`;
             }
 
@@ -801,10 +782,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         memoryId: receipt.memoryId!,
                         content,
                     });
-                    requestRustMemorySync(deps, toolContext.sessionID);
                     return `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${receipt.memoryId}] in ${category}; superseded [${receipt.supersededIds?.join(", ")}].`;
                 }
-                const receipt = await applyCurateMutation(deps, toolContext.directory, {
+                const receipt = await applyCurateMutation(deps, {
                     key: randomUUID(),
                     projectPath,
                     sourceSessionId: toolContext.sessionID,
@@ -819,14 +799,13 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 });
                 if (receipt.state !== "applied")
                     return `Error: ${receipt.reason}; memories [${ids.join(", ")}] are unchanged.`;
-                if (!deps.rustToolBackends?.curateMemory)
-                    queueMemoryEmbedding({
-                        deps,
-                        sessionId: toolContext.sessionID,
-                        projectPath,
-                        memoryId: receipt.memoryId!,
-                        content,
-                    });
+                queueMemoryEmbedding({
+                    deps,
+                    sessionId: toolContext.sessionID,
+                    projectPath,
+                    memoryId: receipt.memoryId!,
+                    content,
+                });
                 return `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${receipt.memoryId}] in ${category}; superseded [${receipt.supersededIds?.join(", ")}].`;
             }
 
@@ -881,13 +860,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     });
                     if (receipt.state !== "applied")
                         return `Error: ${receipt.reason}; memories [${archiveIds.join(", ")}] are unchanged.`;
-                    requestRustMemorySync(deps, toolContext.sessionID);
                     const plural = archiveIds.length > 1 ? "memories" : "memory";
                     return args.reason?.trim()
                         ? `Archived ${plural} [ID: ${archiveIds.join(", ")}] (${args.reason.trim()}).`
                         : `Archived ${plural} [ID: ${archiveIds.join(", ")}].`;
                 }
-                const receipt = await applyCurateMutation(deps, toolContext.directory, {
+                const receipt = await applyCurateMutation(deps, {
                     key: randomUUID(),
                     projectPath,
                     sourceSessionId: toolContext.sessionID,
