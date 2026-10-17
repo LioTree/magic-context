@@ -3267,6 +3267,19 @@ export const MIGRATIONS: Migration[] = [
             ensureColumn(db, "session_meta", "held_release", "TEXT");
         },
     },
+    {
+        version: 101,
+        description: "nullable safety-critical memory assessment",
+        up(db: Database): void {
+            if (!tableExists(db, "memories")) return;
+            ensureColumn(
+                db,
+                "memories",
+                "safety_critical",
+                "INTEGER CHECK (safety_critical IN (0, 1))",
+            );
+        },
+    },
 ];
 
 /**

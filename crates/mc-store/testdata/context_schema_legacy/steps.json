@@ -145,5 +145,12 @@
       "ALTER TABLE session_meta ADD COLUMN served_prefix TEXT",
       "ALTER TABLE session_meta ADD COLUMN held_release TEXT"
     ]
+  },
+  {
+    "version": 101,
+    "description": "nullable safety-critical memory assessment",
+    "sql": [
+      "ALTER TABLE memories ADD COLUMN safety_critical INTEGER CHECK (safety_critical IN (0, 1))"
+    ]
   }
 ]

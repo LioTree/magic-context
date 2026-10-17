@@ -30,6 +30,7 @@ const fields = [
     "importance",
     "scope",
     "shareable",
+    "safetyCritical",
     "sourceSessionId",
     "sourceType",
     "seenCount",
@@ -62,6 +63,7 @@ const categories = new Set([
     "KNOWN_ISSUES",
 ]);
 const nullable = new Set([
+    "safetyCritical",
     "importance",
     "sourceSessionId",
     "sourceType",
@@ -73,6 +75,7 @@ const nullable = new Set([
     "metadataJson",
 ]);
 const numeric = new Set([
+    "safetyCritical",
     "id",
     "revision",
     "importance",
@@ -145,7 +148,8 @@ export function normalizeMemoryHistorySnapshot(
         !categories.has(result.category as string) ||
         !["active", "permanent", "archived"].includes(result.status as string) ||
         !["project", "ecosystem", "universe"].includes(result.scope as string) ||
-        ![0, 1].includes(result.shareable as number)
+        ![0, 1].includes(result.shareable as number) ||
+        (result.safetyCritical !== null && ![0, 1].includes(result.safetyCritical as number))
     )
         return null;
     return result as unknown as MemoryHistorySnapshot;
@@ -503,6 +507,7 @@ function planMemoryWrite(
                     "supersededByMemoryId",
                     "mergedFrom",
                     "metadataJson",
+                    "safetyCritical",
                 ].some(
                     (field) =>
                         current[field as keyof MemoryHistorySnapshot] !==
@@ -556,6 +561,7 @@ function planMemoryWrite(
                     "supersededByMemoryId",
                     "mergedFrom",
                     "metadataJson",
+                    "safetyCritical",
                 ] as const)
                     Object.assign(target, { [field]: row.before[field] });
         } else {
@@ -648,7 +654,7 @@ function applyPlannedWrite(
     for (const [index, target] of plan.after.entries()) {
         const source = plan.before[index]!;
         db.prepare(
-            "UPDATE memories SET content=?,category=?,normalized_hash=?,importance=?,scope=?,status=?,expires_at=?,superseded_by_memory_id=?,merged_from=?,metadata_json=?,shareable=0,classified_at=NULL,verification_status='unverified',verified_at=NULL,updated_at=? WHERE id=? AND revision=?",
+            "UPDATE memories SET content=?,category=?,normalized_hash=?,importance=?,scope=?,status=?,expires_at=?,superseded_by_memory_id=?,merged_from=?,metadata_json=?,safety_critical=?,shareable=0,classified_at=NULL,verification_status='unverified',verified_at=NULL,updated_at=? WHERE id=? AND revision=?",
         ).run(
             target.content,
             target.category,
@@ -660,6 +666,7 @@ function applyPlannedWrite(
             target.supersededByMemoryId,
             target.mergedFrom,
             target.metadataJson,
+            target.safetyCritical,
             now,
             target.id,
             source.revision + 1,

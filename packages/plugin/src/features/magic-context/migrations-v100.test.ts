@@ -27,7 +27,7 @@ describe("migration 100", () => {
         }
     });
 
-    it("steps populated v99 through v100 with nullable TEXT prefix documents and a matching fresh schema", () => {
+    it("steps populated v99 through current migrations with nullable TEXT prefix documents and a matching fresh schema", () => {
         const db = new Database(":memory:");
         const fresh = new Database(":memory:");
         try {
@@ -53,9 +53,9 @@ describe("migration 100", () => {
             ).toEqual({ version: 99 });
 
             runMigrations(db);
-            expect(LATEST_SUPPORTED_VERSION).toBe(100);
-            expect(LATEST_MIGRATION_VERSION).toBe(100);
-            expect(MIGRATIONS.slice(-2).map((entry) => entry.version)).toEqual([99, 100]);
+            expect(LATEST_SUPPORTED_VERSION).toBe(101);
+            expect(LATEST_MIGRATION_VERSION).toBe(101);
+            expect(MIGRATIONS.slice(-3).map((entry) => entry.version)).toEqual([99, 100, 101]);
             expect(prefixColumns(db)).toEqual([
                 { name: "held_release", type: "TEXT", notnull: 0, dflt_value: null },
                 { name: "served_prefix", type: "TEXT", notnull: 0, dflt_value: null },
@@ -69,7 +69,7 @@ describe("migration 100", () => {
             ).toEqual({ counter: 42, served_prefix: null, held_release: null });
             expect(
                 db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get(),
-            ).toEqual({ version: 100 });
+            ).toEqual({ version: 101 });
             initializeDatabase(fresh);
             expect(prefixColumns(fresh)).toEqual(prefixColumns(db));
             runMigrations(fresh);
@@ -107,7 +107,8 @@ describe("migration 100", () => {
             initializeDatabase(db);
             runMigrations(db);
             expect(enforceSchemaFence(db, ":previous-binary:", 99)).toBe(false);
-            expect(enforceSchemaFence(db, ":current-binary:", 100)).toBe(true);
+            expect(enforceSchemaFence(db, ":previous-binary:", 100)).toBe(false);
+            expect(enforceSchemaFence(db, ":current-binary:", 101)).toBe(true);
         } finally {
             db.close();
         }

@@ -85,6 +85,7 @@ function makeMemoryDatabase(): Database {
       superseded_by_memory_id INTEGER,
       merged_from TEXT,
       metadata_json TEXT,
+      safety_critical INTEGER,
       UNIQUE(project_path, category, normalized_hash)
     );
 

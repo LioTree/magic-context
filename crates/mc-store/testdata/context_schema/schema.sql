@@ -253,6 +253,7 @@ CREATE TABLE memories (
       verification_status TEXT DEFAULT 'unverified',
       verified_at INTEGER,
       classified_at INTEGER,
+      safety_critical INTEGER CHECK (safety_critical IN (0, 1)),
       superseded_by_memory_id INTEGER,
       merged_from TEXT,
       metadata_json TEXT,
@@ -1932,26 +1933,27 @@ INSERT INTO schema_migrations (version, description, applied_at) VALUES
 (97, 'durable append-only host runner entries, ids, views and pass state', :applied_at),
 (98, 'score revision sidecar, selection history and project rescore jobs', :applied_at),
 (99, 'memory lifecycle evidence, attempts, receipts and applied snapshots', :applied_at),
-(100, 'durable served thinking prefix and held release request', :applied_at);
+(100, 'durable served thinking prefix and held release request', :applied_at),
+(101, 'nullable safety-critical memory assessment', :applied_at);
 
-INSERT INTO "message_fts_rowid_map_backfill_state" ("id", "watermark_rowid", "completed", "updated_at") VALUES
-(1, 0, 0, 0);
+INSERT INTO "message_fts_rowid_map_backfill_state" ("completed", "id", "updated_at", "watermark_rowid") VALUES
+(0, 1, 0, 0);
 
-INSERT INTO "message_time_backfill_state" ("id", "cursor_session_id", "cursor_ordinal", "completed", "updated_at") VALUES
-(1, '', 0, 0, 0);
+INSERT INTO "message_time_backfill_state" ("completed", "cursor_ordinal", "cursor_session_id", "id", "updated_at") VALUES
+(0, 0, '', 1, 0);
 
-INSERT INTO "mirror_resnapshot_state" ("domain", "status", "updated_at", "generation") VALUES
-('memories', 'pending_check', 0, NULL);
+INSERT INTO "mirror_resnapshot_state" ("domain", "generation", "status", "updated_at") VALUES
+('memories', NULL, 'pending_check', 0);
 
-INSERT INTO "rescore_activation" ("id", "activated_at") VALUES
-(1, :applied_at);
+INSERT INTO "rescore_activation" ("activated_at", "id") VALUES
+(:applied_at, 1);
 
 INSERT INTO "schema_migrations_meta" ("key", "value") VALUES
 ('v22_legacy_compartment_boundary', '0'),
 ('v22_legacy_memory_backfill', 'pending');
 
-INSERT INTO "single_store_state" ("id", "state", "migrated_at", "migrated_by", "backup_dir", "report_json") VALUES
-(1, 'required', NULL, NULL, NULL, NULL);
+INSERT INTO "single_store_state" ("backup_dir", "id", "migrated_at", "migrated_by", "report_json", "state") VALUES
+(NULL, 1, NULL, NULL, NULL, 'required');
 
 ANALYZE;
 DROP TABLE IF EXISTS sqlite_stat4;

@@ -166,7 +166,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastUnconfirmedMigrationHolders = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 100;
+export const LATEST_SUPPORTED_VERSION = 101;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -1369,6 +1369,7 @@ export function initializeDatabase(
       verification_status TEXT DEFAULT 'unverified',
       verified_at INTEGER,
       classified_at INTEGER,
+      safety_critical INTEGER CHECK (safety_critical IN (0, 1)),
       superseded_by_memory_id INTEGER,
       merged_from TEXT,
       metadata_json TEXT,
