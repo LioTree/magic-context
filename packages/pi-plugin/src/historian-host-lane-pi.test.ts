@@ -7,22 +7,17 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { loadPiConfig } from "./config/index";
 import { resolveHistorianFromConfig } from "./index";
 
 /**
- * Where a Pi session stands when the shared config puts the historian in the
- * host lane.
- *
- * The host lane is a Rust-transform arrangement: the module queues a run and a
- * host process claims it. Pi has no Rust transform mode, no module client and no
- * claim-lane caller, so nothing in a Pi session can queue a run — which means the
- * failure this pins against is not "Pi claims badly" but "a run is queued with
- * nobody to answer it". These tests state what a Pi session actually does with
- * `historian.runner: "host"`, so a later change that makes Pi queue without
- * giving it a claimant cannot land quietly.
+ * A standalone Pi extension still resolves its own subagent historian when the
+ * shared config selects `historian.runner: "host"`. It must not queue jobs in a
+ * Rust module with no external worker to execute them. Rust transforms belong
+ * to the separately constructed createPiBridgeAdapter, never to the standalone
+ * extension's imports.
  */
 
 const tempRoots: string[] = [];
@@ -78,7 +73,7 @@ function piSourceFiles(): string[] {
 	return found;
 }
 
-describe("Pi and the historian host lane", () => {
+describe("standalone Pi and the historian host lane", () => {
 	it("runs its own historian and never queues a run for a claimant", () => {
 		// A claim lane needs two halves: something that queues a run and something
 		// that claims it. Pi has neither, so a Pi session cannot leave a run queued
@@ -94,8 +89,8 @@ describe("Pi and the historian host lane", () => {
 		});
 		expect(offenders).toEqual([]);
 
-		// The other half of the same fact: Pi has no Rust transform mode, so there is
-		// no module for a run to be queued in.
+		// Only createPiBridgeAdapter may call Rust transform APIs. The standalone
+		// index.ts import graph must not reach that adapter.
 		const rustModeCallers = piSourceFiles().filter((path) => {
 			const source = readFileSync(path, "utf-8");
 			return (
@@ -103,7 +98,26 @@ describe("Pi and the historian host lane", () => {
 				source.includes("createRustModeTransform")
 			);
 		});
-		expect(rustModeCallers).toEqual([]);
+		const bridge = join(import.meta.dir, "bridge-adapter-pi.ts");
+		expect(rustModeCallers).toEqual([bridge]);
+		const sources = new Set(piSourceFiles());
+		const reached = new Set<string>();
+		const scanner = new Bun.Transpiler({ loader: "ts" });
+		const visit = (path: string): void => {
+			if (reached.has(path)) return;
+			reached.add(path);
+			for (const dependency of scanner.scan(readFileSync(path, "utf8"))
+				.imports) {
+				if (!dependency.path.startsWith(".")) continue;
+				const base = resolve(dirname(path), dependency.path);
+				const target = [base, `${base}.ts`, join(base, "index.ts")].find(
+					(candidate) => sources.has(candidate),
+				);
+				if (target) visit(target);
+			}
+		};
+		visit(join(import.meta.dir, "index.ts"));
+		expect(reached.has(bridge)).toBe(false);
 	});
 
 	it("accepts historian.runner=host in shared config and resolves the Pi subagent historian anyway", () => {
