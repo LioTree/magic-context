@@ -43,6 +43,7 @@ pub mod classify;
 pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
+mod dream_claim;
 pub mod dream_dispatch;
 pub mod dream_tasks;
 mod memory_actions;
@@ -4131,6 +4132,7 @@ pub struct McHandler {
     /// Runs queued for a claimant that a firing task in this process is still
     /// waiting on. Empty under the in-module runner.
     host_runs: Arc<HostRunLedger>,
+    dream_children: Arc<dream_dispatch::host_carrier::DreamQueue>,
     /// Which runner each session's most recent historian and dreamer completion
     /// used in this process, and why. Read by the status and health surfaces.
     runner_choices: Arc<Mutex<runner_choices::RunnerChoiceLog>>,
@@ -5011,6 +5013,7 @@ impl McHandler {
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
+            dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             memory_paused_routes: Arc::default(),
@@ -5438,6 +5441,7 @@ impl McHandler {
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
+            dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             memory_paused_routes: Arc::default(),
@@ -16219,6 +16223,14 @@ impl McHandler {
                 "state_import" => self.handle_state_import_value(channel, request),
                 "agent_drops.append" => self.handle_agent_drops_value(channel, request),
                 "note.evaluate" => self.handle_note_evaluation_value(channel, &request).await,
+                "dream.child.pending"
+                | "dream.child.claim"
+                | "dream.child.heartbeat"
+                | "dream.child.opened"
+                | "dream.child.event"
+                | "dream.child.tool"
+                | "dream.child.cleanup"
+                | "dream.child.unavailable" => self.handle_dream_child(channel, method, &request),
                 "historian.pending" => self.handle_historian_pending_value(channel, &request),
                 "historian.claim" => self.handle_historian_claim_value(channel, &request),
                 "historian.heartbeat" => self.handle_historian_heartbeat_value(channel, &request),

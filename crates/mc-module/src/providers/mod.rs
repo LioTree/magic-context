@@ -127,7 +127,7 @@ fn host_binding(binding: &SessionBinding) -> bool {
     matches!(binding.harness.as_str(), "opencode" | "opencode2") || attested_claude_code(binding)
 }
 
-fn admit_host_lane(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
+pub(super) fn admit_host_lane(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
     if !matches!(binding.harness.as_str(), "opencode" | "opencode2") {
         return Ok(());
     }
