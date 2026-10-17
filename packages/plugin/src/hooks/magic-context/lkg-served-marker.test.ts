@@ -423,6 +423,56 @@ describe("served marker durability", () => {
         }
     });
 
+    test("a sibling writer can replace the certified request while this process reuses the old marker", () => {
+        // Two connections share one context.db. The second connection commits a
+        // newer served request and advances the marker. This connection still
+        // holds the older request. Reuse must not allocate a new id for that
+        // older request, and saving it must not replace the committed request.
+        const root = createTestTempDirFromPath(join(tmpdir(), "served-marker-sibling-"));
+        const db = fixture(join(root, "context.db"));
+        const sibling = new Database(join(root, "context.db"));
+        databases.push(sibling);
+        try {
+            const first = slot(recordServedCapture(db, "s", true));
+            expect(captureSlot("s", first)).toBe(true);
+            expect(saveLkgSlotToDb(db, "s", first)).toBe(true);
+            const replacement = {
+                ...first,
+                jsonPrefix: '[{"text":"sibling served bytes"}]',
+                inputContentDigests: ["sibling-digest"],
+                inputMoveDigests: ["b".repeat(64)],
+                captureSequence: 9,
+                servedCaptureId: recordServedCapture(sibling, "s", true),
+            };
+            expect(replacement.servedCaptureId).toBe(first.servedCaptureId! + 1);
+            expect(saveLkgSlotToDb(sibling, "s", replacement)).toBe(true);
+            expect(loadPersistedLkgSlot(sibling, "s")?.jsonPrefix).toBe(replacement.jsonPrefix);
+
+            const olderRequest = {
+                ...first,
+                capturedAt: first.capturedAt + 1,
+                captureSequence: 4,
+            };
+            const reused = recordServedCapture(db, "s", true, olderRequest);
+            if (reused === undefined) {
+                expect(readServedMarker(db, "s")?.servedCaptureId).toBe(
+                    replacement.servedCaptureId,
+                );
+                return;
+            }
+            const staleCertified = { ...olderRequest, servedCaptureId: reused };
+            expect(captureSlot("s", staleCertified)).toBe(true);
+            expect(saveLkgSlotToDb(db, "s", staleCertified)).toBe(false);
+            expect(loadPersistedLkgSlot(db, "s")?.jsonPrefix).toBe(replacement.jsonPrefix);
+            expect(readServedMarker(db, "s")?.servedCaptureId).toBe(
+                replacement.servedCaptureId,
+            );
+        } finally {
+            for (const connection of databases.splice(0)) connection.close();
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("TS saves the same marker id and certifies partial anchor coverage as no_frontier", () => {
         const db = fixture();
         const input = [
