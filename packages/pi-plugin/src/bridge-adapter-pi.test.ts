@@ -1,11 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import {
-	mkdirSync,
-	mkdtempSync,
-	readdirSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "../../plugin/src/features/magic-context/compartment-storage";
@@ -13,6 +7,10 @@ import { getOrCreateSessionMeta } from "../../plugin/src/features/magic-context/
 import { setPendingPiCompactionMarkerState } from "../../plugin/src/features/magic-context/storage-meta-persisted";
 import { startOracle } from "../../plugin/src/hooks/magic-context/host-runner/conformance/oracle";
 import { Database } from "../../plugin/src/shared/sqlite";
+import {
+	cleanupTestTempDir,
+	createTestTempDirFromPath,
+} from "../../plugin/src/shared/test-temp-dir";
 import {
 	nativePiEntry,
 	type PiBridgeEntry,
@@ -26,12 +24,12 @@ import { createTestDb } from "./test-utils.test";
 
 const roots: string[] = [];
 afterAll(() => {
-	for (const root of roots) rmSync(root, { recursive: true, force: true });
+	for (const root of roots) cleanupTestTempDir(root);
 });
 function fixture() {
 	const base = join(tmpdir(), "magic-context/pi-bridge");
 	mkdirSync(base, { recursive: true });
-	const root = mkdtempSync(join(base, "adapter-"));
+	const root = createTestTempDirFromPath(join(base, "adapter-"));
 	roots.push(root);
 	createTestDb(join(root, "context.db")).close();
 	const configPath = join(root, "config.json");

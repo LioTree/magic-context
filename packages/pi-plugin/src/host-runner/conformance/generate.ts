@@ -1,24 +1,22 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import {
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { setPendingPiCompactionMarkerState } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { startOracle } from "@magic-context/core/hooks/magic-context/host-runner/conformance/oracle";
 import { Database } from "@magic-context/core/shared/sqlite";
+import {
+	cleanupTestTempDir,
+	createTestTempDirFromPath,
+} from "@magic-context/core/shared/test-temp-dir";
 import type { PiBridgeEntry } from "../../bridge-codec-pi";
 import { createPiBridgeAdapter } from "../../host-runner";
 import { createTestDb } from "../../test-utils.test";
 
 export const PI_VECTOR_PATH = new URL(
-	"./vectors/relay-pi-v1.json",
+	"../../../../plugin/src/hooks/magic-context/host-runner/conformance/vectors/relay-pi-v1.json",
 	import.meta.url,
 );
 
@@ -26,7 +24,7 @@ export const PI_VECTOR_PATH = new URL(
 export async function generatePiVectors() {
 	const parent = join(tmpdir(), "magic-context/pi-bridge");
 	mkdirSync(parent, { recursive: true });
-	const root = mkdtempSync(join(parent, "vectors-"));
+	const root = createTestTempDirFromPath(join(parent, "vectors-"));
 	const savedEnv = { ...process.env };
 	Object.assign(process.env, {
 		XDG_DATA_HOME: join(root, "data"),
@@ -271,14 +269,14 @@ export async function generatePiVectors() {
 		for (const key of Object.keys(process.env))
 			if (!(key in savedEnv)) delete process.env[key];
 		Object.assign(process.env, savedEnv);
-		rmSync(root, { recursive: true, force: true });
+		cleanupTestTempDir(root);
 	}
 }
 
 if (import.meta.main) {
 	const bytes = `${JSON.stringify(await generatePiVectors(), null, 4)}\n`;
 	if (process.argv.includes("--write")) {
-		mkdirSync(new URL("./vectors/", import.meta.url), { recursive: true });
+		mkdirSync(new URL(".", PI_VECTOR_PATH), { recursive: true });
 		writeFileSync(PI_VECTOR_PATH, bytes);
 	} else if (process.argv.includes("--print")) console.log(bytes);
 	else

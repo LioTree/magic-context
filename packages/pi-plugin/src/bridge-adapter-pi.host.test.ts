@@ -1,14 +1,12 @@
 import { expect, test } from "bun:test";
-import {
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { startOracle } from "../../plugin/src/hooks/magic-context/host-runner/conformance/oracle";
+import {
+	cleanupTestTempDir,
+	createTestTempDirFromPath,
+} from "../../plugin/src/shared/test-temp-dir";
 import { createPiBridgeAdapter } from "./host-runner";
 import { createTestDb } from "./test-utils.test";
 
@@ -19,7 +17,7 @@ test.skipIf(!process.env.MC_PI_BRIDGE_HOST_PACKAGE)(
 		expect(JSON.parse(readFileSync(manifest, "utf8")).version).toBe("1.2.0");
 		const parent = join(tmpdir(), "magic-context/pi-bridge");
 		mkdirSync(parent, { recursive: true });
-		const root = mkdtempSync(join(parent, "host-"));
+		const root = createTestTempDirFromPath(join(parent, "host-"));
 		const savedEnv = { ...process.env };
 		createTestDb(join(root, "context.db")).close();
 		const oracle = startOracle({ contextRoot: root });
@@ -224,7 +222,7 @@ test.skipIf(!process.env.MC_PI_BRIDGE_HOST_PACKAGE)(
 			for (const key of Object.keys(process.env))
 				if (!(key in savedEnv)) delete process.env[key];
 			Object.assign(process.env, savedEnv);
-			rmSync(root, { recursive: true, force: true });
+			cleanupTestTempDir(root);
 		}
 	},
 	180_000,
