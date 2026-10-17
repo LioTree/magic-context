@@ -1,4 +1,5 @@
 import {
+	certifyDispatchedLkgSlot,
 	createDbLkgPersistence,
 	loadPersistedLkgSlot,
 	saveLkgSlotToDb,
@@ -122,6 +123,12 @@ interface PiLkgSessionState {
 		envelopeSignature: string;
 		usage: { signature: string; inputTokens: number };
 	};
+	/**
+	 * The request this pass published durably but has not dispatched yet. Its
+	 * certificate is bound only when the context handler returns that request
+	 * to Pi; a pass refused after publishing leaves it uncertified.
+	 */
+	pendingDispatch?: { snapshot: PiLkgPassSnapshot; servedCaptureId: number };
 }
 
 interface PiLkgCapturePlan {
@@ -441,6 +448,13 @@ export interface PiLkgCoordinator {
 		releaseRecovery?: boolean;
 		hostEnvelopeSignature?: string;
 	}): PiLkgSerializedOutput | undefined;
+	/**
+	 * Call when the context handler returns this pass's request to Pi for
+	 * dispatch. Certifies the request its publication saved; until then that
+	 * request is durable but certifies nothing and is not hydrated after a
+	 * restart. Never throws.
+	 */
+	certifyDispatched(snapshot: PiLkgPassSnapshot): void;
 }
 
 /** A request that cannot be saved for replay can still be served with its admitted tag numbers recorded. */
@@ -1200,6 +1214,9 @@ export function createPiLkgCoordinator(
 			return;
 		}
 		const state = stateFor(snapshot.sessionId);
+		// A newer pass supersedes any request an earlier pass published but never
+		// dispatched; only this pass's own publication may be certified now.
+		state.pendingDispatch = undefined;
 		let jsonPrefix: string;
 		try {
 			// Pi clones the host array between hooks, so reference identity cannot prove
@@ -1508,7 +1525,12 @@ export function createPiLkgCoordinator(
 							db,
 							plan.sessionId,
 							slot,
-							args.publishServedNumbers,
+							// The request is not dispatched yet: commit it durably, with its
+							// served numbers, but bind its certificate only at dispatch.
+							{
+								publishMetadata: args.publishServedNumbers,
+								deferCertificate: true,
+							},
 							{
 								rebuild: args.releaseRecovery,
 								retainDirtyRevision: !args.releaseRecovery
@@ -1562,7 +1584,14 @@ export function createPiLkgCoordinator(
 							retainDirtyRevision: state.recoveryPrefix?.fenceRevision,
 						});
 				state.syncCaptureRequired = !persisted;
-				if (args.publishServedNumbers) noteCapturedRequest();
+				if (args.publishServedNumbers) {
+					noteCapturedRequest();
+					if (plan.servedCaptureId !== undefined)
+						state.pendingDispatch = {
+							snapshot,
+							servedCaptureId: plan.servedCaptureId,
+						};
+				}
 			} catch (error) {
 				if (args.publishServedNumbers) {
 					state.syncCaptureRequired = true;
@@ -1660,6 +1689,26 @@ export function createPiLkgCoordinator(
 			return result;
 		},
 		captureAppliedPass,
+		certifyDispatched(snapshot) {
+			try {
+				const state = piLkgSessionStates.get(snapshot.sessionId);
+				const pending = state?.pendingDispatch;
+				if (!state || pending?.snapshot !== snapshot) return;
+				state.pendingDispatch = undefined;
+				certifyDispatchedLkgSlot(
+					db,
+					snapshot.sessionId,
+					pending.servedCaptureId,
+				);
+			} catch (error) {
+				// Certification is optional; a dispatched request stays servable.
+				sessionLog(
+					snapshot.sessionId,
+					"LKG dispatch certification skipped:",
+					error,
+				);
+			}
+		},
 		measureOutgoingPrefix(snapshot, messages, parentOf) {
 			try {
 				const slot = getSlot(snapshot.sessionId);

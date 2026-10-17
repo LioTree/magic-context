@@ -25,7 +25,12 @@ import {
 } from "../hooks/magic-context/lkg-recovery-prefix";
 import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-replay";
 import { lkgReplayFits, lkgReplayLimit } from "../hooks/magic-context/lkg-replay-fit";
-import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
+import {
+    discardWithheldServedCapture,
+    dropSlot,
+    getSlot,
+    noteEntry,
+} from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import { replayCommittedDrops } from "../hooks/magic-context/replay-committed-drops";
 import {
@@ -244,6 +249,9 @@ export function tryMessagesTransformLkgReplay(args: {
     replayFits?: (messages: MessageLike[]) => boolean;
 }): boolean {
     const { output, sessionId, error, agent } = args;
+    // A capture whose pass never returned it was never sent; neither the entry
+    // note nor the replay below may be taken against it.
+    discardWithheldServedCapture(sessionId);
     const slotAtEntry = getSlot(sessionId);
     let entry = args.entry;
     if (entry === undefined && slotAtEntry) {
@@ -528,6 +536,9 @@ export function createMessagesTransformHandler(args: {
             ? provider?.isProviderSession?.(sessionId) === true
             : false;
         const captureEntry = (): ReturnType<typeof noteEntry> => {
+            // A capture left by a pass that never returned it was never sent. Note
+            // this pass's entry against the last request actually sent instead.
+            if (sessionId) discardWithheldServedCapture(sessionId);
             if (
                 !sessionId ||
                 providerAtEntry ||

@@ -2,6 +2,7 @@ import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { claimLkgRequestIdentity, noteCapturedLkgRequest } from "./lkg-measured-request";
 import {
     captureSlot,
+    discardWithheldServedCapture,
     dropSlot,
     getSlot,
     isLegacyLkgDigest,
@@ -631,6 +632,10 @@ export function replayLkg(args: {
     /** Reapply persisted thinking-strip decisions before validating the candidate's wire shape. */
     prepareReplay?: (messages: MessageLike[]) => void;
 }): { ok: true; messages: MessageLike[] } | { ok: false; reason: LkgValidationFailure } {
+    // A capture its pass never returned (withheld, then the pass threw or was
+    // refused) was never sent. Replay the last request actually sent instead,
+    // which is the saved one.
+    discardWithheldServedCapture(args.sessionId);
     const slot = getSlot(args.sessionId);
     if (!slot) return { ok: false, reason: "lkg_invalidated_reshape" };
     const requestedModelKeys = canonicalLkgModelKeys(args.modelKey, args.providerKey);

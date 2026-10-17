@@ -6762,6 +6762,9 @@ export function registerPiContextHandler(
 				recordPiHeldSystemHead(sessionId, (ownsHistory) =>
 					deferPiDeliveredSystemRefresh(sessionId, ownsHistory),
 				);
+			// Every refusal point is behind us: this request now goes to Pi for
+			// dispatch, so its saved last-good copy may be certified as sent.
+			if (lkgPassSnapshot) lkgCoordinator.certifyDispatched(lkgPassSnapshot);
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;
 			};

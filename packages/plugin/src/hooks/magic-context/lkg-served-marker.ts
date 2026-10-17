@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { assembleLkgPrefix, layoutLkgPrefix } from "../../features/magic-context/lkg-prefix-chunks";
 import { isRustMarkerAdmissionFenced } from "../../features/magic-context/storage-replay-document";
 import { sessionLog } from "../../shared/logger";
@@ -23,7 +24,67 @@ export interface ServedMarker {
     servedDigest: string | null;
 }
 
-export function readServedMarker(db: Database, sessionId: string): ServedMarker | undefined {
+/**
+ * Until its save binds bytes to it, an allocated id stores `pending:<token>` in
+ * `served_digest`. The token is random per allocation and only the connection
+ * that allocated it remembers it. After session cleanup deletes the marker row,
+ * the counter restarts, so two writers can hold the same id; the token tells a
+ * save whether the pending id is its own allocation or another writer's newer
+ * one. A NULL digest remains only on rows written before allocations carried a
+ * token, and such a marker is accepted by any save, as it was then.
+ */
+const PENDING_ALLOCATION_PREFIX = "pending:";
+const OWN_ALLOCATION_MAX_SESSIONS = 1000;
+const ownAllocations = new WeakMap<
+    Database,
+    Map<string, { servedCaptureId: number; token: string }>
+>();
+
+/** The marker row as stored, with an unsaved allocation's token kept apart from the digest. */
+export interface ServedMarkerRow extends ServedMarker {
+    /** Token of an allocation whose save has not bound bytes yet; null otherwise. */
+    pendingToken: string | null;
+}
+
+function rememberOwnAllocation(
+    db: Database,
+    sessionId: string,
+    servedCaptureId: number,
+    token: string,
+): void {
+    let own = ownAllocations.get(db);
+    if (!own) {
+        own = new Map();
+        ownAllocations.set(db, own);
+    }
+    own.delete(sessionId);
+    if (own.size >= OWN_ALLOCATION_MAX_SESSIONS) {
+        const oldest = own.keys().next().value;
+        if (oldest !== undefined) own.delete(oldest);
+    }
+    own.set(sessionId, { servedCaptureId, token });
+}
+
+/**
+ * Whether a marker's pending id is the latest allocation this connection made
+ * for the session. A legacy NULL marker (no token) counts as anyone's.
+ */
+export function ownsServedMarkerAllocation(
+    db: Database,
+    sessionId: string,
+    marker: Pick<ServedMarkerRow, "servedCaptureId" | "pendingToken">,
+): boolean {
+    if (marker.pendingToken === null) return true;
+    const own = ownAllocations.get(db)?.get(sessionId);
+    return own?.servedCaptureId === marker.servedCaptureId && own.token === marker.pendingToken;
+}
+
+/** The stored value that names a pending allocation, for SQL comparisons. */
+export function pendingServedDigest(marker: Pick<ServedMarkerRow, "pendingToken">): string | null {
+    return marker.pendingToken === null ? null : PENDING_ALLOCATION_PREFIX + marker.pendingToken;
+}
+
+export function readServedMarkerRow(db: Database, sessionId: string): ServedMarkerRow | undefined {
     const row = db
         .prepare(`SELECT served_capture_id, full_coverage, slot_state, served_digest
         FROM lkg_served_markers WHERE session_id = ?`)
@@ -35,14 +96,24 @@ export function readServedMarker(db: Database, sessionId: string): ServedMarker 
               served_digest: string | null;
           }
         | undefined;
-    return row
-        ? {
-              servedCaptureId: row.served_capture_id,
-              fullCoverage: row.full_coverage === 1,
-              slotState: row.slot_state,
-              servedDigest: typeof row.served_digest === "string" ? row.served_digest : null,
-          }
-        : undefined;
+    if (!row) return undefined;
+    const stored = typeof row.served_digest === "string" ? row.served_digest : null;
+    const pending = stored?.startsWith(PENDING_ALLOCATION_PREFIX) === true;
+    return {
+        servedCaptureId: row.served_capture_id,
+        fullCoverage: row.full_coverage === 1,
+        slotState: row.slot_state,
+        servedDigest: pending ? null : stored,
+        pendingToken: pending && stored ? stored.slice(PENDING_ALLOCATION_PREFIX.length) : null,
+    };
+}
+
+/** The marker as readers outside storage see it: a pending allocation is simply unbound. */
+export function readServedMarker(db: Database, sessionId: string): ServedMarker | undefined {
+    const row = readServedMarkerRow(db, sessionId);
+    if (!row) return undefined;
+    const { pendingToken: _pendingToken, ...marker } = row;
+    return marker;
 }
 
 /**
@@ -87,30 +158,41 @@ export function recordServedCapture(
             prior.lastInputMessageId === candidate.lastInputMessageId &&
             equal(prior.inputIdSeq, candidate.inputIdSeq) &&
             equal(prior.inputContentDigests, candidate.inputContentDigests) &&
+            // The certificate digest includes the content signatures, so an id is
+            // reused only when they match too; otherwise its save would be refused.
+            (prior.inputContentSignatures === candidate.inputContentSignatures ||
+                equal(prior.inputContentSignatures, candidate.inputContentSignatures)) &&
             equal(prior.inputMoveDigests, candidate.inputMoveDigests) &&
             (prior.piOutputEntryIds === candidate.piOutputEntryIds ||
                 equal(prior.piOutputEntryIds, candidate.piOutputEntryIds))
         ) {
-            const marker = readServedMarker(db, sessionId);
+            const marker = readServedMarkerRow(db, sessionId);
             if (
                 marker?.servedCaptureId === prior.servedCaptureId &&
                 marker.fullCoverage === fullCoverage &&
                 marker.slotState === "captured"
             ) {
-                // An unbound marker still names this process's own allocation whose
-                // save has not landed; that save binds these same bytes. A bound
-                // marker is reusable only for the bytes this connection bound to it.
-                if (marker.servedDigest === null) return marker.servedCaptureId;
-                const bound = boundLkgCertificate(db, sessionId);
-                if (
-                    bound?.servedCaptureId === marker.servedCaptureId &&
-                    bound.digest === marker.servedDigest &&
-                    bound.jsonPrefix === candidate.jsonPrefix
-                )
-                    return marker.servedCaptureId;
+                // An unbound marker is reusable only while it is still this
+                // connection's own pending allocation, whose save binds these same
+                // bytes. An equal id another writer allocated after the counter
+                // restarted is not. A bound marker is reusable only for the bytes
+                // this connection bound to it.
+                if (marker.servedDigest === null) {
+                    if (ownsServedMarkerAllocation(db, sessionId, marker))
+                        return marker.servedCaptureId;
+                } else {
+                    const bound = boundLkgCertificate(db, sessionId);
+                    if (
+                        bound?.servedCaptureId === marker.servedCaptureId &&
+                        bound.digest === marker.servedDigest &&
+                        bound.jsonPrefix === candidate.jsonPrefix
+                    )
+                        return marker.servedCaptureId;
+                }
             }
         }
-        return withSqliteBackgroundWriter(() =>
+        const token = randomUUID();
+        const allocated = withSqliteBackgroundWriter(() =>
             db
                 .transaction(() => {
                     const previous = readServedMarker(db, sessionId)?.servedCaptureId ?? 0;
@@ -118,14 +200,21 @@ export function recordServedCapture(
                     if (!Number.isSafeInteger(id))
                         throw new Error("served capture counter exhausted");
                     db.prepare(`INSERT INTO lkg_served_markers
-                (session_id, served_capture_id, full_coverage, slot_state, served_digest) VALUES (?, ?, ?, 'captured', NULL)
+                (session_id, served_capture_id, full_coverage, slot_state, served_digest) VALUES (?, ?, ?, 'captured', ?)
                 ON CONFLICT(session_id) DO UPDATE SET served_capture_id=excluded.served_capture_id,
                 full_coverage=excluded.full_coverage, slot_state=excluded.slot_state,
-                served_digest=excluded.served_digest`).run(sessionId, id, fullCoverage ? 1 : 0);
+                served_digest=excluded.served_digest`).run(
+                        sessionId,
+                        id,
+                        fullCoverage ? 1 : 0,
+                        PENDING_ALLOCATION_PREFIX + token,
+                    );
                     return id;
                 })
                 .immediate(),
         );
+        rememberOwnAllocation(db, sessionId, allocated, token);
+        return allocated;
     } catch (error) {
         sessionLog(sessionId, "LKG capture served without move certification:", error);
         return undefined;

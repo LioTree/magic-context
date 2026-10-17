@@ -82,6 +82,17 @@ function loadHistoricalFixture(): { source_revision: string; captures: Record<st
     return JSON.parse(readFileSync(baselinePath, "utf8"));
 }
 
+const PENDING_TOKEN_PLACEHOLDER = "pending:<allocation token>";
+
+/** Replace each random served-capture allocation token with one placeholder. */
+function withPendingTokenPlaceholders(captures: Capture[]): string[][] {
+    return captures.map((capture) =>
+        capture.writes.map((write) =>
+            write.replace(/"pending:[0-9a-f-]{36}"/g, JSON.stringify(PENDING_TOKEN_PLACEHOLDER)),
+        ),
+    );
+}
+
 function expectedVersionedLkgWrites(captures: Capture[]): string[][] {
     const chunks = new Map<number, string>();
     return captures.map((capture) =>
@@ -93,8 +104,10 @@ function expectedVersionedLkgWrites(captures: Capture[]): string[][] {
             // All other historical writes must still match in their original order.
             if (sql === "PRAGMA busy_timeout=250")
                 return [JSON.stringify({ ...record, sql: "PRAGMA busy_timeout=2000" })];
-            // Allocating a served-capture id now also clears the marker's byte digest,
-            // because the new id names bytes that are not saved yet.
+            // Allocating a served-capture id now also replaces the marker's byte digest
+            // with a pending token, because the new id names bytes that are not saved
+            // yet and only the allocating connection may bind them. The token is
+            // random, so both sides compare it as a placeholder.
             if (sql.startsWith("INSERT INTO lkg_served_markers") && sql.includes("'captured')"))
                 return [
                     JSON.stringify({
@@ -102,12 +115,13 @@ function expectedVersionedLkgWrites(captures: Capture[]): string[][] {
                         sql: record.sql
                             .replace(
                                 "(session_id, served_capture_id, full_coverage, slot_state) VALUES (?, ?, ?, 'captured')",
-                                "(session_id, served_capture_id, full_coverage, slot_state, served_digest) VALUES (?, ?, ?, 'captured', NULL)",
+                                "(session_id, served_capture_id, full_coverage, slot_state, served_digest) VALUES (?, ?, ?, 'captured', ?)",
                             )
                             .replace(
                                 "full_coverage=excluded.full_coverage, slot_state=excluded.slot_state",
                                 "full_coverage=excluded.full_coverage, slot_state=excluded.slot_state,\n                served_digest=excluded.served_digest",
                             ),
+                        args: [...(record.args ?? []), PENDING_TOKEN_PLACEHOLDER],
                     }),
                 ];
             const args = record.args;
@@ -643,7 +657,7 @@ if (process.env.H4_REVIEW2_CAPTURE) {
             expect(before.every((p) => p.methods.includes("transform"))).toBe(true);
             expect(after.every((p) => p.methods.includes("transform"))).toBe(true);
             assertVersionedLkgDigests(after);
-            expect(after.map((p) => p.writes)).toEqual(expectedVersionedLkgWrites(before));
+            expect(withPendingTokenPlaceholders(after)).toEqual(expectedVersionedLkgWrites(before));
             expect(after.map((p) => p.request)).toEqual(before.map((p) => p.request));
         }, 60000);
     }

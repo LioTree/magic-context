@@ -5305,6 +5305,14 @@ export function createRustModeTransform(
                             captureForCertificate.prepared.slot.servedCaptureId =
                                 captureForCertificate.servedCaptureId = undefined;
                     }
+                    // The deferred save must keep the bytes this pass actually
+                    // returned. Saving the prepared bytes instead would put a request
+                    // that was never sent back in memory and storage, over the
+                    // returned one installed below.
+                    if (!returnedPrepared) {
+                        captureForCertificate.jsonPrefix = returnedJson;
+                        captureForCertificate.prepared.slot.jsonPrefix = returnedJson;
+                    }
                     const returnedSlot = {
                         ...captureForCertificate.prepared.slot,
                         jsonPrefix: returnedJson,

@@ -786,6 +786,23 @@ export function releaseWithheldServedCapture(
     return true;
 }
 
+/**
+ * Remove the in-memory capture if its pass never returned it (still withheld),
+ * so the next read loads the last saved request instead. A withheld capture was
+ * never sent, so a replay must never serve it. Only the process copy is removed:
+ * a withheld capture is never saved, so the durable row still holds the last
+ * request sent. Returns whether a capture was removed.
+ */
+export function discardWithheldServedCapture(sessionId: string): boolean {
+    const entry = lkgHeapHolder.entries.get(sessionId);
+    if (!entry?.slot.servedCaptureWithheld) return false;
+    lkgHeapHolder.entries.delete(sessionId);
+    totalBytes -= entry.bytes;
+    // The durable row was never consulted for this miss; allow it to load now.
+    hydrationAttemptBySession.delete(sessionId);
+    return true;
+}
+
 /** Evict only the process copy; durable replay authority is unchanged. */
 export function forgetInMemorySlot(sessionId: string): void {
     clearLkgRecoverySession(sessionId);
