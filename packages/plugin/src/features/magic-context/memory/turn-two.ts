@@ -19,8 +19,7 @@
  * length-capped or schema-invalid envelope (every fact of the send), a check
  * transport failure, an unvalidated reported profile for an edit, a CAS loss, and a
  * carrier that reports on recovery that the send or child no longer exists.
- * Pre-send skips consume nothing: a dormant lane (one whose carrier has no
- * provider-enforced response schema), a carrier that cannot continue the child,
+ * Pre-send skips consume nothing: a dormant lane, a carrier that cannot continue the child,
  * `authority_elsewhere` (the Rust module, not this process, owns the project's
  * memory), and backlog facts beyond `RETRY_BACKLOG_PER_RUN`.
  */
@@ -102,6 +101,8 @@ export interface TurnTwoStageReply {
      */
     profile: ReportedProfile | null;
     usage?: unknown;
+    /** Any tool call or result invalidates the send, even beside valid text. */
+    toolActivity?: boolean;
 }
 
 /**
@@ -145,8 +146,8 @@ export interface TurnTwoCarrier extends TurnTwoCheckCarrier {
     /** Carrier kind written on stage records, so recovery can find its carrier again. */
     readonly carrier: string;
     readonly harness: string;
-    /** True only when the provider enforces the turn-two response schema. */
-    readonly enforcedJson: boolean;
+    /** Accepted for older callers, but ignored: provider enforcement does not authorize a send. */
+    readonly enforcedJson?: boolean;
     /** The turn-one child this carrier continues; null when it cannot continue one. */
     readonly childSessionId: string | null;
     /**
@@ -551,7 +552,11 @@ function recordStageReply(db: Database, stageKey: string, reply: TurnTwoStageRep
     db.prepare(
         "UPDATE memory_stage_attempts SET reply_json=?,reported_profile_json=?,usage_json=?,state='replied' WHERE stage_key=? AND state IN ('reserved','sending')",
     ).run(
-        JSON.stringify({ text: reply.text, lengthCapped: reply.lengthCapped }),
+        JSON.stringify({
+            text: reply.text,
+            lengthCapped: reply.lengthCapped,
+            toolActivity: reply.toolActivity,
+        }),
         JSON.stringify(reply.profile),
         JSON.stringify(reply.usage ?? null),
         stageKey,
@@ -562,7 +567,6 @@ interface ResolveContext {
     log?: (message: string) => void;
     memoryEnabled: boolean;
     autoPromote: boolean;
-    enforcedJson: boolean;
     validatedProfiles: readonly ReportedProfile[];
     checks: TurnTwoCheckCarrier;
     owner: { sessionId: string; harness: string };
@@ -598,12 +602,12 @@ async function resolveStage(
     } | null;
     const request = readStageRequest(db, stageKey);
     if (!row?.reply_json || !request) return true;
-    const reply = JSON.parse(row.reply_json) as { text: string; lengthCapped: boolean };
+    const reply = JSON.parse(row.reply_json) as TurnTwoStageReply;
     const profile =
         (row.reported_profile_json
             ? (JSON.parse(row.reported_profile_json) as ReportedProfile | null)
             : null) ?? PLACEHOLDER_PROFILE;
-    const envelope = parseTurnTwoEnvelope(reply.text, reply.lengthCapped);
+    const envelope = parseTurnTwoEnvelope(reply.text, reply.lengthCapped, reply.toolActivity);
     if (!envelope.ok) {
         consumeStageAttempts(db, stageKey, `envelope_${envelope.reason}`, "envelope_failed");
         return true;
@@ -889,7 +893,6 @@ async function resolveRevision(
     };
     const gate: GateContext = {
         enabled: true,
-        enforcedJson: context.enforcedJson,
         memoryEnabled: context.memoryEnabled,
         autoPromote: context.autoPromote,
         anchorKnown: fact.anchor_known === 1,
@@ -1033,9 +1036,6 @@ export async function recoverTurnTwoStages(
             const done = await resolveStage(db, record.stageKey, {
                 memoryEnabled: input.memoryEnabled,
                 autoPromote: input.autoPromote,
-                // A reply is only recorded by a run on an enabled lane, which requires a
-                // provider-enforced response schema.
-                enforcedJson: true,
                 validatedProfiles: input.validatedProfiles,
                 checks: carrier ?? {
                     check: () => Promise.reject(new CheckOutcomeUnknownError("no carrier")),
@@ -1074,7 +1074,7 @@ export async function runTurnTwo(db: Database, input: TurnTwoRunInput): Promise<
         reason,
         childInFlight: false,
     });
-    if (input.lane !== "enabled" || !input.carrier.enforcedJson) return skip("lane_dormant");
+    if (input.lane !== "enabled") return skip("lane_dormant");
     if (!input.memoryEnabled) return skip("memory_disabled");
     if (!tsOwnsMemory(db, input.projectPath)) {
         // The Rust module owns this project's memory, so this process may not apply
@@ -1147,7 +1147,6 @@ export async function runTurnTwo(db: Database, input: TurnTwoRunInput): Promise<
     const done = await resolveStage(db, reserved.stageKey, {
         memoryEnabled: input.memoryEnabled,
         autoPromote: input.autoPromote,
-        enforcedJson: input.carrier.enforcedJson,
         validatedProfiles: input.validatedProfiles,
         checks: input.carrier,
         owner: { sessionId: input.sessionId, harness: input.carrier.harness },

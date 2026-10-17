@@ -104,6 +104,8 @@ export interface HiddenRunHandle {
 
 export interface HiddenCompletion {
     text: string | null;
+    /** Transport-observed tool activity, including calls refused by a guard. */
+    toolActivity?: boolean;
     reasoning?: string | null;
     usage: TokenTotals;
     lengthCapped: boolean;
@@ -213,8 +215,8 @@ export interface CompartmentRunnerDeps<
     autoPromote?: boolean;
     /**
      * Which historian turn one this lane runs (see `TurnOneLane`). Unset means
-     * `dormant`, the only production value: `enabled` needs a transport that makes
-     * the provider enforce a JSON response schema, and none does yet.
+     * `dormant`, the production default until profile authorization is available.
+     * Both lanes request their format through the prompt and validate locally.
      */
     memoryLifecycleLane?: TurnOneLane;
     /**

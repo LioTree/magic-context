@@ -306,7 +306,10 @@ function rpcHarness(holdSecond = false) {
 								text: first
 									? xml
 									: JSON.stringify({
-											decisions: [{ fact_id: 1, action: "new" }],
+											result: {
+												step: "turn_two",
+												decisions: [{ fact_id: 1, action: "new" }],
+											},
 										}),
 							},
 						],
@@ -589,7 +592,10 @@ describe.skipIf(!enabled)("S8 independent review", () => {
 					ok: true,
 					durationMs: 1,
 					assistantText: JSON.stringify({
-						decisions: [{ fact_id: 1, action, target_id: memory.id }],
+						result: {
+							step: "turn_two",
+							decisions: [{ fact_id: 1, action, target_id: memory.id }],
+						},
 					}),
 				}),
 			};
@@ -745,26 +751,29 @@ describe.skipIf(!enabled)("S8 independent review", () => {
 				ok: true,
 				durationMs: 1,
 				assistantText: JSON.stringify({
-					decisions: [
-						{
-							fact_id: 1,
-							action: "edit",
-							target_id: memory.id,
-							revision: 1,
-							removed: [],
-							replaced: [
-								{
-									memory_id: memory.id,
-									clause: 1,
-									block: 1,
-									excerpt: "New rule.",
-								},
-							],
-							kept: [{ memory_id: memory.id, clause: 2 }],
-							added: [{ text: "New rule. ", block: 1, excerpt: "New rule." }],
-							final_text: "New rule. Keep rule.",
-						},
-					],
+					result: {
+						step: "turn_two",
+						decisions: [
+							{
+								fact_id: 1,
+								action: "edit",
+								target_id: memory.id,
+								revision: 1,
+								removed: [],
+								replaced: [
+									{
+										memory_id: memory.id,
+										clause: 1,
+										block: 1,
+										excerpt: "New rule.",
+									},
+								],
+								kept: [{ memory_id: memory.id, clause: 2 }],
+								added: [{ text: "New rule. ", block: 1, excerpt: "New rule." }],
+								final_text: "New rule. Keep rule.",
+							},
+						],
+					},
 				}),
 				meta: { reportedProvider: "test", reportedModel: "model" },
 			}),

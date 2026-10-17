@@ -1,3 +1,4 @@
+import { hasHistorianToolActivity } from "@magic-context/core/features/magic-context/memory/historian-wire";
 import { resolveFactDecision } from "@magic-context/core/features/magic-context/memory/lifecycle-applier";
 import type { ReportedProfile } from "@magic-context/core/features/magic-context/memory/lifecycle-gates";
 import { lifecycleTextHash } from "@magic-context/core/features/magic-context/memory/lifecycle-text";
@@ -256,13 +257,13 @@ function reportedProfile(
 	};
 }
 
-/** Tests can require JSON replies. Production Pi cannot enforce a reply schema, so it never enables this reconciliation carrier. */
+/** Continue the retained historian child; locally validate its best-effort replies. */
 export function createPiTurnTwoCarrier(args: {
 	child: PiRpcHistorianChild;
 	runner: PiRpcHistorianRunner;
 	options: SubagentRunOptions;
 	turnOneText: string;
-	enforcedJson: boolean;
+	enforcedJson?: boolean;
 	onStageKey?: (key: string) => void;
 }): PiTurnTwoCarrier {
 	const systemHash = lifecycleTextHash(args.options.systemPrompt);
@@ -278,7 +279,6 @@ export function createPiTurnTwoCarrier(args: {
 		},
 		carrier: PI_RPC_CARRIER,
 		harness: "pi",
-		enforcedJson: args.enforcedJson,
 		childSessionId: args.child.id,
 		baseline: lifecycleTextHash(args.turnOneText),
 		historianSystemHash: systemHash,
@@ -293,6 +293,7 @@ export function createPiTurnTwoCarrier(args: {
 			return {
 				text: result.assistantText,
 				lengthCapped: result.meta?.lengthCapped === true,
+				toolActivity: hasHistorianToolActivity(result.meta),
 				profile: reportedProfile(result, args.options, systemHash),
 				usage: result.meta?.usage,
 			};
@@ -331,6 +332,7 @@ export function createPiTurnTwoCarrier(args: {
 					/* Malformed output is a refusing verdict, not a transport retry. */
 				}
 				return {
+					toolActivity: hasHistorianToolActivity(result.meta),
 					verdicts:
 						Array.isArray(verdicts) && result.meta?.lengthCapped !== true
 							? verdicts
@@ -435,7 +437,6 @@ export function schedulePiHistorianTurnTwo(args: {
 	};
 	const carrier = createPiTurnTwoCarrier({
 		...args,
-		enforcedJson: true,
 		onStageKey: (key) => {
 			if (!renewStageLease(args.db, key, args.child.id))
 				throw new Error("Pi RPC stage released before send");

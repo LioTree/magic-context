@@ -172,7 +172,9 @@ function carrier(f: ReturnType<typeof fixture>): TurnTwoCarrier {
 		childSessionId: `review-r2-${randomUUID()}`,
 		historianSystemHash: profile.systemHash,
 		send: async () => ({
-			text: JSON.stringify({ decisions: f.decisions }),
+			text: JSON.stringify({
+				result: { step: "turn_two", decisions: f.decisions },
+			}),
 			lengthCapped: false,
 			profile,
 		}),
@@ -232,7 +234,7 @@ const child = {
   const row = db.prepare("SELECT stage_key,request_json FROM memory_stage_attempts WHERE state='sending'").get();
   out({ event: "ready", pid: process.pid, sends, ...row });
   await pending;
-  return { ok: true, durationMs: 1, assistantText: JSON.stringify({ decisions: cfg.decisions }), meta: { reportedProvider: "test", reportedModel: "model" } };
+  return { ok: true, durationMs: 1, assistantText: JSON.stringify({ result: { step: "turn_two", decisions: cfg.decisions } }), meta: { reportedProvider: "test", reportedModel: "model" } };
  }
 };
 const runner = {
@@ -371,7 +373,10 @@ async function visitPi(db: Db, publicationId = publication(db, 0)) {
 			ok: true as const,
 			durationMs: 1,
 			assistantText: JSON.stringify({
-				decisions: [{ fact_id: 1, action: "abstain" }],
+				result: {
+					step: "turn_two",
+					decisions: [{ fact_id: 1, action: "abstain" }],
+				},
 			}),
 		}),
 	};

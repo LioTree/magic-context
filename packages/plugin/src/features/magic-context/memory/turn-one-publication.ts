@@ -17,13 +17,10 @@ import { tsOwnsMemory } from "./lifecycle-applier";
 export type TurnOneLane = "enabled" | "dormant";
 
 /**
- * A lane may run the `enabled` turn one only when its transport sends a response
- * schema the provider enforces (so a reply is either schema-valid JSON or an error,
- * never free text that could be misparsed into an automatic memory edit) and the
- * model profile the provider reports has passed a recorded replay of the trial
- * corpus. No transport (OpenCode host prompt, OpenCode 2 hidden completion, Pi
- * subagent, Rust host or Broca) sends such a field yet, so every production lane is
- * `dormant`. The override exists for tests that exercise the enabled contract.
+ * A lane may run enabled only with a validated profile and a retained child.
+ * Replies are best-effort and validated locally; provider enforcement is not an
+ * eligibility condition. Production defaults dormant until profile authorization
+ * is available. Tests pass an explicit lane to override that dormant default.
  */
 export function resolveTurnOneLane(override?: TurnOneLane): TurnOneLane {
     return override ?? "dormant";

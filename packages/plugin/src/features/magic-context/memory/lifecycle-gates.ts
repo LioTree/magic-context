@@ -1,3 +1,4 @@
+import { CHECK_SCHEMA_CONTRACT } from "./historian-schema";
 import { KEPT_CHECK_INPUT_MAX, NARROW_CHECK_CALL_CEILING } from "./lifecycle-constants";
 import {
     type EvidenceBlock,
@@ -49,7 +50,8 @@ export interface RevisionDecision {
 }
 export interface GateContext {
     enabled: boolean;
-    enforcedJson: boolean;
+    /** Accepted for older callers, but ignored: provider enforcement does not authorize an edit. */
+    enforcedJson?: boolean;
     memoryEnabled: boolean;
     autoPromote: boolean;
     anchorKnown: boolean;
@@ -99,7 +101,7 @@ export function compatibilityPair(left: CheckOperand, right: CheckOperand): Chec
 export function planMemoryRevision(decision: RevisionDecision, context: GateContext): GatePlan {
     if (!context.memoryEnabled) return refused("memory_disabled");
     if (!context.autoPromote) return refused("auto_promote_disabled");
-    if (!context.enabled || !context.enforcedJson) return refused("lane_dormant");
+    if (!context.enabled) return refused("lane_dormant");
     if (
         !Array.isArray(decision.changes) ||
         !Array.isArray(decision.added) ||
@@ -301,20 +303,27 @@ export function planMemoryRevision(decision: RevisionDecision, context: GateCont
     return { ok: true, checks, kept, spans };
 }
 
-export const CHECK_SYSTEM_PROMPTS: Record<CheckKind, string> = {
+const CHECK_QUESTIONS: Record<CheckKind, string> = {
     disproof:
-        "Does the evidence disprove each statement? Return exactly one identity-keyed verdict (yes, no, unclear) per operand.",
+        "Does the evidence disprove each statement? Return exactly one identity-keyed verdict per operand.",
     support:
-        "Does the evidence support each statement? Return exactly one identity-keyed verdict (yes, no, unclear) per operand.",
+        "Does the evidence support each statement? Return exactly one identity-keyed verdict per operand.",
     "kept-clause":
-        "Do the stored blocks disprove any kept statement? Return exactly one identity-keyed verdict (yes, no, unclear) per operand.",
+        "Do the stored blocks disprove any kept statement? Return exactly one identity-keyed verdict per operand.",
     compatibility:
-        "Do the statements in each pair contradict each other? Return exactly one identity-keyed verdict (yes, no, unclear) per pair.",
+        "Do the statements in each pair contradict each other? Return exactly one identity-keyed verdict per pair.",
 };
+export const CHECK_SYSTEM_PROMPTS = Object.fromEntries(
+    Object.entries(CHECK_QUESTIONS).map(([kind, question]) => [
+        kind,
+        `${question}\n\n${CHECK_SCHEMA_CONTRACT}`,
+    ]),
+) as Record<CheckKind, string>;
 export interface CheckReply {
     verdicts: Array<{ id: string; verdict: "yes" | "no" | "unclear" }>;
     profile: ReportedProfile;
     usage: unknown;
+    toolActivity?: boolean;
 }
 export interface CheckRequest {
     key: string;
@@ -424,8 +433,16 @@ export async function runMemoryChecks(
                 ? check.pairs.map((pair) => pair.id)
                 : check.operands.map((operand) => operand.id);
         if (
+            reply.toolActivity ||
             !Array.isArray(reply.verdicts) ||
             reply.verdicts.length !== expected.length ||
+            reply.verdicts.some(
+                (entry) =>
+                    !entry ||
+                    typeof entry !== "object" ||
+                    typeof entry.id !== "string" ||
+                    !["yes", "no"].includes(entry.verdict),
+            ) ||
             new Set(reply.verdicts.map((entry) => entry.id)).size !== expected.length ||
             reply.verdicts.some((entry) => !expected.includes(entry.id))
         )

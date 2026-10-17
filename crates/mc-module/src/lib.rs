@@ -61,6 +61,7 @@ pub mod historian_runner;
 pub mod historian_stage;
 pub mod historian_tool_template;
 pub mod historian_validate;
+pub mod historian_wire;
 pub mod host_store;
 mod image_tokens;
 pub mod injection;

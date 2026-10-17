@@ -98,8 +98,11 @@ test("a proposed decay class stays a free string with no taxonomy", () => {
     expect(combined).toContain("a free nonempty string of at most 64 characters");
     const result = parseTurnTwoEnvelope(
         JSON.stringify({
-            decisions: [],
-            scores: [{ item: 7, importance: 40, class: "an entirely new class" }],
+            result: {
+                step: "turn_two",
+                decisions: [],
+                scores: [{ item: 7, importance: 40, class: "an entirely new class" }],
+            },
         }),
         false,
     );

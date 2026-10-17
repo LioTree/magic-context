@@ -27,6 +27,7 @@ import {
 	TOKEN_BUDGET_FINALIZE_MESSAGE,
 	TOKEN_BUDGET_TOOL_REFUSAL,
 } from "@magic-context/core/features/magic-context/dreamer/token-budget";
+import { hasHistorianToolActivity } from "@magic-context/core/features/magic-context/memory/historian-wire";
 import { probeChildSpawnFence } from "@magic-context/core/features/magic-context/schema-fence-probe";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage";
 import type { SubagentKind } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
@@ -1979,6 +1980,7 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 			const accumulatedMessages: unknown[] = [];
 			accountingMessages = accumulatedMessages;
 			let rpcTurnDelivered = false;
+			let rpcToolActivity = false;
 			if (retainedRpc && rpcBudget) {
 				retainedRpc.ready({
 					id: `pi-rpc:${process.pid}:${child.pid ?? 0}:${randomUUID()}`,
@@ -2069,6 +2071,8 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 					return;
 				}
 				const event = parsed.event;
+				if (retainedRpc && hasHistorianToolActivity(event))
+					rpcToolActivity = true;
 				observeTemperatureDecision(event);
 
 				if (typeof event !== "object" || event === null) return;
@@ -2431,6 +2435,7 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 						| { provider?: string; model?: string; usage?: unknown }
 						| undefined;
 					const meta = {
+						toolActivity: rpcToolActivity,
 						reportedProvider: last?.provider,
 						reportedModel: last?.model,
 						usage: last?.usage,
@@ -2440,7 +2445,7 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 						(finalStopReason === "stop" || finalStopReason === "length")
 							? {
 									ok: true,
-									assistantText: finalAssistantText.trim(),
+									assistantText: finalAssistantText,
 									durationMs: Date.now() - startTime,
 									meta: { ...meta, lengthCapped: finalStopReason === "length" },
 								}

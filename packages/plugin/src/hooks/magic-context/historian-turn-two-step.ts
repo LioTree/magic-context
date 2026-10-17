@@ -133,16 +133,14 @@ export async function runHistorianTurnTwo(args: {
         projectPath: args.projectPath,
         publicationId: args.publicationId,
         sessionId: args.sessionId,
-        // The runner retains turn one's child (and so reaches this step) only on an
-        // enabled lane, and a lane is enabled only when its carrier's provider
-        // enforces the response schema; hence `lane` and `enforcedJson` are fixed.
+        // Only an enabled lane retains turn one's child and reaches this step.
+        // The carrier requests the prompt contract, and replies are validated locally.
         lane: "enabled",
         carrier: createOpenCodeTurnTwoCarrier({
             child: args.child,
             parentSessionId: args.sessionId,
             harness: args.harness,
             carrier: args.carrier,
-            enforcedJson: true,
             turnOneText: args.child.turnOneText,
             timeoutMs: args.timeoutMs,
         }),

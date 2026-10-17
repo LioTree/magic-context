@@ -149,26 +149,29 @@ test("review probe: an applied turn-two edit is invisible on Pi SOFT and defer p
 					);
 					return {
 						text: JSON.stringify({
-							decisions: ids.map((id) => ({
-								fact_id: id,
-								action: "edit",
-								target_id: memory.id,
-								revision: 1,
-								removed: [],
-								replaced: [
-									{
-										memory_id: memory.id,
-										clause: 1,
-										block: 42,
-										excerpt: "New rule.",
-									},
-								],
-								kept: [{ memory_id: memory.id, clause: 2 }],
-								added: [
-									{ text: "New rule. ", block: 42, excerpt: "New rule." },
-								],
-								final_text: "New rule. Keep rule.",
-							})),
+							result: {
+								step: "turn_two",
+								decisions: ids.map((id) => ({
+									fact_id: id,
+									action: "edit",
+									target_id: memory.id,
+									revision: 1,
+									removed: [],
+									replaced: [
+										{
+											memory_id: memory.id,
+											clause: 1,
+											block: 42,
+											excerpt: "New rule.",
+										},
+									],
+									kept: [{ memory_id: memory.id, clause: 2 }],
+									added: [
+										{ text: "New rule. ", block: 42, excerpt: "New rule." },
+									],
+									final_text: "New rule. Keep rule.",
+								})),
+							},
 						}),
 						lengthCapped: false,
 						profile: PROFILE,
