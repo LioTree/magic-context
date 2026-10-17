@@ -5669,6 +5669,34 @@ pub struct StoredMemoryFull {
     pub mural_cue_rejection_count: i64,
 }
 
+fn inherit_memory_safety(
+    sources: impl IntoIterator<Item = Option<bool>>,
+    importance: Option<i32>,
+) -> (Option<bool>, Option<i32>) {
+    let mut assessed = false;
+    let mut unknown = false;
+    let mut critical = false;
+    for source in sources {
+        assessed = true;
+        unknown |= source.is_none();
+        critical |= source == Some(true);
+    }
+    // Unknown assessments must be retried; only unanimously assessed sources can establish false.
+    let safety = if critical {
+        Some(true)
+    } else if assessed && !unknown {
+        Some(false)
+    } else {
+        None
+    };
+    let importance = if safety == Some(true) {
+        Some(importance.unwrap_or(50).max(80))
+    } else {
+        importance
+    };
+    (safety, importance)
+}
+
 /// Inputs for an additive ctx_memory write. Duplicate detection follows the plugin's
 /// normalized-content hash (`lowercase → collapse whitespace → MD5`): a matching
 /// `(project_path, category, normalized_hash)` returns the existing row id instead of
@@ -7137,12 +7165,25 @@ impl<'a> FacadeMutationTxn<'a> {
                 .iter()
                 .map(|row| row.retrieval_count.max(0))
                 .sum::<i64>();
+            // The newly inserted, unassessed target is not one of the consolidated sources.
+            let (safety, importance) = inherit_memory_safety(
+                rows.iter().map(|row| row.safety_critical),
+                merged.importance,
+            );
             self.tx
                 .execute(
                     "UPDATE memories
-                        SET seen_count = ?1, retrieval_count = ?2, merged_from = ?3, revision = 1
+                        SET seen_count = ?1, retrieval_count = ?2, merged_from = ?3, revision = 1,
+                            safety_critical = ?5, importance = ?6
                       WHERE id = ?4",
-                    params![seen_count, retrieval_count, merged_from, target_id],
+                    params![
+                        seen_count,
+                        retrieval_count,
+                        merged_from,
+                        target_id,
+                        safety,
+                        importance
+                    ],
                 )
                 .map_err(FacadeMemoryMutationError::storage)?;
             if !self.automated {
@@ -7229,6 +7270,10 @@ impl<'a> FacadeMutationTxn<'a> {
         let mut affected = Vec::with_capacity(source_rows.len() + 1);
         affected.push(target.clone());
         affected.extend(source_rows.iter().cloned());
+        let (safety, importance) = inherit_memory_safety(
+            affected.iter().map(|row| row.safety_critical),
+            target.importance,
+        );
         let merged_from = merged_from_json(&affected);
         let seen_count: i64 = affected.iter().map(|memory| memory.seen_count.max(0)).sum();
         let retrieval_count: i64 = affected
@@ -7277,7 +7322,9 @@ impl<'a> FacadeMutationTxn<'a> {
                         status = ?6,
                         updated_at = ?7,
                         shareable = 0,
-                        classified_at = NULL
+                        classified_at = NULL,
+                        safety_critical = ?9,
+                        importance = ?10
                   WHERE id = ?8",
                 params![
                     merged_content,
@@ -7288,6 +7335,8 @@ impl<'a> FacadeMutationTxn<'a> {
                     merged_status,
                     now_ms,
                     target_id,
+                    safety,
+                    importance,
                 ],
             )
             .map_err(FacadeMemoryMutationError::storage)?;
@@ -13927,6 +13976,10 @@ impl McStore {
             let mut affected = Vec::with_capacity(source_rows.len() + 1);
             affected.push(target.clone());
             affected.extend(source_rows.iter().cloned());
+            let (safety, importance) = inherit_memory_safety(
+                affected.iter().map(|row| row.safety_critical),
+                target.importance,
+            );
             let merged_from = merged_from_json(&affected);
             let seen_count: i64 = affected.iter().map(|memory| memory.seen_count.max(0)).sum();
             let retrieval_count: i64 = affected
@@ -13972,7 +14025,9 @@ impl McStore {
                         status = ?6,
                         updated_at = ?7,
                         shareable = 0,
-                        classified_at = NULL
+                        classified_at = NULL,
+                        safety_critical = ?9,
+                        importance = ?10
                   WHERE id = ?8",
                 params![
                     merged_content,
@@ -13983,6 +14038,8 @@ impl McStore {
                     merged_status,
                     now_ms,
                     target_id,
+                    safety,
+                    importance,
                 ],
             )?;
             append_memory_mutation_tx(
@@ -23984,6 +24041,277 @@ mod tests {
             (memory.safety_critical, memory.importance),
             (None, Some(40))
         );
+    }
+
+    #[test]
+    fn s02_merge_safety_matches_typescript_source_table() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/s02-merge-safety-cases.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            for mode in ["new", "existing", "store"] {
+                let archived = case["archivedSource"].as_u64().map(|index| index as usize);
+                if mode == "store" && archived.is_some() {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+                let project = "git:safety-parity";
+                let flags = case["flags"].as_array().unwrap();
+                let ids = (1..=flags.len() as i64).collect::<Vec<_>>();
+                for (index, flag) in flags.iter().enumerate() {
+                    let id = ids[index];
+                    insert_memory(
+                        &store,
+                        project,
+                        id,
+                        &format!("Source {index}."),
+                        Some(if flag.as_bool() == Some(true) { 80 } else { 50 }),
+                        if archived == Some(index) {
+                            "archived"
+                        } else {
+                            "active"
+                        },
+                        None,
+                    );
+                    store
+                        .with_context_conn_for_test(|conn| {
+                            conn.execute(
+                                "UPDATE memories SET safety_critical=?1 WHERE id=?2",
+                                params![flag.as_bool(), id],
+                            )?;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                let content = if mode == "existing" {
+                    "Source 0."
+                } else {
+                    "Combined sources."
+                };
+                let merged = if mode == "store" {
+                    store
+                        .merge_memories(project, ids[0], &ids[1..], content, 10)
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    store
+                        .with_context_conn_for_test(|conn| {
+                            let facade = FacadeMutationTxn {
+                                tx: conn,
+                                automated: archived.is_some(),
+                            };
+                            Ok(facade
+                                .merge_memories_canonical(project, &ids, content, Some("ses"), 10)
+                                .unwrap()
+                                .0)
+                        })
+                        .unwrap()
+                };
+                assert_eq!(
+                    (merged.safety_critical, merged.importance),
+                    (
+                        case["expected"].as_bool(),
+                        Some(case["importance"].as_i64().unwrap() as i32)
+                    ),
+                    "{}: {mode}",
+                    case["name"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn s02_review_p1_facade_canonical_merge_preserves_safety_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let project = "git:s02-review";
+        insert_memory(
+            &store,
+            project,
+            1,
+            "Never push without approval.",
+            Some(80),
+            "active",
+            None,
+        );
+        insert_memory(
+            &store,
+            project,
+            2,
+            "Use the release branch.",
+            Some(50),
+            "active",
+            None,
+        );
+        store
+            .with_context_conn_for_test(|conn| {
+                conn.execute("UPDATE memories SET safety_critical=1 WHERE id=1", [])?;
+                let facade = FacadeMutationTxn {
+                    tx: conn,
+                    automated: false,
+                };
+                let (merged, _) = facade
+                    .merge_memories_canonical(
+                        project,
+                        &[1, 2],
+                        "Never push without approval. Use the release branch.",
+                        Some("ses"),
+                        10,
+                    )
+                    .unwrap();
+                eprintln!(
+                    "canonical successor: safety={:?}, importance={:?}",
+                    merged.safety_critical, merged.importance
+                );
+                assert_eq!(
+                    (merged.safety_critical, merged.importance),
+                    (Some(true), Some(80))
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn s02_review_p1_store_merge_preserves_source_safety_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let project = "git:s02-review";
+        insert_memory(
+            &store,
+            project,
+            1,
+            "Never push without approval.",
+            Some(80),
+            "active",
+            None,
+        );
+        insert_memory(
+            &store,
+            project,
+            2,
+            "Use the release branch.",
+            Some(50),
+            "active",
+            None,
+        );
+        store
+            .with_context_conn_for_test(|conn| {
+                conn.execute("UPDATE memories SET safety_critical=1 WHERE id=1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let merged = store
+            .merge_memories(
+                project,
+                2,
+                &[1],
+                "Never push without approval. Use the release branch.",
+                10,
+            )
+            .unwrap()
+            .unwrap();
+        eprintln!(
+            "store survivor: safety={:?}, importance={:?}",
+            merged.safety_critical, merged.importance
+        );
+        assert_eq!(
+            (merged.safety_critical, merged.importance),
+            (Some(true), Some(80))
+        );
+    }
+
+    #[test]
+    fn s02_review_score_edges_match_typescript() {
+        use crate::memory_lifecycle::scoring::ItemScore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let project = "git:s02-review";
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/s02-review-score-cases.json")).unwrap();
+        for (index, case) in cases.as_array().unwrap().iter().enumerate() {
+            let id = index as i64 + 1;
+            insert_memory(
+                &store,
+                project,
+                id,
+                &format!("edge {id}"),
+                None,
+                "active",
+                None,
+            );
+            store.with_context_conn_for_test(|conn| {
+                conn.execute("UPDATE memories SET safety_critical=?1 WHERE id=?2", params![case["flag"].as_bool().map(i64::from), id])?;
+                conn.execute("INSERT INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal,excerpt) VALUES(?1,?2,1,'ses',?3,1,'excerpt')", params![project, id, format!("edge-{id}")])?;
+                Ok(())
+            }).unwrap();
+            assert_eq!(
+                store
+                    .record_memory_item_scores(
+                        &[id],
+                        &[ItemScore {
+                            item: id,
+                            importance: case["score"].as_i64().unwrap() as i32,
+                            proposed_class: "durable".into()
+                        }],
+                        1
+                    )
+                    .unwrap(),
+                1
+            );
+            let memory = store.get_memory_full(id).unwrap().unwrap();
+            assert_eq!(
+                memory.importance,
+                Some(case["expected"].as_i64().unwrap() as i32)
+            );
+            assert_eq!(memory.safety_critical, case["flag"].as_bool());
+        }
+        for (index, importance) in [
+            None,
+            Some(0),
+            Some(1),
+            Some(79),
+            Some(80),
+            Some(81),
+            Some(100),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = index as i64 + 100;
+            insert_memory(
+                &store,
+                project,
+                id,
+                &format!("classify edge {id}"),
+                importance,
+                "active",
+                None,
+            );
+            let memory = store.get_memory_full(id).unwrap().unwrap();
+            store
+                .set_memory_classification(
+                    project,
+                    &[ClassificationUpdate {
+                        memory_id: id,
+                        content_hash_at_prompt: memory.normalized_hash,
+                        importance: None,
+                        scope: None,
+                        shareable: None,
+                        safety_critical: Some(true),
+                    }],
+                    2,
+                )
+                .unwrap();
+            assert_eq!(
+                store.get_memory_full(id).unwrap().unwrap().importance,
+                Some(match importance {
+                    Some(81) => 81,
+                    Some(100) => 100,
+                    _ => 80,
+                })
+            );
+        }
     }
 
     #[test]

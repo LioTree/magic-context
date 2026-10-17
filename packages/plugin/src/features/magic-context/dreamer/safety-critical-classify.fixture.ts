@@ -1,5 +1,5 @@
 import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { getMemoryById } from "../memory";
 import { type ClassifyArgs, type ClassifyModuleClient, runClassify } from "./classify";
 import { acquireLease } from "./lease";
@@ -82,23 +82,4 @@ export async function classifySafetyFixture(
             : {}),
     };
     return { result: await runClassify(args), prompted, anchorIds };
-}
-
-// Rust's integration test runs selection against its disposable MODULE-owned store,
-// then submits these exact rows to the real classification RPC.
-if (import.meta.main) {
-    const db = new Database(process.argv[2]);
-    try {
-        let rows: unknown = [];
-        const selection = await classifySafetyFixture(db, process.argv[3], {
-            call: async (request) => {
-                rows = (request.body as { arguments: { rows: Array<{ memory_id: number }> } })
-                    .arguments.rows;
-                return { accepted: [], rejected: [] };
-            },
-        });
-        console.log(JSON.stringify({ ...selection, rows }));
-    } finally {
-        db.close();
-    }
 }
