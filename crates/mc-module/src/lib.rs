@@ -84,6 +84,7 @@ mod transport_admission;
 mod transport_handler;
 pub use transport_handler::McTransportHandler;
 pub mod edit_admission;
+pub mod engram_catalog;
 mod reclaim_distance;
 pub mod route_targets;
 pub mod runner_choices;
