@@ -139,6 +139,7 @@ pub mod decision_calibration;
 mod digest;
 pub mod divergence;
 mod dream_runner;
+pub mod dream_tasks;
 /// Explicit background entries. None is called by a served transform or tool.
 /// Config resolution and all adapter work happen on the worker, not its caller.
 pub mod background {
