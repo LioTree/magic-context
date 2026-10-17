@@ -1603,7 +1603,12 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 				pendingTurn = undefined;
 				// Mapping emits decisions between tool turns. Preserve those turns on
 				// every settlement so a timeout cannot erase already located files.
-				if (isMemoryMapper) {
+				// A Zen free-tier refusal has no located files, and its error message
+				// carries the provider's raw response body, so it is never kept.
+				if (
+					isMemoryMapper &&
+					result.meta?.failureClass !== ZEN_FREE_TIER_FAILURE
+				) {
 					result = {
 						...result,
 						meta: { ...result.meta, mappingMessages: [...mappingMessages] },
