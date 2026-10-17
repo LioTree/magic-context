@@ -59,6 +59,10 @@ import {
     runBootPhaseWithinBudget,
 } from "./plugin/boot-deadline";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
+import {
+    guardBridgedSessionRpc,
+    standDownForBridgedSessions,
+} from "./plugin/bridged-session-guard";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
 import { startDreamScheduleTimer } from "./plugin/dream-timer";
 import { createDreamTimerModuleClient } from "./plugin/dream-timer-module-client";
@@ -73,6 +77,7 @@ import { isDebugRpcEnabled, registerRpcHandlers } from "./plugin/rpc-handlers";
 import { bindStaleBuildNotice } from "./plugin/stale-build-notice";
 import { primaryOnlyToolIds } from "./plugin/subagent-tool-policy";
 import { createToolRegistry } from "./plugin/tool-registry";
+import { isBridgedSession } from "./shared/bridged-sessions";
 import { getMagicContextBuiltinCommands } from "./shared/builtin-commands";
 import { claimConfigParseFailuresOnce } from "./shared/config-diagnostics";
 import { buildOpenCodeConfigWarningBanner } from "./shared/config-warning-surface";
@@ -225,7 +230,9 @@ const server: Plugin = async (ctx) => {
                         clientWithSessions.session?.list?.(),
                     ).catch(() => null);
                     const sessionList = Array.isArray(sessions) ? sessions : sessions?.data;
-                    const sessionId = sessionList?.[0]?.id;
+                    // A session another product's bridge serves gets no Magic
+                    // Context notices; warn the first session we do serve.
+                    const sessionId = sessionList?.find((s) => !isBridgedSession(s?.id))?.id;
                     if (sessionId) {
                         await sendStatusNotification(ctx.client, sessionId, warningText, {});
                     }
@@ -259,7 +266,7 @@ const server: Plugin = async (ctx) => {
                     () => null,
                 );
                 const sessionList = Array.isArray(sessions) ? sessions : sessions?.data;
-                const sessionId = sessionList?.[0]?.id;
+                const sessionId = sessionList?.find((s) => !isBridgedSession(s?.id))?.id;
                 if (sessionId)
                     await sendStatusNotification(ctx.client, sessionId, missingDbBanner, {});
             } catch {
@@ -636,6 +643,9 @@ const server: Plugin = async (ctx) => {
         // Start RPC server for TUI↔server communication (replaces SQLite plugin_messages bus).
         // `storageDir` is hoisted above so the auto-update checker can also use it.
         rpcServer = new MagicContextRpcServer(storageDir, ctx.directory);
+        // Per-session RPC requests (sidebar, status, flush, recomp, ...) about a
+        // session another product's bridge serves are refused, not answered.
+        guardBridgedSessionRpc(rpcServer);
         registerRpcHandlers(rpcServer, {
             directory: ctx.directory,
             config: pluginConfig,
@@ -694,6 +704,9 @@ const server: Plugin = async (ctx) => {
     // disabled, allowing the hermetic A/B harness to sample the same host process.
     if (!pluginConfig.enabled && isDebugRpcEnabled(pluginConfig)) {
         rpcServer = new MagicContextRpcServer(storageDir, ctx.directory);
+        // Per-session RPC requests (sidebar, status, flush, recomp, ...) about a
+        // session another product's bridge serves are refused, not answered.
+        guardBridgedSessionRpc(rpcServer);
         registerRpcHandlers(rpcServer, {
             directory: ctx.directory,
             config: pluginConfig,
@@ -845,7 +858,9 @@ const server: Plugin = async (ctx) => {
         }),
     );
 
-    return {
+    // Sessions another product's bridge has enrolled get none of these hooks'
+    // work; every other session reaches them unchanged.
+    return standDownForBridgedSessions({
         tool: tools,
         event: createEventHandler({
             magicContext: {
@@ -1153,7 +1168,7 @@ const server: Plugin = async (ctx) => {
                 );
             }
         },
-    };
+    });
 };
 
 // V1 plugin-object shape (`{ id, server }`), NOT a bare function. This is
