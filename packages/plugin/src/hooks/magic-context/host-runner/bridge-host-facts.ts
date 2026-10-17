@@ -1,4 +1,5 @@
 import type { loadPluginConfigDetailed } from "../../../config";
+import { isCompactionEnabled } from "../../../config/agent-disable";
 import { createCompactionHandler } from "../../../features/magic-context/compaction";
 import {
     clearDetectedContextLimit,
@@ -48,7 +49,7 @@ export function createBridgeHostFacts(
         contextUsageMap: deps.contextUsageMap,
         compactionHandler: createCompactionHandler(),
         config,
-        compactionOff: !config.compaction.enabled,
+        compactionOff: !isCompactionEnabled(config),
         usageContextWindow: (id, model) => {
             const window = windows.get(id);
             if (!window || window.model !== model) return undefined;
