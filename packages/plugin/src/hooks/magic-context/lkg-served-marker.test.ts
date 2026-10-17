@@ -637,6 +637,40 @@ describe("served certificates are bound to their bytes", () => {
         }
     });
 
+    test("an identical re-serve never reuses an id another writer bound to different bytes", () => {
+        const root = createTestTempDirFromPath(join(tmpdir(), "served-marker-reuse-bound-"));
+        const db = fixture(join(root, "context.db"));
+        const sibling = new Database(join(root, "context.db"));
+        databases.push(sibling);
+        try {
+            const served = slot(recordServedCapture(db, "s", true));
+            expect(captureSlot("s", served)).toBe(true);
+            expect(saveLkgSlotToDb(db, "s", served)).toBe(true);
+            // Session cleanup removes the marker row; another writer then takes
+            // the same restarted id for its own bytes and binds it.
+            db.exec("DELETE FROM lkg_served_markers");
+            const other = {
+                ...served,
+                jsonPrefix: '[{"text":"recreated session"}]',
+                servedCaptureId: recordServedCapture(sibling, "s", true),
+            };
+            expect(other.servedCaptureId).toBe(served.servedCaptureId);
+            expect(saveLkgSlotToDb(sibling, "s", other)).toBe(true);
+            // This process serves its own request again: equal id, other bytes bound.
+            const again = { ...served, capturedAt: served.capturedAt + 1, captureSequence: 4 };
+            const id = recordServedCapture(db, "s", true, again);
+            expect(id).toBe(other.servedCaptureId! + 1);
+            expect(saveLkgSlotToDb(db, "s", { ...again, servedCaptureId: id })).toBe(true);
+            expect(checkLkgDurability(sibling, "s")).toEqual({
+                durable: true,
+                servedCaptureId: id!,
+            });
+        } finally {
+            for (const connection of databases.splice(0)) connection.close();
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("an older deferred save racing a newer serve by the same process leaves the sibling's bytes", () => {
         const root = createTestTempDirFromPath(join(tmpdir(), "served-marker-race-"));
         const db = fixture(join(root, "context.db"));
