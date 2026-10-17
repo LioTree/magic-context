@@ -324,3 +324,107 @@ async fn claude_resident_randomized_48_passes_are_byte_identical() {
     );
     println!("CLAUDE_DIFFERENTIAL passes=48 replacements={folds} resident_tail_passes={tail_passes} hooks=48 restart=1 drops=7");
 }
+
+fn cc_raw(ordinal: u64, raw: &str) -> Value {
+    json!({"ordinal":ordinal,"mid":format!("m{ordinal}"),"message":serde_json::from_str::<Value>(raw).unwrap(),"raw_message":raw})
+}
+
+/// Claude Code history whose message `call` is an assistant `tool_use` and
+/// whose next message is the user `tool_result` answering it.
+fn cc_tool_history(newest: u64, call: u64) -> Vec<Value> {
+    (1..=newest)
+        .map(|ordinal| {
+            if ordinal == call {
+                cc_raw(
+                    ordinal,
+                    r#"{"role":"assistant","content":[{"type":"tool_use","id":"toolu_boundary","name":"read","input":{"path":"a"}}]}"#,
+                )
+            } else if ordinal == call + 1 {
+                cc_raw(
+                    ordinal,
+                    r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_boundary","content":"boundary result"}]}"#,
+                )
+            } else {
+                cc_message(ordinal, &format!("source {ordinal}: café 🦀"))
+            }
+        })
+        .collect()
+}
+
+/// When the history summary ends at a `tool_result` message, a resident
+/// Claude Code fold renders the coverage boundary in front of its retained
+/// tail. The boundary's paired `tool_use` lies in the previous message; without
+/// it the renderer saw a covered span that split the tool exchange and refused
+/// the fold as `invalid_signed_tool_boundary`. The resident fold must serve
+/// exactly what the full rebuild (the non-resident oracle) serves.
+#[tokio::test]
+async fn claude_resident_fold_with_tool_result_boundary_matches_full_rebuild() {
+    let root = synthetic();
+    let a = root.path().join("on");
+    let b = root.path().join("off");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let project = root.path().join("project");
+    let on = claude(&a, &project, true);
+    let off = claude(&b, &project, false);
+    let ready = super::super::claude_code_tests::setup(&on).await;
+    assert_eq!(ready, super::super::claude_code_tests::setup(&off).await);
+    let boundary = 81;
+    let mut newest = 100;
+    let mut applied = Value::Null;
+    let mut folds = 0;
+    for pass in 0..8u64 {
+        let appended = if pass == 0 {
+            cc_tool_history(newest, boundary - 1)
+        } else if pass % 2 == 0 {
+            newest += 1;
+            vec![cc_message(newest, &format!("append {pass}"))]
+        } else {
+            vec![]
+        };
+        for h in [&on, &off] {
+            let store = h.store.get().unwrap();
+            let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+            let namespace = store
+                .load_provider_conversation(&key.store_key())
+                .unwrap()
+                .unwrap()
+                .engine_namespace;
+            store
+                .replace_compartments(&namespace, &compartments(pass, boundary))
+                .unwrap();
+            store.arm_soft_refresh(&namespace).unwrap();
+        }
+        let mut request = step("cc", appended, Some(newest));
+        request["harness"] = json!("claude-code");
+        request["request_id"] = json!(format!("boundary-{pass}"));
+        request["now"] = json!(1000 + pass * 1000);
+        request["served_through_ordinal"] = json!(newest);
+        if !applied.is_null() {
+            request["last_applied"] = applied.clone();
+        }
+        let response = invoke(&on, "compaction.step", &request).await;
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            String::from_utf8_lossy(&invoke(&off, "compaction.step", &request).await),
+            "step {pass}"
+        );
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        if response["answer"] == "compaction_message" {
+            folds += 1;
+            applied = json!({"compaction_id":response["compaction"]["compaction_id"],"version":response["compaction"]["version"]});
+        }
+    }
+    assert!(folds >= 2, "must exercise replacements: {folds}");
+    let stats = on.provider_resident.stats();
+    let tail_passes: u64 = stats["containers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["tail_passes"].as_u64().unwrap())
+        .sum();
+    assert!(
+        tail_passes > 0,
+        "must fold through the resident tail that renders the boundary: {stats}"
+    );
+}
