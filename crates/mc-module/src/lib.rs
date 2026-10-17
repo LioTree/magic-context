@@ -4312,6 +4312,8 @@ fn historian_trigger_rule(reason: boundary::TriggerReason) -> &'static str {
 }
 
 struct HistorianPrepareContext<'a> {
+    /// A drain/provider supplies its start-time value; ordinary callers capture here.
+    rust_background_enabled: Option<bool>,
     now: i64,
     // Provider runs compare selected message fingerprints and lineage cuts
     // against the database. They have no full-request cache generation to check,
@@ -4326,6 +4328,7 @@ struct HistorianPrepareContext<'a> {
 }
 
 struct ReattachPublicationGuards {
+    rust_background_enabled: bool,
     snapshot_generation: Option<u64>,
     log_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
 }
@@ -4619,6 +4622,7 @@ impl historian::HistorianPublicationFence for ReattachSnapshotPublicationFence {
 }
 
 struct HistorianFiringTask {
+    rust_background_enabled: bool,
     store: Arc<McStore>,
     session_id: String,
     /// The route's harness label, stamped on rows the single-store writers produce.
@@ -6319,6 +6323,7 @@ impl McHandler {
         now: i64,
     ) -> Option<&'static str> {
         let ReattachPublicationGuards {
+            rust_background_enabled,
             snapshot_generation,
             log_fence: log_publication_fence,
         } = guards;
@@ -6473,6 +6478,7 @@ impl McHandler {
                 let _guard = guard;
                 let outcome =
                     historian::adopt_historian_run_on_host(historian::HistorianReattachRequest {
+                        rust_background_enabled,
                         store: &store,
                         session_id: &session_id,
                         project_path: &project_path,
@@ -6607,6 +6613,7 @@ impl McHandler {
                         reattach_historian_producer(
                             &mut *producer,
                             historian::HistorianReattachRequest {
+                                rust_background_enabled,
                                 store: &store,
                                 session_id: &session_id,
                                 project_path: &project_path,
@@ -6686,6 +6693,7 @@ impl McHandler {
     ) -> PreparedHistorianAction {
         profile_start!(_perf_trigger, "trigger_ms");
         let HistorianPrepareContext {
+            rust_background_enabled,
             now,
             snapshot_generation,
             publication_fence,
@@ -6766,12 +6774,15 @@ impl McHandler {
             };
         }
         let cfg = self.effective_config(&binding.project_root);
+        let rust_background_enabled =
+            rust_background_enabled.unwrap_or_else(|| cfg.rust_background_enabled());
         if loaded.meta.historian.state != HistorianPhase::Idle {
             let no_fire = self
                 .maybe_spawn_reattach(
                     Arc::clone(&store),
                     parsed,
                     ReattachPublicationGuards {
+                        rust_background_enabled,
                         snapshot_generation,
                         log_fence: publication_fence.clone(),
                     },
@@ -7293,6 +7304,7 @@ impl McHandler {
         PreparedHistorianAction::FireReady(Box::new(PreparedHistorianFiring {
             diagnostics,
             task: HistorianFiringTask {
+                rust_background_enabled,
                 store,
                 session_id: parsed.session_id.clone(),
                 harness: binding.harness.clone(),
@@ -7454,6 +7466,7 @@ impl McHandler {
             }
         };
         PreparedWrapupAction::FireReady(Box::new(HistorianFiringTask {
+            rust_background_enabled: binding.config.rust_background_enabled(),
             store,
             session_id: parsed.session_id.clone(),
             harness: binding.harness.clone(),
@@ -7564,6 +7577,7 @@ impl McHandler {
         task: HistorianFiringTask,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
         let HistorianFiringTask {
+            rust_background_enabled,
             store,
             session_id,
             harness,
@@ -7608,6 +7622,7 @@ impl McHandler {
                 language.as_deref(),
             );
             request.temperature = historian_temperature;
+            request.rust_background_enabled = rust_background_enabled;
             request.publication_fence = publication_fence.as_deref();
             // The claimant walks the same model chain a Broca firing would, each
             // attempt under the host's own per-attempt timeout, so this waits for the
@@ -7640,6 +7655,7 @@ impl McHandler {
                     language.as_deref(),
                 );
                 request.temperature = historian_temperature;
+                request.rust_background_enabled = rust_background_enabled;
                 request.await_timeout = historian_await_timeout;
                 request.publication_fence = publication_fence.as_deref();
                 run_historian_firing_with_model_cache(
@@ -11802,6 +11818,7 @@ impl McHandler {
                 &project_path,
                 &result.projection,
                 HistorianPrepareContext {
+                    rust_background_enabled: None,
                     now: pass_now,
                     snapshot_generation: Some(snapshot_generation),
                     publication_fence: None,
@@ -11835,6 +11852,7 @@ impl McHandler {
                             &project_path,
                             &result.projection,
                             HistorianPrepareContext {
+                                rust_background_enabled: None,
                                 now: pass_now,
                                 snapshot_generation: Some(snapshot_generation),
                                 publication_fence: None,
@@ -11909,6 +11927,7 @@ impl McHandler {
                 &project_path,
                 &result.projection,
                 HistorianPrepareContext {
+                    rust_background_enabled: None,
                     now: pass_now,
                     snapshot_generation: Some(snapshot_generation),
                     publication_fence: None,
@@ -28903,6 +28922,7 @@ mod tests {
                     let loaded = store.load("ses").unwrap();
                     store
                         .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                            rust_background_enabled: false,
                             lifecycle_publication_id: None,
                             harness: None,
                             session_id: "ses",
@@ -31092,6 +31112,7 @@ mod tests {
             .unwrap();
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -40908,6 +40929,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -43160,6 +43182,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id,

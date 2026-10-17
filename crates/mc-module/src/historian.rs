@@ -920,6 +920,7 @@ pub trait HistorianPublicationFence: Send + Sync {
 }
 
 pub struct ValidatedPublishRequest<'a> {
+    pub rust_background_enabled: bool,
     pub session_id: &'a str,
     pub project_path: &'a str,
     /// The harness label the host stamps on this session's rows (`opencode`, `opencode2`,
@@ -1047,6 +1048,7 @@ pub fn publish_validated_chunk(
         request.expected_revert_epoch,
     );
     let publish_request = HistorianPublishRequest {
+        rust_background_enabled: request.rust_background_enabled,
         lifecycle_publication_id: Some(&publication_id),
         harness: Some(request.harness),
         session_id: request.session_id,
@@ -1144,6 +1146,7 @@ pub fn publish_validated_chunk(
                 },
             ))
         }
+        Err(err @ HistorianPublishError::Deferred { .. }) => Err(err.into()),
         Err(err) => {
             // The publish error occurs after the producer has completed its work, so
             // leave the producer run available for the normal recovery path instead of
@@ -1570,6 +1573,7 @@ pub struct HistorianModelLimits {
 }
 
 pub struct HistorianFireRequest<'a> {
+    pub rust_background_enabled: bool,
     pub store: &'a McStore,
     pub session_id: &'a str,
     pub project_path: &'a str,
@@ -1618,6 +1622,7 @@ pub struct HistorianFireRequest<'a> {
 }
 
 pub struct HistorianReattachRequest<'a> {
+    pub rust_background_enabled: bool,
     pub store: &'a McStore,
     pub session_id: &'a str,
     pub project_path: &'a str,
@@ -3215,6 +3220,7 @@ where
             &mut parent_invocation_id,
         );
         let publish_result = publish_output_from_awaiting(PublishOutputRequest {
+            rust_background_enabled: request.rust_background_enabled,
             store: request.store,
             session_id: request.session_id,
             project_path: request.project_path,
@@ -3465,7 +3471,9 @@ async fn drive_historian_on_host(
     }
 
     let report = registration.wait(await_budget).await;
-    let _ = request.store.finish_historian_pending_run(&run_id);
+    if !request.rust_background_enabled {
+        let _ = request.store.finish_historian_pending_run(&run_id);
+    }
 
     let completed_at_ms = (request.completion_now_ms)();
     let failure_backoff_at_ms = completion_failure_backoff_at_ms(
@@ -3479,6 +3487,7 @@ async fn drive_historian_on_host(
     let output = match report {
         Some(crate::historian_host::HostRunReport::Output(output)) => output,
         Some(crate::historian_host::HostRunReport::Failed { code, message }) => {
+            let _ = request.store.finish_historian_pending_run(&run_id);
             abandon_current_state_with_detail(
                 request.store,
                 request.session_id,
@@ -3491,6 +3500,7 @@ async fn drive_historian_on_host(
         }
         Some(crate::historian_host::HostRunReport::WithInvocations { .. }) => unreachable!(),
         None => {
+            let _ = request.store.finish_historian_pending_run(&run_id);
             abandon_current_state_with_detail(
                 request.store,
                 request.session_id,
@@ -3512,6 +3522,7 @@ async fn drive_historian_on_host(
     if claimed.state != HistorianPhase::AwaitingProducer
         || claimed.producer_run_id.as_deref() != Some(run_id.as_str())
     {
+        let _ = request.store.finish_historian_pending_run(&run_id);
         return Err(HistorianDriveError::State(
             HistorianStateError::InvalidTransition {
                 from: claimed.state.clone(),
@@ -3520,7 +3531,12 @@ async fn drive_historian_on_host(
         ));
     }
 
-    let row_version = publish_output_from_awaiting(PublishOutputRequest {
+    let durable_output = mc_store::HistorianRunReport::Output {
+        text: output.text.clone(),
+        length_capped: output.length_capped,
+    };
+    let publish_result = publish_output_from_awaiting(PublishOutputRequest {
+        rust_background_enabled: request.rust_background_enabled,
         store: request.store,
         session_id: request.session_id,
         project_path: request.project_path,
@@ -3540,7 +3556,31 @@ async fn drive_historian_on_host(
         failure_backoff_at_ms: request.failure_backoff_at_ms,
         completion_now_ms: request.completion_now_ms,
         publication_fence: request.publication_fence,
-    })?;
+    });
+    if matches!(
+        &publish_result,
+        Err(HistorianDriveError::State(HistorianStateError::Publish(
+            HistorianPublishError::Deferred { .. }
+        )))
+    ) {
+        if let Some(token) = claimed.coordinator_token.as_deref().filter(|_| {
+            request
+                .store
+                .historian_state(request.session_id)
+                .is_ok_and(|state| state.state == HistorianPhase::AwaitingProducer)
+        }) {
+            request.store.record_historian_report(
+                request.project_path,
+                &run_id,
+                token,
+                &durable_output,
+                completed_at_ms,
+            )?;
+        }
+    } else {
+        let _ = request.store.finish_historian_pending_run(&run_id);
+    }
+    let row_version = publish_result?;
 
     Ok(HistorianDriveOutcome::Completed(HistorianRunSuccess {
         row_version,
@@ -3680,6 +3720,7 @@ pub fn adopt_historian_run_on_host(
 
     let predicate = publish_predicate(&awaiting)?;
     let publish_result = publish_output_from_awaiting(PublishOutputRequest {
+        rust_background_enabled: request.rust_background_enabled,
         store: request.store,
         session_id: request.session_id,
         project_path: request.project_path,
@@ -3700,9 +3741,20 @@ pub fn adopt_historian_run_on_host(
         completion_now_ms: request.completion_now_ms,
         publication_fence: request.publication_fence,
     });
-    // The queue row goes whether the publish landed or was refused: the report it
-    // carried has been spent either way, and leaving it would offer the same
-    // rejected document to the next pass forever.
+    if matches!(
+        &publish_result,
+        Err(HistorianDriveError::State(HistorianStateError::Publish(
+            HistorianPublishError::Deferred { .. }
+        )))
+    ) {
+        return Ok(HostRunAdoption::StillOut {
+            run_id,
+            deadline_ms: parked.deadline_ms,
+            republished: false,
+        });
+    }
+    // Remove rejected stale reports so later passes cannot retry the same document.
+    // Lease contention above instead preserves the queue row and its output for retry.
     let _ = request.store.finish_historian_pending_run(&run_id);
     if let Err(error) = &publish_result {
         record_failed_run(
@@ -4072,6 +4124,7 @@ where
     // Always release both routes, whether publish succeeds or errors — an early `?`
     // return would leak the command + subscribe routes for this reattached firing.
     let publish_result = publish_output_from_awaiting(PublishOutputRequest {
+        rust_background_enabled: request.rust_background_enabled,
         store: request.store,
         session_id: request.session_id,
         project_path: request.project_path,
@@ -4103,6 +4156,7 @@ where
 }
 
 struct PublishOutputRequest<'a> {
+    rust_background_enabled: bool,
     store: &'a McStore,
     session_id: &'a str,
     project_path: &'a str,
@@ -4128,6 +4182,7 @@ fn publish_output_from_awaiting(
     request: PublishOutputRequest<'_>,
 ) -> Result<u64, HistorianDriveError> {
     let PublishOutputRequest {
+        rust_background_enabled,
         store,
         session_id,
         project_path,
@@ -4234,6 +4289,7 @@ fn publish_output_from_awaiting(
     let published = publish_validated_chunk(
         store,
         ValidatedPublishRequest {
+            rust_background_enabled,
             session_id,
             project_path,
             harness,
@@ -4254,7 +4310,19 @@ fn publish_output_from_awaiting(
             failure_backoff_at_ms,
             publication_fence,
         },
-    )?;
+    );
+    let published = match published {
+        Err(error @ HistorianStateError::Publish(HistorianPublishError::Deferred { .. })) => {
+            // Before store.db records the publication intent, contention leaves
+            // the report reusable. After that commit, recovery replays the saved
+            // compartment payload from mc_single_store_pending_publish instead.
+            if store.load_meta(session_id)?.meta.historian.state == HistorianPhase::Publishing {
+                persist_historian_report_state(store, session_id, &publishing, awaiting.clone())?;
+            }
+            return Err(error.into());
+        }
+        result => result?,
+    };
     let importance: Vec<i64> = validated
         .compartments
         .iter()
@@ -5603,6 +5671,7 @@ mod tests {
             .unwrap()
             .compartment_set_generation;
         HistorianFireRequest {
+            rust_background_enabled: false,
             store,
             session_id: "ses",
             project_path: FIRE_PROJECT,
@@ -5650,6 +5719,7 @@ mod tests {
         prior: &'a [StoredCompartmentRange],
     ) -> HistorianReattachRequest<'a> {
         HistorianReattachRequest {
+            rust_background_enabled: false,
             store,
             session_id: "ses",
             project_path: "git:proj",
@@ -5979,6 +6049,7 @@ mod tests {
         let before = main_store.load_meta("ses").unwrap();
         let rows = main_store.load_compartments("ses").unwrap();
         let late = publish_output_from_awaiting(PublishOutputRequest {
+            rust_background_enabled: false,
             store: &main_store,
             session_id: "ses",
             project_path: FIRE_PROJECT,
@@ -7296,6 +7367,7 @@ mod tests {
             .with_status(Ok(RunState::Terminal))
             .with_output(Ok(producer_output(historian_xml("right summary"))));
         let left_request = HistorianReattachRequest {
+            rust_background_enabled: false,
             store: &store,
             session_id: left_lineage,
             project_path: "git:proj",
@@ -7315,6 +7387,7 @@ mod tests {
             publication_fence: None,
         };
         let right_request = HistorianReattachRequest {
+            rust_background_enabled: false,
             store: &store,
             session_id: right_lineage,
             project_path: "git:proj",
@@ -8167,6 +8240,7 @@ mod tests {
 
         // observed fingerprint diverges from the stored "fp" — a tail change since firing.
         let request = HistorianReattachRequest {
+            rust_background_enabled: false,
             store: &store,
             session_id: "ses",
             project_path: "git:proj",
@@ -8528,6 +8602,7 @@ mod tests {
         publish_validated_chunk(
             &store,
             ValidatedPublishRequest {
+                rust_background_enabled: false,
                 session_id: "ses",
                 project_path: "git:proj",
                 harness: "opencode",
@@ -8620,6 +8695,7 @@ mod tests {
             publish_validated_chunk(
                 &store,
                 ValidatedPublishRequest {
+                    rust_background_enabled: false,
                     session_id,
                     project_path: "git:proj",
                     harness: "opencode",
@@ -8777,6 +8853,7 @@ mod tests {
         let err = publish_validated_chunk(
             &store,
             ValidatedPublishRequest {
+                rust_background_enabled: false,
                 session_id: "ses",
                 project_path: "git:proj",
                 harness: "opencode",
@@ -8868,6 +8945,7 @@ mod tests {
         let err = publish_validated_chunk(
             &store,
             ValidatedPublishRequest {
+                rust_background_enabled: false,
                 session_id: "ses",
                 project_path: "git:proj",
                 harness: "opencode",
@@ -8952,6 +9030,7 @@ mod tests {
         let error = publish_validated_chunk(
             &store,
             ValidatedPublishRequest {
+                rust_background_enabled: false,
                 session_id: "ses",
                 project_path: "git:proj",
                 harness: "opencode",
@@ -9106,6 +9185,7 @@ mod tests {
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -9231,6 +9311,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -9955,6 +10036,147 @@ mod tests {
                 .is_empty(),
             "a published run leaves the queue"
         );
+    }
+
+    fn i4_store_report(store: &McStore) {
+        let (run_id, token) = claim_a_run_with_no_firing_task(store);
+        store
+            .record_historian_report(
+                FIRE_PROJECT,
+                &run_id,
+                &token,
+                &mc_store::HistorianRunReport::Output {
+                    text: historian_xml("stored output"),
+                    length_capped: false,
+                },
+                123,
+            )
+            .unwrap();
+    }
+
+    fn i4_hold_ts_lease(dir: &std::path::Path, holder: &str) {
+        let conn = rusqlite::Connection::open(dir.join("context.db")).unwrap();
+        conn.execute("INSERT INTO compartment_state_lease (session_id, holder_id, owner_pid, acquired_at, expires_at) VALUES ('ses', ?1, ?2, ?3, ?4)", rusqlite::params![holder, std::process::id(), crate::now_ms(), crate::now_ms() + 300_000]).unwrap();
+    }
+
+    #[test]
+    fn i4_stored_report_holder_matrix_retains_then_publishes_once() {
+        for restart in [false, true] {
+            for holder in ["ts-wrapup", "ts-recomp", "ts-incremental"] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut host_store = store(dir.path());
+                seed_prior_compartment(&host_store);
+                i4_store_report(&host_store);
+                i4_hold_ts_lease(dir.path(), holder);
+                if restart {
+                    drop(host_store);
+                    host_store = store(dir.path());
+                }
+                let chunk = historian_chunk();
+                let prior = prior_ranges();
+                let mut request = reattach_request(&host_store, &chunk, &prior);
+                request.rust_background_enabled = true;
+                assert!(matches!(
+                    adopt_historian_run_on_host(request).unwrap(),
+                    HostRunAdoption::StillOut { .. }
+                ));
+                assert_eq!(host_store.load_compartments("ses").unwrap().len(), 1);
+                assert!(host_store
+                    .load_parked_historian_run("ses")
+                    .unwrap()
+                    .unwrap()
+                    .report
+                    .is_some());
+                assert_eq!(
+                    host_store.historian_state("ses").unwrap().state,
+                    HistorianPhase::AwaitingProducer
+                );
+                rusqlite::Connection::open(dir.path().join("context.db"))
+                    .unwrap()
+                    .execute(
+                        "DELETE FROM compartment_state_lease WHERE session_id='ses'",
+                        [],
+                    )
+                    .unwrap();
+                let mut request = reattach_request(&host_store, &chunk, &prior);
+                request.rust_background_enabled = true;
+                assert!(matches!(
+                    adopt_historian_run_on_host(request).unwrap(),
+                    HostRunAdoption::Published(_)
+                ));
+                assert!(host_store
+                    .load_parked_historian_run("ses")
+                    .unwrap()
+                    .is_none());
+                assert_eq!(host_store.load_compartments("ses").unwrap().len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn i4_stored_report_uses_fire_time_snapshot_with_and_without_restart() {
+        for restart in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut host_store = store(dir.path());
+            seed_prior_compartment(&host_store);
+            i4_store_report(&host_store);
+            let conn = rusqlite::Connection::open(dir.path().join("context.db")).unwrap();
+            conn.execute("INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at) VALUES ('ses', 2, 50, 60, 'm50', 'm60', 'TS append', 'new TS history', 1)", []).unwrap();
+            drop(conn);
+            if restart {
+                drop(host_store);
+                host_store = store(dir.path());
+            }
+            let chunk = historian_chunk();
+            let prior = prior_ranges();
+            let mut request = reattach_request(&host_store, &chunk, &prior);
+            request.rust_background_enabled = true;
+            let error = adopt_historian_run_on_host(request).unwrap_err();
+            assert!(
+                matches!(error, HistorianDriveError::State(HistorianStateError::Publish(HistorianPublishError::FenceRejected { reason })) if reason.contains("compartment set"))
+            );
+            assert_eq!(host_store.load_compartments("ses").unwrap().len(), 2);
+            assert!(host_store
+                .load_parked_historian_run("ses")
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn i4_firing_carries_captured_activation_to_store_after_toggle() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_store = store(dir.path());
+        seed_prior_compartment(&host_store);
+        i4_hold_ts_lease(dir.path(), "ts-wrapup");
+        let config = std::sync::Arc::new(std::sync::Mutex::new(crate::config::McModuleConfig {
+            rust_background_enabled: true,
+            ..Default::default()
+        }));
+        let captured = config.lock().unwrap().rust_background_enabled();
+        let config_for_hook = config.clone();
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Ok(producer_output(historian_xml("captured on"))))
+            .with_await_output_hook(move || {
+                config_for_hook.lock().unwrap().rust_background_enabled = false
+            });
+        let models = vec!["prov/model-a".into()];
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let mut request = fire_request(&host_store, "prompt", &models, &chunk, &prior);
+        request.rust_background_enabled = captured;
+        let error = run_historian_firing(&mut producer, request)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianDriveError::State(HistorianStateError::Publish(
+                HistorianPublishError::Deferred { .. }
+            ))
+        ));
+        assert!(!config.lock().unwrap().rust_background_enabled());
+        assert_eq!(host_store.load_compartments("ses").unwrap().len(), 1);
     }
 
     #[test]
