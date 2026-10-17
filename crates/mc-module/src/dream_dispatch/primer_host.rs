@@ -435,6 +435,8 @@ mod tests {
         during_model: Option<Box<dyn FnOnce() + Send>>,
         requests: Vec<ChildRequest>,
         tools: bool,
+        /// Whether an embedding model is available.
+        embed: bool,
     }
     impl FakeCarrier {
         fn callback(&mut self) {
@@ -469,7 +471,7 @@ mod tests {
     }
     impl PrimerCarrier for FakeCarrier {
         fn embedding_model(&self) -> Option<&str> {
-            Some("active")
+            self.embed.then_some("active")
         }
         async fn embed_questions(
             &mut self,
@@ -563,7 +565,7 @@ mod tests {
                     tx.execute("INSERT INTO primer_candidates(id,project_path,harness,session_id,question,normalized_question,source_compartment_start,source_compartment_end,source_start_message_id,source_end_message_id,source_message_time,created_at) VALUES (?1,?2,'opencode',?3,?4,?5,1,3,?6,?6,?7,1)",params![id,project,format!("source-{id}"),question,question.to_lowercase(),format!("m{id}"),day*primers::DAY_MS])?;
                 }
                 if task==TaskName::RefreshPrimers {
-                    tx.execute("INSERT INTO primers(id,project_path,question,answer,total_support,last_observed_at,source_candidate_ids,source_candidate_provenance,created_at,updated_at) VALUES (1,'project','How does routing work?','',3,?1,'[1,2,3]',?2,1,1)",params![NOW-1,json!([{"candidateId":1,"projectPath":"project","harness":"opencode","sessionId":"source-1","sourceCompartmentStart":1,"sourceCompartmentEnd":3,"sourceStartMessageId":"m1","sourceEndMessageId":"m1"}]).to_string()])?;
+                    tx.execute("INSERT INTO primers(id,project_path,question,answer,total_support,last_observed_at,source_candidate_ids,source_candidate_provenance,created_at,updated_at) VALUES (1,'project','How does routing work?','',3,?1,'[1,2,3]',?2,1,1)",params![NOW-1,r#"[{"candidate_id":1,"project_path":"project","harness":"opencode","session_id":"source-1","source_compartment_start":1,"source_compartment_end":3,"source_start_message_id":"m1","source_end_message_id":"m1"}]"#])?;
                 }
                 tx.execute("INSERT INTO session_meta(session_id,served_prefix,cached_m0_bytes) VALUES ('session','frozen prefix',?1),('other-session','other prefix',?2)", params![b"frozen bytes",b"other bytes"])?;
                 tx.execute("INSERT INTO project_state(project_path,project_memory_epoch) VALUES ('project',7),('foreign',9)", [])?;
@@ -585,6 +587,7 @@ mod tests {
                 during_model: None,
                 requests: Vec::new(),
                 tools: true,
+                embed: true,
             }
         }
         fn host(&self) -> PrimerHost<FakeCarrier> {
@@ -648,6 +651,8 @@ mod tests {
         let provenance = fixture.store.load_dream_primers("project").unwrap().primers[0]
             ["sourceProvenance"]
             .clone();
+        // The TypeScript-shaped column reads back as the planner's list.
+        assert_eq!(provenance[0]["candidateId"], 1, "{provenance}");
         let mut host = fixture.host();
         assert!(matches!(
             host.run().await.unwrap(),
@@ -1044,5 +1049,113 @@ mod tests {
             compare_keys("project\u{1f}😀\u{1f}1", "project\u{1f}\u{e000}\u{1f}1"),
             Ordering::Less
         );
+    }
+
+    fn rows(f: &Fixture, sql: &str) -> Value {
+        f.store
+            .with_context_read(|db| {
+                let mut stmt = db.prepare(sql)?;
+                let names: Vec<String> =
+                    stmt.column_names().into_iter().map(str::to_owned).collect();
+                let rows = stmt
+                    .query_map([], |row| {
+                        let mut object = serde_json::Map::new();
+                        for (i, name) in names.iter().enumerate() {
+                            let value = match row.get::<_, rusqlite::types::Value>(i)? {
+                                rusqlite::types::Value::Null => Value::Null,
+                                rusqlite::types::Value::Integer(v) => json!(v),
+                                rusqlite::types::Value::Real(v) => json!(v),
+                                rusqlite::types::Value::Text(v) => json!(v),
+                                rusqlite::types::Value::Blob(v) => json!(v),
+                            };
+                            object.insert(name.clone(), value);
+                        }
+                        Ok(Value::Object(object))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(Value::Array(rows))
+            })
+            .unwrap()
+    }
+
+    fn assert_rows_match(f: &Fixture, step: &Value) {
+        let name = step["step"].as_str().unwrap();
+        assert_eq!(
+            rows(f, "SELECT id,project_path,question,answer,status,total_support,last_observed_at,answer_refreshed_at,source_candidate_ids,source_candidate_provenance,question_embedding IS NULL AS no_embedding,created_at,updated_at FROM primers ORDER BY id"),
+            step["primers"],
+            "{name}"
+        );
+        let ids: Vec<i64> = rows(f, "SELECT id FROM primer_candidates ORDER BY id")
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(json!(ids), step["candidateIds"], "{name}");
+    }
+
+    /// testdata/dream_tasks/primers.json is what the TypeScript dreamer's
+    /// promote-primers and refresh-primers (gen/gen-dream-primers-golden.ts)
+    /// wrote, in sequence, for this fixture's candidates plus one past the TTL:
+    /// promotion without an embedding provider, then a refresh whose
+    /// investigator used no tools, then one that read code.
+    #[tokio::test]
+    async fn primer_rows_match_the_typescript_dreamer() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../../testdata/dream_tasks/primers.json")).unwrap();
+        assert_eq!(golden["now"], json!(NOW));
+        let f = Fixture::new(TaskName::PromotePrimers);
+        let expired = &golden["candidates"][7];
+        assert_eq!(expired["id"], 8);
+        f.sql(|tx| {
+            tx.execute("INSERT INTO primer_candidates(id,project_path,harness,session_id,question,normalized_question,source_compartment_start,source_compartment_end,source_start_message_id,source_end_message_id,source_message_time,created_at) VALUES (8,?1,'opencode',?2,?3,?4,1,3,?5,?5,?6,1)",
+                params![expired["project_path"].as_str(), expired["session_id"].as_str(), expired["question"].as_str(), expired["normalized_question"].as_str(), expired["message_id"].as_str(), expired["source_message_time"].as_i64()])?;
+            Ok(())
+        });
+        // The golden's other candidates are this fixture's own.
+        assert_eq!(
+            rows(&f, "SELECT id,project_path,session_id,question,normalized_question,source_start_message_id AS message_id,source_message_time FROM primer_candidates ORDER BY id"),
+            golden["candidates"]
+        );
+        let steps = golden["steps"].as_array().unwrap();
+        let mut carrier = f.carrier();
+        carrier.embed = false;
+        let mut host = PrimerHost::new(carrier, f.store.clone(), f.context.clone());
+        let Outcome::Promote(result) = host.run().await.unwrap() else {
+            panic!("promotion expected")
+        };
+        assert_eq!(serde_json::to_value(&result).unwrap(), steps[0]["result"]);
+        assert!(host.carrier.requests.is_empty());
+        assert_rows_match(&f, &steps[0]);
+        for step in &steps[1..] {
+            let c = &f.context;
+            let context = Arc::new(TaskContext {
+                task: TaskName::RefreshPrimers,
+                scope: c.scope.clone(),
+                config: c.config.clone(),
+                domain_lease: c.domain_lease.clone(),
+                task_lease: c.task_lease.clone(),
+                cancellation: c.cancellation.clone(),
+                clock: c.clock.clone(),
+                deadline_ms: c.deadline_ms,
+                control: c.control.clone(),
+            });
+            let mut carrier = f.carrier();
+            carrier.embed = false;
+            carrier.tools = step["tools"].as_bool().unwrap();
+            carrier.answer = step["answer"].as_str().unwrap().to_owned();
+            let mut host = PrimerHost::new(carrier, f.store.clone(), context);
+            let Outcome::Refresh(result) = host.run().await.unwrap() else {
+                panic!("refresh expected")
+            };
+            assert_eq!(
+                json!({"refreshed": result.refreshed, "skipped": result.skipped}),
+                step["result"],
+                "{}",
+                step["step"]
+            );
+            assert_eq!(json!(host.carrier.requests.len()), step["modelCalls"]);
+            assert_rows_match(&f, step);
+        }
     }
 }

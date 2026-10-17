@@ -105,7 +105,7 @@ impl McStore {
             for write in &batch.writes {
                 if write.project_path != expected.project { return Err(rusqlite::Error::InvalidQuery); }
                 let ids = serde_json::to_string(&write.source_candidate_ids).map_err(crate::serde_to_sql_error)?;
-                let provenance = write.source_provenance.as_ref().map(serde_json::to_string).transpose().map_err(crate::serde_to_sql_error)?;
+                let provenance = write.source_provenance.as_ref().map(stored_provenance).transpose()?;
                 let vector = write.question_embedding.as_deref().map(vector_blob).transpose()?;
                 if let Some(id) = write.primer_id {
                     // Identical support is a replay, not a new observation. Preserve
@@ -200,6 +200,62 @@ fn write_vector(
     Ok(())
 }
 
+/// The `primers.source_candidate_provenance` column as the TypeScript dreamer
+/// writes it (storage-primers.ts `serializePrimerSourceProvenance`): snake-case
+/// keys in a fixed order. The planner's camel-case entries are converted here.
+fn stored_provenance(provenance: &Value) -> rusqlite::Result<String> {
+    #[derive(Serialize)]
+    struct Stored<'a> {
+        candidate_id: &'a Value,
+        project_path: &'a Value,
+        harness: &'a Value,
+        session_id: &'a Value,
+        source_compartment_start: &'a Value,
+        source_compartment_end: &'a Value,
+        source_start_message_id: &'a Value,
+        source_end_message_id: &'a Value,
+    }
+    let entries = provenance.as_array().ok_or(rusqlite::Error::InvalidQuery)?;
+    let stored: Vec<_> = entries
+        .iter()
+        .map(|e| Stored {
+            candidate_id: &e["candidateId"],
+            project_path: &e["projectPath"],
+            harness: &e["harness"],
+            session_id: &e["sessionId"],
+            source_compartment_start: &e["sourceCompartmentStart"],
+            source_compartment_end: &e["sourceCompartmentEnd"],
+            source_start_message_id: &e["sourceStartMessageId"],
+            source_end_message_id: &e["sourceEndMessageId"],
+        })
+        .collect();
+    serde_json::to_string(&stored).map_err(crate::serde_to_sql_error)
+}
+
+/// Read the column as storage-primers.ts `parsePrimerSourceProvenance` does: an
+/// array of complete snake-case entries becomes the planner's camel-case list;
+/// anything else reads as no provenance.
+fn loaded_provenance(raw: &str) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(raw).ok()?;
+    let mut out = Vec::new();
+    for e in parsed.as_array()? {
+        let text = |key: &str| e.get(key).filter(|v| v.is_string()).cloned();
+        let bound = |key: &str| e.get(key).filter(|v| v.is_null() || v.is_number()).cloned();
+        let candidate = e.get("candidate_id").filter(|v| v.is_number())?;
+        out.push(json!({
+            "candidateId": candidate,
+            "projectPath": text("project_path")?,
+            "harness": text("harness")?,
+            "sessionId": text("session_id")?,
+            "sourceCompartmentStart": bound("source_compartment_start")?,
+            "sourceCompartmentEnd": bound("source_compartment_end")?,
+            "sourceStartMessageId": text("source_start_message_id")?,
+            "sourceEndMessageId": text("source_end_message_id")?,
+        }));
+    }
+    Some(Value::Array(out))
+}
+
 fn snapshot(conn: &Connection, project: &str) -> rusqlite::Result<PrimerSnapshot> {
     let candidates = conn.prepare("SELECT id,project_path,harness,session_id,question,normalized_question,source_compartment_start,source_compartment_end,source_start_message_id,source_end_message_id,source_message_time,question_embedding,question_embedding_model_id,created_at FROM primer_candidates WHERE project_path=?1 ORDER BY id")?
         .query_map([project], |r| Ok(json!({
@@ -209,7 +265,7 @@ fn snapshot(conn: &Connection, project: &str) -> rusqlite::Result<PrimerSnapshot
         .query_map([project], |r| {
             let ids: String = r.get(10)?;
             let provenance: Option<String> = r.get(11)?;
-            Ok(json!({"id":r.get::<_,i64>(0)?,"projectPath":r.get::<_,String>(1)?,"question":r.get::<_,String>(2)?,"questionEmbedding":vector_value(r,3)?,"questionEmbeddingModelId":r.get::<_,Option<String>>(4)?,"answer":r.get::<_,String>(5)?,"status":r.get::<_,String>(6)?,"totalSupport":r.get::<_,i64>(7)?,"lastObservedAt":r.get::<_,Option<i64>>(8)?,"answerRefreshedAt":r.get::<_,Option<i64>>(9)?,"sourceCandidateIds":serde_json::from_str::<Value>(&ids).map_err(crate::serde_to_sql_error)?,"sourceProvenance":provenance.map(|v|serde_json::from_str::<Value>(&v)).transpose().map_err(crate::serde_to_sql_error)?,"createdAt":r.get::<_,i64>(12)?,"updatedAt":r.get::<_,i64>(13)?}))
+            Ok(json!({"id":r.get::<_,i64>(0)?,"projectPath":r.get::<_,String>(1)?,"question":r.get::<_,String>(2)?,"questionEmbedding":vector_value(r,3)?,"questionEmbeddingModelId":r.get::<_,Option<String>>(4)?,"answer":r.get::<_,String>(5)?,"status":r.get::<_,String>(6)?,"totalSupport":r.get::<_,i64>(7)?,"lastObservedAt":r.get::<_,Option<i64>>(8)?,"answerRefreshedAt":r.get::<_,Option<i64>>(9)?,"sourceCandidateIds":serde_json::from_str::<Value>(&ids).map_err(crate::serde_to_sql_error)?,"sourceProvenance":provenance.as_deref().and_then(loaded_provenance),"createdAt":r.get::<_,i64>(12)?,"updatedAt":r.get::<_,i64>(13)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
     let compartments = conn.prepare("SELECT DISTINCT p.session_id,p.sequence,p.start_message,p.title,p.p1,p.content FROM compartments p JOIN compartments o ON o.session_id=p.session_id AND p.sequence BETWEEN o.sequence-1 AND o.sequence+1 JOIN primer_candidates c ON c.session_id=o.session_id AND c.harness=o.harness AND c.source_compartment_start=o.start_message WHERE c.project_path=?1 AND p.harness=c.harness AND o.sequence=(SELECT MIN(first.sequence) FROM compartments first WHERE first.session_id=c.session_id AND first.harness=c.harness AND first.start_message=c.source_compartment_start) ORDER BY p.session_id,p.sequence")?
         .query_map([project], |r| Ok(json!({"sessionId":r.get::<_,String>(0)?,"sequence":r.get::<_,i64>(1)?,"startMessage":r.get::<_,i64>(2)?,"title":r.get::<_,String>(3)?,"p1":r.get::<_,Option<String>>(4)?,"content":r.get::<_,String>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
