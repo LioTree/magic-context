@@ -1,7 +1,6 @@
 use super::*;
 use crate::dream_dispatch::host_carrier::RESTART_GRACE_MS;
 use crate::dream_runner::CarrierError;
-use tracing_subscriber::prelude::*;
 
 pub(super) fn marker_path(f: &Fixture) -> std::path::PathBuf {
     let key = format!(
@@ -156,41 +155,26 @@ async fn dream_restart_quarantine_blocks_immediate_replacement() {
     assert!(f.effects.calls.lock().unwrap().is_empty());
 }
 
-struct RetirementLogs(Arc<AtomicUsize>);
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RetirementLogs {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        struct Name(bool);
-        impl tracing::field::Visit for Name {
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                if field.name() == "event" && value == "dream_child_restart_retired" {
-                    self.0 = true;
-                }
-            }
-            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
-        }
-        let mut name = Name(false);
-        event.record(&mut name);
-        if name.0 {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test]
 async fn dream_restart_quarantine_retires_at_frozen_horizon() {
-    let count = Arc::new(AtomicUsize::new(0));
-    let subscriber = tracing_subscriber::registry().with(RetirementLogs(count.clone()));
-    let _subscriber = tracing::subscriber::set_default(subscriber);
     let mut f = Fixture::new();
     let (carrier, old, _) = f.open().await;
     drop(carrier);
     restart(&mut f, 61_000, "restart-1");
+    let queue = f.handler.dream_queue();
+    assert_eq!(queue.retired_attempts(), 0);
     assert!(try_open(&f).await.1.is_err());
+    assert_eq!(queue.retired_attempts(), 0);
     f.clock.0.store(75_000, Ordering::SeqCst);
     let (carrier, result, claim) = try_open(&f).await;
     let child = result.expect("expired quarantine never retired its old attempt");
     let claim = claim.unwrap();
     assert_ne!(claim["entry_id"], old["entry_id"]);
+    assert_eq!(
+        queue.retired_attempts(),
+        1,
+        "expired attempt must be retired exactly once"
+    );
     assert!(f.child_resource(&child).exists());
     exercise(&f, carrier, &claim, &child).await;
     assert_eq!(f.effects.calls.lock().unwrap().len(), 1);
@@ -198,9 +182,9 @@ async fn dream_restart_quarantine_retires_at_frozen_horizon() {
     let (mut carrier, claim, child) = f.open().await;
     f.cleanup(&mut carrier, &claim, &child, false).await;
     assert_eq!(
-        count.load(Ordering::SeqCst),
+        queue.retired_attempts(),
         1,
-        "retirement must log exactly once, not on ordinary subsequent work"
+        "retirement must be observed exactly once, not on ordinary subsequent work"
     );
 }
 

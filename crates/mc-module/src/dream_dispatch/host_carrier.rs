@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -148,9 +149,16 @@ impl Entry {
 pub struct DreamQueue {
     entries: Mutex<BTreeMap<String, Entry>>,
     epoch: OnceLock<String>,
+    retired_attempts: AtomicUsize,
 }
 
 impl DreamQueue {
+    /// Successful restart retirements observed by this coordinator. Ordinary child
+    /// cleanup does not count; the observation is independent of tracing subscribers.
+    pub fn retired_attempts(&self) -> usize {
+        self.retired_attempts.load(Ordering::Relaxed)
+    }
+
     fn enqueue(
         &self,
         carrier: &HostCarrier,
@@ -241,6 +249,7 @@ impl DreamQueue {
             Some(&timing),
         )?;
         if let Some(retired) = retired {
+            self.retired_attempts.fetch_add(1, Ordering::Relaxed);
             entries.remove(&retired);
         }
         entries.insert(
