@@ -30,6 +30,8 @@ fn context() -> ProducerContext<'static> {
         guidance_date: Some("Today's date: Fri Jan 15 2027".into()),
         historian_active: false,
         wrapup_active: false,
+        // The hold is off by default; this review exercises the default configuration.
+        signed_thinking_hold: mc_module::config::SignedThinkingHold::Off,
         caveman_english_word_rules: true,
     }
 }
