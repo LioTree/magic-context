@@ -116,6 +116,11 @@ jobs:
       - name: Historian prompt golden drift check
         run: bun crates/mc-module/gen/gen-historian-prompt-golden.ts --check
 
+      # Rust consumes this fixture without Bun; this lane runs the TypeScript oracle
+      # and rejects any source change or committed golden drift.
+      - name: Memory actions golden drift check
+        run: bun crates/mc-module/gen/gen-memory-actions-golden.ts --check
+
       - name: Test
         # Keep CLI and retina coverage here, but let check-pi-plugin own Pi's
         # normal/assertion pair rather than fanning out through the root script.

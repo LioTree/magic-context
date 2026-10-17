@@ -1100,9 +1100,6 @@ fn format_rows(rows: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
-    use std::io::Write;
-    use std::process::{Command, Stdio};
 
     const NOW: i64 = 1_700_000_000_000;
     fn database() -> Connection {
@@ -1216,133 +1213,13 @@ mod tests {
         );
     }
 
-    // The TypeScript writer is the fixed compatibility reference for tool replies,
-    // memory rows and history. These source hashes pin that reference to commit
-    // 282d9c08bce4, so later TypeScript edits cannot silently change expected results.
-    const ORACLE_SOURCES: &[(&str, &str)] = &[
-        (
-            "packages/plugin/src/tools/ctx-memory/tools.ts",
-            "5741d13960d469571b642c2470b45c3102a4ee92e75e6163fd4f11c68593cab6",
-        ),
-        (
-            "packages/plugin/src/features/magic-context/memory/lifecycle-applier.ts",
-            "d44420e713e0f39deb5dc662e09e0d11ce4b3e4ab2f69331fa35b7b69b5cf4ad",
-        ),
-        (
-            "packages/plugin/src/features/magic-context/memory/storage-memory.ts",
-            "61c45628a632bc6e4c32f554ab5864641d8dae979e1eb6f28f717ad47fe95a77",
-        ),
-        (
-            "packages/plugin/src/features/magic-context/dreamer/curate-memory-safety.ts",
-            "112bcf63c22dab51dfedf48a4a7616e6610a3e5c33159827a208dbba31caa190",
-        ),
-        (
-            "packages/plugin/src/features/magic-context/dreamer/memory-claim-safety.ts",
-            "ba423d5d18a7eec2be92d3aed179074230912776ba7dd766cc78afb910bd19f1",
-        ),
-    ];
-    const ORACLE_TS: &str = r#"
-import { Database } from './packages/plugin/src/shared/sqlite';
-import { createCtxMemoryTools } from './packages/plugin/src/tools/ctx-memory/tools';
-import { DREAMER_AGENT } from './packages/plugin/src/agents/dreamer';
-import { tsOwnsMemory } from './packages/plugin/src/features/magic-context/memory/lifecycle-applier';
-import { _setTestProviderFactoryForProject, registerProjectEmbedding } from './packages/plugin/src/features/magic-context/memory/embedding';
-const db = new Database(':memory:');
-db.exec((await Bun.file('crates/mc-store/testdata/context_schema/schema.sql').text()).replaceAll(':applied_at','1700000000000'));
-Date.now = () => 1700000000000;
-const calls:string[]=[];
-_setTestProviderFactoryForProject(()=>({modelId:'mock-model',initialize:async()=>true,embed:async(text:string)=>{calls.push(text);return new Float32Array([1,0]);},embedBatch:async()=>[],dispose:async()=>{},isLoaded:()=>true}));
-registerProjectEmbedding(db,'project-a',{provider:'local',model:'mock-model'},{memoryEnabled:true,gitCommitEnabled:false},'project-a');
-const tool = createCtxMemoryTools({db, resolveProjectPath: () => 'project-a'} as any).ctx_memory;
-const cases = [
- ['primary', {action:'write',category:'CONSTRAINTS',content:'  Alpha fact.  '}],
- ['primary', {action:'write',category:'CONSTRAINTS',content:'ALPHA   fact.'}],
- ['primary', {action:'update',ids:[1],content:'Updated alpha fact.',category:'invalid'}],
- ['primary', {action:'write',category:'CONSTRAINTS',content:'Beta fact.'}],
- ['primary', {action:'merge',ids:[2,1],content:'Unified fact.',reason:'combine facts'}],
- ['primary', {action:'archive',ids:[3,3],reason:'  obsolete  '}],
- ['primary', {action:'archive',ids:[3]}],
- ['dreamer', {action:'write',category:'CONFIG_VALUES',content:'Limit is 12.'}],
- ['dreamer', {action:'write',category:'CONFIG_VALUES',content:'Limit is 24.'}],
- ['dreamer', {action:'archive',ids:[4],superseded_by:5,reason:'replaced configuration'}],
- ['dreamer', {action:'update',ids:[5],content:'Limit is 48.',reason:'measured'}],
- ['primary', {action:'get',ids:[3,999,3]}],
- ['dreamer', {action:'list'}],
- ['primary', {action:'list'}],
- ['dreamer', {action:'archive',ids:[5],reason:'move to user profile'}],
- ['dreamer', {action:'update',ids:[5],content:'x'}],
- ['primary', {action:'update',ids:[5],content:'Limit is 48.',category:' CONFIG_VALUES '}],
- ['primary', {action:'merge',ids:[5,5],content:'bad'}],
- ['primary', {action:'write',category:'UNKNOWN',content:'bad'}],
- ['primary', {action:'get',ids:[1.25]}],
- ['primary', {reduced:true,summary:JSON.stringify({action:'write',category:'NAMING',content:'Symbols use camelCase.'})}],
- ['primary', {action:'update',ids:[5],category:'ARCHITECTURE',content:'Configuration is a boundary value.'}],
- ['primary', {action:'write',category:'ARCHITECTURE',content:'Configuration is a boundary value.'}],
- ['primary', {action:'archive',ids:[6,999]}],
- ['primary', {action:'write',category:'CONSTRAINTS',content:'Unified fact.'}],
- ['primary', {action:'write',category:'NAMING',content:'Configuration is a boundary value.'}],
- ['dreamer', {action:'list',category:'NAMING',limit:1}],
- ['primary', {reduced:true,summary:JSON.stringify({action:'write',category:'NAMING',content:'Must not decode.',role:'dreamer'})}],
- ['primary', {reduced:true,summary:'not json'}],
- ['dreamer', {action:'write',category:'PROJECT_RULES',content:'Always check ownership.'}],
- ['dreamer', {action:'update',ids:[7],content:'Always check the ownership.'}],
- ['primary', {action:'write',category:'NAMING',content:'\uFEFF  Unicode fact.\uFEFF'}],
- ['primary', {action:'update',ids:[8],content:'\uFEFFUnicode\u0085fact.\uFEFF'}],
- ['primary', {action:'get',ids:[8]}],
-];
-const out = [];
-for (const [role, args] of cases) {
- const reply = await tool.execute(args as any, {agent:role === 'dreamer'?DREAMER_AGENT:'primary',sessionID:'session-a',directory:'/fixture'} as any);
- await new Promise(resolve=>setTimeout(resolve,0));
- const memories = db.prepare('SELECT * FROM memories ORDER BY id').all();
- const history = db.prepare('SELECT memory_id,revision,previous_text,after_text,before_json,after_json,applied_at,reason,evidence_json,source_ids_json FROM memory_history ORDER BY id').all();
- const mutations=db.prepare('SELECT mutation_type,target_memory_id,superseded_by_id,category,new_content,queued_at FROM memory_mutation_log ORDER BY id').all();
- const fragments=db.prepare('SELECT session_id,harness,project_path,memory_ids_json,current_id,lines,visible_texts_json,created_at FROM memory_agent_fragments ORDER BY id').all();
- out.push({role,args,reply,memories,history,mutations,fragments,embedCalls:[...calls],tsOwnsMemory:tsOwnsMemory(db,'project-a')});
-}
-console.log('MC_MEMORY_ORACLE='+JSON.stringify(out));
-"#;
-
+    // CI regenerates this fixture from the pinned TypeScript oracle and rejects drift.
     #[test]
     fn ts_a06_a12_replies_rows_history_and_embedding_effects() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for (path, expected) in ORACLE_SOURCES {
-            assert_eq!(
-                format!(
-                    "{:x}",
-                    Sha256::digest(std::fs::read(root.join(path)).unwrap())
-                ),
-                *expected,
-                "pinned TS oracle changed: {path}"
-            );
-        }
-        let mut child = Command::new("bun")
-            .arg("-")
-            .current_dir(&root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Bun is required to execute the pinned TS oracle");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(ORACLE_TS.as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "TS oracle failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let json = stdout
-            .lines()
-            .find_map(|line| line.strip_prefix("MC_MEMORY_ORACLE="))
-            .expect("TS oracle did not emit vectors");
-        let vectors: Vec<Value> = serde_json::from_str(json).unwrap();
-        assert_eq!(vectors.len(), 34);
+        let vectors: Vec<Value> =
+            serde_json::from_str(include_str!("../testdata/memory_actions/golden.json"))
+                .expect("parse memory_actions TypeScript golden");
+        assert_eq!(vectors.len(), 34, "memory_actions golden vector count");
         let mut conn = database();
         let mut actions = MemoryActions::default();
         for (index, vector) in vectors.iter().enumerate() {
