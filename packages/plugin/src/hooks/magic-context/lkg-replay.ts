@@ -332,6 +332,7 @@ export function buildLkgPrefix(
     inputIdSeq: string[];
     inputContentDigests: string[];
     jsonPrefix: string;
+    prefixMessageCount?: number;
 } | null {
     const projected = asEntryProjection(input);
     const anchorIndex =
@@ -374,6 +375,10 @@ export function buildLkgPrefix(
         inputIdSeq: validIds.slice(0, anchorIndex + 1),
         inputContentDigests: inputContentDigests as string[],
         jsonPrefix,
+        // This is the array just serialized, not the number of input messages:
+        // synthesis and drops can change the output length. A custom array
+        // serializer must still be counted from its actual serialized value.
+        prefixMessageCount: "toJSON" in prefix ? undefined : prefix.length,
     };
 }
 
@@ -405,6 +410,7 @@ export function captureLkgSlot(args: LkgCaptureInput): boolean {
         noteCapturedLkgRequest({
             sessionId: args.sessionId,
             slot,
+            prefixMessageCount: built.prefixMessageCount,
             // In TypeScript mode the saved last-known-good copy can stop before the
             // tool calls still running at the end of the request. Such a partial copy
             // is not what the provider measured, so it gets no usage identity.

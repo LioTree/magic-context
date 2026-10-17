@@ -9,7 +9,7 @@ import { generateSyntheticFixture } from "../packages/pi-plugin/scripts/experime
 
 const [source, host, mode] = process.argv.slice(2) as [string, string, string];
 const root = process.env.TRAIN_OVERHEAD_ROOT;
-assert(root && root.includes("/magic-context/train-overhead/"));
+assert(root && root.includes("/magic-context/oc2-overhead/"));
 for (const key of ["HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "OPENCODE_DB", "MAGIC_CONTEXT_STORAGE_DIR", "MAGIC_CONTEXT_TEST_DATA_DIR", "PI_CODING_AGENT_DIR"])
     assert(resolve(process.env[key] ?? "").startsWith(root), `${key} escaped disposable root`);
 const project = process.env.TRAIN_OVERHEAD_PROJECT!;
@@ -87,6 +87,8 @@ for (let i = 0; i < entries.length; i++) {
 let runRequest: () => Promise<unknown>;
 let dispose: () => Promise<void> = async () => {};
 let storeRaw = () => {};
+let recoveryProbe: () => unknown = () => "not-probed";
+const makeV2Draft = () => ({ sessionID: sessionId, agent: "build", model: { providerID: model.providerID, id: model.modelID, limit: { context: window } }, system: [], options: {}, tools: { read: { description: "Read fixture", input: { type: "object" } } }, messages: raw.map((m) => ({ id: m.info.id, role: m.info.role, content: structuredClone(m.parts) })) });
 const usage = new Map();
 const settle = () => {
     updateSessionMeta(db, sessionId, { lastResponseTime: Date.now(), lastContextPercentage: 20, lastInputTokens: 200_000 });
@@ -167,7 +169,7 @@ if (host === "pi") {
         })();
         storeRaw();
         runRequest = async () => {
-            const draft = { sessionID: sessionId, agent: "build", model: { providerID: model.providerID, id: model.modelID, limit: { context: window } }, system: [], options: {}, tools: { read: { description: "Read fixture", input: { type: "object" } } }, messages: raw.map((m) => ({ id: m.info.id, role: m.info.role, content: structuredClone(m.parts) })) };
+            const draft = makeV2Draft();
             const start = performance.now();
             await handler(draft);
             return { ms: performance.now() - start, wire: draft };
@@ -192,7 +194,7 @@ async function invoke(record: boolean) {
     assert(!meta.lastTransformError, `failed-open ${host}: ${meta.lastTransformError}`);
     assert.equal(foregroundDecisions.length, 1, `${host} ${source} did not record exactly one decision: ${logLines.join("")}`);
     if (mode === "warm" && record) assert.equal(foregroundDecisions[0], "defer", `${host} measured a non-defer`);
-    return { ms: result.ms, stages: foregroundStages, spans: foregroundSpans, wire: createHash("sha256").update(JSON.stringify(result.wire)).digest("hex"), decision: foregroundDecisions[0] };
+    return { ms: result.ms, stages: foregroundStages, spans: foregroundSpans, wire: createHash("sha256").update(JSON.stringify(result.wire)).digest("hex"), decision: foregroundDecisions[0], recovery: JSON.stringify(recoveryProbe()) };
 }
 // Seed the history and memories before the first head render, then let the
 // handler allocate tags before installing dropped statuses on eight of them.
@@ -246,6 +248,44 @@ const corpus = {
 };
 assert(corpus.tags > 0 && corpus.droppedTags > 0 && corpus.compartments === 1 && corpus.memories === 8);
 console.log("OVERHEAD " + JSON.stringify({ ready: true, corpus }));
+if (mode === "random") {
+    const { captureSlot, dropSlot } = await load(`${core}hooks/magic-context/lkg-slot.ts`);
+    const { replayLkg } = await load(`${core}hooks/magic-context/lkg-replay.ts`);
+    const { lkgFenceRequiresRebuild } = await load(`${core}hooks/magic-context/lkg-recovery-fence.ts`);
+    const { adaptPayload } = await load(`${core}v2/hooks/payload.ts`);
+    const coordinator = host === "pi" ? (await load("packages/pi-plugin/src/pi-lkg.ts")).createPiLkgCoordinator(db) : undefined;
+    const probeId = `${sessionId}-recovery-probe`;
+    recoveryProbe = () => {
+        const slot = getInMemorySlot(sessionId);
+        assert(slot, "randomized handler did not retain its served capture");
+        const restartRequiresRebuild = lkgFenceRequiresRebuild(sessionId, slot, false);
+        const outcomes = ["unchanged", "edited", "model"].map((kind) => {
+            assert(captureSlot(probeId, slot), "could not install isolated recovery probe");
+            try {
+                const messages = host === "pi" ? structuredClone(piRaw) : host === "opencode2" ? adaptPayload(makeV2Draft()).messages : structuredClone(raw);
+                if (kind === "edited") {
+                    if (host === "pi") messages[0].content = "same id, changed recovery input";
+                    else messages[0].parts[0].text = "same id, changed recovery input";
+                }
+                const modelKey = kind === "model" ? `${model.providerID}/wrong-model` : slot.modelKey;
+                const result = coordinator
+                    ? coordinator.replay(coordinator.beginPass({ sessionId: probeId, messages, entryIds: entries.map((e) => e.id), modelKey, providerKey: slot.providerKey }))
+                    : replayLkg({ sessionId: probeId, messages, modelKey, providerKey: slot.providerKey });
+                if (kind === "unchanged") {
+                    assert(result.ok || ["lkg_seam_invalid", "lkg_unsafe_seam", "lkg_anthropic_reasoning_run_invalid"].includes(result.reason), `${host} unchanged probe did not reach wire validation: ${result.reason}`);
+                } else {
+                    assert.equal(result.ok ? "replay" : result.reason, kind === "edited" ? "lkg_content_mismatch" : "lkg_model_mismatch", `${host} ${kind} recovery probe did not reach its intended validation`);
+                }
+                return result.ok ? { kind, decision: "replay", wire: createHash("sha256").update(JSON.stringify(result.messages)).digest("hex") } : { kind, decision: result.reason };
+            } finally {
+                // Rejection can drop a slot and its durable row; only the probe
+                // session is installed or dropped, never the timed session.
+                dropSlot(probeId, "probe-complete");
+            }
+        });
+        return { restartRequiresRebuild, outcomes };
+    };
+}
 const lines = createInterface({ input: process.stdin });
 for await (const line of lines) {
     if (line === "quit") break;
