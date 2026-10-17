@@ -180,21 +180,7 @@ mod tests {
         let corpus: Vec<Value> =
             serde_json::from_str(include_str!("../testdata/historian-wire-corpus.json")).unwrap();
         assert_eq!(corpus.len(), 30);
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../packages/plugin/src/features/magic-context/memory/historian-wire-parity.ts",
-        );
-        let output = std::process::Command::new("bun")
-            .arg(script)
-            .output()
-            .expect("Bun is required for the TypeScript/Rust wire differential");
-        assert!(
-            output.status.success(),
-            "TypeScript parser failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let typescript: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(typescript.len(), corpus.len());
-        for (entry, typescript) in corpus.into_iter().zip(typescript) {
+        for entry in corpus {
             let parsed = parse_turn_two_envelope(
                 entry["text"].as_str().unwrap(),
                 entry["lengthCapped"].as_bool().unwrap_or(false),
@@ -211,11 +197,6 @@ mod tests {
                 }
             };
             assert_eq!(normalized, entry["expected"], "{}", entry["name"]);
-            assert_eq!(
-                normalized, typescript,
-                "TypeScript/Rust differential: {}",
-                entry["name"]
-            );
         }
     }
 }

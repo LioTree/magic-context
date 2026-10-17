@@ -1,10 +1,41 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { hasHistorianToolActivity } from "./historian-wire";
-import { historianWireCorpus, parseHistorianWireCase } from "./historian-wire-parity";
+import { parseTurnTwoEnvelope } from "./turn-two-envelope";
+
+interface HistorianWireCase {
+    name: string;
+    text: string;
+    lengthCapped?: boolean;
+    toolActivity?: boolean;
+    expected: unknown;
+}
+
+const historianWireCorpus: HistorianWireCase[] = JSON.parse(
+    readFileSync(
+        new URL(
+            "../../../../../../crates/mc-module/testdata/historian-wire-corpus.json",
+            import.meta.url,
+        ),
+        "utf8",
+    ),
+);
+
+test("historian wire equivalence corpus contains all 30 shared cases", () => {
+    expect(historianWireCorpus).toHaveLength(30);
+});
 
 for (const entry of historianWireCorpus) {
     test(`historian wire equivalence: ${entry.name}`, () => {
-        expect(parseHistorianWireCase(entry)).toEqual(entry.expected);
+        const parsed = parseTurnTwoEnvelope(
+            entry.text,
+            entry.lengthCapped ?? false,
+            entry.toolActivity,
+        );
+        const normalized = parsed.ok
+            ? { ...parsed, decisions: [...parsed.decisions].sort(([a], [b]) => a - b) }
+            : parsed;
+        expect(normalized).toEqual(entry.expected);
     });
 }
 
