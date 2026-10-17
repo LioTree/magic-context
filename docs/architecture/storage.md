@@ -81,8 +81,8 @@ files from the same backup set; never mix snapshots or restore just one.
 There are other persisted cross-store boundaries. The TypeScript transform keeps
 its LKG slots (`lkg_slots`), its served markers (`lkg_served_markers`) and its
 compaction-marker state in `context.db`, while OpenCode's compaction marker rows
-are in `opencode.db`. No transaction spans the two files, so NORMAL can lose a
-recent `context.db` write at power loss even if the separate host-store update
+are in `opencode.db`. No transaction spans the two files, so `synchronous=NORMAL`
+can lose a recent `context.db` write at power loss even if the separate host-store update
 survives. Startup's marker consistency probe is diagnostic-only: it retains state
 and waits for a priced publication to replace inconsistent marker rows. A lost
 latest LKG capture likewise leaves only an older slot or none; the loader checks

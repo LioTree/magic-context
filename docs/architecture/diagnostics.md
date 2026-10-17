@@ -34,7 +34,7 @@ Useful lines to know:
 
 ## Decision records
 
-`transform_decisions` in `context.db` stores the cache-affecting decision of each pass (scheduler decision, materialisation reason and related fields), keeping the newest 2,000 rows per session and host. The dashboard reads it to attribute each cache bust to a cause. `/ctx-status diagnostics` prints the extended status view in a session. ck-mc keeps its own pass audit in `mc_pass_trace` in `store.db`.
+`transform_decisions` in `context.db` stores the cache-affecting decision of each pass (scheduler decision, materialisation reason and related fields), keeping the newest 2,000 rows per session and host. The dashboard reads it to attribute each cache bust to a cause. `/ctx-status diagnostics` prints the extended status view in a session. The Rust module, ck-mc, keeps its own pass audit in `mc_pass_trace` in `store.db` (see [rust-module.md](rust-module.md)).
 
 User-facing problems carry stable `MC-*` codes (`user-facing-codes.ts`), each with one sentence and one action. The same text appears in `/ctx-status`, the sidebar and `doctor`, so a code in a bug report identifies the problem without the log.
 
