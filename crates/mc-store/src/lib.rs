@@ -27,6 +27,7 @@ pub mod context_writes;
 pub mod dream_curate;
 pub mod dream_domain;
 pub mod dream_memory;
+pub mod dream_primer;
 pub mod dream_retrospective;
 pub mod dream_scheduler;
 pub mod dream_verify;
