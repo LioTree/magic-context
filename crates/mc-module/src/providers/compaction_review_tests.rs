@@ -102,6 +102,10 @@ fn root() -> ProviderLineage {
 }
 
 fn pending_hook(store: &McStore, key: &Key, ordinal: u64) {
+    pending_hook_in_lineage(store, key, ordinal, &root());
+}
+
+fn pending_hook_in_lineage(store: &McStore, key: &Key, ordinal: u64, lineage: &ProviderLineage) {
     let native = message(ordinal);
     let entry = ProviderMessage {
         ordinal,
@@ -112,7 +116,7 @@ fn pending_hook(store: &McStore, key: &Key, ordinal: u64) {
         .commit_provider_hook(
             &key.store_key(),
             ProviderHookRequest {
-                lineage: &root(),
+                lineage,
                 message: Some(&entry),
                 served_through_ordinal: None,
                 unserved_subjects: &[],
@@ -1204,4 +1208,264 @@ async fn hookcost_review_durable_wire_fragment_is_not_response_wire_fragment() {
     );
     assert_ne!(raw_assembled.as_bytes(), answer_bytes.as_slice());
     println!("typed durable CompactionMessage and Value response compaction are JSON-equal but byte-unequal; substituting the durable fragment changes the encoded answer");
+}
+
+#[test]
+fn bridge_reference_scope_is_named_tags_only_without_serving_the_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, store, key, _) = fixture(dir.path());
+    initialize_reference_conversation(&store, &key);
+    pending_hook(&store, &key, 1);
+    pending_hook(&store, &key, 2);
+    store.queue_provider_drops(&key.store_key(), &[1]).unwrap();
+    let before = format!(
+        "{:?}",
+        store.load_provider_hook_answers(&key.store_key()).unwrap()
+    );
+    assert_eq!(
+        referenced_drop_targets(&store, &key, &root(), Codec::OpencodeAiSdk).unwrap(),
+        ["m1#0"]
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            store.load_provider_hook_answers(&key.store_key()).unwrap()
+        ),
+        before
+    );
+    assert!(store.load_tags_for_session("s").unwrap().is_empty());
+    assert_eq!(
+        store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap()
+            .served_through_ordinal,
+        None
+    );
+    let status = store.load_session_status_snapshot("s").unwrap();
+    assert_eq!(status.pending_drop_count, 1);
+    assert_eq!(status.provider_unserved_drop_count, 1);
+    assert_eq!(status.provider_applied_drop_count, 0);
+    store
+        .append_pending_agent_drops("s", &["m1#0".into()], 1)
+        .unwrap();
+    assert_eq!(
+        store
+            .load_session_status_snapshot("s")
+            .unwrap()
+            .pending_drop_count,
+        1
+    );
+}
+
+#[test]
+fn bridge_reference_claude_code_keeps_the_served_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, store, key, _) = fixture(dir.path());
+    initialize_reference_conversation(&store, &key);
+    pending_hook(&store, &key, 1);
+    store.queue_provider_drops(&key.store_key(), &[1]).unwrap();
+    assert!(
+        referenced_drop_targets(&store, &key, &root(), Codec::ClaudeCodeAnthropic)
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .commit_provider_status(&key.store_key(), &root(), &[], Some(1), &[])
+        .unwrap();
+    assert_eq!(
+        referenced_drop_targets(&store, &key, &root(), Codec::ClaudeCodeAnthropic).unwrap(),
+        ["m1#0"]
+    );
+}
+
+#[test]
+fn bridge_reference_burned_and_retired_numbers_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, store, key, _) = fixture(dir.path());
+    initialize_reference_conversation(&store, &key);
+    pending_hook(&store, &key, 1);
+    let subject = ProviderSubject {
+        subject_mid: "m1".into(),
+        hook: "pre_user".into(),
+        subject_part: "".into(),
+    };
+    store.queue_provider_drops(&key.store_key(), &[1]).unwrap();
+    store
+        .append_pending_agent_drops("s", &["m1#0".into()], 1)
+        .unwrap();
+    store
+        .commit_provider_status(&key.store_key(), &root(), &[], None, &[subject])
+        .unwrap();
+    for number in [1, 999] {
+        assert!(!store
+            .provider_answer_tag_known(&key.store_key(), number)
+            .unwrap());
+        assert!(store
+            .queue_provider_drops(&key.store_key(), &[number])
+            .is_err());
+    }
+    assert_eq!(
+        store.load_provider_hook_answers(&key.store_key()).unwrap()[0].state,
+        "burned"
+    );
+    assert!(store
+        .load_provider_pending_drops(&key.store_key())
+        .unwrap()
+        .is_empty());
+    store
+        .reconcile_provider_drop_targets(&key.store_key(), &[])
+        .unwrap();
+    assert!(store.load_pending_agent_drops("s").unwrap().is_empty());
+    pending_hook(&store, &key, 1);
+    store.queue_provider_drops(&key.store_key(), &[2]).unwrap();
+    store
+        .consume_provider_drops(&key.store_key(), &[2])
+        .unwrap();
+    assert!(!store
+        .provider_answer_tag_known(&key.store_key(), 2)
+        .unwrap());
+    assert!(store.queue_provider_drops(&key.store_key(), &[2]).is_err());
+}
+
+#[test]
+fn bridge_reference_lineage_excludes_sibling_pending_but_allows_identical_carried_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, store, key, _) = fixture(dir.path());
+    initialize_reference_conversation(&store, &key);
+    pending_hook(&store, &key, 1);
+    pending_hook(&store, &key, 2);
+    let sibling = ProviderLineage {
+        lineage_id: "sibling".into(),
+        first_ordinal: 2,
+        descends_from: Some("L".into()),
+        through_ordinal: Some(1),
+    };
+    pending_hook_in_lineage(&store, &key, 2, &sibling);
+    store
+        .queue_provider_drops(&key.store_key(), &[1, 3])
+        .unwrap();
+    store
+        .append_pending_agent_drops(
+            "s",
+            &["m1#0".into(), "m2#0".into(), "engine-only#0".into()],
+            1,
+        )
+        .unwrap();
+    let child = ProviderLineage {
+        lineage_id: "child".into(),
+        ..sibling
+    };
+    store
+        .commit_provider_status(&key.store_key(), &child, &[], None, &[])
+        .unwrap();
+    let mut replacement = message(2)["message"].clone();
+    replacement["parts"][0]["text"] = json!("different child bytes at the same mid and ordinal");
+    store
+        .commit_provider_status(
+            &key.store_key(),
+            &child,
+            &[ProviderMessage {
+                ordinal: 2,
+                mid: "m2".into(),
+                message_bytes: serde_json::to_vec(&replacement).unwrap(),
+            }],
+            None,
+            &[],
+        )
+        .unwrap();
+    assert!(!store
+        .provider_answer_tag_known(&key.store_key(), 2)
+        .unwrap());
+    assert!(!store
+        .provider_answer_tag_known(&key.store_key(), 3)
+        .unwrap());
+    assert!(store
+        .provider_answer_tag_known(&key.store_key(), 1)
+        .unwrap());
+    let targets = referenced_drop_targets(&store, &key, &child, Codec::OpencodeAiSdk).unwrap();
+    assert_eq!(targets, ["m1#0"]);
+    store
+        .reconcile_provider_drop_targets(&key.store_key(), &targets)
+        .unwrap();
+    let remaining = store
+        .load_pending_agent_drops("s")
+        .unwrap()
+        .into_iter()
+        .map(|drop| drop.target_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        remaining,
+        BTreeSet::from(["m1#0".into(), "engine-only#0".into()])
+    );
+    let mut changed_carried = message(1)["message"].clone();
+    changed_carried["parts"][0]["text"] = json!("not the carried bytes");
+    assert!(store
+        .commit_provider_status(
+            &key.store_key(),
+            &child,
+            &[ProviderMessage {
+                ordinal: 1,
+                mid: "m1".into(),
+                message_bytes: serde_json::to_vec(&changed_carried).unwrap()
+            }],
+            None,
+            &[]
+        )
+        .is_err());
+}
+
+#[tokio::test]
+async fn bridge_reference_exact_retry_keeps_frozen_bytes_and_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, binding, store, key, _) = fixture(dir.path());
+    response(h.provider_setup(binding.clone(), &setup_request()).await);
+    pending_hook(&store, &key, 1);
+    let mut boot = step("frozen", vec![], 1);
+    boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+    let frozen = h.provider_step(binding.clone(), &boot).await.unwrap();
+    let frozen = response(Ok(frozen))["compaction"].clone();
+    let version = frozen["version"].as_u64().unwrap();
+    let before = serde_json::to_vec(
+        &super::super::view_recipe::load(&store, &key, version)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    store.queue_provider_drops(&key.store_key(), &[1]).unwrap();
+    let replay = super::super::view_recipe::load(&store, &key, version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(serde_json::to_vec(&replay).unwrap(), before);
+    assert_eq!(replay.wire.version, version);
+    assert_eq!(serde_json::to_value(replay.wire).unwrap(), frozen);
+    let mut ordinary = step("ordinary", vec![], 1);
+    ordinary["last_applied"] = frozen;
+    assert_eq!(
+        response(h.provider_step(binding, &ordinary).await)["answer"],
+        "noop"
+    );
+    assert_eq!(
+        store.load_provider_pending_drops(&key.store_key()).unwrap(),
+        [1]
+    );
+    assert_eq!(
+        store.load_provider_hook_answers(&key.store_key()).unwrap()[0].state,
+        "pending"
+    );
+}
+
+fn initialize_reference_conversation(store: &McStore, key: &Key) {
+    store
+        .save_provider_conversation(
+            &key.store_key(),
+            &ProviderConversation {
+                engine_namespace: "s".into(),
+                params_json: "{}".into(),
+                hook_counters_json: "{}".into(),
+                historian_model_chain_json: "[]".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 }

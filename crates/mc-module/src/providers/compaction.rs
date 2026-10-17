@@ -1182,23 +1182,10 @@ fn execute_host(
         })
         .transpose()?;
     state.last_produced = previous.as_ref().map(|v| v.engine.clone());
-    let pending = store
-        .load_provider_pending_drops(&work.key.store_key())
+    let targets = referenced_drop_targets(store, &work.key, lineage, codec)?;
+    store
+        .reconcile_provider_drop_targets(&work.key.store_key(), &targets)
         .map_err(transient)?;
-    let live = if pending.is_empty() {
-        Vec::new()
-    } else {
-        store
-            .load_provider_hook_answers(&work.key.store_key())
-            .map_err(transient)?
-    };
-    let targets = live
-        .iter()
-        .filter(|a| a.state == "live")
-        .flat_map(|a| &a.answer.tags)
-        .filter(|t| pending.contains(&t.number))
-        .map(|t| t.block_id.clone())
-        .collect::<Vec<_>>();
     store
         .append_pending_agent_drops(&conversation.engine_namespace, &targets, now_ms())
         .map_err(transient)?;
@@ -1562,6 +1549,50 @@ fn execute_host(
         publish_ms=publish_started.elapsed().as_secs_f64()*1000.0,
         "native fold resident publication");
     Ok(Some((view, persisted)))
+}
+
+fn referenced_drop_targets(
+    store: &McStore,
+    key: &Key,
+    lineage: &ProviderLineage,
+    codec: Codec,
+) -> Result<Vec<String>, HandlerOutcome> {
+    let pending = store
+        .load_provider_pending_drops(&key.store_key())
+        .map_err(transient)?;
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut targets = Vec::new();
+    for stored in store
+        .load_provider_hook_answers(&key.store_key())
+        .map_err(transient)?
+    {
+        // Naming a pending tag in ctx_reduce proves receipt of that tag's
+        // message, allowing its queued drop to run on a rewrite-permitted pass.
+        // It proves nothing about other messages: leave the served watermark,
+        // protection accounting and frozen hook/retry bytes unchanged.
+        if stored.state != "live" && !(stored.state == "pending" && codec == Codec::OpencodeAiSdk) {
+            continue;
+        }
+        // An ancestor answer is carried only through the declared fork cut.
+        // Message admission already checks its ordinal, mid and exact bytes;
+        // a child message reusing the ordinal above the cut is not that answer.
+        if ancestor_cut(store, key, lineage, &stored.lineage_id)?
+            .is_none_or(|cut| stored.answer.ordinal > cut)
+        {
+            continue;
+        }
+        targets.extend(
+            stored
+                .answer
+                .tags
+                .iter()
+                .filter(|tag| pending.contains(&tag.number))
+                .map(|tag| tag.block_id.clone()),
+        );
+    }
+    Ok(targets)
 }
 
 fn status(

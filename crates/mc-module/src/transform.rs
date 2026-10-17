@@ -13051,6 +13051,7 @@ pub(crate) fn channel1_inputs_from_parts(
         .iter()
         .filter(|p| {
             p.tag_kind.as_deref() == Some("tool_result")
+                && p.served
                 && p.active
                 && !p.reduced
                 && is_tail(p.ordinal, coverage)
