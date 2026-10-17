@@ -92,7 +92,30 @@ fn record() -> serde_json::Value {
     })
 }
 
+/// The populated record without its view bodies. Since migration 73 a runner
+/// record names its views by version and stores each as a recipe, so a whole
+/// view body is refused on save.
+fn record_without_views() -> serde_json::Value {
+    let mut record = record();
+    let state = record["setup"]["state"].as_object_mut().unwrap();
+    state.remove("last_produced");
+    state.remove("last_applied");
+    record
+}
+
+/// Both legacy-keyed runner conversations own rows in the retired
+/// mc_provider_views_v1 table, so migration 73 resets exactly these two.
+const VIEWED_V1: [&str; 2] = ["broca", "claude-code"];
+
 const HARNESS: [&str; 4] = ["broca", "claude-code", "opencode", "opencode2"];
+
+/// Harnesses whose populated conversations still exist at `version`: migration
+/// 72 reset the two OpenCode ledgers.
+fn seeded_harnesses(version: u32) -> impl Iterator<Item = &'static str> {
+    HARNESS
+        .into_iter()
+        .filter(move |harness| version < 72 || !harness.starts_with("opencode"))
+}
 
 fn native_key() -> ProviderSessionKey {
     ProviderSessionKey {
@@ -201,7 +224,7 @@ fn seed(descriptor: &StorageDescriptor, version: u32) -> Snapshot {
     }
     if version >= 66 {
         store.inner.with_conn_fenced(|conn| {
-            for harness in HARNESS {
+            for harness in seeded_harnesses(version) {
                 let key = provider_key(harness);
                 let conv = key.conversation_key();
                 let policy = r#"{"tag_number":10,"tag_kind":"tool_result","arc_id":"arc","served":false,"measurement":{"tokens":40}}"#;
@@ -234,7 +257,7 @@ fn seed(descriptor: &StorageDescriptor, version: u32) -> Snapshot {
             .unwrap();
     }
     if version >= 71 {
-        for harness in HARNESS {
+        for harness in seeded_harnesses(version) {
             assert!(store
                 .prepare_provider_policy(&provider_key(harness), |_, _| Ok(Some(
                     crate::provider_preparation::ProviderPreparationWrite {
@@ -263,7 +286,36 @@ fn seed(descriptor: &StorageDescriptor, version: u32) -> Snapshot {
 }
 
 fn assert_preserved(before: &Snapshot, after: &Snapshot, target: u32) {
+    // Conversation keys and engine namespaces that migration 73 resets.
+    let reset: Vec<(String, String)> = if target == 73 {
+        let conversations = &before.tables["mc_provider_conversations_v2"];
+        let ki = conversations.columns.iter().position(|c| c == "conv_key").unwrap();
+        let ni = conversations.columns.iter().position(|c| c == "engine_namespace").unwrap();
+        let keys: Vec<String> = VIEWED_V1
+            .iter()
+            .map(|h| provider_key(h).conversation_key())
+            .collect();
+        conversations
+            .rows
+            .iter()
+            .filter_map(|row| match (&row[ki], &row[ni]) {
+                (SqlValue::Text(k), SqlValue::Text(n)) if keys.contains(k) => {
+                    Some((k.clone(), n.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if target == 73 {
+        assert_eq!(reset.len(), 2, "both v1-owning conversations are seeded");
+    }
     for (name, old) in &before.tables {
+        if target == 73 && name == "mc_provider_views_v1" {
+            assert!(!after.tables.contains_key(name), "migration 73 drops {name}");
+            continue;
+        }
         let new = after
             .tables
             .get(name)
@@ -311,6 +363,41 @@ fn assert_preserved(before: &Snapshot, after: &Snapshot, target: u32) {
                 expected.retain(|row| !matches!(&row[si], SqlValue::Text(s) if s == "provider-opencode" || s == "provider-opencode2"));
             }
         }
+        if target == 73 {
+            let column = |c: &str| old.columns.iter().position(|n| n == c);
+            if name == "mc_provider_policy_revisions_v1" {
+                // Deleting a reset conversation's policy inputs advances its
+                // namespace revision; every other namespace is untouched.
+                let ni = column("engine_namespace").unwrap();
+                let ri = column("revision").unwrap();
+                for row in &mut expected {
+                    if reset.iter().any(|(_, n)| matches!(&row[ni], SqlValue::Text(s) if s == n)) {
+                        let current = actual
+                            .iter()
+                            .find(|a| a[ni] == row[ni])
+                            .expect("reset namespace keeps its revision row");
+                        assert!(
+                            matches!((&current[ri], &row[ri]), (SqlValue::Integer(a), SqlValue::Integer(b)) if a > b),
+                            "migration 73 did not fence the reset namespace's revision"
+                        );
+                        row[ri] = current[ri].clone();
+                    }
+                }
+            } else if name == "mc_provider_sessions_v1" {
+                let si = column("session").unwrap();
+                let hi = column("harness").unwrap();
+                expected.retain(|row| {
+                    !VIEWED_V1.iter().any(|h| {
+                        row[hi] == SqlValue::Text((*h).into())
+                            && row[si] == SqlValue::Text(provider_key(h).session)
+                    })
+                });
+            } else if let Some(ki) = column("conv_key") {
+                expected.retain(|row| {
+                    !reset.iter().any(|(k, _)| matches!(&row[ki], SqlValue::Text(s) if s == k))
+                });
+            }
+        }
         assert_eq!(
             sorted(actual),
             sorted(expected),
@@ -334,7 +421,9 @@ fn assert_metadata_and_inventory(store: &McStore, version: u32) {
     assert_eq!(recorded, (1..=version).collect::<Vec<_>>());
     let snap = store_snapshot(store);
     for (name, table) in &snap.tables {
-        if name.starts_with("sqlite_") {
+        // The retired view table exists only below 73; the current inventory
+        // no longer classifies it, and migration 73 removes it.
+        if name.starts_with("sqlite_") || (version < 73 && name == "mc_provider_views_v1") {
             continue;
         }
         let entry = crate::move_inventory::tables(crate::move_inventory::Store::Module)
@@ -362,7 +451,7 @@ fn assert_metadata_and_inventory(store: &McStore, version: u32) {
             }
         }
     }
-    if version == 72 {
+    if version == 73 {
         store
             .inner
             .with_conn(|conn| {
@@ -371,8 +460,8 @@ fn assert_metadata_and_inventory(store: &McStore, version: u32) {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(crate::move_inventory::INVENTORY_VERSION, 7);
-        assert_eq!(crate::move_inventory::STORE_SCHEMA_VERSION, 72);
+        assert_eq!(crate::move_inventory::INVENTORY_VERSION, 8);
+        assert_eq!(crate::move_inventory::STORE_SCHEMA_VERSION, 73);
     }
 }
 
@@ -400,6 +489,10 @@ fn assert_fault_rolls_back(descriptor: &StorageDescriptor, before: &Snapshot, ta
                     }
                     AuthAction::CreateIndex { index_name, .. } => {
                         target == 70 && index_name == "mc_provider_conversations_session"
+                    }
+                    // 73 creates nothing; fail its final statement after every reset.
+                    AuthAction::DropTable { table_name } => {
+                        target == 73 && table_name == "mc_provider_views_v1"
                     }
                     // Fence-only migrations have one no-op statement: fail their durable stamp.
                     AuthAction::Insert { table_name } => {
@@ -688,6 +781,23 @@ fn assert_intent(store: &McStore, target: u32) {
                 );
             }
         }
+        73 => {
+            for harness in VIEWED_V1 {
+                assert!(store
+                    .load_provider_record(&provider_key(harness))
+                    .unwrap()
+                    .is_none());
+                assert!(store
+                    .load_provider_conversation(&provider_key(harness))
+                    .unwrap()
+                    .is_none());
+            }
+            // The generation-keyed native conversation never owned a v1 view.
+            assert!(store.load_provider_conversation(&native_key()).unwrap().is_some());
+            assert_eq!(scalar::<u32>(store, "SELECT count(*) FROM sqlite_master WHERE name='mc_provider_views_v1'"), 0);
+            assert_eq!(scalar::<u32>(store, "SELECT count(*) FROM mc_provider_messages_v1"), 0);
+            assert_eq!(scalar::<u32>(store, "SELECT count(*) FROM mc_provider_catalogs_v1"), 4);
+        }
         _ => unreachable!(),
     }
 }
@@ -773,8 +883,10 @@ fn assert_tag_and_native_triggers(store: &McStore, target: u32) {
             "{error}"
         );
         assert_eq!(store_snapshot(store), before);
-        for harness in HARNESS {
-            if target == 72 && harness.starts_with("opencode") {
+        // Runner records are read through mc_provider_views_v2, which exists
+        // from 72; the current binary cannot read an older schema's record.
+        for harness in seeded_harnesses(target).filter(|_| target >= 72) {
+            if target >= 73 && VIEWED_V1.contains(&harness) {
                 continue;
             }
             let actual: serde_json::Value = serde_json::from_str(
@@ -784,9 +896,13 @@ fn assert_tag_and_native_triggers(store: &McStore, target: u32) {
                     .unwrap(),
             )
             .unwrap();
+            // This binary reads view bodies only from v2 recipes. Bodies left in
+            // the retired v1 table of an older schema read as absent.
+            let mut expected = record();
+            expected["setup"]["state"]["last_produced"] = serde_json::Value::Null;
+            expected["setup"]["state"]["last_applied"] = serde_json::Value::Null;
             assert_eq!(
-                actual,
-                record(),
+                actual, expected,
                 "{harness} legacy record must reconstruct after the upgrade"
             );
         }
@@ -923,6 +1039,20 @@ fn assert_policy_triggers(store: &McStore, target: u32) {
     }
     let key = provider_key("broca");
     let conv = key.conversation_key();
+    if target >= 73 {
+        // Migration 73 reset the seeded Broca conversation. Recreate it through
+        // the current writer, with the seed's policy rows, for the probes below.
+        store
+            .save_provider_record(&key, &record_without_views().to_string(), "reseeded-broca-engine", &[], &[])
+            .unwrap();
+        store.inner.with_conn_fenced(|conn| {
+            let policy = r#"{"tag_number":10,"tag_kind":"tool_result","arc_id":"arc","served":false,"measurement":{"tokens":40}}"#;
+            conn.execute("INSERT INTO mc_provider_policy_parts_v1 VALUES(?1,'L',4,'m4#0',?2,?3)", params![conv, policy, key.session])?;
+            conn.execute("INSERT INTO mc_provider_consumed_tags_v1 VALUES('reseeded-broca-engine',12,?1)", params![key.session])?;
+            conn.execute("INSERT INTO mc_provider_policy_summaries_v1 VALUES(?1,'{\"kept\":true}',?2)", params![conv, key.session])?;
+            Ok(())
+        }).unwrap();
+    }
     let namespace: String = store
         .inner
         .with_conn(|conn| {
@@ -1078,7 +1208,7 @@ fn assert_revision_and_frontier_triggers(store: &McStore, target: u32) {
     store
         .save_provider_record(
             &key,
-            &record().to_string(),
+            &record_without_views().to_string(),
             namespace,
             &[McTagRow {
                 tag_number: 1,
@@ -1088,6 +1218,7 @@ fn assert_revision_and_frontier_triggers(store: &McStore, target: u32) {
                 created_at_ms: 10,
                 source_bytes: b"verbatim".as_slice().into(),
             }],
+            &[],
         )
         .unwrap();
     store.inner.with_conn_fenced(|conn| {
@@ -1304,3 +1435,4 @@ increment!(populated_68_to_69, 68);
 increment!(populated_69_to_70, 69);
 increment!(populated_70_to_71, 70);
 increment!(populated_71_to_72, 71);
+increment!(populated_72_to_73, 72);
