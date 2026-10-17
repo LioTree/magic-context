@@ -1,0 +1,297 @@
+[
+  {
+    "name": "promote_update_dismiss_and_consume_used_candidates",
+    "threshold": 3,
+    "candidates": [
+      {
+        "id": 1,
+        "content": "Prefers bounded checks",
+        "session_id": "source-1",
+        "created_at": 900,
+        "source_compartment_start": 10,
+        "source_compartment_end": 20
+      },
+      {
+        "id": 2,
+        "content": "Prefers bounded verification",
+        "session_id": "source-2",
+        "created_at": 900,
+        "source_compartment_start": 30,
+        "source_compartment_end": 40
+      },
+      {
+        "id": 3,
+        "content": "Wants concise reports",
+        "session_id": "source-3",
+        "created_at": 900,
+        "source_compartment_start": 50,
+        "source_compartment_end": 60
+      },
+      {
+        "id": 4,
+        "content": "Reviews diffs before merging",
+        "session_id": "source-4",
+        "created_at": 900,
+        "source_compartment_start": null,
+        "source_compartment_end": null
+      },
+      {
+        "id": 5,
+        "content": "One-off frustration",
+        "session_id": "source-5",
+        "created_at": -3000000000,
+        "source_compartment_start": null,
+        "source_compartment_end": null
+      }
+    ],
+    "answer": "{\"promote\":[{\"content\":\"  Prefers bounded checks  \",\"candidate_ids\":[1,2]},{\"content\":\"Reviews diffs before merging\",\"candidate_ids\":[4,99]},{\"content\":\"   \",\"candidate_ids\":[3]}],\"update_existing\":[{\"memory_id\":1,\"content\":\"Prefers concise reports\",\"candidate_ids\":[3]},{\"memory_id\":0,\"content\":\"ignored\"}],\"dismiss_existing\":[{\"memory_id\":2,\"reason\":\"unsupported\"}],\"consume_candidate_ids\":[1]}",
+    "profile": [
+      {
+        "id": 1,
+        "content": "Prefers long reports",
+        "status": "active",
+        "promoted_at": 1,
+        "created_at": 1,
+        "updated_at": 1
+      },
+      {
+        "id": 2,
+        "content": "Likes guesses",
+        "status": "active",
+        "promoted_at": 1,
+        "created_at": 1,
+        "updated_at": 1
+      }
+    ],
+    "modelCalls": 1,
+    "result": {
+      "promoted": 2,
+      "merged": 1,
+      "dismissed": 1,
+      "candidatesConsumed": 5
+    },
+    "userMemories": [
+      {
+        "id": 1,
+        "content": "Prefers concise reports",
+        "status": "active",
+        "promoted_at": 1,
+        "source_candidate_ids": "[]",
+        "source_candidate_provenance": null,
+        "created_at": 1,
+        "updated_at": 1000
+      },
+      {
+        "id": 2,
+        "content": "Likes guesses",
+        "status": "dismissed",
+        "promoted_at": 1,
+        "source_candidate_ids": "[]",
+        "source_candidate_provenance": null,
+        "created_at": 1,
+        "updated_at": 1000
+      },
+      {
+        "id": 3,
+        "content": "Prefers bounded checks",
+        "status": "active",
+        "promoted_at": 1000,
+        "source_candidate_ids": "[1,2]",
+        "source_candidate_provenance": "[{\"candidate_id\":1,\"session_id\":\"source-1\",\"source_compartment_start\":10,\"source_compartment_end\":20},{\"candidate_id\":2,\"session_id\":\"source-2\",\"source_compartment_start\":30,\"source_compartment_end\":40}]",
+        "created_at": 1000,
+        "updated_at": 1000
+      },
+      {
+        "id": 4,
+        "content": "Reviews diffs before merging",
+        "status": "active",
+        "promoted_at": 1000,
+        "source_candidate_ids": "[4,99]",
+        "source_candidate_provenance": "[{\"candidate_id\":4,\"session_id\":\"source-4\",\"source_compartment_start\":null,\"source_compartment_end\":null}]",
+        "created_at": 1000,
+        "updated_at": 1000
+      }
+    ],
+    "remainingCandidateIds": [],
+    "profileVersion": 1
+  },
+  {
+    "name": "fenced_answer_consumes_without_profile_change",
+    "threshold": 3,
+    "candidates": [
+      {
+        "id": 1,
+        "content": "Prefers bounded checks",
+        "session_id": "source-1",
+        "created_at": 900,
+        "source_compartment_start": 10,
+        "source_compartment_end": 20
+      },
+      {
+        "id": 2,
+        "content": "Prefers bounded verification",
+        "session_id": "source-2",
+        "created_at": 900,
+        "source_compartment_start": 30,
+        "source_compartment_end": 40
+      },
+      {
+        "id": 3,
+        "content": "Wants concise reports",
+        "session_id": "source-3",
+        "created_at": 900,
+        "source_compartment_start": 50,
+        "source_compartment_end": 60
+      },
+      {
+        "id": 4,
+        "content": "Reviews diffs before merging",
+        "session_id": "source-4",
+        "created_at": 900,
+        "source_compartment_start": null,
+        "source_compartment_end": null
+      },
+      {
+        "id": 5,
+        "content": "One-off frustration",
+        "session_id": "source-5",
+        "created_at": -3000000000,
+        "source_compartment_start": null,
+        "source_compartment_end": null
+      }
+    ],
+    "answer": "Verdict:\n```json\n{\"promote\":[],\"update_existing\":[],\"dismiss_existing\":[],\"consume_candidate_ids\":[1,2,3,4]}\n```",
+    "profile": [
+      {
+        "id": 1,
+        "content": "Prefers long reports",
+        "status": "active",
+        "promoted_at": 1,
+        "created_at": 1,
+        "updated_at": 1
+      },
+      {
+        "id": 2,
+        "content": "Likes guesses",
+        "status": "active",
+        "promoted_at": 1,
+        "created_at": 1,
+        "updated_at": 1
+      }
+    ],
+    "modelCalls": 1,
+    "result": {
+      "promoted": 0,
+      "merged": 0,
+      "dismissed": 0,
+      "candidatesConsumed": 4
+    },
+    "userMemories": [
+      {
+        "id": 1,
+        "content": "Prefers long reports",
+        "status": "active",
+        "promoted_at": 1,
+        "source_candidate_ids": "[]",
+        "source_candidate_provenance": null,
+        "created_at": 1,
+        "updated_at": 1
+      },
+      {
+        "id": 2,
+        "content": "Likes guesses",
+        "status": "active",
+        "promoted_at": 1,
+        "source_candidate_ids": "[]",
+        "source_candidate_provenance": null,
+        "created_at": 1,
+        "updated_at": 1
+      }
+    ],
+    "remainingCandidateIds": [],
+    "profileVersion": 0
+  },
+  {
+    "name": "below_threshold_after_pruning_asks_no_model",
+    "threshold": 3,
+    "candidates": [
+      {
+        "id": 1,
+        "content": "Prefers bounded checks",
+        "session_id": "source-1",
+        "created_at": 900,
+        "source_compartment_start": 10,
+        "source_compartment_end": 20
+      },
+      {
+        "id": 2,
+        "content": "Prefers bounded verification",
+        "session_id": "source-2",
+        "created_at": 900,
+        "source_compartment_start": 30,
+        "source_compartment_end": 40
+      },
+      {
+        "id": 5,
+        "content": "One-off frustration",
+        "session_id": "source-5",
+        "created_at": -3000000000,
+        "source_compartment_start": null,
+        "source_compartment_end": null
+      }
+    ],
+    "answer": null,
+    "profile": [
+      {
+        "id": 1,
+        "content": "Prefers long reports",
+        "status": "active",
+        "promoted_at": 1,
+        "created_at": 1,
+        "updated_at": 1
+      },
+      {
+        "id": 2,
+        "content": "Likes guesses",
+        "status": "active",
+        "promoted_at": 1,
+        "created_at": 1,
+        "updated_at": 1
+      }
+    ],
+    "modelCalls": 0,
+    "result": {
+      "promoted": 0,
+      "merged": 0,
+      "dismissed": 0,
+      "candidatesConsumed": 0
+    },
+    "userMemories": [
+      {
+        "id": 1,
+        "content": "Prefers long reports",
+        "status": "active",
+        "promoted_at": 1,
+        "source_candidate_ids": "[]",
+        "source_candidate_provenance": null,
+        "created_at": 1,
+        "updated_at": 1
+      },
+      {
+        "id": 2,
+        "content": "Likes guesses",
+        "status": "active",
+        "promoted_at": 1,
+        "source_candidate_ids": "[]",
+        "source_candidate_provenance": null,
+        "created_at": 1,
+        "updated_at": 1
+      }
+    ],
+    "remainingCandidateIds": [
+      1,
+      2
+    ],
+    "profileVersion": 0
+  }
+]

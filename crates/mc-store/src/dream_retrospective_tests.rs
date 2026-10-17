@@ -111,8 +111,12 @@ fn dream_retrospective_final_checkpoint_failure_rolls_back_observations() {
     assert!(after.processed_windows.is_empty());
 }
 
+/// A reviewer answer naming a candidate the pool does not hold commits as the
+/// TypeScript reviewer does: the id is kept in source_candidate_ids with null
+/// provenance and consuming it deletes nothing. A snapshot that changed after
+/// the model ran is still refused.
 #[test]
-fn dream_retrospective_review_rejects_stale_or_unknown_candidate_sources() {
+fn dream_retrospective_review_refuses_stale_snapshots_and_ignores_unknown_ids() {
     let (store, _dir) = fixture();
     let lease = store
         .acquire_dream_domain("user-memories", "holder", 10)
@@ -134,11 +138,8 @@ fn dream_retrospective_review_rejects_stale_or_unknown_candidate_sources() {
         promotions: &promotions,
         updates: &[],
         dismissals: &[],
-        consume_candidate_ids: &[],
+        consume_candidate_ids: &[999],
     };
-    assert!(store
-        .commit_dream_user_review(&batch, |tx| require_tx(tx, &lease, 30))
-        .is_err());
     store
         .with_context_conn_for_test(|tx| {
             tx.execute("UPDATE user_memory_candidates SET content='Changed'", [])?;
@@ -149,6 +150,19 @@ fn dream_retrospective_review_rejects_stale_or_unknown_candidate_sources() {
         .commit_dream_user_review(&batch, |tx| require_tx(tx, &lease, 30))
         .unwrap());
     assert!(store.load_dream_user_review().unwrap().profiles.is_empty());
+    let snapshot = store.load_dream_user_review().unwrap();
+    let batch = ReviewCommit {
+        expected: &snapshot,
+        ..batch
+    };
+    assert!(store
+        .commit_dream_user_review(&batch, |tx| require_tx(tx, &lease, 30))
+        .unwrap());
+    let after = store.load_dream_user_review().unwrap();
+    assert_eq!(after.candidates, snapshot.candidates);
+    assert_eq!(after.profiles.len(), 1);
+    assert_eq!(after.profiles[0].source_candidate_ids, "[999]");
+    assert_eq!(after.profiles[0].source_candidate_provenance, None);
 }
 
 #[test]

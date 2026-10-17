@@ -191,15 +191,20 @@ impl McStore {
             check_commit_fence(tx)?;
             let already: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM memory_journal WHERE decision_key=?1)", [batch.decision_key], |r| r.get(0))?;
             if already || review_snapshot(tx)? != *batch.expected { return Ok(false); }
-            let known = |id: &i64| batch.expected.candidates.iter().any(|c| c.id == *id);
-            if !batch.consume_candidate_ids.iter().all(known) || batch.promotions.iter().any(|p| !p.candidate_ids.iter().all(known)) {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
+            // As the TypeScript reviewer: an id the answer names but the pool does
+            // not hold is kept in source_candidate_ids, contributes no provenance
+            // and deletes nothing. Refusing it would fail every retry of a review
+            // the TypeScript dreamer commits.
             for promotion in batch.promotions {
                 let mut sources: Vec<_> = batch.expected.candidates.iter().filter(|c| promotion.candidate_ids.contains(&c.id)).collect();
                 sources.sort_by_key(|c| c.id);
-                let provenance: Vec<_> = sources.iter().map(|c| json!({"candidate_id":c.id,"session_id":c.session_id,"source_compartment_start":c.source_compartment_start,"source_compartment_end":c.source_compartment_end})).collect();
-                tx.execute("INSERT INTO user_memories(content,status,promoted_at,source_candidate_ids,source_candidate_provenance,created_at,updated_at) VALUES(?1,'active',?2,?3,?4,?2,?2)", params![promotion.content,batch.now_ms,encode(&promotion.candidate_ids)?,encode(&provenance)?])?;
+                // A struct keeps the TypeScript key order (json! sorts keys).
+                #[derive(Serialize)]
+                struct Provenance<'a> { candidate_id: i64, session_id: &'a str, source_compartment_start: Option<i64>, source_compartment_end: Option<i64> }
+                let provenance: Vec<_> = sources.iter().map(|c| Provenance { candidate_id: c.id, session_id: &c.session_id, source_compartment_start: c.source_compartment_start, source_compartment_end: c.source_compartment_end }).collect();
+                // TypeScript stores null when ids were named but none exists.
+                let provenance = if provenance.is_empty() && !promotion.candidate_ids.is_empty() { None } else { Some(encode(&provenance)?) };
+                tx.execute("INSERT INTO user_memories(content,status,promoted_at,source_candidate_ids,source_candidate_provenance,created_at,updated_at) VALUES(?1,'active',?2,?3,?4,?2,?2)", params![promotion.content,batch.now_ms,encode(&promotion.candidate_ids)?,provenance])?;
             }
             for (id, content) in batch.updates {
                 tx.execute("UPDATE user_memories SET content=?2,updated_at=?3 WHERE id=?1", params![id,content,batch.now_ms])?;

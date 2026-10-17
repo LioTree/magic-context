@@ -999,4 +999,103 @@ mod tests {
         assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_journal"), 1);
         assert_eq!(f.store.user_profile_version().unwrap(), 0);
     }
+
+    /// Every row of `sql` as a JSON object keyed by column name.
+    fn rows(f: &Fixture, sql: &str) -> Value {
+        f.store
+            .with_context_read(|db| {
+                let mut stmt = db.prepare(sql)?;
+                let names: Vec<String> =
+                    stmt.column_names().into_iter().map(str::to_owned).collect();
+                let rows = stmt
+                    .query_map([], |row| {
+                        let mut object = serde_json::Map::new();
+                        for (i, name) in names.iter().enumerate() {
+                            let value = match row.get::<_, rusqlite::types::Value>(i)? {
+                                rusqlite::types::Value::Null => Value::Null,
+                                rusqlite::types::Value::Integer(v) => json!(v),
+                                rusqlite::types::Value::Real(v) => json!(v),
+                                rusqlite::types::Value::Text(v) => json!(v),
+                                rusqlite::types::Value::Blob(v) => json!(v),
+                            };
+                            object.insert(name.clone(), value);
+                        }
+                        Ok(Value::Object(object))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(Value::Array(rows))
+            })
+            .unwrap()
+    }
+
+    /// testdata/dream_tasks/review_user_memories.json is what the TypeScript
+    /// dreamer's review-user-memories task (gen/gen-dream-review-golden.ts) wrote
+    /// for the same candidate pool, profile and reviewer answer.
+    #[tokio::test]
+    async fn user_review_rows_match_the_typescript_reviewer() {
+        let golden: Vec<Value> = serde_json::from_str(include_str!(
+            "../../testdata/dream_tasks/review_user_memories.json"
+        ))
+        .unwrap();
+        assert_eq!(golden.len(), 3);
+        for case in golden {
+            let name = case["name"].as_str().unwrap();
+            let f = Fixture::new(TaskName::ReviewUserMemories);
+            f.store
+                .with_context_conn_for_test(|tx| {
+                    tx.execute_batch(
+                        "DELETE FROM user_memory_candidates; DELETE FROM user_memories;",
+                    )?;
+                    for c in case["candidates"].as_array().unwrap() {
+                        tx.execute("INSERT INTO user_memory_candidates(id,content,session_id,created_at,source_compartment_start,source_compartment_end) VALUES(?1,?2,?3,?4,?5,?6)",
+                            params![c["id"].as_i64(), c["content"].as_str(), c["session_id"].as_str(), c["created_at"].as_i64(), c["source_compartment_start"].as_i64(), c["source_compartment_end"].as_i64()])?;
+                    }
+                    for m in case["profile"].as_array().unwrap() {
+                        tx.execute("INSERT INTO user_memories(id,content,status,promoted_at,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                            params![m["id"].as_i64(), m["content"].as_str(), m["status"].as_str(), m["promoted_at"].as_i64(), m["created_at"].as_i64(), m["updated_at"].as_i64()])?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(f.time.0.load(Ordering::SeqCst), 1000, "the golden writes at 1000 ms");
+            let mut carrier = f.carrier();
+            carrier.answers = case["answer"]
+                .as_str()
+                .map(|a| vec![a.to_owned()])
+                .unwrap_or_default()
+                .into();
+            let mut host = f.host(carrier);
+            let result = host
+                .run_user_review(case["threshold"].as_u64().unwrap() as usize)
+                .await
+                .unwrap();
+            assert_eq!(
+                json!(host.carrier.requests.len()),
+                case["modelCalls"],
+                "{name}"
+            );
+            assert_eq!(
+                serde_json::to_value(result.unwrap_or_default()).unwrap(),
+                case["result"],
+                "{name}"
+            );
+            assert_eq!(
+                rows(&f, "SELECT id,content,status,promoted_at,source_candidate_ids,source_candidate_provenance,created_at,updated_at FROM user_memories ORDER BY id"),
+                case["userMemories"],
+                "{name}"
+            );
+            let remaining: Vec<i64> = rows(&f, "SELECT id FROM user_memory_candidates ORDER BY id")
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_i64().unwrap())
+                .collect();
+            assert_eq!(json!(remaining), case["remainingCandidateIds"], "{name}");
+            assert_eq!(
+                json!(f.store.user_profile_version().unwrap()),
+                case["profileVersion"],
+                "{name}"
+            );
+        }
+    }
 }
