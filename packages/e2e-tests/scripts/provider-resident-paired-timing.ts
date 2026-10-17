@@ -103,18 +103,20 @@ export async function pairedResidentTiming(baseRoot: string) {
     return result;
 }
 /** Compare the same runner protocol with the startup switch off and on. */
-export async function brocaResidentTiming(samples = 50, claude = false) {
+export async function brocaResidentTiming(samples = 50, claude = false, driverBinary?: string) {
     assert.ok(samples >= 50, "fold p99 needs at least 50 samples");
-    const root = join(tmpdir(), "magic-context", "resident-all-lanes-review");
+    const root = join(tmpdir(), "magic-context", "broca-hook");
     mkdirSync(root, { recursive: true });
     const work = mkdtempSync(join(root, "broca-paired-"));
-    const driver = new tip.Driver(tip.buildDriver(join(work, "build")), work);
+    const driver = new tip.Driver(driverBinary ?? tip.buildDriver(join(work, "build")), work);
     const rows: Array<{ lane: string; kind: string; sample: number; module_ms: number; cpu_ms: number;
-        scheduler_wait_ms: number; db_acquire_ms: number; db_callback_ms: number; db_finish_ms: number }> = [];
+        scheduler_wait_ms: number; db_acquire_ms: number; db_callback_ms: number; db_finish_ms: number; allocation_bytes?: number }> = [];
     const rigs = ["off", "on"] as const;
     const applied: Record<string, any> = {};
     const namespaces: Record<string, string> = {};
-    const through = 17_000;
+    const through = Number(process.env.MC_BROCA_HISTORY ?? 17_000);
+    assert.ok(Number.isSafeInteger(through) && through >= 500);
+    const hookOnly = process.env.MC_BROCA_HOOK_ONLY === "1";
     const harness = claude ? "claude-code" : "broca";
     const plan = { serializer_profile: claude ? "claude-code-anthropic" : "owned-broca", ...(claude ? { observation: "answer" } : {}) };
     const messages = Array.from({ length: through }, (_, i) => {
@@ -133,7 +135,8 @@ export async function brocaResidentTiming(samples = 50, claude = false) {
     const before = systemSample();
     const measurement = (lane: string, kind: string, sample: number, response: any) => ({ lane, kind, sample,
         module_ms: response.module_ms, cpu_ms: response.cpu_ms, scheduler_wait_ms: response.scheduler_wait_ms,
-        db_acquire_ms: response.db_acquire_ms, db_callback_ms: response.db_callback_ms, db_finish_ms: response.db_finish_ms });
+        db_acquire_ms: response.db_acquire_ms, db_callback_ms: response.db_callback_ms, db_finish_ms: response.db_finish_ms,
+        allocation_bytes: response.allocation_bytes });
     try {
         for (const rig of rigs) {
             const directory = join(work, rig); mkdirSync(directory);
@@ -151,7 +154,7 @@ export async function brocaResidentTiming(samples = 50, claude = false) {
                         messages: messages.slice(from, from + 100), more: from + 100 < messages.length, now: 2 });
                 }
             } else await call(rig, "compaction.step", { ...status, request_id: "bootstrap", messages, now: 2 });
-            await event(rig, "realistic_seed", { covered: 16_500, compartments: 2_300, memories: 0 });
+            await event(rig, "realistic_seed", { covered: through - 500, compartments: Math.round(through * 2300 / 17000), memories: 0 });
             await event(rig, "flush");
             const response = await call(rig, "compaction.step", { ...status, request_id: "seed", messages: [], now: 3 });
             assert.equal(response.ok.answer, "compaction_message");
@@ -165,7 +168,12 @@ export async function brocaResidentTiming(samples = 50, claude = false) {
                 const hook = await call(rig, "transform.hook", { session: "session", harness, lineage_id: "L", step_id: `hook-${sample}`,
                     ...(claude ? { params: plan, hook: "post_assistant", subject_mid: subject.mid, subject_ordinal: through,
                         message: subject.message, raw_message: subject.raw_message,
-                        blocks: [subject.message.content[0]!.text] } : { hook: "post_assistant", blocks: [`§999§ measured hook ${sample}: café 🦀`] }) }, true);
+                         blocks: [subject.message.content[0]!.text] } : { hook: "post_assistant", blocks: [`§999§ measured hook ${sample}: café 🦀`] }) }, true);
+                if (hookOnly) {
+                    answers.push(hook.raw);
+                    if (sample >= 0) rows.push(measurement(rig, "hook", sample, hook));
+                    continue;
+                }
                 await event(rig, "realistic_visible_delta", { sample: sample + 2 });
                 await event(rig, "flush");
                 const fold = await call(rig, "compaction.step", { ...status, request_id: `fold-${sample}`, messages: [],
@@ -180,7 +188,7 @@ export async function brocaResidentTiming(samples = 50, claude = false) {
             }
             assert.equal(answers[0], answers[1], "paired runner folds must be byte-identical");
         }
-        const lanes = rigs.flatMap(lane => ["hook", "fold"].map(kind => {
+        const lanes = rigs.flatMap(lane => (hookOnly ? ["hook"] : ["hook", "fold"]).map(kind => {
             const selected = rows.filter(row => row.lane === lane && row.kind === kind);
             return { lane, kind, samples: selected.length, p50_ms: percentile(selected.map(row => row.module_ms), .5),
                 p99_ms: percentile(selected.map(row => row.module_ms), .99),
@@ -198,7 +206,8 @@ export async function brocaResidentTiming(samples = 50, claude = false) {
             cpu_pressure: { before: before.host_cpu_pressure, after: after.host_cpu_pressure },
             worst_resident_hook: rows.filter(row => row.lane === "on" && row.kind === "hook").sort((a, b) => b.module_ms - a.module_ms)[0],
             worst_resident_fold: rows.filter(row => row.lane === "on" && row.kind === "fold").sort((a, b) => b.module_ms - a.module_ms)[0] })}`);
-        assert.ok(lanes.find(row => row.lane === "on" && row.kind === "fold")!.p99_ms < 250, "resident fold p99 must stay below 250 ms");
+        if (!hookOnly) assert.ok(lanes.find(row => row.lane === "on" && row.kind === "fold")!.p99_ms < 250, "resident fold p99 must stay below 250 ms");
+        if (!hookOnly) assert.ok(lanes.find(row => row.lane === "on" && row.kind === "hook")!.cpu_p99_ms <= 10, "resident hook CPU p99 must stay at or under 10 ms");
         if (claude) assert.ok(lanes.find(row => row.lane === "on" && row.kind === "hook")!.p99_ms <= 10, "resident hook p99 must stay at or under 10 ms");
         return result;
     } finally { await driver.close(); }

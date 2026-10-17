@@ -7,6 +7,10 @@ struct CountingAllocator;
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 
+pub fn allocated_bytes() -> u64 {
+    BYTES.load(Relaxed)
+}
+
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         CALLS.fetch_add(1, Relaxed);

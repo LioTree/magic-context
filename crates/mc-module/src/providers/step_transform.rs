@@ -1496,12 +1496,14 @@ impl McHandler {
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
         let mut record = self.runner_record(&store, &key)?;
+        let mut append_only = record.hook.is_some();
         record.hook.get_or_insert_with(HookState::default);
         if record.catalog.is_none() {
             record.catalog = self.provider_store.catalog(&SessionBinding {
                 session: key.session.clone(),
                 ..binding.clone()
             })?;
+            append_only &= record.catalog.is_none();
         }
         let mut declaration_params = json!({"preset":call.preset,"params":call.params});
         let compacting =
@@ -1626,9 +1628,13 @@ impl McHandler {
         let rendered = hooks::answer::apply_ops(blocks, &ops).map_err(|e| transient(e.name()))?;
         let subject = sha256_hex(&serde_json::to_vec(&call.subject).map_err(transient)?);
         let state = record.hook.as_mut().expect("hook state");
-        for old in &state.answers {
-            if old.subject == subject && !old.observed {
-                state.burned.extend(old.tags.iter().copied());
+        // Assistant answers never allocate tags. Matching assistant subjects
+        // therefore cannot burn tags, even when an earlier answer is unobserved.
+        if hook_kind != Hook::PostAssistant {
+            for old in &state.answers {
+                if old.subject == subject && !old.observed {
+                    state.burned.extend(old.tags.iter().copied());
+                }
             }
         }
         let tool_call_id = match &call.subject {
@@ -1645,7 +1651,11 @@ impl McHandler {
             observed: false,
             tool_call_id,
         });
-        record.save(&self.provider_store, &key)?;
+        if hook_kind == Hook::PostAssistant && append_only {
+            record.save_assistant_answer(&store, &self.provider_store, &key)?;
+        } else {
+            record.save(&self.provider_store, &key)?;
+        }
         fault("HookStateRecorded");
         record.publish();
         bytes(&answer)
