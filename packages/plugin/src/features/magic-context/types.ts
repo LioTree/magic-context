@@ -140,4 +140,14 @@ export type SchedulerDecision = "execute" | "defer";
 export interface ContextUsage {
     percentage: number;
     inputTokens: number;
+    /** Provider-reported token components, before summing input and cache tokens for scheduling. */
+    providerUsage?: {
+        model: string;
+        input: number;
+        cache_read: number;
+        cache_write: number;
+        output: number;
+        completed_at: number;
+        finish_reason: string;
+    };
 }

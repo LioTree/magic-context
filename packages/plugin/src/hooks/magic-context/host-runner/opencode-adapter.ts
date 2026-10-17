@@ -46,6 +46,7 @@ import {
     type ProviderUsageInput,
     recordProviderUsage,
 } from "./fallback-admissibility";
+import { openCodeStepInputs } from "./opencode-step-inputs";
 import {
     type FrozenProviderPlan,
     freezeProviderPlan,
@@ -1056,24 +1057,13 @@ export function createOpenCodeProviderTransform(
         return `${row.mutation}:${row.epoch}:${row.legacy > 0 ? "legacy" : "ready"}`;
     }
     function inputs(id: string, messages: MessageLike[], meta: SessionMeta): StepInputs {
-        const usage = deps.contextUsageMap.get(id)?.usage;
-        return {
+        return openCodeStepInputs({
             model: model(id, messages),
-            step_id: messages.at(-1)?.info.id ?? randomUUID(),
-            step_kind: "model",
-            context_window: meta.lastUsageContextLimit || 200_000,
-            previous_usage: usage
-                ? {
-                      input: usage.inputTokens,
-                      cache_read: 0,
-                      cache_write: 0,
-                      output: 0,
-                      completed_at: meta.lastResponseTime,
-                      finish_reason: "stop",
-                  }
-                : undefined,
-            estimate: { request_tokens: usage?.inputTokens ?? 0 },
-        };
+            stepId: messages.at(-1)?.info.id ?? randomUUID(),
+            meta,
+            entry: deps.contextUsageMap.get(id),
+            now: now(),
+        });
     }
     function rebuildReason(
         id: string,

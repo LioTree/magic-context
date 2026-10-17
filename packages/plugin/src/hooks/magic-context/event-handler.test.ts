@@ -1330,6 +1330,39 @@ describe("createEventHandler", () => {
         expect(entry?.usage.inputTokens).toBe(124_000);
     });
 
+    it("records cache-only provider usage as a real pressure sample", async () => {
+        useTempDataHome("context-event-cache-only-usage-");
+        const contextUsageMap = new Map<string, { usage: ContextUsage; updatedAt: number }>();
+        const handler = createEventHandler(createDeps(contextUsageMap));
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        role: "assistant",
+                        sessionID: "ses-cache-only",
+                        providerID: "test-provider",
+                        modelID: "cache-only",
+                        time: { completed: Date.now() },
+                        finish: "stop",
+                        tokens: { input: 0, output: 10, cache: { read: 321, write: 79 } },
+                    },
+                },
+            },
+        });
+
+        const entry = contextUsageMap.get("ses-cache-only");
+        expect(entry?.hasUsageTokens).toBe(true);
+        expect(entry?.usage.inputTokens).toBe(400);
+        expect(entry?.usage.providerUsage).toMatchObject({
+            input: 0,
+            cache_read: 321,
+            cache_write: 79,
+            output: 10,
+        });
+    });
+
     it("resolves model-specific cache ttl via per-model config", async () => {
         useTempDataHome("context-event-provider-model-");
         const contextUsageMap = new Map<string, { usage: ContextUsage; updatedAt: number }>();

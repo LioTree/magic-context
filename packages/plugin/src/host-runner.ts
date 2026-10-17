@@ -3,7 +3,10 @@
 export { StoreVersionMismatchError } from "./features/magic-context/store-version-mismatch";
 export {
     type BridgeAdapterOptions,
+    type BridgeFactScope,
     type BridgeFallbackInputs,
+    type BridgeHostFact,
+    type BridgeHostFactResult,
     type BridgeOutcomeListener,
     BridgeRefusalError,
     type BridgeRefusalReason,

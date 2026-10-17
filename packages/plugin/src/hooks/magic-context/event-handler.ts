@@ -61,6 +61,7 @@ import { hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { removeCompactionMarkerForSession } from "./compaction-marker-manager";
 import { noteContextLimitResolution } from "./context-limit-resolution";
+import { CONTEXT_USAGE_TTL_MS } from "./context-usage";
 import {
     getMessageRemovedInfo,
     getMessageUpdatedAssistantInfo,
@@ -100,7 +101,6 @@ import { isAnthropicFamilyRoute } from "./sentinel";
 import { clearMessageTokensCache } from "./transform";
 import { resetDegradedCacheCount } from "./transform-postprocess-phase";
 
-const CONTEXT_USAGE_TTL_MS = 60 * 60 * 1000;
 // Session/model pairs whose current run of above-window readings was logged.
 const usageAboveWallLogSeen = new Set<string>();
 
@@ -119,6 +119,8 @@ interface MessageRemovedCleanupResult {
 
 export interface EventHandlerDeps {
     contextUsageMap: Map<string, ContextUsageEntry>;
+    /** A bridge's host-resolved window takes precedence over the OpenCode catalog. */
+    usageContextWindow?: (sessionId: string, modelKey: string | undefined) => number | undefined;
     compactionHandler: ReturnType<typeof createCompactionHandler>;
     /**
      * Compaction-off mode (issue #266), boot-resolved. Overflow recovery is
@@ -847,13 +849,15 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     (info.tokens?.input ?? 0) +
                     (info.tokens?.cache?.read ?? 0) +
                     (info.tokens?.cache?.write ?? 0);
+                const hostWindow = deps.usageContextWindow?.(info.sessionID, modelKey);
                 const baseGeometry = hasUsageTokens
                     ? resolveContextWindowGeometry(info.providerID, info.modelID)
                     : undefined;
                 const trustedAbsoluteWall =
-                    baseGeometry && hasTrustedAbsoluteWall(baseGeometry)
+                    hostWindow ??
+                    (baseGeometry && hasTrustedAbsoluteWall(baseGeometry)
                         ? baseGeometry.derivation.absoluteWall
-                        : undefined;
+                        : undefined);
                 // Provider usage is the prompt size of a request the provider
                 // accepted, so it is real pressure at any size. The trusted
                 // window is configured (overlay or provider metadata) and can be
@@ -932,10 +936,12 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             ? getSdkContextLimit(info.providerID, info.modelID)
                             : undefined;
                     const resolvePressure = () => {
-                        const resolvedLimit = resolveContextLimit(info.providerID, info.modelID, {
-                            db: deps.db,
-                            sessionID: info.sessionID,
-                        });
+                        const resolvedLimit =
+                            hostWindow ??
+                            resolveContextLimit(info.providerID, info.modelID, {
+                                db: deps.db,
+                                sessionID: info.sessionID,
+                            });
                         const contextLimit = successfulUsageProof
                             ? Math.max(resolvedLimit, provenSafeInputTokens)
                             : resolvedLimit;
@@ -984,6 +990,16 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             usage: {
                                 percentage: pressure.percentage,
                                 inputTokens: pressureInputTokens,
+                                providerUsage: {
+                                    model: modelKey ?? "unknown/unknown",
+                                    input: info.tokens?.input ?? 0,
+                                    cache_read: info.tokens?.cache?.read ?? 0,
+                                    cache_write: info.tokens?.cache?.write ?? 0,
+                                    output: info.tokens?.output ?? 0,
+                                    completed_at: responseTime,
+                                    finish_reason:
+                                        info.finish ?? (responseFailed ? "error" : "unknown"),
+                                },
                             },
                             updatedAt: now,
                             lastResponseTime: now,
