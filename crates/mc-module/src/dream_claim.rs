@@ -15,8 +15,9 @@ use subc_client_rs::HandlerOutcome;
 /// TypeScript dreamer itself. Any other route needs a daemon-attested principal.
 const PLUGIN_HARNESSES: [&str; 4] = ["opencode", "opencode2", "pi", "omp"];
 
-/// True for a route opened by a Magic Context plugin, which still runs every
-/// dream task Rust has not published.
+/// True for a route opened by a Magic Context plugin: no principal and a harness
+/// in `PLUGIN_HARNESSES`. Such a host runs every dream task itself unless the
+/// task is in Rust's published list.
 pub(crate) fn plugin_lane(binding: &SessionBinding) -> bool {
     binding.principal.is_none() && PLUGIN_HARNESSES.contains(&binding.harness.as_str())
 }
@@ -28,8 +29,9 @@ impl McHandler {
         self.dream_children.clone()
     }
 
-    /// The bound route and its project key for a dream route, after the same lane
-    /// admission every claimant route uses.
+    /// The bound route and its project key, once the route passed the checks every
+    /// dream route applies: a plugin route, or a principal-bearing route that
+    /// `providers` admits as the attested harness module.
     fn dream_lane(
         &self,
         channel: u16,
@@ -109,18 +111,18 @@ impl McHandler {
     /// `dream.ownership {v:1, claimant?}` answers with the published list for the
     /// route's project; it is the only list a plugin's scheduler consults.
     ///
-    /// Reading is open to plugin and attested harness routes. Only a
-    /// daemon-attested harness route (in mode 3, THALAMUS's harness) may declare a
-    /// claimant (`claimant: {capabilities, agents}`) or withdraw its own
-    /// (`claimant: null`): a plugin cannot make Rust take its own tasks away.
+    /// Reading is open to plugin and attested harness routes. Only an attested
+    /// harness route (the plugin-free THALAMUS harness, admitted by `dream_lane`)
+    /// may declare a claimant (`claimant: {capabilities, agents}`) or withdraw its
+    /// own (`claimant: null`): a plugin cannot make Rust take its own tasks away.
     pub(crate) fn handle_dream_ownership(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let (binding, project) = match self.dream_lane(channel, request, "dream.ownership") {
             Ok(lane) => lane,
             Err(refusal) => return refusal,
         };
         if let Some(claimant) = request.get("claimant") {
-            // dream_lane already admitted any principal-bearing route as an attested
-            // harness; a principal-less route is a plugin's.
+            // dream_lane let a route through only as a plugin route (no principal)
+            // or as the admitted harness module (principal present); refuse the former.
             if binding.principal.is_none() {
                 return HandlerOutcome::Error {
                     code: "claimant_requires_attested_harness".into(),

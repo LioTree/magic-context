@@ -10,7 +10,8 @@ fn vector() -> Value {
     serde_json::from_str(VECTOR).unwrap()
 }
 
-/// Every task that has a Rust host, wired as if production executors existed.
+/// A wiring that names every task with a Rust host (Broca transport off), so a
+/// test can exercise publication the production wiring does not allow yet.
 pub(crate) fn every_hosted_task() -> Wiring {
     Wiring {
         tasks: CANONICAL_TASKS
@@ -220,7 +221,8 @@ fn broca_is_chosen_only_when_the_user_configured_it() {
     let settings = json!({"dreamer": {"claude-code": {"model": "anthropic/claude-sonnet-4-5"}}});
     let no_models = json!({"dreamer": {}});
     let mut wiring = every_hosted_task();
-    // A harness whose default is Broca: the default alone never publishes.
+    // claude-code's default runner is Broca, but the user named none: nothing is
+    // published, whatever is wired.
     let defaulted = publish(&OwnershipInput {
         config: &host_config(),
         settings: Some(&settings),

@@ -7,8 +7,8 @@
 //! 1. the user enabled `rust_background_enabled`;
 //! 2. a production executor for the task is wired (see [`Wiring::production`]);
 //! 3. the carrier the user's runner choice selects can carry every child the
-//!    task opens. For the Host runner that means a daemon-attested harness
-//!    claimant (in mode 3, THALAMUS's harness) declared on one of the project's
+//!    task opens. For the Host runner that means an attested harness claimant
+//!    (the THALAMUS harness, when no plugin runs the host) declared on one of the project's
 //!    routes, within [`DECLARATION_TTL_MS`], the agents and capabilities the
 //!    dream-claim-v1 claim route would admit. A plugin route cannot declare one.
 //!    For Broca it means the user configured Broca and a Broca transport is wired.
@@ -322,14 +322,16 @@ fn withheld_reason(task: TaskName, input: &OwnershipInput<'_>) -> Option<String>
     let runner = input.config.dreamer_runner_for(input.harness);
     match runner.kind {
         HistorianRunnerKind::Broca => {
-            // Rust mode never requires Broca: a harness default is not a choice.
+            // Broca is used only when the user named it (`dreamer.runner` or
+            // `historian.runner`); a harness that merely defaults to Broca stays
+            // with TypeScript, so Rust background work never requires Broca.
             if runner.source != RunnerSource::Configured {
                 return Some("broca_not_configured".into());
             }
             if !input.wiring.broca {
                 return Some("broca_unwired".into());
             }
-            // The Broca carrier refuses a child without a model.
+            // BrocaCarrier refuses to open a child whose request names no model.
             if resolve_task_models(settings, input.harness, task.as_str())
                 .primary
                 .is_none()

@@ -1,7 +1,7 @@
 //! `dream.ownership` and `dreamer.run_task` against the published list, on a real
-//! handler and store. Claimants are declared on a daemon-attested harness route
-//! (THALAMUS's harness in mode 3); publication is fed by the fixture's wiring,
-//! never by a request field.
+//! handler and store. Claimants are declared on an attested harness route (the
+//! THALAMUS harness module principal with an authorized prefrontal scope);
+//! publication is fed by the fixture's wiring, never by a request field.
 
 use super::*;
 use crate::dream_dispatch::ownership::tests::{every_hosted_task, vector_claimant};
@@ -13,7 +13,7 @@ const VECTOR: &str = include_str!(
 );
 
 /// Channel 7: a plugin route. Channel 9: an attested harness route of the same
-/// project, bound with the harness the vector's claimant declares from.
+/// project, bound with the harness name the vector lists for its claimant.
 const PLUGIN: u16 = 7;
 const HARNESS: u16 = 9;
 
@@ -218,7 +218,8 @@ async fn ownership_route_refuses_malformed_claimants_and_foreign_lanes() {
 }
 
 /// With the switch on, a plugin route keeps running every unpublished task
-/// exactly as with it off; only a published task is refused as Rust's.
+/// exactly as with it off; only a published task is refused with
+/// `rust_scheduler_owns_task`.
 #[tokio::test]
 async fn run_task_on_a_plugin_route_refuses_only_published_tasks() {
     for activated in [false, true] {

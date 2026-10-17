@@ -344,7 +344,8 @@ impl DreamQueue {
             caps.get("tools")
                 .and_then(Value::as_array)
                 .ok_or("unavailable")?;
-            // Publication asks the same question before it names a task as Rust's.
+            // dream_dispatch::ownership applies this same claim_refusal check before
+            // it publishes a task as one Rust runs.
             if super::ownership::claim_refusal(
                 caps,
                 e.request.allowed_tools,
