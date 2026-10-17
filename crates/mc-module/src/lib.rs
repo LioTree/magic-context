@@ -220,6 +220,20 @@ pub mod background {
     }
 
     impl Unit {
+        pub fn captured_dream_config(
+            &self,
+            harness: String,
+            directory: std::path::PathBuf,
+        ) -> Arc<crate::dream_dispatch::context::CapturedConfig> {
+            Arc::new(crate::dream_dispatch::context::CapturedConfig {
+                activated: self.activated,
+                route: self.config.effective.clone(),
+                effective: self.config.settings.clone(),
+                harness,
+                directory,
+            })
+        }
+
         pub fn run_dream_task<T>(
             &self,
             request: &DreamRequest<'_>,

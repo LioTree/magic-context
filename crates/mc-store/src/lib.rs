@@ -24,6 +24,7 @@ pub mod archive_index;
 pub mod background_state;
 pub mod context_schema;
 pub mod context_writes;
+pub mod dream_domain;
 pub mod dream_scheduler;
 pub mod git_archive;
 mod historian_claim;
@@ -11380,6 +11381,8 @@ impl McStore {
                 return Ok(CommitOutcome::FrozenClearRefused(stored_units));
             }
 
+            let flush_progress = command_ledger::prepare_flush_progress_tx(tx, session_id)?;
+
             // The grow-mostly parts of the meta are rows, so a pass writes only the entries
             // that differ instead of re-serializing the whole history to append one. Finding
             // WHICH entries differ means reading every stored row, so a pass that changed
@@ -11689,6 +11692,10 @@ impl McStore {
                     params![session_id, drop_id],
                 )?;
             }
+
+            command_ledger::finish_flush_progress_tx(
+                tx, session_id, flush_progress, meta.soft_refresh_pending, divergence_at_ms,
+            )?;
 
             Ok(CommitOutcome::Committed(accepted_version))
         })?;
