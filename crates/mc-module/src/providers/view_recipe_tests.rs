@@ -471,7 +471,13 @@ fn v2_pi_recipe_round_trips_the_whole_host_view() {
         replacement: std::iter::once(ck_wire::CkWireMessage::synthetic_user_text(
             "summary head".to_string(),
         ))
-        .chain(request.messages.iter().skip(1).map(|entry| entry.ck.clone()))
+        .chain(
+            request
+                .messages
+                .iter()
+                .skip(1)
+                .map(|entry| entry.ck.clone()),
+        )
         .collect(),
     };
     let wire = super::codec_pi::encode_view(&engine, &request).unwrap();
