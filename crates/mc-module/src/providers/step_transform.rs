@@ -513,7 +513,8 @@ impl McHandler {
         &self,
         binding: &SessionBinding,
     ) -> Option<(Key, mc_store::provider_records::ProviderConversation)> {
-        if !host_binding(binding) {
+        if !host_binding(binding) || (binding.harness == "pi" && admit_host_lane(binding).is_err())
+        {
             return None;
         }
         let key = Key::new(binding, &binding.session, &binding.harness).ok()?;
@@ -525,6 +526,8 @@ impl McHandler {
         let plan: Value = serde_json::from_str(&c.params_json).ok()?;
         let expected = if attested_claude_code(binding) {
             "claude-code-anthropic"
+        } else if binding.harness == "pi" {
+            "pi"
         } else {
             "opencode-aisdk"
         };
@@ -599,29 +602,37 @@ impl McHandler {
                     descends_from: pass.descends_from.as_ref().map(|d| d.lineage_id.clone()),
                     through_ordinal: pass.descends_from.as_ref().map(|d| d.through_ordinal),
                 });
-            let decoded = super::codec_opencode::decode_messages(&pass.appended)?;
+            let decoded = if binding.harness == "pi" {
+                super::codec_pi::decode_messages(&pass.appended)?
+            } else {
+                super::codec_opencode::decode_messages(&pass.appended)?
+            };
             admitted = Some((pass.lineage_id.clone(), decoded.messages.clone()));
             let mut req: TransformRequest = decode(
-                &json!({"v":2,"session_id":c.engine_namespace,"render_config":"provider-policy","serializer_profile":"opencode-aisdk","messages":decoded.messages}),
+                &json!({"v":2,"session_id":c.engine_namespace,"render_config":"provider-policy","serializer_profile":if binding.harness == "pi" { "pi" } else { "opencode-aisdk" },"messages":decoded.messages}),
             )?;
             req.tool_present = true;
             let projection = ck_wire::project_messages(&req.messages).map_err(transient)?;
             let mut parts = admission_policy_parts(&req, &projection);
             for part in &mut parts {
                 if part.kind == "tool_result" {
-                    part.subject_part = decoded
-                        .sidecar
-                        .messages
-                        .get(&part.mid)
-                        .and_then(|m| {
-                            m.blocks
-                                .iter()
-                                .find(|b| b.block_index == part.block_index as usize)
-                        })
-                        .and_then(|b| b.raw.get("id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .into();
+                    part.subject_part = if binding.harness == "pi" {
+                        format!("{}#{}", part.mid, part.block_index)
+                    } else {
+                        decoded
+                            .sidecar
+                            .messages
+                            .get(&part.mid)
+                            .and_then(|m| {
+                                m.blocks
+                                    .iter()
+                                    .find(|b| b.block_index == part.block_index as usize)
+                            })
+                            .and_then(|b| b.raw.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .into()
+                    };
                 }
             }
             let eligible_user = pass
@@ -1004,21 +1015,31 @@ impl McHandler {
         };
         #[cfg(test)]
         probe.stage("conversation_lineage_read");
-        let decoded = super::codec_opencode::decode_messages(&[entry])?;
-        let ingress = &decoded.messages[0];
+        let decoded = if binding.harness == "pi" {
+            super::codec_pi::decode_hook_messages(&store, &key, lineage_id, entry)?
+        } else {
+            super::codec_opencode::decode_messages(&[entry])?
+        };
+        let ingress = decoded.messages.last().expect("hook ingress");
         let projection = ck_wire::project_messages(&decoded.messages).map_err(transient)?;
         let shell = decoded.sidecar.messages.get(mid).expect("decoded sidecar");
         let targets = projection
             .blocks
             .iter()
+            .filter(|block| block.mid == mid)
             .filter(|b| match hook {
                 Hook::PreUser => b.role == "user" && b.kind_tag == "text",
                 Hook::PostAssistant => b.role == "assistant" && b.kind_tag == "text",
                 Hook::PostTool => {
                     b.kind_tag == "tool_result"
+                        && (binding.harness != "pi" || b.scalar_text().is_some())
                         && shell.blocks.iter().any(|meta| {
                             meta.block_index == b.block_index
-                                && meta.raw.get("id").and_then(Value::as_str) == Some(part)
+                                && (if binding.harness == "pi" {
+                                    part == format!("{mid}#{}", meta.block_index)
+                                } else {
+                                    meta.raw.get("id").and_then(Value::as_str) == Some(part)
+                                })
                         })
                 }
                 _ => false,
@@ -1111,19 +1132,23 @@ impl McHandler {
             message_bytes: serde_json::to_vec(message).map_err(transient)?,
         };
         let policy_request: TransformRequest = decode(
-            &json!({"v":2,"kind":"transform.hook","session_id":c.engine_namespace,"render_config":"provider-policy","serializer_profile":"opencode-aisdk","messages":decoded.messages}),
+            &json!({"v":2,"kind":"transform.hook","session_id":c.engine_namespace,"render_config":"provider-policy","serializer_profile":if binding.harness == "pi" { "pi" } else { "opencode-aisdk" },"messages":decoded.messages}),
         )?;
         let mut policy_parts = admission_policy_parts(&policy_request, &projection);
         for p in &mut policy_parts {
             if p.kind == "tool_result" {
-                p.subject_part = shell
-                    .blocks
-                    .iter()
-                    .find(|b| b.block_index == p.block_index as usize)
-                    .and_then(|b| b.raw.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .into();
+                p.subject_part = if binding.harness == "pi" {
+                    format!("{mid}#{}", p.block_index)
+                } else {
+                    shell
+                        .blocks
+                        .iter()
+                        .find(|b| b.block_index == p.block_index as usize)
+                        .and_then(|b| b.raw.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into()
+                };
             }
         }
         // The store owns P1's newest-held/monotonic confirmation check. Descent,
@@ -1330,7 +1355,7 @@ impl McHandler {
         let directory = binding.project_root.to_string_lossy();
         let project = self.route_project(store, binding)?.key;
         let mut request: TransformRequest = decode(
-            &json!({"v":2,"kind":"transform.hook","session_id":namespace,"serializer_profile":"opencode-aisdk","render_config":"host-hook","messages":messages}),
+            &json!({"v":2,"kind":"transform.hook","session_id":namespace,"serializer_profile":if binding.harness == "pi" { "pi" } else { "opencode-aisdk" },"render_config":"host-hook","messages":messages}),
         )?;
         if let Some(chars) = plan
             .get("auto_search_min_prompt_chars")
@@ -1494,7 +1519,7 @@ impl McHandler {
                 .provider_claude_code_hook(binding, key, &call, params)
                 .await;
         }
-        if matches!(binding.harness.as_str(), "opencode" | "opencode2") {
+        if matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi") {
             return self.provider_host_hook(binding, key, &call, params).await;
         }
         if call.lineage_id.is_none() && call.subject.hook() != Hook::PreUser {

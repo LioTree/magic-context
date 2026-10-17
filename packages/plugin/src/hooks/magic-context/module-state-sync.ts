@@ -1302,7 +1302,7 @@ function isHistorianCompartmentSyncBusy(error: unknown): boolean {
     return false;
 }
 
-function readAuthoritySeqMismatch(error: unknown): number | null {
+export function readAuthoritySeqMismatch(error: unknown): number | null {
     let current = error;
     const seen = new Set<unknown>();
     while (isRecord(current) && !seen.has(current)) {

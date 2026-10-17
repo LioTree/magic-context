@@ -62,7 +62,7 @@ async fn refusal(h: &McHandler, method: &str) -> String {
 async fn host_lane_requires_attested_harness_even_with_authorized_scope() {
     let dir = tempfile::tempdir().unwrap();
     let h = McHandler::new();
-    for harness in ["opencode", "opencode2"] {
+    for harness in ["opencode", "opencode2", "pi"] {
         for principal in [
             None,
             Some(Principal::Direct),
@@ -95,7 +95,7 @@ async fn host_lane_requires_authorized_prefrontal_scope_even_with_harness_princi
     direct_owner.owner = Principal::Direct;
     let mut unauthorized = scope();
     unauthorized.owner_authorized = false;
-    for harness in ["opencode", "opencode2"] {
+    for harness in ["opencode", "opencode2", "pi"] {
         for scope in [
             None,
             Some(wrong_owner.clone()),
@@ -117,7 +117,7 @@ async fn host_lane_requires_authorized_prefrontal_scope_even_with_harness_princi
 #[tokio::test]
 async fn host_lane_admits_both_daemon_attestations_and_retains_the_bind_stamp() {
     let dir = tempfile::tempdir().unwrap();
-    for harness in ["opencode", "opencode2"] {
+    for harness in ["opencode", "opencode2", "pi"] {
         let h = super::claude_code_tests::handler(dir.path(), None);
         bind(
             &h,
@@ -134,7 +134,7 @@ async fn host_lane_admits_both_daemon_attestations_and_retains_the_bind_stamp() 
         for method in ["transform.declare", "compaction.setup"] {
             let outcome = h.dispatch_value(7, json!({"method":method,"params":{
                 "session":"s","harness":harness,"request_id":"setup","preset":"head",
-                "params":{"serializer_profile":"opencode-aisdk","observation":"answer"},
+                "params":{"serializer_profile":if harness == "pi" { "pi" } else { "opencode-aisdk" },"observation":"answer"},
                 "composition":{},"model":"fixture","context_window":100000,"lineage_id":"L","now":1
             }})).await;
             assert!(
@@ -187,5 +187,36 @@ async fn host_lane_check_leaves_broca_and_claude_code_admission_unchanged() {
     assert!(
         matches!(outcome, HandlerOutcome::Response(_)),
         "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn pi_provider_tool_facade_requires_attestation_even_when_the_plan_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = super::claude_code_tests::handler(dir.path(), None);
+    bind(
+        &h,
+        dir.path(),
+        "pi",
+        Some(harness_principal()),
+        Some(scope()),
+    )
+    .await;
+    let declaration = h.dispatch_value(7, json!({"method":"transform.declare","params":{"session":"s","harness":"pi","preset":"head","params":{"serializer_profile":"pi","observation":"answer"}}})).await;
+    assert!(matches!(declaration, HandlerOutcome::Response(_)));
+    let response = h
+        .dispatch_value(7, json!({"name":"ctx_reduce","arguments":{"drop":"1"}}))
+        .await;
+    assert!(
+        matches!(response, HandlerOutcome::Response(_)),
+        "{response:?}"
+    );
+    bind(&h, dir.path(), "pi", Some(Principal::Direct), Some(scope())).await;
+    let response = h
+        .dispatch_value(7, json!({"name":"ctx_reduce","arguments":{"drop":"1"}}))
+        .await;
+    assert!(
+        !matches!(response, HandlerOutcome::Response(_)),
+        "unattested Pi caller reused the host plan: {response:?}"
     );
 }

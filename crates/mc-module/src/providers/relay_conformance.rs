@@ -68,10 +68,24 @@ async fn oracle() {
         return;
     }
     let mut dir = tempfile::tempdir().unwrap();
-    let mut mc = handler(dir.path());
+    let context_root = std::env::var_os("MC_PI_BRIDGE_ROOT").map(PathBuf::from);
+    if let Some(root) = &context_root {
+        assert!(
+            root.starts_with(std::env::temp_dir().join("magic-context/pi-bridge")),
+            "Pi oracle root must be disposable"
+        );
+    }
+    let mut mc = handler(context_root.as_deref().unwrap_or(dir.path()));
     for line in std::io::stdin().lock().lines() {
         let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
         let answer = match request["control"].as_str() {
+            Some("bind") => {
+                let mut binding = mc.bindings.lock().unwrap().get(&7).unwrap().clone();
+                binding.harness = request["harness"].as_str().unwrap().into();
+                binding.session = request["session"].as_str().unwrap().into();
+                mc.bind_route(7, binding);
+                String::new()
+            }
             Some("reset") => {
                 drop(mc);
                 dir = tempfile::tempdir().unwrap();
@@ -80,7 +94,7 @@ async fn oracle() {
             }
             Some("restart") => {
                 drop(mc);
-                mc = handler(dir.path());
+                mc = handler(context_root.as_deref().unwrap_or(dir.path()));
                 String::new()
             }
             Some("scheduler") => {
@@ -108,7 +122,7 @@ async fn oracle() {
                     .get()
                     .unwrap()
                     .replace_compartments(
-                        "relay-v1",
+                        request["session"].as_str().unwrap_or("relay-v1"),
                         &[mc_store::StoredCompartment {
                             sequence: 0,
                             start_message: 1,
@@ -126,6 +140,8 @@ async fn oracle() {
             }
             _ => match mc.dispatch_value(7, request).await {
                 HandlerOutcome::Response(bytes) => String::from_utf8(bytes).unwrap(),
+                HandlerOutcome::Error { code, message } => json!({"oracle_error":{"source":"module","code":code,"message":message}}).to_string(),
+                HandlerOutcome::ErrorWithDetail { code, message, detail } => json!({"oracle_error":{"source":"module","code":code,"message":message,"detail":detail}}).to_string(),
                 other => panic!("relay oracle request failed: {other:?}"),
             },
         };

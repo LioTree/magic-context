@@ -14,13 +14,14 @@ export const ORACLE_COMMAND = [
 ];
 
 /** Each case owns a disposable Magic Context store, reused only for module restarts. */
-export function startOracle() {
+export function startOracle(options: { contextRoot?: string } = {}) {
     const child = Bun.spawn(ORACLE_COMMAND, {
         windowsHide: true,
         cwd: resolve(import.meta.dir, "../../../../../../.."),
         env: {
             ...process.env,
             MC_RELAY_ORACLE: "1",
+            ...(options.contextRoot ? { MC_PI_BRIDGE_ROOT: options.contextRoot } : {}),
             RUSTC_WRAPPER: "",
             CARGO_BUILD_RUSTC_WRAPPER: "",
         },

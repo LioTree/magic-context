@@ -28,6 +28,8 @@ fn host_plan(
 ) -> Result<bool, HandlerOutcome> {
     let expected = if attested_claude_code(binding) {
         "claude-code-anthropic"
+    } else if binding.harness == "pi" {
+        "pi"
     } else {
         "opencode-aisdk"
     };
@@ -1602,7 +1604,9 @@ fn referenced_drop_targets(
         // message, allowing its queued drop to run on a rewrite-permitted pass.
         // It proves nothing about other messages: leave the served watermark,
         // protection accounting and frozen hook/retry bytes unchanged.
-        if stored.state != "live" && !(stored.state == "pending" && codec == Codec::OpencodeAiSdk) {
+        if stored.state != "live"
+            && !(stored.state == "pending" && matches!(codec, Codec::OpencodeAiSdk | Codec::Pi))
+        {
             continue;
         }
         // An ancestor answer is carried only through the declared fork cut.

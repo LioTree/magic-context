@@ -171,7 +171,22 @@ export async function generateVectors(): Promise<VectorFile> {
     }
 }
 
-if (import.meta.main) {
+if (import.meta.main && process.argv.includes("--pi")) {
+    const pi = await import(
+        new URL(
+            "../../../../../../pi-plugin/src/host-runner/conformance/generate.ts",
+            import.meta.url,
+        ).href
+    );
+    const bytes = `${JSON.stringify(await pi.generatePiVectors(), null, 4)}\n`;
+    if (process.argv.includes("--write")) {
+        await mkdir(new URL(".", pi.PI_VECTOR_PATH), { recursive: true });
+        await writeFile(pi.PI_VECTOR_PATH, bytes);
+    } else if (process.argv.includes("--print")) console.log(bytes);
+    else if ((await readFile(pi.PI_VECTOR_PATH, "utf8")) !== bytes)
+        throw new Error("relay-pi-v1.json drift; regenerate with --write --pi");
+    console.log(`relay-pi-v1: ${JSON.parse(bytes).cases.length} cases generated from real MC`);
+} else if (import.meta.main) {
     const bytes = encodeVectors(await generateVectors());
     if (process.argv.includes("--write")) {
         await mkdir(new URL("./vectors/", import.meta.url), { recursive: true });
