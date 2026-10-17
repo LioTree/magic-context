@@ -50,7 +50,11 @@ struct Fixture {
 impl Fixture {
     fn new(paused: bool) -> Self {
         let root = std::env::temp_dir().join("magic-context/historian-claim-v1");
-        std::fs::create_dir_all(&root).unwrap();
+        // Store creation goes through the shared permission helper, as the
+        // repository's direct-creator guard requires. The shared parent stays
+        // non-private like a plain create_dir_all; each fixture's store lives in
+        // its own owner-only tempdir below it.
+        mc_store::private_permissions::ensure_directory(&root, false).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
         let descriptor = StorageDescriptor {
             module_id: DEFAULT_MODULE_ID.into(),

@@ -753,8 +753,21 @@ async fn review_feature_off_normal_dispatch_preserves_business_write_footprints(
         before_historian = row_counts(h, false);
     }
     let claim = json!({"method":"historian.claim","v":1,"run_id":"review-run","claimant_instance_id":"review-host"});
+    // Historian claims on a module route need the attested thalamus-harness
+    // principal and scope; a Direct OpenCode caller is refused. This witness
+    // compares footprints, not admission, so claim on the principal-less
+    // in-process plugin lane and restore the Direct binding afterwards.
+    let set_principal = |h: &McHandler, principal: Option<Principal>| {
+        h.bindings.lock().unwrap().get_mut(&1).unwrap().principal = principal;
+    };
+    for h in [&old, &new] {
+        set_principal(h, None);
+    }
     let direct = reply(old.handle_historian_claim_value(1, &claim));
     let dispatched = reply(new.dispatch_value(1, claim).await);
+    for h in [&old, &new] {
+        set_principal(h, Some(Principal::Direct));
+    }
     assert_eq!(direct["ok"], true, "{direct}");
     assert_eq!(dispatched["ok"], true, "{dispatched}");
     assert!(direct["token"]
