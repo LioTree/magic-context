@@ -46,8 +46,8 @@ mod provider_v2_tests;
 mod provider_view_recipe;
 mod provider_wal;
 pub use provider_view_recipe::{
-    ProviderResolvedView, ProviderViewRecipe, ProviderViewSegment, ProviderViewTreatment,
-    MAX_VIEW_ANCESTOR_BYTES, MAX_VIEW_BASE_DEPTH,
+    record_lineage_answered_view, ProviderResolvedView, ProviderViewRecipe, ProviderViewSegment,
+    ProviderViewTreatment, LINEAGE_ANSWERED_VIEWS, MAX_VIEW_ANCESTOR_BYTES, MAX_VIEW_BASE_DEPTH,
 };
 pub mod provider_meters;
 mod provider_preparation;
