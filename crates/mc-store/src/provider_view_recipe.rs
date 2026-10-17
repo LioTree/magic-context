@@ -440,7 +440,21 @@ pub(crate) fn save_recipe_tx(
                         recipe.base_version=None;
                     }
                 }
-                let cut=if let Some(cut)=recipe.policy_cut_id {cut} else {
+                // A view without a baseline cut links to the conversation's current
+                // cut. Only a conversation with no cut at all gets a Setup cut: a new
+                // cut would become the current one that policy and fold reads use.
+                let current=match recipe.policy_cut_id {
+                    Some(cut)=>Some(cut),
+                    None=>crate::provider_policy_overlay::current_cut_tx(conn,&conv)?,
+                };
+                if current.is_some() {
+                    let held:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",params![conv,recipe.lineage_id],|r|r.get(0))?;
+                    if !held {
+                        conn.execute("INSERT INTO mc_provider_lineages_v1 SELECT ?1,'',0,NULL,NULL,json_extract(?1,'$[1]') WHERE NOT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id='')",[&conv])?;
+                        recipe.lineage_id=String::new();
+                    }
+                }
+                let cut=if let Some(cut)=current {cut} else {
                     // Setup creates a synthetic head before receiving native messages.
                     // Its empty lineage ID cannot be supplied by host ingest.
                     conn.execute("INSERT INTO mc_provider_lineages_v1 SELECT ?1,'',0,NULL,NULL,json_extract(?1,'$[1]') WHERE NOT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id='')",[&conv])?;
