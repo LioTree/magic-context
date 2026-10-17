@@ -1,6 +1,9 @@
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 
+/** Pairs currently open on this thread; the work inside one is synchronous. */
+let pairDepth = 0;
+
 /** Commit a synchronous edit and its required thinking omissions as one decision. */
 export function pairedThinkingEdit<T>(args: {
     db: ContextDatabase;
@@ -15,17 +18,24 @@ export function pairedThinkingEdit<T>(args: {
     const state = args.state ? { ...args.state } : undefined;
     // A nested pair runs as a savepoint inside its caller's write transaction;
     // only the outermost one acquires, and so measures, the write lock.
-    const outermost = !args.db.inTransaction;
+    const outermost = pairDepth === 0;
     let heldFrom = 0;
     try {
         const result = args.db
             .transaction(() => {
                 heldFrom = performance.now();
-                const result = args.edit();
-                if (result && typeof (result as { then?: unknown }).then === "function")
-                    throw new Error("A thinking companion transaction cannot contain awaited work");
-                if (args.needsCompanion(result)) args.persistCompanion(result);
-                return result;
+                pairDepth++;
+                try {
+                    const result = args.edit();
+                    if (result && typeof (result as { then?: unknown }).then === "function")
+                        throw new Error(
+                            "A thinking companion transaction cannot contain awaited work",
+                        );
+                    if (args.needsCompanion(result)) args.persistCompanion(result);
+                    return result;
+                } finally {
+                    pairDepth--;
+                }
             })
             .immediate();
         if (outermost) logSlowWriteTransaction("paired_thinking_edit", heldFrom);
