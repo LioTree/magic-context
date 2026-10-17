@@ -910,7 +910,7 @@ Tier boundaries are hardcoded to keep behavior predictable and prevent cache-bus
 | `transform_mode` | deprecated, ignored | — |
 | `rust_pipeline` | deprecated, ignored | — |
 
-Rust transform mode is retired. Old configs that set either key keep loading, but the value has no effect. Magic Context writes one warning to its log per process. OpenCode, OpenCode 2, Pi, and OMP all run the TypeScript transform. These keys do not control the CortexKit harness bridge, which can serve OpenCode and Pi sessions from `ck-mc` instead. The bridge has its own setting in the harness.
+Rust transform mode is retired. Old configs that set either key keep loading, but the value has no effect. On OpenCode and OpenCode 2, Magic Context writes one warning to its log per process. Pi and OMP ignore the keys without a warning. OpenCode, OpenCode 2, Pi, and OMP all run the TypeScript transform. These keys do not control the CortexKit harness bridge, which can serve OpenCode and Pi sessions from `ck-mc` instead. The bridge has its own setting in the harness.
 
 ### `protected_tools`
 

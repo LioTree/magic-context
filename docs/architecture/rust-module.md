@@ -17,7 +17,7 @@ The Rust workspace in `crates/` re-implements the cache-stability transform and 
 
 ## Who calls the module
 
-Rust transform mode is retired. In that mode the in-tree plugin sent each pass's full message array to ck-mc. The plugins now ignore `transform_mode` and `rust_pipeline` and log one warning.
+Rust transform mode is retired. In that mode the in-tree plugin sent each pass's full message array to ck-mc. The plugins ignore `transform_mode` and `rust_pipeline`; the OpenCode plugin logs one warning.
 
 ck-mc answers the step contract: `compaction.setup`, `compaction.step`, `compaction.view.read`, `transform.declare` and `transform.hook`. `lib.rs` sends these methods to `providers/`. The callers are:
 
