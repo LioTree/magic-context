@@ -18,6 +18,7 @@
  * MC_AUDIT_STRICT=1 to make every exposed lane fail on its strict-binding 400.
  */
 import { describe, it, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import {
     appendCompartments,
     replaceAllCompartmentState,
@@ -60,6 +61,7 @@ import {
 } from "./__tests__/strict-binding-mock";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { clearInjectionCache } from "./inject-compartments";
+import { recordSystemPromptEdit } from "./pending-materialization";
 import type { MessageLike } from "./tag-messages";
 import { clearMessageTokensCache, createTransform, type TransformDeps } from "./transform";
 import { hasParkedBustTrigger, resetDegradedCacheCount } from "./transform-postprocess-phase";
@@ -740,6 +742,188 @@ function withFixture(
 
 for (const generation of ["v1", "v2"] as const) {
     const host = generation === "v1" ? "OpenCode 1 TS mode" : "OpenCode 2";
+    it(
+        `${host}: companion failure rolls back an admitted queued drop and preserves replay`,
+        withFixture(
+            generation,
+            false,
+            "ctx_reduce drop (full removal)",
+            async (f) => {
+                await toolLoop(f, 4);
+                await nextUserTurn(f, "pair-failure-turn");
+                const before = wire(f.served);
+                expect(thinkingBlocks(before)).not.toBe("[]");
+                f.db.exec(
+                    "CREATE TRIGGER reject_pair BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(ABORT, 'reject companion'); END",
+                );
+                armAndBust(f, "ctx_reduce drop (full removal)", false);
+                let failed = false;
+                try {
+                    await f.pass();
+                } catch {
+                    failed = true;
+                }
+                expect(failed).toBe(true);
+                expect(getPendingOps(f.db, f.sessionId).length).toBe(1);
+                expect(f.tagStatus("old-read-b")).toBe("active");
+                f.db.exec("DROP TRIGGER reject_pair");
+                f.execute(false);
+                f.setUsage(20);
+                expect(wire((await f.pass()).messages)).toEqual(before);
+            },
+            "companion-failed-drop",
+        ),
+    );
+    it(
+        `${host}: synthetic todo with completed-turn thinking after anchor setup`,
+        withFixture(
+            generation,
+            false,
+            "synthetic todo",
+            async (f) => {
+                await prepareLane(f, "synthetic todo");
+                await toolLoop(f, 2);
+                await nextUserTurn(f, "todo-completed-turn");
+                await toolLoop(f, 4);
+                const before = wire(f.served);
+                expect(thinkingBlocks(before)).not.toBe("[]");
+                armAndBust(f, "synthetic todo", false);
+                const held = (await f.pass()).messages;
+                expect(f.mock.check(wire(held))).toBeNull();
+                expect(wire(held)).toEqual(before);
+                expect(wire((await f.pass()).messages)).toEqual(before);
+                f.served = held;
+                await nextUserTurn(f, "todo-completed-release");
+                expect(f.mock.check(wire(f.served))).toBeNull();
+                expect(landed(f, "synthetic todo", wire(f.served))).toBe(true);
+            },
+            "todo-completed-thinking",
+        ),
+    );
+    it(`${host}: bust permission without an admitted edit keeps completed thinking`, async () => {
+        const { dir, cleanup } = createTestTempDir("thinking-no-edit-");
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        runMigrations(db);
+        const sessionId = `thinking-no-edit-${generation}`;
+        const pendingMaterialization = new Set<string>();
+        const mock = new StrictBindingMock(Boolean(GOLDEN));
+        const capture = new GoldenCapture(
+            auditName(
+                generation,
+                false,
+                "reasoning clearing (keep_reasoning_tokens)",
+                "strip-no-edit",
+            ),
+        );
+        let busted = false;
+        const transform = createTransform({
+            db,
+            storeGeneration: generation,
+            signedThinkingHold: "on",
+            tagger: createTagger(),
+            directory: dir,
+            historianRunnable: false,
+            pendingMaterializationSessions: pendingMaterialization,
+            historyRefreshSessions: new Set(),
+            contextUsageMap: new Map(),
+            lastHeuristicsTurnId: new Map(),
+            liveModelBySession: new Map([[sessionId, MODEL]]),
+            scheduler: { shouldExecute: () => "defer" } as never,
+            keepReasoningTokens: 1_000_000,
+            onPostprocess: (result) => {
+                busted = result.bustedThisPass;
+            },
+        });
+        const raw: MessageLike[] = [
+            {
+                info: { id: "u0", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "Original task" }],
+            },
+        ];
+        const pass = async () => {
+            const messages = structuredClone(raw);
+            await transform({}, { messages });
+            const request = wire(messages);
+            capture.write(
+                request,
+                busted,
+                mock.hasCurrentTurnThinking(request),
+                hasParkedBustTrigger(sessionId),
+            );
+            return request;
+        };
+        try {
+            const block = mock.respond(await pass())!;
+            raw.push({
+                info: { id: "a0", role: "assistant", sessionID: sessionId, ...MODEL },
+                parts: [
+                    {
+                        type: "reasoning",
+                        text: block.thinking,
+                        metadata: { anthropic: { signature: block.signature } },
+                    },
+                    { type: "text", text: "Answer" },
+                ],
+            });
+            mock.newUserTurn();
+            raw.push({
+                info: { id: "u1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "Next task" }],
+            });
+            const before = await pass();
+            expect(mock.check(before)).toBeNull();
+            expect(thinkingBlocks(before)).not.toBe("[]");
+            pendingMaterialization.add(sessionId);
+            expect(await pass()).toEqual(before);
+            expect(busted).toBe(false);
+            // A real host system-prompt change is an edit before every kept
+            // block: the system hook records it and the next pass strips with it.
+            recordSystemPromptEdit(pendingMaterialization, sessionId);
+            const changed = await pass();
+            expect(thinkingBlocks(changed)).toBe("[]");
+            expect(await pass()).toEqual(changed);
+        } finally {
+            closeQuietly(db);
+            cleanup();
+        }
+    });
+    it(
+        `${host}: first-kept request digest survives held reasoning pressure, rebuild and replay`,
+        withFixture(
+            generation,
+            false,
+            "reasoning clearing (keep_reasoning_tokens)",
+            async (f) => {
+                await toolLoop(f, 4);
+                const before = wire(f.served);
+                const firstKept = before.findIndex((message) =>
+                    message.content.some((block) => block.type === "thinking"),
+                );
+                expect(firstKept).toBeGreaterThan(-1);
+                // Hash the serialized request message independently of prefix-record code.
+                const digest = (request: Wire) =>
+                    createHash("sha256").update(JSON.stringify(request[firstKept])).digest("hex");
+                const heldDigest = digest(before);
+                const removalState = getReasoningRemovalState(f.db, f.sessionId);
+                armAndBust(f, "reasoning clearing (keep_reasoning_tokens)", false);
+                for (let repeat = 0; repeat < 3; repeat++) {
+                    const held = await f.pass();
+                    expect(held.bustedThisPass).toBe(false);
+                    expect(wire(held.messages)).toEqual(before);
+                    expect(digest(wire(held.messages))).toBe(heldDigest);
+                    expect(getReasoningRemovalState(f.db, f.sessionId)).toEqual(removalState);
+                }
+                await nextUserTurn(f, "digest-release");
+                const rebuilt = wire(f.served);
+                expect(f.mock.check(rebuilt)).toBeNull();
+                expect(thinkingBlocks(rebuilt)).toBe("[]");
+                expect(digest(rebuilt)).not.toBe(heldDigest);
+                expect(wire((await f.pass()).messages)).toEqual(rebuilt);
+            },
+            "reasoning-digest",
+        ),
+    );
     for (const subagent of [false, true]) {
         const scope = subagent ? "subagent run" : "primary mid tool loop";
         describe(`signed prefix audit: ${host}, ${scope}`, () => {

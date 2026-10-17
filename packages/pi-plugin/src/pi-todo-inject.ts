@@ -41,6 +41,10 @@ import type {
 	EditCoord,
 } from "@magic-context/core/hooks/magic-context/edit-admission";
 import {
+	pairedThinkingEdit,
+	todoCompanionRequired,
+} from "@magic-context/core/hooks/magic-context/paired-thinking-edit";
+import {
 	buildSyntheticTodoPart,
 	type SyntheticTodoPart,
 } from "@magic-context/core/hooks/magic-context/todo-view";
@@ -255,6 +259,7 @@ export function injectSyntheticTodowriteForPi(args: {
 	messages: PiMessage[];
 	editAdmission?: EditAdmission;
 	stableId?: (message: PiMessage, index: number) => string | undefined;
+	persistCompanion?: (messages: PiMessage[]) => void;
 }): PiMessage[] {
 	if (args.isSubagent) return args.messages;
 
@@ -262,149 +267,187 @@ export function injectSyntheticTodowriteForPi(args: {
 		args.db,
 		args.sessionId,
 	);
-
-	const replay = (): PiMessage[] => {
-		if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
-			const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
-			if (part !== null && part.callID === persistedAnchor.callId) {
-				injectByAssistantId(args.messages, persistedAnchor.messageId, part);
+	const source = args.messages.map((message) => ({
+		id:
+			message.role === "assistant"
+				? getMessageId(message as PiAssistantMessage)
+				: undefined,
+		thinking:
+			message.role === "assistant" &&
+			Array.isArray(message.content) &&
+			message.content.some(
+				(part) =>
+					part &&
+					typeof part === "object" &&
+					["thinking", "redactedThinking", "redacted_thinking"].includes(
+						String((part as { type?: string }).type),
+					),
+			),
+	}));
+	const apply = (): PiMessage[] => {
+		const replay = (): PiMessage[] => {
+			if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
+				const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
+				if (part !== null && part.callID === persistedAnchor.callId) {
+					injectByAssistantId(args.messages, persistedAnchor.messageId, part);
+				}
 			}
-		}
-		return args.messages;
-	};
-	const entryId = (anchor: string): string | undefined => {
-		const index = args.messages.findIndex(
-			(message) =>
-				message.role === "assistant" &&
-				getMessageId(message as PiAssistantMessage) === anchor,
-		);
-		return index < 0 ? undefined : args.stableId?.(args.messages[index], index);
-	};
-	const admit = (newAnchor?: string | null): boolean => {
-		const coords: EditCoord[] = [];
-		if (persistedAnchor)
-			coords.push({
-				kind: "message",
-				id: entryId(persistedAnchor.messageId),
-				block: "whole",
-			});
-		let hasSyntheticCall = false;
-		for (let index = 0; index < args.messages.length; index++) {
-			const message = args.messages[index];
-			if (
-				message.role === "assistant" &&
-				Array.isArray(message.content) &&
-				message.content.some((part) => part.syntheticTodoMarker === true)
-			) {
-				hasSyntheticCall = true;
+			return args.messages;
+		};
+		const entryId = (anchor: string): string | undefined => {
+			const index = args.messages.findIndex(
+				(message) =>
+					message.role === "assistant" &&
+					getMessageId(message as PiAssistantMessage) === anchor,
+			);
+			return index < 0
+				? undefined
+				: args.stableId?.(args.messages[index], index);
+		};
+		const admit = (newAnchor?: string | null): boolean => {
+			const coords: EditCoord[] = [];
+			if (persistedAnchor)
 				coords.push({
 					kind: "message",
-					id: args.stableId?.(message, index),
+					id: entryId(persistedAnchor.messageId),
 					block: "whole",
 				});
+			let hasSyntheticCall = false;
+			for (let index = 0; index < args.messages.length; index++) {
+				const message = args.messages[index];
+				if (
+					message.role === "assistant" &&
+					Array.isArray(message.content) &&
+					message.content.some((part) => part.syntheticTodoMarker === true)
+				) {
+					hasSyntheticCall = true;
+					coords.push({
+						kind: "message",
+						id: args.stableId?.(message, index),
+						block: "whole",
+					});
+				}
 			}
-		}
-		if (
-			!persistedAnchor &&
-			!hasSyntheticCall &&
-			args.messages.some(
-				(message) =>
-					"syntheticTodoMarker" in message &&
-					message.syntheticTodoMarker === true,
-			)
-		) {
-			coords.push({ kind: "prefix" });
-		}
-		if (newAnchor) coords.push({ kind: "append", afterId: entryId(newAnchor) });
-		if (
-			coords.every(
-				(coord) => !args.editAdmission || args.editAdmission.admit(coord),
-			)
-		)
-			return true;
-		if (args.editAdmission?.frame.kind === "boundary") {
-			sessionLog(
-				args.sessionId,
-				`edit admission: held lane=synthetic todo coords=${JSON.stringify(coords)} boundary=${args.editAdmission.frame.messageId ?? "<unresolved>"} held_edits=1`,
-			);
-		}
-		return false;
-	};
-	const removePair = (): void => {
-		for (let index = args.messages.length - 1; index >= 0; index--) {
-			const message = args.messages[index];
 			if (
-				"syntheticTodoMarker" in message &&
-				message.syntheticTodoMarker === true
+				!persistedAnchor &&
+				!hasSyntheticCall &&
+				args.messages.some(
+					(message) =>
+						"syntheticTodoMarker" in message &&
+						message.syntheticTodoMarker === true,
+				)
+			) {
+				coords.push({ kind: "prefix" });
+			}
+			if (newAnchor)
+				coords.push({ kind: "append", afterId: entryId(newAnchor) });
+			if (
+				coords.every(
+					(coord) => !args.editAdmission || args.editAdmission.admit(coord),
+				)
 			)
-				args.messages.splice(index, 1);
-			else if (message.role === "assistant" && Array.isArray(message.content)) {
-				message.content = message.content.filter(
-					(part) => part.syntheticTodoMarker !== true,
+				return true;
+			if (args.editAdmission?.frame.kind === "boundary") {
+				sessionLog(
+					args.sessionId,
+					`edit admission: held lane=synthetic todo coords=${JSON.stringify(coords)} boundary=${args.editAdmission.frame.messageId ?? "<unresolved>"} held_edits=1`,
 				);
 			}
-		}
-	};
-	if (args.isCacheBusting) {
-		const part = buildSyntheticTodoPart(args.lastTodoState);
-		if (part === null) {
-			if (!admit()) return replay();
+			return false;
+		};
+		const removePair = (): void => {
+			for (let index = args.messages.length - 1; index >= 0; index--) {
+				const message = args.messages[index];
+				if (
+					"syntheticTodoMarker" in message &&
+					message.syntheticTodoMarker === true
+				)
+					args.messages.splice(index, 1);
+				else if (
+					message.role === "assistant" &&
+					Array.isArray(message.content)
+				) {
+					message.content = message.content.filter(
+						(part) => part.syntheticTodoMarker !== true,
+					);
+				}
+			}
+		};
+		if (args.isCacheBusting) {
+			const part = buildSyntheticTodoPart(args.lastTodoState);
+			if (part === null) {
+				if (!admit()) return replay();
+				removePair();
+				if (persistedAnchor) {
+					clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
+				}
+				return args.messages;
+			}
+			// Preview placement on copies before changing messages or the persisted todo anchor:
+			// a rejected move must replay the previously served todo pair byte-for-byte.
+			const preview = args.messages.map((message) => ({
+				...message,
+				...(Array.isArray(message.content)
+					? { content: [...message.content] }
+					: {}),
+			})) as PiMessage[];
+			if (
+				persistedAnchor &&
+				persistedAnchor.callId === part.callID &&
+				injectByAssistantId(preview, persistedAnchor.messageId, part)
+			) {
+				// Snapshot unchanged AND persisted anchor still present —
+				// idempotent re-inject; backfill stateJson if it was empty
+				// (legacy row from a build that persisted callID without state).
+				// Mirrors the same self-heal in the OpenCode todo-injection path.
+				if (persistedAnchor.stateJson.length === 0) {
+					if (!admit(persistedAnchor.messageId)) return replay();
+					setPersistedTodoSyntheticAnchor(
+						args.db,
+						args.sessionId,
+						persistedAnchor.callId,
+						persistedAnchor.messageId,
+						args.lastTodoState,
+					);
+				}
+				injectByAssistantId(args.messages, persistedAnchor.messageId, part);
+				return args.messages;
+			}
+			const candidateId = injectIntoLatestAssistant(preview, part);
+			if (!admit(candidateId)) return replay();
 			removePair();
-			if (persistedAnchor) {
+			const anchoredMessageId = injectIntoLatestAssistant(args.messages, part);
+			if (anchoredMessageId) {
+				setPersistedTodoSyntheticAnchor(
+					args.db,
+					args.sessionId,
+					part.callID,
+					anchoredMessageId,
+					args.lastTodoState,
+				);
+			} else if (persistedAnchor) {
 				clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
 			}
 			return args.messages;
 		}
-		// Preview placement on copies before changing messages or the persisted todo anchor:
-		// a rejected move must replay the previously served todo pair byte-for-byte.
-		const preview = args.messages.map((message) => ({
-			...message,
-			...(Array.isArray(message.content)
-				? { content: [...message.content] }
-				: {}),
-		})) as PiMessage[];
-		if (
-			persistedAnchor &&
-			persistedAnchor.callId === part.callID &&
-			injectByAssistantId(preview, persistedAnchor.messageId, part)
-		) {
-			// Snapshot unchanged AND persisted anchor still present —
-			// idempotent re-inject; backfill stateJson if it was empty
-			// (legacy row from a build that persisted callID without state).
-			// Mirrors the same self-heal in the OpenCode todo-injection path.
-			if (persistedAnchor.stateJson.length === 0) {
-				if (!admit(persistedAnchor.messageId)) return replay();
-				setPersistedTodoSyntheticAnchor(
-					args.db,
-					args.sessionId,
-					persistedAnchor.callId,
-					persistedAnchor.messageId,
-					args.lastTodoState,
-				);
-			}
-			injectByAssistantId(args.messages, persistedAnchor.messageId, part);
-			return args.messages;
-		}
-		const candidateId = injectIntoLatestAssistant(preview, part);
-		if (!admit(candidateId)) return replay();
-		removePair();
-		const anchoredMessageId = injectIntoLatestAssistant(args.messages, part);
-		if (anchoredMessageId) {
-			setPersistedTodoSyntheticAnchor(
-				args.db,
-				args.sessionId,
-				part.callID,
-				anchoredMessageId,
-				args.lastTodoState,
-			);
-		} else if (persistedAnchor) {
-			clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
-		}
-		return args.messages;
-	}
 
-	// Replay the persisted todo state rather than the live snapshot: a real todowrite
-	// between passes must not change the synthetic call/result bytes on a defer pass.
-	// If its saved assistant is missing, skip replay instead of moving the pair.
-	return replay();
+		// Replay the persisted todo state rather than the live snapshot: a real todowrite
+		// between passes must not change the synthetic call/result bytes on a defer pass.
+		// If its saved assistant is missing, skip replay instead of moving the pair.
+		return replay();
+	};
+	return args.persistCompanion
+		? pairedThinkingEdit({
+				db: args.db,
+				messages: args.messages,
+				edit: apply,
+				needsCompanion: () =>
+					todoCompanionRequired(
+						persistedAnchor,
+						getPersistedTodoSyntheticAnchor(args.db, args.sessionId),
+						source,
+					),
+				persistCompanion: args.persistCompanion,
+			})
+		: apply();
 }

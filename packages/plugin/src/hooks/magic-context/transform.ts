@@ -3400,6 +3400,9 @@ export function createTransform(deps: TransformDeps) {
             dateRequest,
             (postTransformResult.bustedThisPass && !activeThinkingPrefixHold) ||
                 postTransformResult.thinkingReleasedForFit === true,
+            isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID)
+                ? hasKeptSignedThinking(output.messages)
+                : undefined,
         );
         if (
             activeThinkingPrefixHold &&
@@ -3827,6 +3830,7 @@ import {
     beginSystemDateRequest,
     bindSystemDateRequest,
     finishSystemDateRefresh,
+    hasKeptSignedThinking,
     registerSystemDateRefresh,
     systemDateRequestForOutput,
     systemDateRequestIdentity,

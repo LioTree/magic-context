@@ -1,4 +1,5 @@
 import { activeAnthropicTurnStart } from "./active-anthropic-turn";
+import { thinkingAnchor } from "./edit-admission";
 
 export type SystemDateRequestIdentity = object | string;
 export interface SystemDateRequest {
@@ -12,6 +13,7 @@ interface RequestState extends SystemDateRequest {
     systemDone: boolean;
     messagesSeen: boolean;
     permitted: boolean | undefined;
+    keptSignedThinking?: boolean;
     ambiguous: boolean;
     waiting?: (permitted: boolean) => void;
 }
@@ -20,6 +22,83 @@ const channels = new WeakMap<Set<string>, Channel>();
 const outputUpdates = new WeakMap<string[], () => void>();
 const outputIdentities = new WeakMap<object, SystemDateRequestIdentity>();
 const outputRequests = new WeakMap<object, SystemDateRequest>();
+const thinkingDateDebts = new WeakMap<Set<string>, Set<string>>();
+
+/** Inspect the returned render, not raw history whose saved omissions still need replay. */
+export function hasKeptSignedThinking(messages: readonly unknown[]): boolean {
+    for (const raw of messages) {
+        if (!raw || typeof raw !== "object") continue;
+        const message = raw as {
+            role?: string;
+            info?: { role?: string };
+            parts?: unknown;
+            content?: unknown;
+            providerPayload?: { items?: unknown[] };
+        };
+        if ((message.info?.role ?? message.role) !== "assistant") continue;
+        const parts = message.parts ?? message.content;
+        if (
+            Array.isArray(parts) &&
+            parts.some((part) => {
+                if (!part || typeof part !== "object") return false;
+                const block = part as {
+                    type?: string;
+                    kind?: string;
+                    metadata?: object;
+                    data?: unknown;
+                };
+                if (
+                    ![
+                        "reasoning",
+                        "thinking",
+                        "redacted_thinking",
+                        "redactedThinking",
+                        "redacted_reasoning",
+                    ].includes(String(block.type ?? block.kind))
+                )
+                    return false;
+                return (
+                    thinkingAnchor(part) !== undefined ||
+                    (typeof block.data === "string" && block.data.length > 0) ||
+                    (!!block.metadata && Object.keys(block.metadata).length > 0)
+                );
+            })
+        )
+            return true;
+        if (
+            message.providerPayload?.items?.some(
+                (item) =>
+                    !!item &&
+                    typeof item === "object" &&
+                    (item as { type?: string }).type === "reasoning",
+            )
+        )
+            return true;
+    }
+    return false;
+}
+
+export function systemDateThinkingHeld(
+    history: Set<string>,
+    request: SystemDateRequest | undefined,
+): boolean | undefined {
+    return state(history, request)?.keptSignedThinking;
+}
+
+export function deferSystemDateForThinking(
+    history: Set<string>,
+    request: SystemDateRequest | undefined,
+): void {
+    const current = state(history, request);
+    if (current?.keptSignedThinking !== true) return;
+    let pending = thinkingDateDebts.get(history);
+    if (!pending) thinkingDateDebts.set(history, (pending = new Set()));
+    pending.add(current.sessionId);
+}
+
+export function acknowledgeSystemDateAdvance(history: Set<string>, sessionId: string): void {
+    thinkingDateDebts.get(history)?.delete(sessionId);
+}
 
 /** Use the last real-user message ID that anchors thinking recovery, including
  * its exclusions for synthetic messages and tool-result carriers. */
@@ -180,10 +259,17 @@ export function finishSystemDateRefresh(
     history: Set<string>,
     request: SystemDateRequest | undefined,
     permitted: boolean,
+    keptSignedThinking?: boolean,
 ): void {
     const current = state(history, request);
     if (!current) return;
-    current.permitted = current.ambiguous ? false : permitted;
+    current.keptSignedThinking = keptSignedThinking;
+    current.permitted =
+        current.ambiguous || keptSignedThinking === true
+            ? false
+            : permitted ||
+              (keptSignedThinking === false &&
+                  thinkingDateDebts.get(history)?.has(current.sessionId) === true);
     const apply = current.waiting;
     current.waiting = undefined;
     apply?.(current.permitted);
@@ -200,4 +286,5 @@ export function finishSystemDateHook(
 }
 export function clearSystemDateRefresh(history: Set<string>, sessionId: string): void {
     channels.get(history)?.delete(sessionId);
+    thinkingDateDebts.get(history)?.delete(sessionId);
 }

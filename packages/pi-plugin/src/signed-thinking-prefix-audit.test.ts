@@ -12,6 +12,7 @@
  * MC_AUDIT_STRICT=1 to make every exposed lane fail on its strict-binding 400.
  */
 import { describe, it } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	appendCompartments,
 	replaceAllCompartmentState,
@@ -52,6 +53,7 @@ import {
 	registerPiContextHandler,
 	signalPiHistoryRefresh,
 	signalPiPendingMaterialization,
+	signalPiSystemHashChange,
 } from "./context-handler";
 import {
 	createFakePi,
@@ -721,6 +723,141 @@ function withFixture(
 		}
 	};
 }
+
+it(
+	"Pi/OMP: bust permission without an admitted edit keeps completed thinking",
+	withFixture(
+		false,
+		"reasoning clearing (keep_reasoning_tokens)",
+		async (f) => {
+			await toolLoop(f, 4);
+			await nextUserTurn(f, "no-edit-turn");
+			const before = wire(f.served);
+			expect(thinkingBlocks(before)).not.toBe("[]");
+			signalPiPendingMaterialization(f.sessionId);
+			f.setPercent(20);
+			expect(wire((await f.pass()).messages)).toEqual(before);
+		},
+		"strip-no-edit",
+		false,
+	),
+);
+
+it(
+	"Pi/OMP: a host system-prompt change strips completed thinking with it",
+	withFixture(
+		false,
+		"reasoning clearing (keep_reasoning_tokens)",
+		async (f) => {
+			await toolLoop(f, 4);
+			await nextUserTurn(f, "system-edit-turn");
+			expect(thinkingBlocks(wire(f.served))).not.toBe("[]");
+			// The host serves the new system from this request on; every kept
+			// completed-turn block was signed over the old one.
+			signalPiSystemHashChange(f.sessionId, "changed-system-hash");
+			f.setPercent(20);
+			const changed = wire((await f.pass()).messages);
+			expect(thinkingBlocks(changed)).toBe("[]");
+			// The omission is persisted, so later passes keep serving it.
+			expect(thinkingBlocks(wire((await f.pass()).messages))).toBe("[]");
+		},
+		"strip-system-edit",
+		false,
+	),
+);
+
+it(
+	"Pi/OMP: first-kept request digest survives held reasoning pressure, rebuild and replay",
+	withFixture(
+		false,
+		"reasoning clearing (keep_reasoning_tokens)",
+		async (f) => {
+			await toolLoop(f, 4);
+			const before = wire(f.served);
+			const firstKept = before.findIndex((message) =>
+				message.content.some((block) => block.type === "thinking"),
+			);
+			expect(firstKept).toBeGreaterThan(-1);
+			// Hash the serialized request message independently of prefix-record code.
+			const digest = (request: Wire) =>
+				createHash("sha256")
+					.update(JSON.stringify(request[firstKept]))
+					.digest("hex");
+			const heldDigest = digest(before);
+			armAndBust(f, "reasoning clearing (keep_reasoning_tokens)", false);
+			for (let repeat = 0; repeat < 3; repeat++) {
+				const held = await f.pass();
+				expect(held.bustedThisPass).toBe(false);
+				expect(wire(held.messages)).toEqual(before);
+				expect(digest(wire(held.messages))).toBe(heldDigest);
+			}
+			await nextUserTurn(f, "digest-release");
+			const rebuilt = wire(f.served);
+			expect(f.mock.check(rebuilt)).toBeNull();
+			expect(thinkingBlocks(rebuilt)).toBe("[]");
+			expect(digest(rebuilt)).not.toBe(heldDigest);
+			expect(wire((await f.pass()).messages)).toEqual(rebuilt);
+		},
+		"reasoning-digest",
+	),
+);
+
+it(
+	"Pi/OMP: companion failure rolls back an admitted queued drop and preserves replay",
+	withFixture(
+		false,
+		"ctx_reduce drop (full removal)",
+		async (f) => {
+			await toolLoop(f, 4);
+			await nextUserTurn(f, "pair-failure-turn");
+			const before = wire(f.served);
+			expect(thinkingBlocks(before)).not.toBe("[]");
+			f.db.exec(
+				"CREATE TRIGGER reject_pair BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(ABORT, 'reject companion'); END",
+			);
+			armAndBust(f, "ctx_reduce drop (full removal)", false);
+			let failed = false;
+			try {
+				await f.pass();
+			} catch {
+				failed = true;
+			}
+			expect(failed).toBe(true);
+			expect(getPendingOps(f.db, f.sessionId).length).toBe(1);
+			expect(f.tagStatus("old-read-b")).toBe("active");
+			f.db.exec("DROP TRIGGER reject_pair");
+			f.setPercent(20);
+			expect(wire((await f.pass()).messages)).toEqual(before);
+		},
+		"companion-failed-drop",
+	),
+);
+
+it(
+	"Pi/OMP: synthetic todo with completed-turn thinking after anchor setup",
+	withFixture(
+		false,
+		"synthetic todo",
+		async (f) => {
+			await prepareLane(f, "synthetic todo");
+			await toolLoop(f, 2);
+			await nextUserTurn(f, "todo-completed-turn");
+			await toolLoop(f, 4);
+			const before = wire(f.served);
+			expect(thinkingBlocks(before)).not.toBe("[]");
+			armAndBust(f, "synthetic todo", false);
+			const held = (await f.pass()).messages;
+			expect(f.mock.check(wire(held))).toBeNull();
+			expect(wire(held)).toEqual(before);
+			expect(wire((await f.pass()).messages)).toEqual(before);
+			f.served = held;
+			await nextUserTurn(f, "todo-completed-release");
+			expect(f.mock.check(wire(f.served))).toBeNull();
+			expect(landed(f, "synthetic todo", wire(f.served))).toBe(true);
+		},
+		"todo-completed-thinking",
+	),
+);
 
 for (const subagent of [false, true]) {
 	const scope = subagent ? "subagent run" : "primary mid tool loop";

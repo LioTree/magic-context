@@ -9145,7 +9145,8 @@ describe("Pi proactive strip of invalidated thinking", () => {
 				return (result?.messages ?? messages) as unknown[];
 			};
 
-			// The first render busts the cache, so it already strips all thinking.
+			// Initial tag allocation adds handles before the older thinking blocks.
+			// That actual edit, not first-render permission alone, requires the strip.
 			const first = await pass(false);
 			expect(first.map(thinkingIn)).toEqual([0, 0, 0, 0, 0]);
 
@@ -9164,7 +9165,8 @@ describe("Pi proactive strip of invalidated thinking", () => {
 				new Set([
 					"binding_mismatch:entry-a1",
 					"binding_mismatch:entry-a2",
-					"binding_mismatch_order:end",
+					"binding_mismatch_entry_order:end:entry-a1",
+					"binding_mismatch_entry_order:end:entry-a2",
 				]),
 			);
 
@@ -9284,7 +9286,7 @@ describe("Pi proactive strip of invalidated thinking", () => {
 				(tag) => tag.messageId === "entry-u3:p0",
 			);
 			if (!dropped) throw new Error("missing tag for an older user message");
-			updateTagStatus(db, sessionId, dropped.tagNumber, "dropped");
+			queuePendingOp(db, sessionId, dropped.tagNumber, "drop");
 			signalPiPendingMaterialization(sessionId);
 			const dropPass = await pass(10, 96, true);
 			// Complete the active turn before introducing the external old-user

@@ -97,6 +97,7 @@ import {
 } from "./inject-compartments";
 import * as noteNudger from "./note-nudger";
 import { createPassOutcome } from "./pass-outcome";
+import { recordSystemPromptEdit, requestPendingMaterialization } from "./pending-materialization";
 import * as readSessionFormatting from "./read-session-formatting";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { stripStructuralNoise } from "./strip-structural-noise";
@@ -290,6 +291,20 @@ function makeDropTarget(message: MessageLike): TagTarget {
 }
 
 type PostTransformArgs = Parameters<typeof runPostTransformPhase>[0];
+
+// What the system-prompt hook leaves behind when the host's top-level system
+// prompt changes: the system-prompt edit record and, unless the change was
+// adopted without a flush, a "system_hash" materialization request.
+function hostSystemChanged(
+    sessionId: string,
+    sessions = new Set<string>(),
+    options: { materialize?: boolean } = {},
+): Set<string> {
+    if (options.materialize !== false)
+        requestPendingMaterialization(sessions, sessionId, "system_hash");
+    recordSystemPromptEdit(sessions, sessionId);
+    return sessions;
+}
 
 function basePostTransformArgs(
     db: Database,
@@ -736,7 +751,7 @@ describe("postprocess replay-or-refuse", () => {
                         );
                         break;
                     case "proactive-thinking-strip-persistence-failure":
-                        args.pendingMaterializationSessions.add(sessionId);
+                        hostSystemChanged(sessionId, args.pendingMaterializationSessions);
                         args.thinkingBindingRecoveryEnabledForModel = true;
                         // Isolate the proactive lane from merged-run detection.
                         messages.splice(2, 0, {
@@ -11056,26 +11071,100 @@ describe("proactive strip of thinking on busting passes", () => {
             },
         ] as unknown as MessageLike[];
 
-    const serve = (
+    // The host owns the top-level system string; each session keeps one
+    // pending set across passes, as the plugin's live session state does.
+    const hostSystems = new Map<string, string>();
+    const pendingBySession = new Map<string, Set<string>>();
+    const servedRequests = new Map<string, { system: string; messages: MessageLike[] }[]>();
+    const serve = async (
         sessionId: string,
         messages: MessageLike[],
         options: { busting: boolean; boundModel?: boolean; fullFeatureMode?: boolean },
-    ) =>
-        runPostTransformPhase(
+    ) => {
+        const pending = pendingBySession.get(sessionId) ?? new Set<string>();
+        pendingBySession.set(sessionId, pending);
+        if (options.busting) {
+            hostSystems.set(
+                sessionId,
+                `${hostSystems.get(sessionId) ?? "Original system prompt"}\nNext system revision`,
+            );
+            hostSystemChanged(sessionId, pending);
+        }
+        const result = await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, messages, {
                 resolvedProviderID: "anthropic",
                 thinkingBindingRecoveryEnabledForModel: options.boundModel ?? true,
                 fullFeatureMode: options.fullFeatureMode ?? true,
-                ...(options.busting
-                    ? { pendingMaterializationSessions: new Set([sessionId]) }
-                    : { schedulerDecision: "defer" as const }),
+                pendingMaterializationSessions: pending,
+                ...(options.busting ? {} : { schedulerDecision: "defer" as const }),
             }),
         );
+        const requests = servedRequests.get(sessionId) ?? [];
+        requests.push({
+            system: hostSystems.get(sessionId) ?? "Original system prompt",
+            messages: structuredClone(messages),
+        });
+        servedRequests.set(sessionId, requests);
+        return result;
+    };
 
     const openDb = () => {
         db = new Database(":memory:");
         initializeDatabase(db);
+        hostSystems.clear();
+        pendingBySession.clear();
+        servedRequests.clear();
     };
+
+    it("a host system change strips older thinking with it; a failed strip refuses and the next pass retries", async () => {
+        openDb();
+        const sessionId = "ses-paired-system-request";
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+        expect(servedRequests.get(sessionId)?.[0].system).toBe("Original system prompt");
+        const changed = await serve(sessionId, buildSession(sessionId), { busting: true });
+        expect(servedRequests.get(sessionId)?.[1].system).toBe(
+            "Original system prompt\nNext system revision",
+        );
+        expect(changed.proactiveThinkingStrip?.messageIds).toEqual(ALL_ASSISTANTS);
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+        expect(servedRequests.get(sessionId)?.[2]).toEqual(servedRequests.get(sessionId)?.[1]);
+        await serve(sessionId, appendTurn(buildSession(sessionId), sessionId, "four"), {
+            busting: false,
+        });
+        expect(
+            reasoningCount(
+                findMessage(servedRequests.get(sessionId)![3].messages, "assistant-four"),
+            ),
+        ).toBe(1);
+        db.exec(
+            "CREATE TRIGGER reject_system_companion BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(ABORT, 'reject companion'); END",
+        );
+        await expect(
+            serve(sessionId, appendTurn(buildSession(sessionId), sessionId, "four"), {
+                busting: true,
+            }),
+        ).rejects.toMatchObject({ site: "proactive-thinking-strip-persistence-failure" });
+        expect(servedRequests.get(sessionId)?.length).toBe(4);
+        db.exec("DROP TRIGGER reject_system_companion");
+        // The host already serves the new system, so the next pass owes the strip.
+        const retried = await serve(
+            sessionId,
+            appendTurn(buildSession(sessionId), sessionId, "four"),
+            {
+                busting: false,
+            },
+        );
+        expect(retried.proactiveThinkingStrip?.messageIds).toEqual(["assistant-four"]);
+        const served = servedRequests.get(sessionId)![4];
+        expect(served.system).toBe(
+            "Original system prompt\nNext system revision\nNext system revision",
+        );
+        expect(reasoningCount(findMessage(served.messages, "assistant-four"))).toBe(0);
+        await serve(sessionId, appendTurn(buildSession(sessionId), sessionId, "four"), {
+            busting: false,
+        });
+        expect(servedRequests.get(sessionId)?.[5]).toEqual(served);
+    });
 
     it("a budget-shrink HARD strips thinking on the resizing pass and not the next replay", async () => {
         openDb();
@@ -11185,7 +11274,7 @@ describe("proactive strip of thinking on busting passes", () => {
                             resolvedProviderID: providerID,
                             thinkingBindingRecoveryEnabledForModel: enabled,
                             ...(busting
-                                ? { pendingMaterializationSessions: new Set([sessionId]) }
+                                ? { pendingMaterializationSessions: hostSystemChanged(sessionId) }
                                 : { schedulerDecision: "defer" as const }),
                         }),
                     );
@@ -11304,7 +11393,7 @@ describe("proactive strip of thinking on busting passes", () => {
         );
     });
 
-    it("refuses and remembers nothing when the proactive frozen set cannot be written", async () => {
+    it("refuses and persists no strip decision when the frozen set cannot be written; the owed strip lands on the next pass", async () => {
         openDb();
         const sessionId = "ses-proactive-persist-failure";
         await serve(sessionId, buildSession(sessionId), { busting: false });
@@ -11320,13 +11409,18 @@ describe("proactive strip of thinking on busting passes", () => {
         expect(JSON.stringify(failed)).toBe(before);
         expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
 
-        // With the store writable again, a defer pass serves the same bytes: no
-        // strip decision survived the failed write anywhere.
+        // With the store writable again, the failed pass left no strip decision
+        // behind, but the host still serves the changed system prompt, so the
+        // next pass owes the strip and lands it.
         db.exec("DROP TRIGGER refuse_freeze");
-        const defer = buildSession(sessionId, "re-rendered first user message");
-        const deferResult = await serve(sessionId, defer, { busting: false });
-        expect(deferResult.proactiveThinkingStrip).toBeNull();
-        expect(JSON.stringify(defer)).toBe(before);
+        const retry = buildSession(sessionId, "re-rendered first user message");
+        const retryResult = await serve(sessionId, retry, { busting: false });
+        expect(retryResult.proactiveThinkingStrip).toEqual({ messageIds: ALL_ASSISTANTS });
+        const replay = buildSession(sessionId, "re-rendered first user message");
+        expect(
+            (await serve(sessionId, replay, { busting: false })).proactiveThinkingStrip,
+        ).toBeNull();
+        expect(JSON.stringify(replay)).toBe(JSON.stringify(retry));
     });
 
     it("leaves sessions on other models byte-identical on a busting pass", async () => {
@@ -11861,7 +11955,9 @@ describe("prefix-bound all-or-none reasoning", () => {
                 contextUsage: options.force
                     ? { percentage: 96, inputTokens: 96_000 }
                     : { percentage: 20, inputTokens: 1000 },
-                ...(options.flush ? { pendingMaterializationSessions: new Set([sessionId]) } : {}),
+                ...(options.flush
+                    ? { pendingMaterializationSessions: hostSystemChanged(sessionId) }
+                    : {}),
                 ...options.overrides,
             }),
         );
@@ -11927,7 +12023,7 @@ describe("prefix-bound all-or-none reasoning", () => {
         for (const m of pass.messages.slice(1)) expect(reasoningCount(m)).toBe(0);
     });
 
-    it('"Change the top-level `system` string or blocks" is invalid, and a requested materialization cannot say whether it changed it, so a trimming pass that materializes strips every signed block', async () => {
+    it("a durable top-level system edit strips every signed block without changing the shared message prefix", async () => {
         openDb();
         const sessionId = "ses-bound-trim-and-flush";
         await serve(sessionId, boundLoop(sessionId, 8));
@@ -12037,7 +12133,7 @@ describe("prefix-bound all-or-none reasoning", () => {
         }
     });
 
-    it("review: a served hint still strips signed thinking and its defer replay is byte-identical", async () => {
+    it("a served hint rides a durable system edit and its defer replay is byte-identical", async () => {
         openDb();
         const embedding = await import("../../features/magic-context/memory/embedding");
         const worker = await import("./auto-search-worker-client");
@@ -12071,6 +12167,9 @@ describe("prefix-bound all-or-none reasoning", () => {
                 force: true,
                 clearReasoningAge: 999,
                 overrides: {
+                    pendingMaterializationSessions: hostSystemChanged(sessionId, new Set(), {
+                        materialize: false,
+                    }),
                     projectPath: "git:review-healthy",
                     autoSearch: { enabled: true, scoreThreshold: 0, minPromptChars: 1 },
                 },

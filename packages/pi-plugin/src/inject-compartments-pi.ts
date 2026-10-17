@@ -1879,8 +1879,11 @@ export function materializeM0Pi(
 	steps.mark("pre_metadata");
 	state.beforeCacheCommitForTest?.();
 	// Validate the m[0] snapshot, render m[1], and persist the pair atomically.
+	let writer: ReturnType<typeof beginPrefixWrite>;
+	const nested = db.inTransaction;
 	try {
-		db.exec("BEGIN IMMEDIATE");
+		if (!nested) db.exec("BEGIN IMMEDIATE");
+		writer = beginPrefixWrite(db, nested);
 	} catch (error) {
 		if (isTransientSqliteLockError(error)) {
 			throw new PiMaterializeContentionError("begin immediate locked");
@@ -1919,7 +1922,7 @@ export function materializeM0Pi(
 			current.sessionFactsVersion !== snapshotMarkers.sessionFactsVersion ||
 			current.upgradeState !== snapshotMarkers.upgradeState;
 		if (stale) {
-			db.exec("ROLLBACK");
+			writer.rollback();
 			throw new PiMaterializeContentionError("snapshot changed before persist");
 		}
 		steps.mark("staleCheck");
@@ -2010,7 +2013,8 @@ export function materializeM0Pi(
 		// the next pass trims against the wrong point (under/over-trim). Atomic
 		// with the m[0] bytes + markers + m[1] bytes is the only correct placement.
 		steps.mark("sessionMeta");
-		db.exec("COMMIT");
+		if (nested) writer.commit();
+		else db.exec("COMMIT");
 		steps.mark("commit");
 		logSlowWriteTransaction(
 			"pi_materialize_cache",
@@ -2032,7 +2036,7 @@ export function materializeM0Pi(
 		};
 	} catch (error) {
 		try {
-			db.exec("ROLLBACK");
+			writer.rollback();
 		} catch {
 			// already rolled back
 		}
@@ -2729,7 +2733,9 @@ function softRefreshCachedM1Pi(args: {
 } {
 	const steps = new WriteTransactionSteps();
 	args.state.beforeCacheCommitForTest?.();
-	args.db.exec("BEGIN IMMEDIATE");
+	const nested = args.db.inTransaction;
+	if (!nested) args.db.exec("BEGIN IMMEDIATE");
+	const writer = beginPrefixWrite(args.db, nested);
 	const transactionStartedAt = performance.now();
 	steps.reset();
 	try {
@@ -2743,7 +2749,7 @@ function softRefreshCachedM1Pi(args: {
 				compartmentsForNormalization: args.compartmentsForNormalization,
 			})
 		) {
-			args.db.exec("ROLLBACK");
+			writer.rollback();
 			const sibling = readCachedPiM0M1Row(args.db, args.state.sessionId);
 			if (!sibling) {
 				throw new PiMaterializeContentionError(
@@ -2848,7 +2854,8 @@ function softRefreshCachedM1Pi(args: {
 			projection: soft.projection,
 		});
 		steps.mark("sessionMeta");
-		args.db.exec("COMMIT");
+		if (nested) writer.commit();
+		else args.db.exec("COMMIT");
 		steps.mark("commit");
 		logSlowWriteTransaction(
 			"pi_soft_refresh_cache",
@@ -2866,7 +2873,7 @@ function softRefreshCachedM1Pi(args: {
 		};
 	} catch (error) {
 		try {
-			args.db.exec("ROLLBACK");
+			writer.rollback();
 		} catch {
 			// already rolled back
 		}
@@ -3457,4 +3464,27 @@ export interface PiInjectionResult {
 	/** Exact canonical model-key operands when that comparison caused materialization. */
 	m0ModelKeyPrev?: string | null;
 	m0ModelKeyNew?: string | null;
+}
+
+let prefixWriteSequence = 0;
+
+/** A savepoint must not commit cached head messages separately from the caller's thinking removals. */
+function beginPrefixWrite(
+	db: ContextDatabase,
+	nested: boolean,
+): {
+	commit(): void;
+	rollback(): void;
+} {
+	const name = `pi_prefix_${++prefixWriteSequence}`;
+	if (nested) db.exec(`SAVEPOINT ${name}`);
+	return {
+		commit() {
+			db.exec(nested ? `RELEASE SAVEPOINT ${name}` : "COMMIT");
+		},
+		rollback() {
+			db.exec(nested ? `ROLLBACK TO SAVEPOINT ${name}` : "ROLLBACK");
+			if (nested) db.exec(`RELEASE SAVEPOINT ${name}`);
+		},
+	};
 }
