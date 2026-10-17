@@ -608,7 +608,7 @@ CREATE TABLE lkg_served_markers (
         served_capture_id INTEGER NOT NULL CHECK (served_capture_id > 0),
         full_coverage INTEGER NOT NULL CHECK (full_coverage IN (0, 1)),
         slot_state TEXT NOT NULL
-    );
+    , served_digest TEXT);
 
 CREATE TABLE lkg_slot_chunks (
         session_id TEXT NOT NULL,
@@ -1939,7 +1939,8 @@ INSERT INTO schema_migrations (version, description, applied_at) VALUES
 (98, 'score revision sidecar, selection history and project rescore jobs', :applied_at),
 (99, 'memory lifecycle evidence, attempts, receipts and applied snapshots', :applied_at),
 (100, 'durable served thinking prefix and held release request', :applied_at),
-(101, 'indexed trimmed-source tag retirement', :applied_at);
+(101, 'indexed trimmed-source tag retirement', :applied_at),
+(102, 'bind served capture markers to the digest of their certified bytes', :applied_at);
 
 INSERT INTO "message_fts_rowid_map_backfill_state" ("completed", "id", "updated_at", "watermark_rowid") VALUES
 (0, 1, 0, 0);

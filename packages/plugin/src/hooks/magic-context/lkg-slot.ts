@@ -29,6 +29,12 @@ export interface LkgSlot {
     servedCaptureId?: number;
     /** Coverage of this process's capture, retained for drained marker repair. */
     fullCoverage?: boolean;
+    /**
+     * Set while the pass that captured this slot has not yet returned it to the
+     * host. Such a capture was never served, so the drained marker repair must not
+     * certify it. The pass clears it when it returns these bytes.
+     */
+    servedCaptureWithheld?: boolean;
     /** RFC 8785 message digests for the portable hostCut frontier. */
     inputMoveDigests?: string[];
 }
@@ -757,6 +763,27 @@ export function getSlot(sessionId: string): LkgSlot | undefined {
     }
     touch(sessionId, entry);
     return copySlotForRead(entry.slot);
+}
+
+/**
+ * Mark the in-memory capture as served once its pass returns it: clear the
+ * withheld flag and attach the certificate id allocated at return. Only the same
+ * capture (same time and bytes) is changed; a newer capture is left alone.
+ */
+export function releaseWithheldServedCapture(
+    sessionId: string,
+    capture: Pick<LkgSlot, "capturedAt" | "jsonPrefix">,
+    servedCaptureId: number | undefined,
+): boolean {
+    const entry = lkgHeapHolder.entries.get(sessionId);
+    if (
+        !entry ||
+        entry.slot.capturedAt !== capture.capturedAt ||
+        entry.slot.jsonPrefix !== capture.jsonPrefix
+    )
+        return false;
+    entry.slot = { ...entry.slot, servedCaptureId, servedCaptureWithheld: undefined };
+    return true;
 }
 
 /** Evict only the process copy; durable replay authority is unchanged. */

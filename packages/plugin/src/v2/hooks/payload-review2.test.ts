@@ -10,6 +10,7 @@ import { createScheduler } from "../../features/magic-context/scheduler";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { createTagger } from "../../features/magic-context/tagger";
+import { lkgCertificateDigest } from "../../hooks/magic-context/lkg-persist";
 import { lkgContentDigest, resetLkgSlotsForTest } from "../../hooks/magic-context/lkg-slot";
 import { setRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
 import { createTransform, type TransformDeps } from "../../hooks/magic-context/transform";
@@ -84,21 +85,38 @@ function loadHistoricalFixture(): { source_revision: string; captures: Record<st
 function expectedVersionedLkgWrites(captures: Capture[]): string[][] {
     const chunks = new Map<number, string>();
     return captures.map((capture) =>
-        capture.writes.map((write) => {
+        capture.writes.flatMap((write) => {
             const record = JSON.parse(write) as { sql?: string; args?: unknown[] };
-            if (!record.sql) return write;
+            if (!record.sql) return [write];
             const sql = record.sql.trimStart();
             // The foreground lock budget increased from 250 ms to 2 seconds.
             // All other historical writes must still match in their original order.
             if (sql === "PRAGMA busy_timeout=250")
-                return JSON.stringify({ ...record, sql: "PRAGMA busy_timeout=2000" });
+                return [JSON.stringify({ ...record, sql: "PRAGMA busy_timeout=2000" })];
+            // Allocating a served-capture id now also clears the marker's byte digest,
+            // because the new id names bytes that are not saved yet.
+            if (sql.startsWith("INSERT INTO lkg_served_markers") && sql.includes("'captured')"))
+                return [
+                    JSON.stringify({
+                        ...record,
+                        sql: record.sql
+                            .replace(
+                                "(session_id, served_capture_id, full_coverage, slot_state) VALUES (?, ?, ?, 'captured')",
+                                "(session_id, served_capture_id, full_coverage, slot_state, served_digest) VALUES (?, ?, ?, 'captured', NULL)",
+                            )
+                            .replace(
+                                "full_coverage=excluded.full_coverage, slot_state=excluded.slot_state",
+                                "full_coverage=excluded.full_coverage, slot_state=excluded.slot_state,\n                served_digest=excluded.served_digest",
+                            ),
+                    }),
+                ];
             const args = record.args;
             if (sql.startsWith("INSERT INTO lkg_slot_chunks") && args)
                 chunks.set(Number(args[1]), String(args[3]));
             if (sql.startsWith("DELETE FROM lkg_slot_chunks") && args)
                 for (const index of chunks.keys())
                     if (index >= Number(args[1])) chunks.delete(index);
-            if (!sql.startsWith("INSERT INTO lkg_slots (") || !args) return write;
+            if (!sql.startsWith("INSERT INTO lkg_slots (") || !args) return [write];
 
             // This fixture's fake module echoes the pristine inputs. Use the frozen
             // historical bytes, not the revised request or its recorded digest values.
@@ -117,10 +135,32 @@ function expectedVersionedLkgWrites(captures: Capture[]): string[][] {
                 expect(digest).toMatch(/^2\.[A-Za-z0-9_-]{43}$/);
                 return digest;
             });
-            return JSON.stringify({
+            const slotWrite = JSON.stringify({
                 ...record,
                 args: args.map((value, index) => (index === 5 ? JSON.stringify(digests) : value)),
             });
+            if (args[13] === null || args[13] === undefined) return [slotWrite];
+            // A certified save binds the marker to the saved bytes in the same
+            // transaction, right after the slot row. Recompute that digest from the
+            // historical row's own stored identity, not from the revised capture.
+            const certificate = lkgCertificateDigest({
+                prefixHash: String(args[3]),
+                inputIdSeq: String(args[4]),
+                inputContentDigests: JSON.stringify(digests),
+                inputContentSignatures: (args[6] as string | null) ?? null,
+                inputMoveDigests: (args[14] as string | null) ?? null,
+                lastInputMessageId: String(args[7]),
+                modelKey: (args[8] as string | null) ?? null,
+                providerKey: (args[9] as string | null) ?? null,
+                rowVersion: (args[11] as number | null) ?? null,
+            });
+            return [
+                slotWrite,
+                JSON.stringify({
+                    sql: "UPDATE lkg_served_markers SET served_digest = ? WHERE session_id = ? AND served_capture_id = ?",
+                    args: [certificate, args[0], args[13]],
+                }),
+            ];
         }),
     );
 }

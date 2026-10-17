@@ -167,7 +167,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastUnconfirmedMigrationHolders = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 101;
+export const LATEST_SUPPORTED_VERSION = 102;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -2058,6 +2058,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "message_fts_rowid_map", "message_time_ms", "INTEGER");
     ensureColumn(db, "lkg_slots", "served_capture_id", "INTEGER");
     ensureColumn(db, "lkg_slots", "input_move_digests", "TEXT");
+    ensureColumn(db, "lkg_served_markers", "served_digest", "TEXT");
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_message_fts_rowid_map_session_time
         ON message_fts_rowid_map(session_id, message_time_ms);

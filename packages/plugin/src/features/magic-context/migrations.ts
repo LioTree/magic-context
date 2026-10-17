@@ -3276,6 +3276,16 @@ export const MIGRATIONS: Migration[] = [
             installTrimSourceIndexes(db);
         },
     },
+    {
+        version: 102,
+        description: "bind served capture markers to the digest of their certified bytes",
+        up(db: Database): void {
+            // Existing markers keep a NULL digest. A NULL digest never certifies a
+            // slot, so a session is uncertified until its next served save binds it.
+            if (!tableExists(db, "lkg_served_markers")) return;
+            ensureColumn(db, "lkg_served_markers", "served_digest", "TEXT");
+        },
+    },
 ];
 
 /**
