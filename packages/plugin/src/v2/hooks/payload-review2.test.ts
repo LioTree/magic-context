@@ -85,10 +85,20 @@ function loadHistoricalFixture(): { source_revision: string; captures: Record<st
 function expectedVersionedLkgWrites(captures: Capture[]): string[][] {
     const chunks = new Map<number, string>();
     return captures.map((capture) =>
-        capture.writes.flatMap((write) => {
+        capture.writes.flatMap((write, index) => {
             const record = JSON.parse(write) as { sql?: string; args?: unknown[] };
             if (!record.sql) return [write];
             const sql = record.sql.trimStart();
+            // A historical 250 ms timeout set right after a session_meta UPDATE was
+            // that autocommit statement's foreground lock budget. A prepared
+            // autocommit write now first tries the lock without waiting (0 ms) and
+            // succeeds here, because nothing else holds the lock in this fixture.
+            const previous = index > 0 ? (JSON.parse(capture.writes[index - 1]) as { sql?: string }) : {};
+            if (
+                sql === "PRAGMA busy_timeout=250" &&
+                previous.sql?.trimStart().startsWith("UPDATE session_meta")
+            )
+                return [JSON.stringify({ ...record, sql: "PRAGMA busy_timeout=0" })];
             // The foreground lock budget increased from 250 ms to 2 seconds.
             // All other historical writes must still match in their original order.
             if (sql === "PRAGMA busy_timeout=250")
