@@ -602,7 +602,7 @@ fn host_engine_step(
     }
 }
 
-fn fold_structure(compartments: &[mc_store::StoredCompartment], through: u64) -> [u8; 32] {
+pub(super) fn fold_structure(compartments: &[mc_store::StoredCompartment], through: u64) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     for compartment in compartments
@@ -661,6 +661,7 @@ pub(super) fn prime_resident_fold(
     let (Some(applied), Some(produced)) = (&setup.applied, &setup.produced) else {
         return Ok(());
     };
+    let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
     if applied.version != produced.version
         || applied.range.lineage_id != conversation.lineage_id
         || setup.invalidated
@@ -690,10 +691,10 @@ pub(super) fn prime_resident_fold(
     };
     let messages = non_tag_messages_since(store, key, &lineage, prefix.through.saturating_add(1))?;
     let mut template: TransformRequest = decode(
-        &json!({"v":2,"kind":"compaction.step","serializer_profile":"opencode-aisdk",
+        &json!({"v":2,"kind":"compaction.step","serializer_profile":codec.serializer_profile().wire_id(),
         "session_id":conversation.engine_namespace,"render_config":"","messages":[],"tool_present":true,"auto_search_enabled":false}),
     )?;
-    Codec::OpencodeAiSdk.prepare_request(&mut template, &messages)?;
+    codec.prepare_request(&mut template, &messages)?;
     let mids = template
         .messages
         .iter()
@@ -737,9 +738,8 @@ pub(super) fn prime_resident_fold(
             })
         })
         .collect::<Result<Vec<_>, HandlerOutcome>>()?;
-    let decoded = super::codec_opencode::decode_messages(&users)?;
+    let decoded = users.iter().map(|message| codec.decode_message(message)).collect::<Result<Vec<_>, _>>()?;
     prefix.users = decoded
-        .messages
         .iter()
         .filter(|message| {
             message.ck.role == "user"
@@ -797,7 +797,7 @@ fn execute_host(
 ) -> Result<Option<(HostView, bool)>, HandlerOutcome> {
     let codec = Codec::from_params(&Value::Object(setup.setup.request.params.clone()))?;
     let started = Instant::now();
-    let mut resident = if work.resident_folds && codec == Codec::OpencodeAiSdk {
+    let mut resident = if work.resident_folds {
         work.resident
             .begin(store.tag_cache_namespace(), &work.key)
             .map_err(transient)?
@@ -956,7 +956,7 @@ fn execute_host(
     } else {
         codec.prepare_request(&mut template, &messages)?;
     }
-    template.native_tail_section = work.resident_folds && codec == Codec::OpencodeAiSdk;
+    template.native_tail_section = work.resident_folds;
     if template.native_tail_section {
         template.native_compartment_source_revision = source_revision.cloned();
     }
@@ -1358,12 +1358,27 @@ fn execute_host(
     );
     let encoding_key = resident
         .as_ref()
-        .filter(|_| template.native_fold_prefix.is_some())
+        .filter(|_| template.native_fold_prefix.is_some() && codec == Codec::OpencodeAiSdk)
         .and_then(|lease| {
             lease.state.fold_working.as_ref().map(|working| {
                 super::codec_opencode::resident_render_key(&template, &render_context, &working.key)
             })
         });
+    // The engine omits messages already represented by summaries. Claude's
+    // renderer still needs the last omitted message's exact source to verify that
+    // the cut ends at its final content block and preserves signed native bytes.
+    if codec == Codec::ClaudeCodeAnthropic && template.native_fold_prefix.is_some() {
+        if let Some(ordinal) = output.engine.response.coverage_ordinal {
+            if !template.messages.iter().any(|message| message.ordinal == ordinal) {
+                let boundary = non_tag_messages_since(store, &work.key, lineage, ordinal)?
+                    .into_iter().find(|message| message.ordinal == ordinal)
+                    .ok_or_else(|| error("native_endpoint_unrepresentable", "covered native message is missing"))?;
+                template.messages.insert(0, codec.decode_message(&boundary)?);
+                template.native_messages.as_mut().expect("native codec").insert(0, boundary.message.clone());
+                messages.push(boundary);
+            }
+        }
+    }
     let (mut wire, mut coverage, raw_replacement, head_slots) = if let Some(previous) =
         previous.as_ref().filter(|p| {
             status
@@ -1418,7 +1433,7 @@ fn execute_host(
             if cached.is_none() {
                 if let Some(lease) = resident
                     .as_ref()
-                    .filter(|_| template.native_fold_prefix.is_some())
+                    .filter(|_| template.native_fold_prefix.is_some() && codec == Codec::OpencodeAiSdk)
                 {
                     if let Some(working) = &lease.state.fold_working {
                         template.native_fold_sidecar =
@@ -1520,7 +1535,7 @@ fn execute_host(
     if codec == Codec::ClaudeCodeAnthropic && view.wire.raw_view.is_some() {
         super::native_cut::attach(&work.key, &mut view, &template)?;
     }
-    let persisted = template.native_fold_prefix.is_some();
+    let persisted = template.native_fold_prefix.is_some() && codec == Codec::OpencodeAiSdk;
     if persisted {
         let base = resident.as_ref().and_then(|lease| {
             lease
@@ -1651,7 +1666,7 @@ fn status(
 fn execute(
     store: &McStore,
     work: &Work,
-    record: &mut Record,
+    record: &mut super::runner_resident::RunnerRecord<'_>,
     status: &transform::compaction::Status,
     initial: bool,
 ) -> Result<transform::compaction::Output, HandlerOutcome> {
@@ -1659,22 +1674,13 @@ fn execute(
         .setup
         .as_ref()
         .ok_or_else(|| error("setup_missing", "compaction.step requires a Setup record"))?;
-    let messages = record
-        .messages
-        .get(&status.lineage_id)
-        .map(|m| {
-            m.values()
-                .map(decode_message)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let template: TransformRequest = decode(
+    let mut template: TransformRequest = decode(
         &json!({"v":2,"kind":"compaction.step","serializer_profile":"owned-broca",
         "session_id":work.key.engine_key(),"render_config":serde_json::to_string(&setup.request.params).map_err(transient)?,
-        "model_key":setup.request.model,"messages":messages,"tool_present":false,"auto_search_enabled":false}),
+        "model_key":setup.request.model,"messages":[],"tool_present":false,"auto_search_enabled":false}),
     )?;
     let mut context = producer_context(work, &setup.request.model, status.context_window, false);
+    record.prepare_fold(store, &work.key, status, &mut template, initial)?;
     // The runner reports cache expiry through prefix_rebuilding. It supplies no
     // prior-response timestamp, so the scheduler's zero fallback would measure
     // idle time from the Unix epoch and execute every step with nonzero usage.
@@ -1706,9 +1712,11 @@ fn execute(
         transform::compaction::step(store, &template, &context, status, state)
     }
     .map_err(transient)?;
+    record.finish_fold(store, &work.key, status, &template)?;
     let pending = store
         .load_pending_agent_drops(&work.key.engine_key())
         .map_err(transient)?;
+    let record = &mut **record;
     if let Some(hook) = &record.hook {
         record.pending_drops.retain(|n| {
             hook.live
@@ -1947,9 +1955,7 @@ impl McHandler {
         params: &Value,
         request: compact::status::StepStatus,
     ) -> Result<Vec<u8>, HandlerOutcome> {
-        let source_revision = if work.resident_folds
-            && matches!(work.key.harness.as_str(), "opencode" | "opencode2")
-        {
+        let source_revision = if work.resident_folds {
             store
                 .compartment_source_revision(&conversation.engine_namespace)
                 .ok()
@@ -2299,7 +2305,7 @@ impl McHandler {
                     .ok_or_else(|| transient("version exhausted"))?;
                 // The final answer publishes and prunes all view references below.
                 // Pruning the same roots before resident execution does no new work.
-                if work.resident_folds && codec == Codec::OpencodeAiSdk {
+                if work.resident_folds {
                     save_host_setup_fields(store, &work.key, &mut conversation, &setup)?;
                 } else {
                     save_host_setup(store, &work.key, &mut conversation, &setup)?;
@@ -2443,7 +2449,7 @@ impl McHandler {
             };
             return self.host_setup(&store, binding, &key, request, chosen);
         }
-        let mut record = self.provider_store.load(&key)?;
+        let mut record = self.runner_record(&store, &key)?;
         if record.catalog.is_none() {
             record.catalog = self.provider_store.catalog(&SessionBinding {
                 session: key.session.clone(),
@@ -2493,7 +2499,7 @@ impl McHandler {
             });
             // Persist the Setup before engine work. Re-entry can finish a Setup
             // killed between recording its inputs and producing its initial view.
-            self.provider_store.save(&key, &record)?;
+            record.save(&self.provider_store, &key)?;
             fault("SetupRecorded");
         }
         if request.newest.is_some() {
@@ -2526,7 +2532,7 @@ impl McHandler {
             .expect("setup")
             .state
             .version_high_water = high;
-        self.provider_store.save(&key, &record)?;
+        record.save(&self.provider_store, &key)?;
         let initial = if let Some(mut initial) = record
             .setup
             .as_ref()
@@ -2548,16 +2554,18 @@ impl McHandler {
                 }
             }
         };
+        let initial = record.checked_view(&initial)?;
         let setup = record.setup.as_ref().expect("setup");
         let answer = compact::setup::SetupAnswer::Ready {
             request_id: request.request_id,
-            initial: checked_view(&initial, &record)?,
+            initial,
             stability: setup.stability.clone(),
             call_when: Some(setup.call_when.clone()),
         };
         record.last_answer = Some(serde_json::to_value(&answer).map_err(transient)?);
-        self.provider_store.save(&key, &record)?;
+        record.save(&self.provider_store, &key)?;
         fault("AnswerRecorded");
+        record.publish();
         bytes(&answer)
     }
 
@@ -2621,7 +2629,7 @@ impl McHandler {
                 return self.host_step(&store, &work, conversation, params, request);
             }
         }
-        let mut record = self.provider_store.load(&key)?;
+        let mut record = self.runner_record(&store, &key)?;
         if record.setup.is_none() {
             return Err(error(
                 "setup_missing",
@@ -2630,7 +2638,7 @@ impl McHandler {
         }
         let work = self.provider_work(&store, binding, key.clone())?;
         ingest(&mut record, &request.lineage_id, &request.messages)?;
-        self.provider_store.save(&key, &record)?;
+        record.save(&self.provider_store, &key)?;
         fault("MessagesIngested");
         let normalized = status(params, &record)?;
         let complete = request
@@ -2649,16 +2657,17 @@ impl McHandler {
                 bound_ms: bound,
             };
             record.last_answer = Some(serde_json::to_value(&answer).map_err(transient)?);
-            self.provider_store.save(&key, &record)?;
+            record.save(&self.provider_store, &key)?;
             let storage = Arc::clone(&self.provider_store);
             let runner = Arc::clone(&self.provider_runner);
             let serial = Arc::clone(&self.provider_serial);
+            let resident = self.provider_resident.clone();
             tokio::spawn(async move {
                 tokio::task::yield_now().await;
                 fault("WaitAnswered");
                 let _serial = serial.lock_for(&key).await;
                 let result = async {
-                    let mut record = storage.load(&key)?;
+                    let mut record = super::runner_resident::RunnerRecord::load(&storage, &resident, &store, &key)?;
                     if record.wait_request.as_deref() != Some(&request.request_id) {
                         return Ok(());
                     }
@@ -2678,16 +2687,17 @@ impl McHandler {
                         .max(normalized.last_applied_version.unwrap_or(0))
                         .checked_add(1)
                         .ok_or_else(|| transient("version exhausted"))?;
-                    storage.save(&key, &record)?;
+                    record.save(&storage, &key)?;
                     if let transform::compaction::Answer::Replacement(view) =
                         execute(&store, &work, &mut record, &normalized, false)?.answer
                     {
-                        checked_view(&view, &record)?;
+                        record.checked_view(&view)?;
                         record.wait_view = Some(view);
                     }
                     record.wait_request = None;
-                    storage.save(&key, &record)?;
+                    record.save(&storage, &key)?;
                     fault("WaitWorkDurable");
+                    record.publish();
                     runner
                         .call(
                             &key.project,
@@ -2705,6 +2715,7 @@ impl McHandler {
                     tracing::warn!("mc-module: provider wait work failed: {error:?}");
                 }
             });
+            record.publish();
             return bytes(&answer);
         }
         let state = &mut record.setup.as_mut().expect("setup").state;
@@ -2716,7 +2727,7 @@ impl McHandler {
             .max(normalized.last_not_applied.map_or(0, |n| n.version))
             .checked_add(1)
             .ok_or_else(|| transient("version exhausted"))?;
-        self.provider_store.save(&key, &record)?;
+        record.save(&self.provider_store, &key)?;
         let output = execute(&store, &work, &mut record, &normalized, false)?;
         let produced = output.answer;
         if matches!(produced, transform::compaction::Answer::Replacement(_)) {
@@ -2733,15 +2744,16 @@ impl McHandler {
                     channel2_directive: None,
                     bootstrap_complete: None,
                     request_id: request.request_id,
-                    compaction: checked_view(&view, &record)?,
+                    compaction: record.checked_view(&view)?,
                     coverage: None,
                 }
             }
         };
         record.wait_request = None;
         record.last_answer = Some(serde_json::to_value(&answer).map_err(transient)?);
-        self.provider_store.save(&key, &record)?;
+        record.save(&self.provider_store, &key)?;
         fault("AnswerRecorded");
+        record.publish();
         bytes(&answer)
     }
 }

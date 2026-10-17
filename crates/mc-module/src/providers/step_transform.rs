@@ -387,6 +387,13 @@ impl McHandler {
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
         let _route = self.native_publication_fence(&binding)?;
+        let mut resident = self.provider_resident.begin(store.tag_cache_namespace(), &key).map_err(transient)?;
+        if let Some(lease) = resident.as_mut().filter(|lease| lease.cold) {
+            lease.state = store.read_provider_resident_policy(&key.store_key(), |index, counters| {
+                super::policy_summary::ResidentPolicy::rebuild(index, counters, 0, &binding.config.protected_tools)
+            }).map_err(transient)?;
+            super::compaction::prime_resident_fold(&store, &key, &mut lease.state)?;
+        }
         let held = store
             .load_provider_conversation(&key.store_key())
             .map_err(transient)?
@@ -486,6 +493,9 @@ impl McHandler {
                 },
             )
             .map_err(provider_policy_error)?;
+        if let Some(lease) = resident {
+            lease.publish();
+        }
         bytes(&answer)
     }
 
@@ -1470,12 +1480,12 @@ impl McHandler {
         if call.lineage_id.is_none() && call.subject.hook() != Hook::PreUser {
             return Err(invalid("lineage_id is required after the first pre_user"));
         }
-        let _store = self
+        let store = self
             .store_for_request()
             .await
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
-        let mut record = self.provider_store.load(&key)?;
+        let mut record = self.runner_record(&store, &key)?;
         record.hook.get_or_insert_with(HookState::default);
         if record.catalog.is_none() {
             record.catalog = self.provider_store.catalog(&SessionBinding {
@@ -1496,7 +1506,7 @@ impl McHandler {
             .iter()
             .find(|s| s.hook == call.subject.hook() && s.phase == call.subject.phase());
         let Some(subscription) = subscription else {
-            self.provider_store.save(&key, &record)?;
+            record.save(&self.provider_store, &key)?;
             return Err(error(
                 "not_subscribed",
                 "hook is not declared for this plan item",
@@ -1625,8 +1635,9 @@ impl McHandler {
             observed: false,
             tool_call_id,
         });
-        self.provider_store.save(&key, &record)?;
+        record.save(&self.provider_store, &key)?;
         fault("HookStateRecorded");
+        record.publish();
         bytes(&answer)
     }
 
@@ -1649,7 +1660,8 @@ impl McHandler {
                 .map_err(|_| session_unresolved_error())?;
             let key = self.provider_store.tool_key(&binding)?;
             let _serial = self.provider_serial.lock_for(&key).await;
-            let mut record = self.provider_store.load(&key)?;
+            let store = self.store_for_request().await.map_err(StoreRefusal::into_outcome)?;
+            let mut record = self.runner_record(&store, &key)?;
             let needs_read = requested.iter().any(|n| {
                 record
                     .hook
@@ -1685,7 +1697,8 @@ impl McHandler {
                 .filter(|n| !record.pending_drops.contains(n))
                 .collect::<Vec<_>>();
             record.pending_drops.extend(queue.iter().copied());
-            self.provider_store.save(&key, &record)?;
+            record.save(&self.provider_store, &key)?;
+            record.publish();
             let detail = ctx_reduce_ack_details(&unknown);
             if queue.is_empty() {
                 if unknown.is_empty() && !already.is_empty() {

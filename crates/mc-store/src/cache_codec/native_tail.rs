@@ -100,7 +100,7 @@ pub(crate) fn encode_native_row(
     let Some(baseline) = &meta.tail_hygiene_baseline else {
         return Ok(None);
     };
-    let owners: Vec<String> = conn.prepare_cached("SELECT c.conv_key FROM mc_provider_conversations_v2 c WHERE c.engine_namespace=?1 AND c.harness IN ('opencode','opencode2') AND NOT EXISTS(SELECT 1 FROM mc_provider_conversations_v2 other WHERE other.engine_namespace=c.engine_namespace AND other.conv_key<>c.conv_key)")?
+    let owners: Vec<String> = conn.prepare_cached("SELECT c.conv_key FROM mc_provider_conversations_v2 c WHERE c.engine_namespace=?1 AND NOT EXISTS(SELECT 1 FROM mc_provider_conversations_v2 other WHERE other.engine_namespace=c.engine_namespace AND other.conv_key<>c.conv_key)")?
         .query_map([namespace], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
     if owners.len() != 1 {
         return Ok(None);
@@ -178,7 +178,7 @@ pub(super) fn hydrate(
     let Some(mut baseline) = decoded.meta.tail_hygiene_baseline.take() else {
         return Err(CodecError::Serde("native tail baseline is missing".into()));
     };
-    let owners: Vec<String> = conn.prepare_cached("SELECT c.conv_key FROM mc_provider_conversations_v2 c WHERE c.engine_namespace=?1 AND c.harness IN ('opencode','opencode2') AND NOT EXISTS(SELECT 1 FROM mc_provider_conversations_v2 other WHERE other.engine_namespace=c.engine_namespace AND other.conv_key<>c.conv_key)")?
+    let owners: Vec<String> = conn.prepare_cached("SELECT c.conv_key FROM mc_provider_conversations_v2 c WHERE c.engine_namespace=?1 AND NOT EXISTS(SELECT 1 FROM mc_provider_conversations_v2 other WHERE other.engine_namespace=c.engine_namespace AND other.conv_key<>c.conv_key)")?
         .query_map([namespace], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
     if owners.len() != 1 {
         return Err(CodecError::Serde(

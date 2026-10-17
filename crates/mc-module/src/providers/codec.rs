@@ -394,11 +394,21 @@ pub(super) fn validate_replacement(
     record: &Record,
     lineage: &str,
 ) -> Result<(), HandlerOutcome> {
+    validate_replacement_with(view, record, lineage, |message| {
+        record.messages.get(lineage).is_some_and(|entries| entries.values().any(|entry| entry.message == *message))
+    })
+}
+
+pub(super) fn validate_replacement_with(
+    view: &compact::answer::CompactionMessage,
+    record: &Record,
+    lineage: &str,
+    is_carried: impl Fn(&Value) -> bool,
+) -> Result<(), HandlerOutcome> {
     let originals = record.messages.get(lineage);
     for message in &view.replacement {
         let parsed = native(message)?;
-        let carried = originals
-            .is_some_and(|entries| entries.values().any(|entry| entry.message == *message));
+        let carried = is_carried(message);
         if parsed.role == "system" {
             return Err(error("history_unreadable", "replacement_system_message"));
         }

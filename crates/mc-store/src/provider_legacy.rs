@@ -53,6 +53,27 @@ pub(crate) fn save_tx(
     namespace: &str,
     tags: &[McTagRow],
 ) -> rusqlite::Result<()> {
+    save_inner(conn, key, raw, namespace, tags, false)
+}
+
+pub(crate) fn save_delta_tx(
+    conn: &Connection,
+    key: &ProviderSessionKey,
+    raw: &str,
+    namespace: &str,
+    tags: &[McTagRow],
+) -> rusqlite::Result<()> {
+    save_inner(conn, key, raw, namespace, tags, true)
+}
+
+fn save_inner(
+    conn: &Connection,
+    key: &ProviderSessionKey,
+    raw: &str,
+    namespace: &str,
+    tags: &[McTagRow],
+    references: bool,
+) -> rusqlite::Result<()> {
     let original = parse(raw)?;
     let mut small = original.clone();
     let mut shape = json!({});
@@ -169,6 +190,11 @@ pub(crate) fn save_tx(
         ("/wait_view", "produced"),
     ] {
         if let Some(view) = original.pointer(path) {
+            if references && view.get("replacement").is_none() && !view.is_null() {
+                let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2)", params![conv, view["version"].as_u64()], |row| row.get(0))?;
+                if !exists { return Err(rusqlite::Error::InvalidQuery); }
+                continue;
+            }
             view_tx(conn, &conv, view, state)?;
         }
     }

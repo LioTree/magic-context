@@ -239,7 +239,7 @@ pub(crate) fn save_engine_policy_tx(
         // Every policy part is rewritten below. Dropping the summary first means
         // the change triggers log nothing, and the next hook rebuilds it.
         drop_policy_summary_tx(conn, &conv)?;
-        let native_v2=matches!(harness.as_str(),"opencode"|"opencode2") && conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",params![conv,lineage],|r|r.get::<_,bool>(0))?;
+        let native_v2=(matches!(harness.as_str(),"opencode"|"opencode2") || policy.native_tail_section) && conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",params![conv,lineage],|r|r.get::<_,bool>(0))?;
         let old_frozen = if native_v2 {
             conn.query_row("SELECT frozen_through_ordinal FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 ORDER BY cut_id DESC LIMIT 1",[&conv],|r|r.get::<_,Option<u64>>(0)).optional()?.flatten()
         } else {

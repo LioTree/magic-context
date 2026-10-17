@@ -116,7 +116,9 @@ impl ResidentState {
                 message: native,
                 raw_message: None,
             };
-            let ck = Codec::OpencodeAiSdk
+            let codec = Codec::from_params(&serde_json::from_str::<Value>(&authority.conversation.params_json).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("resident codec: {e:?}"))?;
+            let ck = codec
                 .decode_message(&entry)
                 .map_err(|e| format!("resident native decode: {e:?}"))?;
             let mid = state.push(message.mid.as_bytes(), cap)?;

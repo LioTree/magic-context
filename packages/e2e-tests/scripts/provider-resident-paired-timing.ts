@@ -102,4 +102,77 @@ export async function pairedResidentTiming(baseRoot: string) {
     console.log(`PAIRED_TIMING_RESULT=${JSON.stringify({ bun: result.bun, cpus: result.cpus, lanes })}`);
     return result;
 }
-if (import.meta.main) await pairedResidentTiming(Bun.argv[2]!);
+/** Compare the same runner protocol with the startup switch off and on. */
+export async function brocaResidentTiming(samples = 50) {
+    assert.ok(samples >= 50, "fold p99 needs at least 50 samples");
+    const root = join(tmpdir(), "magic-context", "resident-all-lanes");
+    mkdirSync(root, { recursive: true });
+    const work = mkdtempSync(join(root, "broca-paired-"));
+    const driver = new tip.Driver(tip.buildDriver(join(work, "build")), work);
+    const rows: Array<{ lane: string; kind: string; sample: number; module_ms: number; cpu_ms: number }> = [];
+    const rigs = ["off", "on"] as const;
+    const applied: Record<string, any> = {};
+    const namespaces: Record<string, string> = {};
+    const through = 17_000;
+    const messages = Array.from({ length: through }, (_, i) => ({ ordinal: i + 1, mid: `synthetic-${i}`,
+        message: { role: i % 5 === 0 ? "user" : "assistant", content: [{ type: "text", text: `Fixture ${i}: café 🦀 exact source` }] } }));
+    const status = { session: "session", harness: "broca", lineage_id: "L", step_id: "bench", step_kind: "user_turn", model: "fixture",
+        context_window: 4_000_000, estimate: { request_tokens: 1000 }, newest: { ordinal: through, mid: messages.at(-1)!.mid } };
+    const call = async (rig: string, method: string, params: any, timing = false) => {
+        const result = await driver.send({ op: "call", rig, timing, body: { method, params } });
+        assert.ok(!result.error, JSON.stringify(result.error));
+        return result;
+    };
+    const event = (rig: string, event: string, extra: Record<string, unknown> = {}) =>
+        driver.send({ op: "event", rig, event, namespace: namespaces[rig], ...extra });
+    try {
+        for (const rig of rigs) {
+            const directory = join(work, rig); mkdirSync(directory);
+            await driver.send({ op: "create", rig, harness: "runner", directory, project_root: join(work, "project"), resident_enabled: rig === "on" });
+            await call(rig, "compaction.setup", { session: "session", harness: "broca", request_id: "setup", preset: "head",
+                params: { serializer_profile: "owned-broca" }, composition: {}, model: "fixture", context_window: 4_000_000, lineage_id: "L", now: 1 });
+            namespaces[rig] = (await driver.send({ op: "sql", rig, sql: "SELECT engine_namespace FROM mc_provider_conversations_v2" }))[0][0];
+            await call(rig, "compaction.step", { ...status, request_id: "bootstrap", messages, now: 2 });
+            await event(rig, "realistic_seed", { covered: 16_500, compartments: 2_300, memories: 0 });
+            await event(rig, "flush");
+            const response = await call(rig, "compaction.step", { ...status, request_id: "seed", messages: [], now: 3 });
+            assert.equal(response.ok.answer, "compaction_message");
+            applied[rig] = { compaction_id: response.ok.compaction.compaction_id, version: response.ok.compaction.version };
+        }
+        for (let sample = -2; sample < samples; sample++) {
+            const order = sample % 2 ? [...rigs].reverse() : rigs;
+            const answers: string[] = [];
+            for (const rig of order) {
+                const hook = await call(rig, "transform.hook", { session: "session", harness: "broca", lineage_id: "L", step_id: `hook-${sample}`,
+                    hook: "post_assistant", blocks: [`§999§ measured hook ${sample}: café 🦀`] }, true);
+                await event(rig, "realistic_visible_delta", { sample: sample + 2 });
+                await event(rig, "flush");
+                const fold = await call(rig, "compaction.step", { ...status, request_id: `fold-${sample}`, messages: [],
+                    now: 2000 + (sample + 2) * 1000, last_applied: applied[rig] }, true);
+                assert.equal(fold.ok.answer, "compaction_message");
+                applied[rig] = { compaction_id: fold.ok.compaction.compaction_id, version: fold.ok.compaction.version };
+                answers.push(fold.raw);
+                if (sample >= 0) {
+                    rows.push({ lane: rig, kind: "hook", sample, module_ms: hook.module_ms, cpu_ms: hook.cpu_ms });
+                    rows.push({ lane: rig, kind: "fold", sample, module_ms: fold.module_ms, cpu_ms: fold.cpu_ms });
+                }
+            }
+            assert.equal(answers[0], answers[1], "paired runner folds must be byte-identical");
+        }
+        const lanes = rigs.flatMap(lane => ["hook", "fold"].map(kind => {
+            const selected = rows.filter(row => row.lane === lane && row.kind === kind);
+            return { lane, kind, samples: selected.length, p50_ms: percentile(selected.map(row => row.module_ms), .5),
+                p99_ms: percentile(selected.map(row => row.module_ms), .99) };
+        }));
+        const result = { bun: Bun.version, cpus: systemSample().nproc, work, history: through, lanes, rows };
+        if (process.env.MC_PAIR_RESULT_OUT) writeFileSync(process.env.MC_PAIR_RESULT_OUT, JSON.stringify(result, null, 2) + "\n");
+        console.log(`BROCA_PAIRED_TIMING_RESULT=${JSON.stringify({ bun: result.bun, cpus: result.cpus, history: through, lanes })}`);
+        assert.ok(lanes.find(row => row.lane === "on" && row.kind === "fold")!.p99_ms < 250, "resident fold p99 must stay below 250 ms");
+        return result;
+    } finally { await driver.close(); }
+}
+
+if (import.meta.main) {
+    if (Bun.argv[2] === "--broca") await brocaResidentTiming(Number(Bun.argv[3] ?? 50));
+    else await pairedResidentTiming(Bun.argv[2]!);
+}

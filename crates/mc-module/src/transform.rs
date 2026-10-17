@@ -2621,9 +2621,14 @@ pub mod compaction {
         }
         let mut range = working_range(status, &template.messages)?;
         if template.native_fold_prefix.is_some() {
+            // status.last_applied_version acknowledges the last produced view.
+            // Use that view's original range before updating last_applied below;
+            // the older applied view may still be Setup's empty insertion.
             range.from = state
-                .last_applied
+                .last_produced
                 .as_ref()
+                .filter(|view| Some(view.version) == status.last_applied_version)
+                .or(state.last_applied.as_ref())
                 .ok_or(TransformError::OrdinalViolation)?
                 .range
                 .from;
