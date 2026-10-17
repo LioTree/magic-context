@@ -93,7 +93,8 @@ function expectedVersionedLkgWrites(captures: Capture[]): string[][] {
             // that autocommit statement's foreground lock budget. A prepared
             // autocommit write now first tries the lock without waiting (0 ms) and
             // succeeds here, because nothing else holds the lock in this fixture.
-            const previous = index > 0 ? (JSON.parse(capture.writes[index - 1]) as { sql?: string }) : {};
+            const previous =
+                index > 0 ? (JSON.parse(capture.writes[index - 1]) as { sql?: string }) : {};
             if (
                 sql === "PRAGMA busy_timeout=250" &&
                 previous.sql?.trimStart().startsWith("UPDATE session_meta")
