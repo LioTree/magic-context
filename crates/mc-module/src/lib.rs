@@ -184,6 +184,8 @@ pub mod test_support;
 
 #[cfg(test)]
 mod differential_goldens;
+#[cfg(test)]
+mod historian_claim_conformance;
 use transform::{
     transform_with_projection_cached, HistorianDiagnostics, ProjectionCacheInput,
     SerializedOutputCache, TransformRequest,
@@ -8488,16 +8490,11 @@ impl McHandler {
     /// The project a claim-lane request may act on, and the version check the rest
     /// of the management surface applies.
     ///
-    /// The four claim ops cannot take a `session_id` the way the neighbouring
-    /// management ops do: a claimant polls precisely because it does not know which
-    /// session produced a run. What it can be held to is the channel's own binding.
-    /// One module store serves every project on the machine, the queue row records
-    /// which project queued the run, and `historian.claim` hands back the folded
-    /// conversation transcript — so without this scope a second project's host
-    /// process can list and claim the first project's runs and read its transcripts.
-    ///
-    /// The project is resolved exactly as the transform that queued the run resolved it,
-    /// so both agree on one key.
+    /// Both lanes derive their project from the channel, never the request body.
+    /// The legacy in-process plugin discovers runs project-wide; an attested
+    /// harness route is additionally confined to its bound session. Claims expose
+    /// transcript bytes, so module callers must pass the bridge's host attestation
+    /// check before looking up any run.
     fn historian_lane_binding(
         &self,
         channel: u16,
@@ -8510,11 +8507,45 @@ impl McHandler {
                 message: format!("{operation} requires v=1"),
             });
         }
-        self.facade_binding(channel)
+        let binding = self
+            .facade_binding(channel)
             .map_err(|_| HandlerOutcome::Error {
                 code: "route_unbound".to_string(),
                 message: format!("{operation} on a channel with no session binding"),
-            })
+            })?;
+        // Principal-less bindings are the legacy in-process plugin lane. Module
+        // routes must carry the same daemon attestations as the bridge host lane.
+        if binding.principal.is_some() {
+            if !matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi") {
+                return Err(HandlerOutcome::Error {
+                    code: "host_lane_requires_harness_module".into(),
+                    message: "Historian host lane requires an OpenCode or Pi harness".into(),
+                });
+            }
+            providers::admit_host_lane(&binding)?;
+        }
+        Ok(binding)
+    }
+
+    fn historian_lane_run(
+        &self,
+        binding: &SessionBinding,
+        store: &McStore,
+        run_id: &str,
+    ) -> Result<(), HandlerOutcome> {
+        if binding.principal.is_none() {
+            return Ok(());
+        }
+        // A harness route owns one session. A run id or session id in the body
+        // cannot grant access to a sibling session, even within the same project.
+        match store.load_parked_historian_run(&binding.session) {
+            Ok(Some(run)) if run.run_id == run_id => Ok(()),
+            Ok(_) => Err(respond(json!({"ok": false, "refusal": "unknown_run"}))),
+            Err(error) => Err(HandlerOutcome::Error {
+                code: "store_load_failed".into(),
+                message: error.to_string(),
+            }),
+        }
     }
 
     /// The project key a bound channel's runs are queued under: the same project identity
@@ -8530,9 +8561,9 @@ impl McHandler {
 
     /// `historian.pending {session_id?}` — runs waiting for a claimant.
     ///
-    /// Omitting `session_id` lists every run of the caller's own project, because a
-    /// claimant discovers runs by polling, not by already knowing which session
-    /// produced them. Runs queued by any other project are not the caller's to see.
+    /// The plugin may omit `session_id` to discover every run in its own project.
+    /// The harness lane always uses the route's session, ignoring a body filter.
+    /// Runs queued by another project are never the caller's to see.
     fn handle_historian_pending_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let binding = match self.historian_lane_binding(channel, request, "historian.pending") {
             Ok(binding) => binding,
@@ -8550,7 +8581,13 @@ impl McHandler {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        match store.list_pending_historian_runs(&project_path, session_id.as_deref(), now_ms()) {
+        let session_id = if binding.principal.is_some() {
+            Some(binding.session.as_str())
+        } else {
+            session_id.as_deref()
+        };
+        match store.list_pending_historian_runs(&project_path, session_id, historian_claim_now_ms())
+        {
             Ok(runs) => respond(json!({
                 "ok": true,
                 "runs": runs
@@ -8599,7 +8636,11 @@ impl McHandler {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        match store.claim_historian_run(&project_path, &run_id, &claimant, now_ms()) {
+        if let Err(outcome) = self.historian_lane_run(&binding, store, &run_id) {
+            return outcome;
+        }
+        match store.claim_historian_run(&project_path, &run_id, &claimant, historian_claim_now_ms())
+        {
             Ok(mc_store::HistorianClaimOutcome::Claimed(claim)) => {
                 let lifecycle = if historian_stage::lifecycle_enabled() {
                     let state = match store.load_meta(&claim.session_id) {
@@ -8691,7 +8732,15 @@ impl McHandler {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        match store.heartbeat_historian_run(&project_path, &run_id, &token, now_ms()) {
+        if let Err(outcome) = self.historian_lane_run(&binding, store, &run_id) {
+            return outcome;
+        }
+        match store.heartbeat_historian_run(
+            &project_path,
+            &run_id,
+            &token,
+            historian_claim_now_ms(),
+        ) {
             Ok(mc_store::HistorianHeartbeatOutcome::Extended { claim_deadline_ms }) => {
                 respond(json!({
                     "ok": true,
@@ -8751,6 +8800,9 @@ impl McHandler {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
+        if let Err(outcome) = self.historian_lane_run(&binding, store, &run_id) {
+            return outcome;
+        }
         let authorization = match store.authorize_historian_report(&project_path, &run_id, &token) {
             Ok(mc_store::HistorianReportOutcome::Authorized(authorization)) => authorization,
             Ok(mc_store::HistorianReportOutcome::Refused(refusal)) => {
@@ -8826,7 +8878,7 @@ impl McHandler {
                     &run_id,
                     &token,
                     &durable,
-                    now_ms(),
+                    historian_claim_now_ms(),
                 ) {
                     Ok(mc_store::HistorianRecordOutcome::Recorded) => {
                         deferred_telemetry.record_invocations(
@@ -15471,6 +15523,14 @@ fn unrecognized_request_error(request: &Value) -> HandlerOutcome {
 /// be a historian document the validator would accept anyway, and refusing at
 /// the wire keeps an oversized body from reaching the parser at all.
 const MAX_HISTORIAN_REPORT_BYTES: usize = MAX_FACADE_FRAME_BYTES;
+
+fn historian_claim_now_ms() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = historian_claim_conformance::fixture_now_ms() {
+        return now;
+    }
+    now_ms()
+}
 
 /// Read a required non-empty string field from a historian claim-lane request.
 fn required_run_string(
