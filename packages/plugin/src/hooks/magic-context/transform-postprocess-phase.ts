@@ -212,6 +212,7 @@ import {
 import { admitTemporalCandidates } from "./temporal-admission";
 import { injectTemporalMarkers } from "./temporal-awareness";
 import { buildSyntheticTodoPart, isSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
+import { openCodeToolBatchCoordinates, protectToolBatchMutations } from "./tool-arc-admission";
 import {
     advanceToolReclaimWatermarkToCurrentMax,
     buildSyntheticToolReclaimOps,
@@ -2208,12 +2209,18 @@ export async function runPostTransformPhase(
         }
         heldWholeMessages.clear();
     };
-    let newTargets = protectNewTagMutations(
-        args.messages,
-        args.targets,
-        retainedThinking,
-        args.thinkingBindingRecoveryEnabledForModel === true,
-    );
+    const protectTargets = () =>
+        protectToolBatchMutations(
+            protectNewTagMutations(
+                args.messages,
+                args.targets,
+                retainedThinking,
+                args.thinkingBindingRecoveryEnabledForModel === true,
+            ),
+            editAdmission,
+            openCodeToolBatchCoordinates(args.messages),
+        );
+    let newTargets = protectTargets();
     let maxReasoningTag = 0;
     for (const tag of args.messageTagNumbers.values())
         maxReasoningTag = Math.max(maxReasoningTag, tag);
@@ -2462,12 +2469,7 @@ export async function runPostTransformPhase(
     if (args.normalizeRecoveryTail && (foldBustsServedPrefixThisPass || firstRenderBust)) {
         args.normalizeRecoveryTail();
         args.tags = getTagsBySession(args.db, args.sessionId);
-        newTargets = protectNewTagMutations(
-            args.messages,
-            args.targets,
-            retainedThinking,
-            args.thinkingBindingRecoveryEnabledForModel === true,
-        );
+        newTargets = protectTargets();
     }
     // Fold decision, cached-prefix capture and the m[1] soft refresh run above;
     // time precomputation and commit together so setup has no untimed stretch.

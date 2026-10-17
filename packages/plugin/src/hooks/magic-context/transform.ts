@@ -2391,6 +2391,10 @@ export function createTransform(deps: TransformDeps) {
                       recovery.prefix?.untaggedInputIds.has(message.info.id ?? ""),
                   );
                   const tagged = tagMessages(sessionId, tail, deps.tagger, db, {
+                      protectedThinkingMessages:
+                          deps.signedThinkingHold === "on" && activeThinkingPrefixHold
+                              ? protectedThinkingMessages
+                              : undefined,
                       skipPrefixInjection: !ctxReduceCallable,
                       servedMessages: messages,
                       normalizeRestoredAssistantText: deps.normalizeRestoredAssistantText,
@@ -2455,6 +2459,13 @@ export function createTransform(deps: TransformDeps) {
                     deps.tagger,
                     db,
                     {
+                        // Shortening tool output must not remove thinking from this user turn.
+                        // Tagging can associate a preceding assistant's thinking with the next
+                        // call, so protect every assistant in the turn, not just the call owner.
+                        protectedThinkingMessages:
+                            deps.signedThinkingHold === "on" && activeThinkingPrefixHold
+                                ? protectedThinkingMessages
+                                : undefined,
                         skipPrefixInjection,
                         scopedToolSweep,
                         servedMessages: messages,
