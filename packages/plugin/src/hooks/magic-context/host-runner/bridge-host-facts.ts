@@ -9,6 +9,7 @@ import {
     getOrCreateSessionMeta,
     updateSessionMeta,
 } from "../../../features/magic-context/storage-meta";
+import { sessionLog } from "../../../shared/logger";
 import { createEventHandler } from "../event-handler";
 import { createSystemPromptHashHandler } from "../system-prompt-hash";
 import { normalizeTodoStateJson } from "../todo-view";
@@ -40,6 +41,7 @@ export function createBridgeHostFacts(
     const windows = new Map<string, { model: string; limit: number }>();
     const latest = new Map<string, number>();
     const modelTimes = new Map<string, number>();
+    const zeroUsageLogSeen = new Set<string>();
     const events = createEventHandler({
         db: deps.db,
         tagger: deps.tagger,
@@ -98,6 +100,17 @@ export function createBridgeHostFacts(
             )
                 throw new Error("Invalid bridge provider meters/window/time");
         }
+        if (
+            fact.kind === "provider_response" &&
+            fact.usage &&
+            fact.usage.input + fact.usage.cacheRead + fact.usage.cacheWrite === 0
+        ) {
+            if (!zeroUsageLogSeen.has(id)) {
+                zeroUsageLogSeen.add(id);
+                sessionLog(id, "[debug] ignoring provider response with no input or cache tokens");
+            }
+            return { accepted: true };
+        }
         if (switched) {
             deps.contextUsageMap.delete(id);
             windows.delete(id);
@@ -143,40 +156,12 @@ export function createBridgeHostFacts(
                     },
                 },
             });
-            // Preserve an explicit zero-input sample. The ordinary event hook
-            // ignores zero-input updates because OpenCode emits them before a request runs.
-            if (
-                fact.usage &&
-                fact.usage.input + fact.usage.cacheRead + fact.usage.cacheWrite === 0
-            ) {
-                deps.contextUsageMap.set(id, {
-                    usage: {
-                        percentage: 0,
-                        inputTokens: 0,
-                        providerUsage: {
-                            model,
-                            input: 0,
-                            cache_read: 0,
-                            cache_write: 0,
-                            output: fact.usage.output,
-                            completed_at: fact.completedAt,
-                            finish_reason: fact.finishReason,
-                        },
-                    },
-                    updatedAt: fact.observedAt,
-                    hasUsageTokens: false,
-                });
-            }
             const reading = deps.contextUsageMap.get(id);
             if (reading && fact.usage) reading.updatedAt = fact.observedAt;
             const detected = getOverflowState(deps.db, id, model).detectedContextLimit;
             updateSessionMeta(deps.db, id, {
                 lastUsageContextLimit:
                     detected > 0 ? Math.min(fact.contextWindow, detected) : fact.contextWindow,
-                ...(fact.usage &&
-                fact.usage.input + fact.usage.cacheRead + fact.usage.cacheWrite === 0
-                    ? { lastContextPercentage: 0, lastInputTokens: 0 }
-                    : {}),
             });
         } else if (fact.kind === "system_prompt") {
             const output = { system: [...fact.system] };

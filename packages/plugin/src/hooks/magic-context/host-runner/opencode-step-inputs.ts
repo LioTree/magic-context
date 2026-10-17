@@ -17,7 +17,16 @@ export function openCodeStepInputs(input: {
     // An outgoing model switch can precede its first usage event. Do not price
     // that model using another model's sample; legacy aggregate entries lack identity.
     const matchesModel = !entry?.usage.providerUsage || entry.usage.providerUsage.model === model;
-    const usage = fresh && matchesModel ? entry.usage : undefined;
+    const candidate = fresh && matchesModel ? entry.usage : undefined;
+    const hasUsage = candidate
+        ? candidate.providerUsage
+            ? candidate.providerUsage.input +
+                  candidate.providerUsage.cache_read +
+                  candidate.providerUsage.cache_write >
+              0
+            : candidate.inputTokens > 0
+        : false;
+    const usage = hasUsage ? candidate : undefined;
     const meters = usage?.providerUsage;
     return {
         model,

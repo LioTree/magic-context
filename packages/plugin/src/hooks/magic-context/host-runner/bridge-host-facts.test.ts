@@ -147,6 +147,23 @@ test("bridge usage reaches scheduler bands and frame parity", async () => {
                                 contextWindow: 200_000,
                             }),
                         ).toEqual({ accepted: true });
+                        if (percentage === 70) {
+                            expect(
+                                await bridge.recordHostFact({
+                                    kind: "provider_response",
+                                    sessionId: id,
+                                    lineageId: initial.receipt.lineage_id,
+                                    requestId: initial.receipt.request_id,
+                                    model,
+                                    observedAt: now + 1,
+                                    completedAt: now + 1,
+                                    finishReason: "stop",
+                                    outcome: "success",
+                                    usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 7 },
+                                    contextWindow: 200_000,
+                                }),
+                            ).toEqual({ accepted: true });
+                        }
                         expect(bridge.receipt(id)?.delivery).toBe("pending");
                         const run = bridge.run({
                             sessionId: id,
@@ -446,24 +463,119 @@ test("host facts preserve failure, scope, sticky dates and native todo state", a
         expect(
             await bridge.recordHostFact({
                 ...noMeters,
+                observedAt: now + 4,
+                completedAt: now + 4,
                 usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 7 },
             }),
         ).toEqual({ accepted: true });
-        expect(getOrCreateSessionMeta(f.db, id).lastInputTokens).toBe(0);
+        expect(getOrCreateSessionMeta(f.db, id).lastInputTokens).toBe(100_000);
         await bridge.run({ sessionId: id, messages: rows.slice(), kind: "model" });
-        const zero = calls.filter((c) => c.method === "compaction.step").at(-1).params;
-        expect(zero.previous_usage).toMatchObject({
-            input: 0,
-            cache_read: 0,
-            cache_write: 0,
-            output: 7,
-        });
-        expect(zero.estimate.request_tokens).toBe(0);
+        const retained = calls.filter((c) => c.method === "compaction.step").at(-1).params;
+        expect(retained.previous_usage).toMatchObject({ input: 100_000 });
+        expect(retained.estimate.request_tokens).toBe(100_000);
         const freshId = bridge.receipt(id)!.request_id;
         await expect(
             bridge.recordHostFact({ ...noMeters, requestId: freshId, contextWindow: 0 }),
         ).rejects.toThrow("Invalid bridge provider");
         expect(bridge.receipt(id)?.delivery).toBe("pending");
+    } finally {
+        await bridge.dispose();
+        unregister();
+        f.db.close();
+        cleanupTestTempDir(f.dir);
+    }
+});
+
+test("zero-total bridge usage does not seed pressure, while cache-only usage is real", async () => {
+    const f = fixture();
+    const calls: any[] = [];
+    let version = 1;
+    const wire: BridgeTransport = {
+        request: async (method, body) => {
+            const request = JSON.parse(new TextDecoder().decode(body));
+            const p = request.params ?? request;
+            calls.push(request);
+            let answer: unknown = {};
+            if (method === "transform.declare") answer = { subscriptions: [] };
+            if (method === "compaction.setup")
+                answer = {
+                    answer: "ready",
+                    request_id: p.request_id,
+                    initial: {
+                        compaction_id: "initial",
+                        version: 1,
+                        range: { from: 0, to: 0 },
+                        replacement: [],
+                    },
+                    call_when: { share: 0 },
+                };
+            if (method === "compaction.step")
+                answer = {
+                    answer: "compaction_message",
+                    request_id: p.request_id,
+                    compaction: {
+                        compaction_id: `view-${version}`,
+                        version: ++version,
+                        range: { from: 1, to: p.newest.ordinal + 1 },
+                        replacement: p.messages.map((m: any) => m.message),
+                    },
+                };
+            return new TextEncoder().encode(JSON.stringify(answer));
+        },
+    };
+    const unregister = setRawMessageProvider(id, {
+        readMessages: () => [],
+        getStoredMessageCount: () => 1,
+        getMessageCount: () => 1,
+        hasMessageById: () => true,
+        readMessageOrdinalPage: (after) =>
+            after
+                ? []
+                : [{ id: "user-1", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true }],
+    });
+    const bridge = await createBridgeAdapter({ ...f.options, transport: wire });
+    try {
+        const initial = await bridge.run({ sessionId: id, messages: rows.slice(), kind: "model" });
+        const now = Date.now();
+        const zeroFact: BridgeHostFact = {
+            kind: "provider_response",
+            sessionId: id,
+            lineageId: initial.receipt.lineage_id,
+            requestId: initial.receipt.request_id,
+            model,
+            observedAt: now,
+            completedAt: now,
+            finishReason: "stop",
+            outcome: "success",
+            usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 7 },
+            contextWindow: 200_000,
+        };
+        expect(await bridge.recordHostFact(zeroFact)).toEqual({ accepted: true });
+        await bridge.run({ sessionId: id, messages: rows.slice(), kind: "model" });
+        let frame = calls.filter((c) => c.method === "compaction.step").at(-1).params;
+        expect(frame.previous_usage).toBeUndefined();
+        expect(frame.estimate.request_tokens).toBe(0);
+
+        const current = bridge.receipt(id)!;
+        expect(
+            await bridge.recordHostFact({
+                ...zeroFact,
+                lineageId: current.lineage_id,
+                requestId: current.request_id,
+                observedAt: now + 1,
+                completedAt: now + 1,
+                usage: { input: 0, cacheRead: 5_000, cacheWrite: 2_000, output: 11 },
+            }),
+        ).toEqual({ accepted: true });
+        await bridge.run({ sessionId: id, messages: rows.slice(), kind: "model" });
+        frame = calls.filter((c) => c.method === "compaction.step").at(-1).params;
+        expect(frame.previous_usage).toMatchObject({
+            input: 0,
+            cache_read: 5_000,
+            cache_write: 2_000,
+            output: 11,
+        });
+        expect(frame.estimate.request_tokens).toBe(7_000);
     } finally {
         await bridge.dispose();
         unregister();

@@ -37,6 +37,15 @@ function acceptedBase(input: Input): StepInputs {
     )("session", [{ info: { id: input.stepId } }], input.meta);
 }
 
+function hasZeroTotalUsage(input: Input): boolean {
+    const usage = input.entry?.usage;
+    if (!usage) return false;
+    const meters = usage.providerUsage;
+    return meters
+        ? meters.input + meters.cache_read + meters.cache_write === 0
+        : usage.inputTokens === 0;
+}
+
 function freshInput(): Input {
     return {
         model: MODEL,
@@ -78,6 +87,21 @@ test("ordinary provider inputs retain fresh meters and terminal metadata", () =>
         },
         estimate: { request_tokens: 140_000 },
     });
+});
+
+test("ordinary provider inputs omit zero-total samples", () => {
+    const input = freshInput();
+    input.entry!.usage.inputTokens = 0;
+    input.entry!.usage.providerUsage = {
+        ...input.entry!.usage.providerUsage!,
+        input: 0,
+        cache_read: 0,
+        cache_write: 0,
+    };
+
+    const frame = openCodeStepInputs(input);
+    expect(frame.previous_usage).toBeUndefined();
+    expect(frame.estimate.request_tokens).toBe(0);
 });
 
 test("ordinary provider inputs expire usage only after the shared one-hour observation TTL", () => {
@@ -216,12 +240,19 @@ test("ordinary OpenCode inputs and Rust scheduler match the accepted base over 2
     const scheduler = createScheduler({ executeThresholdPercentage: 65 });
     let metadataDifferences = 0;
     let filtered = 0;
+    let zeroTotalFiltered = 0;
     for (const { input, exception, cacheTtl, midToolUse } of states) {
         const base = acceptedBase(input);
         const current = openCodeStepInputs(input);
         const projected = structuredClone(current);
         if (exception) {
             filtered++;
+            expect(current.previous_usage).toBeUndefined();
+            expect(current.estimate.request_tokens).toBe(0);
+            projected.previous_usage = base.previous_usage;
+            projected.estimate = base.estimate;
+        } else if (hasZeroTotalUsage(input)) {
+            zeroTotalFiltered++;
             expect(current.previous_usage).toBeUndefined();
             expect(current.estimate.request_tokens).toBe(0);
             projected.previous_usage = base.previous_usage;
@@ -239,8 +270,8 @@ test("ordinary OpenCode inputs and Rust scheduler match the accepted base over 2
                 metadataDifferences++;
             projected.previous_usage = base.previous_usage;
         }
-        // Fresh samples may change only previous_usage input/cache/output and
-        // completion metadata. Expired or other-model samples may be omitted.
+        // Fresh positive samples may change only previous_usage input/cache/output and
+        // completion metadata. Expired, other-model, and zero-total samples may be omitted.
         // Every other serialized byte, including key order, must match the base.
         expect(JSON.stringify(projected)).toBe(JSON.stringify(base));
         const decision = (frame: StepInputs) =>
@@ -264,6 +295,7 @@ test("ordinary OpenCode inputs and Rust scheduler match the accepted base over 2
     }
     expect(states).toHaveLength(3072);
     expect(filtered).toBe(512);
+    expect(zeroTotalFiltered).toBeGreaterThan(0);
     expect(metadataDifferences).toBeGreaterThan(2000);
     const oracle = startOracle();
     try {
@@ -283,7 +315,7 @@ test("ordinary OpenCode inputs and Rust scheduler match the accepted base over 2
         }
         expect(changedDecisions).toBeGreaterThan(0);
         console.info(
-            `ordinary-input differential: 256 sequences, 3072 steps, ${metadataDifferences} raw-meter byte differences, ${filtered} justified filter cases, ${changedDecisions} filter decision differences`,
+            `ordinary-input differential: 256 sequences, 3072 steps, ${metadataDifferences} raw-meter byte differences, ${filtered} age/model filters plus ${zeroTotalFiltered} zero-total filters, ${changedDecisions} age/model filter decision differences`,
         );
     } finally {
         await oracle.close();
