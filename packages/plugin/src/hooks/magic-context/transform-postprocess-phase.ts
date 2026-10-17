@@ -609,10 +609,9 @@ export interface ProactiveThinkingStrip {
  * The ids are persisted into the binding-mismatch set before the pass serves
  * any stripped byte, the same contract as the reactive recovery, so every
  * later pass (defer passes and last-known-good replays included) removes the
- * same blocks and a removed block never comes back. When the write fails,
- * nothing is stripped on this pass and nothing is remembered; the reactive
- * recovery remains the fallback. Reasoning produced after this pass is kept
- * until the next busting pass.
+ * same blocks and a removed block never comes back. If an id is missing or the
+ * write fails, callers must withhold the accompanying edit rather than serve
+ * changed bytes with the old signatures.
  *
  * Callers must invoke this only on a pass that already busts the cache: it
  * never originates a byte change on a defer pass.
@@ -625,6 +624,22 @@ export function freezeReasoningOnBustingPass(args: {
     alreadyFrozen: ReadonlySet<string>;
 }): { strip: ProactiveThinkingStrip | null; persistenceFailed: boolean } {
     const protectedMessages = args.protectedMessages ?? new Set<MessageLike>();
+    if (
+        args.messages.some(
+            (message) =>
+                !protectedMessages.has(message) &&
+                message.info.role === "assistant" &&
+                !message.info.id &&
+                message.parts.some(
+                    (part) =>
+                        isRecord(part) &&
+                        (part.type === "reasoning" ||
+                            part.type === "thinking" ||
+                            part.type === "redacted_thinking"),
+                ),
+        )
+    )
+        return { strip: null, persistenceFailed: true };
     const messageIds = findReasoningBearingAssistantIds(
         args.messages.filter((message) => !protectedMessages.has(message)),
     ).filter((id) => !args.alreadyFrozen.has(id));

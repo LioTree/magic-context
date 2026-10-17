@@ -303,8 +303,9 @@ export interface PiProactiveThinkingStrip {
  * omissions after transcript commit, so raw history cannot restore a removed
  * block or change the rendered drop shape. `persistOnly` records this decision
  * before the pipeline edits the transcript; otherwise `messages` is its final
- * output. Entries without stable IDs and failed writes leave thinking intact.
- * Provider-error recovery can handle a rejected request separately.
+ * output. Entries without stable IDs and failed writes leave all thinking
+ * intact. Callers serving a companion edit require persistence and withhold
+ * that edit if planning or writing the omissions fails.
  *
  * `cacheBustingPass` requires the shared prefix-edit permission; neither idle
  * expiry nor a scheduler label alone authorizes edits before kept thinking.
@@ -341,7 +342,7 @@ export function applyPiProactiveThinkingStrip(args: {
 				throw new Error(
 					"Cannot persist thinking omission without a stable entry id",
 				);
-			continue;
+			return null;
 		}
 		entryIds.push(entryId);
 		indices.push(index);

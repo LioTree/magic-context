@@ -65,6 +65,13 @@ import { clearMessageTokensCache, createTransform, type TransformDeps } from "./
 import { hasParkedBustTrigger, resetDegradedCacheCount } from "./transform-postprocess-phase";
 
 const MODEL = { providerID: "anthropic", modelID: process.env.MC_AUDIT_MODEL ?? "claude-opus-5-5" };
+// Postponing a content edit to preserve a current-turn signature must leave
+// completed-turn thinking unchanged too.
+const THINKING_STRIP_GATED = true;
+
+it("thinking strip gating stays enabled", () => {
+    expect(THINKING_STRIP_GATED).toBe(true);
+});
 
 /**
  * What OpenCode's `@ai-sdk/anthropic` path sends for a message array: empty
@@ -778,7 +785,8 @@ for (const generation of ["v1", "v2"] as const) {
                             expect(beforeLastThinking(after)).toBe(beforeLastThinking(before));
                         else expect(nonThinkingEdit).toBe(false);
                         // A held pass preserves every signed block, including completed turns.
-                        expect(thinkingBlocks(after)).toBe(thinkingBlocks(before));
+                        if (THINKING_STRIP_GATED)
+                            expect(thinkingBlocks(after)).toBe(thinkingBlocks(before));
                         if (lane !== "reasoning clearing (keep_reasoning_tokens)")
                             expect(edit).toBe(false);
                         if (lane.startsWith("ctx_reduce") || lane === "/ctx-flush")

@@ -6328,7 +6328,7 @@ fn apply_once(
         let planned_reasoning_cutoff = reasoning_clear_cutoff_with_tags(
             req,
             serializer_profile,
-            non_tool_bust_opportunity,
+            non_tool_bust_opportunity && admission.admit(crate::edit_admission::EditCoord::Prefix),
             &tag_numbers,
             &loaded.core,
             reasoning_scope,
@@ -6832,7 +6832,7 @@ fn apply_once(
     let reasoning_clear_cutoff = reasoning_clear_cutoff_with_tags(
         req,
         serializer_profile,
-        is_bust_pass,
+        is_bust_pass && admission.admit(crate::edit_admission::EditCoord::Prefix),
         &tag_numbers,
         &loaded.core,
         reasoning_scope,
@@ -8312,6 +8312,7 @@ fn apply_once(
         req,
         &built_output.messages,
         is_provider_prefix_mutation_pass,
+        &admission,
     );
     if !new_merged_reasoning_units.is_empty() {
         core.frozen_units.extend(new_merged_reasoning_units);
@@ -16396,7 +16397,11 @@ fn new_frozen_strip_units(
                     tag > 0 && tag <= cutoff
                 })
                 && blocks.iter().any(is_reasoning_block);
-            if cc_aged || opencode_removal_mids.contains(message.mid.as_str()) {
+            // Removing even the oldest thinking blocks changes bytes before a kept
+            // signed block. Reducing later tool results cannot authorize that change.
+            if (cc_aged || opencode_removal_mids.contains(message.mid.as_str()))
+                && admission.admit(crate::edit_admission::EditCoord::Prefix)
+            {
                 let unit = strip_unit("reasoning_age", &message.mid, "");
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
@@ -17841,8 +17846,9 @@ fn new_merged_reasoning_strip_units(
     req: &TransformRequest,
     rendered_messages: &[ServedMessage],
     can_mutate_provider_prefix: bool,
+    admission: &crate::edit_admission::EditAdmission,
 ) -> Vec<FrozenUnit> {
-    if !can_mutate_provider_prefix {
+    if !can_mutate_provider_prefix || !admission.admit(crate::edit_admission::EditCoord::Prefix) {
         return Vec::new();
     }
     let Some(profile) = SerializerProfile::parse(&req.serializer_profile) else {
@@ -22952,6 +22958,8 @@ pub(crate) mod tests {
 
     #[test]
     fn latest_thinking_turn_is_not_a_merged_reasoning_strip_candidate() {
+        use crate::edit_admission::{EditAdmission, Message, Part};
+        let open = EditAdmission::new(&[], false);
         let mut messages = vec![item("user", 1, "task")];
         for (mid, ordinal) in [("a1", 2), ("a2", 3), ("a3", 4)] {
             let mut assistant = trailing_regression_assistant(mid, ordinal, None, false);
@@ -22972,17 +22980,47 @@ pub(crate) mod tests {
             .iter()
             .map(|m| ServedMessage::from_message(m.ck.clone()))
             .collect::<Vec<_>>();
-        assert!(
-            new_merged_reasoning_strip_units(&CoreState::default(), &request, &rendered, true)
-                .is_empty()
-        );
+        assert!(new_merged_reasoning_strip_units(
+            &CoreState::default(),
+            &request,
+            &rendered,
+            true,
+            &open
+        )
+        .is_empty());
         request
             .messages
             .push(item("next-user", 5, "next real turn"));
-        let completed =
-            new_merged_reasoning_strip_units(&CoreState::default(), &request, &rendered, true);
+        let completed = new_merged_reasoning_strip_units(
+            &CoreState::default(),
+            &request,
+            &rendered,
+            true,
+            &open,
+        );
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].key, "strip:merged_reasoning:a2");
+        // The same older-turn removal is forbidden while a newer signed block is
+        // kept: its signature depends on those earlier bytes, regardless of tail reductions.
+        let held = EditAdmission::new(
+            &[Message {
+                id: Some("current".into()),
+                real_user: false,
+                parts: vec![Part {
+                    retained: true,
+                    anchor: Some("current-signature".into()),
+                }],
+            }],
+            true,
+        );
+        assert!(new_merged_reasoning_strip_units(
+            &CoreState::default(),
+            &request,
+            &rendered,
+            true,
+            &held,
+        )
+        .is_empty());
     }
 
     fn protection_cutoff(cutoff: Option<i64>) -> TagNumberCutoffProjection {

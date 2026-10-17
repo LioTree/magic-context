@@ -967,6 +967,17 @@ fn mid_loop(profile: &str, subagent: bool, lane: Lane) {
         !non_thinking_edit,
         "{profile} subagent={subagent} {lane:?}: held lane changed bytes"
     );
+    audit_assert_eq!(
+        before
+            .iter()
+            .filter(|b| b[1]["type"] == "reasoning")
+            .collect::<Vec<_>>(),
+        after
+            .iter()
+            .filter(|b| b[1]["type"] == "reasoning")
+            .collect::<Vec<_>>(),
+        "{profile} subagent={subagent} {lane:?}: held lane changed thinking"
+    );
     audit_assert!(
         !landed,
         "{profile} subagent={subagent} {lane:?}: held lane landed"

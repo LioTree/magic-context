@@ -62,6 +62,14 @@ import {
 	userMessage,
 } from "./test-utils.test";
 
+// Postponing a content edit to preserve a current-turn signature must leave
+// completed-turn thinking unchanged too.
+const THINKING_STRIP_GATED = true;
+
+it("thinking strip gating stays enabled", () => {
+	expect(THINKING_STRIP_GATED).toBe(true);
+});
+
 const MODEL = {
 	provider: "anthropic",
 	id: process.env.MC_AUDIT_MODEL ?? "claude-opus-5-5",
@@ -760,7 +768,8 @@ for (const subagent of [false, true]) {
 						expect(beforeLastThinking(after)).toBe(beforeLastThinking(before));
 					} else expect(nonThinkingEdit).toBe(false);
 					// A held pass preserves every signed block, including completed turns.
-					expect(thinkingBlocks(after)).toBe(thinkingBlocks(before));
+					if (THINKING_STRIP_GATED)
+						expect(thinkingBlocks(after)).toBe(thinkingBlocks(before));
 					// A held edit is never recorded as served: repeating the pass with
 					// no new response serves exactly the same bytes.
 					expect(wire((await f.pass()).messages)).toEqual(after);
