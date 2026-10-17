@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { getMemoryById, insertMemory } from "../memory";
@@ -11,7 +11,7 @@ import { acquireLeaseWithAcquisition, releaseLease } from "./lease";
 import type { DreamerModuleRoute } from "./module-apply";
 import { createDreamTaskExecutor } from "./task-executor";
 import { leaseKeyFor } from "./task-registry";
-import { runDueTasksForProject } from "./task-scheduler";
+import { planDueTasks, runDueTasksForProject } from "./task-scheduler";
 
 let db: Database | null = null;
 
@@ -21,8 +21,60 @@ afterEach(() => {
 });
 
 describe("archiveExpiredMemories", () => {
+    test("idle expiry ticks take no write lease when no project memory has expired", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        runMigrations(db);
+        const project = "/repo/idle-expiry";
+        insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "A future rule.",
+            expiresAt: Date.now() + 60_000,
+        });
+        insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "A rule without a TTL.",
+        });
+        insertMemory(db, {
+            projectPath: "/repo/another-project",
+            category: "PROJECT_RULES",
+            content: "An expired rule in another project.",
+            expiresAt: Date.now() - 1,
+        });
+        const call = mock(async () => ({ result: { ok: true } }));
+        const executor = createDreamTaskExecutor({
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            transformMode: "rust",
+            moduleClient: { call },
+        });
+        // Initialize daily schedule housekeeping before observing an idle tick.
+        planDueTasks(db, project, [], Date.now());
+        const exec = spyOn(db, "exec");
+        try {
+            for (let tick = 0; tick < 2; tick++) {
+                expect(
+                    await runDueTasksForProject({
+                        db,
+                        projectIdentity: project,
+                        tasks: [],
+                        executor,
+                    }),
+                ).toBe(0);
+            }
+            expect(exec.mock.calls.filter(([sql]) => /\bBEGIN\s+IMMEDIATE\b/i.test(sql))).toEqual(
+                [],
+            );
+            expect(call).not.toHaveBeenCalled();
+        } finally {
+            exec.mockRestore();
+        }
+    });
+
     for (const transformMode of ["ts", "rust"] as const) {
-        test(`C5 row 6: scheduled expiry runs with curate and all model tasks disabled (${transformMode})`, async () => {
+        test(`scheduled expiry runs with curate and all model tasks disabled (${transformMode})`, async () => {
             db = new Database(":memory:");
             initializeDatabase(db);
             runMigrations(db);

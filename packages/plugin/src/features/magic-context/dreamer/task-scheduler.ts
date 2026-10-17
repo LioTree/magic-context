@@ -7,6 +7,7 @@ import type { ModelInput } from "../../../shared/model-resolution";
 import type { Database } from "../../../shared/sqlite";
 import { isUsableProjectIdentity } from "../memory/project-identity";
 import { nextDueAtMs } from "./cron";
+import { getExpiredActiveMemoryIds } from "./expire-memories";
 import { pruneIdleScheduleIdentities } from "./idle-schedule-prune";
 import {
     acquireLeaseWithAcquisition,
@@ -689,7 +690,12 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
     // rotation). An identity with no memories and nothing else to do loses its
     // rows to the daily idle prune instead.
     if (deps.projectMemoryEnabled === false) return 0;
-    if (deps.executor.expireMemories) {
+    // Idle expiry ticks must not take a write lease. The executor rechecks the
+    // expired rows under the lease before archiving them.
+    if (
+        deps.executor.expireMemories &&
+        getExpiredActiveMemoryIds(deps.db, deps.projectIdentity).length > 0
+    ) {
         const holderId = crypto.randomUUID();
         const leaseKey = leaseKeyFor("curate", deps.projectIdentity);
         const leaseAcquisition = acquireLeaseWithAcquisition(deps.db, holderId, leaseKey);

@@ -17,7 +17,7 @@ const memory = (id: number, content: string): CuratePromptMemory => ({
     hasNoFileSentinel: false,
 });
 
-test("C5 row 5: curate states the configured injection budget and pins the 4000 default", () => {
+test("curate states the configured injection budget and pins the 4000 default", () => {
     const args = { projectPath: "/repo", category: "PROJECT_RULES" as const, memories: [] };
     const defaultPrompt = buildCuratePrompt(args);
     expect(defaultPrompt).toContain("the 4000-token injection budget");

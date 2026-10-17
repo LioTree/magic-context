@@ -2,16 +2,16 @@
 /**
  * Generates `historian-prompt.generated.ts` from `historian-prompt.source.md`.
  *
- * The v8.7.5 historian system prompt (validated across the replay experiments,
- * reconciled to a permanent calibration floor) is the editable source
- * of truth. We emit it as a TS string constant rather than reading the .md at
- * runtime because bundling non-TS assets into dist/index.js is fragile (see the
- * @huggingface/transformers bundling history). The prompt contains ~306
- * backticks and would break a naive template literal, so we escape backticks
- * and `${` defensively before embedding.
+ * The Markdown source renders XML and combined output contracts. TypeScript
+ * constants keep these assets available in bundles without runtime file reads.
  *
- * Regenerate after editing the source prompt:
- *   bun run packages/plugin/scripts/build-historian-prompt.ts
+ * Regenerate both systems in order:
+ *   bun packages/plugin/scripts/build-historian-prompt.ts
+ *   bun crates/mc-module/gen/gen-historian-system-prompt.ts
+ * Check Rust artifact drift without rewriting:
+ *   bun crates/mc-module/gen/gen-historian-system-prompt.ts --check
+ * Changing either system or tool-definition bytes requires a new validation epoch:
+ * revalidate the affected profile against the new exact bytes before enabling it.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";

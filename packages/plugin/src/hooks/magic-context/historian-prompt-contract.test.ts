@@ -49,7 +49,7 @@ test("generated XML and combined artifacts are byte-identical across TypeScript 
     );
 });
 
-test("C5 row 1: combined contract retains turn-one prose and specifies both steps", () => {
+test("combined contract retains turn-one prose and specifies both steps", () => {
     expect(combined.split("## Output")[0]).toBe(xml.split("## Output")[0]);
     expect(combined).toContain('{"result":{"step":"turn_one","xml":"..."}}');
     expect(combined).toContain('{"result":{"step":"turn_two","decisions":[...],"scores":[...]}}');
@@ -94,7 +94,7 @@ test("turn-two user content carries notices and data, not a second format schema
         expect(prompt).not.toContain(format);
 });
 
-test("C5 row 3: a proposed decay class stays a free string with no taxonomy", () => {
+test("a proposed decay class stays a free string with no taxonomy", () => {
     expect(combined).toContain("a free nonempty string of at most 64 characters");
     const result = parseTurnTwoEnvelope(
         JSON.stringify({
@@ -110,14 +110,14 @@ test("C5 row 3: a proposed decay class stays a free string with no taxonomy", ()
         ]);
 });
 
-test("C5 row 4: both contracts name the actual project-memory input block", () => {
+test("both contracts name the actual project-memory input block", () => {
     for (const prompt of [xml, combined]) {
         expect(prompt).toContain("<project-memory>");
         expect(prompt).not.toContain("<project_memory>");
     }
 });
 
-test("C5 row 7: detection relies on the unchanged dreamer registration, not reworded tasks", () => {
+test("detection relies on the unchanged dreamer registration, not reworded tasks", () => {
     for (const [prompt, digest] of [
         [
             FRICTION_GATE_SYSTEM_PROMPT,
@@ -150,7 +150,7 @@ test("C5 row 7: detection relies on the unchanged dreamer registration, not rewo
     }
 });
 
-test("C5 row 8: every historian rendering preserves the exact persona sentence", () => {
+test("every historian rendering preserves the exact persona sentence", () => {
     const persona = "You are Historian — the hippocampus of a long-running coding agent.";
     for (const prompt of [xml, combined, COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT]) {
         expect(prompt).toContain(persona);
