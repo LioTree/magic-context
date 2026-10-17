@@ -74,7 +74,7 @@ import { toModelEntry } from "../../shared/resolve-fallbacks";
 import { beginSqliteWriterAsync, isTransientSqliteError } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
-import { buildCompartmentAgentPrompt, COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
+import { buildCompartmentAgentPrompt, historianSystemPrompt } from "./compartment-prompt";
 import {
     prepareCompartmentDrops,
     queuePreparedCompartmentDrops,
@@ -587,7 +587,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const promptFit = fitHistorianPrompt({
             window: producerWindow,
             systemPrompt: withContentLanguageDirective(
-                COMPARTMENT_AGENT_SYSTEM_PROMPT,
+                historianSystemPrompt(turnOneLane === "enabled"),
                 deps.language,
             ),
             requestedChunkTokens: historianChunkTokens,
@@ -875,6 +875,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             twoPass: deps.historianTwoPass,
             language: deps.language,
             retainChild: anchoredFacts,
+            turnTwoEnabled: turnOneLane === "enabled",
         });
         retainedChild = validatedPass.ok ? validatedPass.retainedChild : undefined;
         // A window refusal here comes from a fallback model (the primary was fitted

@@ -953,6 +953,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     openOpenCodeDb,
                 }),
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreaming),
+            memoryInjectionBudgetTokens: deps.config.memory?.injection_budget_tokens,
             language: deps.config.language,
             retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
             smartNotesEnabled: deps.config.smart_notes?.enabled,

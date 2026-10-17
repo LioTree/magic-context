@@ -44,8 +44,8 @@ import type { Database } from "../../shared/sqlite";
 import { createChildSessionWithFence } from "./child-session-spawn";
 import {
     buildHistorianEditorPrompt,
-    COMPARTMENT_AGENT_SYSTEM_PROMPT,
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
+    historianSystemPrompt,
 } from "./compartment-prompt";
 import type {
     HiddenCompletion,
@@ -419,6 +419,7 @@ export async function runValidatedHistorianPass(args: {
      * historian turn two. Children of replies that fail validation are closed here.
      */
     retainChild?: boolean;
+    turnTwoEnabled?: boolean;
 }): Promise<ValidatedHistorianPassResult> {
     const withChild = (
         result: ValidatedHistorianPassResult,
@@ -674,6 +675,7 @@ async function runHistorianPrompt(args: {
      * turn two can continue the same session. The caller then owns closing it.
      */
     retainChild?: boolean;
+    turnTwoEnabled?: boolean;
 }): Promise<HistorianRunResult> {
     const {
         client,
@@ -749,7 +751,7 @@ async function runHistorianPrompt(args: {
     const system = withContentLanguageDirective(
         agentId === HISTORIAN_EDITOR_AGENT
             ? HISTORIAN_EDITOR_SYSTEM_PROMPT
-            : COMPARTMENT_AGENT_SYSTEM_PROMPT,
+            : historianSystemPrompt(args.turnTwoEnabled === true),
         args.language,
     );
     // Admit the prompt before opening a child session. A prompt that cannot fit
@@ -1053,6 +1055,7 @@ async function runFallbackHistorianPass(args: {
     language?: string;
     dumpPaths: Array<string | undefined>;
     retainChild?: boolean;
+    turnTwoEnabled?: boolean;
 }): Promise<ValidatedHistorianPassResult> {
     // Ordered escalation that matches the intended fallback policy:
     //   configured fallback_models (in order)  →  live session model (last resort)
@@ -1119,6 +1122,7 @@ async function runFallbackHistorianPass(args: {
             modelOverride,
             agentId: args.agentId,
             retainChild: args.retainChild,
+            turnTwoEnabled: args.turnTwoEnabled,
             accountingTask: isSessionModelLastResort ? "fallback-session" : "fallback",
         });
         if (!fallbackRun.ok || !fallbackRun.result) {

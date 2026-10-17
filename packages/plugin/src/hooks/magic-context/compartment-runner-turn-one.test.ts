@@ -29,7 +29,9 @@ import { __resetNotificationStateForTests } from "../../shared/rpc-notifications
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
 import { runCompartmentAgent as runCompartmentAgentImpl } from "./compartment-runner";
+import { createV1HiddenCompletionExecutor } from "./compartment-runner-historian";
 import { settleHistorianTurnTwoRuns } from "./historian-turn-two-step";
 import {
     clearProducerModelObservations,
@@ -244,7 +246,7 @@ const REPLY_WITH_FACTS = `<output><compartments>
 </output>`;
 
 describe("historian turn one on a dormant lane (production default)", () => {
-    it("keeps today's prompt and promotion, and commits the publication once with its activity", async () => {
+    it("empty allowlist sends the XML artifact, parses and promotes, and commits the publication once", async () => {
         useTempDataHome("turn-one-dormant-ts-");
         const sessionId = "ses-dormant-ts";
         const directory = "/tmp/turn-one-dormant-ts";
@@ -259,8 +261,16 @@ describe("historian turn one on a dormant lane (production default)", () => {
             sourceType: "historian",
         });
         const { client, prompt } = historianClient(directory, () => REPLY_WITH_FACTS);
+        const executor = createV1HiddenCompletionExecutor(client, db, directory);
+        const open = mock(executor.open.bind(executor));
 
-        await runHistorian(db, sessionId, client, directory);
+        await runHistorian(db, sessionId, client, directory, {
+            memoryLifecycleValidatedProfiles: [],
+            hiddenCompletionExecutor: { ...executor, open },
+        });
+
+        expect(open.mock.calls[0]?.[0].system).toBe(COMPARTMENT_AGENT_SYSTEM_PROMPT);
+        expect(open.mock.calls[0]?.[0].agent).toBe("historian");
 
         const [sent] = sentPrompts(prompt);
         expect(sent).toContain("Existing memory shown to the historian.");

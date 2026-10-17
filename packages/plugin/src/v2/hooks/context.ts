@@ -886,6 +886,7 @@ export async function registerContext(context: V2Context) {
             projectIdentity: () =>
                 resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
             projectMemoryEnabled: config.memory.enabled,
+            memoryInjectionBudgetTokens: config.memory.injection_budget_tokens,
             language: config.language,
             mural: config.mural,
         });
@@ -2356,6 +2357,7 @@ export async function registerContext(context: V2Context) {
             language: config.language,
             mural: config.mural,
             executor: runExecutor,
+            memoryInjectionBudgetTokens: config.memory.injection_budget_tokens,
             sessionId,
             ...(requested.task !== undefined ? { task: requested.task } : {}),
         })

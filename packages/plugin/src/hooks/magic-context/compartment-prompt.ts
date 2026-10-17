@@ -1,7 +1,19 @@
 // The historian system prompt is generated from historian-prompt.source.md.
 // Edit that source and run scripts/build-historian-prompt.ts; never hand-edit
 // the generated constant.
-export { COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./historian-prompt.generated";
+import {
+    COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+    COMPARTMENT_AGENT_SYSTEM_PROMPT,
+} from "./historian-prompt.generated";
+
+export { COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT, COMPARTMENT_AGENT_SYSTEM_PROMPT };
+
+/** Both sends of an authorized session use the same combined system bytes. */
+export function historianSystemPrompt(turnTwoEnabled: boolean): string {
+    return turnTwoEnabled
+        ? COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT
+        : COMPARTMENT_AGENT_SYSTEM_PROMPT;
+}
 
 export const HISTORIAN_EDITOR_SYSTEM_PROMPT = `You are a historian editor for the magic-context system, refining a historian draft. The draft was produced by a first-pass historian and may contain noise — low-signal U: lines, redundant quotes across compartments, and weak preservation decisions.
 

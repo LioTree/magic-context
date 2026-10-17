@@ -59,6 +59,7 @@ export function startDreamTrigger(
         projectIdentity: () => string;
         /** The project's `memory.enabled`; `false` keeps the identity unscheduled. */
         projectMemoryEnabled?: boolean;
+        memoryInjectionBudgetTokens?: number;
         language?: string;
         mural?: { enabled: boolean };
         /** Native source boundary; injectable for scheduler-only tests. */
@@ -119,6 +120,7 @@ export function startDreamTrigger(
                             hiddenCompletionExecutor: args.executor,
                             parentSessionId: event.data.sessionID,
                             sessionDirectory: context.location.directory,
+                            memoryInjectionBudgetTokens: args.memoryInjectionBudgetTokens,
                             openOpenCodeDb: () => null,
                             retrospectiveRawProvider: (db) => new V2RetrospectiveRawProvider(db),
                             language: args.language,

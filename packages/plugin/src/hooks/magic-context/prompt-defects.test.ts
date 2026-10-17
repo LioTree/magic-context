@@ -12,7 +12,12 @@ import {
     parseTurnTwoEnvelope,
 } from "../../features/magic-context/memory/turn-two-envelope";
 import { COMPRESS_CUES_SYSTEM_PROMPT } from "../../features/magic-context/mural/compress-cues-prompt";
-import { COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT } from "./compartment-prompt";
+import {
+    COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+    COMPARTMENT_AGENT_SYSTEM_PROMPT,
+    COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT,
+    historianSystemPrompt,
+} from "./compartment-prompt";
 import { renderHistorianSystemPrompt } from "./historian-prompt-render";
 import { isMagicContextInternalAgent } from "./system-prompt-hash";
 
@@ -20,6 +25,29 @@ const source = readFileSync(new URL("./historian-prompt.source.md", import.meta.
 const xml = renderHistorianSystemPrompt(source, "xml");
 const combined = renderHistorianSystemPrompt(source, "combined");
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+
+test("generated XML and combined artifacts are byte-identical across TypeScript and Rust", () => {
+    for (const [rendered, generated, artifact, enabled] of [
+        [xml, COMPARTMENT_AGENT_SYSTEM_PROMPT, "historian-system-prompt.txt", false],
+        [
+            combined,
+            COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+            "historian-system-prompt-combined.txt",
+            true,
+        ],
+    ] as const) {
+        expect(Buffer.from(generated)).toEqual(Buffer.from(rendered));
+        expect(
+            readFileSync(
+                new URL(`../../../../../crates/mc-module/testdata/${artifact}`, import.meta.url),
+            ),
+        ).toEqual(Buffer.from(generated));
+        expect(historianSystemPrompt(enabled)).toBe(generated);
+    }
+    expect(hash(COMPARTMENT_AGENT_SYSTEM_PROMPT)).not.toBe(
+        hash(COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT),
+    );
+});
 
 test("C5 row 1: combined contract retains turn-one prose and specifies both steps", () => {
     expect(combined.split("## Output")[0]).toBe(xml.split("## Output")[0]);

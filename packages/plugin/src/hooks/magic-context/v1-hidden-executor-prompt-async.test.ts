@@ -1,12 +1,12 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, mock, test } from "bun:test";
-import { createDreamerOutputCapSampler } from "../../config/live-child-output-cap";
 import {
     buildHiddenAgentConfig,
     buildHiddenAgentRegistrations,
     buildZenReadAgentRegistrations,
 } from "../../agents/hidden-agent-registrations";
+import { createDreamerOutputCapSampler } from "../../config/live-child-output-cap";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { RescoreService } from "../../features/magic-context/rescore-service";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
@@ -20,8 +20,8 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createV1HiddenCompletionExecutor } from "./compartment-runner-historian";
 import type { HiddenRunIdentity } from "./compartment-runner-types";
-import { createOpenCodeRescoreCarrier, driveRescore } from "./rescore-driver";
 import { createDroppedInputToolExecuteBeforeHook } from "./dropped-input-guard";
+import { createOpenCodeRescoreCarrier, driveRescore } from "./rescore-driver";
 
 function freshDb(): Database {
     const db = new Database(":memory:");

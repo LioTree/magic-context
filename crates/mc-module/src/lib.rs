@@ -7430,6 +7430,9 @@ impl McHandler {
         );
         let failure_started_at_ms = firing.now_ms;
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
+        // Until per-session allowlist selection is supplied, every request stays XML.
+        // Host and Broca requests must use the same decision, not a carrier default.
+        let turn_two_enabled = false;
         if runner == HistorianRunnerKind::Host {
             // The host lane never opens a Broca route, so there is no connect step
             // to fail: the run is queued and this task waits for a claimant.
@@ -7440,6 +7443,7 @@ impl McHandler {
                 &harness,
                 &project_slug,
                 language.as_deref(),
+                turn_two_enabled,
             );
             request.temperature = historian_temperature;
             request.publication_fence = publication_fence.as_deref();
@@ -7472,6 +7476,7 @@ impl McHandler {
                     &harness,
                     &project_slug,
                     language.as_deref(),
+                    turn_two_enabled,
                 );
                 request.temperature = historian_temperature;
                 request.await_timeout = historian_await_timeout;

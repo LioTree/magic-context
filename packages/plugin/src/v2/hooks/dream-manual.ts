@@ -71,6 +71,7 @@ export async function runManualDreamNow(args: {
     dreamer: DreamerConfig;
     smartNotesEnabled?: boolean;
     projectIdentity: string;
+    memoryInjectionBudgetTokens?: number;
     directory: string;
     language?: string;
     mural?: { enabled: boolean };
@@ -88,6 +89,7 @@ export async function runManualDreamNow(args: {
         hiddenCompletionExecutor: args.executor,
         parentSessionId: args.sessionId,
         sessionDirectory: args.directory,
+        memoryInjectionBudgetTokens: args.memoryInjectionBudgetTokens,
         openOpenCodeDb: () => null,
         retrospectiveRawProvider: (db) => new V2RetrospectiveRawProvider(db),
         language: args.language,
