@@ -21220,37 +21220,34 @@ mod tests {
             .unwrap();
             // Exercise the TS entry points against the same memory-task database.
             // Any executor entry would be a second writer, including turn two.
-            let ts = std::process::Command::new("bun")
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .args(["-e", r#"
-import { Database } from 'bun:sqlite';
-import { runDueTasksForProject, runManualDream } from '../../packages/plugin/src/features/magic-context/dreamer/task-scheduler.ts';
-import { CANONICAL_DREAM_TASKS } from '../../packages/plugin/src/features/magic-context/dreamer/task-registry.ts';
-const db = new Database(process.argv[1]);
-let executed = 0;
-const deps = { db, projectIdentity: 'git:identity', rust_background_enabled: true,
-  tasks: CANONICAL_DREAM_TASKS.map(task => ({task, schedule:'0 3 * * *'})),
-  executor: async () => { executed++; throw new Error('duplicate TS memory-task writer'); } };
-if (await runDueTasksForProject(deps) !== 0) throw new Error('TS due task ran');
-for (const task of CANONICAL_DREAM_TASKS) {
-  const result = await runManualDream({...deps, task});
-  if (result.ran.length || result.failed.length) throw new Error('TS manual task ran');
-}
-if (executed !== 0) throw new Error('TS executor reached insertMemory/runTurnTwo');
-console.log(`TS_EXECUTORS tasks=${executed} memory_rows=${db.query('SELECT COUNT(*) AS n FROM memories').get().n}`);
-db.close();
-"#])
-                .arg(&path)
-                .output()
-                .expect("Bun is required for the TS executor exclusion fixture");
+            let ts_reference_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/i4-roots-ts-executor-exclusion.json");
+            let ts_reference = std::fs::read(&ts_reference_path).unwrap_or_else(|error| {
+                panic!(
+                    "unable to read TS executor exclusion reference {}: {error}",
+                    ts_reference_path.display()
+                )
+            });
+            let ts: serde_json::Value =
+                serde_json::from_slice(&ts_reference).unwrap_or_else(|error| {
+                    panic!(
+                        "invalid TS executor exclusion reference {}: {error}",
+                        ts_reference_path.display()
+                    )
+                });
             assert!(
-                ts.status.success(),
+                ts["success"]
+                    .as_bool()
+                    .expect("reference success field must be boolean"),
                 "{}",
-                String::from_utf8_lossy(&ts.stderr)
+                ts["stderr"]
+                    .as_str()
+                    .expect("reference stderr field must be text")
             );
-            assert!(
-                String::from_utf8_lossy(&ts.stdout).contains("TS_EXECUTORS tasks=0 memory_rows=1")
-            );
+            assert!(ts["stdout"]
+                .as_str()
+                .expect("reference stdout field must be text")
+                .contains("TS_EXECUTORS tasks=0 memory_rows=1"));
             let registration = Registration {
                 project: "git:identity".into(),
                 model_id: "fixture".into(),
