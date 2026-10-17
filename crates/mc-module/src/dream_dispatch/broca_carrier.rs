@@ -183,8 +183,10 @@ impl Entry {
     }
 }
 
-/// Process-owned record of live Broca dream children. Restart leaves it empty,
-/// so a run that outlives this process can call no memory tool at all.
+/// The dream children this process started on Broca, each keyed by the Broca
+/// session it runs in. A memory tool call is executed only for a session found
+/// here, and the record lives in memory only: after a restart it is empty, so a
+/// Broca run started by the previous process can no longer call a memory tool.
 #[derive(Default)]
 pub struct BrocaToolRoute {
     entries: Mutex<HashMap<String, Entry>>,
