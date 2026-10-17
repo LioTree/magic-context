@@ -101,6 +101,8 @@ export interface RunDueTasksDeps {
     projectIdentity: string;
     tasks: readonly DreamTaskRuntimeConfig[];
     executor: TaskExecutor;
+    /** Captured once per run: Rust owns dream execution when true; absent keeps TS scheduling. */
+    rust_background_enabled?: boolean;
     now?: number;
     /**
      * The host's `memory.enabled` for this project. `false` means this caller
@@ -561,6 +563,7 @@ export interface ManualRunResult {
 export async function runManualDream(
     deps: Omit<RunDueTasksDeps, "now"> & { task?: DreamTaskName },
 ): Promise<ManualRunResult> {
+    const rustBackgroundEnabled = deps.rust_background_enabled === true;
     const now = Date.now();
     const result: ManualRunResult = {
         ran: [],
@@ -573,6 +576,7 @@ export async function runManualDream(
         backlogAfter: {},
     };
 
+    if (rustBackgroundEnabled) return result;
     if (!isUsableProjectIdentity(deps.projectIdentity)) return result;
     let selected: readonly DreamTaskRuntimeConfig[];
     let forceGate = false;
@@ -644,7 +648,7 @@ export async function runManualDream(
 
     await Promise.all(
         [...groups.values()].map((group) =>
-            runDomainGroup({ ...deps, executor: deps.executor }, group, {
+            runDomainGroup(deps, group, {
                 forceGate,
                 leaseWaitMs: MANUAL_RUN_LEASE_WAIT_MS,
                 onRan: (t, detail, backlog) => {
@@ -676,6 +680,8 @@ export async function runManualDream(
  * number of tasks actually executed (for logging/tests).
  */
 export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<number> {
+    // Stop before planning: even a gated task would seed or advance schedule rows.
+    if (deps.rust_background_enabled === true) return 0;
     // A blank identity is an unresolved directory, not a project; running tasks
     // for it would read and write project-scoped rows under the key "".
     if (!isUsableProjectIdentity(deps.projectIdentity)) return 0;
