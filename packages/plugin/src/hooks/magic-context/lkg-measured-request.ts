@@ -21,6 +21,19 @@ export type LkgRequestIdentity =
 
 const requests = new BoundedSessionMap<LkgRequestIdentity>(1000);
 const claimedRequests = new WeakSet<LkgRequestIdentity>();
+/** The identity each session's current request replaced. Only the newest link is
+ * kept: the replaced identity's own link is dropped, so older identities are not
+ * retained through a chain. */
+const predecessors = new WeakMap<LkgRequestIdentity, LkgRequestIdentity>();
+
+function setRequest(sessionId: string, request: LkgRequestIdentity): void {
+    const previous = requests.get(sessionId);
+    if (previous) {
+        predecessors.set(request, previous);
+        predecessors.delete(previous);
+    }
+    requests.set(sessionId, request);
+}
 const captures = new BoundedSessionMap<{
     request: LkgRequestIdentity;
     slot: string;
@@ -80,7 +93,7 @@ export function beginV2LkgRequest(
     previousResponseId?: string,
     responseAfterSequence?: number,
 ): void {
-    requests.set(sessionId, {
+    setRequest(sessionId, {
         kind: "v2",
         previousResponseId,
         startedAt: Date.now(),
@@ -102,6 +115,19 @@ export function claimLkgRequestIdentity(sessionId: string): LkgRequestIdentity |
 
 export function currentLkgRequestIdentity(sessionId: string): LkgRequestIdentity | undefined {
     return requests.get(sessionId);
+}
+
+/** True when `request` is the session's current request identity or the one it
+ * directly replaced. Material a host hook records late in one request is read early
+ * in the next on OpenCode 1, whose messages transform runs before its system hook;
+ * OpenCode 2 starts a second identity between its system stage and its transform. */
+export function isCurrentOrPreviousLkgRequest(
+    sessionId: string,
+    request: LkgRequestIdentity | undefined,
+): boolean {
+    const current = requests.get(sessionId);
+    if (!request || !current) return false;
+    return request === current || request === predecessors.get(current);
 }
 
 export function noteCapturedLkgRequest(args: {
@@ -151,7 +177,7 @@ export function noteLkgProviderResponse(args: {
             previous.modelKey === args.modelKey
         )
             return;
-        requests.set(args.sessionId, {
+        setRequest(args.sessionId, {
             kind: "v1",
             responseId: args.responseId,
             modelKey: args.modelKey,

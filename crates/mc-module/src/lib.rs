@@ -8513,9 +8513,9 @@ impl McHandler {
                 code: "route_unbound".to_string(),
                 message: format!("{operation} on a channel with no session binding"),
             })?;
-        // Principal-less bindings are the legacy in-process plugin lane. Module
-        // routes must carry the same daemon attestations as the bridge host lane.
-        if binding.principal.is_some() {
+        // The in-process plugin keeps its legacy lane. Every other route must carry
+        // the same daemon attestations as the bridge host lane.
+        if !historian_plugin_lane(&binding) {
             if !matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi") {
                 return Err(HandlerOutcome::Error {
                     code: "host_lane_requires_harness_module".into(),
@@ -8533,7 +8533,7 @@ impl McHandler {
         store: &McStore,
         run_id: &str,
     ) -> Result<(), HandlerOutcome> {
-        if binding.principal.is_none() {
+        if historian_plugin_lane(binding) {
             return Ok(());
         }
         // A harness route owns one session. A run id or session id in the body
@@ -8581,10 +8581,10 @@ impl McHandler {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        let session_id = if binding.principal.is_some() {
-            Some(binding.session.as_str())
-        } else {
+        let session_id = if historian_plugin_lane(&binding) {
             session_id.as_deref()
+        } else {
+            Some(binding.session.as_str())
         };
         match store.list_pending_historian_runs(&project_path, session_id, historian_claim_now_ms())
         {
@@ -15523,6 +15523,23 @@ fn unrecognized_request_error(request: &Value) -> HandlerOutcome {
 /// be a historian document the validator would accept anyway, and refusing at
 /// the wire keeps an oversized body from reaching the parser at all.
 const MAX_HISTORIAN_REPORT_BYTES: usize = MAX_FACADE_FRAME_BYTES;
+
+/// Whether a historian claim-lane route is the in-process plugin's own lane, which
+/// polls and claims across its bound project as it always has.
+///
+/// The plugin opens its route without a consumer identity, so the daemon stamps
+/// `Principal::Direct` on it and requests no scope; a daemon that predates
+/// attestation stamps no principal at all. Both are the plugin lane. A Direct
+/// route that asked the daemon for a scope is presenting itself as a harness
+/// participant, and a reserved or unverified principal is a module caller: those
+/// go through the attested harness check and stay confined to their session.
+fn historian_plugin_lane(binding: &SessionBinding) -> bool {
+    match &binding.principal {
+        None => true,
+        Some(subc_protocol::Principal::Direct) => binding.scope.is_none(),
+        Some(_) => false,
+    }
+}
 
 fn historian_claim_now_ms() -> i64 {
     #[cfg(test)]

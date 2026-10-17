@@ -13,9 +13,17 @@ import {
 } from "../../features/magic-context/tool-definition-tokens";
 import { Database } from "../../shared/sqlite";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
+import {
+    clearCtxReduceAvailability,
+    resolveCtxReduceAvailabilityFromMessages,
+} from "./ctx-reduce-availability";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
 import { measureLkgReplay } from "./lkg-fit-measure";
-import { noteLkgProviderResponse } from "./lkg-measured-request";
+import {
+    beginV2LkgRequest,
+    clearLkgMeasuredRequest,
+    noteLkgProviderResponse,
+} from "./lkg-measured-request";
 import { markerRandom, randomMarkerEnvelope } from "./marker-envelope-test-support";
 import { estimateTokens } from "./read-session-formatting";
 import {
@@ -23,6 +31,7 @@ import {
     measureStandaloneMarker,
     recordMarkerSystem,
 } from "./standalone-marker-envelope";
+import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import type { MessageLike } from "./transform-operations";
 import {
     type CompactionMarkerStrategy,
@@ -35,7 +44,7 @@ afterEach(() => {
     clearMarkerSystem("marker-envelope-session");
 });
 
-test("standalone marker requires raw material from the current request and model", () => {
+test("standalone marker requires raw material from the current or previous request and model", () => {
     const args = {
         sessionId: "marker-envelope-session",
         model: "unknown/model",
@@ -62,7 +71,105 @@ test("standalone marker requires raw material from the current request and model
         responseId: "second",
         inputTokens: 0,
     });
+    // OpenCode 1 records a request's final system only after its messages
+    // transform, so the request directly before this one still supplies it.
+    expect(measureStandaloneMarker(args).fit).toBe("under");
+    noteLkgProviderResponse({
+        sessionId: args.sessionId,
+        modelKey: args.model,
+        responseId: "third",
+        inputTokens: 0,
+    });
     expect(measureStandaloneMarker(args).fit).toBe("unproven");
+});
+
+function markerHandlerFixture(sessionId: string) {
+    const db = new Database(":memory:");
+    initializeDatabase(db);
+    runMigrations(db);
+    getOrCreateSessionMeta(db, sessionId);
+    resolveCtxReduceAvailabilityFromMessages(sessionId, [
+        { info: { id: "u", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+    ] as never);
+    recordToolDefinition("unknown", "model", undefined, "read", "Read file", { type: "object" });
+    const system = createSystemPromptHashHandler({
+        db,
+        dreamerEnabled: false,
+        resolveModel: () => ({ providerID: "unknown", modelID: "model" }),
+        systemPromptRefreshSessions: new Set<string>(),
+        historyRefreshSessions: new Set<string>(),
+        pendingMaterializationSessions: new Set<string>(),
+        lastHeuristicsTurnId: new Map<string, string>(),
+    });
+    const measure = () =>
+        measureStandaloneMarker({
+            sessionId,
+            model: "unknown/model",
+            systemHash: getOrCreateSessionMeta(db, sessionId).systemPromptHash,
+            messages: [
+                { info: { id: "m", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+            ],
+            limit: 100_000,
+        }).fit;
+    return {
+        runSystemHook: () =>
+            system.handler(
+                { sessionID: sessionId, model: { providerID: "unknown", modelID: "model" } },
+                { system: ["Host instructions for the marker fixture."] },
+            ),
+        measure,
+        close: () => {
+            clearCtxReduceAvailability(sessionId);
+            clearLkgMeasuredRequest(sessionId);
+            db.close();
+        },
+    };
+}
+
+test("OpenCode 1 order admits the final system its system hook recorded on the previous request", async () => {
+    const sessionId = "marker-envelope-session";
+    const fixture = markerHandlerFixture(sessionId);
+    try {
+        // Request 1: the assistant row exists before either hook runs, and the
+        // system hook runs after the messages transform.
+        noteLkgProviderResponse({
+            sessionId,
+            modelKey: "unknown/model",
+            responseId: "assistant-1",
+            inputTokens: 0,
+        });
+        await fixture.runSystemHook();
+        // Request 2: its messages transform measures before its system hook runs.
+        noteLkgProviderResponse({
+            sessionId,
+            modelKey: "unknown/model",
+            responseId: "assistant-2",
+            inputTokens: 0,
+        });
+        expect(fixture.measure()).toBe("under");
+    } finally {
+        fixture.close();
+    }
+});
+
+test("OpenCode 2 order admits the system stage's final system after the transform starts its request", async () => {
+    const sessionId = "marker-envelope-session";
+    const fixture = markerHandlerFixture(sessionId);
+    try {
+        // The context hook starts a request, runs the system stage, then starts
+        // the transform's own request identity for a non-provider session.
+        beginV2LkgRequest(sessionId, "unknown/model", undefined, 0);
+        await fixture.runSystemHook();
+        beginV2LkgRequest(sessionId, "unknown/model");
+        expect(fixture.measure()).toBe("under");
+        // A further request whose system stage did not record anything must not
+        // reuse material from two requests back.
+        beginV2LkgRequest(sessionId, "unknown/model", undefined, 1);
+        beginV2LkgRequest(sessionId, "unknown/model");
+        expect(fixture.measure()).toBe("unproven");
+    } finally {
+        fixture.close();
+    }
 });
 
 test("standalone randomized marker timing preserves full defer bytes and attributes inherited summary differences", () => {
