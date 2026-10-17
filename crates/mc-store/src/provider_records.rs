@@ -76,14 +76,7 @@ impl McStore {
             let version: u64 = tx.query_row("PRAGMA data_version", [], |row| row.get(0))?;
             let record: Option<String> = tx.query_row("SELECT record_json FROM mc_provider_conversations_v2 WHERE conv_key=?1", [key.conversation_key()], |row| row.get(0)).optional()?;
             if &(version, record) != expected { return Err(rusqlite::Error::InvalidQuery); }
-            let counters: Option<String> = tx.query_row("SELECT hook_counters_json FROM mc_provider_conversations_v2 WHERE conv_key=?1", [key.conversation_key()], |row| row.get(0)).optional()?;
             crate::provider_legacy::save_delta_tx(tx, key, record_json, engine_session, tags)?;
-            // Hook saves contain only runner-owned counters. Preserve the token
-            // measurements and summary boundary committed by the compaction
-            // engine, which the next resident fold needs to validate its prefix.
-            if let Some(policy) = counters.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()).and_then(|value| value.get("engine_policy").cloned()) {
-                tx.execute("UPDATE mc_provider_conversations_v2 SET hook_counters_json=json_set(hook_counters_json,'$.engine_policy',json(?2)) WHERE conv_key=?1", params![key.conversation_key(), policy.to_string()])?;
-            }
             Ok(())
         })?;
         Ok(())

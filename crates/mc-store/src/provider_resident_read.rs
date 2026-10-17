@@ -9,6 +9,32 @@ use rusqlite::params;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+fn fold_counters_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+    conversation: &ProviderConversation,
+) -> rusqlite::Result<Value> {
+    use rusqlite::OptionalExtension;
+    let mut counters: Value = serde_json::from_str(&conversation.hook_counters_json)
+        .map_err(crate::serde_to_sql_error)?;
+    let cut: Option<(u64, String)> = conn.query_row(
+        "SELECT cut_id,policy_key FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 AND lineage_id=?2 ORDER BY cut_id DESC LIMIT 1",
+        params![conv, conversation.lineage_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    if let Some((cut, settings)) = cut {
+        // Runner metadata saves replace hook counters on both serving paths.
+        // The immutable cut, not those counters, owns the resident fold baseline.
+        if counters.get("engine_policy").is_none() {
+            counters["engine_policy"] = serde_json::from_str(&settings)
+                .map_err(crate::serde_to_sql_error)?;
+        }
+        // This reference is a read-time cache input, never shared policy state.
+        counters["engine_policy"]["baseline_cut_id"] = serde_json::json!(cut);
+    }
+    Ok(counters)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CompartmentSourceRevision {
     pub generation: String,
@@ -29,6 +55,53 @@ pub struct ProviderResidentAuthority {
 }
 
 impl McStore {
+    /// Prove obsolete targets from immutable covered policy facts. Missing rows
+    /// are not proof: a partial request can omit a still-live queued target.
+    pub fn provider_covered_drop_targets(
+        &self,
+        namespace: &str,
+        through: u64,
+        targets: &[&str],
+    ) -> Result<std::collections::HashSet<String>, crate::McStoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self.inner.with_conn(|conn| {
+            let owner: Option<(String, String)> = conn.query_row(
+                "SELECT conv_key,lineage_id FROM mc_provider_conversations_v2 WHERE engine_namespace=?1",
+                [namespace], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            let mut covered = std::collections::HashSet::new();
+            let Some((conv, lineage)) = owner else { return Ok(covered); };
+            let ancestry = crate::provider_log::ancestry_tx(conn, &conv, &lineage)?;
+            let mut query = conn.prepare_cached("SELECT ordinal,frozen_policy_format,frozen_policy_bytes,frozen_policy_raw_bytes,frozen_policy_parts FROM mc_provider_messages_v1 WHERE conv_key=?1 AND lineage_id=?2 AND mid=?3")?;
+            for target in targets {
+                let Some((mid, _)) = target.rsplit_once('#') else { continue; };
+                for (source, cut) in &ancestry {
+                    let row = query.query_row(params![conv, source.lineage_id, mid], |row| {
+                        Ok((row.get::<_,u64>(0)?, row.get::<_,u32>(1)?, row.get::<_,Option<Vec<u8>>>(2)?, row.get::<_,usize>(3)?, row.get::<_,usize>(4)?))
+                    }).optional()?;
+                    if let Some((ordinal, format, blob, bytes, parts)) = row {
+                        if ordinal > *cut { continue; }
+                        if ordinal <= through && format == 1 {
+                            let facts = crate::provider_policy_overlay::decode_facts(&blob.unwrap_or_default(), bytes, parts)
+                                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                            if facts.iter().any(|part| part.kind != "header" && part.block_id == *target) {
+                                covered.insert((*target).to_owned());
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            Ok(covered)
+        })?)
+    }
+
+    pub fn provider_fold_settings(&self, key: &ProviderSessionKey) -> Result<Value, ProviderError> {
+        self.inner.with_conn(|conn| {
+            let conversation = conversation_tx(conn, key)?.ok_or(rusqlite::Error::InvalidQuery)?;
+            Ok(fold_counters_tx(conn, &key.conversation_key(), &conversation)?["engine_policy"].clone())
+        }).map_err(|error| ProviderError::Storage(error.into()))
+    }
     /// Includes every compartment write, including interior boundary edits that
     /// leave the last covered message unchanged. Fold reuse needs that stronger
     /// identity than the revision used to decide whether to refresh history text.
@@ -109,7 +182,7 @@ impl McStore {
                 if rows > 100_000 || bytes > 128 * 1024 * 1024 {
                     return Err(ProviderError::Transient("resident_not_ready: policy input exceeds rebuild cap".into()));
                 }
-                let counters = serde_json::from_str(&conversation.hook_counters_json).map_err(|e| ProviderError::Transient(e.to_string()))?;
+                let counters = fold_counters_tx(&tx, &key.conversation_key(), &conversation)?;
                 let index = ProviderPolicyIndex::new(&tx, &key.conversation_key(), &conversation.lineage_id)?;
                 read(&index, &counters)
             })().map_err(|e| { refusal = Some(e); rusqlite::Error::InvalidQuery })?;

@@ -276,7 +276,7 @@ pub(crate) fn save_engine_policy_tx(
                     parts.push(serde_json::from_str(&raw?).map_err(sql_json)?);
                 }
             }
-            let cut = crate::provider_policy_overlay::freeze_cut_tx(
+            crate::provider_policy_overlay::freeze_cut_tx(
                 conn,
                 &conv,
                 &lineage,
@@ -289,7 +289,6 @@ pub(crate) fn save_engine_policy_tx(
                     e.to_string(),
                 )))
             })?;
-            counters["engine_policy"]["baseline_cut_id"] = json!(cut);
         }
         conn.execute(
             "UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1",

@@ -379,19 +379,16 @@ async fn review_claude_three_seeds_64_passes_and_audit_durable_state() {
 }
 
 #[tokio::test]
-#[ignore = "known stored-state identity defect: resident Broca persists engine_policy only when enabled"]
 async fn review_broca_strict_durable_policy_identity_witness() {
     seeded_identity(false, 0x13a5, 1, Some("conversation"), 81).await;
 }
 
 #[tokio::test]
-#[ignore = "known stored-state identity defect: resident Claude persists baseline_cut_id only when enabled"]
 async fn review_claude_strict_durable_policy_identity_witness() {
     seeded_identity(true, 0x13a5, 1, Some("conversation"), 40).await;
 }
 
 #[tokio::test]
-#[ignore = "known stored-state identity defect: resident Claude leaves an already-covered drop queued"]
 async fn review_claude_covered_drop_retirement_identity_witness() {
     seeded_identity(true, 0x13a5, 4, Some("pending_drops"), 40).await;
 }
@@ -402,7 +399,6 @@ async fn review_claude_live_tail_drop_retires_with_residency_on_and_off() {
 }
 
 #[tokio::test]
-#[ignore = "known stored-state identity defect: delta references do not promote the frozen view to applied"]
 async fn review_broca_strict_frozen_view_ack_identity_witness() {
     let root = review_root();
     let project = root.path().join("project");

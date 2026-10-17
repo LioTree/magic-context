@@ -1256,13 +1256,7 @@ fn execute_host(
         }
     }
     if let Some(lease) = resident.as_mut() {
-        let current = store
-            .load_provider_conversation(&work.key.store_key())
-            .map_err(transient)?
-            .ok_or_else(|| transient("resident conversation is missing"))?;
-        let counters: Value =
-            serde_json::from_str(&current.hook_counters_json).map_err(transient)?;
-        let settings = &counters["engine_policy"];
+        let settings = store.provider_fold_settings(&work.key.store_key()).map_err(transient)?;
         if let Some(mut prefix) = template.native_fold_prefix.clone().filter(|prefix| {
             settings["coverage"]
                 .as_u64()

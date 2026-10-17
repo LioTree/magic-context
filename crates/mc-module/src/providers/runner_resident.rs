@@ -595,13 +595,7 @@ impl RunnerRecord<'_> {
         let Some(lease) = self.lease.as_mut() else {
             return Ok(());
         };
-        let conversation = store
-            .load_provider_conversation(&key.store_key())
-            .map_err(transient)?
-            .ok_or_else(|| transient("runner conversation missing"))?;
-        let counters: Value =
-            serde_json::from_str(&conversation.hook_counters_json).map_err(transient)?;
-        let settings = &counters["engine_policy"];
+        let settings = store.provider_fold_settings(&key.store_key()).map_err(transient)?;
         if template
             .native_fold_prefix
             .as_ref()

@@ -63,7 +63,7 @@ pub(crate) fn decode_facts(
 
 pub(crate) fn current_cut_tx(conn: &Connection, conv: &str) -> rusqlite::Result<Option<u64>> {
     use rusqlite::OptionalExtension;
-    conn.query_row("SELECT json_extract(hook_counters_json,'$.engine_policy.baseline_cut_id') FROM mc_provider_conversations_v2 WHERE conv_key=?1", [conv], |r|r.get(0)).optional().map(Option::flatten)
+    conn.query_row("SELECT cut_id FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 ORDER BY cut_id DESC LIMIT 1", [conv], |r|r.get(0)).optional()
 }
 
 pub(crate) struct FrozenPolicyResolver {
