@@ -29,6 +29,23 @@ const messages = (): MessageLike[] =>
 const digests = (entry: ReturnType<typeof projectLkgEntry>) =>
     entry.map((p) => p.contentDigest?.());
 
+test("entry digest session deletion releases only that session's accounted bytes", () => {
+    const cache = new slot.LkgEntryDigestCache({
+        sessionMaxBytes: 1024 * 1024,
+        totalMaxBytes: 2 * 1024 * 1024,
+        maxSessions: 16,
+    });
+    cache.digests("ended", messages().slice(0, 1));
+    cache.digests("active", messages().slice(0, 2));
+    const active = cache.stats().sessions.find((entry) => entry.sessionId === "active");
+    expect(active?.bytes).toBeGreaterThan(0);
+    cache.deleteSession("ended");
+    cache.deleteSession("ended");
+    expect(cache.stats()).toEqual({ totalBytes: active?.bytes, sessions: [active] });
+    expect(cache.digests("active", messages().slice(0, 2)).stats.reused).toBe(2);
+    expect(cache.digests("ended", messages().slice(0, 1)).stats.reused).toBe(0);
+});
+
 test("portable input certification reuses only exact pristine entries", () => {
     const project = createLkgEntryProjector({ maxBytes: 8 * 1024 * 1024 });
     const raw = messages().slice(0, 4);

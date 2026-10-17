@@ -770,6 +770,7 @@ export function forgetInMemorySlot(sessionId: string): void {
 }
 
 export function dropSlot(sessionId: string, _reason?: string, certify = true): void {
+    sharedLkgEntryDigests.deleteSession(sessionId);
     clearCapturedLkgMeasurement(sessionId);
     forgetInMemorySlot(sessionId);
     // The durable row must follow the drop: a slot invalidated in memory
@@ -1119,6 +1120,13 @@ export class LkgEntryDigestCache {
                 bytes: session.bytes,
             })),
         };
+    }
+
+    deleteSession(sessionId: string): void {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        this.totalBytes -= session.bytes;
+        this.sessions.delete(sessionId);
     }
 
     clear(): void {
