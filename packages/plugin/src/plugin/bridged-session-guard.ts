@@ -4,8 +4,11 @@ import {
     hasBridgedSessions,
     isBridgedSession,
 } from "../shared/bridged-sessions";
+import { getHarness } from "../shared/harness";
+import { log } from "../shared/logger";
 import { isRecord } from "../shared/record-type-guard";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
+import type { Database } from "../shared/sqlite";
 
 /**
  * OpenCode 1 stand-down for sessions another product's bridge has enrolled
@@ -107,6 +110,44 @@ export function eventConcernsBridgedSession(event: unknown): boolean {
     return isRecord(part) && isBridgedSession(part.sessionID);
 }
 
+/**
+ * The session a `session.deleted` event removes, when that session is
+ * enrolled; otherwise undefined.
+ */
+function deletedBridgedSessionId(event: unknown): string | undefined {
+    if (!isRecord(event) || event.type !== "session.deleted") return undefined;
+    const properties = isRecord(event.properties) ? event.properties : undefined;
+    const info = isRecord(properties?.info) ? properties.info : undefined;
+    const sessionId = info?.id ?? properties?.sessionID;
+    return typeof sessionId === "string" && isBridgedSession(sessionId) ? sessionId : undefined;
+}
+
+/**
+ * Remove the two rows OpenCode 1's `session.created` handler wrote for a
+ * session that was enrolled in a bridge afterwards: its `session_meta` row
+ * (subagent flag, cache TTL) and its `session_projects` row (project
+ * identity). The bridge enrolls sessions that already exist, so their
+ * `session.created` can reach Magic Context before the enrollment does (a
+ * session enrolled earlier has its `session.created` stood down and owns no
+ * rows here). Every hook after enrollment stands down, including the normal
+ * `session.deleted` cleanup. This removes exactly
+ * those rows and nothing else: in bridge mode other writers may own further
+ * rows for the same session, and cleaning those up is the bridge's job.
+ */
+export function dropBridgedSessionCreatedRows(db: Database, sessionId: string): void {
+    const harness = getHarness();
+    db.transaction(() => {
+        db.prepare("DELETE FROM session_meta WHERE session_id = ? AND harness = ?").run(
+            sessionId,
+            harness,
+        );
+        db.prepare("DELETE FROM session_projects WHERE session_id = ? AND harness = ?").run(
+            sessionId,
+            harness,
+        );
+    })();
+}
+
 /** Refuse Magic Context tool calls that arrive for an enrolled session. */
 export function guardBridgedSessionTools(
     tools: Record<string, ToolDefinition>,
@@ -143,8 +184,16 @@ export function guardBridgedSessionRpc(server: MagicContextRpcServer): void {
         );
 }
 
+export interface StandDownOptions {
+    /**
+     * Called, instead of the normal event handling, when an enrolled session is
+     * deleted. The plugin entry uses it to run `dropBridgedSessionCreatedRows`.
+     */
+    onBridgedSessionDeleted?: (sessionId: string) => void;
+}
+
 /** Wrap the OpenCode 1 hooks object so enrolled sessions are left untouched. */
-export function standDownForBridgedSessions(hooks: Hooks): Hooks {
+export function standDownForBridgedSessions(hooks: Hooks, options: StandDownOptions = {}): Hooks {
     const guarded: Hooks = { ...hooks };
     const slots = guarded as Record<string, unknown>;
 
@@ -194,8 +243,21 @@ export function standDownForBridgedSessions(hooks: Hooks): Hooks {
 
     const event = hooks.event;
     if (event) {
-        guarded.event = (input) =>
-            eventConcernsBridgedSession(input?.event) ? RESOLVED : event(input);
+        guarded.event = (input) => {
+            if (!eventConcernsBridgedSession(input?.event)) return event(input);
+            const deleted = deletedBridgedSessionId(input?.event);
+            if (deleted && options.onBridgedSessionDeleted) {
+                try {
+                    options.onBridgedSessionDeleted(deleted);
+                } catch (error) {
+                    log(
+                        `[magic-context] bridged session ${deleted}: dropping created rows failed`,
+                        error,
+                    );
+                }
+            }
+            return RESOLVED;
+        };
     }
 
     if (hooks.tool) guarded.tool = guardBridgedSessionTools(hooks.tool);

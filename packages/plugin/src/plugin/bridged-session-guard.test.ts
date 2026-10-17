@@ -662,7 +662,10 @@ describe("plugin entry wiring", () => {
     const entry = readFileSync(join(import.meta.dir, "..", "index.ts"), "utf8");
 
     test("the hooks object OpenCode receives is wrapped by the stand-down guard", () => {
-        expect(entry).toMatch(/return standDownForBridgedSessions\(\{\n\s{8}tool: tools,/);
+        expect(entry).toMatch(/const entryHooks: Hooks = \{\n\s{8}tool: tools,/);
+        expect(entry).toMatch(/return standDownForBridgedSessions\(entryHooks, \{/);
+        // Nothing else is returned to the host.
+        expect([...entry.matchAll(/^ {4}return /gm)]).toHaveLength(1);
     });
 
     test("every RPC registration on the entry is guarded first", () => {
@@ -675,8 +678,8 @@ describe("plugin entry wiring", () => {
     });
 
     test("every session-bearing hook the entry returns is one the guard covers", () => {
-        const start = entry.indexOf("return standDownForBridgedSessions({");
-        const end = entry.indexOf("\n    });\n};", start);
+        const start = entry.indexOf("const entryHooks: Hooks = {");
+        const end = entry.indexOf("\n    };\n", start);
         const returned = entry.slice(start, end);
         const keys = [...returned.matchAll(/^\s{8}(?:"([a-z.]+)"|([a-zA-Z]+)):/gm)].map(
             (match) => match[1] ?? match[2],

@@ -60,6 +60,7 @@ import {
 } from "./plugin/boot-deadline";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
 import {
+    dropBridgedSessionCreatedRows,
     guardBridgedSessionRpc,
     standDownForBridgedSessions,
 } from "./plugin/bridged-session-guard";
@@ -858,9 +859,7 @@ const server: Plugin = async (ctx) => {
         }),
     );
 
-    // Sessions another product's bridge has enrolled get none of these hooks'
-    // work; every other session reaches them unchanged.
-    return standDownForBridgedSessions({
+    const entryHooks: Hooks = {
         tool: tools,
         event: createEventHandler({
             magicContext: {
@@ -1167,6 +1166,19 @@ const server: Plugin = async (ctx) => {
                         : undefined,
                 );
             }
+        },
+    };
+
+    // Sessions another product's bridge has enrolled get none of these hooks'
+    // work; every other session reaches them unchanged.
+    return standDownForBridgedSessions(entryHooks, {
+        // When our session.created handler ran before the bridge enrolled the
+        // session, the two rows it wrote are the only ones to remove on deletion.
+        // Storage that never opened (disabled plugin, fail-closed) wrote none.
+        onBridgedSessionDeleted: (sessionId) => {
+            if (!pluginConfig.enabled || !magicContextRuntime.magicContext) return;
+            const db = openDatabase();
+            if (db && isDatabasePersisted(db)) dropBridgedSessionCreatedRows(db, sessionId);
         },
     });
 };
