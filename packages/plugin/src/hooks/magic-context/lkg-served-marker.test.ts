@@ -591,7 +591,8 @@ describe("served certificates are bound to their bytes", () => {
             WHEN NEW.served_digest IS NOT NULL
             BEGIN SELECT RAISE(ABORT, 'injected bind failure'); END`);
         expect(saveLkgSlotToDb(db, "s", next)).toBe(false);
-        // Neither half landed: the old bytes stay, and the new id remains unbound.
+        // The failed transaction wrote neither the new slot bytes nor the digest:
+        // the first request's bytes remain, and the new id stays unbound.
         expect(loadPersistedLkgSlot(db, "s")?.jsonPrefix).toBe(first.jsonPrefix);
         expect(readServedMarker(db, "s")).toEqual({
             servedCaptureId: next.servedCaptureId!,
@@ -656,7 +657,8 @@ describe("served certificates are bound to their bytes", () => {
             };
             expect(other.servedCaptureId).toBe(served.servedCaptureId);
             expect(saveLkgSlotToDb(sibling, "s", other)).toBe(true);
-            // This process serves its own request again: equal id, other bytes bound.
+            // The first connection serves its original request again. Its in-memory id
+            // equals the marker's id, but the marker is bound to the other bytes.
             const again = { ...served, capturedAt: served.capturedAt + 1, captureSequence: 4 };
             const id = recordServedCapture(db, "s", true, again);
             expect(id).toBe(other.servedCaptureId! + 1);
@@ -799,11 +801,13 @@ describe("served certificates are bound to their bytes", () => {
         const previous = slot(recordServedCapture(db, "s", true));
         expect(saveLkgSlotToDb(db, "s", previous)).toBe(true);
         const failedPrefix = '[{"text":"failed pass bytes"}]';
-        // This process still owns the marker: the old restore behavior applies.
+        // The marker still holds this pass's own id, so the restore may rewrite and
+        // re-certify storage as it did before the binding existed.
         expect(failedPassRestoreMode(db, "s", [previous.servedCaptureId], failedPrefix)).toBe(
             "certify",
         );
-        // Another writer allocated and saved: leave its slot and marker alone.
+        // Another writer allocated an id and saved its own slot: the failed pass must
+        // leave both that slot and the marker unchanged.
         const siblingSlot = {
             ...slot(),
             jsonPrefix: '[{"text":"sibling served bytes"}]',
@@ -813,7 +817,8 @@ describe("served certificates are bound to their bytes", () => {
         expect(failedPassRestoreMode(db, "s", [previous.servedCaptureId], failedPrefix)).toBe(
             "leave",
         );
-        // Another writer allocated, but storage still holds this pass's own bytes.
+        // Another writer allocated an id but has not saved, so storage still holds the
+        // failed pass's bytes: replace them, but without a certificate.
         expect(saveLkgSlotToDb(db, "s", { ...slot(), jsonPrefix: failedPrefix })).toBe(true);
         recordServedCapture(db, "s", true);
         expect(failedPassRestoreMode(db, "s", [previous.servedCaptureId], failedPrefix)).toBe(

@@ -3757,7 +3757,8 @@ export function createTransform(deps: TransformDeps) {
                 systemPromptHash: sessionMeta.systemPromptHash,
             });
         deps.onPostprocess?.({ bustedThisPass: postTransformResult.bustedThisPass });
-        // This pass now returns its request: certify the capture it served.
+        // The pass is about to return its request to the host, so the capture of that
+        // request was really served: give it its served-capture id now.
         if (servedAtReturn) {
             const { slot, fullCoverage, prior } = servedAtReturn;
             const servedCaptureId = recordServedCapture(db, sessionId, fullCoverage, slot, prior);

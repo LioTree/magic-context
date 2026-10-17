@@ -150,8 +150,9 @@ export function recordServedSlotState(db: Database, sessionId: string, reason: s
 
 /**
  * How a pass that failed after its capture may treat storage when it puts back
- * its previous request. `certify` keeps the previous behavior: this process still
- * owns the certificate, so it may write and certify. `uncertified` means another
+ * its previous request. `certify`: the marker still holds one of this pass's ids, so the
+ * restore may rewrite the slot and allocate a fresh certificate for it, as it did
+ * before certificates were bound to bytes. `uncertified` means another
  * connection has allocated since, but storage still holds this failed pass's own
  * bytes; those must be replaced, without claiming the other writer's id.
  * `leave` means another connection owns both the certificate and the stored
@@ -297,7 +298,11 @@ export function checkLkgDurability(
         .deferred();
 }
 
-/** The certificate digest of the in-memory slot, from this connection's record when it has one. */
+/**
+ * The certificate digest of the in-memory slot. Uses the digest this connection
+ * recorded when it last saved those same bytes under that id, and otherwise
+ * hashes the slot.
+ */
 function liveCertificateDigest(db: Database, sessionId: string, slot: LkgSlot): string {
     const bound = boundLkgCertificate(db, sessionId);
     if (
@@ -321,7 +326,8 @@ export function repairLkgDurability(db: Database, sessionId: string): LkgDurabil
     const status = checkLkgDurability(db, sessionId);
     const slot = getInMemorySlot(sessionId);
     if (!slot || isRustMarkerAdmissionFenced(db, sessionId)) return status;
-    // A capture whose pass did not return it was never served; it has no claim.
+    // The pass that captured this slot never returned it to the host, so these
+    // bytes were never served and must not be certified.
     if (slot.servedCaptureWithheld) return uncertified;
     if (!status.durable && slot.servedCaptureId !== undefined) return status;
     const marker = readServedMarker(db, sessionId);

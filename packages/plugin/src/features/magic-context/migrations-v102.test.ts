@@ -91,7 +91,8 @@ describe("migration 102", () => {
             MIGRATIONS.find((entry) => entry.version === 102)!.up(db);
             expect(markerColumns(db)).toEqual(markerColumns(fresh));
 
-            // A pre-upgrade pair with matching ids is not certified by id alone.
+            // A pre-upgrade slot and marker with matching capture ids are not certified:
+            // the marker has no digest naming the slot's bytes.
             db.prepare(
                 `INSERT INTO lkg_slots (session_id, json_prefix_chars, json_prefix_chunks,
                     json_prefix_hash, input_id_seq, input_content_digests, last_input_message_id,

@@ -2682,7 +2682,8 @@ export function createRustModeTransform(
         if (prepareOnly) return rejection === null ? "captured" : "superseded";
         // A capture committed before its pass returns (a synchronous capture, or a
         // test scheduler that runs inline) is served by that same pass, so it
-        // takes its certificate here. Otherwise the pass took it on return.
+        // allocates its served-capture id here. Any other capture was given its id
+        // when its pass returned, and this call does nothing.
         allocateServedCapture(plan);
         const captured = rejection === null && captureSlot(plan.sessionId, slot);
         if (!captured)
@@ -5296,8 +5297,8 @@ export function createRustModeTransform(
                     // served certificate now (a capture already committed inside the
                     // pass took it then). When later work changed the returned bytes,
                     // the prepared bytes the deferred save writes were not served:
-                    // move the certificate past every earlier capture, but leave this
-                    // save uncertified.
+                    // still allocate a new id so no earlier capture stays
+                    // certified, but save these prepared bytes without that id.
                     if (!captureForCertificate.servedIdAllocated) {
                         allocateServedCapture(captureForCertificate, returnedPrepared);
                         if (!returnedPrepared)

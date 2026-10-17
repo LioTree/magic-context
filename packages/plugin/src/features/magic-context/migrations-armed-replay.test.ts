@@ -854,8 +854,8 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
                 { name: "idx_tags_session_tool_owner" },
             ]);
             // Fresh initialization already has the served digest column. Remove it
-            // and leave a populated pre-102 marker so the next step must add the
-            // column to a store that already holds certificates.
+            // and insert a pre-102 served marker row, so migration 102 must add the
+            // column to a store that already holds marker rows.
             db.exec(`ALTER TABLE lkg_served_markers DROP COLUMN served_digest;
                 INSERT INTO lkg_served_markers(session_id, served_capture_id, full_coverage, slot_state)
                 VALUES ('armed-v101', 7, 1, 'captured');`);
