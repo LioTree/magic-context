@@ -1,5 +1,6 @@
 use super::*;
 
+mod restart;
 mod vectors;
 use crate::dream_dispatch::context::*;
 use crate::dream_dispatch::domain_control::available;
@@ -7,7 +8,6 @@ use crate::dream_dispatch::host_carrier::HostCarrier;
 use crate::dream_runner::{ChildRequest, Completion, DreamCarrier, ModelEntry, Usage};
 use crate::historian_runner::{HistorianRunnerKind, ResolvedRunner, RunnerSource};
 use crate::{McModuleConfig, SessionBinding};
-use mc_store::dream_domain::DreamDomainLease;
 use mc_store::dream_scheduler::budget::{BudgetAction, TokenBudget};
 use mc_store::dream_scheduler::schedules::TaskName;
 use mc_store::dream_scheduler::{schedules::TaskConfig, SqliteDreamScheduler};
@@ -192,12 +192,13 @@ impl Fixture {
                 harness: "opencode2".into(),
                 directory,
             }),
-            domain_lease: DreamDomainLease {
-                key: "dreaming".into(),
-                holder: "owner".into(),
-                generation: 3,
-                expires_at_ms: 180_000,
-            },
+            domain_lease: handler
+                .store
+                .get()
+                .unwrap()
+                .acquire_dream_domain("dreaming", "owner", 60_000)
+                .unwrap()
+                .unwrap(),
             task_lease: lease,
             cancellation: Cancellation::default(),
             clock: clock.clone(),
@@ -242,6 +243,7 @@ impl Fixture {
             self.context.clone(),
             self.effects.clone(),
             self.effects.clone(),
+            self.handler.store.get().unwrap().clone(),
             self.scheduler.clone(),
             &self.root.path().join("claim-fences"),
         )
@@ -718,6 +720,7 @@ async fn dream_claim_restart_and_unknown_cleanup_block_replacement() {
         f.context.clone(),
         f.effects.clone(),
         f.effects.clone(),
+        f.handler.store.get().unwrap().clone(),
         f.scheduler.clone(),
         &f.root.path().join("claim-fences"),
     );
@@ -726,7 +729,7 @@ async fn dream_claim_restart_and_unknown_cleanup_block_replacement() {
         .await
         .unwrap_err()
         .message
-        .contains("unreconciled_domain"));
+        .contains("dream_restart_quarantine_until"));
     let close = carrier.close(&child, false);
     let claimant = async {
         wait_for(
@@ -751,7 +754,7 @@ async fn dream_claim_restart_and_unknown_cleanup_block_replacement() {
         .await
         .unwrap_err()
         .message
-        .contains("unreconciled_domain"));
+        .contains("dream_restart_quarantine_until"));
     assert_eq!(
         f.send(
             &claim,

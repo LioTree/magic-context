@@ -11,11 +11,14 @@ use mc_store::dream_scheduler::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+mod recovery;
+pub use recovery::RESTART_GRACE_MS;
 
 const CAPACITY: usize = 64;
 const MAX_BODY: usize = 1024 * 1024;
@@ -67,6 +70,7 @@ struct Entry {
     router: Arc<dyn TaskToolRouter>,
     observer: Arc<dyn ChildObserver>,
     fence: PathBuf,
+    epoch: String,
     child: String,
     host_child: Option<String>,
     claim: Option<Claim>,
@@ -137,11 +141,13 @@ impl Entry {
     }
 }
 
-/// Timed-out claims are never reassigned. Until remote cleanup is acknowledged,
-/// the domain's durable marker prevents a second paid attempt, even after restart.
+/// After restart, the coordinator cannot know whether an old external child still
+/// runs. Replacement waits past the larger of its saved child deadline and lease
+/// renewal timestamp, plus grace. That bound is frozen once; old tokens never resume.
 #[derive(Default)]
 pub struct DreamQueue {
     entries: Mutex<BTreeMap<String, Entry>>,
+    epoch: OnceLock<String>,
 }
 
 impl DreamQueue {
@@ -196,37 +202,47 @@ impl DreamQueue {
             .map(TokenBudget::new)
             .transpose()
             .map_err(error)?;
-        fs::create_dir_all(&carrier.fence_root).map_err(|e| error(e.to_string()))?;
-        #[cfg(unix)]
+        let epoch = if let Some(epoch) = self.epoch.get() {
+            epoch.clone()
+        } else {
+            let epoch = secret()?;
+            let _ = self.epoch.set(epoch.clone());
+            epoch
+        };
+        let timing = carrier
+            .store
+            .dream_domain_timing(&carrier.context.domain_lease.key)
+            .map_err(|e| error(e.to_string()))?
+            .ok_or_else(|| error("unavailable: domain_timing_missing"))?;
+        if timing.holder != carrier.context.domain_lease.holder
+            || timing.generation != carrier.context.domain_lease.generation
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&carrier.fence_root, fs::Permissions::from_mode(0o700))
-                .map_err(|e| error(e.to_string()))?;
+            return Err(error("LeaseLost"));
         }
         let key = format!(
             "{}\0{}",
             carrier.context.scope.project.0, carrier.context.domain_lease.key
         );
-        let fence = carrier
-            .fence_root
-            .join(format!("{:x}.active", Sha256::digest(key.as_bytes())));
-        // Persist the active-attempt file before exposing work. A leftover file blocks
-        // replacement after restart; lease expiry cannot prove remote quiescence.
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+        let key = format!("{:x}", Sha256::digest(key.as_bytes()));
+        let marker = recovery::Marker::new(
+            &epoch,
+            &id,
+            &child,
+            &carrier.context.task_lease.invocation.0,
+            deadline,
+            carrier.context.deadline_ms,
+            &timing,
+        );
+        let (fence, retired) = recovery::reserve(
+            &carrier.fence_root,
+            &key,
+            &marker,
+            carrier.context.now_ms(),
+            Some(&timing),
+        )?;
+        if let Some(retired) = retired {
+            entries.remove(&retired);
         }
-        let mut file = options
-            .open(&fence)
-            .map_err(|e| error(format!("unavailable: unreconciled_domain: {e}")))?;
-        file.write_all(json!({"entry_id": id, "child_id": child, "invocation": carrier.context.task_lease.invocation}).to_string().as_bytes())
-            .and_then(|()| file.sync_all()).map_err(|e| error(e.to_string()))?;
-        fs::File::open(&carrier.fence_root)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| error(e.to_string()))?;
         entries.insert(
             id.clone(),
             Entry {
@@ -235,6 +251,7 @@ impl DreamQueue {
                 router: carrier.router.clone(),
                 observer: carrier.observer.clone(),
                 fence,
+                epoch,
                 child,
                 host_child: None,
                 claim: None,
@@ -265,7 +282,7 @@ impl DreamQueue {
             if let Some(e) = entries.get_mut(id) {
                 e.stop = true;
                 e.abandoned = true;
-                if e.claim.is_none() && fs::remove_file(&e.fence).is_ok() {
+                if e.claim.is_none() && recovery::release(&e.fence, id, &e.epoch).is_ok() {
                     e.cleaned = true;
                 }
             }
@@ -343,7 +360,7 @@ impl DreamQueue {
             {
                 e.stop = true;
                 // A refused descriptor was never handed out and cannot have a remote child.
-                fs::remove_file(&e.fence).map_err(|_| "fence_remove_failed")?;
+                recovery::release(&e.fence, id, &e.epoch).map_err(|e| e.message)?;
                 e.cleaned = true;
                 return Err("unavailable".into());
             }
@@ -399,10 +416,7 @@ impl DreamQueue {
                             .observe(child, ChildEvent::Closed { settled: e.settled })
                             .map_err(|e| format!("{e:?}"))?;
                     }
-                    fs::remove_file(&e.fence).map_err(|_| "fence_remove_failed")?;
-                    fs::File::open(e.fence.parent().ok_or("fence_parent")?)
-                        .and_then(|d| d.sync_all())
-                        .map_err(|_| "fence_sync_failed")?;
+                    recovery::release(&e.fence, id, &e.epoch).map_err(|e| e.message)?;
                     e.cleaned = true;
                 }
                 Ok(json!({"ok": true}))
@@ -640,6 +654,7 @@ pub struct HostCarrier {
     context: Arc<TaskContext>,
     router: Arc<dyn TaskToolRouter>,
     observer: Arc<dyn ChildObserver>,
+    store: Arc<mc_store::McStore>,
     scheduler: Arc<SqliteDreamScheduler>,
     fence_root: PathBuf,
     used_children: Vec<String>,
@@ -652,6 +667,7 @@ impl HostCarrier {
         context: Arc<TaskContext>,
         router: Arc<dyn TaskToolRouter>,
         observer: Arc<dyn ChildObserver>,
+        store: Arc<mc_store::McStore>,
         scheduler: Arc<SqliteDreamScheduler>,
         fence_root: &Path,
     ) -> Self {
@@ -660,6 +676,7 @@ impl HostCarrier {
             context,
             router,
             observer,
+            store,
             scheduler,
             fence_root: fence_root.into(),
             used_children: Vec::new(),

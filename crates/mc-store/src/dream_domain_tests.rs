@@ -133,3 +133,79 @@ fn concurrent_dream_domain_claims_have_one_winner() {
     });
     assert_eq!(winners, 1);
 }
+
+fn timing_fixture() -> (McStore, tempfile::TempDir) {
+    let base = std::env::temp_dir().join("magic-context/i5-c1");
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::tempdir_in(base).unwrap();
+    let path = dir.path().join("context.db");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            &include_str!("../testdata/context_schema/schema.sql").replace(":applied_at", "1"),
+        )
+        .unwrap();
+    let store = McStore::open(&StorageDescriptor {
+        module_id: "magic-context".into(),
+        storage_namespace: "mc_cache".into(),
+        isolation: Isolation::Module,
+        backend: StorageBackend::Sqlite {
+            path: dir.path().join("store.db").to_string_lossy().into_owned(),
+        },
+    })
+    .unwrap();
+    store.install_context_domain(Arc::new(crate::SqliteContextDomain::open(&path).unwrap()));
+    (store, dir)
+}
+
+#[test]
+fn domain_timing_reads_durable_renewal_and_release_without_new_rows() {
+    let (store, _root) = timing_fixture();
+    assert_eq!(store.dream_domain_timing("dreaming").unwrap(), None);
+    let lease = store
+        .acquire_dream_domain("dreaming", "owner", 100)
+        .unwrap()
+        .unwrap();
+    let timing = store.dream_domain_timing("dreaming").unwrap().unwrap();
+    assert_eq!(
+        timing,
+        DreamDomainTiming {
+            holder: "owner".into(),
+            generation: lease.generation,
+            renewed_at_ms: 100,
+            expires_at_ms: 120_100
+        }
+    );
+    assert!(store.renew_dream_domain(&lease, 300).unwrap());
+    let renewed = store.dream_domain_timing("dreaming").unwrap().unwrap();
+    assert_eq!(renewed.renewed_at_ms, 300);
+    assert_eq!(renewed.expires_at_ms, 120_300);
+    assert!(store.release_dream_domain(&lease).unwrap());
+    assert_eq!(store.dream_domain_timing("dreaming").unwrap(), None);
+    assert_eq!(
+        store.context_read(|db| generation(db, "dreaming")).unwrap(),
+        lease.generation
+    );
+}
+
+#[test]
+fn domain_timing_refuses_corrupt_or_partial_lease_records() {
+    let (store, _root) = timing_fixture();
+    let lease = store
+        .acquire_dream_domain("dreaming", "owner", 100)
+        .unwrap()
+        .unwrap();
+    store
+        .context_write(&["dream_state"], |tx| {
+            set(tx, "dreaming", "heartbeat", "not-a-time")
+        })
+        .unwrap();
+    assert!(store.dream_domain_timing("dreaming").is_err());
+    assert!(store.release_dream_domain(&lease).unwrap());
+    store
+        .context_write(&["dream_state"], |tx| {
+            set(tx, "dreaming", "heartbeat", "100")
+        })
+        .unwrap();
+    assert!(store.dream_domain_timing("dreaming").is_err());
+}

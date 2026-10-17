@@ -60,7 +60,7 @@
           "directory": "<root>",
           "domain": {
             "expires_at_ms": 180000,
-            "generation": 3,
+            "generation": 1,
             "holder": "owner",
             "key": "dreaming"
           },
@@ -486,7 +486,7 @@
           "directory": "<root>",
           "domain": {
             "expires_at_ms": 180000,
-            "generation": 3,
+            "generation": 1,
             "holder": "owner",
             "key": "dreaming"
           },
@@ -563,6 +563,276 @@
       "response": {
         "ok": false,
         "refusal": "unavailable"
+      }
+    },
+    {
+      "name": "restart_original_claim",
+      "request": {
+        "capabilities": {
+          "child_guard": true,
+          "default_model": true,
+          "filesystem_fence": true,
+          "retire": true,
+          "steps": true,
+          "stop": true,
+          "task_tools": true,
+          "tokens": true,
+          "tools": [
+            "ctx_memory"
+          ]
+        },
+        "claimant_epoch": "epoch-1",
+        "entry_id": "<entry-5>",
+        "method": "dream.child.claim",
+        "v": 1
+      },
+      "response": {
+        "control": {
+          "claim_deadline_ms": 70000,
+          "heartbeat_interval_ms": 5000,
+          "ok": true,
+          "retire": false,
+          "start": false,
+          "stop": false
+        },
+        "descriptor": {
+          "agent": "curator",
+          "allowed_tools": [
+            "ctx_memory"
+          ],
+          "child_id": "<child-5>",
+          "deadline_ms": 70000,
+          "directory": "<root>",
+          "domain": {
+            "expires_at_ms": 180000,
+            "generation": 1,
+            "holder": "owner",
+            "key": "dreaming"
+          },
+          "invocation": "invocation-1",
+          "max_steps": 3,
+          "model": {
+            "model": "provider/model/with/slash",
+            "qualifier": "high"
+          },
+          "parent_session_id": "parent",
+          "prompt": "prompt",
+          "scope": {
+            "generation": 4,
+            "project": "<root>",
+            "session": "parent"
+          },
+          "system": "system",
+          "task": "curate",
+          "task_lease": {
+            "expires_at_ms": 180000,
+            "invocation": "invocation-1",
+            "scope": {
+              "generation": 4,
+              "project": "<root>",
+              "session": "parent"
+            }
+          },
+          "token_budget": 100
+        },
+        "entry_id": "<entry-5>",
+        "ok": true,
+        "token": "<token-5>"
+      }
+    },
+    {
+      "name": "restart_zombie_tool_refused",
+      "request": {
+        "arguments": {},
+        "call_id": "zombie",
+        "child_id": "<child-5>",
+        "claimant_epoch": "epoch-1",
+        "entry_id": "<entry-5>",
+        "method": "dream.child.tool",
+        "token": "<token-5>",
+        "tool": "ctx_memory",
+        "v": 1
+      },
+      "response": {
+        "ok": false,
+        "refusal": "not_found"
+      }
+    },
+    {
+      "name": "restart_zombie_completion_refused",
+      "request": {
+        "child_id": "<child-5>",
+        "claimant_epoch": "epoch-1",
+        "entry_id": "<entry-5>",
+        "event": {
+          "kind": "complete",
+          "length_capped": false,
+          "text": "stale completion"
+        },
+        "method": "dream.child.event",
+        "seq": 1,
+        "token": "<token-5>",
+        "v": 1
+      },
+      "response": {
+        "ok": false,
+        "refusal": "not_found"
+      }
+    },
+    {
+      "name": "restart_quarantine_no_replacement",
+      "request": {
+        "method": "dream.child.pending",
+        "v": 1
+      },
+      "response": {
+        "entries": [],
+        "ok": true
+      },
+      "setup": {
+        "frozen_retire_at_ms": 75000,
+        "now_ms": 61000,
+        "open_refusal": "unavailable: dream_restart_quarantine_until:75000"
+      }
+    },
+    {
+      "name": "second_restart_preserves_quarantine",
+      "request": {
+        "method": "dream.child.pending",
+        "v": 1
+      },
+      "response": {
+        "entries": [],
+        "ok": true
+      },
+      "setup": {
+        "frozen_retire_at_ms": 75000,
+        "now_ms": 74000,
+        "open_refusal": "unavailable: dream_restart_quarantine_until:75000"
+      }
+    },
+    {
+      "name": "restart_automatically_retired_replacement_claim",
+      "request": {
+        "capabilities": {
+          "child_guard": true,
+          "default_model": true,
+          "filesystem_fence": true,
+          "retire": true,
+          "steps": true,
+          "stop": true,
+          "task_tools": true,
+          "tokens": true,
+          "tools": [
+            "ctx_memory"
+          ]
+        },
+        "claimant_epoch": "epoch-1",
+        "entry_id": "<entry-6>",
+        "method": "dream.child.claim",
+        "v": 1
+      },
+      "response": {
+        "control": {
+          "claim_deadline_ms": 85000,
+          "heartbeat_interval_ms": 5000,
+          "ok": true,
+          "retire": false,
+          "start": false,
+          "stop": false
+        },
+        "descriptor": {
+          "agent": "curator",
+          "allowed_tools": [
+            "ctx_memory"
+          ],
+          "child_id": "<child-6>",
+          "deadline_ms": 85000,
+          "directory": "<root>",
+          "domain": {
+            "expires_at_ms": 194000,
+            "generation": 3,
+            "holder": "restart-2",
+            "key": "dreaming"
+          },
+          "invocation": "restart-2",
+          "max_steps": 3,
+          "model": {
+            "model": "provider/model/with/slash",
+            "qualifier": "high"
+          },
+          "parent_session_id": "parent",
+          "prompt": "prompt",
+          "scope": {
+            "generation": 4,
+            "project": "<root>",
+            "session": "parent"
+          },
+          "system": "system",
+          "task": "curate",
+          "task_lease": {
+            "expires_at_ms": 194000,
+            "invocation": "restart-2",
+            "scope": {
+              "generation": 4,
+              "project": "<root>",
+              "session": "parent"
+            }
+          },
+          "token_budget": 100
+        },
+        "entry_id": "<entry-6>",
+        "ok": true,
+        "token": "<token-6>"
+      }
+    },
+    {
+      "name": "restart_replacement_tool_permitted",
+      "request": {
+        "arguments": {},
+        "call_id": "permitted",
+        "child_id": "<child-6>",
+        "claimant_epoch": "epoch-1",
+        "entry_id": "<entry-6>",
+        "method": "dream.child.tool",
+        "token": "<token-6>",
+        "tool": "ctx_memory",
+        "v": 1
+      },
+      "response": {
+        "ok": true,
+        "output": {
+          "effect": "applied"
+        },
+        "receipt": {
+          "affected_ids": [
+            "memory-1"
+          ],
+          "details": {
+            "committed": true
+          },
+          "tool": "ctx_memory"
+        }
+      }
+    },
+    {
+      "name": "restart_replacement_completion_permitted",
+      "request": {
+        "child_id": "<child-6>",
+        "claimant_epoch": "epoch-1",
+        "entry_id": "<entry-6>",
+        "event": {
+          "kind": "complete",
+          "length_capped": false,
+          "text": "done"
+        },
+        "method": "dream.child.event",
+        "seq": 1,
+        "token": "<token-6>",
+        "v": 1
+      },
+      "response": {
+        "ok": true
       }
     }
   ],

@@ -19,6 +19,16 @@ pub struct DreamDomainLease {
     pub expires_at_ms: i64,
 }
 
+/// Durable timing of the current domain holder. A release deletes this record;
+/// callers must not interpret its absence as proof that remote work has stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DreamDomainTiming {
+    pub holder: String,
+    pub generation: u64,
+    pub renewed_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
 fn row_key(key: &str, field: &str) -> String {
     if key == "dreaming" {
         format!("dreaming_lease_{field}")
@@ -90,6 +100,42 @@ pub fn require_tx(
 }
 
 impl McStore {
+    /// Read the existing heartbeat/expiry rows without acquiring or renewing a lease.
+    pub fn dream_domain_timing(
+        &self,
+        key: &str,
+    ) -> Result<Option<DreamDomainTiming>, McStoreError> {
+        self.context_read(|db| {
+            let holder = get(db, key, "holder")?;
+            let heartbeat = get(db, key, "heartbeat")?;
+            let expiry = get(db, key, "expiry")?;
+            if holder.is_none() && heartbeat.is_none() && expiry.is_none() {
+                return Ok(None);
+            }
+            let timestamp = |value: Option<String>| {
+                number(value)
+                    .filter(|n| n.fract() == 0.0 && *n >= 0.0 && *n <= i64::MAX as f64)
+                    .map(|n| n as i64)
+                    .ok_or(rusqlite::Error::InvalidQuery)
+            };
+            let renewed_at_ms = timestamp(heartbeat)?;
+            let expires_at_ms = timestamp(expiry)?;
+            let holder = holder
+                .filter(|h| !h.is_empty())
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            let generation = generation(db, key)?;
+            if generation == 0 || expires_at_ms < renewed_at_ms {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(Some(DreamDomainTiming {
+                holder,
+                generation,
+                renewed_at_ms,
+                expires_at_ms,
+            }))
+        })
+    }
+
     /// Share the plugin's two-minute lease and generation protocol. Use a unique
     /// holder for each dispatcher attempt; an existing holder may refresh its lease.
     /// This transaction must complete before claiming the independent scheduler.

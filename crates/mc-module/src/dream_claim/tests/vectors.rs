@@ -269,6 +269,90 @@ async fn dream_claim_v1_frozen_vectors() {
         h.call(7, request).await,
     );
     drop(open);
+    let mut k = Fixture::new();
+    r.replacements.insert(
+        0,
+        (
+            k.root
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            "<root>".into(),
+        ),
+    );
+    let (old_job, old_claim, _) = k.running().await;
+    r.bind(&old_claim, 5);
+    r.record("restart_original_claim", json!({"v": 1, "method": "dream.child.claim", "entry_id": old_claim["entry_id"], "claimant_epoch": "epoch-1", "capabilities": capabilities()}), old_claim.clone());
+    old_job.abort();
+    let _ = old_job.await;
+    restart::restart(&mut k, 61_000, "restart-1");
+    r.send(
+        &k,
+        &old_claim,
+        "restart_zombie_tool_refused",
+        "dream.child.tool",
+        json!({"call_id": "zombie", "tool": "ctx_memory", "arguments": {}}),
+    )
+    .await;
+    r.send(&k, &old_claim, "restart_zombie_completion_refused", "dream.child.event", json!({"seq": 1, "event": {"kind": "complete", "text": "stale completion", "length_capped": false}})).await;
+    let (_, refused, claim) = restart::try_open(&k).await;
+    assert!(claim.is_none());
+    r.record(
+        "restart_quarantine_no_replacement",
+        json!({"v": 1, "method": "dream.child.pending"}),
+        k.pending().await,
+    );
+    r.cases.last_mut().unwrap()["setup"] = json!({"now_ms": 61000, "open_refusal": refused.unwrap_err().message,
+        "frozen_retire_at_ms": restart::marker(&k)["recovery"]["retire_at_ms"]});
+    restart::restart(&mut k, 74_000, "restart-2");
+    let (_, refused, claim) = restart::try_open(&k).await;
+    assert!(claim.is_none());
+    r.record(
+        "second_restart_preserves_quarantine",
+        json!({"v": 1, "method": "dream.child.pending"}),
+        k.pending().await,
+    );
+    r.cases.last_mut().unwrap()["setup"] = json!({"now_ms": 74000, "open_refusal": refused.unwrap_err().message,
+        "frozen_retire_at_ms": restart::marker(&k)["recovery"]["retire_at_ms"]});
+    k.clock.0.store(75_000, Ordering::SeqCst);
+    let (mut carrier, result, claim) = restart::try_open(&k).await;
+    let child = result.unwrap();
+    let claim = claim.unwrap();
+    r.bind(&claim, 6);
+    r.record("restart_automatically_retired_replacement_claim", json!({"v": 1, "method": "dream.child.claim", "entry_id": claim["entry_id"], "claimant_epoch": "epoch-1", "capabilities": capabilities()}), claim.clone());
+    let request = k.request();
+    let child_copy = child.clone();
+    let job = tokio::spawn(async move {
+        let result = carrier.complete(&child_copy, &request).await;
+        (carrier, result)
+    });
+    wait_for(
+        async || k.send(&claim, "dream.child.heartbeat", json!({})).await,
+        |v| v["start"] == true,
+    )
+    .await;
+    r.send(
+        &k,
+        &claim,
+        "restart_replacement_tool_permitted",
+        "dream.child.tool",
+        json!({"call_id": "permitted", "tool": "ctx_memory", "arguments": {}}),
+    )
+    .await;
+    r.send(
+        &k,
+        &claim,
+        "restart_replacement_completion_permitted",
+        "dream.child.event",
+        json!({"seq": 1, "event": {"kind": "complete", "text": "done", "length_capped": false}}),
+    )
+    .await;
+    let (mut carrier, result) = bounded(job).await.unwrap();
+    result.unwrap();
+    k.cleanup(&mut carrier, &claim, &child, true).await;
+
     let vectors = json!({"schema": "dream-claim-v1", "normalization": "Only OS credentials, queue/child ids and throwaway roots are replaced. Cases use v=1 routes; setup and routing channels are described in dream-claim-v1.md.", "cases": r.cases});
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(VECTOR_PATH);
     if std::env::var_os("UPDATE_DREAM_CLAIM_VECTORS").is_some() {
