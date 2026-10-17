@@ -296,13 +296,53 @@ describe("supported bridge constructor", () => {
             contextWindow: 100_000,
             systemPromptTokens: 100,
             toolDefinitionTokens: 0,
+            material: { system: ["Final system"], tools: [] },
         };
         expect(view.receipt.delivery).toBe("pending");
+        const before = JSON.stringify(view.messages);
+        expect(
+            await adapter.advanceNativeMarker("session", view.receipt, {
+                ...inputs,
+                material: undefined,
+            }),
+        ).toEqual({ kind: "deferred", reason: "native-marker-evidence-unavailable" });
+        expect(marker).not.toHaveBeenCalled();
+        expect(
+            adapter.isFallbackAdmissible("session", { ...inputs, contextWindow: 199 }).admissible,
+        ).toBe(true);
+        const fact = {
+            kind: "provider_response" as const,
+            sessionId: "session",
+            lineageId: view.receipt.lineage_id,
+            requestId: view.receipt.request_id,
+            model: { providerID: "openai", modelID: "gpt-5.6" },
+            observedAt: Date.now(),
+            completedAt: Date.now() - 1,
+            finishReason: "stop",
+            outcome: "success" as const,
+            contextWindow: 100_000,
+            material: inputs.material,
+            usage: { input: 100, cacheRead: 80, cacheWrite: 20, output: 99_999 },
+        };
+        expect(await adapter.recordHostFact({ ...fact, requestId: "unrelated" })).toEqual({
+            accepted: false,
+        });
+        expect((await adapter.recordHostFact(fact)).accepted).toBe(true);
+        expect(
+            (
+                await adapter.advanceNativeMarker("session", view.receipt, {
+                    ...inputs,
+                    contextWindow: 199,
+                })
+            ).kind,
+        ).toBe("deferred");
+        expect(marker).not.toHaveBeenCalled();
+        expect(JSON.stringify(view.messages)).toBe(before);
         expect((await adapter.advanceNativeMarker("session", view.receipt, inputs)).kind).toBe(
             "applied",
         );
         expect(marker).toHaveBeenCalledTimes(1);
-        expect(preparation).toHaveBeenCalledTimes(1);
+        expect(preparation).toHaveBeenCalledTimes(2);
         expect(adapter.receipt("session")).toMatchObject({
             delivery: "pending",
             served_through_ordinal: 0,
@@ -332,7 +372,7 @@ describe("supported bridge constructor", () => {
             ).kind,
         ).toBe("applied");
         expect(marker).toHaveBeenCalledTimes(2);
-        expect(preparation).toHaveBeenCalledTimes(2);
+        expect(preparation).toHaveBeenCalledTimes(3);
         expect(
             restarted.isFallbackAdmissible("session", {
                 ...inputs,
@@ -404,7 +444,6 @@ describe("supported bridge constructor", () => {
                 await restarted.advanceNativeMarker("session", clean!, {
                     messages: rows,
                     model: "openai/gpt-5.6",
-                    envelope: "complete",
                 })
             ).kind,
         ).toBe("deferred");
@@ -427,10 +466,8 @@ describe("supported bridge constructor", () => {
                 await restarted.advanceNativeMarker("session", clean!, {
                     messages: rows,
                     model: "openai/gpt-5.6",
-                    envelope: "complete",
                     contextWindow: 100_000,
-                    systemPromptTokens: 100,
-                    toolDefinitionTokens: 0,
+                    material: { system: ["Final system"], tools: [] },
                 })
             ).kind,
         ).toBe("applied");

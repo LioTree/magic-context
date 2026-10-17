@@ -15,6 +15,7 @@ import { createTagger } from "../../../features/magic-context/tagger";
 import type { PluginContext } from "../../../plugin/types";
 import { sessionLog } from "../../../shared/logger";
 import { resolveHistorianModel } from "../../../shared/model-resolution";
+import { boundMarkerEnvelope, markerEnvelopeKey } from "../marker-envelope";
 import { SubcModuleTransport } from "../module-transport";
 import { hasRawMessageProvider } from "../read-session-chunk";
 import { createRustModeTransform } from "../rust-mode-transform";
@@ -28,6 +29,7 @@ import {
     type BridgeAdapterOptions,
     type BridgeFallbackInputs,
     type BridgeHostFact,
+    type BridgeMarkerInputs,
     type BridgeOutcomeListener,
     BridgeRefusalError,
     type BridgeRunInput,
@@ -156,6 +158,7 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
     let disposal: Promise<void> | undefined;
     const runs = new Set<Promise<void>>();
     const activeSessions = new Set<string>();
+    const published = new Map<string, { requestId: string; messages: BridgeView["messages"] }>();
     function assertOpen() {
         if (disposed) throw new Error("Bridge adapter is disposed");
     }
@@ -180,7 +183,31 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             );
             observations.add(observing);
             try {
-                return await pending;
+                const result = await pending;
+                if (
+                    result.accepted &&
+                    fact.kind === "provider_response" &&
+                    fact.material &&
+                    fact.usage
+                ) {
+                    const sent = published.get(fact.sessionId);
+                    const model = `${fact.model.providerID}/${fact.model.modelID}`;
+                    const inputTokens =
+                        fact.usage.input + fact.usage.cacheRead + fact.usage.cacheWrite;
+                    if (
+                        sent?.requestId === fact.requestId &&
+                        inputTokens > 0 &&
+                        boundMarkerEnvelope(fact.material, model) !== undefined
+                    ) {
+                        provider.recordProviderUsage(fact.sessionId, {
+                            messages: sent.messages,
+                            model,
+                            envelope: markerEnvelopeKey(fact.material),
+                            inputTokens,
+                        });
+                    }
+                }
+                return result;
             } finally {
                 activeSessions.delete(fact.sessionId);
                 observations.delete(observing);
@@ -241,6 +268,17 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                     // receipt cannot authorize a native cut or acknowledge delivery.
                     sessionLog(id, "bridge receipt persistence deferred", error);
                 }
+                try {
+                    published.set(id, {
+                        requestId: receipt.request_id,
+                        messages: structuredClone(output.messages as BridgeView["messages"]).map(
+                            (m) => providerIncoming(m).read(),
+                        ),
+                    });
+                } catch {
+                    // Optional usage attribution must never reject a published view.
+                    published.delete(id);
+                }
                 return {
                     messages: output.messages as BridgeView["messages"],
                     kind: stepKind,
@@ -275,12 +313,16 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
         async advanceNativeMarker(
             id: string,
             receipt: BridgeReceipt,
-            inputs: BridgeFallbackInputs,
+            inputs: BridgeMarkerInputs,
         ): Promise<BridgeMarkerOutcome> {
             assertOpen();
             if (v2 || activeSessions.has(id))
                 return { kind: "deferred", reason: "native-marker-unavailable" };
             try {
+                const material = inputs.material && structuredClone(inputs.material);
+                if (!material || boundMarkerEnvelope(material, inputs.model) === undefined)
+                    return { kind: "deferred", reason: "native-marker-evidence-unavailable" };
+                const envelope = markerEnvelopeKey(material);
                 const pending = getPendingCompactionMarkerState(db, id);
                 if (!pending) return { kind: "deferred", reason: "no-pending-target" };
                 const { applyDeferredCompactionMarker } = await import(
@@ -319,6 +361,8 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                                 id,
                                 {
                                     ...inputs,
+                                    material,
+                                    envelope,
                                     messages: inputs.messages
                                         .filter((m) => !isMagicContextHead(m))
                                         .map((m) => providerIncoming(m).read()),
@@ -420,6 +464,7 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                 } finally {
                     listeners.clear();
                     observerFailures.clear();
+                    published.clear();
                     try {
                         transport.close();
                     } finally {

@@ -122,9 +122,9 @@ export function createBridgeHostFacts(
         modelTimes.set(id, Math.max(modelTimes.get(id) ?? 0, fact.observedAt));
         if (fact.kind === "provider_response") {
             windows.set(id, { model, limit: fact.contextWindow });
-            // Usage and completion time are not delivery acknowledgements.
-            // Only completeRequest can certify delivery; recordProviderUsage
-            // separately binds a token count to the exact outgoing messages.
+            // Usage and completion time are not delivery acknowledgements. The
+            // adapter separately binds supplied material/usage to the published
+            // request's messages; only completeRequest can certify delivery.
             await events({
                 event: {
                     type: "message.updated",

@@ -199,6 +199,7 @@ import {
 import { isAnthropicFamilyRoute } from "./sentinel";
 import { SharedCompartmentBoundaryError } from "./shared-compartment-boundaries";
 import { singleStoreMigrationRequiredFailure } from "./single-store-refusal";
+import { measureStandaloneMarker } from "./standalone-marker-envelope";
 import { StorageBusyRefusalError } from "./storage-busy-refusal";
 import { STORE_AHEAD_OF_BINARY_CODE, storeAheadOfBinaryFailure } from "./store-ahead-refusal";
 import {
@@ -4443,7 +4444,18 @@ export function createRustModeTransform(
                         new Set(ids).size === ids.length &&
                         pendingWireCache.rawContentSnapshots.length === ids.length;
                     const measure = measureOutputAgainstLimit(moduleMessages, contextLimit);
-                    markerAdmissionProven = coherentInputs && measure.fit === "under";
+                    const envelopeMeasure = measureStandaloneMarker({
+                        sessionId,
+                        model: `${model?.providerID}/${model?.modelID}`,
+                        systemHash: sessionMeta.systemPromptHash,
+                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                        messages: moduleMessages as MessageLike[],
+                        limit: contextLimit,
+                    });
+                    markerAdmissionProven =
+                        coherentInputs &&
+                        measure.fit === "under" &&
+                        envelopeMeasure.fit === "under";
                     if (!markerAdmissionProven) {
                         // A host cut is optional. Retain its pending target and serve the
                         // fresh engine output when local fit/capture proof is unavailable.

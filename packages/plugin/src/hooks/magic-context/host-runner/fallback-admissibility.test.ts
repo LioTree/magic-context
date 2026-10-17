@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { markerEnvelopeKey } from "../marker-envelope";
 import type { MessageLike } from "../transform-operations";
 import { isFallbackAdmissible, recordProviderUsage } from "./fallback-admissibility";
 import {
@@ -78,6 +79,55 @@ function measuredFixture() {
 }
 
 describe("host-runner fallback admissibility", () => {
+    test("material bound is never replaced by smaller matching usage", () => {
+        const { record, messages } = fixture();
+        const material = { system: ["Final system instructions. ".repeat(200)], tools: [] };
+        const envelope = markerEnvelopeKey(material);
+        const input = { messages, model: defaults.model, envelope, material, contextWindow: 300 };
+        recordProviderUsage(record, {
+            model: input.model,
+            envelope,
+            inputTokens: 1,
+            messages: assemble(record),
+        });
+        expect(isFallbackAdmissible(record, input)).toMatchObject({
+            admissible: false,
+            reason: "fit_unproven",
+        });
+        expect(isFallbackAdmissible(record, { ...input, contextWindow: 10000 }).admissible).toBe(
+            true,
+        );
+    });
+
+    test("same-view usage can raise the material floor but unrelated usage cannot", () => {
+        const { record, messages } = fixture();
+        const material = { system: ["Final system"], tools: [] };
+        const envelope = markerEnvelopeKey(material);
+        const input = { messages, model: defaults.model, envelope, material, contextWindow: 1000 };
+        expect(isFallbackAdmissible(record, input).admissible).toBe(true);
+        recordProviderUsage(record, {
+            model: input.model,
+            envelope,
+            inputTokens: 2000,
+            messages: assemble(record),
+        });
+        expect(isFallbackAdmissible(record, input).admissible).toBe(false);
+        for (const changed of [
+            { model: "another/model" },
+            { envelope: "other-envelope" },
+            { messages: [message("other-view")] },
+        ]) {
+            recordProviderUsage(record, {
+                model: input.model,
+                envelope,
+                inputTokens: 2000,
+                messages: assemble(record),
+                ...changed,
+            });
+            expect(isFallbackAdmissible(record, input).admissible).toBe(true);
+        }
+    });
+
     test("OpenCode retained pre-C tail serves the applied view and raw tail in append order", () => {
         const { record, messages } = fixture();
         const cut = {

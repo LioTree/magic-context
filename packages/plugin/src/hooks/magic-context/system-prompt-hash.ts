@@ -25,6 +25,7 @@ import {
 import { currentLkgRequestIdentity } from "./lkg-measured-request";
 import { requestPendingMaterialization } from "./pending-materialization";
 import { estimateTokens } from "./read-session-formatting";
+import { clearMarkerSystem, recordMarkerSystem } from "./standalone-marker-envelope";
 import { systemPromptDates } from "./system-prompt-dates";
 import { isHeldHeadForRequest, recordSystemPromptForRequest } from "./system-prompt-delivery";
 
@@ -49,6 +50,7 @@ export function clearSystemPromptHashSession(
 ): void {
     handleMaps.stickyDateBySession.delete(sessionId);
     handleMaps.cachedDocsBySession.delete(sessionId);
+    clearMarkerSystem(sessionId);
 }
 
 /**
@@ -594,6 +596,7 @@ export function createSystemPromptHashHandler(deps: {
         const currentHash = createHash("md5")
             .update(promptSurfaceHashMaterial(systemContent, promptSurface.preset))
             .digest("hex");
+        recordMarkerSystem(sessionId, modelKey, currentHash, output.system);
 
         recordSystemPromptForRequest(
             sessionId,

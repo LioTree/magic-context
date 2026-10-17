@@ -1,6 +1,7 @@
 import type { PluginContext } from "../../../plugin/types";
 import type { V2Context } from "../../../v2/hooks/types";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
+import type { MarkerEnvelope } from "../marker-envelope";
 import type { MessageLike } from "../transform-operations";
 import type { BridgeReceipt } from "./bridge-receipt";
 import type { FallbackInputs } from "./fallback-admissibility";
@@ -65,6 +66,8 @@ export type BridgeHostFact = BridgeFactScope &
               usage?: { input: number; cacheRead: number; cacheWrite: number; output: number };
               /** Positive host-resolved usable input window, including auth/config route caps. */
               contextWindow: number;
+              /** System strings and tool definitions sent by requestId. Usage is reusable only for a matching model and envelope. */
+              material?: MarkerEnvelope;
           }
         | {
               kind: "system_prompt";
@@ -114,6 +117,14 @@ export class StepBudgetExceededError extends Error {
 export type BridgeFallbackInputs = Omit<FallbackInputs, "messages"> & {
     /** Complete host-sent window; the facade normalizes OpenCode's C/S-before-tail order. */
     messages: readonly MessageLike[];
+};
+
+export type BridgeMarkerInputs = Omit<
+    BridgeFallbackInputs,
+    "envelope" | "systemPromptTokens" | "toolDefinitionTokens" | "material"
+> & {
+    /** Final system-transform strings and the complete sent tool set, not host token estimates. */
+    material?: MarkerEnvelope;
 };
 
 export type BridgeRefusalReason =

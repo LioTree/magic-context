@@ -102,6 +102,7 @@ import { getVisibleMemoryIds } from "./inject-compartments";
 import {
     beginV2LkgRequest,
     clearLkgMeasuredRequest,
+    currentLkgRequestIdentity,
     noteLkgProviderResponse,
 } from "./lkg-measured-request";
 import { createDbLkgPersistence, loadPersistedLkgSlot, saveLkgSlotToDb } from "./lkg-persist";
@@ -134,6 +135,7 @@ import {
     type RustModeModuleClient,
 } from "./rust-mode-transform";
 import { rustRawRebuild, servedRawBlockIds } from "./rust-served-raw";
+import { recordMarkerSystem } from "./standalone-marker-envelope";
 import { StorageBusyRefusalError } from "./storage-busy-refusal";
 import { registerSystemDateRefresh } from "./system-date-refresh";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
@@ -334,6 +336,16 @@ function makeMeta(
         updateSessionMeta(db, sessionId, { systemPromptTokens: 100 });
         meta.systemPromptTokens = 100;
     }
+    if (!currentLkgRequestIdentity(sessionId))
+        noteLkgProviderResponse({
+            sessionId,
+            modelKey: "test-provider/test-model",
+            responseId: `fixture-${sessionId}`,
+            inputTokens: 0,
+        });
+    recordMarkerSystem(sessionId, "test-provider/test-model", meta.systemPromptHash, [
+        "Fixture final system instructions.",
+    ]);
     return meta;
 }
 
