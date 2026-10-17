@@ -27,6 +27,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { instrumentNativeFold } from "./provider-native-fold-profile";
 import { createScheduler } from "../../plugin/src/features/magic-context/scheduler";
 import { runMigrations } from "../../plugin/src/features/magic-context/migrations";
 import { initializeDatabase } from "../../plugin/src/features/magic-context/storage-db";
@@ -166,7 +167,7 @@ fn provider_pipeline_driver() {
                 handler.store.set(store.clone()).ok().unwrap();
                 let binding = SessionBinding {
                     connection_incarnation: 0, native_generation: None,
-                    principal: matches!(cmd["harness"].as_str(), Some("opencode" | "opencode2")).then(|| subc_protocol::Principal::Reserved { module_id: "thalamus-harness".into() }),
+                    principal: if matches!(cmd["harness"].as_str(), Some("opencode" | "opencode2")) { Some(subc_protocol::Principal::Reserved { module_id: "thalamus-harness".into() }) } else { (cmd["attest_claude_code"] == true).then(||subc_protocol::Principal::Reserved { module_id: "thalamus".into() }) },
                     scope: matches!(cmd["harness"].as_str(), Some("opencode" | "opencode2")).then(|| serde_json::from_value(json!({"owner":subc_protocol::Principal::Reserved { module_id: "prefrontal-core".into() },"ref":"test-scope","scope_epoch":1,"kind":"head","owner_authorized":true})).unwrap()),
                     project_root: project, harness: cmd["harness"].as_str().unwrap().into(),
                     session: "session".into(), model_key: None, config,
@@ -658,6 +659,9 @@ export function buildDriver(directory: string): string {
     // compile the mutated source, not a cached source surrogate.
     const transformPath = join(generated, "src/transform.rs");
     if (existsSync(transformPath)) rmSync(transformPath);
+    const providersPath = join(generated, "src/providers");
+    if (existsSync(providersPath) && !lstatSync(providersPath).isSymbolicLink())
+        rmSync(providersPath, { recursive: true });
     for (const name of readdirSync(join(original, "src"))) {
         if (name !== "lib.rs") link(join(original, "src", name), join(generated, "src", name));
     }
@@ -667,7 +671,8 @@ export function buildDriver(directory: string): string {
     writeCurrent(driverPath, DRIVER);
     writeCurrent(
         join(generated, "src/lib.rs"),
-        lib.replace("mod tests {", `mod tests {\ninclude!(${JSON.stringify(driverPath)});`),
+        instrumentNativeFold(ROOT, generated,
+            lib.replace("mod tests {", `mod tests {\ninclude!(${JSON.stringify(driverPath)});`)),
     );
     const target = resolve(process.env.CARGO_TARGET_DIR ?? join(ROOT, "target"));
     const built = spawnSync(
@@ -688,7 +693,7 @@ export function buildDriver(directory: string): string {
             // optimized test executable avoids measuring debug-code overhead as a
             // provider outage; this oracle does not claim production timings.
             cwd: overlay,
-            env: { ...process.env, CARGO_TARGET_DIR: target, CARGO_PROFILE_TEST_OPT_LEVEL: "3" },
+            env: { ...process.env, CARGO_TARGET_DIR: target, CARGO_PROFILE_TEST_OPT_LEVEL: process.env.MC_PROVIDER_DRIVER_OPT_LEVEL ?? "3" },
             encoding: "utf8",
             maxBuffer: 64 * 1024 * 1024,
         },

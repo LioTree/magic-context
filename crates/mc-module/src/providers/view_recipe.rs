@@ -197,11 +197,6 @@ pub(super) fn save_with_base(
     let conversation = store
         .load_provider_conversation(&key.store_key())
         .map_err(transient)?;
-    let counters: Value = conversation
-        .as_ref()
-        .map(|row| serde_json::from_str(&row.hook_counters_json).map_err(transient))
-        .transpose()?
-        .unwrap_or(Value::Null);
     let base = conversation
         .as_ref()
         .and_then(|c| c.setup_json.as_ref())
@@ -218,8 +213,10 @@ pub(super) fn save_with_base(
         range_from: view.engine.range.from,
         range_to: view.engine.range.to,
         base_version: previous_view.map(|previous| previous.version()),
-        policy_cut_id: counters
-            .pointer("/engine_policy/baseline_cut_id")
+        policy_cut_id: store
+            .provider_fold_settings(&key.store_key())
+            .map_err(transient)?
+            .get("baseline_cut_id")
             .and_then(Value::as_u64),
         metadata,
         segments: Vec::new(),

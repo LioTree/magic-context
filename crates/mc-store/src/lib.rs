@@ -9029,6 +9029,21 @@ impl McStore {
         }
     }
 
+    /// Read the committed boundary from the small cache header without hydrating
+    /// frozen units or covered-message policy. Native endpoint validation needs
+    /// only this coordinate, not the history represented by the boundary.
+    pub fn load_boundary_id(&self, session_id: &str) -> Result<String, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            cache_codec::read_small_row(conn, session_id)?
+                .map(|row| {
+                    cache_codec::decode_small_core(&row.core_state).map(|core| core.boundary_id)
+                })
+                .transpose()
+                .map(|boundary| boundary.unwrap_or_default())
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?)
+    }
+
     /// Read the cache header and bounded shape summary, never chunk payloads.
     /// Missing summaries are deliberately unknown, not an empty frozen set.
     pub fn load_compaction_trigger_core(

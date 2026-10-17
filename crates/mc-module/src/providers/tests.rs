@@ -1,4 +1,6 @@
 use super::*;
+#[path = "resident_all_lanes_tests.rs"]
+mod resident_all_lanes;
 use std::collections::VecDeque;
 
 #[derive(Default)]

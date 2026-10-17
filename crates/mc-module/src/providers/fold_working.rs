@@ -16,6 +16,7 @@ pub(super) struct FoldWorking {
     pub native: Vec<Value>,
     projection: Arc<ck_wire::FlatProjection>,
     prefix_messages: usize,
+    serve_native: bool,
 }
 
 impl FoldWorking {
@@ -26,7 +27,7 @@ impl FoldWorking {
         prefix_messages: usize,
     ) -> Result<Self, HandlerOutcome> {
         let messages = request.messages.clone();
-        let native = request.native_messages.as_ref().unwrap().clone();
+        let native = request.native_messages.clone().unwrap_or_default();
         let projection = Arc::new(ck_wire::project_messages(&messages).map_err(transient)?);
         Ok(Self {
             key,
@@ -34,6 +35,7 @@ impl FoldWorking {
             native,
             projection,
             prefix_messages,
+            serve_native: request.serve_native,
         })
     }
 
@@ -45,10 +47,10 @@ impl FoldWorking {
         // Re-parsing CK JSON marks omitted optional fields as present and changes
         // source hashes. Retain the original decoder output, not a JSON round trip.
         request.messages.clone_from(&self.messages);
-        request.native_messages = Some(self.native.clone());
+        request.native_messages = (!self.native.is_empty()).then(|| self.native.clone());
         request.native_fold_projection = Some(self.projection.clone());
         request.native_fold_sidecar = None;
-        request.serve_native = true;
+        request.serve_native = self.serve_native;
         Ok(())
     }
 
@@ -119,6 +121,7 @@ mod tests {
             )],
             projection: Arc::new(ck_wire::project_messages(&[]).unwrap()),
             prefix_messages: 0,
+            serve_native: true,
         });
         lease.publish();
         assert_eq!(

@@ -50,6 +50,55 @@ pub struct ProviderGeneration {
 }
 
 impl McStore {
+    /// Detect changes to a cached runner record using SQLite's external-write
+    /// counter and the record's metadata. Compaction's policy counters are not
+    /// included: a fold updates them without changing the runner's transcript.
+    pub fn provider_record_token(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<(u64, Option<String>), McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let version = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+            let record = conn
+                .query_row(
+                    "SELECT record_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+                    [key.conversation_key()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok((version, record))
+        })?)
+    }
+
+    /// Append transcript rows while replacing runner metadata. The caller holds
+    /// its conversation lock. Refuse the write if the supplied token no longer
+    /// matches the database, so a stale cache cannot overwrite another writer.
+    pub fn save_provider_record_delta(
+        &self,
+        key: &ProviderSessionKey,
+        record_json: &str,
+        engine_session: &str,
+        tags: &[McTagRow],
+        expected: &(u64, Option<String>),
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            let version: u64 = tx.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+            let record: Option<String> = tx
+                .query_row(
+                    "SELECT record_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+                    [key.conversation_key()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if &(version, record) != expected {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            crate::provider_legacy::save_delta_tx(tx, key, record_json, engine_session, tags)?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     pub fn load_provider_record(
         &self,
         key: &ProviderSessionKey,

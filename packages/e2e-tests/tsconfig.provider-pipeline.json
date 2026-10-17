@@ -12,6 +12,7 @@
         "scripts/provider-resident-fleet-timing.ts",
         "scripts/provider-resident-hook-timing.ts",
         "scripts/provider-resident-paired-timing.ts",
+        "scripts/provider-resident-crash-review.ts",
         "scripts/provider-historian-hook-timing.ts",
         "scripts/provider-cold-hook-commit.test.ts",
         "tests/rust-provider-pipeline-opencode1.test.ts",

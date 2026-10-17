@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub(crate) struct ResidentPolicy {
+    pub(in crate::providers) runner: Option<Box<crate::providers::runner_resident::RunnerState>>,
     pub(crate) fold_prefix: Option<crate::providers::fold_prefix::FoldPrefix>,
     pub(crate) fold_lineage: Option<String>,
     pub(crate) fold_structure: Option<[u8; 32]>,
@@ -64,6 +65,7 @@ impl ResidentPolicy {
             None
         };
         Ok(Self {
+            runner: None,
             fold_prefix: crate::providers::fold_prefix::FoldPrefix::build(
                 &parts,
                 &counters["engine_policy"],
@@ -96,6 +98,7 @@ impl ResidentPolicy {
         // read_provider_resident_policy bounds input to 100,000 rows / 128 MiB
         // before allocating the temporary rebuild input.
         std::mem::size_of::<Self>()
+            + self.runner.as_ref().map_or(0, |runner| runner.retained_bytes())
             + crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES
             + std::mem::size_of::<Mutex<transform::SerializedOutputCache>>()
             + self

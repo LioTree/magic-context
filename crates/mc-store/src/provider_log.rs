@@ -239,7 +239,7 @@ pub(crate) fn save_engine_policy_tx(
         // Every policy part is rewritten below. Dropping the summary first means
         // the change triggers log nothing, and the next hook rebuilds it.
         drop_policy_summary_tx(conn, &conv)?;
-        let native_v2=matches!(harness.as_str(),"opencode"|"opencode2") && conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",params![conv,lineage],|r|r.get::<_,bool>(0))?;
+        let native_v2=(matches!(harness.as_str(),"opencode"|"opencode2") || policy.native_tail_section) && conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",params![conv,lineage],|r|r.get::<_,bool>(0))?;
         let old_frozen = if native_v2 {
             conn.query_row("SELECT frozen_through_ordinal FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 ORDER BY cut_id DESC LIMIT 1",[&conv],|r|r.get::<_,Option<u64>>(0)).optional()?.flatten()
         } else {
@@ -266,6 +266,12 @@ pub(crate) fn save_engine_policy_tx(
         }
         let mut counters = parse(&raw)?;
         counters["engine_policy"] = policy.settings.clone();
+        // The compartment source revision detects edits to summarized history
+        // before reusing a cached prefix. Save it with the frozen baseline in
+        // the cut's policy_key, not in hook counters shared with uncached calls.
+        if let Some(settings) = counters["engine_policy"].as_object_mut() {
+            settings.remove("native_compartment_source_revision");
+        }
         if native_v2 {
             let mut parts = Vec::new();
             if let Some(coverage) = coverage {
@@ -276,7 +282,7 @@ pub(crate) fn save_engine_policy_tx(
                     parts.push(serde_json::from_str(&raw?).map_err(sql_json)?);
                 }
             }
-            let cut = crate::provider_policy_overlay::freeze_cut_tx(
+            crate::provider_policy_overlay::freeze_cut_tx(
                 conn,
                 &conv,
                 &lineage,
@@ -289,7 +295,6 @@ pub(crate) fn save_engine_policy_tx(
                     e.to_string(),
                 )))
             })?;
-            counters["engine_policy"]["baseline_cut_id"] = json!(cut);
         }
         conn.execute(
             "UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1",

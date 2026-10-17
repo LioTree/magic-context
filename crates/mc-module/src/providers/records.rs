@@ -202,6 +202,18 @@ impl Storage {
     }
 
     pub fn save(&self, key: &Key, record: &Record) -> Result<(), HandlerOutcome> {
+        self.save_inner(key, record, None)
+    }
+
+    pub(super) fn token(&self, key: &Key) -> Result<(u64, Option<String>), HandlerOutcome> {
+        self.store()?.provider_record_token(&key.store_key()).map_err(transient)
+    }
+
+    pub(super) fn save_delta(&self, key: &Key, record: &Record, raw: &str, token: &(u64, Option<String>)) -> Result<(), HandlerOutcome> {
+        self.save_inner(key, record, Some((token, raw)))
+    }
+
+    fn save_inner(&self, key: &Key, record: &Record, delta: Option<(&(u64, Option<String>), &str)>) -> Result<(), HandlerOutcome> {
         // A host switch adopts the full-request engine namespace. Compatibility
         // saves must not silently move its tags and frozen state to a new one.
         let namespace = self
@@ -229,10 +241,13 @@ impl Storage {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        self.store()?
-            .save_provider_record(
+        if let Some((token, raw)) = delta {
+            return self.store()?.save_provider_record_delta(&key.store_key(), raw, &namespace, &tags, token).map_err(transient);
+        }
+        let raw = serde_json::to_string(record).map_err(transient)?;
+        self.store()?.save_provider_record(
                 &key.store_key(),
-                &serde_json::to_string(record).map_err(transient)?,
+                &raw,
                 &namespace,
                 &tags,
             )
@@ -442,7 +457,7 @@ pub async fn scan(
     storage: &Storage,
     runner: &dyn session_resolver::ProviderRunner,
     key: &Key,
-    record: &mut Record,
+    record: &mut super::runner_resident::RunnerRecord<'_>,
     lineage: Option<&str>,
     sought: &[u64],
     deadline: Instant,
@@ -478,7 +493,7 @@ pub async fn scan(
                 .ok_or_else(|| transient("transcript page omitted messages"))?,
         )?;
         ingest(record, page_lineage, &messages)?;
-        storage.save(key, record)?;
+        record.save(storage, key)?;
         if Instant::now() >= deadline {
             return Err(transient(
                 "transcript scan budget exhausted before its answer",
@@ -524,7 +539,7 @@ pub async fn scan(
                 }
             }
         }
-        storage.save(key, record)?;
+        record.save(storage, key)?;
         return Ok(());
     }
 }

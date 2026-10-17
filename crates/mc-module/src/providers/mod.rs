@@ -39,12 +39,13 @@ pub(crate) mod resident;
 mod resident_bytes;
 pub(crate) mod resident_hooks;
 mod resident_view;
+mod runner_resident;
 mod step_transform;
 #[cfg(test)]
 mod tests;
 mod view_recipe;
 
-use codec::{checked_view, decode_message};
+use codec::decode_message;
 #[cfg(test)]
 use codec::{encode_message, validate_replacement};
 pub(crate) use historian::RunCompletion;
@@ -427,7 +428,7 @@ impl McHandler {
                 method,
                 "compaction.setup" | "compaction.step" | "transform.hook"
             )
-            && matches!(binding.harness.as_str(), "opencode" | "opencode2");
+            && (host || binding.harness == session_resolver::RUNNER_BIND_HARNESS);
         if resident_wal {
             if let Some(store) = self.store.get() {
                 store.prepare_provider_wal();

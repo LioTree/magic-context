@@ -48,6 +48,8 @@ pub(super) struct ResidentView {
 
 impl ResidentView {
     pub fn metadata_of(view: &HostView) -> HostView {
+        let mut wire = view.wire.clone();
+        wire.replacement.clear();
         HostView {
             engine: transform::compaction::View {
                 compaction_id: view.engine.compaction_id.clone(),
@@ -55,16 +57,11 @@ impl ResidentView {
                 range: view.engine.range.clone(),
                 replacement: Vec::new(),
             },
-            wire: compact::answer::CompactionMessage::new(
-                &view.wire.compaction_id,
-                view.wire.version,
-                compact::answer::Range::new(view.wire.range.from, view.wire.range.to),
-                Vec::new(),
-            ),
+            wire,
             coverage: view.coverage.clone(),
-            raw_replacement: None,
-            head_slots: None,
-            cut_replacement: None,
+            raw_replacement: view.raw_replacement.clone(),
+            head_slots: view.head_slots.clone(),
+            cut_replacement: view.cut_replacement.clone(),
         }
     }
     pub fn store(
@@ -162,6 +159,7 @@ impl ResidentView {
 
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + serde_json::to_vec(&self.metadata).expect("view metadata JSON").len() * 4
             + self.metadata.engine.compaction_id.capacity()
             + self.metadata.engine.range.lineage_id.capacity()
             + self.metadata.wire.compaction_id.capacity()

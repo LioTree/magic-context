@@ -2717,9 +2717,14 @@ pub mod compaction {
         }
         let mut range = working_range(status, &template.messages)?;
         if template.native_fold_prefix.is_some() {
+            // status.last_applied_version acknowledges the last produced view.
+            // Use that view's original range before updating last_applied below;
+            // the older applied view may still be Setup's empty insertion.
             range.from = state
-                .last_applied
+                .last_produced
                 .as_ref()
+                .filter(|view| Some(view.version) == status.last_applied_version)
+                .or(state.last_applied.as_ref())
                 .ok_or(TransformError::OrdinalViolation)?
                 .range
                 .from;
@@ -8547,13 +8552,34 @@ fn apply_once(
     // Build the output before committing so a missing synthetic-todo anchor cannot
     // persist an unusable frozen pair. Pending rows are classified from the final plan:
     // live unfrozen targets remain durable, while applied or retired targets are consumed.
-    let consumed_drop_ids = consumed_pending_drop_ids(
+    let mut consumed_drop_ids = consumed_pending_drop_ids(
         &pending_agent_drops,
         &loaded.core,
         &core,
         &projection,
         meta.coverage_ordinal,
     );
+    if let Some(prefix) = req
+        .native_fold_prefix
+        .as_ref()
+        .filter(|_| !pending_agent_drops.is_empty())
+    {
+        let targets = pending_agent_drops
+            .iter()
+            .map(|drop| drop.target_id.as_str())
+            .collect::<Vec<_>>();
+        let covered =
+            store.provider_covered_drop_targets(&req.session_id, prefix.through, &targets)?;
+        consumed_drop_ids.extend(
+            pending_agent_drops
+                .iter()
+                .filter(|drop| {
+                    covered.contains(&drop.target_id) && !consumed_drop_ids.contains(&drop.id)
+                })
+                .map(|drop| drop.id)
+                .collect::<Vec<_>>(),
+        );
+    }
     // Only current trusted ingress evidence can authorize a native refusal. This
     // counts the protected results still live after this plan's actual fold;
     // protected results cannot be reduced by reclaim, so they are a lower bound
