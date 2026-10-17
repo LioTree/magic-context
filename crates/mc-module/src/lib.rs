@@ -43,6 +43,7 @@ pub mod classify;
 pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
+pub mod dream_tasks;
 mod memory_actions;
 
 /// Names reserved for scoped, non-tool management requests. These are not facade
