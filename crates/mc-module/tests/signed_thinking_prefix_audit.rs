@@ -36,6 +36,7 @@ const PREFIX_ERROR: &str = "bound to a different conversation";
 const MIDDLE_ERROR: &str = "thinking removed from the middle";
 const LATEST_TURN_ERROR: &str = "latest assistant turn thinking modified";
 const BYTES_ERROR: &str = "thinking bytes modified";
+const ORPHAN_ERROR: &str = "tool calls and results are not paired in adjacent carriers";
 
 /// One provider-visible block: `[role, kind]`.
 type Block = Value;
@@ -68,6 +69,9 @@ impl StrictMock {
     }
 
     fn check(&self, request: &[Block]) -> Option<&'static str> {
+        if tool_pairing_error(request) {
+            return Some(ORPHAN_ERROR);
+        }
         let sent: Vec<&Value> = request
             .iter()
             .filter(|b| b[1]["type"] == "reasoning")
@@ -132,6 +136,139 @@ impl StrictMock {
         }
         None
     }
+}
+
+/// The provider folds consecutive tool results into a user carrier. Check both directions
+/// across adjacent carriers so removing either side of a parallel batch is observable.
+fn tool_pairing_error(request: &[Block]) -> bool {
+    let mut carriers: Vec<(&str, Vec<&Value>)> = Vec::new();
+    for block in request {
+        let role = match block[0].as_str().unwrap() {
+            "tool" => "user",
+            role => role,
+        };
+        if let Some((_, blocks)) = carriers.last_mut().filter(|c| c.0 == role) {
+            blocks.push(&block[1]);
+        } else {
+            carriers.push((role, vec![&block[1]]));
+        }
+    }
+    let ids = |index: usize, kind: &str| -> BTreeSet<&str> {
+        carriers
+            .get(index)
+            .into_iter()
+            .flat_map(|(_, blocks)| blocks.iter())
+            .filter(|block| block["type"] == kind)
+            .filter_map(|block| block["id"].as_str())
+            .collect()
+    };
+    for i in 0..carriers.len() {
+        if !ids(i, "tool_call").is_subset(&ids(i + 1, "tool_result"))
+            || !ids(i, "tool_result").is_subset(
+                &i.checked_sub(1)
+                    .map_or_else(BTreeSet::new, |p| ids(p, "tool_call")),
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn mixed_wall(subagent: bool) {
+    let mut f = Fixture::new("opencode-aisdk", subagent, Lane::Wall95, "mixed-parallel");
+    f.tool_loop(3);
+    let n = f.step + 1;
+    let a = format!("parallel-{n}-a");
+    let b = format!("parallel-{n}-b");
+    // Keep assistant text beside the calls so dropping tool output cannot leave only thinking.
+    // The existing Wall95 case has no such text and continues to hold every reduction.
+    f.respond(
+        vec![
+            json!({"type":"text","text":"Read both parser implementations before choosing a fix."}),
+            read_call(&a, "/project/a.ts"),
+            read_call(&b, "/project/b.ts"),
+        ],
+        vec![
+            result(&a, "read", &"export const a = 1;\n".repeat(2400)),
+            result(&b, "read", &"export const b = 2;\n".repeat(2400)),
+        ],
+        true,
+    );
+    let before = f.wire();
+    let before_boundary = |wire: &[Block]| {
+        let last = wire
+            .iter()
+            .rposition(|b| b[1]["type"] == "reasoning")
+            .unwrap();
+        wire[..=last].to_vec()
+    };
+    f.store
+        .append_pending_agent_drops(&f.req.session_id, &["step-2-result-0#0".into()], 1)
+        .unwrap();
+    f.set_usage(95_000);
+    f.served = f.pass();
+    let after = f.wire();
+    audit_assert_eq!(f.mock.check(&after), None);
+    audit_assert_eq!(before_boundary(&after), before_boundary(&before));
+    audit_assert!(
+        without_thinking(&before) != without_thinking(&after),
+        "wall must reclaim the admitted parallel tail"
+    );
+    audit_assert_eq!(f.triggers().pending_drops, 1, "older drop must stay queued");
+    audit_assert!(f
+        .store
+        .load_meta(&f.req.session_id)
+        .unwrap()
+        .meta
+        .held_release
+        .is_some());
+    f.served = f.pass();
+    audit_assert_eq!(f.wire(), after, "unchanged input repeats identical bytes");
+    f.tool_loop(2);
+    if !subagent {
+        f.next_user_turn("mixed-release");
+        audit_assert_eq!(f.mock.check(&f.wire()), None);
+        audit_assert_eq!(
+            f.triggers().pending_drops,
+            0,
+            "tail reclaim must not settle the held older drop"
+        );
+        audit_assert!(f.served.prefix_bust_permitted);
+    } else {
+        audit_assert_eq!(f.triggers().pending_drops, 1);
+    }
+}
+
+#[test]
+fn mixed_wall_parallel_primary() {
+    mixed_wall(false);
+}
+
+#[test]
+fn mixed_wall_parallel_subagent() {
+    mixed_wall(true);
+}
+
+#[test]
+fn strict_mock_rejects_split_parallel_arcs() {
+    let mock = StrictMock::default();
+    let paired = vec![
+        json!(["assistant", read_call("a", "/a")]),
+        json!(["assistant", read_call("b", "/b")]),
+        json!(["tool", result("a", "read", "a")]),
+        json!(["tool", result("b", "read", "b")]),
+    ];
+    assert_eq!(mock.check(&paired), None);
+    for missing in 0..paired.len() {
+        let mut split = paired.clone();
+        split.remove(missing);
+        assert_eq!(mock.check(&split), Some(ORPHAN_ERROR), "missing {missing}");
+    }
+    let mut separated = paired.clone();
+    separated.insert(2, json!(["user", {"type":"text","text":"next turn"}]));
+    separated.insert(3, json!(["assistant", {"type":"text","text":"unrelated"}]));
+    assert_eq!(mock.check(&separated), Some(ORPHAN_ERROR));
 }
 
 /// The served request as the provider sees it: empty text sentinels and unsigned

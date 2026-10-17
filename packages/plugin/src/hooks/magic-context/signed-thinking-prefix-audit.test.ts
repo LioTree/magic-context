@@ -803,7 +803,53 @@ for (const generation of ["v1", "v2"] as const) {
                     }),
                 );
             }
-            if (subagent) return;
+            if (subagent) {
+                it(
+                    "wall reduces whole parallel tail arcs while the older drop stays held for the run",
+                    withFixture(
+                        generation,
+                        true,
+                        "emergency 95% wall",
+                        async (f) => {
+                            await toolLoop(f, 3);
+                            const parallel = (n: number) =>
+                                ["a", "b"].map((suffix) =>
+                                    readPart(
+                                        `call-${n}-${suffix}`,
+                                        `/project/${n}-${suffix}.ts`,
+                                        `export const ${suffix} = ${n};\n`.repeat(1000),
+                                    ),
+                                );
+                            await toolLoop(f, 1, parallel);
+                            const older = f.tag("old-read-b");
+                            queuePendingOp(f.db, f.sessionId, older, "drop");
+                            f.execute(true);
+                            f.setUsage(85);
+                            f.served = (await f.pass()).messages;
+                            const before = wire(f.served);
+                            f.setUsage(95);
+                            f.served = (await f.pass()).messages;
+                            const after = wire(f.served);
+                            expect(f.mock.check(after)).toBeNull();
+                            expect(beforeLastThinking(after)).toBe(beforeLastThinking(before));
+                            expect(withoutThinking(after)).not.toBe(withoutThinking(before));
+                            expect(f.tagStatus("old-read-b")).not.toBe("dropped");
+                            expect(
+                                getPendingOps(f.db, f.sessionId).some((op) => op.tagId === older),
+                            ).toBe(true);
+                            expect(wire((await f.pass()).messages)).toEqual(after);
+                            // Usage is still at 95%, so new tool output must be reducible even
+                            // after this pressure episode has already reclaimed an earlier batch.
+                            await toolLoop(f, 1, parallel);
+                            expect(f.mock.check(wire(f.served))).toBeNull();
+                            expect(f.tagStatus("call-9-a")).toBe("dropped");
+                            expect(f.tagStatus("old-read-b")).not.toBe("dropped");
+                        },
+                        "parallel-wall-run",
+                    ),
+                );
+                return;
+            }
             it(
                 "pass returns the postprocess bust verdict",
                 withFixture(
@@ -934,7 +980,7 @@ for (const generation of ["v1", "v2"] as const) {
                         ).toBe(true);
                         // The admitted tail reduction lands in every runtime (Pi does it today), so
                         // the pass really is mixed: something landed and something stayed held.
-                        if (STRICT_AUDIT) expect(tailLanded).toBe(true);
+                        expect(tailLanded).toBe(true);
                         expect(wire((await f.pass()).messages)).toEqual(after);
                         f.served = afterMessages;
                         await toolLoop(f, 2);

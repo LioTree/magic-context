@@ -5784,6 +5784,8 @@ fn apply_once(
     } else {
         crate::edit_admission::EditAdmission::new(&[], false)
     };
+    let (held_tool_batch_blocks, admitted_tool_batch_blocks) =
+        tool_batch_admission(req, &admission);
     let force_band_active = usage_percentage
         >= scheduler::escalation_bands(ctx.execute_threshold_percentage)
             .force_materialize_percentage;
@@ -6153,15 +6155,22 @@ fn apply_once(
             .into_iter()
             .flatten()
             .flat_map(|mid| {
+                let admitted_tool_batch_blocks = &admitted_tool_batch_blocks;
                 projection
                     .blocks
                     .iter()
                     .filter(move |block| block.mid == mid)
+                    .filter(move |block| {
+                        mid == lineage_anchor_mid.unwrap_or("")
+                            || scheduler_outcome.pass != scheduler::PassDecision::Emergency95
+                            || !admitted_tool_batch_blocks.contains(&block.id)
+                    })
                     .map(|block| block.id.clone())
             })
             .collect::<HashSet<_>>();
         exempt_message_protected_block_ids
             .extend(active_thinking_prefix_edit_ids(planning_core, req));
+        exempt_message_protected_block_ids.extend(held_tool_batch_blocks.iter().cloned());
         let mut protected_block_ids = tag_window_protected_block_ids
             .union(&exempt_message_protected_block_ids)
             .cloned()
@@ -19164,6 +19173,82 @@ impl HeldRelease {
         (!self.obligations.is_empty())
             .then(|| serde_json::to_value(self).expect("held triggers serialize"))
     }
+}
+
+/// A parallel assistant batch and all its results share admission. Reused provider call ids
+/// are paired in occurrence order rather than merging tools from different turns.
+fn tool_batch_admission(
+    req: &TransformRequest,
+    admission: &crate::edit_admission::EditAdmission,
+) -> (HashSet<String>, HashSet<String>) {
+    use crate::edit_admission::{BlockPos, EditCoord};
+    if admission.admit(EditCoord::Prefix) {
+        return (HashSet::new(), HashSet::new());
+    }
+    #[derive(Default)]
+    struct Batch<'a> {
+        coords: Vec<(&'a str, usize)>,
+        pending: HashSet<&'a str>,
+    }
+    let mut batches: Vec<Batch<'_>> = Vec::new();
+    let mut pending: HashMap<&str, std::collections::VecDeque<usize>> = HashMap::new();
+    let mut held = HashSet::new();
+    for message in &req.messages {
+        let mut batch = Batch::default();
+        for (index, block) in message.ck.content.iter().enumerate() {
+            if let ck_wire::CkKind::ToolCall {
+                id,
+                provider_executed: false,
+                ..
+            } = &block.kind
+            {
+                batch.coords.push((&message.mid, index));
+                batch.pending.insert(id);
+                pending.entry(id).or_default().push_back(batches.len());
+            }
+        }
+        if !batch.coords.is_empty() {
+            batches.push(batch);
+        }
+        for (index, block) in message.ck.content.iter().enumerate() {
+            if let ck_wire::CkKind::ToolResult {
+                id,
+                provider_executed: false,
+                ..
+            } = &block.kind
+            {
+                if let Some(batch) = pending.get_mut(id.as_str()).and_then(|q| q.pop_front()) {
+                    batches[batch].pending.remove(id.as_str());
+                    batches[batch].coords.push((&message.mid, index));
+                } else {
+                    held.insert(ck_wire::block_id(&message.mid, index));
+                }
+            }
+        }
+    }
+    let mut admitted = HashSet::new();
+    for batch in batches {
+        let sources = batch
+            .coords
+            .iter()
+            .map(|(mid, index)| EditCoord::Message {
+                mid: Some(mid),
+                block: BlockPos::Index(*index),
+            })
+            .collect::<Vec<_>>();
+        let target = if batch.pending.is_empty() && admission.admit_compound(&sources) {
+            &mut admitted
+        } else {
+            &mut held
+        };
+        target.extend(
+            batch
+                .coords
+                .iter()
+                .map(|(mid, index)| ck_wire::block_id(mid, *index)),
+        );
+    }
+    (held, admitted)
 }
 
 fn admit_block_id(admission: &crate::edit_admission::EditAdmission, id: &str) -> bool {
@@ -33253,6 +33338,7 @@ pub(crate) mod tests {
     include!("transform/image_admission_tests.rs");
     include!("transform/todo_admission_tests.rs");
     include!("transform/temporal_admission_tests.rs");
+    include!("transform/tool_arc_admission_tests.rs");
     include!("tests/signed_prefix_hold.rs");
     include!("tests/signed_prefix_hold_review.rs");
     include!("tests/image_stripping_review_witness.rs");
