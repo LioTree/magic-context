@@ -1,17 +1,20 @@
 use super::context::*;
 use super::dispatcher::*;
-use super::domain_control::{available, SystemClock};
+use super::domain_control::available;
 use crate::config_parity::{
     ConfigResolveRequest, CoreConfig, CoreConfigResolver, ProtectedTokenTiers, TrustFlags,
 };
+use mc_store::dream_domain::DreamDomainLease;
 use mc_store::dream_scheduler::{
     schedules::{RunOutcome, RunStatus, ScheduleState, TaskConfig, TaskName},
     SqliteDreamScheduler,
 };
 use mc_store::parity_schema_manifest::*;
 use mc_store::McStore;
-use rusqlite::{Connection, OptionalExtension};
-use serde_json::{json, Value};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
+use serde_json::json;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
@@ -171,29 +174,163 @@ fn effects(path: &std::path::Path) -> i64 {
         .unwrap_or(0)
 }
 
-fn ts(path: &std::path::Path, action: &str, key: &str, holder: &str) -> Value {
-    let output = std::process::Command::new("bun")
-        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/dream_domain.ts"))
-        .args([path.to_str().unwrap(), action, key, holder])
-        .output()
-        .expect("Bun is required for the real TS lease proof");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InteropStep {
+    name: String,
+    op: String,
+    holder: String,
+    key: String,
+    now_ms: i64,
+    generation: Option<u64>,
+    result: Option<bool>,
+    rows: BTreeMap<String, String>,
+    owns: BTreeMap<String, BTreeMap<String, bool>>,
+}
+
+fn interop_steps() -> Vec<InteropStep> {
+    serde_json::from_str(include_str!("../../testdata/dream_domain_interop.json")).unwrap()
+}
+
+fn interop_step(name: &str) -> InteropStep {
+    interop_steps()
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap()
+}
+
+fn dream_rows(path: &std::path::Path) -> BTreeMap<String, String> {
+    Connection::open(path)
+        .unwrap()
+        .prepare("SELECT key,value FROM dream_state")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+// Install a committed foreign-runtime snapshot, not a second lease algorithm.
+// The colocated TS test proves these exact rows using the real TS lease functions.
+fn install_interop_rows(path: &std::path::Path, step: &InteropStep) {
+    let mut db = Connection::open(path).unwrap();
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    tx.execute("DELETE FROM dream_state", []).unwrap();
+    for (key, value) in &step.rows {
+        tx.execute(
+            "INSERT INTO dream_state(key,value) VALUES(?1,?2)",
+            params![key, value],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+}
+
+#[test]
+fn rust_replays_shared_dream_domain_interop_fixture() {
+    let (dispatcher, _dir, clock) = fixture();
+    let mut leases = BTreeMap::<(String, String), DreamDomainLease>::new();
+    let steps = interop_steps();
+    assert_eq!(steps.len(), 17);
+    // Both native replayers use the same holder labels and fixed expected rows.
+    // Expiry advances the clock without deleting the durable lease identity.
+    for step in steps {
+        clock.0.store(step.now_ms, Ordering::SeqCst);
+        let identity = (step.key.clone(), step.holder.clone());
+        match step.op.as_str() {
+            "acquire" => {
+                let lease = dispatcher
+                    .store
+                    .acquire_dream_domain(&step.key, &step.holder, step.now_ms)
+                    .unwrap();
+                assert_eq!(Some(lease.is_some()), step.result, "{}", step.name);
+                assert_eq!(
+                    lease.as_ref().map(|l| l.generation),
+                    step.generation,
+                    "{}",
+                    step.name
+                );
+                if let Some(lease) = lease {
+                    leases.insert(identity, lease);
+                }
+            }
+            "renew" => {
+                let mut lease = leases[&identity].clone();
+                lease.generation = step.generation.unwrap();
+                assert_eq!(
+                    Some(
+                        dispatcher
+                            .store
+                            .renew_dream_domain(&lease, step.now_ms)
+                            .unwrap()
+                    ),
+                    step.result,
+                    "{}",
+                    step.name
+                );
+            }
+            "release" => {
+                dispatcher
+                    .store
+                    .release_dream_domain(&leases[&identity])
+                    .unwrap();
+            }
+            "expire" => {}
+            other => panic!("unknown fixture operation: {other}"),
+        }
+        assert_eq!(
+            dream_rows(&dispatcher.executor.path),
+            step.rows,
+            "{}",
+            step.name
+        );
+        for (key, holders) in step.owns {
+            for (holder, expected) in holders {
+                let absent = DreamDomainLease {
+                    key: key.clone(),
+                    holder: holder.clone(),
+                    generation: 0,
+                    expires_at_ms: 0,
+                };
+                let lease = leases.get(&(key.clone(), holder)).unwrap_or(&absent);
+                assert_eq!(
+                    dispatcher
+                        .store
+                        .owns_dream_domain(lease, step.now_ms)
+                        .unwrap(),
+                    expected,
+                    "{}: {} / {}",
+                    step.name,
+                    lease.key,
+                    lease.holder
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
-async fn ts_held_domain_blocks_rust_canonical_dispatch() {
-    let (mut dispatcher, _dir, _) = fixture();
-    dispatcher.clock = Arc::new(SystemClock);
+async fn ts_fixture_domain_blocks_rust_canonical_dispatch_until_release() {
+    let (mut dispatcher, _dir, clock) = fixture();
     let key = TaskName::Classify.lease_key(&dispatcher.scope.project.0);
-    assert_eq!(
-        ts(&dispatcher.executor.path, "acquire", &key, "typescript")["owns"],
-        true
-    );
+    let held = interop_step("ts-acquire-memory");
+    assert_eq!(key, held.key);
+    install_interop_rows(&dispatcher.executor.path, &held);
+    clock.0.store(held.now_ms, Ordering::SeqCst);
+    assert!(dispatcher
+        .store
+        .owns_dream_domain(
+            &DreamDomainLease {
+                key: key.clone(),
+                holder: "typescript".into(),
+                generation: held.generation.unwrap(),
+                expires_at_ms: 0
+            },
+            held.now_ms
+        )
+        .unwrap());
     let outcome = dispatcher
         .manual(&config(), "manual", TIMEOUT, Cancellation::default())
         .await;
@@ -206,7 +343,21 @@ async fn ts_held_domain_blocks_rust_canonical_dispatch() {
     .unwrap()
     .is_none());
     assert_eq!(effects(&dispatcher.executor.path), 0);
-    ts(&dispatcher.executor.path, "release", &key, "typescript");
+    let released = interop_step("ts-release-memory");
+    install_interop_rows(&dispatcher.executor.path, &released);
+    clock.0.store(released.now_ms, Ordering::SeqCst);
+    assert!(dispatcher
+        .store
+        .owns_dream_domain(
+            &DreamDomainLease {
+                key: "dreaming".into(),
+                holder: "rust".into(),
+                generation: 1,
+                expires_at_ms: 0
+            },
+            released.now_ms
+        )
+        .unwrap());
     assert_eq!(
         dispatcher
             .manual(&config(), "manual", TIMEOUT, Cancellation::default())
@@ -214,12 +365,15 @@ async fn ts_held_domain_blocks_rust_canonical_dispatch() {
         DispatchOutcome::Finished(RunStatus::Completed)
     );
     assert_eq!(effects(&dispatcher.executor.path), 1);
+    let rows = dream_rows(&dispatcher.executor.path);
+    assert_eq!(rows.get("dreaming_lease_holder"), Some(&"rust".into()));
+    assert!(!rows.keys().any(|k| k.starts_with("lease:dreaming:")));
 }
 
 #[tokio::test]
-async fn rust_held_domain_blocks_actual_ts_acquire_during_dispatch() {
-    struct TsProbe(Effects);
-    impl TaskExecutor for TsProbe {
+async fn rust_dispatch_domain_blocks_foreign_fixture_holder_until_completion() {
+    struct ForeignProbe(Effects);
+    impl TaskExecutor for ForeignProbe {
         fn operational_tasks(&self) -> &[TaskName] {
             self.0.operational_tasks()
         }
@@ -227,16 +381,17 @@ async fn rust_held_domain_blocks_actual_ts_acquire_during_dispatch() {
             Ok(true)
         }
         async fn run(&mut self, context: &TaskContext) -> RunOutcome {
-            let value = ts(
-                &self.0.path,
-                "acquire",
-                &context.domain_lease.key,
-                "typescript",
-            );
-            assert!(
-                value["lease"].is_null(),
-                "TS acquired Rust-owned domain: {value}"
-            );
+            assert!(self
+                .0
+                .store
+                .owns_dream_domain(&context.domain_lease, context.now_ms())
+                .unwrap());
+            assert!(self
+                .0
+                .store
+                .acquire_dream_domain(&context.domain_lease.key, "typescript", context.now_ms())
+                .unwrap()
+                .is_none());
             self.0.run(context).await
         }
     }
@@ -246,8 +401,8 @@ async fn rust_held_domain_blocks_actual_ts_acquire_during_dispatch() {
         scheduler: dispatcher.scheduler,
         scope: dispatcher.scope,
         config: dispatcher.config,
-        clock: Arc::new(SystemClock),
-        executor: TsProbe(dispatcher.executor),
+        clock: dispatcher.clock,
+        executor: ForeignProbe(dispatcher.executor),
     };
     assert_eq!(
         dispatcher
@@ -256,15 +411,15 @@ async fn rust_held_domain_blocks_actual_ts_acquire_during_dispatch() {
         DispatchOutcome::Finished(RunStatus::Completed)
     );
     assert_eq!(effects(&dispatcher.executor.0.path), 1);
-    assert_eq!(
-        ts(
-            &dispatcher.executor.0.path,
-            "acquire",
+    assert!(dispatcher
+        .store
+        .acquire_dream_domain(
             &TaskName::Classify.lease_key("project"),
-            "typescript"
-        )["owns"],
-        true
-    );
+            "typescript",
+            dispatcher.clock.now_ms()
+        )
+        .unwrap()
+        .is_some());
 }
 
 #[tokio::test]
