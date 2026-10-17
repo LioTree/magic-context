@@ -148,8 +148,9 @@ export function standDownForBridgedSessions(hooks: Hooks): Hooks {
     const guarded: Hooks = { ...hooks };
     const slots = guarded as Record<string, unknown>;
 
-    // `tool.definition` carries no session; the entry attributes it to the
-    // provider and model of the most recent `chat.message`. When that message
+    // `tool.definition` carries no session; the plugin entry (src/index.ts)
+    // attributes it to the provider and model of the most recent
+    // `chat.message`. When that message
     // belonged to an enrolled session the flight's tool set is the bridge's,
     // so measuring it would charge the bridge's tools to our model key.
     let lastChatMessageBridged = false;

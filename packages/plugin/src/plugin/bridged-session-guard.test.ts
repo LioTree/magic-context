@@ -433,10 +433,11 @@ describe("Desktop notices", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The real OpenCode 1 messages-transform pipeline (createTransform behind
-// createMessagesTransformHandler, as the plugin entry wires it) with real
-// storage, so "no tags, no rows, no module calls" is checked against the code
-// that would otherwise write them.
+// Tests against the real OpenCode 1 messages-transform pipeline:
+// createTransform behind createMessagesTransformHandler, wired the way
+// src/index.ts wires it, over a real context database. They check that an
+// enrolled session gets no tag prefixes, no database rows and no Rust module
+// calls from the very code that would otherwise produce them.
 // ---------------------------------------------------------------------------
 
 type TestMessage = {
@@ -509,7 +510,7 @@ function realPipeline(
     return { db, run, rawRun };
 }
 
-/** Rows naming `sessionId` in any table of the context database that has a session column. */
+/** Counts rows, across every context-database table with a `session_id` column, whose `session_id` equals the given ID. */
 function rowsForSession(db: ReturnType<typeof openDatabase>, sessionId: string): number {
     const tables = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -563,8 +564,9 @@ describe("standDownForBridgedSessions: real messages transform", () => {
 
         expect(JSON.stringify(bridged)).toBe(bridgedBefore);
         expect(rowsForSession(db, "ses-bridged")).toBe(0);
-        // The control: the same pipeline really does tag and persist a session
-        // it manages, so the zero above is the guard's doing.
+        // Control: the same pipeline tags and stores rows for the unenrolled
+        // session, so the enrolled session's zero rows come from the guard,
+        // not from a pipeline that writes nothing.
         expect(plain[0].parts[0].text).toStartWith("§1§ ");
         expect(rowsForSession(db, "ses-plain")).toBeGreaterThan(0);
     });
@@ -585,8 +587,9 @@ describe("standDownForBridgedSessions: real messages transform", () => {
         expect(calls).toEqual([]);
         expect(JSON.stringify(bridged)).toBe(before);
 
-        // Control: an unenrolled session in the same Rust-mode pipeline does
-        // reach the module, so an empty call list is meaningful.
+        // Control: in the same Rust-mode pipeline an unenrolled session does
+        // call the Rust module client, so the enrolled session's empty call
+        // list shows the guard stopped those calls.
         await run(sessionMessages("ses-plain")).catch(() => undefined);
         expect(calls.length).toBeGreaterThan(0);
         expect(calls.every((call) => call.sessionId !== "ses-bridged")).toBe(true);
@@ -608,7 +611,8 @@ describe("standDownForBridgedSessions: real transform differential", () => {
         const words = ["Plan this", "Implemented", "§9§ looks tagged", "ünïcødé", "x".repeat(300)];
 
         for (let pass = 0; pass < passes; pass += 1) {
-            // A bridge is running and enrolls other sessions, or none is.
+            // Half the passes publish a bridged-sessions map that enrolls some
+            // other session; the rest remove the map entirely.
             if (random() < 0.5) enroll(`ses-elsewhere-${pass}`);
             else Reflect.deleteProperty(slot, BRIDGED_SESSIONS_KEY);
 
@@ -677,7 +681,10 @@ describe("plugin entry wiring", () => {
         const keys = [...returned.matchAll(/^\s{8}(?:"([a-z.]+)"|([a-zA-Z]+)):/gm)].map(
             (match) => match[1] ?? match[2],
         );
-        // Keys with no session in their input; each is handled or N/A by design.
+        // Hook keys whose input has no session ID. `tool` and `event` are
+        // guarded separately (per tool call and per event payload),
+        // `tool.definition` follows the last chat.message, and `config` is
+        // process-wide, so none of them belongs in the session-input list.
         const sessionless = new Set(["tool", "event", "config", "tool.definition"]);
         const covered = new Set<string>([
             ...SESSION_INPUT_HOOKS,
