@@ -2305,6 +2305,7 @@ pub mod compaction {
         // adapter projection that production might never consume.
         pub(crate) static LAST_NATIVE_REQUEST: std::cell::RefCell<Option<(String, Option<super::TransformGeometry>, bool)>> = const { std::cell::RefCell::new(None) };
         pub(crate) static LAST_NATIVE_PRESSURE: std::cell::RefCell<Option<(f64,f64)>> = const { std::cell::RefCell::new(None) };
+        pub(crate) static LAST_NATIVE_PASS: std::cell::Cell<Option<scheduler::PassDecision>> = const { std::cell::Cell::new(None) };
     }
     use super::*;
 
@@ -2708,6 +2709,10 @@ pub mod compaction {
             }
         });
         let engine = transform_with_projection(store, &req, ctx)?;
+        #[cfg(test)]
+        if native_cc {
+            LAST_NATIVE_PASS.with(|slot| slot.set(Some(engine.scheduler_pass)));
+        }
         let permitted =
             engine.response.prefix_bust_permitted || native_step_bust(&req, engine.scheduler_pass);
         let mut answer = Answer::Noop;
@@ -3080,8 +3085,8 @@ fn claude_code_marker_ttl(assumed_lifetime: &str) -> String {
 /// Anthropic is the one profile here with a known one-hour provider ceiling, and Claude Code has no
 /// cache-keep warmup on this path. An assumption above that ceiling therefore cannot be true and is
 /// clamped down to one hour. Other profiles retain the raw assumption because their provider ceiling
-/// is unknown or their plugin may keep a cache warm. `never` remains the user's explicit instruction
-/// to disable TTL-driven folds and is not a finite lifetime to clamp.
+/// is unknown or their plugin may keep a cache warm. `never` disables idle-driven folds regardless
+/// of provenance, including when a host adapter owns cache expiry instead of the engine.
 fn internal_assumed_cache_lifetime_for_profile(
     profile: Option<SerializerProfile>,
     is_subagent: bool,
@@ -3091,16 +3096,16 @@ fn internal_assumed_cache_lifetime_for_profile(
     if profile != Some(SerializerProfile::ClaudeCodeAnthropic) {
         return configured_assumed_lifetime.to_string();
     }
-    if provenance == CacheTtlProvenance::Default {
-        // Claude Code authors beta-gated one-hour markers and does not run cache-keep here.
-        // A five-minute assumption could trigger a fold while the provider marker is still valid.
-        return "1h".to_string();
-    }
     if configured_assumed_lifetime
         .trim()
         .eq_ignore_ascii_case("never")
     {
         return configured_assumed_lifetime.to_string();
+    }
+    if provenance == CacheTtlProvenance::Default {
+        // Claude Code authors beta-gated one-hour markers and does not run cache-keep here.
+        // A five-minute assumption could trigger a fold while the provider marker is still valid.
+        return "1h".to_string();
     }
     if is_subagent {
         return SUBAGENT_CACHE_TTL.to_string();
@@ -20071,6 +20076,36 @@ pub(crate) mod tests {
             ),
             "300m"
         );
+    }
+
+    #[test]
+    fn host_owned_never_disables_idle_folds_for_every_profile_and_provenance() {
+        for profile in [
+            Some(SerializerProfile::ClaudeCodeAnthropic),
+            Some(SerializerProfile::OpencodeAiSdk),
+            None,
+        ] {
+            for provenance in [
+                CacheTtlProvenance::Default,
+                CacheTtlProvenance::ConfiguredDefault,
+                CacheTtlProvenance::Explicit,
+            ] {
+                for is_subagent in [false, true] {
+                    for lifetime in ["never", "NEVER", " never "] {
+                        let internal = internal_assumed_cache_lifetime_for_profile(
+                            profile,
+                            is_subagent,
+                            lifetime,
+                            provenance,
+                        );
+                        assert_eq!(internal, lifetime);
+                        assert_eq!(scheduler::parse_cache_ttl(&internal), Ok(u64::MAX));
+                        assert!(!scheduler::ttl_execute_fired(u64::MAX, 0, u64::MAX));
+                        assert!(!scheduler::ttl_hard_expired(u64::MAX, 0, u64::MAX));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

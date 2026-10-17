@@ -60,6 +60,10 @@ async fn summary_with_tail(reason: Option<&str>) {
     status["request_id"] = json!("summarized-step");
     if let Some(reason) = reason {
         status["prefix_rebuilding"] = json!({"reason":reason});
+    } else {
+        // Reach 65% of the 100,000-token window so pressure permits the fold.
+        // The host supplies no timestamp from which to infer idle expiry.
+        status["estimate"]["request_tokens"] = json!(65000);
     }
     if reason == Some("pipeline_switch") {
         status["model"] = json!("next-model");

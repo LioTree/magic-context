@@ -14,8 +14,9 @@ newest IDs, page counts, tool-turn flags, estimates and geometry. Unknown body
 IDs and view identities are reminted. Without the
 `advertise-claude-code-candidate` feature, setup omits the `claude_code` candidate
 capability selection, which default builds deliberately do not publish. With
-that feature enabled, setup selects the exact recorded bundle. An explicit model TTL of
-`never` isolates pressure from the unrelated default-provenance TTL override.
+that feature enabled, setup selects the exact recorded bundle. Replays use the
+default TTL configuration and assert the engine's actual scheduler pass, so a
+completed step below 65% cannot silently execute because of fabricated idle age.
 
 The original sequence has only the marker Read and ctx_reduce results. The reads
 sequence adds four 24-byte results after the 51-byte marker. Neither sequence
@@ -31,6 +32,8 @@ Each must drain at the first completed Execute step (sequence 35 or 47), preserv
 tool pairing, remove invalidated later signatures, and then answer noop after
 acknowledgment. The tests print and check the measured calibrated newer-tool mass.
 Below-threshold unfinished tool steps remain noop with their drop queued.
+An additional `expired_cache` variant drains the eligible drop at sequence 31,
+below the pressure threshold, and then remains stable after acknowledgment.
 
 Measured newer-tool masses (including the 2-token ctx_reduce reply) are 2 tokens
 for the original capture, 22 for the tiny-reads reconstruction, 2,405 for the

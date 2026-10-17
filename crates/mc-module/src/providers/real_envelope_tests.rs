@@ -73,12 +73,12 @@ fn body(ordinal: u64, newer_calls: &[u64], tool_words: usize) -> Value {
 
 #[tokio::test]
 async fn cc_recorded_real_envelopes_hold_protected_drop_with_reason() {
-    replay(ORIGINAL, ORIGINAL_SHA, &[], 0, None).await;
+    replay(ORIGINAL, ORIGINAL_SHA, &[], 0, None, None).await;
 }
 
 #[tokio::test]
 async fn cc_real_envelope_shape_with_three_newer_tool_groups_drains_at_execute() {
-    replay(ORIGINAL, ORIGINAL_SHA, &[11, 14, 17], 800, Some(35)).await;
+    replay(ORIGINAL, ORIGINAL_SHA, &[11, 14, 17], 800, Some(35), None).await;
 }
 
 const ORIGINAL: &str = include_str!("../../testdata/cc-step-real-envelopes.json");
@@ -88,12 +88,25 @@ const READS_SHA: &str = "d213385da4224b73c30ae1d4f720f3629d4ee1f7664b90dc826460e
 
 #[tokio::test]
 async fn cc_recorded_reads_envelopes_hold_below_tool_mass_floor() {
-    replay(READS, READS_SHA, &[14, 20, 26, 32], 0, None).await;
+    replay(READS, READS_SHA, &[14, 20, 26, 32], 0, None, None).await;
 }
 
 #[tokio::test]
 async fn cc_recorded_reads_with_four_3kb_results_drain_at_first_execute() {
-    replay(READS, READS_SHA, &[14, 20, 26, 32], 750, Some(47)).await;
+    replay(READS, READS_SHA, &[14, 20, 26, 32], 750, Some(47), None).await;
+}
+
+#[tokio::test]
+async fn cc_default_ttl_expired_cache_drains_before_pressure_crossing() {
+    replay(
+        ORIGINAL,
+        ORIGINAL_SHA,
+        &[11, 14, 17],
+        800,
+        Some(31),
+        Some(31),
+    )
+    .await;
 }
 
 async fn replay(
@@ -102,6 +115,7 @@ async fn replay(
     newer_calls: &[u64],
     tool_words: usize,
     expected_apply: Option<u64>,
+    expired_at: Option<u64>,
 ) {
     let logs = LogWriter::default();
     let writer = logs.clone();
@@ -123,18 +137,13 @@ async fn replay(
     );
     let newer_tools = expected_apply.is_some();
     let first_execute = if fixture_sha == ORIGINAL_SHA { 35 } else { 47 };
+    let drain_sequence = expected_apply.unwrap_or(first_execute);
     let dir = tempfile::tempdir().unwrap();
     let mut h = handler(dir.path(), thalamus());
     let session = rows[0]["params"]["session"].as_str().unwrap();
     let lineage = rows[0]["params"]["lineage_id"].as_str().unwrap();
     let mut route = binding(dir.path(), thalamus());
     route.session = session.into();
-    // Disable idle-expiry scheduling so only input pressure can grant Execute.
-    // The default TTL provenance otherwise overrides the adapter's never value.
-    route
-        .config
-        .cache_ttl_by_model
-        .insert("claude-sonnet-5-5".into(), "never".into());
     h.bind_route(7, route);
     h.session_resolver = Arc::new(ReplayResolver(session.into()));
     let mut setup_params = rows[0]["params"].clone();
@@ -218,7 +227,14 @@ async fn replay(
         // replay's installed view where the recording acknowledged its own view.
         params["last_applied"] =
             json!({"compaction_id":installed["compaction_id"],"version":installed["version"]});
+        if expired_at == Some(sequence) {
+            params["prefix_rebuilding"] = json!({"reason":"expired_cache"});
+        }
+        transform::compaction::LAST_NATIVE_PASS.with(|slot| slot.set(None));
         let answer = response(call(&h, "compaction.step", params).await);
+        let pass = transform::compaction::LAST_NATIVE_PASS
+            .with(|slot| slot.take())
+            .expect("the replay must observe this step's real engine decision");
         if answer["answer"] == "compaction_message" {
             installed = answer["compaction"].clone();
         }
@@ -230,7 +246,7 @@ async fn replay(
             .await,
         );
         assert_eq!(status["step_lane"]["protected_tokens"]["floor"], 1920);
-        if sequence == first_execute {
+        if sequence == drain_sequence {
             let tags = store.load_tags_for_session(&key.engine_key()).unwrap();
             let meta = store.load_meta(&key.engine_key()).unwrap().meta;
             let ratio = meta
@@ -262,6 +278,14 @@ async fn replay(
             .unwrap();
         assert!((pressure.0 - estimate as f64 / 24000.0 * 100.0).abs() < 0.001);
         assert!((pressure.1 - estimate as f64 / 72000.0 * 100.0).abs() < 0.001);
+        let expected_pass = if pressure.0 >= 85.0 {
+            crate::scheduler::PassDecision::Force85
+        } else if pressure.0 >= 65.0 && row["params"]["mid_turn"] == false {
+            crate::scheduler::PassDecision::Execute
+        } else {
+            crate::scheduler::PassDecision::Defer
+        };
+        assert_eq!(pass, expected_pass, "sequence={sequence} tokens={estimate}");
         eprintln!(
             "sequence={sequence} tokens={estimate} answer={} queued={} applied={} holds={}",
             answer["answer"],
@@ -290,7 +314,7 @@ async fn replay(
         } else if sequence != 5 {
             assert_eq!(answer["answer"], "noop", "sequence={sequence}");
         }
-        if sequence >= 15 && (!newer_tools || sequence < first_execute) {
+        if sequence >= 15 && (!newer_tools || sequence < drain_sequence) {
             assert_eq!(status["step_lane"]["queued_drops"]["total_count"], 1);
             assert_eq!(status["step_lane"]["applied_drops_last_step"], 0);
         }
@@ -302,7 +326,7 @@ async fn replay(
         } else {
             assert_eq!(status["step_lane"]["queued_drops"]["holds"], json!([]));
         }
-        if newer_tools && sequence >= first_execute {
+        if newer_tools && sequence >= drain_sequence {
             assert_eq!(status["step_lane"]["queued_drops"]["total_count"], 0);
         }
     }
