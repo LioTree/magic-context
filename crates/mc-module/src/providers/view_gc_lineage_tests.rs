@@ -75,7 +75,9 @@ fn reads(answer: &Value) -> [Value; 2] {
 async fn read_pages(h: &McHandler, reads: &[Value; 2]) -> Vec<Value> {
     let mut pages = Vec::new();
     for read in reads {
-        pages.push(response(call(h, "compaction.view.read", read.clone()).await));
+        pages.push(response(
+            call(h, "compaction.view.read", read.clone()).await,
+        ));
     }
     pages
 }
@@ -143,12 +145,20 @@ async fn cc_fork_fold_and_prune_keep_the_parent_answered_view_across_restart() {
     let f_reads = reads(&fork);
     let f_before = read_pages(&h, &f_reads).await;
     assert_pages(&f_before, &f_before);
-    assert!(held_versions(&h).contains(&version), "{:?}", held_versions(&h));
+    assert!(
+        held_versions(&h).contains(&version),
+        "{:?}",
+        held_versions(&h)
+    );
     assert_pages(&read_pages(&h, &l_reads).await, &before);
     drop(h);
     let h = handler(dir.path(), thalamus());
     setup(&h).await;
-    assert!(held_versions(&h).contains(&version), "{:?}", held_versions(&h));
+    assert!(
+        held_versions(&h).contains(&version),
+        "{:?}",
+        held_versions(&h)
+    );
     assert_pages(&read_pages(&h, &l_reads).await, &before);
     assert_pages(&read_pages(&h, &f_reads).await, &f_before);
 }
@@ -178,7 +188,11 @@ async fn cc_superseded_answer_is_refused_after_the_lineage_steps_again() {
     assert_eq!(fork["answer"], "noop", "{fork}");
     // Still stored (the Setup state's produced view), so the refusal below
     // comes from the read's branch check, not from pruning.
-    assert!(held_versions(&h).contains(&version), "{:?}", held_versions(&h));
+    assert!(
+        held_versions(&h).contains(&version),
+        "{:?}",
+        held_versions(&h)
+    );
     for page in read_pages(&h, &l_reads).await {
         assert_eq!(page["code"], "unknown_version", "{page}");
     }

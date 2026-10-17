@@ -62,7 +62,10 @@ fn lineage_answered_views_tx(
         "SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",
     )?;
     let mut answered = BTreeMap::new();
-    let Some(map) = counters.get(LINEAGE_ANSWERED_VIEWS).and_then(Value::as_object) else {
+    let Some(map) = counters
+        .get(LINEAGE_ANSWERED_VIEWS)
+        .and_then(Value::as_object)
+    else {
         return Ok(answered);
     };
     for (lineage, version) in map {

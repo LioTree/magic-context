@@ -365,7 +365,9 @@ fn record_answered_view(
     mc_store::record_lineage_answered_view(
         &mut counters,
         lineage_id,
-        answer.pointer("/compaction/version").and_then(Value::as_u64),
+        answer
+            .pointer("/compaction/version")
+            .and_then(Value::as_u64),
     );
     conversation.hook_counters_json = counters.to_string();
     Ok(())

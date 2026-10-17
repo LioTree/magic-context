@@ -212,20 +212,40 @@ fn lineage_answered_views_are_roots_until_superseded_or_retired() {
         BTreeMap::from([("F".to_string(), 3), ("L".to_string(), 2)])
     );
     assert_eq!(roots(&store, &key), BTreeSet::from([2, 3]));
-    assert_eq!(store.prune_provider_views_from_conversation(&key).unwrap(), 2);
-    assert_eq!(store.load_provider_view_recipe_versions(&key).unwrap(), vec![2, 3]);
+    assert_eq!(
+        store.prune_provider_views_from_conversation(&key).unwrap(),
+        2
+    );
+    assert_eq!(
+        store.load_provider_view_recipe_versions(&key).unwrap(),
+        vec![2, 3]
+    );
 
     // L steps again and is answered with view 5: its earlier view 2 goes.
-    store.save_provider_view_recipe(&key, &recipe(5, None, "produced")).unwrap();
+    store
+        .save_provider_view_recipe(&key, &recipe(5, None, "produced"))
+        .unwrap();
     set_answered(&store, &key, "L", Some(5));
     assert_eq!(roots(&store, &key), BTreeSet::from([3, 5]));
-    assert_eq!(store.prune_provider_views_from_conversation(&key).unwrap(), 1);
-    assert_eq!(store.load_provider_view_recipe_versions(&key).unwrap(), vec![3, 5]);
+    assert_eq!(
+        store.prune_provider_views_from_conversation(&key).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.load_provider_view_recipe_versions(&key).unwrap(),
+        vec![3, 5]
+    );
     // L steps again and the answer names no view: view 5 goes as well.
     set_answered(&store, &key, "L", None);
     assert_eq!(roots(&store, &key), BTreeSet::from([3]));
-    assert_eq!(store.prune_provider_views_from_conversation(&key).unwrap(), 1);
-    assert_eq!(store.load_provider_view_recipe_versions(&key).unwrap(), vec![3]);
+    assert_eq!(
+        store.prune_provider_views_from_conversation(&key).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.load_provider_view_recipe_versions(&key).unwrap(),
+        vec![3]
+    );
 
     // A cold reopen reads the same per-lineage roots from the conversation row.
     drop(store);
@@ -237,7 +257,9 @@ fn lineage_answered_views_are_roots_until_superseded_or_retired() {
     assert_eq!(roots(&store, &key), BTreeSet::from([3]));
 
     // Removing lineage F releases its view even though the entry remains.
-    store.save_provider_view_recipe(&key, &recipe(8, None, "produced")).unwrap();
+    store
+        .save_provider_view_recipe(&key, &recipe(8, None, "produced"))
+        .unwrap();
     set_answered(&store, &key, "L", Some(8));
     store
         .inner
@@ -254,8 +276,14 @@ fn lineage_answered_views_are_roots_until_superseded_or_retired() {
         BTreeMap::from([("L".to_string(), 8)])
     );
     assert_eq!(roots(&store, &key), BTreeSet::from([8]));
-    assert_eq!(store.prune_provider_views_from_conversation(&key).unwrap(), 1);
-    assert_eq!(store.load_provider_view_recipe_versions(&key).unwrap(), vec![8]);
+    assert_eq!(
+        store.prune_provider_views_from_conversation(&key).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.load_provider_view_recipe_versions(&key).unwrap(),
+        vec![8]
+    );
 }
 
 fn move_binding(cut: &str) -> crate::move_store::CutBinding {
