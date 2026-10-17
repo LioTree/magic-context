@@ -28,7 +28,11 @@ import {
     startSqliteWriteLocker,
 } from "../../shared/sqlite-write-locker-test-support";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
-import { currentLkgRequestIdentity, noteLkgProviderResponse } from "./lkg-measured-request";
+import {
+    __setLkgMarkerReadingForTests,
+    currentLkgRequestIdentity,
+    noteLkgProviderResponse,
+} from "./lkg-measured-request";
 import { createDbLkgPersistence, saveLkgSlotToDb } from "./lkg-persist";
 import { lkgServedArrayDigest } from "./lkg-recovery-fence";
 import { lkgDirtyRevision } from "./lkg-recovery-prefix";
@@ -37,7 +41,7 @@ import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slo
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
-import { recordMarkerSystem } from "./standalone-marker-envelope";
+import { recordMarkerSystem, standaloneMarkerIdentity } from "./standalone-marker-envelope";
 import type { TransformDeps } from "./transform";
 import type { MessageLike } from "./transform-operations";
 import {
@@ -217,6 +221,22 @@ async function runPassUnderLock(args: {
     recordMarkerSystem(sessionId, "test-provider/test-model", meta.systemPromptHash, [
         "Fixture final system instructions.",
     ]);
+    // The envelope (system strings plus tool definitions) is bounded only by the
+    // provider usage of a completed request with the same model, system strings and
+    // tool names, because built-in tool schemas are not visible to the plugin.
+    // Install the reading such a completed request leaves behind.
+    const marker = standaloneMarkerIdentity(
+        sessionId,
+        currentLkgRequestIdentity(sessionId),
+        undefined,
+    );
+    if (marker)
+        __setLkgMarkerReadingForTests(sessionId, {
+            responseId: `fixture-${sessionId}`,
+            inputTokens: 1_000,
+            jsonPrefix: JSON.stringify(inputMessages(sessionId)),
+            marker,
+        });
 
     const transform = createRustModeTransform(deps, {
         moduleClient,
