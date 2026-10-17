@@ -416,6 +416,7 @@ impl Run<'_> {
                 scheduler.clone(),
                 transport,
                 published,
+                &self.handles.wiring.tasks,
             ),
         };
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()

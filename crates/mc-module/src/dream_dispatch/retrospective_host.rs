@@ -18,8 +18,9 @@ use crate::{
 };
 
 /// Harness adapters supply bounded source reads, not rendered foreground prompts.
-/// Each session contains at most 80 new messages and 12 prior user lines, and must
-/// report truncation so the planner cannot advance past unread source messages.
+/// Each session contains rows from at most 80 new source messages and 12 prior
+/// user lines, and must report truncation so the planner cannot advance past
+/// unread source messages.
 pub trait SessionReader {
     fn read_sessions(&self, project: &str, watermark_ms: i64) -> Result<Vec<SessionRead>, String>;
 }
@@ -82,9 +83,18 @@ impl<C: DreamCarrier> RetrospectiveHost<C> {
         let sessions = reader
             .read_sessions(project, since)
             .map_err(HostError::Input)?;
+        // One source message can yield a user row and several tool rows, which
+        // share its ordinal; the bound is on source messages.
+        let source_messages = |messages: &[plan::Message]| {
+            messages
+                .iter()
+                .map(|m| m.ordinal)
+                .collect::<HashSet<_>>()
+                .len()
+        };
         if sessions
             .iter()
-            .any(|s| s.messages.len() > 80 || s.overlap.len() > 12)
+            .any(|s| source_messages(&s.messages) > 80 || s.overlap.len() > 12)
         {
             return Err(HostError::Input(
                 "session reader exceeded source bounds".into(),
@@ -1026,6 +1036,102 @@ mod tests {
                 Ok(Value::Array(rows))
             })
             .unwrap()
+    }
+
+    /// testdata/dream_tasks/retrospective.json is what the TypeScript dreamer's
+    /// retrospective (gen/gen-dream-retrospective-golden.ts) read through its
+    /// production OpenCode provider, sent to the model and wrote, over two runs on
+    /// one database. The same messages, archived, go through the production
+    /// archive reader and this host.
+    #[tokio::test]
+    async fn retrospective_reads_decides_and_writes_as_the_typescript_dreamer() {
+        use crate::dream_dispatch::session_reader;
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../testdata/dream_tasks/retrospective.json"
+        ))
+        .unwrap();
+        assert_eq!(golden["project"], "project");
+        let f = Fixture::new(TaskName::Retrospective);
+        let now = golden["now"].as_i64().unwrap();
+        f.time.0.store(now, Ordering::SeqCst);
+        f.store
+            .with_context_conn_for_test(|tx| {
+                session_reader::install_archive_for_test(tx)?;
+                for s in golden["sessions"].as_array().unwrap() {
+                    tx.execute("INSERT INTO session_projects(session_id,harness,project_path,updated_at) VALUES(?1,'opencode',?2,0)",
+                        params![s["session"].as_str(), s["project"].as_str()])?;
+                    tx.execute("INSERT INTO session_meta(session_id,harness,is_subagent) VALUES(?1,'opencode',?2)",
+                        params![s["session"].as_str(), s["subagent"].as_i64()])?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let settings = json!({"dreamer": {"tasks": {
+            "retrospective": {"recency_days": 30},
+            "review-user-memories": {"schedule": "0 4 * * *"}}}});
+        for (index, run) in golden["runs"].as_array().unwrap().iter().enumerate() {
+            f.store
+                .with_context_conn_for_test(|tx| {
+                    for row in run["archived"].as_array().unwrap() {
+                        let session = row["sessionId"].as_str().unwrap();
+                        session_reader::archive_for_test(tx, session, &row["message"])?;
+                        tx.execute("INSERT INTO schema_migrations_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(excluded.value AS INTEGER) > CAST(value AS INTEGER)",
+                            params![format!("retrospective_activity:{session}"), row["message"]["createdAt"].as_i64().unwrap().to_string()])?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let mut carrier = f.carrier();
+            carrier.answers = [&run["answer"]["gate"], &run["answer"]["deepen"]]
+                .into_iter()
+                .filter_map(|a| a.as_str().map(str::to_owned))
+                .collect();
+            let (reader, options, collection) =
+                session_reader::retrospective_inputs(f.store.clone(), &settings, "opencode", now);
+            assert!(collection);
+            let mut host = f.host(carrier);
+            host.run_retrospective(&reader, &options, collection)
+                .await
+                .unwrap();
+            let requests = &host.carrier.requests;
+            assert_eq!(json!(requests.len()), run["modelCalls"], "run {index}");
+            let gate = run["gateUserText"].as_str().unwrap();
+            assert!(
+                requests[0].prompt.ends_with(gate),
+                "run {index} gate lines differ:\n{}\n---\n{gate}",
+                requests[0].prompt
+            );
+            if let Some(window) = run["frictionWindow"].as_str() {
+                assert!(
+                    requests[1]
+                        .prompt
+                        .contains(&format!("### Friction window\n{window}\n\n")),
+                    "run {index} friction window differs:\n{}",
+                    requests[1].prompt
+                );
+            }
+            assert_eq!(
+                json!(f.scalar("SELECT retrospective_watermark_ms FROM task_schedule_state WHERE project_path='project' AND task='retrospective'")),
+                run["watermark"],
+                "run {index}"
+            );
+            // Row 1 is the fixture's own pre-existing memory.
+            assert_eq!(
+                rows(&f, "SELECT project_path,category,content,source_session_id,source_type,metadata_json,status FROM memories WHERE id > 1 ORDER BY id"),
+                run["memories"],
+                "run {index}"
+            );
+            assert_eq!(
+                rows(&f, "SELECT content,session_id,created_at,source_compartment_start,source_compartment_end FROM user_memory_candidates ORDER BY id"),
+                run["candidates"],
+                "run {index}"
+            );
+            assert_eq!(
+                rows(&f, "SELECT project_path,window_key FROM retrospective_processed_windows ORDER BY window_key"),
+                run["processedWindows"],
+                "run {index}"
+            );
+        }
     }
 
     /// testdata/dream_tasks/review_user_memories.json is what the TypeScript

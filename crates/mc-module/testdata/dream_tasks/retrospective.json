@@ -1,0 +1,295 @@
+{
+  "project": "project",
+  "now": 100000,
+  "sessions": [
+    {
+      "session": "ses-a",
+      "project": "project",
+      "subagent": 0
+    },
+    {
+      "session": "ses-b",
+      "project": "project",
+      "subagent": 0
+    },
+    {
+      "session": "ses-sub",
+      "project": "project",
+      "subagent": 1
+    },
+    {
+      "session": "ses-foreign",
+      "project": "git:other",
+      "subagent": 0
+    }
+  ],
+  "runs": [
+    {
+      "archived": [
+        {
+          "sessionId": "ses-a",
+          "message": {
+            "id": "a1",
+            "role": "user",
+            "parts": [
+              {
+                "type": "text",
+                "text": "Please run the focused tests before you report the change as done."
+              }
+            ],
+            "ordinal": 1,
+            "createdAt": 1000,
+            "completedAt": null,
+            "version": null
+          }
+        },
+        {
+          "sessionId": "ses-a",
+          "message": {
+            "id": "a2",
+            "role": "assistant",
+            "parts": [
+              {
+                "type": "text",
+                "text": "Done, it works."
+              },
+              {
+                "type": "tool",
+                "tool": "bash",
+                "state": {
+                  "status": "completed",
+                  "output": "ok"
+                }
+              }
+            ],
+            "ordinal": 2,
+            "createdAt": 1100,
+            "completedAt": null,
+            "version": null
+          }
+        },
+        {
+          "sessionId": "ses-a",
+          "message": {
+            "id": "a3",
+            "role": "user",
+            "parts": [
+              {
+                "type": "text",
+                "text": "Injected context the user never typed.",
+                "synthetic": true
+              },
+              {
+                "type": "text",
+                "text": "  You did not run the tests again; run the focused tests before reporting done.  "
+              },
+              {
+                "type": "text",
+                "text": "ignored aside",
+                "ignored": true
+              }
+            ],
+            "ordinal": 3,
+            "createdAt": 1200,
+            "completedAt": null,
+            "version": null
+          }
+        },
+        {
+          "sessionId": "ses-a",
+          "message": {
+            "id": "a4",
+            "role": "user",
+            "parts": [
+              {
+                "type": "text",
+                "text": "<system-reminder>background task finished</system-reminder>"
+              }
+            ],
+            "ordinal": 4,
+            "createdAt": 1300,
+            "completedAt": null,
+            "version": null
+          }
+        },
+        {
+          "sessionId": "ses-a",
+          "message": {
+            "id": "a5",
+            "role": "assistant",
+            "parts": [
+              {
+                "type": "tool",
+                "tool": "read",
+                "state": {
+                  "status": "error",
+                  "error": "file not found"
+                }
+              }
+            ],
+            "ordinal": 5,
+            "createdAt": 1400,
+            "completedAt": null,
+            "version": null
+          }
+        },
+        {
+          "sessionId": "ses-a",
+          "message": {
+            "id": "a6",
+            "role": "user",
+            "parts": [
+              {
+                "type": "text",
+                "text": "<!-- OMO_INTERNAL_INITIATOR -->Thanks, that works now."
+              }
+            ],
+            "ordinal": 6,
+            "createdAt": 1500,
+            "completedAt": null,
+            "version": null
+          }
+        },
+        {
+          "sessionId": "ses-b",
+          "message": {
+            "id": "b1",
+            "role": "user",
+            "parts": [
+              {
+                "type": "text",
+                "text": "Stop guessing file paths and read the directory listing first."
+              }
+            ],
+            "ordinal": 1,
+            "createdAt": 1250,
+            "completedAt": null,
+            "version": null
+          }
+        },
+        {
+          "sessionId": "ses-sub",
+          "message": {
+            "id": "s1",
+            "role": "user",
+            "parts": [
+              {
+                "type": "text",
+                "text": "Subagent task prompt that says this is wrong and failed."
+              }
+            ],
+            "ordinal": 1,
+            "createdAt": 1210,
+            "completedAt": null,
+            "version": null
+          }
+        },
+        {
+          "sessionId": "ses-foreign",
+          "message": {
+            "id": "f1",
+            "role": "user",
+            "parts": [
+              {
+                "type": "text",
+                "text": "FOREIGN project message."
+              }
+            ],
+            "ordinal": 1,
+            "createdAt": 1220,
+            "completedAt": null,
+            "version": null
+          }
+        }
+      ],
+      "answer": {
+        "gate": "y: 3, 4",
+        "deepen": "<learnings>\n  <learning route=\"memory\" category=\"PROJECT_RULES\">Run the focused test suite and report its result before calling a change done.</learning>\n  <learning route=\"memory\" category=\"PROJECT_RULES\">Run the focused test suite and report its result before calling a change done.</learning>\n  <learning route=\"observation\">Prefers explicit verification evidence in completion summaries.</learning>\n  <learning route=\"memory\" category=\"CONSTRAINTS\">On 2026-06-01 the build broke.</learning>\n  <learning route=\"memory\" category=\"WORKFLOW\">Not a valid category.</learning>\n</learnings>"
+      },
+      "gateUserText": "Decide whether these user lines show the user correcting, re-explaining to, or expressing frustration at the ASSISTANT's behavior — a moment a future assistant should learn from.\n\nFire (y) when the user: corrects a mistake the assistant made, repeats an instruction the assistant didn't follow, tells the assistant to stop or revert an unwanted action, or shows frustration at repeated assistant behavior.\nDo NOT fire (n) for: a normal request or question; the user changing their own mind or fixing their own earlier message (\"actually, use X instead — my mistake\"); reporting a bug/error/test failure to investigate; a calm one-off \"do X instead\". The words \"no\", \"not\", \"error\", \"fail\", \"wrong\" inside an otherwise-normal sentence are not friction.\n\nReturn exactly one line: \"n\", or \"y: <line numbers>\". Be conservative.\n\n1: Please run the focused tests before you report the change as done.\n3: You did not run the tests again; run the focused tests before reporting done.\n4: Stop guessing file paths and read the directory listing first.\n6: Thanks, that works now.",
+      "frictionWindow": "1. (ses-a) U: Please run the focused tests before you report the change as done.\n2. (ses-a) tool bash: \n3. (ses-a) U: You did not run the tests again; run the focused tests before reporting done.  [friction]\n4. (ses-b) U: Stop guessing file paths and read the directory listing first.  [friction]\n5. (ses-a) tool read: \n6. (ses-a) U: Thanks, that works now.",
+      "modelCalls": 2,
+      "watermark": 1500,
+      "memories": [
+        {
+          "project_path": "project",
+          "category": "PROJECT_RULES",
+          "content": "Run the focused test suite and report its result before calling a change done.",
+          "source_session_id": "ses-a",
+          "source_type": "dreamer",
+          "metadata_json": "{\"source\":\"retrospective\"}",
+          "status": "active"
+        }
+      ],
+      "candidates": [
+        {
+          "content": "Prefers explicit verification evidence in completion summaries.",
+          "session_id": "ses-a",
+          "created_at": 100000,
+          "source_compartment_start": null,
+          "source_compartment_end": null
+        }
+      ],
+      "processedWindows": [
+        {
+          "project_path": "project",
+          "window_key": "7501385f682e8e358fd04b05777567a8"
+        }
+      ]
+    },
+    {
+      "archived": [
+        {
+          "sessionId": "ses-a",
+          "message": {
+            "id": "a7",
+            "role": "user",
+            "parts": [
+              {
+                "type": "text",
+                "text": "Looks good, please continue with the next step."
+              }
+            ],
+            "ordinal": 7,
+            "createdAt": 1600,
+            "completedAt": null,
+            "version": null
+          }
+        }
+      ],
+      "answer": {
+        "gate": "n"
+      },
+      "gateUserText": "Decide whether these user lines show the user correcting, re-explaining to, or expressing frustration at the ASSISTANT's behavior — a moment a future assistant should learn from.\n\nFire (y) when the user: corrects a mistake the assistant made, repeats an instruction the assistant didn't follow, tells the assistant to stop or revert an unwanted action, or shows frustration at repeated assistant behavior.\nDo NOT fire (n) for: a normal request or question; the user changing their own mind or fixing their own earlier message (\"actually, use X instead — my mistake\"); reporting a bug/error/test failure to investigate; a calm one-off \"do X instead\". The words \"no\", \"not\", \"error\", \"fail\", \"wrong\" inside an otherwise-normal sentence are not friction.\n\nReturn exactly one line: \"n\", or \"y: <line numbers>\". Be conservative.\n\n1: Please run the focused tests before you report the change as done.\n2: You did not run the tests again; run the focused tests before reporting done.\n3: Thanks, that works now.\n4: Looks good, please continue with the next step.",
+      "frictionWindow": null,
+      "modelCalls": 1,
+      "watermark": 1600,
+      "memories": [
+        {
+          "project_path": "project",
+          "category": "PROJECT_RULES",
+          "content": "Run the focused test suite and report its result before calling a change done.",
+          "source_session_id": "ses-a",
+          "source_type": "dreamer",
+          "metadata_json": "{\"source\":\"retrospective\"}",
+          "status": "active"
+        }
+      ],
+      "candidates": [
+        {
+          "content": "Prefers explicit verification evidence in completion summaries.",
+          "session_id": "ses-a",
+          "created_at": 100000,
+          "source_compartment_start": null,
+          "source_compartment_end": null
+        }
+      ],
+      "processedWindows": [
+        {
+          "project_path": "project",
+          "window_key": "7501385f682e8e358fd04b05777567a8"
+        }
+      ]
+    }
+  ]
+}

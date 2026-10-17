@@ -16,12 +16,16 @@ use super::context::{
 use super::curate_host::{CurateError, CurateHost};
 use super::dispatcher::TaskExecutor;
 use super::host_carrier::{DreamQueue, HostCarrier};
+use super::primer_host::{PrimerCarrier, PrimerHost};
 use super::retrospective_host::{HostError, RetrospectiveHost};
+use super::session_reader;
 use super::verify_host::VerifyHost;
 use crate::dream_runner::{
     resolve_task_models, CarrierError, ChildRequest, Completion, DreamCarrier,
 };
-use crate::dream_tasks::{classify::SensitiveContext, classify::TaskError, curate::CurateCarrier};
+use crate::dream_tasks::{
+    classify::SensitiveContext, classify::TaskError, curate::CurateCarrier,
+};
 use mc_store::dream_scheduler::schedules::{RunOutcome, RunStatus, ScheduleState, TaskName};
 use mc_store::dream_scheduler::SqliteDreamScheduler;
 use mc_store::parity_schema_manifest::StoreScope;
@@ -162,14 +166,29 @@ impl TaskToolRouter for RecordingRouter {
     }
 }
 
-/// A curate carrier whose message list is the executed tool calls of the child,
-/// in the assistant-message shape `curate::inspect_operations` reads.
-struct CurateTaskCarrier<P: BrocaPort> {
+/// A carrier whose message list for a child is the tool calls the task router
+/// actually executed for it, in the assistant-message shape that
+/// `curate::inspect_operations` and the primer grounding gate read. Tools the
+/// host runs itself (read, grep and the like) never reach the router, so they
+/// are not listed.
+struct RecordedCarrier<P: BrocaPort> {
     inner: TaskCarrier<P>,
     calls: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 }
 
-impl<P: BrocaPort> DreamCarrier for CurateTaskCarrier<P> {
+impl<P: BrocaPort> RecordedCarrier<P> {
+    fn recorded(&self, child: &str) -> Value {
+        let parts = self
+            .calls
+            .lock()
+            .ok()
+            .and_then(|calls| calls.get(child).cloned())
+            .unwrap_or_default();
+        json!([{"info": {"role": "assistant"}, "parts": parts}])
+    }
+}
+
+impl<P: BrocaPort> DreamCarrier for RecordedCarrier<P> {
     async fn open(&mut self, request: &ChildRequest) -> Result<String, CarrierError> {
         self.inner.open(request).await
     }
@@ -185,15 +204,19 @@ impl<P: BrocaPort> DreamCarrier for CurateTaskCarrier<P> {
     }
 }
 
-impl<P: BrocaPort> CurateCarrier for CurateTaskCarrier<P> {
+impl<P: BrocaPort> CurateCarrier for RecordedCarrier<P> {
     fn messages(&self, child: &str) -> Value {
-        let parts = self
-            .calls
-            .lock()
-            .ok()
-            .and_then(|calls| calls.get(child).cloned())
-            .unwrap_or_default();
-        json!([{"info": {"role": "assistant"}, "parts": parts}])
+        self.recorded(child)
+    }
+}
+
+/// The module has no embedding client of its own (ctx_search receives its query
+/// vector from the host), so `embedding_model` stays `None`: promotion clusters
+/// by normalized question text, as the TypeScript dreamer does when its
+/// embedding call fails.
+impl<P: BrocaPort> PrimerCarrier for RecordedCarrier<P> {
+    fn messages(&self, child: &str) -> Value {
+        self.recorded(child)
     }
 }
 
@@ -207,18 +230,21 @@ pub struct DreamExecutor<B: BrocaPorts> {
     pub scheduler: Arc<SqliteDreamScheduler>,
     pub transport: Transport<B>,
     /// `ownership::publish`'s list for the project, restricted to the tasks this
-    /// build runs. Nothing else is planned, seeded or dispatched.
+    /// build has wired. Nothing else is planned, seeded or dispatched.
     pub published: Vec<TaskName>,
     /// Host identity used by classification's shareability check.
     pub sensitive: SensitiveContext,
 }
 
 impl<B: BrocaPorts> DreamExecutor<B> {
+    /// `wired` is the wiring publication used (`Wiring::tasks`, which is
+    /// [`OPERATIONAL`] in production); a published task outside it never runs.
     pub fn new(
         store: Arc<McStore>,
         scheduler: Arc<SqliteDreamScheduler>,
         transport: Transport<B>,
         published: &[TaskName],
+        wired: &[TaskName],
     ) -> Self {
         Self {
             store,
@@ -227,7 +253,7 @@ impl<B: BrocaPorts> DreamExecutor<B> {
             published: published
                 .iter()
                 .copied()
-                .filter(|task| OPERATIONAL.contains(task))
+                .filter(|task| wired.contains(task))
                 .collect(),
             sensitive: SensitiveContext {
                 home: std::env::var("HOME").unwrap_or_default(),
@@ -381,7 +407,7 @@ impl<B: BrocaPorts> TaskExecutor for DreamExecutor<B> {
                         inner: router,
                         calls: calls.clone(),
                     });
-                    CurateTaskCarrier {
+                    RecordedCarrier {
                         inner: self.carrier(&context, recording),
                         calls: calls.clone(),
                     }
@@ -390,6 +416,36 @@ impl<B: BrocaPorts> TaskExecutor for DreamExecutor<B> {
                     Ok(_) => RunOutcome::new(RunStatus::Completed),
                     Err(CurateError::Run(failure)) => task_error(TaskError::Runner(failure)),
                     Err(error) => failed(format!("{error:?}")),
+                }
+            }
+            TaskName::Retrospective => {
+                let (reader, options, collection) = session_reader::retrospective_inputs(
+                    self.store.clone(),
+                    &context.config.effective,
+                    &context.config.harness,
+                    context.now_ms(),
+                );
+                let carrier = self.carrier(&context, Arc::new(NoTools));
+                let mut host = RetrospectiveHost::new(carrier, self.store.clone(), context);
+                match host.run_retrospective(&reader, &options, collection).await {
+                    Ok(_) => RunOutcome::new(RunStatus::Completed),
+                    Err(error) => host_error(error),
+                }
+            }
+            TaskName::PromotePrimers | TaskName::RefreshPrimers => {
+                let calls = Arc::new(Mutex::new(HashMap::new()));
+                let recording = Arc::new(RecordingRouter {
+                    inner: Arc::new(NoTools),
+                    calls: calls.clone(),
+                });
+                let carrier = RecordedCarrier {
+                    inner: self.carrier(&context, recording),
+                    calls,
+                };
+                let mut host = PrimerHost::new(carrier, self.store.clone(), context);
+                match host.run().await {
+                    Ok(_) => RunOutcome::new(RunStatus::Completed),
+                    Err(error) => task_error(error),
                 }
             }
             TaskName::ReviewUserMemories => {

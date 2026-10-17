@@ -106,6 +106,7 @@ async fn classify_through_broca(capabilities: &[&str], steps: Vec<Step>) -> Broc
                 module_id: "magic-context".into(),
             },
             &[TaskName::Classify],
+            crate::dream_dispatch::dispatcher::OPERATIONAL_TASKS,
         ),
     };
     let config = TaskConfig {

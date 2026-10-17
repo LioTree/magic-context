@@ -15,6 +15,7 @@ pub mod host_carrier;
 pub mod ownership;
 pub mod primer_host;
 pub mod retrospective_host;
+pub mod session_reader;
 pub mod tick;
 pub mod verify_host;
 
