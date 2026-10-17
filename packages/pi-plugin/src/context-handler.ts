@@ -9435,7 +9435,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			),
 		),
 		editAdmission,
-		piToolBatchCoordinates(workingMessages, stableIdResolver),
+		() => piToolBatchCoordinates(workingMessages, stableIdResolver),
 	);
 	if (
 		!holdEnabled &&

@@ -2,7 +2,7 @@ import { isRustMarkerAdmissionFenced } from "../../features/magic-context/storag
 import { sessionLog } from "../../shared/logger";
 import { type Database, withSqliteBackgroundWriter } from "../../shared/sqlite";
 import { saveLkgSlotToDb } from "./lkg-persist";
-import { captureSlot, getInMemorySlot } from "./lkg-slot";
+import { captureSlot, getInMemorySlot, type LkgSlot } from "./lkg-slot";
 
 export interface ServedMarker {
     servedCaptureId: number;
@@ -36,8 +36,41 @@ export function recordServedCapture(
     db: Database,
     sessionId: string,
     fullCoverage: boolean,
+    candidate?: LkgSlot,
 ): number | undefined {
     try {
+        // A certificate identifies replay bytes and their input frontier, not the
+        // time of a repeated serve. Reuse requires both an identical in-memory
+        // frontier and its still-current database marker, never a content memo alone.
+        const prior = candidate ? getInMemorySlot(sessionId) : undefined;
+        const equal = <T>(a: readonly T[] | undefined, b: readonly T[] | undefined) =>
+            a !== undefined &&
+            b !== undefined &&
+            a.length === b.length &&
+            a.every((value, index) => value === b[index]);
+        if (
+            prior?.servedCaptureId !== undefined &&
+            candidate &&
+            prior.fullCoverage === fullCoverage &&
+            prior.jsonPrefix === candidate.jsonPrefix &&
+            prior.modelKey === candidate.modelKey &&
+            prior.providerKey === candidate.providerKey &&
+            prior.rowVersion === candidate.rowVersion &&
+            prior.lastInputMessageId === candidate.lastInputMessageId &&
+            equal(prior.inputIdSeq, candidate.inputIdSeq) &&
+            equal(prior.inputContentDigests, candidate.inputContentDigests) &&
+            equal(prior.inputMoveDigests, candidate.inputMoveDigests) &&
+            (prior.piOutputEntryIds === candidate.piOutputEntryIds ||
+                equal(prior.piOutputEntryIds, candidate.piOutputEntryIds))
+        ) {
+            const marker = readServedMarker(db, sessionId);
+            if (
+                marker?.servedCaptureId === prior.servedCaptureId &&
+                marker.fullCoverage === fullCoverage &&
+                marker.slotState === "captured"
+            )
+                return marker.servedCaptureId;
+        }
         return withSqliteBackgroundWriter(() =>
             db
                 .transaction(() => {

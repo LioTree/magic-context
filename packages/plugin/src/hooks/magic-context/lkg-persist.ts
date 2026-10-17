@@ -244,10 +244,29 @@ function persistLkgSlot(
 ): boolean {
     const { force, publishMetadata } =
         typeof options === "function" ? { publishMetadata: options, force: false } : options;
-    const fingerprint = slotFingerprint(slot);
+    // Pi saves served tag numbers and the request in one transaction. Even when
+    // the request is unchanged, those numbers must commit, so the fingerprint
+    // used to skip repeated request-only saves cannot skip this transaction.
+    // Avoid computing that unused hash for host-built arrays. Custom serializers
+    // can reject preparation before publication; preserve their existing preflight.
+    const plainPublication =
+        publishMetadata &&
+        [
+            slot.inputIdSeq,
+            slot.inputContentDigests,
+            slot.inputContentSignatures,
+            slot.piOutputEntryIds,
+            slot.inputMoveDigests,
+        ].every(
+            (values) =>
+                values === undefined ||
+                (Object.getPrototypeOf(values) === Array.prototype && !("toJSON" in values)),
+        );
+    const fingerprint = plainPublication ? undefined : slotFingerprint(slot);
     if (
         !force &&
         !publishMetadata &&
+        fingerprint !== undefined &&
         persistedFingerprints.get(db)?.get(sessionId) === fingerprint
     ) {
         const durable = loadPersistedLkgSlot(db, sessionId);
@@ -344,7 +363,7 @@ function persistLkgSlot(
             // Safety metadata must share the request's commit, not a later callback.
             publishMetadata?.();
         }).immediate();
-        rememberFingerprint(db, sessionId, fingerprint);
+        if (fingerprint !== undefined) rememberFingerprint(db, sessionId, fingerprint);
         return true;
     } catch (error) {
         // Paired Pi publication reports its optional failure once per session/reason.

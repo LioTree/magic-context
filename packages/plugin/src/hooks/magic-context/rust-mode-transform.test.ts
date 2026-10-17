@@ -6204,6 +6204,47 @@ describe("Rust mode authority adapter", () => {
         expect(JSON.stringify(coldReplay.messages)).toContain("module output 3");
     });
 
+    it("reuses the served marker on identical healthy Rust passes", async () => {
+        const db = makeDb();
+        const sessionId = "rust-identical-served-id";
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        let calls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                calls++;
+                return {
+                    decision: calls === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: calls === 1,
+                    row_version: 800,
+                    native_messages: structuredClone(input),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const marker = readServedMarker(db, sessionId);
+        expect(marker?.servedCaptureId).toBeGreaterThan(0);
+        for (let i = 0; i < 3; i++) {
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(readServedMarker(db, sessionId)).toEqual(marker);
+            expect(checkLkgDurability(db, sessionId)).toEqual({
+                durable: true,
+                servedCaptureId: marker!.servedCaptureId,
+            });
+        }
+        transform.dispose();
+    });
+
     it("binds two Rust captures at one row_version to distinct durable served ids", async () => {
         const db = makeDb();
         const sessionId = "rust-served-ids";

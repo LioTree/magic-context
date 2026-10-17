@@ -376,6 +376,45 @@ describe("doctor repair-db", () => {
         expect(output).toContain("Backup:");
     });
 
+    salvageIt(
+        "preserves SQLite sequence high-water marks and FTS schema during salvage",
+        async () => {
+            const storageDir = tempStorage();
+            const dbPath = join(storageDir, "context.db");
+            seedCurrentDatabase(dbPath);
+            const source = new Database(dbPath);
+            source.exec(`CREATE TABLE salvage_sequence(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+            INSERT INTO salvage_sequence VALUES(1000, 'deleted high water');
+            DELETE FROM salvage_sequence;
+            INSERT INTO salvage_sequence VALUES(2, 'kept');`);
+            source.close();
+            corruptLastTagLeaf(dbPath);
+            const prompts = new MockPrompts();
+            expect(await runRepairDb({ dbPath, storageDir, prompts })).toBe(
+                REPAIR_DB_EXIT.salvaged,
+            );
+            const recovered = new Database(dbPath);
+            try {
+                recovered.exec("INSERT INTO salvage_sequence(value) VALUES('next')");
+                expect(
+                    recovered.prepare("SELECT id FROM salvage_sequence WHERE value='next'").get(),
+                ).toEqual({ id: 1001 });
+                expect(
+                    recovered
+                        .prepare(
+                            "SELECT count(*) AS n FROM memories_fts WHERE memories_fts MATCH 'memory'",
+                        )
+                        .get(),
+                ).toEqual({ n: 26 });
+                expect(recovered.prepare("SELECT count(*) AS n FROM sqlite_stat1").get()).toEqual({
+                    n: 4,
+                });
+            } finally {
+                recovered.close();
+            }
+        },
+    );
+
     // Like the salvage test above, this test exercises a REAL `.recover` run
     // (here: one that must fail on the data), so it needs a capability-bearing
     // sqlite3 and is skipped the same way when the shell lacks it.

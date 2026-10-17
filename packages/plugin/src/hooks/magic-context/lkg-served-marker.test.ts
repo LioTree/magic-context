@@ -17,6 +17,7 @@ import {
     checkLkgDurability,
     readServedMarker,
     recordServedCapture,
+    recordServedSlotState,
     repairLkgDurability,
     startLkgDurabilityPoll,
 } from "./lkg-served-marker";
@@ -67,6 +68,50 @@ afterEach(() => {
 });
 
 describe("served marker durability", () => {
+    test("unchanged served captures do not write the marker", () => {
+        const db = fixture();
+        const first = slot(recordServedCapture(db, "s", true));
+        expect(captureSlot("s", first)).toBe(true);
+        db.exec(`CREATE TABLE marker_writes(n INTEGER);
+            CREATE TRIGGER count_marker_writes AFTER UPDATE ON lkg_served_markers
+            BEGIN INSERT INTO marker_writes VALUES(1); END`);
+        const next = { ...first, capturedAt: first.capturedAt + 1, captureSequence: 4 };
+        expect(recordServedCapture(db, "s", true, next)).toBe(first.servedCaptureId);
+        expect(db.prepare("SELECT count(*) AS n FROM marker_writes").get()).toEqual({ n: 0 });
+        expect(readServedMarker(db, "s")?.servedCaptureId).toBe(first.servedCaptureId);
+    });
+
+    test("changed frontiers and invalidated certificates allocate fresh served ids", () => {
+        const db = fixture();
+        const first = slot(recordServedCapture(db, "s", true));
+        const variants: LkgSlot[] = [
+            { ...first, jsonPrefix: "[]" },
+            { ...first, inputIdSeq: ["different"] },
+            { ...first, inputContentDigests: ["different"] },
+            { ...first, inputMoveDigests: ["b".repeat(64)] },
+            { ...first, modelKey: "other" },
+            { ...first, providerKey: "other" },
+            { ...first, rowVersion: 901 },
+            { ...first, piOutputEntryIds: [null] },
+        ];
+        for (const candidate of variants) {
+            const baseline = { ...first, servedCaptureId: recordServedCapture(db, "s", true) };
+            expect(captureSlot("s", baseline)).toBe(true);
+            expect(recordServedCapture(db, "s", true, candidate)).toBe(
+                baseline.servedCaptureId! + 1,
+            );
+        }
+        const baseline = { ...first, servedCaptureId: recordServedCapture(db, "s", true) };
+        expect(captureSlot("s", baseline)).toBe(true);
+        expect(recordServedCapture(db, "s", false, first)).toBe(baseline.servedCaptureId! + 1);
+        const current = { ...first, servedCaptureId: recordServedCapture(db, "s", true) };
+        expect(captureSlot("s", current)).toBe(true);
+        recordServedSlotState(db, "s", "invalidated");
+        expect(recordServedCapture(db, "s", true, current)).toBe(current.servedCaptureId! + 1);
+        forgetInMemorySlot("s");
+        expect(recordServedCapture(db, "s", true, current)).toBe(current.servedCaptureId! + 2);
+    });
+
     test("an older marker never certifies a newer durable capture at the same row_version", () => {
         const db = fixture();
         expect(checkLkgDurability(db, "s")).toEqual({ durable: true, servedCaptureId: null });
