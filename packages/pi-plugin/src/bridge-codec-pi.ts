@@ -104,7 +104,8 @@ export function nativePiEntry(projected: MessageLike): PiBridgeEntry {
 
 const COMPLETED_ASSISTANT_STOPS = new Set(["stop", "length", "toolUse"]);
 // Lone UTF-16 surrogates, which pi-ai's provider serializers delete before sending.
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+const LONE_SURROGATE =
+	/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 
 /**
  * Which text of a served, projected Pi message certainly reaches the provider.

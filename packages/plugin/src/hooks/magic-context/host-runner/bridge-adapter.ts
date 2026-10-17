@@ -28,8 +28,8 @@ import { createBridgeDeps } from "./bridge-deps";
 import { createBridgeHostFacts } from "./bridge-host-facts";
 import { type BridgeMarkerOutcome, createBridgeReceiptStore } from "./bridge-marker";
 import { openCodeCutProblem, openCodeCutSources } from "./bridge-native-cut";
-import type { BridgeReceipt, BridgeRequestCompletion } from "./bridge-receipt";
 import { providerUsageFromHostFact } from "./bridge-provider-usage";
+import type { BridgeReceipt, BridgeRequestCompletion } from "./bridge-receipt";
 import { BridgeStep } from "./bridge-step";
 import {
     type BridgeAdapterOptions,

@@ -26,12 +26,12 @@ import {
 } from "@magic-context/core/hooks/magic-context/host-runner/bridge-types";
 import { InjectedBridgeTransport } from "@magic-context/core/hooks/magic-context/host-runner/injected-transport";
 import { createProviderTransform } from "@magic-context/core/hooks/magic-context/host-runner/opencode-adapter";
-import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
-import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import {
 	deriveMarkerEnvelopeReading,
 	type MarkerEnvelope,
 } from "@magic-context/core/hooks/magic-context/marker-envelope";
+import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
+import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { createRustModeTransform } from "@magic-context/core/hooks/magic-context/rust-mode-transform";
 import {
