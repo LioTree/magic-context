@@ -1,7 +1,8 @@
 //! Independent M3 regression cases. Expectations come from the full engine or
 //! the durable host contract, not the incremental aggregate under review.
 use super::host_tests::{
-    admit, dispatch, handler, hook, key, response, sync_pass, text, without_delivery_dependent_hint,
+    admit, dispatch, handler, hook, key, pending_hint_numbers, response, sync_pass, text,
+    without_delivery_dependent_hint,
 };
 use super::*;
 use crate::config::CacheTtlProvenance;
@@ -692,9 +693,10 @@ async fn r2_three_tool_appends_use_full_pass_protection_and_carrier() {
         &pc,
         response(dispatch(&h, 7, "transform.hook", pc.clone()).await),
     );
+    let pending_numbers = pending_hint_numbers(&h);
     let suffix = |s: &str| {
         s.find("<system-reminder>")
-            .map(|n| without_delivery_dependent_hint(&s[n..]))
+            .map(|n| without_delivery_dependent_hint(&s[n..], &pending_numbers))
     };
     let expected = engine_text(&expected, "c", 1);
     assert!(
@@ -754,9 +756,10 @@ async fn r2_model_switch_reminder_uses_the_exact_pass_calibration() {
         response(dispatch(&h, 7, "transform.hook", pa.clone()).await),
     );
     let expected = engine_text(&expected, "a", 1);
+    let pending_numbers = pending_hint_numbers(&h);
     let suffix = |s: &str| {
         s.find("<system-reminder>")
-            .map(|n| without_delivery_dependent_hint(&s[n..]))
+            .map(|n| without_delivery_dependent_hint(&s[n..], &pending_numbers))
     };
     assert!(
         suffix(&expected).is_some(),

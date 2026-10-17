@@ -1844,14 +1844,97 @@ mod host_tests {
         p
     }
 
-    // The full-request engine considers its newly minted tags served; bridge
-    // hooks keep them pending until delivery. Their reminder accounting and
-    // carrier bytes must match, but the bridge must omit pending-number hints.
-    // Hint eligibility itself has separate served/unserved positive controls.
-    pub(super) fn without_delivery_dependent_hint(text: &str) -> String {
+    pub(super) fn pending_hint_numbers(h: &McHandler) -> BTreeSet<i64> {
+        h.store
+            .get()
+            .unwrap()
+            .load_provider_hook_answers(&key(h).store_key())
+            .unwrap()
+            .into_iter()
+            .filter(|answer| answer.state == "pending")
+            .flat_map(|answer| answer.answer.tags.into_iter().map(|tag| tag.number))
+            .collect()
+    }
+
+    // The full-request engine assumes newly numbered messages reached the model;
+    // the bridge waits for delivery confirmation. This can change hint eligibility
+    // while tag numbers are pending. Only then exempt the hint line; with no
+    // pending numbers every byte must match. Separate hint tests check which
+    // confirmed and unconfirmed tags the bridge may mention.
+    pub(super) fn without_delivery_dependent_hint(
+        text: &str,
+        pending_numbers: &BTreeSet<i64>,
+    ) -> String {
+        if pending_numbers.is_empty() {
+            return text.to_owned();
+        }
         text.split_inclusive('\n')
             .filter(|line| !line.starts_with("oldest reclaimable: "))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn bridge_reference_hint_parity_without_pending_tags_rejects_changed_hint_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path());
+        admit(&h, 7).await;
+        let pending = pending_hint_numbers(&h);
+        assert!(pending.is_empty());
+        let expected =
+            "<system-reminder>\nHousekeeping.\noldest reclaimable: §1§ read.\n</system-reminder>";
+        let changed = expected.replace("§1§ read", "§2§ bash");
+        let comparison = std::panic::catch_unwind(|| {
+            assert_eq!(
+                without_delivery_dependent_hint(&changed, &pending),
+                without_delivery_dependent_hint(expected, &pending),
+                "no-pending hint parity must be byte-exact"
+            );
+        });
+        assert!(
+            comparison.is_err(),
+            "the changed no-pending hint was ignored"
+        );
+        assert_eq!(
+            without_delivery_dependent_hint(expected, &pending),
+            expected
+        );
+        let entry = text("m1", "user", "payload");
+        response(
+            dispatch(
+                &h,
+                7,
+                "transform.hook",
+                hook("m1", 1, "pre_user", &["payload"], entry),
+            )
+            .await,
+        );
+        let pending = pending_hint_numbers(&h);
+        assert_eq!(pending, BTreeSet::from([1]));
+        assert_eq!(
+            without_delivery_dependent_hint(&changed, &pending),
+            without_delivery_dependent_hint(expected, &pending)
+        );
+        let store = h.store.get().unwrap();
+        store
+            .commit_provider_status(
+                &key(&h).store_key(),
+                &ProviderLineage {
+                    lineage_id: "L".into(),
+                    first_ordinal: 1,
+                    descends_from: None,
+                    through_ordinal: None,
+                },
+                &[],
+                Some(1),
+                &[],
+            )
+            .unwrap();
+        let pending = pending_hint_numbers(&h);
+        assert!(pending.is_empty());
+        assert_ne!(
+            without_delivery_dependent_hint(&changed, &pending),
+            without_delivery_dependent_hint(expected, &pending)
+        );
     }
 
     #[tokio::test]
