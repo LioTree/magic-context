@@ -35,6 +35,13 @@ export interface LkgSlot {
      * certify it. The pass clears it when it returns these bytes.
      */
     servedCaptureWithheld?: boolean;
+    /**
+     * Set on a slot loaded from storage whose request was saved before dispatch
+     * and whose dispatch was never confirmed (the process stopped in between). It
+     * certifies nothing and may replay only for exactly the input it was built
+     * from, where replaying it equals rebuilding the same request.
+     */
+    dispatchUnconfirmed?: boolean;
     /** RFC 8785 message digests for the portable hostCut frontier. */
     inputMoveDigests?: string[];
 }
@@ -783,6 +790,48 @@ export function releaseWithheldServedCapture(
     )
         return false;
     entry.slot = { ...entry.slot, servedCaptureId, servedCaptureWithheld: undefined };
+    return true;
+}
+
+/**
+ * Remove the in-memory capture if its pass never returned it (still withheld),
+ * so the next read loads the last saved request instead. A withheld capture was
+ * never sent, so a replay must never serve it. Only the process copy is removed:
+ * a withheld capture is never saved, so the durable row still holds the last
+ * request sent. Returns whether a capture was removed.
+ */
+export function discardWithheldServedCapture(sessionId: string): boolean {
+    const entry = lkgHeapHolder.entries.get(sessionId);
+    if (!entry?.slot.servedCaptureWithheld) return false;
+    lkgHeapHolder.entries.delete(sessionId);
+    totalBytes -= entry.bytes;
+    // The durable row was never consulted for this miss; allow it to load now.
+    hydrationAttemptBySession.delete(sessionId);
+    return true;
+}
+
+/**
+ * Undo the in-memory install of a capture whose pass was refused instead of
+ * dispatched: put back `prior`, the capture served before it, or leave no slot
+ * when there is none. A refused capture was never sent, so neither a replay nor
+ * the next pass's entry note may use it. Acts only while `refused` is still the
+ * in-memory slot; a newer capture is left alone.
+ */
+export function restoreRefusedCapture(
+    sessionId: string,
+    refused: Pick<LkgSlot, "capturedAt" | "jsonPrefix">,
+    prior: LkgSlot | undefined,
+): boolean {
+    const entry = lkgHeapHolder.entries.get(sessionId);
+    if (
+        !entry ||
+        entry.slot.capturedAt !== refused.capturedAt ||
+        entry.slot.jsonPrefix !== refused.jsonPrefix
+    )
+        return false;
+    lkgHeapHolder.entries.delete(sessionId);
+    totalBytes -= entry.bytes;
+    if (prior) installHydratedSlot(sessionId, prior);
     return true;
 }
 

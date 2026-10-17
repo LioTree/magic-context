@@ -6804,10 +6804,23 @@ export function registerPiContextHandler(
 				recordPiHeldSystemHead(sessionId, (ownsHistory) =>
 					deferPiDeliveredSystemRefresh(sessionId, ownsHistory),
 				);
+			// Every refusal point inside this handler is behind us. The dispatch
+			// wrapper certifies the saved copy of this request only once it actually
+			// hands the request on for sending, and records a refusal otherwise.
+			if (lkgPassSnapshot) {
+				const dispatchedSnapshot = lkgPassSnapshot;
+				budget.dispatchCertificate = {
+					confirm: () => lkgCoordinator.certifyDispatched(dispatchedSnapshot),
+					refuse: () => lkgCoordinator.refuseDispatch(dispatchedSnapshot),
+				};
+			}
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;
 			};
 		} catch (err) {
+			// This pass's request is not going to Pi; if its publication saved it,
+			// record the refusal so a restarted process never replays it.
+			if (lkgPassSnapshot) lkgCoordinator.refuseDispatch(lkgPassSnapshot);
 			// Cancellation must not enter recovery or queue a failed-turn diagnostic,
 			// including on hosts that report AbortError without exposing a signal.
 			if (budget.isCancelled(err)) throw err;

@@ -1,19 +1,23 @@
 import { expect, test } from "bun:test";
 import { closeDatabase, getDatabasePath, openDatabase } from "../features/magic-context/storage-db";
 import { createTagger } from "../features/magic-context/tagger";
+import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
 import {
+    createDbLkgPersistence,
     lkgSlotCertificateDigest,
     loadPersistedLkgSlot,
     saveLkgSlotToDb,
 } from "../hooks/magic-context/lkg-persist";
+import { replayLkg } from "../hooks/magic-context/lkg-replay";
 import {
     checkLkgDurability,
     readServedMarker,
     recordServedCapture,
 } from "../hooks/magic-context/lkg-served-marker";
-import { dropSlot, getSlot } from "../hooks/magic-context/lkg-slot";
+import { dropSlot, getSlot, registerLkgPersistence } from "../hooks/magic-context/lkg-slot";
 import { createTransform } from "../hooks/magic-context/transform";
 import { Database } from "../shared/sqlite";
+import { createMessagesTransformHandler } from "./messages-transform";
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -87,6 +91,143 @@ test("OpenCode 1: a pass that throws after capturing leaves another connection's
     } finally {
         dropSlot(sessionId);
         sibling.close();
+        closeDatabase();
+    }
+});
+
+// A pass that captures its request in memory and is then refused never sends that
+// request. Its capture is withheld from certification and from the deferred save,
+// but it is still the in-memory slot, and replay does not consult the withheld
+// flag. So the next failed pass replays a request the provider never received.
+// This states the intended behavior and fails today.
+test("OpenCode 1: replay never serves the in-memory capture of a refused pass", async () => {
+    const sessionId = `refused-oc1-${Date.now()}`;
+    const db = openDatabase();
+    if (!db) throw new Error("throwaway database unavailable");
+    let refuseAfterCapture = false;
+    const transform = createTransform({
+        db,
+        tagger: createTagger(),
+        scheduler: { shouldExecute: () => "defer" },
+        contextUsageMap: new Map([
+            [sessionId, { usage: { percentage: 10, inputTokens: 10_000 }, updatedAt: Date.now() }],
+        ]),
+        historyRefreshSessions: new Set(),
+        pendingMaterializationSessions: new Set(),
+        lastHeuristicsTurnId: new Map(),
+        protectedTokens: 1,
+        protectedTags: 0,
+        directory: process.cwd(),
+        onPostprocess: () => {
+            if (refuseAfterCapture) throw new EmergencyFailClosedError("refused after capture");
+        },
+    });
+    const turns = [
+        {
+            info: { id: "start", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "start" }],
+        },
+    ];
+    const pass = async () => {
+        const output = { messages: structuredClone(turns) };
+        await (transform as (input: unknown, output: unknown) => Promise<void>)({}, output);
+        return JSON.stringify(output.messages);
+    };
+    try {
+        await pass();
+        await settle();
+        refuseAfterCapture = true;
+        turns.push({
+            info: { id: "next", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "next turn" }],
+        });
+        await expect(pass()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        const refused = getSlot(sessionId);
+        expect(refused?.servedCaptureWithheld).toBe(true);
+        // The next pass fails before capturing and falls back to replay, as the
+        // messages.transform wrapper does.
+        const replay = replayLkg({
+            sessionId,
+            messages: structuredClone(turns),
+            modelKey: refused?.modelKey ?? null,
+            providerKey: refused?.providerKey ?? null,
+        });
+        const replayed = replay.ok ? JSON.stringify(replay.messages) : "";
+        expect(replayed).not.toBe(refused?.jsonPrefix);
+    } finally {
+        dropSlot(sessionId);
+        closeDatabase();
+    }
+});
+
+// Through the messages.transform wrapper: after a refused pass leaves its unsent
+// capture in memory, the next pass that fails replays the request the provider
+// last received (the saved one), with this pass's new messages after it.
+test("OpenCode 1: after a refused pass, the wrapper's replay serves the last request sent", async () => {
+    const sessionId = `refused-oc1-wrapper-${Date.now()}`;
+    const db = openDatabase();
+    if (!db) throw new Error("throwaway database unavailable");
+    registerLkgPersistence(createDbLkgPersistence(db));
+    let failure: "none" | "refuse" | "throw" = "none";
+    const transform = createTransform({
+        db,
+        tagger: createTagger(),
+        scheduler: { shouldExecute: () => "defer" },
+        contextUsageMap: new Map([
+            [sessionId, { usage: { percentage: 10, inputTokens: 10_000 }, updatedAt: Date.now() }],
+        ]),
+        historyRefreshSessions: new Set(),
+        pendingMaterializationSessions: new Set(),
+        lastHeuristicsTurnId: new Map(),
+        protectedTokens: 1,
+        protectedTags: 0,
+        directory: process.cwd(),
+        onPostprocess: () => {
+            if (failure === "refuse") throw new EmergencyFailClosedError("refused after capture");
+            if (failure === "throw") throw new Error("failed after capture");
+        },
+    });
+    const handler = createMessagesTransformHandler({
+        magicContext: {
+            "experimental.chat.messages.transform": transform as never,
+        },
+    });
+    const turns = [
+        {
+            info: { id: "start", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "start" }],
+        },
+    ];
+    const pass = async () => {
+        const output = { messages: structuredClone(turns) };
+        await handler({}, output as never);
+        return output.messages;
+    };
+    try {
+        await pass();
+        await settle();
+        const sent = loadPersistedLkgSlot(db, sessionId)?.jsonPrefix;
+        expect(sent).toBeDefined();
+
+        failure = "refuse";
+        turns.push({
+            info: { id: "next", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "next turn" }],
+        });
+        await expect(pass()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        const refused = getSlot(sessionId)?.jsonPrefix;
+        expect(refused).not.toBe(sent);
+
+        failure = "throw";
+        turns.push({
+            info: { id: "third", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "third turn" }],
+        });
+        const replayed = await pass();
+        expect(replayed).toEqual([...JSON.parse(sent!), ...turns.slice(1)]);
+    } finally {
+        registerLkgPersistence(undefined);
+        dropSlot(sessionId);
         closeDatabase();
     }
 });

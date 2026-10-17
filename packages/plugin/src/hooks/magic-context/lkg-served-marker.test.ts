@@ -638,6 +638,87 @@ describe("served certificates are bound to their bytes", () => {
         }
     });
 
+    // The same restart race in the other order. The stale writer's deferred save of
+    // its older serve lands while the sibling's newer allocation of the restarted
+    // id is still unbound, so the stale bytes bind the sibling's id and the
+    // sibling's own save is then refused. Under "the latest real serve wins" the
+    // stored, certified pair should be the sibling's. This states the intended
+    // behavior and fails today.
+    test("a stale save landing first on a restarted id does not displace the newer serve that allocated it", () => {
+        const root = createTestTempDirFromPath(join(tmpdir(), "served-marker-restart-order-"));
+        const db = fixture(join(root, "context.db"));
+        const sibling = new Database(join(root, "context.db"));
+        databases.push(sibling);
+        try {
+            const stale = slot(recordServedCapture(db, "s", true));
+            // Session cleanup removes the marker row, so the counter restarts.
+            db.exec("DELETE FROM lkg_served_markers");
+            const fresh = {
+                ...stale,
+                jsonPrefix: '[{"text":"recreated session"}]',
+                servedCaptureId: recordServedCapture(sibling, "s", true),
+            };
+            expect(fresh.servedCaptureId).toBe(stale.servedCaptureId);
+            // The older serve's save is delayed until after the newer allocation.
+            saveLkgSlotToDb(db, "s", stale);
+            saveLkgSlotToDb(sibling, "s", fresh);
+            const stored = loadPersistedLkgSlot(sibling, "s")?.jsonPrefix;
+            const status = checkLkgDurability(sibling, "s");
+            const staleCertified =
+                stored === stale.jsonPrefix && status.durable && status.servedCaptureId !== null;
+            expect(staleCertified).toBe(false);
+        } finally {
+            for (const connection of databases.splice(0)) connection.close();
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("an identical re-serve never reuses an equal id another writer allocated after the counter restarted", () => {
+        const root = createTestTempDirFromPath(join(tmpdir(), "served-marker-reuse-pending-"));
+        const db = fixture(join(root, "context.db"));
+        const sibling = new Database(join(root, "context.db"));
+        databases.push(sibling);
+        try {
+            const served = slot(recordServedCapture(db, "s", true));
+            expect(captureSlot("s", served)).toBe(true);
+            expect(saveLkgSlotToDb(db, "s", served)).toBe(true);
+            // Session cleanup removes the marker row; another writer then allocates
+            // the same restarted id for its own serve, which has not saved yet.
+            db.exec("DELETE FROM lkg_served_markers");
+            const otherId = recordServedCapture(sibling, "s", true);
+            expect(otherId).toBe(served.servedCaptureId);
+            // This connection's in-memory id equals the marker's unbound id, but that
+            // id is the other writer's allocation, not this connection's.
+            const again = { ...served, capturedAt: served.capturedAt + 1, captureSequence: 4 };
+            expect(recordServedCapture(db, "s", true, again)).toBe(otherId! + 1);
+        } finally {
+            for (const connection of databases.splice(0)) connection.close();
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("a re-serve with changed content signatures takes a new id that its save binds", () => {
+        const db = fixture();
+        const first = {
+            ...slot(recordServedCapture(db, "s", true)),
+            inputContentSignatures: ["sig-a"],
+        };
+        expect(captureSlot("s", first)).toBe(true);
+        expect(saveLkgSlotToDb(db, "s", first)).toBe(true);
+        // Everything the reuse check compared before is equal; only the signatures,
+        // which the certificate digest covers, differ.
+        const resigned = {
+            ...first,
+            inputContentSignatures: ["sig-b"],
+            capturedAt: first.capturedAt + 1,
+            captureSequence: 4,
+        };
+        const id = recordServedCapture(db, "s", true, resigned);
+        expect(id).toBe(first.servedCaptureId! + 1);
+        expect(saveLkgSlotToDb(db, "s", { ...resigned, servedCaptureId: id })).toBe(true);
+        expect(checkLkgDurability(db, "s")).toEqual({ durable: true, servedCaptureId: id! });
+    });
+
     test("an identical re-serve never reuses an id another writer bound to different bytes", () => {
         const root = createTestTempDirFromPath(join(tmpdir(), "served-marker-reuse-bound-"));
         const db = fixture(join(root, "context.db"));
