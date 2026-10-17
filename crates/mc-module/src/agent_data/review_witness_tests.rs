@@ -753,10 +753,13 @@ async fn review_feature_off_normal_dispatch_preserves_business_write_footprints(
         before_historian = row_counts(h, false);
     }
     let claim = json!({"method":"historian.claim","v":1,"run_id":"review-run","claimant_instance_id":"review-host"});
-    // Historian claims on a module route need the attested thalamus-harness
-    // principal and scope; a Direct OpenCode caller is refused. This witness
-    // compares footprints, not admission, so claim on the principal-less
-    // in-process plugin lane and restore the Direct binding afterwards.
+    // The historian claim handler refuses a channel bound with
+    // `Principal::Direct` (as `observe` binds channel 1): only the in-process
+    // plugin, whose binding has no principal, or the daemon-attested
+    // `reserved:thalamus-harness` module with an authorized scope may claim.
+    // This test compares the SQL footprints of a direct handler call and the
+    // dispatcher, not who may claim, so both handlers claim with no principal
+    // and channel 1 gets its `Principal::Direct` binding back afterwards.
     let set_principal = |h: &McHandler, principal: Option<Principal>| {
         h.bindings.lock().unwrap().get_mut(&1).unwrap().principal = principal;
     };
