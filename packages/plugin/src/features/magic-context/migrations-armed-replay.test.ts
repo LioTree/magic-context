@@ -878,6 +878,14 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
             });
             populateModuleOwnedRows(db, version, state);
             return;
+        case 102:
+            expect(
+                db
+                    .prepare("SELECT COUNT(*) n FROM memories WHERE safety_critical IS NOT NULL")
+                    .get(),
+            ).toEqual({ n: 0 });
+            populateModuleOwnedRows(db, version, state);
+            return;
         default:
             throw new Error(`populateForVersion has no arm for migration v${version}`);
     }

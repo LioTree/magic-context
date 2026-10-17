@@ -5638,6 +5638,7 @@ pub struct StoredMemoryFull {
     pub importance: Option<i32>,
     pub scope: String,
     pub shareable: i32,
+    pub safety_critical: Option<bool>,
     pub source_session_id: Option<String>,
     pub source_type: Option<String>,
     pub seen_count: i64,
@@ -5852,6 +5853,7 @@ pub struct ClassificationUpdate {
     pub importance: Option<i32>,
     pub scope: Option<String>,
     pub shareable: Option<bool>,
+    pub safety_critical: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10770,11 +10772,29 @@ impl McStore {
                 );
                 let mut assignments = Vec::new();
                 let mut values: Vec<rusqlite::types::Value> = Vec::new();
-                if let Some(importance) = update.importance {
+                let flagged = update.safety_critical.or(memory.safety_critical) == Some(true);
+                if update.importance.is_some() || flagged {
+                    let requested = update
+                        .importance
+                        .unwrap_or(memory.importance.unwrap_or(50))
+                        .clamp(1, 100);
+                    let importance = if flagged {
+                        requested
+                            .max(80)
+                            .max(if memory.safety_critical != Some(true) {
+                                memory.importance.unwrap_or(0)
+                            } else {
+                                0
+                            })
+                    } else {
+                        requested
+                    };
                     assignments.push("importance = ?".to_string());
-                    values.push(rusqlite::types::Value::Integer(i64::from(
-                        importance.clamp(1, 100),
-                    )));
+                    values.push(rusqlite::types::Value::Integer(i64::from(importance)));
+                }
+                if let Some(safety_critical) = update.safety_critical {
+                    assignments.push("safety_critical = ?".to_string());
+                    values.push(rusqlite::types::Value::Integer(i64::from(safety_critical)));
                 }
                 if let Some(scope) = update.scope.as_deref() {
                     assignments.push("scope = ?".to_string());
@@ -10788,10 +10808,19 @@ impl McStore {
                         0
                     }));
                 }
-                assignments.push("updated_at = ?".to_string());
-                values.push(rusqlite::types::Value::Integer(now_ms));
-                assignments.push("classified_at = ?".to_string());
-                values.push(rusqlite::types::Value::Integer(now_ms));
+                if update.importance.is_some()
+                    || update.scope.is_some()
+                    || update.shareable.is_some()
+                {
+                    assignments.push("updated_at = ?".to_string());
+                    values.push(rusqlite::types::Value::Integer(now_ms));
+                    assignments.push("classified_at = ?".to_string());
+                    values.push(rusqlite::types::Value::Integer(now_ms));
+                }
+                if assignments.is_empty() {
+                    accepted.push(update.memory_id);
+                    continue;
+                }
                 values.push(rusqlite::types::Value::Integer(update.memory_id));
                 let sql = format!(
                     "UPDATE memories SET {} WHERE id = ?",
@@ -17075,7 +17104,7 @@ const MEMORY_FULL_SELECT_COLUMNS: &str =
             first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
             status, expires_at, verification_status, verified_at, classified_at,
             superseded_by_memory_id, merged_from, metadata_json,
-            mural_cue, mural_cue_hash, mural_cue_at, mural_cue_rejection_count";
+            mural_cue, mural_cue_hash, mural_cue_at, mural_cue_rejection_count, safety_critical";
 
 const MEMORY_FULL_SELECT_BY_ID: &str =
     "SELECT id, project_path, category, content, normalized_hash, importance, scope,
@@ -17083,7 +17112,7 @@ const MEMORY_FULL_SELECT_BY_ID: &str =
             first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
             status, expires_at, verification_status, verified_at, classified_at,
             superseded_by_memory_id, merged_from, metadata_json,
-            mural_cue, mural_cue_hash, mural_cue_at, mural_cue_rejection_count
+            mural_cue, mural_cue_hash, mural_cue_at, mural_cue_rejection_count, safety_critical
        FROM memories WHERE id = ?1";
 
 fn stored_memory_full_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemoryFull> {
@@ -17121,6 +17150,7 @@ fn stored_memory_full_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Stored
         mural_cue_hash: r.get(26)?,
         mural_cue_at: r.get(27)?,
         mural_cue_rejection_count: r.get::<_, Option<i64>>(28)?.unwrap_or(0),
+        safety_critical: r.get(29)?,
     })
 }
 
@@ -23716,6 +23746,7 @@ mod tests {
                     importance: Some(75),
                     scope: Some("ecosystem".to_string()),
                     shareable: None,
+                    safety_critical: None,
                 }],
                 100,
             )
@@ -23738,6 +23769,7 @@ mod tests {
                     importance: None,
                     scope: None,
                     shareable: Some(false),
+                    safety_critical: None,
                 }],
                 101,
             )
@@ -23761,6 +23793,7 @@ mod tests {
                     importance: None,
                     scope: None,
                     shareable: Some(true),
+                    safety_critical: None,
                 }],
                 102,
             )
@@ -23771,6 +23804,155 @@ mod tests {
         assert_eq!(grant.len(), 1);
         assert_eq!(grant[0].target_memory_id, 1);
         assert!(grant[0].visibility_changed);
+    }
+
+    #[test]
+    fn safety_critical_scores_match_typescript_corpus_and_classify_preserves_metadata() {
+        use crate::memory_lifecycle::scoring::ItemScore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let project = "git:safety";
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/safety-score-cases.json")).unwrap();
+        for (index, case) in cases.as_array().unwrap().iter().enumerate() {
+            let id = index as i64 + 1;
+            insert_memory(
+                &store,
+                project,
+                id,
+                &format!("memory {id}"),
+                Some(50),
+                "active",
+                None,
+            );
+            store.with_context_conn_for_test(|conn| {
+                conn.execute("UPDATE memories SET safety_critical=?1,scope='ecosystem',shareable=0 WHERE id=?2", params![case["flag"].as_bool().map(i64::from), id])?;
+                conn.execute("INSERT INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal,excerpt) VALUES(?1,?2,1,'ses',?3,1,'excerpt')", params![project, id, format!("part-{id}")])?;
+                Ok(())
+            }).unwrap();
+            let score = ItemScore {
+                item: id,
+                importance: case["score"].as_i64().unwrap() as i32,
+                proposed_class: "free-form".into(),
+            };
+            assert_eq!(
+                store
+                    .record_memory_item_scores(&[], std::slice::from_ref(&score), 1)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                store
+                    .record_memory_item_scores(&[id], std::slice::from_ref(&score), 2)
+                    .unwrap(),
+                1
+            );
+            let memory = store.get_memory_full(id).unwrap().unwrap();
+            assert_eq!(
+                memory.importance,
+                Some(case["expected"].as_i64().unwrap() as i32)
+            );
+            assert_eq!(memory.safety_critical, case["flag"].as_bool());
+            assert_eq!(
+                store
+                    .record_memory_item_scores(
+                        &[id],
+                        &[ItemScore {
+                            importance: 1,
+                            ..score
+                        }],
+                        3
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        let memory = store.get_memory_full(1).unwrap().unwrap();
+        assert_eq!(memory.importance, Some(40));
+        let mut update = ClassificationUpdate {
+            memory_id: 1,
+            content_hash_at_prompt: memory.normalized_hash,
+            importance: None,
+            scope: None,
+            shareable: None,
+            safety_critical: Some(true),
+        };
+        store
+            .set_memory_classification(project, &[update.clone()], 4)
+            .unwrap();
+        let memory = store.get_memory_full(1).unwrap().unwrap();
+        assert_eq!(
+            (
+                memory.importance,
+                memory.safety_critical,
+                memory.scope.as_str(),
+                memory.shareable
+            ),
+            (Some(80), Some(true), "ecosystem", 0)
+        );
+        update.importance = Some(1);
+        update.safety_critical = None;
+        store
+            .set_memory_classification(project, &[update.clone()], 5)
+            .unwrap();
+        assert_eq!(
+            store.get_memory_full(1).unwrap().unwrap().importance,
+            Some(80)
+        );
+        assert_eq!(
+            store.get_memory_full(1).unwrap().unwrap().safety_critical,
+            Some(true)
+        );
+        update.importance = None;
+        update.memory_id = 4;
+        update.content_hash_at_prompt = store.get_memory_full(4).unwrap().unwrap().normalized_hash;
+        update.safety_critical = Some(true);
+        store
+            .set_memory_classification(project, &[update], 6)
+            .unwrap();
+        assert_eq!(
+            store.get_memory_full(4).unwrap().unwrap().importance,
+            Some(95)
+        );
+    }
+
+    #[test]
+    fn safety_critical_history_restore_restores_null_preimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let project = "git:safety-history";
+        insert_memory(
+            &store,
+            project,
+            1,
+            "Never push without approval.",
+            Some(40),
+            "active",
+            None,
+        );
+        store.with_context_conn_for_test(|conn| {
+            let before = crate::memory_history::snapshot(conn, 1).unwrap().unwrap();
+            conn.execute("UPDATE memories SET safety_critical=1,importance=80,revision=revision+1 WHERE id=1", [])?;
+            let after = crate::memory_history::snapshot(conn, 1).unwrap().unwrap();
+            let decision = crate::memory_history::decision("safety", project, "dreamer", "classify", "safety assessment", 1, &[Some(before)], &[after], &[1], None, serde_json::json!([]));
+            crate::memory_history::record_decision(conn, &decision).unwrap();
+            Ok(())
+        }).unwrap();
+        let preview = store
+            .memory_history_rpc(
+                "memory.restore.preview",
+                &serde_json::json!({"projectPath":project,"decisionKey":"safety"}),
+                2,
+            )
+            .unwrap();
+        assert_eq!(preview["state"], "ready");
+        let receipt = store.memory_history_rpc("memory.restore", &serde_json::json!({"projectPath":project,"decisionKey":"safety","operationId":"undo-safety","expectedRevisions":preview["expectedRevisions"]}), 3).unwrap();
+        assert_eq!(receipt["state"], "applied");
+        let memory = store.get_memory_full(1).unwrap().unwrap();
+        assert_eq!(
+            (memory.safety_critical, memory.importance),
+            (None, Some(40))
+        );
     }
 
     #[test]

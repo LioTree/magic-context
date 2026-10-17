@@ -253,6 +253,7 @@ CREATE TABLE memories (
       verification_status TEXT DEFAULT 'unverified',
       verified_at INTEGER,
       classified_at INTEGER,
+      safety_critical INTEGER CHECK (safety_critical IN (0, 1)),
       superseded_by_memory_id INTEGER,
       merged_from TEXT,
       metadata_json TEXT,
@@ -1939,7 +1940,8 @@ INSERT INTO schema_migrations (version, description, applied_at) VALUES
 (98, 'score revision sidecar, selection history and project rescore jobs', :applied_at),
 (99, 'memory lifecycle evidence, attempts, receipts and applied snapshots', :applied_at),
 (100, 'durable served thinking prefix and held release request', :applied_at),
-(101, 'indexed trimmed-source tag retirement', :applied_at);
+(101, 'indexed trimmed-source tag retirement', :applied_at),
+(102, 'nullable safety-critical memory assessment', :applied_at);
 
 INSERT INTO "message_fts_rowid_map_backfill_state" ("completed", "id", "updated_at", "watermark_rowid") VALUES
 (0, 1, 0, 0);

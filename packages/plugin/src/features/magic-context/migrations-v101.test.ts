@@ -42,17 +42,17 @@ describe("migration 101", () => {
             const tags = db.prepare("SELECT * FROM tags ORDER BY id").all();
             const ops = db.prepare("SELECT * FROM pending_ops").all();
             runMigrations(db);
-            expect(LATEST_SUPPORTED_VERSION).toBe(101);
-            expect(MIGRATIONS.at(-1)?.version).toBe(101);
+            expect(LATEST_SUPPORTED_VERSION).toBe(102);
+            expect(MIGRATIONS.at(-1)?.version).toBe(102);
             expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
-                v: 101,
+                v: 102,
             });
             expect(db.prepare("SELECT * FROM tags ORDER BY id").all()).toEqual(tags);
             expect(db.prepare("SELECT * FROM pending_ops").all()).toEqual(ops);
             initializeDatabase(fresh);
             expect(indexes(db)).toEqual(indexes(fresh));
             expect(indexes(db)).toHaveLength(2);
-            MIGRATIONS.at(-1)!.up(db);
+            MIGRATIONS.find((entry) => entry.version === 101)!.up(db);
             runMigrations(db);
             expect(indexes(db)).toEqual(indexes(fresh));
             const plan = db
@@ -60,7 +60,7 @@ describe("migration 101", () => {
                 .all("s", '["new"]') as { detail: string }[];
             expect(plan.filter((row) => row.detail.includes("SEARCH t"))).toHaveLength(4);
             expect(enforceSchemaFence(db, ":previous:", 100)).toBe(false);
-            expect(enforceSchemaFence(db, ":current:", 101)).toBe(true);
+            expect(enforceSchemaFence(db, ":current:", 102)).toBe(true);
             expect(db.prepare("PRAGMA quick_check").get()).toEqual({ quick_check: "ok" });
         } finally {
             db.close();

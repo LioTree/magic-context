@@ -67,7 +67,7 @@ pub const SINGLE_STORE_CAPABLE: bool = mc_store::SINGLE_STORE_CAPABLE;
 /// this binary was built; whether that migration changed anything these writers depend
 /// on is answered per table by the fingerprints, so a migration that touched only tables
 /// the module never writes does not stop the module writing.
-pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 101;
+pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 102;
 
 /// Versions at or above this number belong to downstream forks and are excluded when
 /// reading the persisted lane, matching the host's own fence arithmetic.
@@ -352,7 +352,7 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     ),
     (
         "memories",
-        "b9b8c9026bcc2969b2dfd4d6455a31b98a05d9ea196ff26dbcaf4a5b4f63829b",
+        "d7c72f4690a622c30d15661b7845f58bca7400ddf2807ff5c22821f603f679c6",
     ),
     (
         "memory_agent_fragments",

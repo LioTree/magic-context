@@ -17,6 +17,7 @@ const FIELDS: &[&str] = &[
     "importance",
     "scope",
     "shareable",
+    "safetyCritical",
     "sourceSessionId",
     "sourceType",
     "seenCount",
@@ -35,6 +36,7 @@ const FIELDS: &[&str] = &[
     "metadataJson",
 ];
 const NULLABLE: &[&str] = &[
+    "safetyCritical",
     "importance",
     "sourceSessionId",
     "sourceType",
@@ -46,6 +48,7 @@ const NULLABLE: &[&str] = &[
     "metadataJson",
 ];
 const NUMERIC: &[&str] = &[
+    "safetyCritical",
     "id",
     "revision",
     "importance",
@@ -195,6 +198,7 @@ pub fn normalize_snapshot(input: &Value, revision: Option<i64>) -> Option<Value>
         || !["active", "permanent", "archived"].contains(&out["status"].as_str()?)
         || !["project", "ecosystem", "universe"].contains(&out["scope"].as_str()?)
         || ![0, 1].contains(&out["shareable"].as_i64()?)
+        || (!out["safetyCritical"].is_null() && ![0, 1].contains(&out["safetyCritical"].as_i64()?))
     {
         return None;
     }
@@ -536,6 +540,7 @@ fn plan(
                 "supersededByMemoryId",
                 "mergedFrom",
                 "metadataJson",
+                "safetyCritical",
             ]
             .iter()
             .any(|&field| current[field] != row["after"][field])
@@ -598,6 +603,7 @@ fn plan(
                     "supersededByMemoryId",
                     "mergedFrom",
                     "metadataJson",
+                    "safetyCritical",
                 ] {
                     target[field] = row["before"][field].clone();
                 }
@@ -738,6 +744,11 @@ fn apply_plan(
         if changed != 1 {
             return Err("Memory revision changed during apply".into());
         }
+        conn.execute(
+            "UPDATE memories SET safety_critical=?1 WHERE id=?2",
+            params![target["safetyCritical"].as_i64(), target["id"].as_i64()],
+        )
+        .map_err(storage)?;
         conn.execute(
             "DELETE FROM memory_embeddings WHERE memory_id=?1",
             [target["id"].as_i64()],

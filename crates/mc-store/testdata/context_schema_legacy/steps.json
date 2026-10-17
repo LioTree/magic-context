@@ -152,5 +152,12 @@
     "sql": [
       "CREATE INDEX IF NOT EXISTS idx_tags_session_message_nocase\n        ON tags(session_id, message_id COLLATE NOCASE);\n        CREATE INDEX IF NOT EXISTS idx_tags_session_tool_owner\n        ON tags(session_id, tool_owner_message_id);"
     ]
+  },
+  {
+    "version": 102,
+    "description": "nullable safety-critical memory assessment",
+    "sql": [
+      "ALTER TABLE memories ADD COLUMN safety_critical INTEGER CHECK (safety_critical IN (0, 1))"
+    ]
   }
 ]

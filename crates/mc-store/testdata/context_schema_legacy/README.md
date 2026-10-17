@@ -3,13 +3,13 @@
 ## Coverage and integration
 
 `migrations_legacy::upgrade(&mut Connection, now_ms)` upgrades initialized stores
-at upstream versions **87–100** to fence **100**. The caller provides an already
+at upstream versions **87–102** to schema version **102**. The caller provides an already
 opened connection; no host-store discovery or live-holder probing happens here.
 The supplied `integration.patch` exports the module from `mc_store::context_schema`.
 This module does not replace the fresh bootstrap provider or wire a startup endpoint.
 
 The TypeScript chain still accepts version **0** (no ledger) and runs migrations
-1–100. The serial follow-up must port starting versions **0–86**, including the
+1–102. The serial follow-up must port starting versions **0–86**, including the
 v87 host-evidence harness repair, earlier authority-trigger postconditions,
 identity repairs, embedding rebuilds, and legacy compartment data heals. Older
 versions are explicitly refused, rather than silently skipping those repairs.
@@ -20,7 +20,7 @@ Transactions match the TypeScript runner: **each step** and its ledger insert
 commit together. A failed step rolls back, but earlier steps remain committed.
 `BEGIN IMMEDIATE` and an in-lock version read serialize concurrent starters,
 preventing the ledger primary-key race. A current database takes no write lock.
-Upstream versions above 100 are refused before changing bytes; downstream rows
+Upstream versions above 102 are refused before changing bytes; downstream rows
 at or above the reserved fork floor of 10000 do not mask the upstream version.
 
 ## Independent comparison
@@ -34,10 +34,10 @@ initializer cannot substitute for it: it already installs post-87 schema.
 
 `generate.ts` executes that initializer and the **real current TypeScript
 migration runner**, temporarily bounding its exported migration list at each
-starting fence. Public `insertTag`, `insertMemory`, `addNote`, and
+starting fence. Public `insertTag`, `addNote`, and
 `writeReplayDocument` paths populate the v87 store, then real migrations advance
 those populated rows to every starting version. Additional raw inserts provide
-historical LKG/compartment layouts that current public writers no longer accept,
+historical memory/LKG/compartment layouts that current public writers no longer accept,
 Git FTS content, embedding blob bytes, and invalid/prerelease replay cases.
 Each starting file is copied unchanged: one copy goes through the real TypeScript
 upgrade, the other through Rust. Neither expected output nor fixture schema comes

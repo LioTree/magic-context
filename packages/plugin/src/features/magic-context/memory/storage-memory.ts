@@ -23,6 +23,7 @@ export const COLUMN_MAP: Record<keyof Memory, string> = {
     importance: "importance",
     scope: "scope",
     shareable: "shareable",
+    safetyCritical: "safety_critical",
     sourceSessionId: "source_session_id",
     sourceType: "source_type",
     seenCount: "seen_count",
@@ -310,6 +311,7 @@ export function toMemory(row: Memory): Memory {
         importance: row.importance,
         scope: row.scope,
         shareable: row.shareable,
+        safetyCritical: row.safetyCritical ?? null,
         sourceSessionId: row.sourceSessionId,
         sourceType: row.sourceType,
         seenCount: row.seenCount,
@@ -1127,6 +1129,7 @@ export interface MemoryClassificationUpdate {
     importance?: number;
     scope?: MemoryScope;
     shareable?: boolean;
+    safetyCritical?: boolean;
 }
 
 function normalizeImportance(value: number): number {
@@ -1142,7 +1145,8 @@ export function setMemoryClassification(
     const hasImportance = classification.importance !== undefined;
     const hasScope = classification.scope !== undefined;
     const hasShareable = classification.shareable !== undefined;
-    if (!hasImportance && !hasScope && !hasShareable) {
+    const hasSafety = classification.safetyCritical !== undefined;
+    if (!hasImportance && !hasScope && !hasShareable && !hasSafety) {
         throw new Error("setMemoryClassification requires at least one supplied field");
     }
 
@@ -1151,10 +1155,23 @@ export function setMemoryClassification(
 
     const assignments: string[] = [];
     const values: Array<number | string> = [];
-    if (hasImportance) {
-        const next = normalizeImportance(classification.importance as number);
+    const flagged = classification.safetyCritical ?? memory.safetyCritical === 1;
+    if (hasImportance || flagged) {
+        const requested = hasImportance
+            ? normalizeImportance(classification.importance as number)
+            : (memory.importance ?? 50);
+        const next = flagged
+            ? Math.max(requested, 80, memory.safetyCritical !== 1 ? (memory.importance ?? 0) : 0)
+            : requested;
         if (memory.importance !== next) {
             assignments.push("importance = ?");
+            values.push(next);
+        }
+    }
+    if (hasSafety) {
+        const next = classification.safetyCritical ? 1 : 0;
+        if (memory.safetyCritical !== next) {
+            assignments.push("safety_critical = ?");
             values.push(next);
         }
     }
@@ -1180,11 +1197,11 @@ export function setMemoryClassification(
     // we add the marker (the return value reports real change, for telemetry).
     const fieldChanged = assignments.length > 0;
 
-    // Always stamp classified_at (even when no column value changed) so the
+    // Stamp classified_at for full classifications (even when no value changed) so the
     // run-gate / Stage-3 partition treats this memory as classified and won't
     // re-score it next run. Stamping a timestamp does not affect the rendered
     // m[0] bytes, so this stays cache-neutral.
-    if (hasMemoryClassifiedAtColumn(db)) {
+    if ((hasImportance || hasScope || hasShareable) && hasMemoryClassifiedAtColumn(db)) {
         assignments.push("classified_at = ?");
         values.push(Date.now());
     }

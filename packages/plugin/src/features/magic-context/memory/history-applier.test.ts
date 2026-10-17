@@ -8,13 +8,15 @@ import {
     applyDashboardMemoryEdit,
     applyMemoryRestore,
     listMemoryHistory,
+    makeMemoryHistoryDecision,
     memoryHistorySnapshot,
     normalizeMemoryHistorySnapshot,
     previewMemoryRestore,
+    recordMemoryHistoryDecision,
 } from "./history-applier";
 import { memoryHistoryRpc } from "./history-rpc";
 import { applyCurateMemoryMutation } from "./lifecycle-applier";
-import { getMemoryById, insertMemory } from "./storage-memory";
+import { getMemoryById, insertMemory, setMemoryClassification } from "./storage-memory";
 
 function fixture() {
     const { dir: directory, cleanup } = createTestTempDir("memory-history-undo-");
@@ -95,6 +97,48 @@ test("history restore records a new revision and replays the durable receipt aft
                 expectedRevisions: [{ memoryId: row.id, revision: 3 }],
             }).reason,
         ).toBe("operation_id_reused");
+    } finally {
+        f.close();
+    }
+});
+
+test("history restore restores the three-state safety assessment from its pre-image", () => {
+    const f = fixture();
+    try {
+        const row = f.add();
+        const before = memoryHistorySnapshot(f.db, row.id)!;
+        expect(before.safetyCritical).toBeNull();
+        setMemoryClassification(f.db, row.id, { safetyCritical: true });
+        f.db.prepare("UPDATE memories SET revision=revision+1 WHERE id=?").run(row.id);
+        const after = memoryHistorySnapshot(f.db, row.id)!;
+        recordMemoryHistoryDecision(
+            f.db,
+            makeMemoryHistoryDecision({
+                key: "safety-assessment",
+                projectPath: f.projectPath,
+                writer: "dreamer",
+                operation: "classify",
+                reason: "safety assessment",
+                now: 1000,
+                before: [before],
+                after: [after],
+                sourceIds: [row.id],
+            }),
+        );
+        const preview = previewMemoryRestore(f.db, {
+            projectPath: f.projectPath,
+            decisionKey: "safety-assessment",
+        });
+        expect(preview.state).toBe("ready");
+        const result = applyMemoryRestore(f.db, {
+            projectPath: f.projectPath,
+            decisionKey: "safety-assessment",
+            operationId: "undo-safety",
+            expectedRevisions: preview.expectedRevisions,
+        });
+        expect(result.state).toBe("applied");
+        expect(memoryHistorySnapshot(f.db, row.id)?.safetyCritical).toBeNull();
+        expect(memoryHistorySnapshot(f.db, row.id)?.importance).toBe(before.importance);
     } finally {
         f.close();
     }

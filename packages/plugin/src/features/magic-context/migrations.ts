@@ -3276,6 +3276,19 @@ export const MIGRATIONS: Migration[] = [
             installTrimSourceIndexes(db);
         },
     },
+    {
+        version: 102,
+        description: "nullable safety-critical memory assessment",
+        up(db: Database): void {
+            if (!tableExists(db, "memories")) return;
+            ensureColumn(
+                db,
+                "memories",
+                "safety_critical",
+                "INTEGER CHECK (safety_critical IN (0, 1))",
+            );
+        },
+    },
 ];
 
 /**
