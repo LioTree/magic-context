@@ -5874,6 +5874,145 @@ describe("Rust mode authority adapter", () => {
         expect(JSON.stringify(output.messages)).not.toContain("captured module output");
     });
 
+    // A module-bust pass saves its capture synchronously, with a served-capture
+    // certificate, before the pass returns. If a later step then refuses the turn
+    // (releaseRustServedRaw throws EmergencyFailClosedError when it cannot update the
+    // served-raw record), the provider never receives those bytes, but they stay in
+    // memory and storage as the last good request, certified. The hook below throws
+    // that same refusal after the synchronous save. Both tests state the intended
+    // behavior and fail today.
+    const refusedAfterSyncCapture = async () => {
+        const sessionId = `rust-sync-unreturned-${Date.now()}-${Math.random()}`;
+        sessions.push(sessionId);
+        const db = makeFileDb();
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        let pass = 0;
+        let refuseAfterCapture = false;
+        let unavailable = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (unavailable) throw new Error("module unavailable");
+                pass += 1;
+                return {
+                    decision: "HARD",
+                    prefix_bust_permitted: true,
+                    row_version: pass,
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: `module output ${pass}` }],
+                        },
+                    ],
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 60_000, percentage: 30 },
+            updatedAt: Date.now(),
+        });
+        const transform = createRustModeTransform(deps, {
+            moduleClient,
+            afterLkgCaptureScheduledForTests: () => {
+                if (refuseAfterCapture)
+                    throw new EmergencyFailClosedError("Cannot release Rust served-raw evidence");
+            },
+        });
+        const served = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, served, makeMeta(db, sessionId));
+        expect(JSON.stringify(served.messages)).toContain("module output 1");
+        refuseAfterCapture = true;
+        await expect(
+            transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId)),
+        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        refuseAfterCapture = false;
+        return {
+            db,
+            sessionId,
+            input,
+            failingPass: async () => {
+                unavailable = true;
+                const output = { messages: [...input] as unknown[] };
+                await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+                return JSON.stringify(output.messages);
+            },
+        };
+    };
+
+    it("a module-bust pass refused after its synchronous save certifies none of its unsent bytes", async () => {
+        const { db, sessionId } = await refusedAfterSyncCapture();
+        const status = checkLkgDurability(db, sessionId);
+        const stored = loadPersistedLkgSlot(db, sessionId)?.jsonPrefix ?? "";
+        const certifiesUnsent =
+            status.durable && status.servedCaptureId !== null && stored.includes("module output 2");
+        expect(certifiesUnsent).toBe(false);
+    });
+
+    it("a later failed pass never replays bytes a refused module-bust pass did not send", async () => {
+        const { failingPass } = await refusedAfterSyncCapture();
+        expect(await failingPass()).not.toContain("module output 2");
+    });
+
+    // When work after the capture changes the array a pass returns, the prepared
+    // capture was never sent. The pass end gives it no certificate, but the deferred
+    // save still installs those prepared bytes in memory and storage, over the
+    // returned bytes the pass end had put in memory. The hook below edits the
+    // returned array after the capture is prepared. This states the intended
+    // behavior and fails today.
+    it("a later failed pass replays the bytes a pass returned, not a prepared capture it changed before returning", async () => {
+        const sessionId = `rust-returned-differs-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeFileDb();
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        const scheduled: Array<() => void> = [];
+        let pass = 0;
+        let unavailable = false;
+        let current: { messages: unknown[] } | undefined;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (unavailable) throw new Error("module unavailable");
+                pass += 1;
+                return {
+                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1,
+                    row_version: pass,
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: `module output ${pass}` }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            scheduleLkgCapture: (capture) => scheduled.push(capture),
+            afterLkgCaptureScheduledForTests: () => {
+                if (pass !== 2 || !current) return;
+                const [message] = current.messages as Array<{ parts: Array<{ text: string }> }>;
+                if (message) message.parts = [{ text: "returned after a later edit" }];
+            },
+        });
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        for (const capture of scheduled.splice(0)) capture();
+        current = { messages: [...input] };
+        await transform.run(sessionId, input, current, makeMeta(db, sessionId));
+        const returned = JSON.stringify(current.messages);
+        expect(returned).toContain("returned after a later edit");
+        for (const capture of scheduled.splice(0)) capture();
+        unavailable = true;
+        const output = { messages: [...input] as unknown[] };
+        await transform
+            .run(sessionId, input, output, makeMeta(db, sessionId))
+            .catch(() => undefined);
+        // Pass 2 sent only the edited array; its prepared capture with "module output 2" was never sent.
+        expect(JSON.stringify(output.messages)).not.toContain("module output 2");
+    });
     it("a pass that throws after capturing leaves another connection's certified slot and marker untouched", async () => {
         const sessionId = `rust-unreturned-capture-${Date.now()}`;
         sessions.push(sessionId);

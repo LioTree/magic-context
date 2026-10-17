@@ -638,6 +638,41 @@ describe("served certificates are bound to their bytes", () => {
         }
     });
 
+    // The same restart race in the other order. The stale writer's deferred save of
+    // its older serve lands while the sibling's newer allocation of the restarted
+    // id is still unbound, so the stale bytes bind the sibling's id and the
+    // sibling's own save is then refused. Under "the latest real serve wins" the
+    // stored, certified pair should be the sibling's. This states the intended
+    // behavior and fails today.
+    test("a stale save landing first on a restarted id does not displace the newer serve that allocated it", () => {
+        const root = createTestTempDirFromPath(join(tmpdir(), "served-marker-restart-order-"));
+        const db = fixture(join(root, "context.db"));
+        const sibling = new Database(join(root, "context.db"));
+        databases.push(sibling);
+        try {
+            const stale = slot(recordServedCapture(db, "s", true));
+            // Session cleanup removes the marker row, so the counter restarts.
+            db.exec("DELETE FROM lkg_served_markers");
+            const fresh = {
+                ...stale,
+                jsonPrefix: '[{"text":"recreated session"}]',
+                servedCaptureId: recordServedCapture(sibling, "s", true),
+            };
+            expect(fresh.servedCaptureId).toBe(stale.servedCaptureId);
+            // The older serve's save is delayed until after the newer allocation.
+            saveLkgSlotToDb(db, "s", stale);
+            saveLkgSlotToDb(sibling, "s", fresh);
+            const stored = loadPersistedLkgSlot(sibling, "s")?.jsonPrefix;
+            const status = checkLkgDurability(sibling, "s");
+            const staleCertified =
+                stored === stale.jsonPrefix && status.durable && status.servedCaptureId !== null;
+            expect(staleCertified).toBe(false);
+        } finally {
+            for (const connection of databases.splice(0)) connection.close();
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("an identical re-serve never reuses an id another writer bound to different bytes", () => {
         const root = createTestTempDirFromPath(join(tmpdir(), "served-marker-reuse-bound-"));
         const db = fixture(join(root, "context.db"));
