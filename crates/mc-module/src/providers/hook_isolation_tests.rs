@@ -22,6 +22,10 @@ async fn transport_hook_completes_while_other_session_fold_is_blocked() {
     request["last_applied"] = json!({"compaction_id":initial["compaction"]["compaction_id"],"version":initial["compaction"]["version"]});
     let view = answer(handler.provider_step(fold_binding.clone(), &request).await);
     let fold_session = fold_binding.session.clone();
+    fold_binding.principal = Some(subc_protocol::Principal::Reserved {
+        module_id: "thalamus-harness".into(),
+    });
+    fold_binding.scope = Some(crate::providers::host_lane_tests::scope());
     let mut hook_binding = fold_binding.clone();
     hook_binding.session = "hook-sibling".into();
     let hook_key = Key::new(&hook_binding, &hook_binding.session, "opencode").unwrap();

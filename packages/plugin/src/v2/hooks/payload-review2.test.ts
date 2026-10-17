@@ -88,6 +88,10 @@ function expectedVersionedLkgWrites(captures: Capture[]): string[][] {
             const record = JSON.parse(write) as { sql?: string; args?: unknown[] };
             if (!record.sql) return write;
             const sql = record.sql.trimStart();
+            // The foreground lock budget increased from 250 ms to 2 seconds.
+            // All other historical writes must still match in their original order.
+            if (sql === "PRAGMA busy_timeout=250")
+                return JSON.stringify({ ...record, sql: "PRAGMA busy_timeout=2000" });
             const args = record.args;
             if (sql.startsWith("INSERT INTO lkg_slot_chunks") && args)
                 chunks.set(Number(args[1]), String(args[3]));

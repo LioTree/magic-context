@@ -571,16 +571,11 @@ async function prepareLane(f: Fixture, lane: Lane): Promise<void> {
         expect(f.mock.check(wire(f.served))).toBeNull();
     }
     if (lane === "processed image strip") {
-        // A drop applied at the start of a later turn advances the drop
-        // watermark past the answered screenshot message; that same pass reads
-        // the old watermark, so the image itself is not stripped yet.
+        // Start a later turn without dropping anything yet. Image cleanup now
+        // sees same-pass drops, so queue its watermark only when arming the edit.
         await toolLoop(f, 4);
         await nextUserTurn(f, "prompt-3");
-        queuePendingOp(f.db, f.sessionId, f.tag("old-read-b"), "drop");
-        f.pendingMaterialization.add(f.sessionId);
-        f.served = (await f.pass()).messages;
         expect(f.mock.check(wire(f.served))).toBeNull();
-        expect(f.tagStatus("old-read-b")).toBe("dropped");
         expect(JSON.stringify(wire(f.served))).toContain('"type":"image"');
     }
     if (lane === "prefix cut moved by a compartment rewrite that keeps the cached pair") {
@@ -602,6 +597,7 @@ function armAndBust(f: Fixture, lane: Lane, subagent: boolean): void {
             f.armReasoning();
             break;
         case "ctx_reduce drop (full removal)":
+        case "processed image strip":
         case "/ctx-flush":
             queuePendingOp(f.db, f.sessionId, f.tag("old-read-b"), "drop");
             break;
@@ -706,7 +702,11 @@ function landed(f: Fixture, lane: Lane, after: Wire): boolean {
                 message.content.some((block) => block.type === "thinking"),
             );
         case "processed image strip":
-            return !text.includes('"type":"image"');
+            if (!text.includes('"type":"image"')) {
+                expect(f.tagStatus("old-read-b")).toBe("dropped");
+                return true;
+            }
+            return false;
         case "stale ctx_reduce strip":
             return !text.includes('"id":"old-reduce"');
         case "frozen-sentinel first application":

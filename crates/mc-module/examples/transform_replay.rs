@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         protected_tokens_provenance: "derived",
         compaction_enabled: true,
         smart_drops: false,
+        signed_thinking_hold: mc_module::config::SignedThinkingHold::Off,
         protected_tools: Default::default(),
         cache_ttl: "5m".into(),
         cache_ttl_provenance: mc_module::config::CacheTtlProvenance::Default,

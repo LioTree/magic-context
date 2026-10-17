@@ -602,7 +602,7 @@ async fn incompatible_version_and_cut_not_ready_precede_all_staging_writes() {
         .unwrap()
         .to_owned();
     let conn = rusqlite::Connection::open(destination_path).unwrap();
-    conn.execute("DELETE FROM schema_migrations WHERE version=100", [])
+    conn.execute("DELETE FROM schema_migrations WHERE version>=100", [])
         .unwrap();
     conn.execute_batch("DROP TABLE lkg_served_markers").unwrap();
     for op in [role::ops::DIVERGED, role::ops::IMPORT] {

@@ -1124,6 +1124,49 @@ fn preflight(conn: &Connection, session: &str, path: &Path) -> Result<(), MoveEr
     preflight_for(conn, Store::Module, session, path, false)
 }
 
+/// Provider row selectors refer to conversation identities in the same snapshot.
+/// Validate every conversation owner before exposing those identities to selectors;
+/// an empty or populated destination must never supply missing source references.
+fn staged_conversation_catalogue(
+    store: Store,
+    session: &str,
+    path: &Path,
+) -> Result<Connection, MoveError> {
+    let catalogue = Connection::open_in_memory()?;
+    let mut input = BufReader::new(File::open(path)?);
+    for table in codec::ship_tables(store) {
+        let count = codec::read_section(&mut input, table)?;
+        let conversation = table.table == "mc_provider_conversations_v2";
+        let columns = table.shipped_columns();
+        if conversation {
+            catalogue.execute_batch(&format!(
+                "CREATE TABLE {} ({})",
+                codec::quoted(table.table),
+                columns
+                    .iter()
+                    .map(|c| codec::quoted(c))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))?;
+        }
+        for _ in 0..count {
+            let row = codec::read_row(&mut input, table)?;
+            if conversation {
+                validate_row_owner(table, &row, session)?;
+                catalogue.execute(
+                    &format!(
+                        "INSERT INTO {} VALUES ({})",
+                        codec::quoted(table.table),
+                        vec!["?"; columns.len()].join(",")
+                    ),
+                    rusqlite::params_from_iter(row),
+                )?;
+            }
+        }
+    }
+    Ok(catalogue)
+}
+
 pub(crate) fn preflight_for(
     conn: &Connection,
     store: Store,
@@ -1131,6 +1174,7 @@ pub(crate) fn preflight_for(
     path: &Path,
     replacing: bool,
 ) -> Result<(), MoveError> {
+    let catalogue = staged_conversation_catalogue(store, session, path)?;
     let mut input = BufReader::new(File::open(path)?);
     for table in codec::ship_tables(store) {
         let count = codec::read_section(&mut input, table)?;
@@ -1152,12 +1196,16 @@ pub(crate) fn preflight_for(
                 .collect::<Vec<_>>()
                 .join(",");
             let values = std::iter::once(Value::Text(session.into())).chain(row.iter().cloned());
-            if !conn.query_row(
+            if !catalogue.query_row(
                 &format!("SELECT ({selector}) FROM (SELECT {projection})"),
                 rusqlite::params_from_iter(values),
                 |r| r.get::<_, bool>(0),
             )? {
-                return Err(MoveError::refusal("identity_mismatch"));
+                return Err(if selector.contains("SELECT ") {
+                    MoveError::table("snapshot_reference_missing", table.table)
+                } else {
+                    MoveError::refusal("identity_mismatch")
+                });
             }
             let key = codec::source_key(table, &row)?;
             if keys.execute("INSERT INTO keys VALUES(?1)", [key]).is_err() {
