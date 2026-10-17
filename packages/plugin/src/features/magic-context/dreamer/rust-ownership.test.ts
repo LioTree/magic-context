@@ -8,7 +8,12 @@ import { insertMemory } from "../memory/storage-memory";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import type { ClassifyModuleCallArgs } from "./classify";
-import { decodeRustOwnership, readRustOwnedDreamTasks } from "./rust-ownership";
+import {
+    createRustOwnedDreamRunner,
+    decodeRustDreamRun,
+    decodeRustOwnership,
+    readRustOwnedDreamTasks,
+} from "./rust-ownership";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
 import type { DreamTaskName } from "./task-registry";
 import {
@@ -221,5 +226,78 @@ describe("scheduler skips exactly the tasks Rust published", () => {
         expect(all.skipped).toEqual(["curate: run by ck-mc"]);
         expect(all.ran).not.toContain("curate");
         expect(ran).not.toContain("curate");
+    });
+});
+
+describe("manual ctx-dream starts an owned task in ck-mc", () => {
+    it("decodes started, refused and in-flight dream.run answers", () => {
+        expect(decodeRustDreamRun({ ok: true, started: true })).toEqual({ started: true });
+        expect(decodeRustDreamRun({ result: { ok: true, started: true } })).toEqual({
+            started: true,
+        });
+        expect(decodeRustDreamRun({ ok: false, refusal: "not_published" })).toEqual({
+            started: false,
+            reason: "not_published",
+        });
+        expect(decodeRustDreamRun({ ok: false, started: false })).toEqual({
+            started: false,
+            reason: "a ck-mc run is in progress",
+        });
+        expect(decodeRustDreamRun(null)).toEqual({ started: false, reason: "unexpected answer" });
+    });
+
+    it("sends dream.run on the project's module route with a fresh command id each time", async () => {
+        const attached = client({ ok: true, started: true });
+        const run = createRustOwnedDreamRunner({
+            moduleClient: attached,
+            projectIdentity: PROJECT,
+            projectRoot: "/repo",
+        });
+        expect(await run("curate")).toEqual({ started: true });
+        expect(await run("curate")).toEqual({ started: true });
+        expect(attached.calls).toHaveLength(2);
+        expect(attached.calls[0]).toMatchObject({
+            sessionId: PROJECT,
+            projectRoot: "/repo",
+            method: "dream.run",
+            body: { method: "dream.run", v: 1, task: "curate" },
+        });
+        const ids = attached.calls.map((c) => (c.body as { command_id: string }).command_id);
+        expect(ids[0]).toStartWith("ctx-dream:");
+        expect(ids[0]).not.toBe(ids[1]);
+        const broken = createRustOwnedDreamRunner({
+            moduleClient: client(new Error("module down")),
+            projectIdentity: PROJECT,
+            projectRoot: "/repo",
+        });
+        expect(await broken("curate")).toEqual({ started: false, reason: "ck-mc unreachable" });
+    });
+
+    it("a manual run shows whether ck-mc started each owned task and runs the others here", async () => {
+        db = freshDb();
+        const ran: string[] = [];
+        const asked: string[] = [];
+        const summary = await runManualDream({
+            db,
+            projectIdentity: PROJECT,
+            tasks: [cfg("curate"), cfg("classify-memories"), cfg("verify")],
+            executor: async (task) => {
+                ran.push(task.task);
+                return { status: "completed" };
+            },
+            rustOwnedTasks: new Set(["curate", "classify-memories"]),
+            runRustOwnedTask: async (task) => {
+                asked.push(task);
+                return task === "curate"
+                    ? { started: true }
+                    : { started: false, reason: "not_published" };
+            },
+        });
+        expect(asked).toEqual(["curate", "classify-memories"]);
+        expect(summary.details).toContain("curate: started in ck-mc");
+        expect(summary.skipped).toContain(
+            "classify-memories: ck-mc did not start it (not_published)",
+        );
+        expect(ran).toEqual(["verify"]);
     });
 });

@@ -14,7 +14,10 @@ import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
-import { readRustOwnedDreamTasks } from "../../features/magic-context/dreamer/rust-ownership";
+import {
+    createRustOwnedDreamRunner,
+    readRustOwnedDreamTasks,
+} from "../../features/magic-context/dreamer/rust-ownership";
 import {
     buildDreamTaskRuntimeConfigs,
     userMemoryCollectionEnabled,
@@ -1122,6 +1125,16 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       return runManualDream({
                           db,
                           rustOwnedTasks,
+                          // Attached to ck-mc: a task it owns is started there now.
+                          ...(rustModeModuleClient
+                              ? {
+                                    runRustOwnedTask: createRustOwnedDreamRunner({
+                                        moduleClient: rustModeModuleClient,
+                                        projectIdentity: projectPath,
+                                        projectRoot: deps.directory,
+                                    }),
+                                }
+                              : {}),
                           projectIdentity: projectPath,
                           tasks: buildDreamTaskRuntimeConfigs(
                               currentDreamer,

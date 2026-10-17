@@ -71,3 +71,64 @@ export async function readRustOwnedDreamTasks(
         return NOTHING_OWNED;
     }
 }
+
+/** What ck-mc answered when a manual `/ctx-dream` asked it to run a task it owns. */
+export type RustManualRunOutcome = { started: true } | { started: false; reason: string };
+
+/** Starts one Rust-owned task now; supplied only when the host is attached to ck-mc. */
+export type RunRustOwnedDreamTask = (task: DreamTaskName) => Promise<RustManualRunOutcome>;
+
+const DREAM_RUN_TIMEOUT_MS = 10_000;
+
+/**
+ * Decode ck-mc's `dream.run` answer: `{ok:true, started:true}` when the run
+ * started, `{ok:false, refusal}` when ck-mc does not own the task (any more),
+ * `{ok:false, started:false}` when a run for the project is already in flight.
+ */
+export function decodeRustDreamRun(response: unknown): RustManualRunOutcome {
+    const body = (response as { result?: unknown } | null)?.result ?? response;
+    const answer = (body && typeof body === "object" ? body : {}) as {
+        ok?: unknown;
+        started?: unknown;
+        refusal?: unknown;
+    };
+    if (answer.ok === true && answer.started === true) return { started: true };
+    if (typeof answer.refusal === "string") return { started: false, reason: answer.refusal };
+    if (answer.started === false) return { started: false, reason: "a ck-mc run is in progress" };
+    return { started: false, reason: "unexpected answer" };
+}
+
+/**
+ * A runner for manual `/ctx-dream` that asks ck-mc to run a task it publishes as
+ * its own (`dream.run {v:1, task, command_id}`), on the same module route as the
+ * ownership read. Each call uses a fresh command id: ck-mc never runs one id
+ * twice, and every manual command is a new request. The run itself proceeds in
+ * ck-mc; the answer only says whether it started.
+ */
+export function createRustOwnedDreamRunner(args: {
+    moduleClient: ClassifyModuleClient;
+    projectIdentity: string;
+    projectRoot: string;
+    timeoutMs?: number;
+}): RunRustOwnedDreamTask {
+    return async (task) => {
+        try {
+            const response = await args.moduleClient.call({
+                sessionId: args.projectIdentity,
+                projectRoot: args.projectRoot,
+                method: "dream.run",
+                body: {
+                    method: "dream.run",
+                    v: 1,
+                    task,
+                    command_id: `ctx-dream:${crypto.randomUUID()}`,
+                },
+                timeoutMs: args.timeoutMs ?? DREAM_RUN_TIMEOUT_MS,
+            });
+            return decodeRustDreamRun(response);
+        } catch (error) {
+            log(`[dreamer] ck-mc dream.run ${task} failed: ${error}`);
+            return { started: false, reason: "ck-mc unreachable" };
+        }
+    };
+}

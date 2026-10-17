@@ -1,6 +1,9 @@
 import type { DreamerConfig } from "../../config/schema/magic-context";
 import type { ClassifyModuleClient } from "../../features/magic-context/dreamer/classify";
-import { readRustOwnedDreamTasks } from "../../features/magic-context/dreamer/rust-ownership";
+import {
+    createRustOwnedDreamRunner,
+    readRustOwnedDreamTasks,
+} from "../../features/magic-context/dreamer/rust-ownership";
 import { buildDreamTaskRuntimeConfigs } from "../../features/magic-context/dreamer/task-config";
 import { createDreamTaskExecutor } from "../../features/magic-context/dreamer/task-executor";
 import {
@@ -115,6 +118,16 @@ export async function runManualDreamNow(args: {
         db: args.db,
         projectIdentity: args.projectIdentity,
         rustOwnedTasks,
+        // Attached to ck-mc: a task it owns is started there now.
+        ...(args.moduleClient
+            ? {
+                  runRustOwnedTask: createRustOwnedDreamRunner({
+                      moduleClient: args.moduleClient,
+                      projectIdentity: args.projectIdentity,
+                      projectRoot: args.directory,
+                  }),
+              }
+            : {}),
         tasks: selection.runnable,
         executor,
         ...(args.task !== undefined ? { task: args.task } : {}),

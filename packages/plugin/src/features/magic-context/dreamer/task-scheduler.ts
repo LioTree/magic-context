@@ -15,6 +15,7 @@ import {
     releaseLease,
 } from "./lease";
 import { withDreamerModelCooldown } from "./provider-output-failure";
+import type { RunRustOwnedDreamTask } from "./rust-ownership";
 import { getDreamState } from "./storage-dream-state";
 import {
     getTaskScheduleState,
@@ -586,7 +587,14 @@ export interface ManualRunResult {
  * Still advances next_due_at on completion so the manual run resets the cadence.
  */
 export async function runManualDream(
-    deps: Omit<RunDueTasksDeps, "now"> & { task?: DreamTaskName },
+    deps: Omit<RunDueTasksDeps, "now"> & {
+        task?: DreamTaskName;
+        /**
+         * Present only when this host is attached to ck-mc: asks ck-mc to run a
+         * task it owns now. Without it an owned task is reported as run by ck-mc.
+         */
+        runRustOwnedTask?: RunRustOwnedDreamTask;
+    },
 ): Promise<ManualRunResult> {
     const rustOwned = deps.rustOwnedTasks;
     const now = Date.now();
@@ -614,11 +622,22 @@ export async function runManualDream(
         selected = deps.tasks.filter((t) => t.schedule.trim() !== "");
     }
     if (rustOwned && rustOwned.size > 0) {
-        // Rust runs these on its own schedule; reporting them keeps a manual run
-        // from looking as if the task were silently dropped.
+        // Rust runs these on its own schedule. A host attached to ck-mc asks it
+        // to run them now; otherwise reporting them keeps a manual run from
+        // looking as if the task were silently dropped.
         for (const config of selected) {
-            if (rustOwned.has(config.task)) {
+            if (!rustOwned.has(config.task)) continue;
+            if (!deps.runRustOwnedTask) {
                 (result.skipped ??= []).push(`${config.task}: run by ck-mc`);
+                continue;
+            }
+            const outcome = await deps.runRustOwnedTask(config.task);
+            if (outcome.started) {
+                (result.details ??= []).push(`${config.task}: started in ck-mc`);
+            } else {
+                (result.skipped ??= []).push(
+                    `${config.task}: ck-mc did not start it (${outcome.reason})`,
+                );
             }
         }
         selected = selected.filter((config) => !rustOwned.has(config.task));
