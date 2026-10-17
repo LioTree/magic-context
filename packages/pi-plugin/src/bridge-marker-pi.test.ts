@@ -4,7 +4,10 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
-import { setPendingPiCompactionMarkerState } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
+	getPendingPiCompactionMarkerState,
+	setPendingPiCompactionMarkerState,
+} from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { killBridgeMarkerOwner } from "@magic-context/core/hooks/magic-context/host-runner/bridge-marker-test-support";
 import { bridgeReceipt } from "@magic-context/core/hooks/magic-context/host-runner/bridge-receipt";
 import {
@@ -410,4 +413,32 @@ test("Pi ambiguous committed append reloads the journal before retrying", () => 
 			.readBranchEntries()
 			.filter((e) => (e as any).type === "compaction"),
 	).toHaveLength(1);
+});
+
+test("Pi marker completion preserves a newer pending publication", () => {
+	const f = fixture();
+	const original = getPendingPiCompactionMarkerState(
+		f.db,
+		f.session.getSessionId(),
+	);
+	expect(original).not.toBeNull();
+	const newer = { ...original!, publishedAt: 2 };
+	const owner = createPiBridgeMarkerOwner(
+		{
+			...f.deps,
+			reloadSession: () => {
+				setPendingPiCompactionMarkerState(
+					f.db,
+					f.session.getSessionId(),
+					newer,
+				);
+				return f.deps.reloadSession();
+			},
+		},
+		f.session.getSessionId(),
+	);
+	expect(owner.advance(f.receipt, f.record, f.inputs).kind).toBe("applied");
+	expect(
+		getPendingPiCompactionMarkerState(f.db, f.session.getSessionId()),
+	).toEqual(newer);
 });

@@ -253,3 +253,12 @@ test("an empty applied range cannot authorize a native cut", () => {
     expect(outcome).toEqual({ kind: "deferred", reason: "coverage-does-not-cover-target" });
     expect(apply).not.toHaveBeenCalled();
 });
+
+test("insufficient raw ordinal coverage defers even when the end identity exists", () => {
+    const f = fixture((r) => {
+        r.coverage = { ordinal: target.ordinal - 1, end_mid: target.end_mid };
+    });
+    const { outcome, apply } = f.advance();
+    expect(outcome).toEqual({ kind: "deferred", reason: "coverage-does-not-cover-target" });
+    expect(apply).not.toHaveBeenCalled();
+});
