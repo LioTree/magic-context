@@ -714,6 +714,52 @@ describe("served certificates are bound to their bytes", () => {
         }
     });
 
+    test("a move that ships the LKG rows verbatim, without the drained repair, carries exactly the source's certification", () => {
+        // The agent-move source half acquires its draining fence and freezes it in
+        // the same call, then copies lkg_served_markers, lkg_slots and
+        // lkg_slot_chunks row by row. No drained repair can run in between. The
+        // certificate must therefore prove itself from the shipped rows alone.
+        const ship = (source: Database) => {
+            const destination = fixture();
+            for (const table of ["lkg_served_markers", "lkg_slots", "lkg_slot_chunks"]) {
+                for (const row of source
+                    .prepare(`SELECT * FROM ${table} WHERE session_id = 's'`)
+                    .all() as Record<string, unknown>[]) {
+                    const columns = Object.keys(row);
+                    destination
+                        .prepare(
+                            `INSERT INTO ${table} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
+                        )
+                        .run(...(columns.map((column) => row[column]) as never[]));
+                }
+            }
+            return checkLkgDurability(destination, "s");
+        };
+        const certified = fixture();
+        const first = slot(recordServedCapture(certified, "s", true));
+        expect(saveLkgSlotToDb(certified, "s", first)).toBe(true);
+        expect(ship(certified)).toEqual({ durable: true, servedCaptureId: first.servedCaptureId! });
+
+        // The latest serve's save failed: the shipped pair is uncertified, so the
+        // importer rebuilds instead of trusting the older bytes.
+        const unsaved = fixture();
+        expect(saveLkgSlotToDb(unsaved, "s", slot(recordServedCapture(unsaved, "s", true)))).toBe(
+            true,
+        );
+        recordServedCapture(unsaved, "s", true);
+        expect(ship(unsaved)).toEqual({ durable: true, servedCaptureId: null, certified: false });
+
+        // Different bytes stored under the certified id are not certified either.
+        const replaced = fixture();
+        expect(saveLkgSlotToDb(replaced, "s", slot(recordServedCapture(replaced, "s", true)))).toBe(
+            true,
+        );
+        replaced
+            .prepare("UPDATE lkg_slots SET last_input_message_id = 'other' WHERE session_id = 's'")
+            .run();
+        expect(ship(replaced)).toEqual({ durable: true, servedCaptureId: null, certified: false });
+    });
+
     test("a failed pass restores storage only where it still owns the certificate or the bytes", () => {
         const db = fixture();
         const previous = slot(recordServedCapture(db, "s", true));
