@@ -461,6 +461,10 @@ pub(super) enum RecipeLane {
     OwnedBroca,
     /// A Broca runner record's engine-only view.
     OwnedBrocaRunner,
+    /// A Pi host view. Every message is stored whole as a synthetic slot: no
+    /// native source is matched or decoded, so the stored bytes are the same
+    /// whole copy the retired mc_provider_views_v1 table held.
+    Pi,
 }
 
 impl RecipeLane {
@@ -469,6 +473,7 @@ impl RecipeLane {
             Codec::OpencodeAiSdk => Self::OpencodeAiSdk,
             Codec::ClaudeCodeAnthropic => Self::ClaudeCodeAnthropic,
             Codec::OwnedBroca => Self::OwnedBroca,
+            Codec::Pi => Self::Pi,
         }
     }
 
@@ -478,6 +483,7 @@ impl RecipeLane {
             Self::ClaudeCodeAnthropic => "claude-code-anthropic",
             Self::OwnedBroca => "owned-broca",
             Self::OwnedBrocaRunner => "owned-broca-runner",
+            Self::Pi => "pi",
         }
     }
 
@@ -487,6 +493,7 @@ impl RecipeLane {
             Self::ClaudeCodeAnthropic => "provider-claude-code-raw-v1",
             Self::OwnedBroca => "provider-owned-broca-wire-v1",
             Self::OwnedBrocaRunner => "provider-owned-broca-engine-v1",
+            Self::Pi => "provider-pi-whole-v1",
         }
     }
 
@@ -496,6 +503,7 @@ impl RecipeLane {
             Self::ClaudeCodeAnthropic,
             Self::OwnedBroca,
             Self::OwnedBrocaRunner,
+            Self::Pi,
         ]
         .into_iter()
         .find(|lane| lane.profile() == profile)
@@ -585,6 +593,7 @@ fn source_item(
         RecipeLane::OpencodeAiSdk => {
             Err(transient("OpenCode recipes use their own treatment format"))
         }
+        RecipeLane::Pi => Err(transient("Pi recipes store every message whole")),
     }
 }
 
@@ -944,7 +953,7 @@ fn assemble_host(
 ) -> Result<compaction::HostView, HandlerOutcome> {
     if !matches!(
         lane,
-        RecipeLane::ClaudeCodeAnthropic | RecipeLane::OwnedBroca
+        RecipeLane::ClaudeCodeAnthropic | RecipeLane::OwnedBroca | RecipeLane::Pi
     ) {
         return Err(transient("recipe is not a host view"));
     }
@@ -1171,8 +1180,8 @@ fn baseline_cut(store: &McStore, key: &mc_store::ProviderSessionKey) -> Option<u
         .and_then(Value::as_u64)
 }
 
-/// Persist a Claude Code or Broca host view as an exact recipe. OpenCode views
-/// keep their own writer.
+/// Persist a Claude Code, Broca or Pi host view as an exact recipe. OpenCode
+/// views keep their own writer.
 pub(super) fn save_host(
     store: &McStore,
     key: &Key,
@@ -1195,6 +1204,10 @@ pub(super) fn save_host(
     let (metadata, items) = decompose_host(view)?;
     let natives = if items.is_empty() {
         Vec::new()
+    } else if lane == RecipeLane::Pi {
+        // Pi has no native-source matching yet, so every message becomes a
+        // synthetic slot holding its whole engine and wire form.
+        items.iter().map(|_| None).collect()
     } else {
         host_natives(store, key, lane, view)?
     };

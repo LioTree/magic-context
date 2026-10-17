@@ -1,5 +1,7 @@
 -- Broca runner and Claude Code views now persist as mc_provider_views_v2
--- recipes, and nothing reads or writes mc_provider_views_v1 any longer.
+-- recipes, and Pi host views move to the whole-copy Pi recipe lane, which also
+-- lives in mc_provider_views_v2. Nothing reads or writes mc_provider_views_v1
+-- any longer.
 --
 -- Reason for discarding rather than converting: no released build ever created
 -- this table. Every release tag through v0.49.8 ships store migrations up to 63,
