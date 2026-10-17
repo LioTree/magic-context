@@ -545,8 +545,12 @@ export function createSystemPromptHashHandler(deps: {
                 },
             );
         }
+        // Idle expiry frees the provider cache, not a signature: when this
+        // request's messages already went out keeping signed thinking, a
+        // date-only change would invalidate that thinking and waits instead.
         const dateMayAdvance =
-            idleCacheExpired ||
+            (idleCacheExpired &&
+                systemDateThinkingHeld(deps.historyRefreshSessions, dateRequest) !== true) ||
             contentOrPresetChanged ||
             (isCacheBusting &&
                 !deferredDateRefresh &&
@@ -762,5 +766,6 @@ import {
     type SystemDateRequestIdentity,
     systemDateRefreshPermission,
     systemDateRequestForOutput,
+    systemDateThinkingHeld,
     waitForSystemDateRefresh,
 } from "./system-date-refresh";

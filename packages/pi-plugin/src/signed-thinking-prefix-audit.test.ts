@@ -55,6 +55,7 @@ import {
 	signalPiPendingMaterialization,
 	signalPiSystemHashChange,
 } from "./context-handler";
+import { processSystemPromptForCache } from "./system-prompt";
 import {
 	createFakePi,
 	createTestDb,
@@ -744,19 +745,36 @@ it(
 );
 
 it(
-	"Pi/OMP: a host system-prompt change strips completed thinking with it",
+	"Pi/OMP: a host system-prompt change strips completed thinking on the pass that serves it",
 	withFixture(
 		false,
 		"reasoning clearing (keep_reasoning_tokens)",
 		async (f) => {
+			// What the plugin's before_agent_start hook does at the start of each
+			// user turn: hash the host's prompt and signal a changed one.
+			const agentStart = (systemPrompt: string) => {
+				const result = processSystemPromptForCache({
+					db: f.db,
+					sessionId: f.sessionId,
+					systemPrompt,
+					isCacheBusting: false,
+				});
+				if (result.hashChanged)
+					signalPiSystemHashChange(f.sessionId, result.currentHash);
+			};
+			agentStart("Original instructions");
 			await toolLoop(f, 4);
-			await nextUserTurn(f, "system-edit-turn");
+			await nextUserTurn(f, "system-kept-turn");
 			expect(thinkingBlocks(wire(f.served))).not.toBe("[]");
-			// The host serves the new system from this request on; every kept
-			// completed-turn block was signed over the old one.
-			signalPiSystemHashChange(f.sessionId, "changed-system-hash");
-			f.setPercent(20);
+			f.respond((n) => [{ type: "text", text: `Step ${n}: done.` }]);
+			f.served = (await f.pass()).messages;
+			expect(thinkingBlocks(wire(f.served))).not.toBe("[]");
+			// Every kept block was signed over the original system prompt, so the
+			// first request that serves the changed prompt must omit them.
+			agentStart("Changed instructions");
+			f.userTurn("system-edit-turn", "Continue with the next part.");
 			const changed = wire((await f.pass()).messages);
+			expect(f.mock.check(changed)).toBeNull();
 			expect(thinkingBlocks(changed)).toBe("[]");
 			// The omission is persisted, so later passes keep serving it.
 			expect(thinkingBlocks(wire((await f.pass()).messages))).toBe("[]");

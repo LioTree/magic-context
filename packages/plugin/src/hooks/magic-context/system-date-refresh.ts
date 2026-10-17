@@ -22,7 +22,6 @@ const channels = new WeakMap<Set<string>, Channel>();
 const outputUpdates = new WeakMap<string[], () => void>();
 const outputIdentities = new WeakMap<object, SystemDateRequestIdentity>();
 const outputRequests = new WeakMap<object, SystemDateRequest>();
-const thinkingDateDebts = new WeakMap<Set<string>, Set<string>>();
 
 /** Inspect the returned render, not raw history whose saved omissions still need replay. */
 export function hasKeptSignedThinking(messages: readonly unknown[]): boolean {
@@ -78,26 +77,15 @@ export function hasKeptSignedThinking(messages: readonly unknown[]): boolean {
     return false;
 }
 
+/** Whether the request's served messages kept a signed thinking block. A date
+ * refresh is a system-prompt edit, so it is withheld while such a block is
+ * served; `undefined` means the messages hook has not reported for this request
+ * or the model's thinking is not bound to the bytes before it. */
 export function systemDateThinkingHeld(
     history: Set<string>,
     request: SystemDateRequest | undefined,
 ): boolean | undefined {
     return state(history, request)?.keptSignedThinking;
-}
-
-export function deferSystemDateForThinking(
-    history: Set<string>,
-    request: SystemDateRequest | undefined,
-): void {
-    const current = state(history, request);
-    if (current?.keptSignedThinking !== true) return;
-    let pending = thinkingDateDebts.get(history);
-    if (!pending) thinkingDateDebts.set(history, (pending = new Set()));
-    pending.add(current.sessionId);
-}
-
-export function acknowledgeSystemDateAdvance(history: Set<string>, sessionId: string): void {
-    thinkingDateDebts.get(history)?.delete(sessionId);
 }
 
 /** Use the last real-user message ID that anchors thinking recovery, including
@@ -264,12 +252,10 @@ export function finishSystemDateRefresh(
     const current = state(history, request);
     if (!current) return;
     current.keptSignedThinking = keptSignedThinking;
-    current.permitted =
-        current.ambiguous || keptSignedThinking === true
-            ? false
-            : permitted ||
-              (keptSignedThinking === false &&
-                  thinkingDateDebts.get(history)?.has(current.sessionId) === true);
+    // A changed date line rewrites the system prompt, which every kept signed
+    // thinking block is bound to. It waits for a pass that serves none: a pass
+    // whose landed edit also removed the older thinking, or a later one.
+    current.permitted = current.ambiguous || keptSignedThinking === true ? false : permitted;
     const apply = current.waiting;
     current.waiting = undefined;
     apply?.(current.permitted);
@@ -286,5 +272,4 @@ export function finishSystemDateHook(
 }
 export function clearSystemDateRefresh(history: Set<string>, sessionId: string): void {
     channels.get(history)?.delete(sessionId);
-    thinkingDateDebts.get(history)?.delete(sessionId);
 }

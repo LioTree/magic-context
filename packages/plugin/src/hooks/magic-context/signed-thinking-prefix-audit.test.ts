@@ -61,7 +61,7 @@ import {
 } from "./__tests__/strict-binding-mock";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { clearInjectionCache } from "./inject-compartments";
-import { recordSystemPromptEdit } from "./pending-materialization";
+import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import type { MessageLike } from "./tag-messages";
 import { clearMessageTokensCache, createTransform, type TransformDeps } from "./transform";
 import { hasParkedBustTrigger, resetDegradedCacheCount } from "./transform-postprocess-phase";
@@ -877,13 +877,109 @@ for (const generation of ["v1", "v2"] as const) {
             pendingMaterialization.add(sessionId);
             expect(await pass()).toEqual(before);
             expect(busted).toBe(false);
-            // A real host system-prompt change is an edit before every kept
-            // block: the system hook records it and the next pass strips with it.
-            recordSystemPromptEdit(pendingMaterialization, sessionId);
-            const changed = await pass();
-            expect(thinkingBlocks(changed)).toBe("[]");
-            expect(await pass()).toEqual(changed);
         } finally {
+            closeQuietly(db);
+            cleanup();
+        }
+    });
+    it(`${host}: a host system-prompt change strips completed thinking on the pass that serves it`, async () => {
+        const { dir, cleanup } = createTestTempDir("thinking-system-edit-");
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        runMigrations(db);
+        const sessionId = `thinking-system-edit-${generation}`;
+        const pendingMaterialization = new Set<string>();
+        const historyRefresh = new Set<string>();
+        const lastHeuristicsTurnId = new Map<string, string>();
+        const mock = new StrictBindingMock(Boolean(GOLDEN));
+        const capture = new GoldenCapture(
+            auditName(
+                generation,
+                false,
+                "reasoning clearing (keep_reasoning_tokens)",
+                "strip-system-edit",
+            ),
+        );
+        let busted = false;
+        const transform = createTransform({
+            db,
+            storeGeneration: generation,
+            signedThinkingHold: "on",
+            tagger: createTagger(),
+            directory: dir,
+            historianRunnable: false,
+            pendingMaterializationSessions: pendingMaterialization,
+            historyRefreshSessions: historyRefresh,
+            contextUsageMap: new Map(),
+            lastHeuristicsTurnId,
+            liveModelBySession: new Map([[sessionId, MODEL]]),
+            scheduler: { shouldExecute: () => "defer" } as never,
+            keepReasoningTokens: 1_000_000,
+            onPostprocess: (result) => {
+                busted = result.bustedThisPass;
+            },
+        });
+        // The production system hook: it compares the host's system prompt with
+        // the persisted hash and records a changed prompt for the transform.
+        const system = createSystemPromptHashHandler({
+            db,
+            dreamerEnabled: false,
+            memoryEnabled: false,
+            resolveModel: () => MODEL,
+            historyRefreshSessions: historyRefresh,
+            pendingMaterializationSessions: pendingMaterialization,
+            systemPromptRefreshSessions: new Set(),
+            lastHeuristicsTurnId,
+        });
+        const raw: MessageLike[] = [
+            {
+                info: { id: "u0", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "Original task" }],
+            },
+        ];
+        // One request: the host's system hook runs first, then the messages transform.
+        const pass = async (prompt: string) => {
+            await system.handler({ sessionID: sessionId, model: MODEL }, { system: [prompt] });
+            const messages = structuredClone(raw);
+            await transform({}, { messages });
+            const request = wire(messages);
+            capture.write(
+                request,
+                busted,
+                mock.hasCurrentTurnThinking(request),
+                hasParkedBustTrigger(sessionId),
+            );
+            return request;
+        };
+        try {
+            const block = mock.respond(await pass("Original instructions"))!;
+            raw.push({
+                info: { id: "a0", role: "assistant", sessionID: sessionId, ...MODEL },
+                parts: [
+                    {
+                        type: "reasoning",
+                        text: block.thinking,
+                        metadata: { anthropic: { signature: block.signature } },
+                    },
+                    { type: "text", text: "Answer" },
+                ],
+            });
+            mock.newUserTurn();
+            raw.push({
+                info: { id: "u1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "Next task" }],
+            });
+            const before = await pass("Original instructions");
+            expect(thinkingBlocks(before)).not.toBe("[]");
+            expect(await pass("Original instructions")).toEqual(before);
+            // Every kept block was signed over the original system prompt, so the
+            // request that first serves the changed prompt must omit them.
+            const changed = await pass("Changed instructions");
+            expect(thinkingBlocks(changed)).toBe("[]");
+            expect(busted).toBe(true);
+            expect(await pass("Changed instructions")).toEqual(changed);
+        } finally {
+            system.clearSession(sessionId);
             closeQuietly(db);
             cleanup();
         }
