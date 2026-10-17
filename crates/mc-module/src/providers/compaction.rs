@@ -1352,24 +1352,17 @@ fn execute_host(
                 .iter()
                 .any(|message| message.ordinal == ordinal)
             {
-                let boundary = non_tag_messages_since(store, &work.key, lineage, ordinal)?
-                    .into_iter()
-                    .find(|message| message.ordinal == ordinal)
-                    .ok_or_else(|| {
-                        error(
-                            "native_endpoint_unrepresentable",
-                            "covered native message is missing",
-                        )
-                    })?;
-                template
-                    .messages
-                    .insert(0, codec.decode_message(&boundary)?);
-                template
-                    .native_messages
-                    .as_mut()
-                    .expect("native codec")
-                    .insert(0, boundary.message.clone());
-                messages.push(boundary);
+                let (covered, decoded) =
+                    covered_boundary_span(store, &work.key, lineage, codec, ordinal)?;
+                for (index, (boundary, message)) in covered.into_iter().zip(decoded).enumerate() {
+                    template.messages.insert(index, message);
+                    template
+                        .native_messages
+                        .as_mut()
+                        .expect("native codec")
+                        .insert(index, boundary.message.clone());
+                    messages.push(boundary);
+                }
             }
         }
     }
@@ -1568,6 +1561,76 @@ fn execute_host(
         publish_ms=publish_started.elapsed().as_secs_f64()*1000.0,
         "native fold resident publication");
     Ok(Some((view, persisted)))
+}
+
+/// The covered messages a Claude Code fold renders in front of its retained
+/// tail: the coverage boundary message, plus the earlier covered messages that
+/// hold the `tool_use` blocks its `tool_result` blocks answer. The renderer
+/// refuses a covered span that splits an Anthropic tool exchange, so a boundary
+/// that is a tool result must bring its paired tool call with it. The search
+/// window doubles backwards until every result in the span has its call or the
+/// lineage start is reached; the span is then trimmed to the latest start that
+/// still pairs every result.
+fn covered_boundary_span(
+    store: &McStore,
+    key: &Key,
+    lineage: &ProviderLineage,
+    codec: Codec,
+    ordinal: u64,
+) -> Result<
+    (
+        Vec<compact::status::StatusMessage>,
+        Vec<ck_wire::CkIngressMessage>,
+    ),
+    HandlerOutcome,
+> {
+    fn unpaired_results(messages: &[ck_wire::CkIngressMessage]) -> bool {
+        let mut calls = HashSet::new();
+        let mut results = Vec::new();
+        for block in messages.iter().flat_map(|message| &message.ck.content) {
+            match &block.kind {
+                ck_wire::CkKind::ToolCall { id, .. } => {
+                    calls.insert(id);
+                }
+                ck_wire::CkKind::ToolResult { id, .. } => results.push(id),
+                _ => {}
+            }
+        }
+        results.iter().any(|id| !calls.contains(id))
+    }
+    let mut first = ordinal;
+    let mut step = 1;
+    let (mut covered, mut decoded) = loop {
+        let covered = non_tag_messages_since(store, key, lineage, first)?
+            .into_iter()
+            .filter(|message| message.ordinal <= ordinal)
+            .collect::<Vec<_>>();
+        if covered.last().map(|message| message.ordinal) != Some(ordinal) {
+            return Err(error(
+                "native_endpoint_unrepresentable",
+                "covered native message is missing",
+            ));
+        }
+        let decoded = covered
+            .iter()
+            .map(|message| codec.decode_message(message))
+            .collect::<Result<Vec<_>, _>>()?;
+        if first == 0 || !unpaired_results(&decoded) {
+            break (covered, decoded);
+        }
+        first = first.saturating_sub(step);
+        step = step.saturating_mul(2);
+    };
+    let start = (0..decoded.len())
+        .rev()
+        .find(|start| !unpaired_results(&decoded[*start..]))
+        // A tool result whose tool_use message is not stored has no paired
+        // call to add. Return only the coverage boundary message; encode_view
+        // then refuses the split tool exchange.
+        .unwrap_or(decoded.len() - 1);
+    covered.drain(..start);
+    decoded.drain(..start);
+    Ok((covered, decoded))
 }
 
 fn referenced_drop_targets(
@@ -2929,6 +2992,7 @@ mod host_tests {
         let (ha, ba, sa, key) = handler(a.path(), Arc::new(NoReads::default()));
         let ha = ha.with_startup_provider_resident_enabled(true);
         let (hb, bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+        let hb = hb.with_startup_provider_resident_enabled(false);
         let mut views = Vec::new();
         for (h, binding, store) in [(&ha, &ba, &sa), (&hb, &bb, &sb)] {
             answer(h.provider_setup(binding.clone(), &setup()).await);

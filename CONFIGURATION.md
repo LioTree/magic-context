@@ -252,13 +252,15 @@ Magic Context uses the runtime's built-in SQLite: `bun:sqlite` under Bun (OpenCo
 
 ---
 
-### Experimental Rust provider residency
+### Rust provider residency
 
-`rust_provider_resident` is a startup-only, user-config-only opt-in for the Rust
-OpenCode provider path. It is disabled by default; projects and requests cannot
-enable it. Changing it requires restarting ck-mc.
+The Rust step-transform provider (Broca runner lanes, Claude Code and the
+OpenCode/Pi bridges) always serves through its resident engine; there is no
+setting to turn it off. The former `rust_provider_resident` key is no longer
+read and has no effect.
 
-`rust_provider_resident_process_cap_mb` defaults to **1024 MiB** and accepts values
+`rust_provider_resident_process_cap_mb` is a startup-only, user-config-only
+limit. It defaults to **1024 MiB** and accepts values
 from 1 to 1024. It limits **charged resident cache bytes**, not process memory or
 RSS. Each session also has a 64 MiB charge limit; inadmissible state falls back to
 the standard path. SQLite caches, temporary rebuild working sets and allocator

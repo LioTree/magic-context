@@ -24,6 +24,11 @@ const GROWTH_ALLOWANCE: usize = 12 * 1024 * 1024;
 const COLD_RESERVATION: usize = GROWTH_ALLOWANCE;
 
 pub(crate) struct ResidentHooks {
+    /// Test builds only: `false` turns this cache into the non-resident step
+    /// oracle that byte-identical differentials compare the resident engine
+    /// against. Production builds have no such field, so no configuration,
+    /// request or caller can select the non-resident step path there.
+    #[cfg(test)]
     enabled: bool,
     process_cap: usize,
     entries: Mutex<HashMap<(u64, String), Entry>>,
@@ -39,7 +44,8 @@ pub(crate) struct ResidentHooks {
 impl Default for ResidentHooks {
     fn default() -> Self {
         Self {
-            enabled: false,
+            #[cfg(test)]
+            enabled: true,
             process_cap: PROCESS_CAP,
             entries: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(0),
@@ -89,12 +95,22 @@ pub(crate) struct Lease<'a> {
 }
 
 impl ResidentHooks {
+    /// Whether step transforms use the resident engine. Always `true` outside
+    /// test builds; only the test oracle built by [`Self::enabled`] answers
+    /// `false`.
     pub(crate) fn is_enabled(&self) -> bool {
-        self.enabled
+        #[cfg(test)]
+        {
+            self.enabled
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
     }
 
     pub(crate) fn is_building(&self, instance: u64, key: &Key) -> bool {
-        self.enabled
+        self.is_enabled()
             && matches!(
                 self.entries
                     .lock()
@@ -103,6 +119,9 @@ impl ResidentHooks {
                 Some(Entry::Building(_))
             )
     }
+    /// Test-only constructor: `enabled == false` builds the non-resident step
+    /// oracle used by the byte-identical differentials.
+    #[cfg(test)]
     pub(crate) fn enabled(enabled: bool) -> Self {
         Self {
             enabled,
@@ -124,7 +143,7 @@ impl ResidentHooks {
         first: u64,
         through: u64,
     ) -> Option<Vec<crate::ck_wire::CkIngressMessage>> {
-        if !self.enabled {
+        if !self.is_enabled() {
             return None;
         }
         let version = store.provider_external_data_version().ok()?;
@@ -168,7 +187,7 @@ impl ResidentHooks {
         instance: u64,
         key: &Key,
     ) -> Result<Option<Lease<'_>>, &'static str> {
-        if !self.enabled {
+        if !self.is_enabled() {
             return Ok(None);
         }
         let key = (instance, key.store_key().conversation_key());

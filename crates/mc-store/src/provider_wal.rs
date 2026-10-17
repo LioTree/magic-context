@@ -255,8 +255,8 @@ impl McStore {
         Ok(())
     }
 
-    /// Called by ck-mc after validating the OpenCode session/harness route and
-    /// plan, with the startup `rust_provider_resident` user setting enabled.
+    /// Called by ck-mc's resident step engine after validating the session/harness
+    /// route and plan.
     /// Failure retains SQLite's ordinary autocheckpoint policy rather than refusing.
     pub fn prepare_provider_wal(&self) {
         let mut state = self.provider_wal.lock().expect("provider WAL state");
