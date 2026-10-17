@@ -158,8 +158,11 @@ export function recordServedCapture(
             prior.lastInputMessageId === candidate.lastInputMessageId &&
             equal(prior.inputIdSeq, candidate.inputIdSeq) &&
             equal(prior.inputContentDigests, candidate.inputContentDigests) &&
-            // The certificate digest includes the content signatures, so an id is
-            // reused only when they match too; otherwise its save would be refused.
+            // The certificate digest that a save binds also covers the content
+            // signatures. Reusing the prior id for different signatures would make
+            // this capture's save fail, because that id is (or is about to be) bound
+            // to the prior capture's digest; so the prior id is reused only when they
+            // match too.
             (prior.inputContentSignatures === candidate.inputContentSignatures ||
                 equal(prior.inputContentSignatures, candidate.inputContentSignatures)) &&
             equal(prior.inputMoveDigests, candidate.inputMoveDigests) &&
