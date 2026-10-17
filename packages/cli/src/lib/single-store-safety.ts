@@ -1,7 +1,7 @@
 import type { Database } from "@magic-context/core/shared/sqlite";
 
 export const SINGLE_STORE_REQUIRED =
-    "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)";
+    "Magic Context needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)";
 
 /** Unmigrated module-owned rows may exist only in store.db, so context-only moves are unsafe. */
 export function assertNoUnmigratedAuthority(db: Pick<Database, "prepare">): void {

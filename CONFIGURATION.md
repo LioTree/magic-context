@@ -334,7 +334,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `keep_subagents` | `boolean` | `false` | Debug option: keep every settled Magic Context child session instead of deleting it after success: historian, all Dreamer tasks, smart-note evaluation and compilation, user-memory review, and memory migration. Kept Dreamer children can contain memory-pool text and user messages from other sessions of the same operator; their full transcript stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect. On OpenCode 2.0.22 or newer, every run uses a fresh child, parented when there is a user session. With this option on, settled children and historian children remain inspectable; unsettled Dreamer children are removed. With it off, each run's child is removed through the native session API, whether or not the host runs as a service. |
 | `todowrite` | `object` | See below | **Pi only.** Controls Magic Context's built-in `todowrite` tool and persistent task overlay. OpenCode has its own built-in `todowrite`, so this setting has no effect there. |
 | `sqlite` | `object` | See below | Per-connection SQLite tuning for Magic Context's own `context.db`. |
-| `storage.enforce_private_permissions` | `boolean` | `true` | User-config-only. By default, TypeScript mode creates/re-tightens 0700 directories and 0600 files. `false` delegates TypeScript-mode permissions to the operator; Rust transform mode always keeps the shared data directory owner-only (0700), regardless of this setting. |
+| `storage.enforce_private_permissions` | `boolean` | `true` | User-config-only. By default, Magic Context creates and re-tightens 0700 directories and 0600 files. `false` gives these permissions to the operator. |
 
 `protected_tags` is deprecated and ignored. Remove it and use `protected_tokens` when an explicit absolute floor is needed.
 
@@ -584,8 +584,6 @@ Magic Context's `compaction.enabled` in `magic-context.jsonc` is not OpenCode's 
 Disabling the mode removes Magic Context's own marker boundary lazily when a session is next resumed. History hidden solely by Magic Context becomes visible; a surviving native boundary still hides older history. The first turn after disabling may trigger one native compaction cycle on long sessions. Magic Context does not pre-trim or otherwise mitigate that spike. An unresumed session is not swept in the background.
 
 When turning compaction back on, run `/ctx-wrapup` if the historian is runnable so Magic Context can catch up. If the historian is disabled, no `/ctx-wrapup` suggestion is emitted. Native compaction covers child sessions (verified against OpenCode v1.18.4): subagents receive additive memory/docs injection but no Magic Context reclaim in this mode. Keep subagent tasks small, or keep `compaction.enabled` on for projects that rely on long subagent runs. Raw content hidden by a native boundary before Magic Context's first pass is not retroactively indexed; later passes index new and observed raw messages.
-
-If `transform_mode: "rust"` is also configured, compaction-off mode resolves to the TypeScript transform and emits one frozen boot warning. There is no Rust reduced-mode contract in this cycle.
 
 ## `historian`
 
@@ -904,6 +902,15 @@ Tier boundaries are hardcoded to keep behavior predictable and prevent cache-bus
 | Superseded edits | When a file is edited more than once, the newest edit stays in full and each older edit is compressed to a marker that keeps its `filePath` and a short region hint of the diff, so the agent still sees which file and region it edited. This is the largest source of reclaimable bytes. |
 
 **Cache safety.** Selection is age-independent, but supersession only acts on passes already rebuilding the cache. Sessions that previously set `smart_drops: false` drain their backlog on the first such pass, never on an ordinary defer pass. Drops replay byte-identically afterward.
+
+### `transform_mode` and `rust_pipeline`
+
+| Key | Type | Default |
+|-----|------|---------|
+| `transform_mode` | deprecated, ignored | — |
+| `rust_pipeline` | deprecated, ignored | — |
+
+Rust transform mode is retired. Old configs that set either key keep loading, but the value has no effect. Magic Context writes one warning to its log per process. OpenCode, OpenCode 2, Pi, and OMP all run the TypeScript transform. These keys do not control the CortexKit harness bridge, which can serve OpenCode and Pi sessions from `ck-mc` instead. The bridge has its own setting in the harness.
 
 ### `protected_tools`
 

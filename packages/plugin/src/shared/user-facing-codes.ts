@@ -249,7 +249,7 @@ export const USER_FACING_FAILURES = {
     // another machine held the session's agent. Do not reuse it for a new failure.
     single_store_migration_required: {
         code: "MC-C14",
-        sentence: "Magic Context's Rust mode needs a one-time migration of its store.",
+        sentence: "Magic Context needs a one-time migration of its store.",
         action: "Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`.",
     },
     store_ahead_of_binary: {

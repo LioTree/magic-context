@@ -456,7 +456,7 @@ describe("createCtxMemoryTools", () => {
             toolContext(),
         );
         expect(reply).toBe(
-            "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+            "Magic Context needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
         );
         expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
         db.exec("DELETE FROM authority_managed");

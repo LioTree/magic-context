@@ -40,14 +40,15 @@ passes it with runtime-global updates disabled and never changes `process.env`.
 The bridge does not run config-location migration or install reload timers.
 
 The bridge **always selects the provider lane**. `transform_mode` and
-`rust_pipeline` select the in-tree plugin renderer and do not apply to the bridge;
-the harness's own off-by-default bridge flag owns opt-in. `kind` has exactly one
+`rust_pipeline` are retired: the in-tree plugin ignores them, logs one warning and
+runs its TypeScript transform. They never applied to the bridge; the harness's own
+off-by-default bridge flag owns opt-in. `kind` has exactly one
 supported value, **`"model"`**, because the OpenCode messages-transform hook has no
 caller kind and the provider adapter emits model steps. Rebuilds are not another
 kind: the adapter compares the host window to saved message identities and checks
 whether the selected model, system/tool fingerprint or persisted source state has
 changed. Idle-cache time and token pressure can also require a rebuilt history
-view, using the same rules as the in-tree provider path.
+view, using the same rules as the low-level provider adapter.
 `run` owns `SessionMeta`, publication, normalization through `providerIncoming`,
 and the bootstrap/rebuild record; it returns `Promise<{ messages: MessageLike[],
 kind: "ordinary" | "bootstrap" | "rebuild" }>`.
@@ -258,10 +259,11 @@ the bridge dispatches them after durable commit, as described above.
 
 ### Refused provider handoffs
 
-The native adapter's "legacy transform" is the Rust **full-request** transform.
-It caches message-id to canonical-ordinal mappings for bootstrap, but also normally
-runs when provider selection is off or bootstrap/exit hands off. The bridge
-constructs that same Rust transform internally for its ordinal cache only. It
+The low-level adapter still takes a "legacy transform": the Rust **full-request**
+transform. Rust transform mode is retired, so no in-tree host selects that transform.
+The adapter uses its message-id to canonical-ordinal cache for bootstrap. The
+low-level adapter can also hand a session to it when bootstrap is declined or the
+provider exits. The bridge constructs that transform for its ordinal cache only and
 **never executes a full-request handoff**. These throw `BridgeRefusalError` (an emergency fail-closed error) with
 stable `code` and `reason` fields:
 

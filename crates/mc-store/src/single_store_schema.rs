@@ -46,7 +46,7 @@ pub const SINGLE_STORE_MIGRATION_REQUIRED_REASON: &str = "single_store_migration
 pub const SINGLE_STORE_STATE_SPLIT_REASON: &str = "single_store_state_split";
 
 /// The user-facing sentence for [`SINGLE_STORE_MIGRATION_REQUIRED_REASON`].
-pub const SINGLE_STORE_MIGRATION_REQUIRED_SENTENCE: &str = "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)";
+pub const SINGLE_STORE_MIGRATION_REQUIRED_SENTENCE: &str = "Magic Context needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)";
 
 /// The tables whose rows now live in `context.db`. A store at version 60 or lower with a
 /// row in any of these has not been migrated and must not be opened.
