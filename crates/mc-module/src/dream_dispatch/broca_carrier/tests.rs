@@ -1311,3 +1311,105 @@ async fn broca_child_golden_runner_stops_at_exactly_the_cap() {
     assert_eq!(fake.detail, golden.detail);
     assert_eq!(fake.undelivered_steers, golden.undelivered_steers);
 }
+
+const CAP_CASES: &str = include_str!("golden/llm-runner-conformance-0.4.0/input_token_cap.rs.txt");
+const CAP_CASES_SHA256: &str = "2b28df81080ec88199cb984f907e58ce1e0c0fe7dc1c02ba948cb55ef2f4084f";
+
+#[test]
+fn broca_conformance_cap_cases_are_pinned() {
+    use sha2::{Digest, Sha256};
+    assert_eq!(format!("{:x}", Sha256::digest(CAP_CASES)), CAP_CASES_SHA256);
+    for case in [
+        "input_token_cap_at_limit",
+        "input_token_cap_crossing_tools",
+        "input_token_cap_usage_unreported",
+        "input_token_cap_raise_refused",
+        "input_token_cap_closed_members",
+        "input_token_cap_restart_between_episodes",
+    ] {
+        assert!(CAP_CASES.contains(&format!("\"{case}\"")), "{case}");
+    }
+}
+
+/// One capped attempt on the golden runner; answers the failure, the number of
+/// model steps that started and the memory effects.
+async fn capped(cap: u64, steps: Vec<Step>) -> (CarrierError, usize, usize, usize) {
+    let f = Fixture::golden();
+    f.script(steps);
+    let mut request = f.request(&["ctx_memory"], 10);
+    request.token_budget = Some(cap);
+    let (completion, _) = run(&f, &mut f.carrier(policy()), &request).await;
+    let started = f.broca.state().run.as_ref().unwrap().done;
+    let never = f.broca.state().never_executed.len();
+    (
+        completion.unwrap_err(),
+        started,
+        f.effects.executed().len(),
+        never,
+    )
+}
+
+fn metered(input: u64, read: u64, write: u64, calls: usize, unreported: bool) -> Step {
+    Step {
+        input,
+        cache_read: read,
+        cache_write: write,
+        unreported,
+        calls: (0..calls)
+            .map(|i| ("ctx_memory", json!({"action": "write", "n": i})))
+            .collect(),
+        text: (calls == 0).then_some("text"),
+        ..Step::default()
+    }
+}
+
+/// The carrier-visible conformance cases, with the conformance crate's numbers.
+/// The raise, closed-member and restart cases govern later sends on one session;
+/// this carrier makes one capped first send per fresh session, and the fake
+/// enforces those rules with the role crate's `Budget::check`.
+#[tokio::test]
+async fn broca_child_conformance_cap_cases_hold_through_the_carrier() {
+    // input_token_cap_at_limit: 1+2+3 reaches cap 6; the second step never starts.
+    let (failure, started, executed, _) = capped(
+        6,
+        vec![metered(1, 2, 3, 0, false), metered(1, 0, 0, 0, false)],
+    )
+    .await;
+    assert_eq!(
+        failure.message,
+        "token_budget: budget_exhausted limit 6 spent 6 cause limit_reached"
+    );
+    assert_eq!((started, executed), (1, 0));
+    // input_token_cap_crossing_tools: the under-cap tool runs once, both calls of
+    // the crossing step get never-executed results, spent counts the crossing step.
+    let (failure, started, executed, never) = capped(
+        10,
+        vec![
+            metered(1, 1, 1, 1, false),
+            metered(2, 3, 5, 2, false),
+            metered(1, 0, 0, 0, false),
+        ],
+    )
+    .await;
+    assert_eq!(
+        failure.message,
+        "token_budget: budget_exhausted limit 10 spent 13 cause limit_reached"
+    );
+    assert_eq!((started, executed, never), (2, 1, 2));
+    // input_token_cap_usage_unreported: the unmeasured step is not counted.
+    let (failure, started, executed, never) = capped(
+        10,
+        vec![
+            metered(1, 1, 1, 1, false),
+            metered(2, 3, 5, 2, true),
+            metered(1, 0, 0, 0, false),
+        ],
+    )
+    .await;
+    assert_eq!(
+        failure.message,
+        "token_budget: budget_exhausted limit 10 spent 3 cause usage_unreported"
+    );
+    assert!(!failure.retryable);
+    assert_eq!((started, executed, never), (2, 1, 2));
+}

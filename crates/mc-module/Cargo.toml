@@ -101,4 +101,4 @@ async-trait = "0.1"
 # The role's conformance suite, run in-process against tool.catalog and
 # role.describe (src/tests/tool_catalog_conformance.rs).
 cortexkit-role-tool-provider-conformance = "=0.5.0"
-cortexkit-role-llm-runner-conformance = "=0.4.0"
+cortexkit-role-llm-runner-conformance = { version = "=0.2.1", git = "https://github.com/cortexkit/commons", rev = "77f10f0fcfe465e6cab567dcf1a1bf8901c54547" }
