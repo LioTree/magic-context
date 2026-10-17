@@ -121,8 +121,11 @@ pub fn parse_turn_two_envelope(
             schema_valid = false;
             continue;
         };
-        if decisions.contains_key(&fact_id) {
-            decisions.insert(fact_id, json!("malformed"));
+        // A repeated fact_id makes that fact's decision ambiguous, so it collapses
+        // to malformed instead of keeping either entry.
+        if let std::collections::btree_map::Entry::Occupied(mut existing) = decisions.entry(fact_id)
+        {
+            existing.insert(json!("malformed"));
             schema_valid = false;
             continue;
         }
