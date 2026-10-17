@@ -6,6 +6,7 @@ import {
 	updateReplayDocument,
 } from "@magic-context/core/features/magic-context/storage-replay-document";
 import * as persistence from "@magic-context/core/hooks/magic-context/lkg-persist";
+import { checkLkgDurability } from "@magic-context/core/hooks/magic-context/lkg-served-marker";
 import {
 	dropSlot,
 	getInMemorySlot,
@@ -237,6 +238,53 @@ for (const failure of ["db-save", "late-commit"] as const) {
 		},
 	);
 }
+
+test("real managed handler certifies the request it returns, and a late commit stays uncertified", async () => {
+	for (const late of [false, true]) {
+		await fixture(async (db, sessionId, root) => {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const handler = fake.handlers.get("context");
+			if (!handler) throw new Error("context handler missing");
+			const raw = [userMessage("certified at dispatch", 1)];
+			const ctx = fakeContext(sessionId, root, ["entry-1"], raw);
+			let now = 0;
+			const clock = spyOn(performance, "now").mockImplementation(() => now);
+			const save = persistence.saveLkgSlotToDb;
+			const saver = spyOn(persistence, "saveLkgSlotToDb").mockImplementation(
+				(...args) => {
+					const committed = save(...args);
+					if (late) now = 26_000;
+					return committed;
+				},
+			);
+			try {
+				const pending = handler({ messages: raw } as never, ctx as never);
+				if (late) await expect(pending).rejects.toThrow("elapsed=26000ms");
+				else await pending;
+				expect(
+					persistence.loadPersistedLkgSlot(db, sessionId)?.jsonPrefix,
+				).toContain("certified at dispatch");
+				const status = checkLkgDurability(db, sessionId);
+				if (late) {
+					expect(status).toEqual({
+						durable: true,
+						servedCaptureId: null,
+						certified: false,
+					});
+					expect(
+						persistence.createDbLkgPersistence(db).load(sessionId),
+					).toBeUndefined();
+				} else {
+					expect(status.durable && status.servedCaptureId).toBe(1);
+				}
+			} finally {
+				saver.mockRestore();
+				clock.mockRestore();
+			}
+		});
+	}
+});
 
 for (const limitation of [
 	"branch-unavailable",
