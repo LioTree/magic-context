@@ -385,6 +385,7 @@ test.skipIf(!currentBinary || !baseBinary || !baseAdapter)(
             envelopeSelects: number;
             changes: number;
             servedMarkerWrites: number;
+            markerBinds: number;
             servedMarkerChanges: number;
         }[] = [];
         for (const [arm, fixture] of [
@@ -396,6 +397,25 @@ test.skipIf(!currentBinary || !baseBinary || !baseAdapter)(
             let reads = 0;
             let servedMarkerWrites = 0;
             let servedMarkerChanges = 0;
+            // Context migration 102 binds each served certificate to the exact bytes it
+            // names: the slot save also runs `UPDATE lkg_served_markers SET served_digest`,
+            // inside the same BEGIN IMMEDIATE transaction that writes lkg_slots, so the
+            // bind costs one statement but no extra writer-lock acquisition. Count that
+            // bind on its own; every other marker write keeps the one-per-pass bound.
+            let markerBinds = 0;
+            let bindsOutsideSlotTransaction = 0;
+            let openTransaction: number | undefined;
+            let transactionSerial = 0;
+            let slotWriteTransaction: number | undefined;
+            const originalExec = fixture.db.exec.bind(fixture.db);
+            const execSpy = spyOn(fixture.db, "exec").mockImplementation(((sql: string) => {
+                const result = originalExec(sql);
+                if (/^\s*BEGIN(?:\s+\w+)?\s*;?\s*$/i.test(sql))
+                    openTransaction = ++transactionSerial;
+                else if (/^\s*(?:COMMIT|END|ROLLBACK)\s*;?\s*$/i.test(sql))
+                    openTransaction = undefined;
+                return result;
+            }) as typeof fixture.db.exec);
             const original = fixture.db.prepare.bind(fixture.db);
             const spy = spyOn(fixture.db, "prepare").mockImplementation(((sql: string) => {
                 if (
@@ -403,6 +423,14 @@ test.skipIf(!currentBinary || !baseBinary || !baseAdapter)(
                 )
                     reads++;
                 const statement = original(sql);
+                if (/^\s*INSERT\s+INTO\s+lkg_slots\s*\(/i.test(sql)) {
+                    const run = statement.run.bind(statement);
+                    statement.run = (...args) => {
+                        const result = run(...args);
+                        slotWriteTransaction = openTransaction;
+                        return result;
+                    };
+                }
                 // Session-move and signed-thinking durability records which capture was served
                 // each pass, independently of raw replay. Normalize only this exact table;
                 // retain every other write and bound marker writes separately below.
@@ -412,9 +440,19 @@ test.skipIf(!currentBinary || !baseBinary || !baseAdapter)(
                     )
                 ) {
                     const run = statement.run.bind(statement);
+                    const bind = /^\s*UPDATE\s+lkg_served_markers\s+SET\s+served_digest\b/i.test(
+                        sql,
+                    );
                     statement.run = (...args) => {
                         const result = run(...args);
-                        servedMarkerWrites++;
+                        if (bind) {
+                            markerBinds++;
+                            if (
+                                openTransaction === undefined ||
+                                slotWriteTransaction !== openTransaction
+                            )
+                                bindsOutsideSlotTransaction++;
+                        } else servedMarkerWrites++;
                         servedMarkerChanges += result.changes;
                         return result;
                     };
@@ -426,22 +464,27 @@ test.skipIf(!currentBinary || !baseBinary || !baseAdapter)(
             ).n;
             for (let pass = 0; pass < 5; pass++) {
                 const markerWritesBefore = servedMarkerWrites;
+                const markerBindsBefore = markerBinds;
                 input.push(
                     user(fixture.sid, `question-${pass}`),
                     tool(fixture.sid, `result-${pass}`),
                 );
                 await fixture.run(input);
                 expect(servedMarkerWrites - markerWritesBefore).toBeLessThanOrEqual(1);
+                expect(markerBinds - markerBindsBefore).toBeLessThanOrEqual(1);
+                expect(bindsOutsideSlotTransaction).toBe(0);
                 expect(fixture.host.getState(fixture.sid).lkgRepresentationFrozen).toBe(false);
             }
             const after = (fixture.db.prepare("SELECT total_changes() AS n").get() as { n: number })
                 .n;
             spy.mockRestore();
+            execSpy.mockRestore();
             counts.push({
                 arm,
                 envelopeSelects: reads,
                 changes: after - before - servedMarkerChanges,
                 servedMarkerWrites,
+                markerBinds,
                 servedMarkerChanges,
             });
         }
