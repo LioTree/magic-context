@@ -23987,6 +23987,206 @@ mod tests {
     }
 
     #[test]
+    fn s02_review_p1_facade_canonical_merge_preserves_safety_floor() {
+        if std::env::var("MC_S02_WITNESSES").as_deref() != Ok("1") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let project = "git:s02-review";
+        insert_memory(
+            &store,
+            project,
+            1,
+            "Never push without approval.",
+            Some(80),
+            "active",
+            None,
+        );
+        insert_memory(
+            &store,
+            project,
+            2,
+            "Use the release branch.",
+            Some(50),
+            "active",
+            None,
+        );
+        store
+            .with_context_conn_for_test(|conn| {
+                conn.execute("UPDATE memories SET safety_critical=1 WHERE id=1", [])?;
+                let facade = FacadeMutationTxn {
+                    tx: conn,
+                    automated: false,
+                };
+                let (merged, _) = facade
+                    .merge_memories_canonical(
+                        project,
+                        &[1, 2],
+                        "Never push without approval. Use the release branch.",
+                        Some("ses"),
+                        10,
+                    )
+                    .unwrap();
+                eprintln!(
+                    "canonical successor: safety={:?}, importance={:?}",
+                    merged.safety_critical, merged.importance
+                );
+                assert_eq!(
+                    (merged.safety_critical, merged.importance),
+                    (Some(true), Some(80))
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn s02_review_p1_store_merge_preserves_source_safety_floor() {
+        if std::env::var("MC_S02_WITNESSES").as_deref() != Ok("1") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let project = "git:s02-review";
+        insert_memory(
+            &store,
+            project,
+            1,
+            "Never push without approval.",
+            Some(80),
+            "active",
+            None,
+        );
+        insert_memory(
+            &store,
+            project,
+            2,
+            "Use the release branch.",
+            Some(50),
+            "active",
+            None,
+        );
+        store
+            .with_context_conn_for_test(|conn| {
+                conn.execute("UPDATE memories SET safety_critical=1 WHERE id=1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let merged = store
+            .merge_memories(
+                project,
+                2,
+                &[1],
+                "Never push without approval. Use the release branch.",
+                10,
+            )
+            .unwrap()
+            .unwrap();
+        eprintln!(
+            "store survivor: safety={:?}, importance={:?}",
+            merged.safety_critical, merged.importance
+        );
+        assert_eq!(
+            (merged.safety_critical, merged.importance),
+            (Some(true), Some(80))
+        );
+    }
+
+    #[test]
+    fn s02_review_score_edges_match_typescript() {
+        use crate::memory_lifecycle::scoring::ItemScore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let project = "git:s02-review";
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/s02-review-score-cases.json")).unwrap();
+        for (index, case) in cases.as_array().unwrap().iter().enumerate() {
+            let id = index as i64 + 1;
+            insert_memory(
+                &store,
+                project,
+                id,
+                &format!("edge {id}"),
+                None,
+                "active",
+                None,
+            );
+            store.with_context_conn_for_test(|conn| {
+                conn.execute("UPDATE memories SET safety_critical=?1 WHERE id=?2", params![case["flag"].as_bool().map(i64::from), id])?;
+                conn.execute("INSERT INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal,excerpt) VALUES(?1,?2,1,'ses',?3,1,'excerpt')", params![project, id, format!("edge-{id}")])?;
+                Ok(())
+            }).unwrap();
+            assert_eq!(
+                store
+                    .record_memory_item_scores(
+                        &[id],
+                        &[ItemScore {
+                            item: id,
+                            importance: case["score"].as_i64().unwrap() as i32,
+                            proposed_class: "durable".into()
+                        }],
+                        1
+                    )
+                    .unwrap(),
+                1
+            );
+            let memory = store.get_memory_full(id).unwrap().unwrap();
+            assert_eq!(
+                memory.importance,
+                Some(case["expected"].as_i64().unwrap() as i32)
+            );
+            assert_eq!(memory.safety_critical, case["flag"].as_bool());
+        }
+        for (index, importance) in [
+            None,
+            Some(0),
+            Some(1),
+            Some(79),
+            Some(80),
+            Some(81),
+            Some(100),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = index as i64 + 100;
+            insert_memory(
+                &store,
+                project,
+                id,
+                &format!("classify edge {id}"),
+                importance,
+                "active",
+                None,
+            );
+            let memory = store.get_memory_full(id).unwrap().unwrap();
+            store
+                .set_memory_classification(
+                    project,
+                    &[ClassificationUpdate {
+                        memory_id: id,
+                        content_hash_at_prompt: memory.normalized_hash,
+                        importance: None,
+                        scope: None,
+                        shareable: None,
+                        safety_critical: Some(true),
+                    }],
+                    2,
+                )
+                .unwrap();
+            assert_eq!(
+                store.get_memory_full(id).unwrap().unwrap().importance,
+                Some(match importance {
+                    Some(81) => 81,
+                    Some(100) => 100,
+                    _ => 80,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn get_by_id_applies_full_foreign_visibility_but_keeps_own_archived_rows() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
