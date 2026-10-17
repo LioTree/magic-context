@@ -350,15 +350,13 @@ test.each([
 			"host_runner_views",
 			"host_runner_state",
 		];
-		// The newest migration adds these session_meta columns. Removing them and
-		// the newest version row models a valid database one migration behind.
-		const newestColumns = ["served_prefix", "held_release"];
-		// Model a valid v99 database by removing only v100's version row and its
-		// columns below. Keep git_commit_fts_rowid_map: an earlier migration already
-		// committed it, so deleting that FTS identity map is corruption and startup
-		// must refuse it instead of rebuilding it. When a newer migration lands,
-		// update this pin and the objects it removes together.
-		expect(LATEST_SUPPORTED_VERSION).toBe(100);
+		const servedPrefixMigrationVersion = 100;
+		const servedPrefixColumns = ["served_prefix", "held_release"];
+		// Replay the served-prefix migration and every migration after it, regardless
+		// of the current schema fence. Later schema objects can stay: migrations
+		// tolerate existing objects, but these columns must be installed by the worker.
+		// Keep git_commit_fts_rowid_map, which belongs to an earlier migration;
+		// removing that FTS identity map would model corruption, not pending storage.
 		const dbPath = join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db");
 		if (!openDatabase(dbPath))
 			throw new Error("could not seed isolated storage");
@@ -366,11 +364,11 @@ test.each([
 		const seed = new Database(dbPath);
 		try {
 			seed
-				.prepare("DELETE FROM schema_migrations WHERE version = ?")
-				.run(LATEST_SUPPORTED_VERSION);
+				.prepare("DELETE FROM schema_migrations WHERE version >= ?")
+				.run(servedPrefixMigrationVersion);
 			// Remove new schema objects as well as the version marker: the packaged
 			// worker must actually install them, not just report an already-current DB.
-			for (const name of newestColumns)
+			for (const name of servedPrefixColumns)
 				seed.run(`ALTER TABLE session_meta DROP COLUMN ${name}`);
 		} finally {
 			seed.close();
@@ -409,7 +407,7 @@ test.each([
 				"async open main-thread migration-body count: 0",
 			);
 			expect(log).toContain("migration worker ready");
-			expect(log).toContain("[migrations] applied v100:");
+			expect(log).toContain(`[migrations] applied v${LATEST_SUPPORTED_VERSION}:`);
 			expect(log).not.toContain("storage fatal:");
 			expect(log).toContain("async open main-thread migration-body count: 0");
 			expect(log).not.toContain("migration worker could not start");
@@ -436,7 +434,7 @@ test.each([
 						name: string;
 					}[]
 				).map((column) => column.name);
-				for (const name of newestColumns)
+				for (const name of servedPrefixColumns)
 					expect(sessionMetaColumns).toContain(name);
 			} finally {
 				checked.close();
