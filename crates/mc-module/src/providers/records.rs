@@ -111,6 +111,13 @@ pub struct Record {
     pub wait_view: Option<transform::compaction::View>,
 }
 
+/// Record pointers of the runner's produced, applied and waiting views.
+const VIEW_SLOTS: [&str; 3] = [
+    "/setup/state/last_produced",
+    "/setup/state/last_applied",
+    "/wait_view",
+];
+
 /// A typed adapter over the handler's main store slot. It owns no connection,
 /// policy or schema: store open and migrations finish before the slot is filled.
 pub struct Storage {
@@ -174,12 +181,30 @@ impl Storage {
     }
 
     pub fn load(&self, key: &Key) -> Result<Record, HandlerOutcome> {
-        self.store()?
+        let store = self.store()?;
+        let Some(raw) = store
             .load_provider_record(&key.store_key())
             .map_err(transient)?
-            .map_or(Ok(Record::default()), |raw| {
-                serde_json::from_str(&raw).map_err(transient)
-            })
+        else {
+            return Ok(Record::default());
+        };
+        let mut record: Value = serde_json::from_str(&raw).map_err(transient)?;
+        // The store returns each saved view as a `{"version":N}` reference;
+        // resolve it from its recipe through the Broca codec.
+        for path in VIEW_SLOTS {
+            let Some(version) = record
+                .pointer(path)
+                .filter(|view| view.get("replacement").is_none())
+                .and_then(|view| view.get("version"))
+                .and_then(Value::as_u64)
+            else {
+                continue;
+            };
+            let view = super::view_recipe::load_runner(store, &key.store_key(), version)?;
+            *record.pointer_mut(path).expect("referenced view slot") =
+                serde_json::to_value(view).map_err(transient)?;
+        }
+        serde_json::from_value(record).map_err(transient)
     }
 
     /// The host lane decides cadence after burns and promotion, inside the store
@@ -202,18 +227,79 @@ impl Storage {
     }
 
     pub fn save(&self, key: &Key, record: &Record) -> Result<(), HandlerOutcome> {
-        self.save_inner(key, record, None)
+        self.save_inner(key, record, &record.messages, None)
     }
 
     pub(super) fn token(&self, key: &Key) -> Result<(u64, Option<u64>), HandlerOutcome> {
         self.store()?.provider_record_token(&key.store_key()).map_err(transient)
     }
 
-    pub(super) fn save_delta(&self, key: &Key, record: &Record, raw: &str, token: &(u64, Option<u64>)) -> Result<(), HandlerOutcome> {
-        self.save_inner(key, record, Some((token, raw)))
+    /// `messages` is the whole transcript; the delta record holds only appended
+    /// messages, but a new view's recipe may name any held source.
+    pub(super) fn save_delta(
+        &self,
+        key: &Key,
+        record: &Record,
+        messages: &BTreeMap<String, BTreeMap<u64, compact::status::StatusMessage>>,
+        raw: &str,
+        token: &(u64, Option<u64>),
+    ) -> Result<(), HandlerOutcome> {
+        self.save_inner(key, record, messages, Some((token, raw)))
     }
 
-    fn save_inner(&self, key: &Key, record: &Record, delta: Option<(&(u64, Option<u64>), &str)>) -> Result<(), HandlerOutcome> {
+    /// Replace each whole view in the serialized record with a `{"version":N}`
+    /// reference, building a recipe for every version the store does not hold.
+    fn view_references(
+        &self,
+        key: &Key,
+        record: &Record,
+        messages: &BTreeMap<String, BTreeMap<u64, compact::status::StatusMessage>>,
+        raw: &mut Value,
+    ) -> Result<Vec<mc_store::ProviderViewRecipe>, HandlerOutcome> {
+        let store = self.store()?;
+        let store_key = key.store_key();
+        let typed = [
+            record.setup.as_ref().and_then(|s| s.state.last_produced.as_ref()),
+            record.setup.as_ref().and_then(|s| s.state.last_applied.as_ref()),
+            record.wait_view.as_ref(),
+        ];
+        let held: BTreeSet<u64> = store
+            .load_provider_view_recipe_versions(&store_key)
+            .map_err(transient)?
+            .into_iter()
+            .collect();
+        // Inherit synthetic slots from the newest stored view the record still
+        // names, so an unchanged summary head is not copied into every fold.
+        let base = typed
+            .iter()
+            .flatten()
+            .map(|view| view.version)
+            .filter(|version| held.contains(version))
+            .max();
+        let mut recipes: Vec<mc_store::ProviderViewRecipe> = Vec::new();
+        for ((path, state), view) in VIEW_SLOTS.iter().zip(["produced", "applied", "produced"]).zip(typed) {
+            let Some(view) = view else {
+                continue;
+            };
+            if !held.contains(&view.version) && !recipes.iter().any(|r| r.version == view.version) {
+                recipes.push(super::view_recipe::runner_recipe(
+                    store, &store_key, view, messages, base, state,
+                )?);
+            }
+            if let Some(slot) = raw.pointer_mut(path).filter(|slot| !slot.is_null()) {
+                *slot = json!({ "version": view.version });
+            }
+        }
+        Ok(recipes)
+    }
+
+    fn save_inner(
+        &self,
+        key: &Key,
+        record: &Record,
+        messages: &BTreeMap<String, BTreeMap<u64, compact::status::StatusMessage>>,
+        delta: Option<(&(u64, Option<u64>), &str)>,
+    ) -> Result<(), HandlerOutcome> {
         // A host switch adopts the full-request engine namespace. Compatibility
         // saves must not silently move its tags and frozen state to a new one.
         let namespace = self
@@ -241,16 +327,17 @@ impl Storage {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if let Some((token, raw)) = delta {
-            return self.store()?.save_provider_record_delta(&key.store_key(), raw, &namespace, &tags, token).map_err(transient);
+        let mut raw = match delta {
+            Some((_, raw)) => serde_json::from_str(raw).map_err(transient)?,
+            None => serde_json::to_value(record).map_err(transient)?,
+        };
+        let views = self.view_references(key, record, messages, &mut raw)?;
+        let raw = serde_json::to_string(&raw).map_err(transient)?;
+        if let Some((token, _)) = delta {
+            return self.store()?.save_provider_record_delta(&key.store_key(), &raw, &namespace, &tags, &views, token).map_err(transient);
         }
-        let raw = serde_json::to_string(record).map_err(transient)?;
-        self.store()?.save_provider_record(
-                &key.store_key(),
-                &raw,
-                &namespace,
-                &tags,
-            )
+        self.store()?
+            .save_provider_record(&key.store_key(), &raw, &namespace, &tags, &views)
             .map_err(transient)
     }
 
@@ -267,8 +354,13 @@ impl Storage {
             .map_err(transient)?;
         let mut found = Vec::new();
         for (harness, raw) in rows {
-            let record: Record = serde_json::from_str(&raw).map_err(transient)?;
-            if record.setup.is_some() || record.hook.is_some() {
+            // Only presence matters here. Stored views are `{"version":N}`
+            // references, so the raw row is not a whole `Record`.
+            let record: Value = serde_json::from_str(&raw).map_err(transient)?;
+            if ["setup", "hook"]
+                .iter()
+                .any(|field| record.get(field).is_some_and(|value| !value.is_null()))
+            {
                 found.push(harness);
             }
         }

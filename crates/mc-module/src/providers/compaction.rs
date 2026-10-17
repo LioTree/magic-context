@@ -6,7 +6,6 @@ use super::*;
 mod compaction_review_tests;
 use mc_store::provider_records::{
     ProviderConversation, ProviderError, ProviderLineage, ProviderMessage, ProviderSubject,
-    ProviderView,
 };
 use serde::Deserialize;
 
@@ -356,11 +355,11 @@ fn save_host_setup(
     setup: &HostSetup,
 ) -> Result<(), HandlerOutcome> {
     save_host_setup_fields(store, key, conversation, setup)?;
-    if matches!(key.harness.as_str(), "opencode" | "opencode2") {
-        store
-            .prune_provider_views_from_conversation(&key.store_key())
-            .map_err(transient)?;
-    }
+    // Every host lane stores recipes; prune them against the roots this Setup
+    // and its receipt now name.
+    store
+        .prune_provider_views_from_conversation(&key.store_key())
+        .map_err(transient)?;
     Ok(())
 }
 
@@ -388,19 +387,7 @@ fn save_host_view(
     if matches!(key.harness.as_str(), "opencode" | "opencode2") {
         return super::view_recipe::save(store, key, view, state);
     }
-    store
-        .save_provider_view(
-            &key.store_key(),
-            &ProviderView {
-                version: view.engine.version,
-                lineage_id: view.engine.range.lineage_id.clone(),
-                range_from: view.engine.range.from,
-                range_to: view.engine.range.to,
-                replacement_json: serde_json::to_string(view).map_err(transient)?,
-                state: state.into(),
-            },
-        )
-        .map_err(|e| transient(format!("save provider view: {e}")))
+    super::view_recipe::save_host(store, key, view, state)
 }
 
 fn load_host_view(
@@ -408,18 +395,9 @@ fn load_host_view(
     key: &Key,
     summary: &ViewSummary,
 ) -> Result<HostView, HandlerOutcome> {
-    if matches!(key.harness.as_str(), "opencode" | "opencode2") {
-        if let Some(mut view) = super::view_recipe::load(store, key, summary.version)? {
-            view.engine.range.lineage_id = summary.range.lineage_id.clone();
-            return Ok(view);
-        }
-    }
-    let row = store
-        .load_provider_view(&key.store_key(), summary.version)
-        .map_err(|e| transient(format!("load provider views: {e}")))?
+    let mut view = super::view_recipe::load(store, key, summary.version)?
         .ok_or_else(|| transient("recorded provider view is missing"))?;
-    let mut view: HostView = serde_json::from_str(&row.replacement_json).map_err(transient)?;
-    if key.generation.is_some() {
+    if !matches!(key.harness.as_str(), "opencode" | "opencode2") && key.generation.is_some() {
         super::native_view::validate(key, &view)?;
     }
     // Immutable bytes are shared by a descent; only the in-memory range's
@@ -3254,8 +3232,7 @@ mod host_tests {
             rendered_user,
             &served_user,
             "engine view: {}",
-            s.load_provider_views(&k.store_key())
-                .unwrap()
+            crate::providers::view_recipe::stored_views(&s, &k.store_key())
                 .last()
                 .unwrap()
                 .replacement_json
@@ -4681,14 +4658,8 @@ mod terminal_refusal_tests {
         }
         let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
         let store = h.store.get().unwrap();
-        assert!(store
-            .load_provider_view(&key.store_key(), 2)
-            .unwrap()
-            .is_none());
-        assert!(store
-            .load_provider_view(&key.store_key(), 3)
-            .unwrap()
-            .is_none());
+        assert!(!store.provider_view_exists(&key.store_key(), 2).unwrap());
+        assert!(!store.provider_view_exists(&key.store_key(), 3).unwrap());
         assert_eq!(
             store
                 .load_provider_messages(&key.store_key(), "L")

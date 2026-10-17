@@ -251,21 +251,15 @@ impl McHandler {
                 .load_provider_conversation(&key.store_key())
                 .map_err(|_| ViewReadRefusal::InvalidView)?
                 .ok_or(ViewReadRefusal::UnavailableLane)?;
-            let row = store
-                .load_provider_view(&key.store_key(), request.version)
+            // The recipe resolver streams the stored raw messages and checks the
+            // frozen digests and lengths before materializing the inline bytes.
+            let host = super::view_recipe::load(&store, &key, request.version)
                 .map_err(|_| ViewReadRefusal::InvalidView)?
                 .ok_or(ViewReadRefusal::UnknownVersion)?;
-            if row.lineage_id != conversation.lineage_id {
-                return Err(ViewReadRefusal::UnknownVersion);
-            }
-            let host: compaction::HostView = serde_json::from_str(&row.replacement_json)
-                .map_err(|_| ViewReadRefusal::InvalidView)?;
-            if host.engine.version != row.version
-                || host.engine.range.lineage_id != row.lineage_id
-                || host.engine.range.from != row.range_from
-                || host.engine.range.to != row.range_to
+            if host.engine.version != request.version
+                || host.engine.range.lineage_id != conversation.lineage_id
             {
-                return Err(ViewReadRefusal::InvalidView);
+                return Err(ViewReadRefusal::UnknownVersion);
             }
             validate(&key, &host).map_err(|_| ViewReadRefusal::InvalidView)?;
             let frozen = host

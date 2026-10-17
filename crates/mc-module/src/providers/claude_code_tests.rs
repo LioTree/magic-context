@@ -315,13 +315,12 @@ async fn cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes
     let answer: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(answer["answer"], "compaction_message");
     assert_eq!(answer["cache_policy"], ready["cache_policy"]);
-    let row = store
-        .load_provider_view(
-            &key.store_key(),
-            answer["compaction"]["version"].as_u64().unwrap(),
-        )
-        .unwrap()
-        .unwrap();
+    let row = crate::providers::view_recipe::stored_view(
+        &store,
+        &key.store_key(),
+        answer["compaction"]["version"].as_u64().unwrap(),
+    )
+    .unwrap();
     let committed: Value = serde_json::from_str(&row.replacement_json).unwrap();
     let raw = committed["raw_replacement"]
         .as_array()

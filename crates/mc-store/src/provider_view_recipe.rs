@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+#[path = "provider_view_recipe_tests.rs"]
+mod tests;
+
 pub const MAX_VIEW_BASE_DEPTH: usize = 16;
 pub const MAX_VIEW_ANCESTOR_BYTES: usize = 8 * 1024 * 1024;
 
@@ -52,6 +56,14 @@ pub struct ProviderViewRecipe {
     pub render_key: String,
     pub tokenizer_key: String,
     pub state: String,
+}
+
+/// Replayable view versions and the native `(lineage, from, to)` ordinal
+/// ranges they stream, taken from one transaction.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderViewSourceRoots {
+    pub versions: BTreeSet<u64>,
+    pub sources: BTreeSet<(String, u64, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -265,48 +277,72 @@ impl McStore {
             .map_err(|error| ProviderError::Storage(error.into()))
     }
 
+    /// Prune with roots read in the same fenced transaction as the deletion, so
+    /// an acknowledgement, receipt or record write cannot slip between the
+    /// snapshot of references and the removal of the recipes they name.
     pub fn prune_provider_views_from_conversation(
         &self,
         key: &ProviderSessionKey,
     ) -> Result<usize, ProviderError> {
-        let Some(c) = self
-            .load_provider_conversation(key)
-            .map_err(ProviderError::Storage)?
-        else {
-            return Ok(0);
-        };
-        let mut roots = BTreeSet::new();
-        if let Some(raw) = c.setup_json {
-            let setup: Value = serde_json::from_str(&raw).map_err(invalid)?;
-            for path in ["/applied/version", "/produced/version"] {
-                if let Some(version) = setup.pointer(path).and_then(Value::as_u64) {
-                    roots.insert(version);
-                }
-            }
-        }
-        if let Some(raw) = c.last_answer_json {
-            let receipt: Value = serde_json::from_str(&raw).map_err(invalid)?;
-            for path in ["/compaction/version", "/initial/version"] {
-                if let Some(version) = receipt.pointer(path).and_then(Value::as_u64) {
-                    roots.insert(version);
-                }
-            }
-        }
-        let counters: Value = serde_json::from_str(&c.hook_counters_json).map_err(invalid)?;
-        if let Some(lkg) = counters.get("lkg_view_versions").and_then(Value::as_array) {
-            roots.extend(lkg.iter().filter_map(Value::as_u64));
-        }
-        // Keep the previous applied version while the host replaces its saved
-        // last-good request with the newly acknowledged outgoing view.
-        roots.extend(self.inner.with_conn(|conn| {
-            let mut q=conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 AND state='applied' ORDER BY version DESC LIMIT 2")?;
-            let rows=q.query_map([key.conversation_key()],|r|r.get::<_,u64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        }).map_err(|e|ProviderError::Storage(e.into()))?);
-        if roots.is_empty() {
-            return Ok(0);
-        };
-        self.prune_provider_view_recipes(key, &roots)
+        let mut refusal = None;
+        self.inner
+            .with_conn_fenced(|conn| {
+                let conv = key.conversation_key();
+                let prune = || -> Result<usize, ProviderError> {
+                    let roots = view_roots_tx(conn, &conv)?;
+                    if roots.is_empty() {
+                        return Ok(0);
+                    }
+                    prune_tx(conn, &conv, &roots)
+                };
+                prune().map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
+    }
+
+    /// One read snapshot of the replayable view versions and the native source
+    /// ranges those views stream. Source conversion must not touch a row in
+    /// `sources` while any version in `versions` can still be served.
+    pub fn provider_view_source_roots(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<ProviderViewSourceRoots, ProviderError> {
+        let mut refusal = None;
+        self.inner
+            .with_conn(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                let conv = key.conversation_key();
+                let read = || -> Result<ProviderViewSourceRoots, ProviderError> {
+                    let versions = view_roots_tx(&tx, &conv)?;
+                    let mut sources = BTreeSet::new();
+                    for version in &versions {
+                        if let Some(recipe) = load_recipe_tx(&tx, &conv, *version)? {
+                            for segment in recipe.segments {
+                                if let ProviderViewSegment::NativeRange {
+                                    source_lineage_id,
+                                    from,
+                                    to,
+                                    ..
+                                } = segment
+                                {
+                                    sources.insert((source_lineage_id, from, to));
+                                }
+                            }
+                        }
+                    }
+                    Ok(ProviderViewSourceRoots { versions, sources })
+                };
+                let roots = read().map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })?;
+                tx.commit()?;
+                Ok(roots)
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
     }
 
     pub fn resolve_provider_view(
@@ -349,9 +385,44 @@ impl McStore {
         recipe: &ProviderViewRecipe,
     ) -> Result<usize, ProviderError> {
         let mut refusal = None;
-        self.inner.with_conn_fenced(|conn| {
-            let save=||->Result<usize,ProviderError> {
-                let conv=key.conversation_key();
+        self.inner
+            .with_conn_fenced(|conn| {
+                save_recipe_tx(conn, &key.conversation_key(), recipe).map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
+    }
+
+    /// Reachability, not age, controls retention. Callers pass applied, produced,
+    /// last-known-good request and receipt versions; ancestor recipes and current
+    /// policy exceptions remain live until those roots no longer refer to them.
+    pub fn prune_provider_view_recipes(
+        &self,
+        key: &ProviderSessionKey,
+        roots: &BTreeSet<u64>,
+    ) -> Result<usize, ProviderError> {
+        let mut refusal = None;
+        self.inner
+            .with_conn_fenced(|conn| {
+                prune_tx(conn, &key.conversation_key(), roots).map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
+    }
+}
+
+/// Insert one immutable recipe. Shared by the host view writer and the runner
+/// record writer so both commit the view in the caller's transaction.
+pub(crate) fn save_recipe_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+    recipe: &ProviderViewRecipe,
+) -> Result<usize, ProviderError> {
+    let conv = conv.to_string();
                 let mut recipe=recipe.clone();
                 if let Some(base)=recipe.base_version {
                     let resolved=resolve_tx(conn,&conv,base,false)?.ok_or_else(||invalid("provider view base is missing"))?;
@@ -386,24 +457,17 @@ impl McStore {
                     let patch=treatment.patch.map(|v|v.to_string()); bytes+=patch.as_ref().map_or(0,String::len);
                     conn.execute("INSERT INTO mc_provider_view_overrides_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,json_extract(?1,'$[1]'))",params![conv,recipe.version,treatment.source_lineage_id,treatment.mid,treatment.ordinal,treatment.block_index,treatment.block_id,if patch.is_some(){"set"}else{"reset"},patch])?;
                 }
-                Ok(bytes)
-            };
-            save().map_err(|e|{refusal=Some(e);rusqlite::Error::InvalidQuery})
-        }).map_err(|e|refusal.unwrap_or_else(||ProviderError::Storage(e.into())))
-    }
+    Ok(bytes)
+}
 
-    /// Reachability, not age, controls retention. Callers pass applied, produced,
-    /// last-known-good request and receipt versions; ancestor recipes and current
-    /// policy exceptions remain live until those roots no longer refer to them.
-    pub fn prune_provider_view_recipes(
-        &self,
-        key: &ProviderSessionKey,
-        roots: &BTreeSet<u64>,
-    ) -> Result<usize, ProviderError> {
-        let mut refusal = None;
-        self.inner.with_conn_fenced(|conn| {
-            let prune=||->Result<usize,ProviderError> {
-                let conv=key.conversation_key();
+/// Delete every recipe that no root reaches through its base chain, then the
+/// policy cuts nothing references any longer. See `prune_provider_view_recipes`.
+pub(crate) fn prune_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+    roots: &BTreeSet<u64>,
+) -> Result<usize, ProviderError> {
+    let conv = conv.to_string();
                 let mut keep=roots.clone();
                 for root in roots {
                     let mut current=Some(*root);
@@ -427,9 +491,67 @@ impl McStore {
                 let namespace: String = conn.query_row("SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE conv_key=?1", [&conv], |row| row.get(0))?;
                 let cache_cut = crate::cache_codec::native_tail_cut(conn, &namespace)?;
                 conn.execute("DELETE FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 AND (?2 IS NULL OR cut_id<>?2) AND NOT EXISTS(SELECT 1 FROM mc_provider_views_v2 v WHERE v.conv_key=?1 AND v.policy_cut_id=mc_provider_policy_cuts_v1.cut_id) AND NOT EXISTS(SELECT 1 FROM mc_provider_policy_overrides_v1 o WHERE o.conv_key=?1 AND o.cut_id=mc_provider_policy_cuts_v1.cut_id) AND (?3 IS NULL OR cut_id<>?3)",params![conv,current,cache_cut])?;
-                Ok(removed)
-            };
-            prune().map_err(|e|{refusal=Some(e);rusqlite::Error::InvalidQuery})
-        }).map_err(|e|refusal.unwrap_or_else(||ProviderError::Storage(e.into())))
+    Ok(removed)
+}
+
+/// Every view version that something outside the recipe table can still ask to
+/// replay, read inside the caller's transaction:
+/// - host Setup's applied and produced summaries (acknowledgements and the
+///   not-applied replay of the produced view);
+/// - the last step or Setup receipt (a retried request answers from it);
+/// - last-known-good request versions, including the two newest applied rows,
+///   because the host keeps the previous applied request until it saves the
+///   newly acknowledged one;
+/// - the runner record's produced, applied and waiting views.
+pub(crate) fn view_roots_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+) -> Result<BTreeSet<u64>, ProviderError> {
+    let mut roots = BTreeSet::new();
+    let row: Option<(Option<String>, Option<String>, String, String)> = conn
+        .query_row(
+            "SELECT setup_json,last_answer_json,hook_counters_json,legacy_shape_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+            [conv],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((setup, receipt, counters, shape)) = row else {
+        return Ok(roots);
+    };
+    let mut collect = |raw: &str, paths: &[&str]| -> Result<(), ProviderError> {
+        let value: Value = serde_json::from_str(raw).map_err(invalid)?;
+        for path in paths {
+            if let Some(version) = value.pointer(path).and_then(Value::as_u64) {
+                roots.insert(version);
+            }
+        }
+        Ok(())
+    };
+    if let Some(raw) = setup {
+        collect(&raw, &["/applied/version", "/produced/version"])?;
     }
+    if let Some(raw) = receipt {
+        collect(&raw, &["/compaction/version", "/initial/version"])?;
+    }
+    collect(&shape, &["/produced_version", "/applied_version", "/wait_version"])?;
+    let counters: Value = serde_json::from_str(&counters).map_err(invalid)?;
+    if let Some(lkg) = counters.get("lkg_view_versions").and_then(Value::as_array) {
+        roots.extend(lkg.iter().filter_map(Value::as_u64));
+    }
+    let mut q = conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 AND state='applied' ORDER BY version DESC LIMIT 2")?;
+    for version in q.query_map([conv], |r| r.get::<_, u64>(0))? {
+        roots.insert(version?);
+    }
+    // A reference whose recipe was never stored cannot be protected; keeping it
+    // would only make pruning refuse. Readers already treat it as absent.
+    let mut exists = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2)",
+    )?;
+    let mut held = BTreeSet::new();
+    for version in roots {
+        if exists.query_row(params![conv, version], |r| r.get::<_, bool>(0))? {
+            held.insert(version);
+        }
+    }
+    Ok(held)
 }

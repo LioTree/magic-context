@@ -1,7 +1,8 @@
 //! Compatibility codec for the older runner observation lane. Only explicit
 //! legacy callers hydrate a whole record; the hook API reads the small row.
 use super::provider_log::*;
-use crate::{McTagRow, ProviderSessionKey};
+use crate::provider_view_recipe::{prune_tx, save_recipe_tx, view_roots_tx};
+use crate::{McTagRow, ProviderSessionKey, ProviderViewRecipe};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
@@ -33,37 +34,18 @@ fn restore_pointer(value: &mut Value, path: &str, restored: Value) {
         object.insert(field.into(), restored);
     }
 }
-pub(crate) fn view_tx(
-    conn: &Connection,
-    conv: &str,
-    view: &Value,
-    state: &str,
-) -> rusqlite::Result<()> {
-    if view.is_null() {
-        return Ok(());
-    }
-    conn.execute("INSERT INTO mc_provider_views_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,json_extract(?1,'$[1]')) ON CONFLICT(conv_key,version) DO UPDATE SET state=excluded.state,view_json=excluded.view_json,lineage_id=excluded.lineage_id,range_from=excluded.range_from,range_to=excluded.range_to,replacement_json=excluded.replacement_json",
-        params![conv,view["version"].as_i64(),view["range"]["lineage_id"].as_str(),view["range"]["from"].as_i64(),view["range"]["to"].as_i64(),view["replacement"].to_string(),state,view.to_string()])?;
-    Ok(())
-}
+/// Save a runner record. Its produced, applied and waiting views must be
+/// version references; `views` carries the recipe of every referenced version
+/// that is not stored yet, inserted in this same transaction.
 pub(crate) fn save_tx(
     conn: &Connection,
     key: &ProviderSessionKey,
     raw: &str,
     namespace: &str,
     tags: &[McTagRow],
+    views: &[ProviderViewRecipe],
 ) -> rusqlite::Result<()> {
-    save_inner(conn, key, raw, namespace, tags, false)
-}
-
-pub(crate) fn save_delta_tx(
-    conn: &Connection,
-    key: &ProviderSessionKey,
-    raw: &str,
-    namespace: &str,
-    tags: &[McTagRow],
-) -> rusqlite::Result<()> {
-    save_inner(conn, key, raw, namespace, tags, true)
+    save_inner(conn, key, raw, namespace, tags, views)
 }
 
 pub(crate) fn hook_answer_tx(
@@ -83,7 +65,7 @@ fn save_inner(
     raw: &str,
     namespace: &str,
     tags: &[McTagRow],
-    references: bool,
+    views: &[ProviderViewRecipe],
 ) -> rusqlite::Result<()> {
     let original = parse(raw)?;
     let mut small = original.clone();
@@ -194,25 +176,52 @@ fn save_inner(
             )?;
         }
     }
+    let conv_views = |error: ProviderError| sql_error(std::io::Error::other(error.to_string()));
+    for recipe in views {
+        let held: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2)",
+            params![conv, recipe.version],
+            |row| row.get(0),
+        )?;
+        // Recipes are immutable; a version already stored is the same view.
+        if !held {
+            save_recipe_tx(conn, &conv, recipe).map_err(conv_views)?;
+        }
+    }
+    let mut referenced = !views.is_empty();
     for (path, state) in [
         ("/setup/state/last_produced", "produced"),
         ("/setup/state/last_applied", "applied"),
         ("/wait_view", "produced"),
     ] {
-        if let Some(view) = original.pointer(path) {
-            if references && view.get("replacement").is_none() && !view.is_null() {
-                let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2)", params![conv, view["version"].as_u64()], |row| row.get(0))?;
-                if !exists {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
-                conn.execute(
-                    "UPDATE mc_provider_views_v1 SET state=?3 WHERE conv_key=?1 AND version=?2",
-                    params![conv, view["version"].as_u64(), state],
-                )?;
-                continue;
+        if let Some(view) = original.pointer(path).filter(|view| !view.is_null()) {
+            referenced = true;
+            // Whole view bodies have no table any more; only a recipe is stored.
+            if view.get("replacement").is_some() {
+                return Err(sql_error(std::io::Error::other(
+                    "runner record carries a whole view body instead of a recipe reference",
+                )));
             }
-            view_tx(conn, &conv, view, state)?;
+            let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2)", params![conv, view["version"].as_u64()], |row| row.get(0))?;
+            if !exists {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            conn.execute(
+                "UPDATE mc_provider_views_v2 SET state=?3 WHERE conv_key=?1 AND version=?2",
+                params![conv, view["version"].as_u64(), state],
+            )?;
         }
+    }
+    // The record's references were just written; prune against them in the
+    // same transaction so no other writer can change the roots in between.
+    // A record that names no view leaves stored recipes for a later save.
+    let roots = if referenced {
+        view_roots_tx(conn, &conv).map_err(conv_views)?
+    } else {
+        Default::default()
+    };
+    if !roots.is_empty() {
+        prune_tx(conn, &conv, &roots).map_err(conv_views)?;
     }
     insert_tags_tx(conn, namespace, tags)
 }
@@ -234,8 +243,11 @@ pub(crate) fn load_tx(
     };
     if has("messages") {
         let mut messages = json!({});
-        let mut lineages =
-            conn.prepare("SELECT lineage_id FROM mc_provider_lineages_v1 WHERE conv_key=?1")?;
+        // The view-recipe writer anchors a Setup policy cut on the empty lineage
+        // ID, which host ingest cannot name. It is not part of the transcript.
+        let mut lineages = conn.prepare(
+            "SELECT lineage_id FROM mc_provider_lineages_v1 l WHERE conv_key=?1 AND (lineage_id<>'' OR EXISTS(SELECT 1 FROM mc_provider_messages_v1 m WHERE m.conv_key=l.conv_key AND m.lineage_id=''))",
+        )?;
         for lineage in lineages.query_map([&conv], |r| r.get::<_, String>(0))? {
             messages[lineage?] = json!({});
         }
@@ -291,6 +303,9 @@ pub(crate) fn load_tx(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         record["pending_drops"] = json!(rows);
     }
+    // The store cannot decode native sources, so a stored view comes back as a
+    // `{"version":N}` reference that the module resolves from its recipe. A
+    // version without a stored recipe reads as absent, as it always has.
     for (field, path, version) in [
         (
             "last_produced",
@@ -306,15 +321,16 @@ pub(crate) fn load_tx(
     ] {
         if has(field) {
             let view = if let Some(version) = shape[version].as_i64() {
-                conn.query_row(
-                    "SELECT view_json FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2",
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2)",
                     params![conv, version],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?
-                .map(|s| parse(&s))
-                .transpose()?
-                .unwrap_or(Value::Null)
+                    |r| r.get(0),
+                )?;
+                if exists {
+                    json!({ "version": version })
+                } else {
+                    Value::Null
+                }
             } else {
                 Value::Null
             };

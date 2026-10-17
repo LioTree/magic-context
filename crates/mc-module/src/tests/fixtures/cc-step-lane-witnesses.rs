@@ -393,13 +393,12 @@ async fn provider_committed_replacement_keeps_noncanonical_unsigned_tail() {
             answer["answer"], "compaction_message",
             "seed {seed}: {answer}"
         );
-        let committed = store
-            .load_provider_view(
-                &key.store_key(),
-                answer["compaction"]["version"].as_u64().unwrap(),
-            )
-            .unwrap()
-            .unwrap();
+        let committed = crate::providers::view_recipe::stored_view(
+            &store,
+            &key.store_key(),
+            answer["compaction"]["version"].as_u64().unwrap(),
+        )
+        .unwrap();
         let frozen: Value = serde_json::from_str(&committed.replacement_json).unwrap();
         assert!(frozen["raw_replacement"]
             .as_array()

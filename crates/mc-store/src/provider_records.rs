@@ -105,13 +105,14 @@ impl McStore {
         record_json: &str,
         engine_session: &str,
         tags: &[McTagRow],
+        views: &[crate::ProviderViewRecipe],
         expected: &(u64, Option<u64>),
     ) -> Result<(), McStoreError> {
         self.inner.with_conn_fenced(|tx| {
             if &runner_token(tx, key)? != expected {
                 return Err(rusqlite::Error::InvalidQuery);
             }
-            crate::provider_legacy::save_delta_tx(tx, key, record_json, engine_session, tags)?;
+            crate::provider_legacy::save_tx(tx, key, record_json, engine_session, tags, views)?;
             Ok(())
         })?;
         Ok(())
@@ -146,15 +147,18 @@ impl McStore {
 
     /// Commit the answer/high-water record and newly live tags as one fenced write.
     /// Allocated but unobserved tags belong only in the opaque record, not mc_tags.
+    /// The record names its views by version; `views` holds recipes for
+    /// referenced versions not yet stored, committed in the same transaction.
     pub fn save_provider_record(
         &self,
         key: &ProviderSessionKey,
         record_json: &str,
         engine_session: &str,
         tags: &[McTagRow],
+        views: &[crate::ProviderViewRecipe],
     ) -> Result<(), McStoreError> {
         self.inner.with_conn_fenced(|tx| {
-            provider_legacy::save_tx(tx, key, record_json, engine_session, tags)
+            provider_legacy::save_tx(tx, key, record_json, engine_session, tags, views)
         })?;
         Ok(())
     }
@@ -260,12 +264,12 @@ mod tests {
         let key = key("/project", "runner", "broca");
         assert_eq!(store.provider_record_token(&key).unwrap().1, None);
         let raw = r#"{"hook":{"answers":[],"live":{},"burned":[]},"last_answer":null}"#;
-        store.save_provider_record(&key, raw, "engine", &[]).unwrap();
+        store.save_provider_record(&key, raw, "engine", &[], &[]).unwrap();
         let initial = store.provider_record_token(&key).unwrap();
         store.save_provider_catalog("/project", "runner", r#"{"tools":[]}"#).unwrap();
         let catalog = store.provider_record_token(&key).unwrap();
         assert_ne!(initial, catalog);
-        assert!(store.save_provider_record_delta(&key, raw, "engine", &[], &initial).is_err());
+        assert!(store.save_provider_record_delta(&key, raw, "engine", &[], &[], &initial).is_err());
         // Rolling back metadata changes also rolls back the runner token revision.
         let rollback: Result<(), _> = store.inner.with_conn_fenced(|tx| {
             tx.execute("UPDATE mc_provider_conversations_v2 SET record_json='{}' WHERE conv_key=?1", [key.conversation_key()])?;
@@ -281,7 +285,7 @@ mod tests {
             Ok(())
         }).unwrap();
         assert_eq!(store.provider_record_token(&key).unwrap().1, None);
-        store.save_provider_record(&key, raw, "engine", &[]).unwrap();
+        store.save_provider_record(&key, raw, "engine", &[], &[]).unwrap();
         assert_ne!(initial, store.provider_record_token(&key).unwrap());
     }
 
@@ -292,7 +296,7 @@ mod tests {
         let key = key("/project", "runner", "broca");
         let raw = serde_json::json!({"hook":{"high_water":9,"answers":[],"live":{},"burned":[]},
             "messages":{},"last_answer":{"large_view":"x".repeat(1_000_000)}});
-        store.save_provider_record(&key, &raw.to_string(), "engine", &[]).unwrap();
+        store.save_provider_record(&key, &raw.to_string(), "engine", &[], &[]).unwrap();
         let token = store.provider_record_token(&key).unwrap();
         let answer = serde_json::json!({"subject":"subject","lineage":"L","answer":{"answer":"pass"},
             "rendered":["assistant text"],"tags":[],"cadence":false,"observed":false,"tool_call_id":null});
@@ -373,7 +377,7 @@ mod tests {
         let record = r#"{"setup":{"compaction_id":"comp","allocated_version":17},"hook":{"high_water":23},"pending_drops":[23],"last_answer":{"request_id":"r"}}"#;
         let catalog = r#"{"compacting":true,"tools":["ctx_reduce"]}"#;
         store
-            .save_provider_record(&key, record, "engine", &[tag(23, "m2#0")])
+            .save_provider_record(&key, record, "engine", &[tag(23, "m2#0")], &[])
             .unwrap();
         store
             .save_provider_catalog(&key.project_root, &key.session, catalog)
@@ -462,7 +466,8 @@ mod tests {
                 &key,
                 r#"{"allocated_version":17,"tag_high_water":23}"#,
                 "engine",
-                &[tag(23, "m2#0")]
+                &[tag(23, "m2#0")],
+                &[]
             )
             .is_err());
         assert!(store.load_provider_record(&key).unwrap().is_none());
@@ -477,6 +482,7 @@ mod tests {
                 r#"{"allocated_version":17,"tag_high_water":23}"#,
                 "engine",
                 &[tag(23, "m2#0")],
+                &[],
             )
             .unwrap();
         assert!(store.load_provider_record(&key).unwrap().is_some());
@@ -490,7 +496,7 @@ mod tests {
         let key = key("/project", "session", "broca");
         let before = r#"{"catalog":null,"allocated_version":17}"#;
         store
-            .save_provider_record(&key, before, "engine", &[])
+            .save_provider_record(&key, before, "engine", &[], &[])
             .unwrap();
         assert!(store
             .save_provider_catalog("/project", "session", "not JSON")
@@ -557,7 +563,14 @@ mod generation_migration_tests {
             Ok(())
         }).unwrap();
         drop(inner);
-        let store = McStore::open_for_test(&descriptor).unwrap();
+        // Stop at 72: migration 73 resets development conversations that own a
+        // retired mc_provider_views_v1 row, which this fixture deliberately has.
+        let through_72 = MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= 72)
+            .cloned()
+            .collect::<Vec<_>>();
+        let store = McStore::open_with_migrations(&descriptor, false, &through_72).unwrap();
         assert_eq!(store.module_store_schema_version().unwrap(), 72);
         let conversation = store.load_provider_conversation(&legacy).unwrap().unwrap();
         assert_eq!(conversation.engine_namespace, "legacy-engine");
@@ -566,22 +579,29 @@ mod generation_migration_tests {
             store.load_provider_messages(&legacy, "L").unwrap()[0].message_bytes,
             raw
         );
-        assert_eq!(
-            store
-                .load_provider_view(&legacy, 1)
-                .unwrap()
-                .unwrap()
-                .replacement_json,
-            " [ ] "
-        );
+        store
+            .inner
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT replacement_json FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=1",
+                        [&key],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    " [ ] "
+                );
+                Ok(())
+            })
+            .unwrap();
         store.inner.with_conn(|conn| {
+            // Schema-inventory validation runs at the current head in the
+            // migration train; this database deliberately stays at 72.
             assert_eq!(conn.query_row("SELECT summary_json FROM mc_provider_policy_summaries_v1 WHERE conv_key=?1",[&key],|r|r.get::<_,String>(0))?,"{\"kept\":true}");
-            crate::move_inventory::validate_schema(conn,crate::move_inventory::Store::Module).unwrap();
             assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('mc_provider_native_contract_immutable','mc_provider_consumed_tags_change','mc_provider_conversations_policy_namespace_change')",[],|r|r.get::<_,u64>(0))?,3);
             Ok(())
         }).unwrap();
         drop(store);
-        let reopened = McStore::open_for_test(&descriptor).unwrap();
+        let reopened = McStore::open_with_migrations(&descriptor, false, &through_72).unwrap();
         assert_eq!(
             reopened.load_provider_messages(&legacy, "L").unwrap()[0].message_bytes,
             raw

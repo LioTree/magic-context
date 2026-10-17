@@ -534,7 +534,7 @@ async fn tags_become_live_on_second_page_and_drops_survive_restart() {
             .dispatch_value(8, json!({"name":"ctx_reduce","arguments":{"drop":"1"}}))
             .await,
     );
-    assert_eq!(accepted["isError"], false);
+    assert_eq!(accepted["isError"], false, "{accepted}");
     assert_eq!(
         runner
             .calls

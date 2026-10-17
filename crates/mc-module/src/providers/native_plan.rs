@@ -298,15 +298,25 @@ mod tests {
                 expected
             );
             store
-                .save_provider_view(
+                .save_provider_view_recipe(
                     &key.store_key(),
-                    &mc_store::provider_records::ProviderView {
+                    &mc_store::ProviderViewRecipe {
                         version: 77,
                         lineage_id: "L".into(),
                         range_from: 0,
                         range_to: 1,
-                        replacement_json: json!({"generation":expected}).to_string(),
-                        state: "produced".into(),
+                        base_version: None,
+                        policy_cut_id: None,
+                        metadata: json!({"generation":expected}),
+                        segments: vec![],
+                        synthetic: Default::default(),
+                        treatments: vec![],
+                        serializer_profile: "claude-code-anthropic".into(),
+                        render_key: "fixture".into(),
+                        tokenizer_key: "fixture".into(),
+                        // Applied: a later Setup prunes unreferenced recipes, and
+                        // the two newest applied views stay retained.
+                        state: "applied".into(),
                     },
                 )
                 .unwrap();
@@ -324,25 +334,21 @@ mod tests {
         );
         let store = restarted.store.get().unwrap();
         assert_eq!(
-            serde_json::from_str::<Value>(
-                &store
-                    .load_provider_view(&k1.store_key(), 77)
-                    .unwrap()
-                    .unwrap()
-                    .replacement_json
-            )
-            .unwrap()["generation"],
+            store
+                .resolve_provider_view(&k1.store_key(), 77)
+                .unwrap()
+                .unwrap()
+                .recipe
+                .metadata["generation"],
             "a"
         );
         assert_eq!(
-            serde_json::from_str::<Value>(
-                &store
-                    .load_provider_view(&k2.store_key(), 77)
-                    .unwrap()
-                    .unwrap()
-                    .replacement_json
-            )
-            .unwrap()["generation"],
+            store
+                .resolve_provider_view(&k2.store_key(), 77)
+                .unwrap()
+                .unwrap()
+                .recipe
+                .metadata["generation"],
             "b"
         );
         assert!(store
