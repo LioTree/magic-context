@@ -85,6 +85,7 @@ pub(crate) struct Lease<'a> {
     key: (u64, String),
     pub cold: bool,
     pub state: ResidentPolicy,
+    previous_charge: Option<usize>,
 }
 
 impl ResidentHooks {
@@ -224,6 +225,7 @@ impl ResidentHooks {
             key,
             cold,
             state,
+            previous_charge: (!cold).then_some(existing),
         }))
     }
 
@@ -287,6 +289,20 @@ impl Lease<'_> {
     pub(crate) fn publish(self) {
         let bytes =
             self.state.retained_bytes() + self.key.1.capacity() + std::mem::size_of::<Entry>();
+        self.publish_charged(bytes);
+    }
+
+    /// Only an append-only assistant hook may reuse this charge: its policy,
+    /// transcript, views and indexes are unchanged since the ready lease.
+    pub(crate) fn publish_assistant_growth(self, added_bytes: usize) {
+        if let Some(previous) = self.previous_charge {
+            self.publish_charged(previous.saturating_add(added_bytes));
+        } else {
+            self.publish();
+        }
+    }
+
+    fn publish_charged(self, bytes: usize) {
         let mut entries = self.owner.entries.lock().expect("resident lock");
         if bytes <= SESSION_CAP {
             let reservation = match entries.get(&self.key) {
@@ -435,6 +451,28 @@ mod tests {
         assert_eq!(charged(&resident), bytes + GROWTH_ALLOWANCE);
         assert!(charged(&resident) <= bytes + 16 * 1024 * 1024);
         drop(lease);
+        assert_eq!(charged(&resident), 0);
+    }
+
+    #[test]
+    fn assistant_growth_reuses_ready_charge_and_still_enforces_session_cap() {
+        let resident = ResidentHooks::enabled(true);
+        resident.begin(1, &key("hook")).unwrap().unwrap().publish();
+        let previous = charged(&resident);
+        let mut lease = resident.begin(1, &key("hook")).unwrap().unwrap();
+        let extra = String::with_capacity(4096);
+        let growth = extra.capacity();
+        lease.state.fold_lineage = Some(extra);
+        let expected = retained(&lease);
+        lease.publish_assistant_growth(growth);
+        assert_eq!(charged(&resident), previous + growth);
+        assert_eq!(charged(&resident), expected);
+        resident
+            .begin(1, &key("hook"))
+            .unwrap()
+            .unwrap()
+            .publish_assistant_growth(SESSION_CAP);
+        assert!(!ready(&resident, "hook"));
         assert_eq!(charged(&resident), 0);
     }
 

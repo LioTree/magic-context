@@ -33,6 +33,42 @@ pub(crate) fn register_migration_functions(conn: &rusqlite::Connection) -> rusql
 use crate::{McStore, McStoreError, McTagRow};
 use rusqlite::{params, OptionalExtension};
 
+// The connection-local revision catches our own writes; data_version catches
+// other connections. Triggers cover every metadata writer without copying the
+// compatibility JSON (which contains the last, potentially large, served view).
+fn runner_token(
+    conn: &rusqlite::Connection,
+    key: &ProviderSessionKey,
+) -> rusqlite::Result<(u64, Option<u64>)> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS mc_runner_record_revisions (
+            conv_key TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+         CREATE TEMP TRIGGER IF NOT EXISTS mc_runner_record_insert
+         AFTER INSERT ON main.mc_provider_conversations_v2 BEGIN
+            INSERT INTO mc_runner_record_revisions VALUES (NEW.conv_key,1)
+            ON CONFLICT(conv_key) DO UPDATE SET revision=revision+1;
+         END;
+         CREATE TEMP TRIGGER IF NOT EXISTS mc_runner_record_update
+         AFTER UPDATE OF record_json ON main.mc_provider_conversations_v2 BEGIN
+            INSERT INTO mc_runner_record_revisions VALUES (NEW.conv_key,1)
+            ON CONFLICT(conv_key) DO UPDATE SET revision=revision+1;
+         END;
+         CREATE TEMP TRIGGER IF NOT EXISTS mc_runner_record_delete
+         AFTER DELETE ON main.mc_provider_conversations_v2 BEGIN
+            INSERT INTO mc_runner_record_revisions VALUES (OLD.conv_key,1)
+            ON CONFLICT(conv_key) DO UPDATE SET revision=revision+1;
+         END;",
+    )?;
+    let version = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+    let revision = conn.query_row(
+        "SELECT COALESCE(r.revision,0) FROM mc_provider_conversations_v2 c
+         LEFT JOIN temp.mc_runner_record_revisions r ON r.conv_key=c.conv_key
+         WHERE c.conv_key=?1",
+        [key.conversation_key()], |row| row.get(0),
+    ).optional()?;
+    Ok((version, revision))
+}
+
 /// The route-bound project and the runner's session/caller-harness coordinates.
 #[derive(Clone, Debug)]
 pub struct ProviderSessionKey {
@@ -51,23 +87,13 @@ pub struct ProviderGeneration {
 
 impl McStore {
     /// Detect changes to a cached runner record using SQLite's external-write
-    /// counter and the record's metadata. Compaction's policy counters are not
+    /// counter and a connection-local metadata revision. Compaction's policy counters are not
     /// included: a fold updates them without changing the runner's transcript.
     pub fn provider_record_token(
         &self,
         key: &ProviderSessionKey,
-    ) -> Result<(u64, Option<String>), McStoreError> {
-        Ok(self.inner.with_conn(|conn| {
-            let version = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
-            let record = conn
-                .query_row(
-                    "SELECT record_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
-                    [key.conversation_key()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            Ok((version, record))
-        })?)
+    ) -> Result<(u64, Option<u64>), McStoreError> {
+        Ok(self.inner.with_conn(|conn| runner_token(conn, key))?)
     }
 
     /// Append transcript rows while replacing runner metadata. The caller holds
@@ -79,22 +105,32 @@ impl McStore {
         record_json: &str,
         engine_session: &str,
         tags: &[McTagRow],
-        expected: &(u64, Option<String>),
+        expected: &(u64, Option<u64>),
     ) -> Result<(), McStoreError> {
         self.inner.with_conn_fenced(|tx| {
-            let version: u64 = tx.query_row("PRAGMA data_version", [], |row| row.get(0))?;
-            let record: Option<String> = tx
-                .query_row(
-                    "SELECT record_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
-                    [key.conversation_key()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if &(version, record) != expected {
+            if &runner_token(tx, key)? != expected {
                 return Err(rusqlite::Error::InvalidQuery);
             }
             crate::provider_legacy::save_delta_tx(tx, key, record_json, engine_session, tags)?;
             Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// An assistant hook only appends an answer: it cannot allocate or burn tags,
+    /// change cadence counters, or replace a compaction view.
+    pub fn append_provider_runner_answer(
+        &self,
+        key: &ProviderSessionKey,
+        index: usize,
+        answer: &serde_json::Value,
+        expected: &(u64, Option<u64>),
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            if &runner_token(tx, key)? != expected {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            provider_legacy::hook_answer_tx(tx, &key.conversation_key(), index, answer)
         })?;
         Ok(())
     }
@@ -215,6 +251,61 @@ mod tests {
             created_at_ms: 10,
             source_bytes: b"payload".as_slice().into(),
         }
+    }
+
+    #[test]
+    fn runner_revision_fences_metadata_catalog_external_writes_and_recreation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let key = key("/project", "runner", "broca");
+        assert_eq!(store.provider_record_token(&key).unwrap().1, None);
+        let raw = r#"{"hook":{"answers":[],"live":{},"burned":[]},"last_answer":null}"#;
+        store.save_provider_record(&key, raw, "engine", &[]).unwrap();
+        let initial = store.provider_record_token(&key).unwrap();
+        store.save_provider_catalog("/project", "runner", r#"{"tools":[]}"#).unwrap();
+        let catalog = store.provider_record_token(&key).unwrap();
+        assert_ne!(initial, catalog);
+        assert!(store.save_provider_record_delta(&key, raw, "engine", &[], &initial).is_err());
+        // Rolling back metadata changes also rolls back the runner token revision.
+        let rollback: Result<(), _> = store.inner.with_conn_fenced(|tx| {
+            tx.execute("UPDATE mc_provider_conversations_v2 SET record_json='{}' WHERE conv_key=?1", [key.conversation_key()])?;
+            Err(rusqlite::Error::InvalidQuery)
+        });
+        assert!(rollback.is_err());
+        assert_eq!(catalog, store.provider_record_token(&key).unwrap());
+        let external = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+        external.execute("UPDATE mc_provider_conversations_v2 SET record_json='{}' WHERE conv_key=?1", [key.conversation_key()]).unwrap();
+        assert_ne!(catalog, store.provider_record_token(&key).unwrap());
+        store.inner.with_conn(|conn| {
+            conn.execute("DELETE FROM mc_provider_conversations_v2 WHERE conv_key=?1", [key.conversation_key()])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(store.provider_record_token(&key).unwrap().1, None);
+        store.save_provider_record(&key, raw, "engine", &[]).unwrap();
+        assert_ne!(initial, store.provider_record_token(&key).unwrap());
+    }
+
+    #[test]
+    fn runner_answer_append_preserves_record_views_and_reopens_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let key = key("/project", "runner", "broca");
+        let raw = serde_json::json!({"hook":{"high_water":9,"answers":[],"live":{},"burned":[]},
+            "messages":{},"last_answer":{"large_view":"x".repeat(1_000_000)}});
+        store.save_provider_record(&key, &raw.to_string(), "engine", &[]).unwrap();
+        let token = store.provider_record_token(&key).unwrap();
+        let answer = serde_json::json!({"subject":"subject","lineage":"L","answer":{"answer":"pass"},
+            "rendered":["assistant text"],"tags":[],"cadence":false,"observed":false,"tool_call_id":null});
+        store.append_provider_runner_answer(&key, 0, &answer, &token).unwrap();
+        assert_eq!(token, store.provider_record_token(&key).unwrap());
+        let mut expected = raw;
+        expected["hook"]["answers"] = serde_json::json!([answer]);
+        let loaded: serde_json::Value = serde_json::from_str(&store.load_provider_record(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(loaded, expected);
+        drop(store);
+        let reopened = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let loaded: serde_json::Value = serde_json::from_str(&reopened.load_provider_record(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(loaded, expected);
     }
 
     #[test]

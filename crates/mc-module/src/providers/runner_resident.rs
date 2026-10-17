@@ -17,7 +17,7 @@ fn decode_entry(
 
 pub(super) struct RunnerState {
     record: Record,
-    token: (u64, Option<String>),
+    token: (u64, Option<u64>),
     frontiers: BTreeMap<String, u64>,
     lineage: String,
     decoded: BTreeMap<u64, ck_wire::CkIngressMessage>,
@@ -29,6 +29,7 @@ pub(super) struct RunnerState {
     originals: HashMap<String, Vec<u64>>,
     originals_lineage: String,
     originals_through: Option<u64>,
+    originals_bytes: usize,
 }
 
 impl RunnerState {
@@ -40,7 +41,6 @@ impl RunnerState {
             + self.metadata_bytes
             + self.decoded_bytes
             + self.view_bytes
-            + self.token.1.as_ref().map_or(0, String::capacity)
             + self.lineage.capacity()
             + self
                 .frontiers
@@ -50,17 +50,15 @@ impl RunnerState {
             + self.saved_views.len() * 32
             + crate::retained_size::hash_map_allocation_bytes(&self.originals)
             + self.originals_lineage.capacity()
-            + self
-                .originals
-                .iter()
-                .map(|(hash, ordinals)| hash.capacity() + ordinals.capacity() * 8)
-                .sum::<usize>()
+            + self.originals_bytes
     }
 }
 
 pub(super) struct RunnerRecord<'a> {
     lease: Option<super::resident_hooks::Lease<'a>>,
     state: Box<RunnerState>,
+    reused: bool,
+    assistant_growth: Option<usize>,
 }
 
 impl Deref for RunnerRecord<'_> {
@@ -102,6 +100,7 @@ impl<'a> RunnerRecord<'a> {
             .as_mut()
             .and_then(|lease| lease.state.runner.take())
             .filter(|state| state.token == token);
+        let reused = saved.is_some();
         let state = if let Some(saved) = saved {
             saved
         } else {
@@ -214,9 +213,15 @@ impl<'a> RunnerRecord<'a> {
                 originals: HashMap::new(),
                 originals_lineage: String::new(),
                 originals_through: None,
+                originals_bytes: 0,
             })
         };
-        Ok(RunnerRecord { lease, state })
+        Ok(RunnerRecord {
+            lease,
+            state,
+            reused,
+            assistant_growth: None,
+        })
     }
 }
 
@@ -232,6 +237,7 @@ impl RunnerRecord<'_> {
         let lineage = &view.range.lineage_id;
         if &self.state.originals_lineage != lineage {
             self.state.originals.clear();
+            self.state.originals_bytes = 0;
             self.state.originals_through = None;
             self.state.originals_lineage.clone_from(lineage);
         }
@@ -243,7 +249,13 @@ impl RunnerRecord<'_> {
                     .map_or(0, |through| through.saturating_add(1))..,
             ) {
                 let hash = sha256_hex(&serde_jcs::to_vec(&entry.message).map_err(transient)?);
-                self.state.originals.entry(hash).or_default().push(*ordinal);
+                let ordinals = self.state.originals.entry(hash.clone()).or_insert_with(|| {
+                    self.state.originals_bytes += hash.capacity();
+                    Vec::new()
+                });
+                let before = ordinals.capacity();
+                ordinals.push(*ordinal);
+                self.state.originals_bytes += (ordinals.capacity() - before) * 8;
                 self.state.originals_through = Some(*ordinal);
             }
         }
@@ -268,6 +280,8 @@ impl RunnerRecord<'_> {
     }
 
     pub fn save(&mut self, storage: &records::Storage, key: &Key) -> Result<(), HandlerOutcome> {
+        self.reused = false;
+        self.assistant_growth = None;
         if self.lease.is_none() {
             return storage.save(key, &self.state.record);
         }
@@ -362,6 +376,37 @@ impl RunnerRecord<'_> {
             })
             .collect();
         self.state.token = storage.token(key)?;
+        Ok(())
+    }
+
+    pub fn save_assistant_answer(
+        &mut self,
+        store: &McStore,
+        storage: &records::Storage,
+        key: &Key,
+    ) -> Result<(), HandlerOutcome> {
+        // A freshly loaded runner has no byte estimate for old hook answers or
+        // the last served answer. Count those allocations toward resident caps
+        // with a full save before adding only the new answer's byte growth.
+        if self.lease.is_none() || !self.reused {
+            return self.save(storage, key);
+        }
+        let answers = &self.state.record.hook.as_ref().expect("hook state").answers;
+        let answer =
+            serde_json::to_value(answers.last().expect("new hook answer")).map_err(transient)?;
+        store
+            .append_provider_runner_answer(
+                &key.store_key(),
+                answers.len() - 1,
+                &answer,
+                &self.state.token,
+            )
+            .map_err(transient)?;
+        // The transcript, views and existing answers stay owned by the lease.
+        // Only this newly retained answer adds to the resident byte charge.
+        let growth = serde_json::to_vec(&answer).map_err(transient)?.len() * 4;
+        self.state.metadata_bytes += growth;
+        self.assistant_growth = Some(growth);
         Ok(())
     }
 
@@ -655,7 +700,67 @@ impl RunnerRecord<'_> {
     pub fn publish(mut self) {
         if let Some(mut lease) = self.lease.take() {
             lease.state.runner = Some(self.state);
-            lease.publish();
+            if let Some(growth) = self.assistant_growth {
+                lease.publish_assistant_growth(growth);
+            } else {
+                lease.publish();
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+
+    #[test]
+    fn cold_assistant_append_charges_existing_metadata_before_reusing_growth() {
+        let root = std::env::temp_dir().join("magic-context/broca-hook");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let store = Arc::new(McStore::open_for_test(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        }).unwrap());
+        let slot = Arc::new(OnceLock::new());
+        assert!(slot.set(store.clone()).is_ok());
+        let storage = records::Storage::new(slot);
+        let resident = super::super::resident_hooks::ResidentHooks::enabled(true);
+        let key = Key {
+            project: dir.path().join("project"),
+            session: "cold".into(),
+            harness: "broca".into(),
+            generation: None,
+        };
+        let payload = "x".repeat(1024 * 1024);
+        let initial = Record {
+            hook: Some(HookState::default()),
+            last_answer: Some(json!({"large_view":payload})),
+            ..Default::default()
+        };
+        storage.save(&key, &initial).unwrap();
+        let mut record = RunnerRecord::load(&storage, &resident, &store, &key).unwrap();
+        assert!(!record.reused);
+        record.hook.as_mut().unwrap().answers.push(HookRecord {
+            subject: "assistant".into(),
+            lineage: Some("L".into()),
+            answer: hooks::answer::HookAnswer::Pass,
+            rendered: vec!["answer".into()],
+            tags: vec![],
+            cadence: false,
+            observed: false,
+            tool_call_id: None,
+        });
+        record.save_assistant_answer(&store, &storage, &key).unwrap();
+        assert!(record.state.metadata_bytes >= payload.len() * 4);
+        assert!(record.assistant_growth.is_none());
+        record.publish();
+        assert!(resident.stats()["charged_bytes"].as_u64().unwrap() >= (payload.len() * 4) as u64);
+        assert_eq!(storage.load(&key).unwrap().hook.unwrap().answers.len(), 1);
     }
 }

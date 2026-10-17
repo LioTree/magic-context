@@ -667,7 +667,12 @@ export function buildDriver(directory: string): string {
     const lib = readFileSync(join(original, "src/lib.rs"), "utf8");
     assert.equal(lib.split("mod tests {").length, 2, "unique Rust test-module insertion seam");
     const driverPath = join(generated, "src/provider_pipeline_driver.rs");
-    writeCurrent(driverPath, DRIVER);
+    let driver = DRIVER;
+    if (process.env.MC_BROCA_HOOK_PROFILE) {
+        driver = driver.replace("let started = std::time::Instant::now();\n                        let mut result = transports", "let allocation_started = crate::native_fold_profile::allocated_bytes();\n                        let started = std::time::Instant::now();\n                        let mut result = transports")
+            .replace('let mut result = transports[usize::from(rig.resident_enabled)].call(&format!("{name}-{channel}"), request).await;', 'let mut result = transports[usize::from(rig.resident_enabled)].call(&format!("{name}-{channel}"), request).await;\n                        result["allocation_bytes"] = json!(crate::native_fold_profile::allocated_bytes() - allocation_started);');
+    }
+    writeCurrent(driverPath, driver);
     writeCurrent(
         join(generated, "src/lib.rs"),
         instrumentNativeFold(ROOT, generated,
