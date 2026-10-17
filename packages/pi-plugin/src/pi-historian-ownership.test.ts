@@ -131,28 +131,31 @@ describe("historian resolving ownership", () => {
 						stageKey = key;
 						return {
 							text: JSON.stringify({
-								decisions: [
-									{
-										fact_id: 1,
-										action: "edit",
-										target_id: memory.id,
-										revision: 1,
-										removed: [],
-										replaced: [
-											{
-												memory_id: memory.id,
-												clause: 1,
-												block: 1,
-												excerpt: "New rule.",
-											},
-										],
-										kept: [{ memory_id: memory.id, clause: 2 }],
-										added: [
-											{ text: "New rule. ", block: 1, excerpt: "New rule." },
-										],
-										final_text: "New rule. Keep rule.",
-									},
-								],
+								result: {
+									step: "turn_two",
+									decisions: [
+										{
+											fact_id: 1,
+											action: "edit",
+											target_id: memory.id,
+											revision: 1,
+											removed: [],
+											replaced: [
+												{
+													memory_id: memory.id,
+													clause: 1,
+													block: 1,
+													excerpt: "New rule.",
+												},
+											],
+											kept: [{ memory_id: memory.id, clause: 2 }],
+											added: [
+												{ text: "New rule. ", block: 1, excerpt: "New rule." },
+											],
+											final_text: "New rule. Keep rule.",
+										},
+									],
+								},
 							}),
 							lengthCapped: false,
 							profile,
@@ -314,26 +317,29 @@ describe("Pi UUID stage lease", () => {
 				durationMs: 1,
 				meta: { reportedProvider: "test", reportedModel: "model" },
 				assistantText: JSON.stringify({
-					decisions: [
-						{
-							fact_id: 1,
-							action: "edit",
-							target_id: memory.id,
-							revision: 1,
-							removed: [],
-							replaced: [
-								{
-									memory_id: memory.id,
-									clause: 1,
-									block: 1,
-									excerpt: "New rule.",
-								},
-							],
-							kept: [{ memory_id: memory.id, clause: 2 }],
-							added: [{ text: "New rule. ", block: 1, excerpt: "New rule." }],
-							final_text: "New rule. Keep rule.",
-						},
-					],
+					result: {
+						step: "turn_two",
+						decisions: [
+							{
+								fact_id: 1,
+								action: "edit",
+								target_id: memory.id,
+								revision: 1,
+								removed: [],
+								replaced: [
+									{
+										memory_id: memory.id,
+										clause: 1,
+										block: 1,
+										excerpt: "New rule.",
+									},
+								],
+								kept: [{ memory_id: memory.id, clause: 2 }],
+								added: [{ text: "New rule. ", block: 1, excerpt: "New rule." }],
+								final_text: "New rule. Keep rule.",
+							},
+						],
+					},
 				}),
 			}),
 		};

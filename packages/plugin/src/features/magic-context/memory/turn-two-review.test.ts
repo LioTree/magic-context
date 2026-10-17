@@ -154,7 +154,9 @@ function passingVerdicts(request: CheckRequest): CheckReply {
 
 function reply(decisions: unknown[], scores?: unknown[]): TurnTwoStageReply {
     return {
-        text: JSON.stringify({ decisions, ...(scores ? { scores } : {}) }),
+        text: JSON.stringify({
+            result: { step: "turn_two", decisions, ...(scores ? { scores } : {}) },
+        }),
         lengthCapped: false,
         profile: PROFILE,
     };
@@ -656,7 +658,7 @@ const carrier = {
     baseline: "turn-one-hash",
     async send() {
         kill("send");
-        return { text: JSON.stringify({ decisions: [input.decision] }), lengthCapped: false, profile: input.profile };
+        return { text: JSON.stringify({ result: { step: "turn_two", decisions: [input.decision] } }), lengthCapped: false, profile: input.profile };
     },
     async check(request) {
         kill("check");

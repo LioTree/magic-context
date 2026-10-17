@@ -2,6 +2,7 @@ import {
     createDreamTokenBudget,
     DreamTokenBudgetExceeded,
 } from "../features/magic-context/dreamer/token-budget";
+import { hasHistorianToolActivity } from "../features/magic-context/memory/historian-wire";
 import type {
     HiddenCompletion,
     HiddenCompletionExecutor,
@@ -820,7 +821,11 @@ export async function createV2HiddenCompletionExecutor(
                             : "Hidden completion prompt timed out",
                     );
                 }
+                const toolActivity =
+                    run.identity.kind === "historian" &&
+                    hasHistorianToolActivity([attempt.observedMessages, row.data]);
                 run.completion = {
+                    ...(toolActivity ? { toolActivity: true } : {}),
                     text,
                     tokenLog: runTokenLog(tokens, run.identity.maxOutputTokens, row.data.finish),
                     ...(hiddenToolLoop(run.identity)
@@ -835,7 +840,8 @@ export async function createV2HiddenCompletionExecutor(
                     providerId: row.data.model?.providerID ?? requested.providerID,
                     modelId: row.data.model?.id ?? requested.modelID,
                 };
-                if (text) run.turns.push({ prompt: promptText(request), reply: text });
+                if (text && !toolActivity)
+                    run.turns.push({ prompt: promptText(request), reply: text });
                 // Recorded for `keep_subagents` retention: this child now holds a settled run.
                 if (!run.child.ever_settled) run.child = lifecycle.markEverSettled(run.child);
             } catch (caught) {

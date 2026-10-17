@@ -4,13 +4,12 @@
  * turn-one child with a second prompt on the same session id, and sends each narrow
  * check as a fresh single-turn child of its own.
  *
- * No production lane is enabled yet (see `resolveTurnOneLane`): the OpenCode prompt
- * body has no response-schema field the provider honours, so this carrier is only
- * reached on a lane a test enables. Before a lane is enabled, a recorded replay must
+ * No production lane is enabled yet (see `resolveTurnOneLane`). Before a lane is enabled, a recorded replay must
  * also show that a check request reaches the provider with only its own fixed system
  * prompt (the OpenCode agent registration can add its own).
  */
 
+import { hasHistorianToolActivity } from "../../features/magic-context/memory/historian-wire";
 import type {
     CheckReply,
     CheckRequest,
@@ -114,7 +113,7 @@ export function createOpenCodeTurnTwoCarrier(args: {
     parentSessionId: string;
     harness: string;
     carrier: string;
-    enforcedJson: boolean;
+    enforcedJson?: boolean;
     /** Turn one's reply; a later reply that differs from it is turn two's. */
     turnOneText: string;
     timeoutMs: number;
@@ -137,7 +136,6 @@ export function createOpenCodeTurnTwoCarrier(args: {
     return {
         carrier: args.carrier,
         harness: args.harness,
-        enforcedJson: args.enforcedJson,
         childSessionId: child.handle.childSessionId ?? child.handle.id,
         baseline: lifecycleTextHash(args.turnOneText),
         historianSystemHash,
@@ -148,11 +146,13 @@ export function createOpenCodeTurnTwoCarrier(args: {
                 args.timeoutMs,
             );
             const completion = await child.executor.collect(child.handle, 50);
-            if (!completion.text || completion.text === args.turnOneText)
+            const toolActivity = hasHistorianToolActivity(completion);
+            if (!toolActivity && (!completion.text || completion.text === args.turnOneText))
                 throw new TurnTwoOutcomeUnknownError("turn two reply not yet available");
             return {
-                text: completion.text,
+                text: completion.text ?? "",
                 lengthCapped: completion.lengthCapped,
+                toolActivity,
                 profile: reportedProfile(completion, child.model, historianSystemHash),
                 usage: completion.usage,
             };
@@ -222,7 +222,12 @@ async function sendCheck(
             // failure (which would retry it).
             verdicts = [];
         }
-        return { verdicts, profile, usage: completion.usage };
+        return {
+            verdicts: completion.lengthCapped ? [] : verdicts,
+            profile,
+            usage: completion.usage,
+            toolActivity: hasHistorianToolActivity(completion),
+        };
     } finally {
         await executor.close(handle, {
             promptSettled: settled,
@@ -276,13 +281,18 @@ export function createOpenCodeTurnTwoRecovery(args: {
                     // only by session id that cannot be read no longer exists.
                     return retained ? { kind: "unknown" } : { kind: "gone" };
                 }
-                if (!completion.text || lifecycleTextHash(completion.text) === record.baseline)
+                const toolActivity = hasHistorianToolActivity(completion);
+                if (
+                    !toolActivity &&
+                    (!completion.text || lifecycleTextHash(completion.text) === record.baseline)
+                )
                     return { kind: "unknown" };
                 return {
                     kind: "reply",
                     reply: {
-                        text: completion.text,
+                        text: completion.text ?? "",
                         lengthCapped: completion.lengthCapped,
+                        toolActivity: hasHistorianToolActivity(completion),
                         profile: recoveredProfile(completion, record),
                         usage: completion.usage,
                     },

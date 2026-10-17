@@ -88,12 +88,46 @@ async function assess(f: ReturnType<typeof fixture>, fail?: (request: CheckReque
 }
 
 describe("memory revision deterministic gates", () => {
+    test("null check entry is refused as malformed_check without throwing", async () => {
+        const f = fixture();
+        const plan = planMemoryRevision(f.decision, f.context);
+        expect(plan.ok).toBe(true);
+        if (!plan.ok) throw new Error("fixture must plan checks");
+        const result = await runMemoryChecks(f.decision.key, plan, f.context, async (request) => ({
+            profile: { ...f.context.historianProfile, systemHash: request.systemHash },
+            usage: {},
+            verdicts: [null] as never,
+        }));
+        expect(result).toEqual({ ok: false, reason: "malformed_check", retryable: false });
+    });
+
+    test("tool-bearing check is refused even with passing verdicts", async () => {
+        const f = fixture();
+        const plan = planMemoryRevision(f.decision, f.context);
+        if (!plan.ok) throw new Error("fixture must plan checks");
+        expect(
+            await runMemoryChecks(f.decision.key, plan, f.context, async (request) => ({
+                profile: { ...f.context.historianProfile, systemHash: request.systemHash },
+                usage: {},
+                toolActivity: true,
+                verdicts: request.operands.map((operand) => ({ id: operand.id, verdict: "yes" })),
+            })),
+        ).toEqual({ ok: false, reason: "malformed_check", retryable: false });
+    });
+
+    test("revision planning does not require provider enforcement", async () => {
+        for (const enforcedJson of [false, undefined]) {
+            const f = fixture();
+            f.context.enforcedJson = enforcedJson;
+            expect((await assess(f)).ok).toBe(true);
+        }
+    });
     test("narrow-check system hashes are fixed goldens", () => {
         expect(Object.values(CHECK_SYSTEM_PROMPTS).map(lifecycleTextHash)).toEqual([
-            "1fd3a4570f756c04a4077211769c8a4d6bdac341051776e368148de9e1ef8792",
-            "39ecd8e99026eec9a9ecbd3c8ea4510026f15871aa7be5d3c197a762ee959a5f",
-            "650c7f1119f80889701ffc8cb30902c733d8b6108173830f36030a365c866d31",
-            "e0c7e6e028509193fc4eb4c020a62e056a5fdd143ac227e124bc8c50722bf608",
+            "4095e6562973ff12671fe563a619df4028a6c7224ffc46059ebdb6b7b617b61d",
+            "1cb083b67add7897cbc9a637e1123cc802ef4e13bbd20cc79f5c9afbd90d1ec0",
+            "bcb0eeb523595fc5ecbbbb150f64d6b9c1e84a02edf4e50e4e094834a0669545",
+            "a1b70c1eab9d8330f4071d97e3b5d175e1fafe1ac717dff57f9890dfa8083f25",
         ]);
     });
     test("green single edit plans exactly four isolated calls including full kept input", async () => {
@@ -147,13 +181,6 @@ describe("memory revision deterministic gates", () => {
             "dormant lane",
             (f: ReturnType<typeof fixture>) => {
                 f.context.enabled = false;
-            },
-            "lane_dormant",
-        ],
-        [
-            "free text carrier",
-            (f: ReturnType<typeof fixture>) => {
-                f.context.enforcedJson = false;
             },
             "lane_dormant",
         ],

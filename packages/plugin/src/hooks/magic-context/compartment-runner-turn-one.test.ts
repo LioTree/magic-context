@@ -656,7 +656,10 @@ describe("historian turn two on an enabled lane", () => {
             turnTwoPrompt = prompt;
             const ids = [...prompt.matchAll(/^## Fact (\d+)/gm)].map((match) => Number(match[1]));
             return JSON.stringify({
-                decisions: ids.map((id) => ({ fact_id: id, action: "new" })),
+                result: {
+                    step: "turn_two",
+                    decisions: ids.map((id) => ({ fact_id: id, action: "new" })),
+                },
             });
         });
 
@@ -704,10 +707,13 @@ describe("historian turn two on an enabled lane", () => {
             directory,
             (prompt) =>
                 JSON.stringify({
-                    decisions: [...prompt.matchAll(/^## Fact (\d+)/gm)].map((match) => ({
-                        fact_id: Number(match[1]),
-                        action: "abstain",
-                    })),
+                    result: {
+                        step: "turn_two",
+                        decisions: [...prompt.matchAll(/^## Fact (\d+)/gm)].map((match) => ({
+                            fact_id: Number(match[1]),
+                            action: "abstain",
+                        })),
+                    },
                 }),
             gate,
         );

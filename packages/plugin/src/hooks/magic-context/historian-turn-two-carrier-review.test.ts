@@ -13,6 +13,10 @@ import {
     type CheckRequest,
 } from "../../features/magic-context/memory/lifecycle-gates";
 import { lifecycleTextHash } from "../../features/magic-context/memory/lifecycle-text";
+import {
+    closeTurnTwoChild,
+    registerTurnTwoChild,
+} from "../../features/magic-context/memory/turn-two-children";
 import { Database } from "../../shared/sqlite";
 import type { HiddenChildRows } from "../../v2/hidden-child-record";
 import { createV2HiddenCompletionExecutor, type HiddenChildHost } from "../../v2/hidden-completion";
@@ -20,13 +24,16 @@ import { HIDDEN_HISTORIAN_AGENT, HiddenChildHook } from "../../v2/hooks/hidden-c
 import type { SessionContext } from "../../v2/hooks/types";
 import type { StoreRow } from "../../v2/store-reader";
 import type { HiddenRunHandle, RetainedHistorianChild } from "./compartment-runner-types";
-import { createOpenCodeTurnTwoCarrier } from "./historian-turn-two-carrier";
+import {
+    createOpenCodeTurnTwoCarrier,
+    createOpenCodeTurnTwoRecovery,
+} from "./historian-turn-two-carrier";
 
 const TURN_ONE_PROMPT = "TURN-ONE-PROMPT: summarize messages 1-40";
 const TURN_ONE_REPLY = "<compartments>TURN-ONE-REPLY</compartments>";
 const SYSTEM = "historian system prompt";
 
-async function oc2() {
+async function oc2(toolCallOnTurnTwo = false) {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE schema_migrations_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     const hook = new HiddenChildHook();
@@ -82,7 +89,12 @@ async function oc2() {
                 type: "assistant",
                 seq,
                 data: {
-                    content: [{ type: "text", text }],
+                    content: [
+                        ...(toolCallOnTurnTwo && sent.includes("Turn two")
+                            ? [{ type: "tool-call", id: "blocked", name: "read", input: {} }]
+                            : []),
+                        { type: "text", text },
+                    ],
                     finish: "stop",
                     model: { providerID: "mock", id: "cheap" },
                     tokens: { input: 1, output: 1 },
@@ -143,7 +155,6 @@ async function oc2() {
         parentSessionId: "ses-parent",
         harness: "opencode2",
         carrier: "hidden-completion",
-        enforcedJson: true,
         turnOneText: TURN_ONE_REPLY,
         timeoutMs: 2000,
     });
@@ -151,6 +162,20 @@ async function oc2() {
 }
 
 describe("S6 review witnesses: OpenCode 2 carrier (failed at dafaede1)", () => {
+    test("OpenCode 2 marks a blocked call beside valid text and retains no contaminated exchange", async () => {
+        const { db, child, carrier, shaped } = await oc2(true);
+        try {
+            expect(await carrier.send("Turn two attack", "stage")).toMatchObject({
+                toolActivity: true,
+            });
+            await carrier.send("Turn two retry", "next-stage");
+            expect(JSON.stringify(shaped[2]!.messages)).not.toContain("Turn two attack");
+            expect(JSON.stringify(shaped[2]!.messages)).not.toContain("tool-call");
+        } finally {
+            await child.close();
+            db.close();
+        }
+    });
     test("review witness: on OpenCode 2 a narrow check can start while turn one's child is retained", async () => {
         const { db, child, carrier } = await oc2();
         const system = CHECK_SYSTEM_PROMPTS["kept-clause"];
@@ -195,6 +220,64 @@ describe("S6 review witnesses: OpenCode 2 carrier (failed at dafaede1)", () => {
             expect(sent).toContain("TURN-ONE-REPLY");
         } finally {
             await child.close();
+            db.close();
+        }
+    }, 10_000);
+
+    test("OpenCode 2 reconstructed requests have stable tools and no provider enforcement", async () => {
+        const { db, child, carrier, shaped } = await oc2();
+        registerTurnTwoChild({
+            childSessionId: carrier.childSessionId!,
+            parentSessionId: "ses-parent",
+            harness: "opencode2",
+            handle: child.handle,
+            active: false,
+            close: child.close,
+        });
+        try {
+            await carrier.send("Turn two: reconcile facts", "stage");
+            expect(shaped).toHaveLength(2);
+            const serialized = shaped.map((request) => JSON.stringify(request));
+            for (const bytes of serialized) {
+                for (const key of [
+                    "response_schema",
+                    "responseSchema",
+                    "response_format",
+                    "tool_choice",
+                    "toolChoice",
+                    "StructuredOutput",
+                    "capture",
+                ])
+                    expect(bytes).not.toContain(key);
+            }
+            expect(JSON.stringify(shaped[1]!.tools)).toBe(JSON.stringify(shaped[0]!.tools));
+            const resolve = createOpenCodeTurnTwoRecovery({
+                executor: child.executor,
+                carrier: "hidden-completion",
+                harness: "opencode2",
+                directory: "/review",
+                timeoutMs: 2000,
+                now: () => 10_000,
+            });
+            const recovered = resolve({
+                stageKey: "stage",
+                projectPath: "/review",
+                publicationId: "pub",
+                runAttempt: 1,
+                sessionId: "ses-parent",
+                harness: "opencode2",
+                carrier: "hidden-completion",
+                childSessionId: child.handle.id,
+                startedAt: 0,
+                baseline: lifecycleTextHash(TURN_ONE_REPLY),
+                historianSystemHash: lifecycleTextHash(SYSTEM),
+                variant: null,
+            });
+            if (!recovered || recovered === "busy") throw new Error("expected recovery");
+            expect((await recovered.reattach()).kind).toBe("reply");
+            expect(shaped.map((request) => JSON.stringify(request))).toEqual(serialized);
+        } finally {
+            await closeTurnTwoChild(carrier.childSessionId!);
             db.close();
         }
     }, 10_000);

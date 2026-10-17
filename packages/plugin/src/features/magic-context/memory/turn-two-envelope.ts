@@ -3,8 +3,7 @@
  * candidate facts with existing project memory, and the strict parser for its
  * JSON reply.
  *
- * Turn two runs only on a lane whose carrier makes the provider enforce a response
- * schema, so a reply is either schema-valid JSON or an error. The parser therefore
+ * The schema is a prompt contract, not provider enforcement. The parser
  * never repairs or extracts JSON from prose: anything that is not exactly one JSON
  * object of the expected shape is an envelope failure, and every fact of that send
  * is retried (see `turn-two.ts`).
@@ -76,8 +75,10 @@ export type TurnTwoEnvelope =
           /** Decisions keyed by fact id; a fact named twice maps to `"malformed"`. */
           decisions: Map<number, TurnTwoDecision | "malformed">;
           scores: TurnTwoScore[];
+          /** False when the wrapper is valid but a decision or score is refused. */
+          schemaValid: boolean;
       }
-    | { ok: false; reason: "length_capped" | "unparseable" | "schema_invalid" };
+    | { ok: false; reason: "length_capped" | "unparseable" | "schema_invalid" | "tool_activity" };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -207,7 +208,12 @@ function parseDecision(
  * send. A decision that fails its own schema, or a fact named by two decisions,
  * marks only that fact malformed.
  */
-export function parseTurnTwoEnvelope(text: string, lengthCapped: boolean): TurnTwoEnvelope {
+export function parseTurnTwoEnvelope(
+    text: string,
+    lengthCapped: boolean,
+    toolActivity = false,
+): TurnTwoEnvelope {
+    if (toolActivity) return { ok: false, reason: "tool_activity" };
     if (lengthCapped) return { ok: false, reason: "length_capped" };
     let raw: unknown;
     try {
@@ -215,24 +221,43 @@ export function parseTurnTwoEnvelope(text: string, lengthCapped: boolean): TurnT
     } catch {
         return { ok: false, reason: "unparseable" };
     }
-    if (!isRecord(raw) || !Array.isArray(raw.decisions))
+    if (!isRecord(raw) || !isRecord(raw.result) || raw.result.step !== "turn_two")
         return { ok: false, reason: "schema_invalid" };
-    if (raw.scores !== undefined && !Array.isArray(raw.scores))
+    const result = raw.result;
+    if (!Array.isArray(result.decisions)) return { ok: false, reason: "schema_invalid" };
+    if (result.scores !== undefined && !Array.isArray(result.scores))
         return { ok: false, reason: "schema_invalid" };
+    let schemaValid = true;
     const decisions = new Map<number, TurnTwoDecision | "malformed">();
-    raw.decisions.forEach((entry, ordinal) => {
+    result.decisions.forEach((entry, ordinal) => {
         // A decision that names no fact cannot be attributed; the fact it was
         // meant for is then missing, which is the same malformed outcome.
-        if (!isRecord(entry) || !isInt(entry.fact_id)) return;
+        if (!isRecord(entry) || !isInt(entry.fact_id)) {
+            schemaValid = false;
+            return;
+        }
         const factId = entry.fact_id;
         if (decisions.has(factId)) {
             decisions.set(factId, "malformed");
+            schemaValid = false;
             return;
         }
-        decisions.set(factId, parseDecision(entry, factId, ordinal) ?? "malformed");
+        const decision = parseDecision(entry, factId, ordinal);
+        if (!decision || decision.action === "retire" || decision.action === "promote_rule")
+            schemaValid = false;
+        decisions.set(factId, decision ?? "malformed");
     });
-    const scores: TurnTwoScore[] = [];
-    for (const entry of (raw.scores as unknown[] | undefined) ?? []) {
+    const scores = new Map<number, TurnTwoScore>();
+    const seenScores = new Set<number>();
+    for (const entry of (result.scores as unknown[] | undefined) ?? []) {
+        if (isRecord(entry) && isInt(entry.item)) {
+            if (seenScores.has(entry.item)) {
+                schemaValid = false;
+                scores.delete(entry.item);
+                continue;
+            }
+            seenScores.add(entry.item);
+        }
         if (
             isRecord(entry) &&
             isInt(entry.item) &&
@@ -243,13 +268,14 @@ export function parseTurnTwoEnvelope(text: string, lengthCapped: boolean): TurnT
             entry.class.length > 0 &&
             entry.class.length <= 64
         )
-            scores.push({
+            scores.set(entry.item, {
                 item: entry.item,
                 importance: entry.importance,
                 proposedClass: entry.class,
             });
+        else schemaValid = false;
     }
-    return { ok: true, decisions, scores };
+    return { ok: true, decisions, scores: [...scores.values()], schemaValid };
 }
 
 export interface TurnTwoPromptBlock {

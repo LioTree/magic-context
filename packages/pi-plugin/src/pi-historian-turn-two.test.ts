@@ -18,8 +18,10 @@ import {
 	commitTurnOnePublication,
 } from "@magic-context/core/features/magic-context/memory/turn-one-publication";
 import {
+	recoverTurnTwoStages,
 	runTurnTwo,
 	TurnTwoOutcomeUnknownError,
+	type TurnTwoStageReply,
 } from "@magic-context/core/features/magic-context/memory/turn-two";
 import { closeDatabase } from "@magic-context/core/features/magic-context/storage";
 import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from "@magic-context/core/hooks/magic-context/compartment-prompt";
@@ -27,6 +29,7 @@ import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-se
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
 import {
+	createPiTurnTwoCarrier,
 	PI_RPC_CARRIER,
 	recoverLostPiRpcStages,
 	settlePiHistorianTurnTwoRuns,
@@ -52,6 +55,7 @@ type Prompt = { type: string; id: string; message: string };
 function rpcFixture(
 	reply: (prompt: Prompt, system: string, childIndex: number) => string,
 	budgetGuardAvailable = true,
+	toolMessages: unknown[] = [],
 ) {
 	const children: Array<{
 		args: string[];
@@ -89,7 +93,7 @@ function rpcFixture(
 					usage: { input: 10, output: 5, totalTokens: 15 },
 				};
 				stdout.write(
-					`${JSON.stringify({ type: "message_end", message })}\n${JSON.stringify({ type: "agent_end", messages: [message] })}\n`,
+					`${JSON.stringify({ type: "message_end", message })}\n${JSON.stringify({ type: "agent_end", messages: [...toolMessages, message] })}\n`,
 				);
 			},
 		};
@@ -177,6 +181,156 @@ function base(
 afterEach(() => closeDatabase());
 
 describe("Pi historian RPC parity", () => {
+	it("Pi RPC carries tool-result contamination even when followed by a valid wrapper", async () => {
+		const wrapped = '{"result":{"step":"turn_two","decisions":[]}}';
+		const f = rpcFixture(() => wrapped, true, [
+			{ role: "toolResult", content: "blocked read" },
+		]);
+		const options = {
+			agent: "historian",
+			systemPrompt: "contract",
+			userMessage: "first",
+			model: "test/validated-model",
+			tokenBudget: 1_000_000,
+			timeoutMs: 1000,
+		};
+		const first = await f.runner.runRetainedHistorian(options, "turn-one");
+		if (!first.child) throw new Error("expected retained child");
+		try {
+			expect(first.result.meta?.toolActivity).toBe(true);
+			const carrier = createPiTurnTwoCarrier({
+				child: first.child,
+				runner: f.runner,
+				options,
+				turnOneText: wrapped,
+			});
+			expect(await carrier.send("second", "turn-two")).toMatchObject({
+				text: wrapped,
+				toolActivity: true,
+			});
+		} finally {
+			await first.child.close();
+		}
+	});
+	it("Pi RPC serialized requests stay prompt-only and recovery reuses the recorded reply without a send", async () => {
+		const db = createTestDb();
+		const wrapped =
+			' \n{"result":{"step":"turn_two","decisions":[{"fact_id":1,"action":"new"}]}}\n';
+		const f = rpcFixture((prompt) =>
+			prompt.id === "turn-one-key" ? "turn one raw reply" : wrapped,
+		);
+		const options = {
+			agent: "historian",
+			systemPrompt: "combined prompt contract",
+			userMessage: "turn one",
+			model: "test/validated-model",
+			tokenBudget: 1_000_000,
+			timeoutMs: 1000,
+		};
+		const first = await f.runner.runRetainedHistorian(options, "turn-one-key");
+		if (!first.child) throw new Error("expected retained child");
+		try {
+			const send = allocateTurnOneSend(db, {
+				projectPath,
+				sessionId: "ses-wire",
+				harness: "pi",
+				carrier: PI_RPC_CARRIER,
+				lane: "enabled",
+				chunkStart: 1,
+				chunkEnd: 2,
+			});
+			db.transaction(() =>
+				commitTurnOnePublication(db, {
+					send,
+					projectPath,
+					sessionId: "ses-wire",
+					compartments: [],
+					blocks: [],
+					candidateFacts: [
+						{ category: "CONSTRAINTS", content: "Keep the wire." },
+					],
+					honourAnchors: true,
+				}),
+			)();
+			const carrier = createPiTurnTwoCarrier({
+				child: first.child,
+				runner: f.runner,
+				options,
+				turnOneText: "turn one raw reply",
+			});
+			let reply: TurnTwoStageReply | undefined;
+			const stage = await runTurnTwo(db, {
+				projectPath,
+				publicationId: send.publicationId,
+				sessionId: "ses-wire",
+				lane: "enabled",
+				memoryEnabled: true,
+				autoPromote: true,
+				validatedProfiles: [],
+				carrier: {
+					...carrier,
+					send: async (prompt, key) => {
+						reply = await carrier.send(prompt, key);
+						throw new TurnTwoOutcomeUnknownError();
+					},
+				},
+			});
+			expect(stage.status).toBe("in_flight");
+			expect(reply?.text).toBe(wrapped);
+			const wire = JSON.stringify(
+				f.children.map((child) => ({
+					system: child.system,
+					args: child.args,
+					prompts: child.prompts,
+				})),
+			);
+			for (const key of [
+				"response_schema",
+				"responseSchema",
+				"response_format",
+				"tool_choice",
+				"toolChoice",
+				"StructuredOutput",
+				"capture",
+			])
+				expect(wire).not.toContain(key);
+			expect(f.children).toHaveLength(1);
+			expect(f.children[0]!.args).toContain("--no-tools");
+			expect(
+				f.children[0]!.prompts.filter((prompt) => prompt.type === "prompt"),
+			).toHaveLength(2);
+			await recoverTurnTwoStages(db, {
+				projectPath,
+				memoryEnabled: true,
+				autoPromote: true,
+				validatedProfiles: [],
+				resolver: (record) => {
+					expect(record.stageKey).toBe(stage.stageKey!);
+					return {
+						check: carrier.check,
+						reattach: async () => ({ kind: "reply", reply: reply! }),
+					};
+				},
+			});
+			expect(
+				db
+					.prepare("SELECT state,fact_attempts FROM memory_pending_facts")
+					.get(),
+			).toEqual({ state: "applied", fact_attempts: 0 });
+			expect(
+				JSON.stringify(
+					f.children.map((child) => ({
+						system: child.system,
+						args: child.args,
+						prompts: child.prompts,
+					})),
+				),
+			).toBe(wire);
+		} finally {
+			await first.child.close();
+			closeQuietly(db);
+		}
+	});
 	it("suppresses the turn-one drain timer and continues on the same RPC child with a distinct stage key", async () => {
 		const f = rpcFixture((prompt) =>
 			prompt.id === "turn-one-key" ? "first reply" : "second reply",
@@ -234,26 +388,29 @@ describe("Pi historian RPC parity", () => {
 					.get() as { id: number; state: string };
 				expect(fact.state).toBe("in_flight");
 				return JSON.stringify({
-					decisions: [
-						{
-							fact_id: fact.id,
-							action: "edit",
-							target_id: memory.id,
-							revision: 1,
-							removed: [],
-							replaced: [
-								{
-									memory_id: memory.id,
-									clause: 1,
-									block: 1,
-									excerpt: "New rule.",
-								},
-							],
-							kept: [{ memory_id: memory.id, clause: 2 }],
-							added: [{ text: "New rule. ", block: 1, excerpt: "New rule." }],
-							final_text: "New rule. Keep rule.",
-						},
-					],
+					result: {
+						step: "turn_two",
+						decisions: [
+							{
+								fact_id: fact.id,
+								action: "edit",
+								target_id: memory.id,
+								revision: 1,
+								removed: [],
+								replaced: [
+									{
+										memory_id: memory.id,
+										clause: 1,
+										block: 1,
+										excerpt: "New rule.",
+									},
+								],
+								kept: [{ memory_id: memory.id, clause: 2 }],
+								added: [{ text: "New rule. ", block: 1, excerpt: "New rule." }],
+								final_text: "New rule. Keep rule.",
+							},
+						],
+					},
 				});
 			}
 			expect(f.children[0]?.killed).toBe(false);
@@ -366,7 +523,10 @@ describe("Pi historian RPC parity", () => {
 				id: number;
 			};
 			return JSON.stringify({
-				decisions: [{ fact_id: fact.id, action: "new" }],
+				result: {
+					step: "turn_two",
+					decisions: [{ fact_id: fact.id, action: "new" }],
+				},
 			});
 		});
 		try {

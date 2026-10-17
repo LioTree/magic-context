@@ -170,7 +170,6 @@ function stubCarrier(
         carrier: {
             carrier: "stub",
             harness: "opencode",
-            enforcedJson: true,
             childSessionId: child,
             async send(prompt) {
                 prompts.push(prompt);
@@ -196,7 +195,9 @@ function reply(
     profile: ReportedProfile | null = PROFILE,
 ): TurnTwoStageReply {
     return {
-        text: JSON.stringify({ decisions, ...(scores ? { scores } : {}) }),
+        text: JSON.stringify({
+            result: { step: "turn_two", decisions, ...(scores ? { scores } : {}) },
+        }),
         lengthCapped: false,
         profile,
         usage: { tokens: 11 },
@@ -269,7 +270,7 @@ function editFixture(db: Database) {
 }
 
 describe("turn two pre-send skips", () => {
-    test("a dormant lane or a carrier without enforced JSON sends nothing and consumes no attempt", async () => {
+    test("a dormant lane or a carrier without a retained child sends nothing and consumes no attempt", async () => {
         const db = store();
         try {
             const { publicationId, factIds } = publish(db, [{ content: "Fact one" }]);
@@ -278,9 +279,6 @@ describe("turn two pre-send skips", () => {
                 status: "skipped",
                 reason: "lane_dormant",
             });
-            expect(
-                await run(db, publicationId, { ...stub.carrier, enforcedJson: false }),
-            ).toMatchObject({ status: "skipped", reason: "lane_dormant" });
             expect(
                 await run(db, publicationId, { ...stub.carrier, childSessionId: null }),
             ).toMatchObject({ status: "skipped", reason: "carrier_cannot_continue" });
@@ -385,6 +383,16 @@ describe("turn two envelope outcomes", () => {
     for (const [name, script] of [
         ["unparseable", () => ({ text: "not json", lengthCapped: false, profile: PROFILE })],
         ["length-capped", () => ({ ...reply([]), lengthCapped: true })],
+        ["unwrapped", () => ({ text: '{"decisions":[]}', lengthCapped: false, profile: PROFILE })],
+        [
+            "wrong-step",
+            () => ({
+                text: '{"result":{"step":"turn_one","decisions":[]}}',
+                lengthCapped: false,
+                profile: PROFILE,
+            }),
+        ],
+        ["tool-bearing", () => ({ ...reply([{ fact_id: 1, action: "new" }]), toolActivity: true })],
         [
             "schema-invalid",
             () => ({ text: '{"verdict":1}', lengthCapped: false, profile: PROFILE }),
@@ -433,8 +441,12 @@ describe("turn two envelope outcomes", () => {
             expect(fact(db, factIds[1]!)).toMatchObject({ state: "applied", reason: "inserted" });
             expect(fact(db, factIds[2]!)).toMatchObject({
                 state: "decided_pending",
+                fact_attempts: 0,
                 reason: "missing_decision",
             });
+            const later = stubCarrier(() => reply([]));
+            await run(db, publish(db, []).publicationId, later.carrier);
+            expect(later.prompts).toEqual([]);
             expect(
                 db.prepare("SELECT content,expires_at IS NULL AS no_expiry FROM memories").all(),
             ).toEqual([{ content: "Admitted sibling", no_expiry: 1 }]);
@@ -1083,10 +1095,10 @@ describe("turn two narrow checks", () => {
                     ]),
                 ),
             ).toEqual({
-                disproof: "1fd3a4570f756c04",
-                support: "39ecd8e99026eec9",
-                "kept-clause": "650c7f1119f80889",
-                compatibility: "e0c7e6e028509193",
+                disproof: "4095e6562973ff12",
+                support: "1cb083b67add7897",
+                "kept-clause": "bcb0eeb523595fc5",
+                compatibility: "a1b70c1eab9d8330",
             });
         } finally {
             db.close();
@@ -1181,6 +1193,46 @@ describe("turn two narrow checks", () => {
 });
 
 describe("turn two crash recovery", () => {
+    for (const enforcedJson of [false, undefined]) {
+        test(`best-effort edit applies through recovery with enforcedJson ${enforcedJson}`, async () => {
+            const db = store();
+            try {
+                const { memory, published, decision } = editFixture(db);
+                const first = stubCarrier(() => "unknown");
+                const result = await run(db, published.publicationId, {
+                    ...first.carrier,
+                    enforcedJson,
+                });
+                expect(result.status).toBe("in_flight");
+                const later = stubCarrier(() => reply([]));
+                const keys: string[] = [];
+                let closed = 0;
+                await run(db, publish(db, []).publicationId, later.carrier, {
+                    recover: (record) => ({
+                        reattach: async () => {
+                            keys.push(record.stageKey);
+                            return { kind: "reply", reply: reply([decision]) };
+                        },
+                        check: async (request) => passingVerdicts(request),
+                        close: async () => {
+                            closed++;
+                        },
+                    }),
+                });
+                expect(keys).toEqual([result.stageKey!]);
+                expect(first.prompts).toHaveLength(1);
+                expect(later.prompts).toEqual([]);
+                expect(closed).toBe(1);
+                expect(fact(db, published.factIds[0]!)).toMatchObject({
+                    state: "applied",
+                    fact_attempts: 0,
+                });
+                expect(getMemoryById(db, memory.id)?.content).toBe("New rule. Keep rule.");
+            } finally {
+                db.close();
+            }
+        });
+    }
     test("after turn one's commit the candidates survive and a later publication's run sends them once", async () => {
         const db = store();
         try {

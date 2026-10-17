@@ -80,7 +80,10 @@ for (const action of ["retire", "promote_rule"] as const) {
 					childSessionId: `review-${action}`,
 					send: async () => ({
 						text: JSON.stringify({
-							decisions: [{ fact_id: 1, action, target_id: memory.id }],
+							result: {
+								step: "turn_two",
+								decisions: [{ fact_id: 1, action, target_id: memory.id }],
+							},
 						}),
 						lengthCapped: false,
 						profile: null,
