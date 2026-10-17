@@ -810,6 +810,31 @@ export function discardWithheldServedCapture(sessionId: string): boolean {
     return true;
 }
 
+/**
+ * Undo the in-memory install of a capture whose pass was refused instead of
+ * dispatched: put back `prior`, the capture served before it, or leave no slot
+ * when there is none. A refused capture was never sent, so neither a replay nor
+ * the next pass's entry note may use it. Acts only while `refused` is still the
+ * in-memory slot; a newer capture is left alone.
+ */
+export function restoreRefusedCapture(
+    sessionId: string,
+    refused: Pick<LkgSlot, "capturedAt" | "jsonPrefix">,
+    prior: LkgSlot | undefined,
+): boolean {
+    const entry = lkgHeapHolder.entries.get(sessionId);
+    if (
+        !entry ||
+        entry.slot.capturedAt !== refused.capturedAt ||
+        entry.slot.jsonPrefix !== refused.jsonPrefix
+    )
+        return false;
+    lkgHeapHolder.entries.delete(sessionId);
+    totalBytes -= entry.bytes;
+    if (prior) installHydratedSlot(sessionId, prior);
+    return true;
+}
+
 /** Evict only the process copy; durable replay authority is unchanged. */
 export function forgetInMemorySlot(sessionId: string): void {
     clearLkgRecoverySession(sessionId);

@@ -40,6 +40,7 @@ import {
 	lkgFieldsMatchDigest,
 	lkgSlotRejection,
 	registerLkgPersistence,
+	restoreRefusedCapture,
 	signatureForFields,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { moveMessageDigestFromFields } from "@magic-context/core/hooks/magic-context/move-inputs";
@@ -129,7 +130,15 @@ interface PiLkgSessionState {
 	 * certificate is bound only when the context handler returns that request
 	 * to Pi; a pass refused after publishing leaves it uncertified.
 	 */
-	pendingDispatch?: { snapshot: PiLkgPassSnapshot; servedCaptureId: number };
+	pendingDispatch?: {
+		snapshot: PiLkgPassSnapshot;
+		servedCaptureId?: number;
+		/** The capture this pass installed in memory. */
+		capture: Pick<LkgSlot, "capturedAt" | "jsonPrefix">;
+		/** The in-memory capture served before it, restored if this pass is refused. */
+		prior: LkgSlot | undefined;
+		priorRecoveryPrefix: PiLkgRecoveryPrefix | undefined;
+	};
 }
 
 interface PiLkgCapturePlan {
@@ -1561,14 +1570,18 @@ export function createPiLkgCoordinator(
 					) {
 						throw new Error("Pi LKG/served publication failed");
 					}
-					// The request is durable but not dispatched: the context handler binds
-					// its certificate when it returns the request to Pi, and records a
-					// refusal if it throws instead.
-					if (plan.servedCaptureId !== undefined)
-						state.pendingDispatch = {
-							snapshot,
-							servedCaptureId: plan.servedCaptureId,
-						};
+					// The request is durable but not dispatched: the dispatch wrapper binds
+					// its certificate when it hands the request on, and records a refusal
+					// otherwise. A refusal also puts back the in-memory capture served
+					// before this one. A cache-busting pass already dropped that capture as
+					// stale, so it has none to put back.
+					state.pendingDispatch = {
+						snapshot,
+						servedCaptureId: plan.servedCaptureId,
+						capture: slot,
+						prior: args.cacheBusting && !unchanged ? undefined : livePrior,
+						priorRecoveryPrefix: state.recoveryPrefix,
+					};
 					// SQLite can return after the outcome deadline. The request and identities
 					// are durable, but the handler must refuse rather than dispatch a late result.
 					// A pass past its deadline, cancelled or superseded is never dispatched, so
@@ -1729,11 +1742,12 @@ export function createPiLkgCoordinator(
 				const pending = state?.pendingDispatch;
 				if (!state || pending?.snapshot !== snapshot) return;
 				state.pendingDispatch = undefined;
-				certifyDispatchedLkgSlot(
-					db,
-					snapshot.sessionId,
-					pending.servedCaptureId,
-				);
+				if (pending.servedCaptureId !== undefined)
+					certifyDispatchedLkgSlot(
+						db,
+						snapshot.sessionId,
+						pending.servedCaptureId,
+					);
 			} catch (error) {
 				// Certification is optional; a dispatched request stays servable.
 				sessionLog(
@@ -1749,11 +1763,27 @@ export function createPiLkgCoordinator(
 				const pending = state?.pendingDispatch;
 				if (!state || pending?.snapshot !== snapshot) return;
 				state.pendingDispatch = undefined;
-				refuseUndispatchedLkgSlot(
-					db,
-					snapshot.sessionId,
-					pending.servedCaptureId,
-				);
+				// The refused request was never sent: replay and the next pass must
+				// work from the last request that was, so undo this pass's in-memory
+				// capture and the replay state it advanced.
+				if (
+					restoreRefusedCapture(
+						snapshot.sessionId,
+						pending.capture,
+						pending.prior,
+					)
+				) {
+					state.acceptedInputs = null;
+					state.acceptedSlot = null;
+					state.acceptedRecoverySlotKey = undefined;
+					state.recoveryPrefix = pending.priorRecoveryPrefix;
+				}
+				if (pending.servedCaptureId !== undefined)
+					refuseUndispatchedLkgSlot(
+						db,
+						snapshot.sessionId,
+						pending.servedCaptureId,
+					);
 			} catch (error) {
 				sessionLog(
 					snapshot.sessionId,
