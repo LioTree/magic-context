@@ -233,6 +233,19 @@ export async function generatePiVectors() {
 			appends,
 			wire_sha256: digest(compacted.messages),
 		});
+		const marker = {
+			...entry("pi-native-cut", "Native placeholder, not provider history."),
+			type: "compaction",
+		};
+		const resumed = await run([marker, u2, u3], "A natural system change.");
+		assert.equal(digest(resumed.messages), digest(compacted.messages));
+		assert.equal(
+			adapter.isFallbackAdmissible("relay-pi-v1", {
+				...fit,
+				messages: [marker, u2, u3],
+			}).admissible,
+			true,
+		);
 		const right = entry("pi-tree-right", "Selected /tree branch.");
 		journal.splice(0, journal.length, u1, right);
 		const tree = await run([u1, right], "A natural system change.");

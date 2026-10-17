@@ -6,6 +6,13 @@ import { appendCompartments } from "../../plugin/src/features/magic-context/comp
 import { getOrCreateSessionMeta } from "../../plugin/src/features/magic-context/storage-meta";
 import { setPendingPiCompactionMarkerState } from "../../plugin/src/features/magic-context/storage-meta-persisted";
 import { startOracle } from "../../plugin/src/hooks/magic-context/host-runner/conformance/oracle";
+import { providerReplacementValid } from "../../plugin/src/hooks/magic-context/host-runner/opencode-adapter";
+import {
+	applyCompaction,
+	createRecord,
+	issueRequest,
+	scanWindow,
+} from "../../plugin/src/hooks/magic-context/host-runner/record";
 import { Database } from "../../plugin/src/shared/sqlite";
 import {
 	cleanupTestTempDir,
@@ -14,6 +21,7 @@ import {
 import {
 	nativePiEntry,
 	type PiBridgeEntry,
+	piProviderCodec,
 	projectPiEntry,
 } from "./bridge-codec-pi";
 import {
@@ -389,6 +397,20 @@ test("Pi tool-result reference proof permits reduction without a delivery waterm
 		expect(f.adapter.isFallbackAdmissible("pi-tools", inputs).admissible).toBe(
 			true,
 		);
+		expect(
+			f.adapter.isFallbackAdmissible("pi-tools", {
+				...inputs,
+				messages: [
+					...messages,
+					{
+						message: {
+							role: "user",
+							content: "unidentified live tail must not disappear",
+						},
+					},
+				],
+			}).admissible,
+		).toBe(false);
 		f.adapter.recordProviderUsage("pi-tools", {
 			messages: view.messages,
 			inputTokens: 500,
@@ -584,4 +606,93 @@ test("Pi bridge refuses an unmigrated database by default before contacting the 
 		}),
 	).rejects.toBeInstanceOf(StoreVersionMismatchError);
 	expect(requests).toBe(0);
+});
+
+test("Pi replacement admission accepts separate tool results without widening OpenCode admission", () => {
+	const result = entry("r1", "toolResult", "retained result");
+	Object.assign(result.message, { toolCallId: "call", toolName: "read" });
+	const message = projectPiEntry(result);
+	const codec = piProviderCodec(
+		() => "",
+		() => [],
+	);
+	expect(providerReplacementValid(message, "pi", codec.incoming)).toBe(true);
+	expect(providerReplacementValid(message, "opencode", codec.incoming)).toBe(
+		false,
+	);
+	expect(providerReplacementValid(message, "opencode2", codec.incoming)).toBe(
+		false,
+	);
+	const call = projectPiEntry({
+		...entry("a1", "assistant", ""),
+		message: {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call", name: "read", arguments: {} }],
+		},
+	});
+	const record = createRecord({
+		lineage_id: "lineage",
+		plan: {},
+		initial: {
+			compaction_id: "view",
+			version: 0,
+			range: { from: 0, to: 0 },
+			replacement: [call, message],
+		},
+	});
+	record.next_ordinal = 3;
+	issueRequest(record, "request", 100);
+	const accepted = applyCompaction(
+		record,
+		{
+			request_id: "request",
+			arrived_ms: 1,
+			compaction: {
+				compaction_id: "view",
+				version: 1,
+				range: { from: 1, to: 3 },
+				replacement: [call, message],
+			},
+		},
+		(rows) =>
+			rows.every((row) => providerReplacementValid(row, "pi", codec.incoming)),
+	);
+	expect(accepted.applied).toBe(true);
+	expect(record.view.replacement[1]?.info.role).toBe("tool");
+	expect(
+		providerReplacementValid(message, "pi", () => ({
+			id: "r1",
+			read: () => message,
+			classify: () => "non_terminal",
+		})),
+	).toBe(false);
+});
+
+test("Pi native compaction summaries are markers, not newly ingested user text", () => {
+	const marker = {
+		...entry("native-cut", "user", "native placeholder must not be sent"),
+		type: "compaction",
+	};
+	const user = entry("u1", "user", "retained user");
+	const codec = piProviderCodec(
+		() => "",
+		() => [],
+	);
+	const record = createRecord({
+		lineage_id: "lineage",
+		plan: {},
+		initial: {
+			compaction_id: "initial",
+			version: 0,
+			range: { from: 0, to: 0 },
+			replacement: [],
+		},
+	});
+	const scan = scanWindow(
+		record,
+		[marker, user].map((m) => codec.incoming(projectPiEntry(m))),
+	);
+	expect(scan.elided).toEqual(["native-cut"]);
+	expect(scan.appends.map((m) => m.id)).toEqual(["u1"]);
+	expect(scan.passthrough).toEqual([]);
 });

@@ -327,6 +327,20 @@ export const providerOpFunctions: OpFunctions<MessageLike> = {
     versions: new Map([[1, applyProviderOps]]),
 };
 
+/** OpenCode embeds results in assistant rows; Pi returns separate tool-role messages. */
+export function providerReplacementValid(
+    message: MessageLike,
+    harness: "opencode" | "opencode2" | "pi",
+    incoming: typeof providerIncoming = providerIncoming,
+): boolean {
+    const role = message?.info?.role;
+    return (
+        (role === "user" || role === "assistant" || (harness === "pi" && role === "tool")) &&
+        Array.isArray(message?.parts) &&
+        incoming(message).classify() !== "non_terminal"
+    );
+}
+
 /** Same strict TTL clock and self-consuming baseline as the full-request renderer. */
 export function providerCold(
     meta: Pick<SessionMeta, "cacheTtl" | "lastResponseTime" | "cachedM0MaterializedAt">,
@@ -939,14 +953,7 @@ export function createProviderTransform(
                     compaction: a.compaction as unknown as RecordState["view"],
                     coverage: a.coverage,
                 },
-                (all) =>
-                    all.every(
-                        (m) =>
-                            m &&
-                            (m.info?.role === "user" || m.info?.role === "assistant") &&
-                            Array.isArray(m.parts) &&
-                            incoming(m).classify() !== "non_terminal",
-                    ),
+                (all) => all.every((m) => providerReplacementValid(m, harness, incoming)),
             );
             applied = appliedResult.applied;
             if (appliedResult.applied) coverage = appliedResult.coverage;

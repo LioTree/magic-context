@@ -139,7 +139,9 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 	const facts = createBridgeHostFacts(deps, config);
 	const normalized = (inputs: PiBridgeFallbackInputs) => ({
 		...inputs,
-		messages: inputs.messages.map((m) => projectPiEntry(m)),
+		messages: inputs.messages
+			.filter((m) => m.type !== "compaction")
+			.map((m) => projectPiEntry(m)),
 	});
 	return {
 		async run(input: PiBridgeRunInput): Promise<PiBridgeView> {
@@ -151,7 +153,10 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 					"Bridge run kind must be model; rebuild classification is adapter-owned",
 				);
 			const ids = input.messages.map((m) => m.id);
-			if (ids.some((id) => !id) || new Set(ids).size !== ids.length)
+			if (
+				ids.some((id) => typeof id !== "string" || id.length === 0) ||
+				new Set(ids).size !== ids.length
+			)
 				throw new Error("Pi bridge requires unique stable journal entry IDs");
 			const host = input.host;
 			if (
@@ -285,6 +290,17 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 					admissible: false as const,
 					reason: "covered_range_changed" as const,
 					detail: "No published Pi record",
+				};
+			if (
+				inputs.messages.some(
+					(m) => m.type !== "compaction" && (typeof m.id !== "string" || !m.id),
+				)
+			)
+				return {
+					admissible: false as const,
+					reason: "covered_range_changed" as const,
+					detail:
+						"Pi fallback requires stable journal IDs for every raw message",
 				};
 			const result = owner(id).isFallbackAdmissible(record, normalized(inputs));
 			return result.admissible

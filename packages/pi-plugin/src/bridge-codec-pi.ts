@@ -148,10 +148,15 @@ export function piProviderCodec(
 		manifest,
 		ordinals,
 		freezeUnavailableHooks: true,
+		// Native compaction entries are read boundaries, not new user-message ingest.
 		incoming: (message) => ({
 			id: message.info.id,
 			read: () => message,
-			classify: () => "terminal",
+			classify: () =>
+				(message.info as unknown as { piEntry?: PiBridgeEntry }).piEntry
+					?.type === "compaction"
+					? "marker"
+					: "terminal",
 		}),
 		subjects: (message) => {
 			const entry = nativePiEntry(message),
