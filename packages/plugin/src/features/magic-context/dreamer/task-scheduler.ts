@@ -375,6 +375,11 @@ interface DomainGroupCallbacks {
     /** Manual single-task run ignores the post-lease activity gate re-check. */
     forceGate?: boolean;
     /**
+     * Manual runs ignore the schedule, so they skip the post-lease check that
+     * the planned slot is still due.
+     */
+    ignoreSchedule?: boolean;
+    /**
      * How long a manual run may wait for a busy domain lease before giving
      * up. Scheduled ticks leave this unset (the next tick retries anyway).
      */
@@ -442,6 +447,22 @@ async function runDomainGroupWithCooldown(
             }
 
             acquisition = { acquiredAt: Date.now(), generation: acquisition.generation };
+
+            // Re-read the slot now that we hold the lease. Another runtime sharing
+            // this store (another host process, or ck-mc's Rust dreamer, which may
+            // own the task without this host knowing) can run the planned slot
+            // between planning and taking the lease; it moves next_due_at past the
+            // slot before it releases the lease, so a later next_due_at means the
+            // slot is already done. Leave the row as that runtime wrote it.
+            if (!cb?.ignoreSchedule) {
+                const current = getTaskScheduleState(db, projectIdentity, due.config.task);
+                if (current?.nextDueAt != null && current.nextDueAt > due.scheduledAt) {
+                    log(
+                        `[dreamer] ${due.config.task} slot already run by another dreamer — skipping`,
+                    );
+                    continue;
+                }
+            }
 
             // Re-evaluate the gate now that we hold the lease: a sibling/other
             // process may have just consumed the work (critical for the global
@@ -663,6 +684,7 @@ export async function runManualDream(
         [...groups.values()].map((group) =>
             runDomainGroup(deps, group, {
                 forceGate,
+                ignoreSchedule: true,
                 leaseWaitMs: MANUAL_RUN_LEASE_WAIT_MS,
                 onRan: (t, detail, backlog) => {
                     result.ran.push(t);
