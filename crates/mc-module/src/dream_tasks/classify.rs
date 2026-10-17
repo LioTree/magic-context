@@ -1,8 +1,9 @@
 //! Non-served classify/map tasks over a project snapshot, using the Dreamer runner.
 //!
-//! The caller supplies the captured activation and an off-thread carrier. Store
-//! commits and repository path checks are explicit boundaries: no store lock is
-//! held during a completion and no task can invalidate a served cache epoch.
+//! The caller supplies activation captured at task start and a model-completion
+//! carrier running away from the serving thread. The host adapter checks paths
+//! and commits metadata updates. It must release store locks before model calls
+//! and must not increment cache epochs: background results appear at a natural rebuild.
 
 use std::{collections::HashSet, path::Path, time::Duration};
 
@@ -21,6 +22,9 @@ pub const MAP_TASK: &str = "map-memories";
 pub const MAP_BATCH_FLOOR_MS: u64 = 240_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// One active memory from the caller's project-scoped snapshot. Selection flags
+/// come from classification markers, open historian items and mapping sentinels;
+/// the task never widens that snapshot by reading another session or project.
 pub struct Memory {
     pub id: i64,
     pub category: String,
@@ -800,9 +804,12 @@ pub async fn run_map(
     Ok(Some(result))
 }
 
-// Verbatim prompts from packages/plugin/src/features/magic-context/dreamer/
+// Keep model instructions identical to the TypeScript compatibility baseline
+// while moving orchestration to Rust. These prompts are copied verbatim from
+// packages/plugin/src/features/magic-context/dreamer/
 // {classify-prompt,map-memories-prompt}.ts at 282d9c08bce490346583a3b8c145c402499f980f.
-// SHA256: classify 2eb7678db84542110e3d607a579bdac499f19472b9a7df8abd610b072783ed50;
+// Hashes identify the full source files; tests separately pin the prompt bytes.
+// Source-file SHA256: classify 2eb7678db84542110e3d607a579bdac499f19472b9a7df8abd610b072783ed50;
 // map 4232865ee46a6811380cc45fbe3764355607e216e9df4910d1b224ec7e4ba01c.
 pub const CLASSIFY_SYSTEM_PROMPT: &str = r####"You are a memory classifier for the magic-context system. You classify project memories by metadata only. You do NOT rewrite, merge, archive, verify, or create memories, and you do NOT read code — you judge each memory from its own text.
 
@@ -862,6 +869,11 @@ Rules:
 - Prefer the most specific file(s); do not pad with tangential files. Most memories map to one file; some to a few.
 - When you genuinely cannot find any local backing and it is not clearly external, still emit the memory with independent="true" (do not drop it)."####;
 
+// Recorded inputs and outputs from the TypeScript functions at the revision
+// below. The TS test setup supplies memory snapshots, captures metadata writes,
+// permits lease-guarded writes, replays model completions and fixes the clock.
+// Parser, selection, prompt and apply logic execute from the pinned TS sources;
+// keep these expectations independent of the Rust implementation.
 #[cfg(test)]
 const TS_VECTORS: &str = r####"{
   "revision": "282d9c08bce490346583a3b8c145c402499f980f",
@@ -2802,6 +2814,7 @@ mod tests {
     use super::*;
     use crate::dream_runner::{CarrierError, ChildRequest, Completion, Usage};
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use std::collections::VecDeque;
 
     fn vectors() -> Value {
@@ -2916,7 +2929,14 @@ mod tests {
             v["classify"]
         );
         assert_eq!(build_map_prompt("/repo", &inputs), v["map"]);
-        assert!(CLASSIFY_SYSTEM_PROMPT.contains("scores at least 80"));
+        assert_eq!(
+            format!("{:x}", Sha256::digest(CLASSIFY_SYSTEM_PROMPT)),
+            "b288cfd1baad087ec20f23b44f747fbe1bad93807e91b0b1c6de8f2df0dddadb"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(MAP_MEMORIES_SYSTEM_PROMPT)),
+            "8c8c800f26411aedea708128875967244b8a940f82d8125a3ba15f35e5f817f1"
+        );
     }
     #[test]
     fn sensitive_text_stays_private_like_pinned_ts() {
