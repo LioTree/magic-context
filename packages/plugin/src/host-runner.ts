@@ -7,6 +7,7 @@ export {
     type BridgeFallbackInputs,
     type BridgeHostFact,
     type BridgeHostFactResult,
+    type BridgeMarkerInputs,
     type BridgeOutcomeListener,
     BridgeRefusalError,
     type BridgeRefusalReason,
@@ -27,6 +28,7 @@ export {
 export type { OpenCodeProviderOptions } from "./hooks/magic-context/host-runner/opencode-adapter";
 export * as record from "./hooks/magic-context/host-runner/record";
 export * from "./hooks/magic-context/host-runner/record";
+export type { MarkerEnvelope, MarkerToolDefinition } from "./hooks/magic-context/marker-envelope";
 export type { MessageLike } from "./hooks/magic-context/transform-operations";
 
 export type BridgeAdapter = Awaited<ReturnType<typeof createBridgeAdapter>>;

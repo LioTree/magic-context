@@ -1,5 +1,6 @@
 import { providerMass, resolveDecisionCalibration } from "../decision-calibration";
 import { measureLkgReplay } from "../lkg-fit-measure";
+import { boundMarkerEnvelope, type MarkerEnvelope } from "../marker-envelope";
 import type { MessageLike } from "../transform-operations";
 import { estimateByteBoundedMessageTokens, hasCountableParts } from "../wire-content";
 import type { BridgeNativeCut } from "./bridge-marker";
@@ -19,6 +20,8 @@ export interface FallbackInputs {
     /** Envelope token bounds, required when no provider count matches this exact request prefix. */
     systemPromptTokens?: number;
     toolDefinitionTokens?: number;
+    /** Final prompt/tool material used to prove a host history cut fits; usage may increase, never replace, the complete request bound. */
+    material?: MarkerEnvelope;
 }
 
 export type FallbackAdmissibility =
@@ -51,10 +54,11 @@ export function recordProviderUsage<P>(
 }
 
 /**
- * No provider, storage, session cache or tokenizer is consulted. Text uses the
- * fit estimator's UTF-8 upper-bound mode, with the same model token ratios
- * and independent wire-byte risk budget as Magic Context's saved-request fit guard. This can
- * decline a request a tokenizer would admit, but never borrows unrelated usage.
+ * No provider, storage or session cache is consulted. System/tool material uses
+ * the local tokenizer with measured model corrections. Message text is priced
+ * conservatively from its UTF-8 bytes, and the total message bytes must also fit
+ * an independent size limit. These upper bounds may decline a request an exact
+ * tokenizer would admit; unrelated provider usage can never authorize a cut.
  */
 export function isFallbackAdmissible<P>(
     record: RunnerRecord<MessageLike, P>,
@@ -208,6 +212,39 @@ export function isFallbackAdmissible<P>(
             slash > 0 ? input.model.slice(0, slash) : undefined,
             slash > 0 ? input.model.slice(slash + 1) : input.model,
         );
+        if (input.material) {
+            const envelopeTokens = boundMarkerEnvelope(input.material, input.model);
+            const estimateMessages = (rows: readonly MessageLike[]) =>
+                providerMass(
+                    rows.reduce(
+                        (mass, row) => {
+                            const count = estimateByteBoundedMessageTokens(row);
+                            mass.prose += count.conversation;
+                            mass.tools += count.toolCall;
+                            return mass;
+                        },
+                        { prose: 0, tools: 0 },
+                    ),
+                    calibration,
+                    true,
+                );
+            const measure = measureLkgReplay({
+                messages: view,
+                limit,
+                estimate: () => ({
+                    tokens: Math.max(
+                        (envelopeTokens ?? Number.POSITIVE_INFINITY) + estimateMessages(view),
+                        measured ? usage.input_tokens + estimateMessages(messages) : 0,
+                    ),
+                    trusted: envelopeTokens !== undefined && view.every(hasCountableParts),
+                }),
+            });
+            return measure.fit === "under"
+                ? { admissible: true, view }
+                : unproven(
+                      `Fallback fit ${measure.fit}: tokens=${measure.tokens ?? "unknown"}, limit=${limit}`,
+                  );
+        }
         const measure = measureLkgReplay({
             messages,
             limit,
