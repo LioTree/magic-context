@@ -1,17 +1,19 @@
 /**
- * OpenCode 1 bridge recovery after a refused pass, driven against the real Rust
- * module (the relay oracle's in-process McHandler) through the public bridge
- * adapter. The flow follows the THALAMUS relay trace of the failing run:
+ * OpenCode 1 bridge recovery after a refused pass. The real Rust module runs in
+ * process behind `startOracle()` and is driven through the public bridge adapter.
+ * The prompts follow the failing run of THALAMUS (the bridge host that relays
+ * requests between OpenCode and Magic Context):
  *
- *   BOOTSTRAP, ORDINARY, FROZEN served with tags; the DEADLINE prompt's hook
- *   answer is lost at the relay deadline (the module did commit it) and the pass
- *   is refused; OpenCode then stores an errored, empty assistant row for that
- *   turn; RECOVER_DEADLINE is the next prompt.
+ *   BOOTSTRAP, ORDINARY and FROZEN are served with tags. The DEADLINE prompt's hook
+ *   answer is lost at the relay deadline even though the module committed it, so
+ *   the pass is refused. OpenCode then stores an errored, empty assistant row for
+ *   that turn, and RECOVER_DEADLINE is the next prompt.
  *
- * THALAMUS records the system_prompt fact before each run() and never confirms
- * delivery, so every receipt stays pending (served_through_ordinal 0). The
- * session is enrolled as bridged, so the OpenCode 1 plugin's own hooks stand
- * down and only the bridge view reaches the provider.
+ * Like that host, the test records the system_prompt fact before each run() and
+ * never confirms delivery, so every receipt stays pending
+ * (served_through_ordinal 0). The session is enrolled as bridged, so the
+ * OpenCode 1 plugin's own hooks stand down and only the bridge view reaches the
+ * provider.
  */
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -290,9 +292,9 @@ test("OC1 bridge: a recovery run with no system_prompt fact is refused, then ser
     try {
         const frozen = await lane.throughDeadline();
         expect(frozen.system[0]!.length).toBeGreaterThan(HOST_SYSTEM.length);
-        // THALAMUS's failing run: no fact between the refused DEADLINE pass and
-        // RECOVER, so the host's raw system prompt would have gone out without the
-        // guidance that every earlier request carried.
+        // No fact is recorded between the refused DEADLINE pass and RECOVER. Served,
+        // this run would send the host's raw system prompt without the guidance
+        // that every earlier request carried.
         const refusal = await lane.prompt({ fact: false }).then(
             () => undefined,
             (error: unknown) => error,
