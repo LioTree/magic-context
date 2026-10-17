@@ -719,14 +719,17 @@ mod tests {
         let root = std::env::temp_dir().join("magic-context/broca-hook");
         std::fs::create_dir_all(&root).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
-        let store = Arc::new(McStore::open_for_test(&StorageDescriptor {
-            module_id: "magic-context".into(),
-            storage_namespace: "mc_cache".into(),
-            isolation: Isolation::Module,
-            backend: StorageBackend::Sqlite {
-                path: dir.path().join("store.db").to_string_lossy().into_owned(),
-            },
-        }).unwrap());
+        let store = Arc::new(
+            McStore::open_for_test(&StorageDescriptor {
+                module_id: "magic-context".into(),
+                storage_namespace: "mc_cache".into(),
+                isolation: Isolation::Module,
+                backend: StorageBackend::Sqlite {
+                    path: dir.path().join("store.db").to_string_lossy().into_owned(),
+                },
+            })
+            .unwrap(),
+        );
         let slot = Arc::new(OnceLock::new());
         assert!(slot.set(store.clone()).is_ok());
         let storage = records::Storage::new(slot);
@@ -756,7 +759,9 @@ mod tests {
             observed: false,
             tool_call_id: None,
         });
-        record.save_assistant_answer(&store, &storage, &key).unwrap();
+        record
+            .save_assistant_answer(&store, &storage, &key)
+            .unwrap();
         assert!(record.state.metadata_bytes >= payload.len() * 4);
         assert!(record.assistant_growth.is_none());
         record.publish();

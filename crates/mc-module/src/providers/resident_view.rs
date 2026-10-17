@@ -159,7 +159,10 @@ impl ResidentView {
 
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + serde_json::to_vec(&self.metadata).expect("view metadata JSON").len() * 4
+            + serde_json::to_vec(&self.metadata)
+                .expect("view metadata JSON")
+                .len()
+                * 4
             + self.metadata.engine.compaction_id.capacity()
             + self.metadata.engine.range.lineage_id.capacity()
             + self.metadata.wire.compaction_id.capacity()

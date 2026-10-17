@@ -387,11 +387,21 @@ impl McHandler {
             .map_err(StoreRefusal::into_outcome)?;
         let _serial = self.provider_serial.lock_for(&key).await;
         let _route = self.native_publication_fence(&binding)?;
-        let mut resident = self.provider_resident.begin(store.tag_cache_namespace(), &key).map_err(transient)?;
+        let mut resident = self
+            .provider_resident
+            .begin(store.tag_cache_namespace(), &key)
+            .map_err(transient)?;
         if let Some(lease) = resident.as_mut().filter(|lease| lease.cold) {
-            lease.state = store.read_provider_resident_policy(&key.store_key(), |index, counters| {
-                super::policy_summary::ResidentPolicy::rebuild(index, counters, 0, &binding.config.protected_tools)
-            }).map_err(transient)?;
+            lease.state = store
+                .read_provider_resident_policy(&key.store_key(), |index, counters| {
+                    super::policy_summary::ResidentPolicy::rebuild(
+                        index,
+                        counters,
+                        0,
+                        &binding.config.protected_tools,
+                    )
+                })
+                .map_err(transient)?;
             super::compaction::prime_resident_fold(&store, &key, &mut lease.state)?;
         }
         let held = store
@@ -1680,7 +1690,10 @@ impl McHandler {
                 .map_err(|_| session_unresolved_error())?;
             let key = self.provider_store.tool_key(&binding)?;
             let _serial = self.provider_serial.lock_for(&key).await;
-            let store = self.store_for_request().await.map_err(StoreRefusal::into_outcome)?;
+            let store = self
+                .store_for_request()
+                .await
+                .map_err(StoreRefusal::into_outcome)?;
             let mut record = self.runner_record(&store, &key)?;
             let needs_read = requested.iter().any(|n| {
                 record

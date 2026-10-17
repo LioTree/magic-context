@@ -395,7 +395,10 @@ pub(super) fn validate_replacement(
     lineage: &str,
 ) -> Result<(), HandlerOutcome> {
     validate_replacement_with(view, record, lineage, |message| {
-        record.messages.get(lineage).is_some_and(|entries| entries.values().any(|entry| entry.message == *message))
+        record
+            .messages
+            .get(lineage)
+            .is_some_and(|entries| entries.values().any(|entry| entry.message == *message))
     })
 }
 

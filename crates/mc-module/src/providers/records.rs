@@ -206,14 +206,27 @@ impl Storage {
     }
 
     pub(super) fn token(&self, key: &Key) -> Result<(u64, Option<u64>), HandlerOutcome> {
-        self.store()?.provider_record_token(&key.store_key()).map_err(transient)
+        self.store()?
+            .provider_record_token(&key.store_key())
+            .map_err(transient)
     }
 
-    pub(super) fn save_delta(&self, key: &Key, record: &Record, raw: &str, token: &(u64, Option<u64>)) -> Result<(), HandlerOutcome> {
+    pub(super) fn save_delta(
+        &self,
+        key: &Key,
+        record: &Record,
+        raw: &str,
+        token: &(u64, Option<u64>),
+    ) -> Result<(), HandlerOutcome> {
         self.save_inner(key, record, Some((token, raw)))
     }
 
-    fn save_inner(&self, key: &Key, record: &Record, delta: Option<(&(u64, Option<u64>), &str)>) -> Result<(), HandlerOutcome> {
+    fn save_inner(
+        &self,
+        key: &Key,
+        record: &Record,
+        delta: Option<(&(u64, Option<u64>), &str)>,
+    ) -> Result<(), HandlerOutcome> {
         // A host switch adopts the full-request engine namespace. Compatibility
         // saves must not silently move its tags and frozen state to a new one.
         let namespace = self
@@ -242,15 +255,14 @@ impl Storage {
             })
             .unwrap_or_default();
         if let Some((token, raw)) = delta {
-            return self.store()?.save_provider_record_delta(&key.store_key(), raw, &namespace, &tags, token).map_err(transient);
+            return self
+                .store()?
+                .save_provider_record_delta(&key.store_key(), raw, &namespace, &tags, token)
+                .map_err(transient);
         }
         let raw = serde_json::to_string(record).map_err(transient)?;
-        self.store()?.save_provider_record(
-                &key.store_key(),
-                &raw,
-                &namespace,
-                &tags,
-            )
+        self.store()?
+            .save_provider_record(&key.store_key(), &raw, &namespace, &tags)
             .map_err(transient)
     }
 

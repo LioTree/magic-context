@@ -60,12 +60,15 @@ fn runner_token(
          END;",
     )?;
     let version = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
-    let revision = conn.query_row(
-        "SELECT COALESCE(r.revision,0) FROM mc_provider_conversations_v2 c
+    let revision = conn
+        .query_row(
+            "SELECT COALESCE(r.revision,0) FROM mc_provider_conversations_v2 c
          LEFT JOIN temp.mc_runner_record_revisions r ON r.conv_key=c.conv_key
          WHERE c.conv_key=?1",
-        [key.conversation_key()], |row| row.get(0),
-    ).optional()?;
+            [key.conversation_key()],
+            |row| row.get(0),
+        )
+        .optional()?;
     Ok((version, revision))
 }
 
@@ -260,28 +263,50 @@ mod tests {
         let key = key("/project", "runner", "broca");
         assert_eq!(store.provider_record_token(&key).unwrap().1, None);
         let raw = r#"{"hook":{"answers":[],"live":{},"burned":[]},"last_answer":null}"#;
-        store.save_provider_record(&key, raw, "engine", &[]).unwrap();
+        store
+            .save_provider_record(&key, raw, "engine", &[])
+            .unwrap();
         let initial = store.provider_record_token(&key).unwrap();
-        store.save_provider_catalog("/project", "runner", r#"{"tools":[]}"#).unwrap();
+        store
+            .save_provider_catalog("/project", "runner", r#"{"tools":[]}"#)
+            .unwrap();
         let catalog = store.provider_record_token(&key).unwrap();
         assert_ne!(initial, catalog);
-        assert!(store.save_provider_record_delta(&key, raw, "engine", &[], &initial).is_err());
+        assert!(store
+            .save_provider_record_delta(&key, raw, "engine", &[], &initial)
+            .is_err());
         // Rolling back metadata changes also rolls back the runner token revision.
         let rollback: Result<(), _> = store.inner.with_conn_fenced(|tx| {
-            tx.execute("UPDATE mc_provider_conversations_v2 SET record_json='{}' WHERE conv_key=?1", [key.conversation_key()])?;
+            tx.execute(
+                "UPDATE mc_provider_conversations_v2 SET record_json='{}' WHERE conv_key=?1",
+                [key.conversation_key()],
+            )?;
             Err(rusqlite::Error::InvalidQuery)
         });
         assert!(rollback.is_err());
         assert_eq!(catalog, store.provider_record_token(&key).unwrap());
         let external = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
-        external.execute("UPDATE mc_provider_conversations_v2 SET record_json='{}' WHERE conv_key=?1", [key.conversation_key()]).unwrap();
+        external
+            .execute(
+                "UPDATE mc_provider_conversations_v2 SET record_json='{}' WHERE conv_key=?1",
+                [key.conversation_key()],
+            )
+            .unwrap();
         assert_ne!(catalog, store.provider_record_token(&key).unwrap());
-        store.inner.with_conn(|conn| {
-            conn.execute("DELETE FROM mc_provider_conversations_v2 WHERE conv_key=?1", [key.conversation_key()])?;
-            Ok(())
-        }).unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+                    [key.conversation_key()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(store.provider_record_token(&key).unwrap().1, None);
-        store.save_provider_record(&key, raw, "engine", &[]).unwrap();
+        store
+            .save_provider_record(&key, raw, "engine", &[])
+            .unwrap();
         assert_ne!(initial, store.provider_record_token(&key).unwrap());
     }
 
@@ -292,19 +317,25 @@ mod tests {
         let key = key("/project", "runner", "broca");
         let raw = serde_json::json!({"hook":{"high_water":9,"answers":[],"live":{},"burned":[]},
             "messages":{},"last_answer":{"large_view":"x".repeat(1_000_000)}});
-        store.save_provider_record(&key, &raw.to_string(), "engine", &[]).unwrap();
+        store
+            .save_provider_record(&key, &raw.to_string(), "engine", &[])
+            .unwrap();
         let token = store.provider_record_token(&key).unwrap();
         let answer = serde_json::json!({"subject":"subject","lineage":"L","answer":{"answer":"pass"},
             "rendered":["assistant text"],"tags":[],"cadence":false,"observed":false,"tool_call_id":null});
-        store.append_provider_runner_answer(&key, 0, &answer, &token).unwrap();
+        store
+            .append_provider_runner_answer(&key, 0, &answer, &token)
+            .unwrap();
         assert_eq!(token, store.provider_record_token(&key).unwrap());
         let mut expected = raw;
         expected["hook"]["answers"] = serde_json::json!([answer]);
-        let loaded: serde_json::Value = serde_json::from_str(&store.load_provider_record(&key).unwrap().unwrap()).unwrap();
+        let loaded: serde_json::Value =
+            serde_json::from_str(&store.load_provider_record(&key).unwrap().unwrap()).unwrap();
         assert_eq!(loaded, expected);
         drop(store);
         let reopened = McStore::open_for_test(&descriptor(dir.path())).unwrap();
-        let loaded: serde_json::Value = serde_json::from_str(&reopened.load_provider_record(&key).unwrap().unwrap()).unwrap();
+        let loaded: serde_json::Value =
+            serde_json::from_str(&reopened.load_provider_record(&key).unwrap().unwrap()).unwrap();
         assert_eq!(loaded, expected);
     }
 

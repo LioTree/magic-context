@@ -98,7 +98,10 @@ impl ResidentPolicy {
         // read_provider_resident_policy bounds input to 100,000 rows / 128 MiB
         // before allocating the temporary rebuild input.
         std::mem::size_of::<Self>()
-            + self.runner.as_ref().map_or(0, |runner| runner.retained_bytes())
+            + self
+                .runner
+                .as_ref()
+                .map_or(0, |runner| runner.retained_bytes())
             + crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES
             + std::mem::size_of::<Mutex<transform::SerializedOutputCache>>()
             + self
