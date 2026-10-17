@@ -1329,7 +1329,8 @@ fn broca_conformance_cap_cases_are_pinned() {
         assert!(CAP_CASES.contains(&format!("\"{case}\"")), "{case}");
     }
     // The sixth case, input_token_cap_restart_between_episodes, is named in the
-    // crate's src/runner.rs, which calls this file's `restart` function.
+    // conformance crate's src/runner.rs, which calls the vendored file's
+    // `restart` function, so that function stands in for the name here.
     assert!(CAP_CASES.contains("pub async fn restart<S>("));
 }
 
