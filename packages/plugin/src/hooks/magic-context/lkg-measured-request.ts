@@ -107,6 +107,8 @@ export function currentLkgRequestIdentity(sessionId: string): LkgRequestIdentity
 export function noteCapturedLkgRequest(args: {
     sessionId: string;
     slot: LkgSlot;
+    /** Length of the plain output array serialized into this slot, when already known. */
+    prefixMessageCount?: number;
     request?: LkgRequestIdentity;
     systemPromptTokens: number;
     agentName?: string;
@@ -119,7 +121,8 @@ export function noteCapturedLkgRequest(args: {
     captures.set(args.sessionId, {
         request,
         slot: identity(args.slot),
-        prefixCount: (JSON.parse(args.slot.jsonPrefix) as unknown[]).length,
+        prefixCount:
+            args.prefixMessageCount ?? (JSON.parse(args.slot.jsonPrefix) as unknown[]).length,
         envelope: envelope(request.modelKey, args.systemPromptTokens, args.agentName),
     });
 }
