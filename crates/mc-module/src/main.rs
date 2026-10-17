@@ -68,6 +68,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         "mc-module: log permission tightening"
     );
     let connection_file = parse_subc_arg(std::env::args_os().skip(1))?;
+    // Engram backs up this data folder only from the catalog file in it, so the
+    // catalog is published before serving. A failure is logged inside and never
+    // stops startup.
+    if let Some(data_dir) = mc_module::host_store::resolve_context_db_path().parent() {
+        let _ = mc_module::engram_catalog::write_catalog_at_startup(data_dir);
+    }
     // The runner settings are user-tier only, so one resolution covers every project
     // this process serves. The manifest's background-completion routes and
     // self-signals follow it: when every role is configured to the host runner, no
