@@ -26,6 +26,7 @@ pub mod context_schema;
 pub mod context_writes;
 pub mod dream_domain;
 pub mod dream_memory;
+pub mod dream_retrospective;
 pub mod dream_scheduler;
 pub mod git_archive;
 mod historian_claim;
