@@ -32,11 +32,14 @@ use serde_json::Value;
 use super::retrospective_host::SessionReader;
 use crate::dream_tasks::retrospective::{Message, ScanOptions, SessionRead};
 
+/// Source messages read per session and run; the TypeScript provider's
 /// `RETROSPECTIVE_MAX_MESSAGES_PER_SESSION`.
 pub const MAX_MESSAGES_PER_SESSION: usize = 80;
+/// Sessions read per run, oldest pending first; the TypeScript provider's
 /// `RETROSPECTIVE_MAX_SESSIONS_PER_RUN`.
 pub const MAX_SESSIONS_PER_RUN: usize = 20;
-/// `RETROSPECTIVE_OVERLAP_USER_LINES` in task-executor.ts.
+/// Prior user lines re-read from before the watermark, so friction spanning two
+/// runs is seen; `RETROSPECTIVE_OVERLAP_USER_LINES` in task-executor.ts.
 pub const OVERLAP_USER_LINES: usize = 12;
 
 const OMO_INTERNAL_INITIATOR_MARKER: &str = "<!-- OMO_INTERNAL_INITIATOR -->";
@@ -382,9 +385,11 @@ pub fn retrospective_inputs(
     (reader, options, collection)
 }
 
-/// `RETROSPECTIVE_MAX_MESSAGES_PER_RUN`.
+/// Messages admitted into one run's window across all sessions; the TypeScript
+/// provider's `RETROSPECTIVE_MAX_MESSAGES_PER_RUN`.
 pub const MAX_MESSAGES_PER_RUN: usize = 240;
-/// `RETROSPECTIVE_DEFAULT_USABLE_INPUT_TOKENS` in task-executor.ts.
+/// The model input budget the window is admitted against when no model catalog
+/// entry is known; `RETROSPECTIVE_DEFAULT_USABLE_INPUT_TOKENS` in task-executor.ts.
 pub const DEFAULT_USABLE_INPUT_TOKENS: usize = 128_000;
 
 /// The archive's own tables, as `mc_store::archive_index` store.rs installs them,

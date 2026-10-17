@@ -651,7 +651,8 @@ mod tests {
         let provenance = fixture.store.load_dream_primers("project").unwrap().primers[0]
             ["sourceProvenance"]
             .clone();
-        // The TypeScript-shaped column reads back as the planner's list.
+        // The fixture stores source_candidate_provenance in the TypeScript
+        // snake-case shape; the snapshot reads it back as camel-case entries.
         assert_eq!(provenance[0]["candidateId"], 1, "{provenance}");
         let mut host = fixture.host();
         assert!(matches!(

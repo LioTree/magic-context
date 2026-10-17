@@ -179,7 +179,8 @@ async fn retrospective_and_primers_are_never_published_by_the_production_wiring(
                 "{published}"
             );
         }
-        // The plugin route reads the same list, so TypeScript keeps running them.
+        // The plugin route reads the same published list, so the TypeScript
+        // dreamer behind it keeps running these three tasks.
         assert_eq!(
             p.call(PLUGIN, json!({"method": "dream.ownership"})).await["published"],
             published["published"]
