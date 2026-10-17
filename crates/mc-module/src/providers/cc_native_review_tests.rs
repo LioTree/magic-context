@@ -209,7 +209,7 @@ fn snapshot(h: &McHandler, key: &Key) -> Value {
         "conversation":store.load_provider_conversation(&key.store_key()).unwrap(),
         "messages":store.load_provider_messages(&key.store_key(),"L").unwrap().iter().map(|message|json!([message.mid,message.ordinal,message.message_bytes])).collect::<Vec<_>>(),
         "lineage":format!("{:?}",store.load_provider_lineage(&key.store_key(),"L").unwrap()),
-        "views":format!("{:?}",crate::providers::view_recipe::stored_views(&store,&key.store_key())),
+        "views":format!("{:?}",crate::providers::view_recipe::stored_views(store,&key.store_key())),
         "hooks":format!("{:?}",store.load_provider_hook_answers(&key.store_key()).unwrap()),
         "engine":format!("{:?}",store.load(&key.engine_key()).unwrap()),
     })
@@ -339,7 +339,7 @@ async fn review_witness_old_generation_view_read_refuses_after_rebind() {
     store
         .save_provider_conversation(&old_key.store_key(), &conversation)
         .unwrap();
-    crate::providers::view_recipe::save_host(&store, &old_key, &host, "produced").unwrap();
+    crate::providers::view_recipe::save_host(store, &old_key, &host, "produced").unwrap();
     let frozen = host.wire.raw_view.as_ref().unwrap();
     let params = json!({"request_id":"read","view_id":frozen.view.view_id,"version":frozen.view.version,"sha256":frozen.view.sha256,"byte_cursor":0});
     let HandlerOutcome::Response(bytes) =

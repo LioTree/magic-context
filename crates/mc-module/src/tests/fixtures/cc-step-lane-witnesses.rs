@@ -394,7 +394,7 @@ async fn provider_committed_replacement_keeps_noncanonical_unsigned_tail() {
             "seed {seed}: {answer}"
         );
         let committed = crate::providers::view_recipe::stored_view(
-            &store,
+            store,
             &key.store_key(),
             answer["compaction"]["version"].as_u64().unwrap(),
         )

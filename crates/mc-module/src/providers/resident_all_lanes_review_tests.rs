@@ -117,7 +117,7 @@ fn persisted(h: &McHandler, cc: bool, directory: &Path) -> Value {
         "messages": store.load_provider_messages(&k.store_key(), &conversation.lineage_id).unwrap().iter().map(|message| json!({"ordinal":message.ordinal,"mid":message.mid,"bytes":message.message_bytes})).collect::<Vec<_>>(),
         "hook_answers": store.load_provider_hook_answers(&k.store_key()).unwrap().iter().map(|answer| json!({"subject":format!("{:?}",answer.answer.subject),"lineage":answer.lineage_id,"state":answer.state,"ordinal":answer.answer.ordinal,"ops":answer.answer.ops_json,"tags":answer.answer.tags})).collect::<Vec<_>>(),
         "conversation": conversation,
-        "views": crate::providers::view_recipe::stored_views(&store, &k.store_key()).iter().map(|view| json!({"version":view.version,"lineage_id":view.lineage_id,"range_from":view.range_from,"range_to":view.range_to,"replacement_json":view.replacement_json,"state":view.state})).collect::<Vec<_>>(),
+        "views": crate::providers::view_recipe::stored_views(store, &k.store_key()).iter().map(|view| json!({"version":view.version,"lineage_id":view.lineage_id,"range_from":view.range_from,"range_to":view.range_to,"replacement_json":view.replacement_json,"state":view.state})).collect::<Vec<_>>(),
         "tags": store.load_tags_for_session(&k.engine_key()).unwrap().iter().map(|tag| json!({"tag_number":tag.tag_number,"block_id":tag.block_id,"kind":tag.kind,"token_count":tag.token_count,"source_bytes":tag.source_bytes.as_ref()})).collect::<Vec<_>>(),
         "core": state.core,
         "meta": state.meta,

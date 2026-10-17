@@ -316,7 +316,7 @@ async fn cc_cache_policy_is_frozen_and_cold_rebuild_exposes_committed_head_bytes
     assert_eq!(answer["answer"], "compaction_message");
     assert_eq!(answer["cache_policy"], ready["cache_policy"]);
     let row = crate::providers::view_recipe::stored_view(
-        &store,
+        store,
         &key.store_key(),
         answer["compaction"]["version"].as_u64().unwrap(),
     )
