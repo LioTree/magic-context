@@ -39,6 +39,8 @@ mod runner_resident;
 mod step_transform;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod view_gc_lineage_tests;
 mod view_recipe;
 
 use codec::decode_message;

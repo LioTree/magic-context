@@ -348,6 +348,27 @@ fn answer_receipt(answer: &Value) -> String {
     } else {value.clone()})).collect()).to_string()
 }
 
+/// The conversation's single receipt names only the last stepping lineage's
+/// view. Record per lineage which view this step answered (or that it answered
+/// none), so pruning and the native view read keep that view until the same
+/// lineage steps again, while a fork or parent of it steps in between. See
+/// `mc_store::LINEAGE_ANSWERED_VIEWS`.
+fn record_answered_view(
+    conversation: &mut ProviderConversation,
+    lineage_id: &str,
+    answer: &Value,
+) -> Result<(), HandlerOutcome> {
+    let mut counters: Value =
+        serde_json::from_str(&conversation.hook_counters_json).map_err(transient)?;
+    mc_store::record_lineage_answered_view(
+        &mut counters,
+        lineage_id,
+        answer.pointer("/compaction/version").and_then(Value::as_u64),
+    );
+    conversation.hook_counters_json = counters.to_string();
+    Ok(())
+}
+
 fn save_host_setup(
     store: &McStore,
     key: &Key,
@@ -2162,6 +2183,7 @@ impl McHandler {
             conversation.wait_request = None;
             let answer = json!({"answer":"wait","request_id":request.request_id,"reason":"Awaiting the next host status page","bound_ms":1});
             conversation.last_answer_json = Some(answer.to_string());
+            record_answered_view(&mut conversation, &lineage.lineage_id, &answer)?;
             save_host_setup(store, &work.key, &mut conversation, &setup)?;
             fault("WaitAnswered");
             fault("AnswerRecorded");
@@ -2377,6 +2399,7 @@ impl McHandler {
         conversation.cursor_frontier = frontier;
         conversation.wait_request = None;
         conversation.last_answer_json = Some(answer_receipt(&answer));
+        record_answered_view(&mut conversation, &lineage.lineage_id, &answer)?;
         save_host_setup(store, &work.key, &mut conversation, &setup)?;
         fault("AnswerRecorded");
         if params

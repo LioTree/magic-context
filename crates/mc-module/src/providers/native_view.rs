@@ -1,5 +1,7 @@
 //! Immutable Anthropic replacement bytes belong to one route's project/session,
 //! codec/provider generation and transcript branch; another route cannot borrow them.
+//! The branch a view belongs to is the lineage it was built on, not the lineage
+//! that stepped last (see `provider_native_view_read`).
 use super::*;
 use compact::view::{
     FrozenView, NativeEndpoint, RawPayload, ViewReadAnswer, ViewReadRefusal, ViewReadRequest,
@@ -256,9 +258,20 @@ impl McHandler {
             let host = super::view_recipe::load(&store, &key, request.version)
                 .map_err(|_| ViewReadRefusal::InvalidView)?
                 .ok_or(ViewReadRefusal::UnknownVersion)?;
-            if host.engine.version != request.version
-                || host.engine.range.lineage_id != conversation.lineage_id
-            {
+            // Replacement bytes are served only for their own transcript branch,
+            // and the anchor is the view's own lineage, not whichever lineage
+            // stepped last: a fork and its parent step in turn, and each reads
+            // the view its own step was just answered with. So a view is
+            // readable when it is on the conversation's current lineage, or
+            // when it is the view its own, still-held lineage was named in its
+            // newest step answer. The read request does not identify the
+            // reader's lineage, so the second case is decided by the view alone.
+            let answered = store
+                .provider_lineage_answered_views(&key.store_key())
+                .map_err(|_| ViewReadRefusal::InvalidView)?;
+            let own_branch = host.engine.range.lineage_id == conversation.lineage_id
+                || answered.get(&host.engine.range.lineage_id) == Some(&request.version);
+            if host.engine.version != request.version || !own_branch {
                 return Err(ViewReadRefusal::UnknownVersion);
             }
             validate(&key, &host).map_err(|_| ViewReadRefusal::InvalidView)?;

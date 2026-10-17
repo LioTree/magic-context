@@ -15,6 +15,67 @@ mod tests;
 pub const MAX_VIEW_BASE_DEPTH: usize = 16;
 pub const MAX_VIEW_ANCESTOR_BYTES: usize = 8 * 1024 * 1024;
 
+/// Key in a conversation's `hook_counters_json`: an object mapping each lineage
+/// ID to the view version named in that lineage's newest step answer.
+///
+/// The conversation keeps one step receipt, so when two lineages of one
+/// conversation (a fork and its parent) step in turn, the receipt names only
+/// the last one. A host reads a view right after the step that answered it,
+/// so the version each lineage was last answered must stay readable, and kept
+/// by pruning, until that same lineage steps again. The map holds at most one
+/// version per lineage. An entry counts only while its lineage row is still
+/// held, so removing a lineage releases its view.
+pub const LINEAGE_ANSWERED_VIEWS: &str = "lineage_answered_views";
+
+/// Record in parsed hook counters the view a lineage's step answer named.
+/// `None` (an answer naming no view) clears the lineage's entry: its earlier
+/// answer is superseded by this step.
+pub fn record_lineage_answered_view(counters: &mut Value, lineage_id: &str, version: Option<u64>) {
+    let Some(fields) = counters.as_object_mut() else {
+        return;
+    };
+    let entry = fields
+        .entry(LINEAGE_ANSWERED_VIEWS)
+        .or_insert_with(|| Value::Object(Default::default()));
+    if !entry.is_object() {
+        *entry = Value::Object(Default::default());
+    }
+    let map = entry.as_object_mut().expect("object");
+    match version {
+        Some(version) => {
+            map.insert(lineage_id.to_string(), Value::from(version));
+        }
+        None => {
+            map.remove(lineage_id);
+        }
+    }
+}
+
+/// The per-lineage answered views in parsed hook counters whose lineage is
+/// still held by the conversation.
+fn lineage_answered_views_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+    counters: &Value,
+) -> Result<BTreeMap<String, u64>, ProviderError> {
+    let mut held = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",
+    )?;
+    let mut answered = BTreeMap::new();
+    let Some(map) = counters.get(LINEAGE_ANSWERED_VIEWS).and_then(Value::as_object) else {
+        return Ok(answered);
+    };
+    for (lineage, version) in map {
+        let Some(version) = version.as_u64() else {
+            continue;
+        };
+        if held.query_row(params![conv, lineage], |r| r.get::<_, bool>(0))? {
+            answered.insert(lineage.clone(), version);
+        }
+    }
+    Ok(answered)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderViewSegment {
@@ -259,6 +320,41 @@ impl McStore {
             raw.map(|raw|serde_json::from_str(&raw).map_err(|_|rusqlite::Error::InvalidQuery)).transpose()
         }).map_err(|error|ProviderError::Storage(error.into()))
     }
+    /// The view version each still-held lineage of the conversation was named
+    /// in its newest step answer. See `LINEAGE_ANSWERED_VIEWS`.
+    pub fn provider_lineage_answered_views(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<BTreeMap<String, u64>, ProviderError> {
+        let mut refusal = None;
+        self.inner
+            .with_conn(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                let conv = key.conversation_key();
+                let read = || -> Result<BTreeMap<String, u64>, ProviderError> {
+                    let counters: Option<String> = tx
+                        .query_row(
+                            "SELECT hook_counters_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+                            [&conv],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let Some(counters) = counters else {
+                        return Ok(BTreeMap::new());
+                    };
+                    let counters: Value = serde_json::from_str(&counters).map_err(invalid)?;
+                    lineage_answered_views_tx(&tx, &conv, &counters)
+                };
+                let answered = read().map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })?;
+                tx.commit()?;
+                Ok(answered)
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
+    }
+
     /// List stored model-view recipe versions without decoding native message bodies.
     pub fn load_provider_view_recipe_versions(
         &self,
@@ -517,6 +613,9 @@ pub(crate) fn prune_tx(
 /// - host Setup's applied and produced summaries (acknowledgements and the
 ///   not-applied replay of the produced view);
 /// - the last step or Setup receipt (a retried request answers from it);
+/// - the view each still-held lineage was named in its newest step answer
+///   (`LINEAGE_ANSWERED_VIEWS`), which the receipt alone loses once a sibling
+///   lineage of the same conversation steps;
 /// - last-known-good request versions, including the two newest applied rows,
 ///   because the host keeps the previous applied request until it saves the
 ///   newly acknowledged one;
@@ -556,6 +655,7 @@ pub(crate) fn view_roots_tx(
     if let Some(lkg) = counters.get("lkg_view_versions").and_then(Value::as_array) {
         roots.extend(lkg.iter().filter_map(Value::as_u64));
     }
+    roots.extend(lineage_answered_views_tx(conn, conv, &counters)?.into_values());
     let mut q = conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 AND state='applied' ORDER BY version DESC LIMIT 2")?;
     for version in q.query_map([conv], |r| r.get::<_, u64>(0))? {
         roots.insert(version?);

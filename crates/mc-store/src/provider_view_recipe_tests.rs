@@ -154,6 +154,104 @@ fn v2_recipe_keeps_ack_lkg_receipt_source_roots() {
     }
 }
 
+fn set_answered(store: &McStore, key: &ProviderSessionKey, lineage: &str, version: Option<u64>) {
+    let conversation = store.load_provider_conversation(key).unwrap().unwrap();
+    let mut counters: Value = serde_json::from_str(&conversation.hook_counters_json).unwrap();
+    record_lineage_answered_view(&mut counters, lineage, version);
+    store
+        .inner
+        .with_conn_fenced(|conn| {
+            conn.execute(
+                "UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1",
+                params![key.conversation_key(), counters.to_string()],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+}
+
+fn roots(store: &McStore, key: &ProviderSessionKey) -> BTreeSet<u64> {
+    store.provider_view_source_roots(key).unwrap().versions
+}
+
+/// The view each lineage was named in its newest step answer is a root while
+/// that lineage is held; the lineage's next answer replaces or clears it, so
+/// the older view is pruned, and removing the lineage releases it. The entries
+/// live in the conversation row and survive a cold reopen.
+#[test]
+fn lineage_answered_views_are_roots_until_superseded_or_retired() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let key = key("lineages", "claude-code");
+    seed_conversation(&store, &key);
+    store
+        .inner
+        .with_conn_fenced(|conn| {
+            conn.execute(
+                "INSERT INTO mc_provider_lineages_v1 VALUES (?1,'F',1,'L',0,json_extract(?1,'$[1]'))",
+                [key.conversation_key()],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+    for version in 1..=4 {
+        store
+            .save_provider_view_recipe(&key, &recipe(version, None, "produced"))
+            .unwrap();
+    }
+    set_answered(&store, &key, "L", Some(2));
+    set_answered(&store, &key, "F", Some(3));
+    assert_eq!(
+        store.provider_lineage_answered_views(&key).unwrap(),
+        BTreeMap::from([("F".to_string(), 3), ("L".to_string(), 2)])
+    );
+    assert_eq!(roots(&store, &key), BTreeSet::from([2, 3]));
+    assert_eq!(store.prune_provider_views_from_conversation(&key).unwrap(), 2);
+    assert_eq!(store.load_provider_view_recipe_versions(&key).unwrap(), vec![2, 3]);
+
+    // L steps again and is answered with view 5: its earlier view 2 goes.
+    store.save_provider_view_recipe(&key, &recipe(5, None, "produced")).unwrap();
+    set_answered(&store, &key, "L", Some(5));
+    assert_eq!(roots(&store, &key), BTreeSet::from([3, 5]));
+    assert_eq!(store.prune_provider_views_from_conversation(&key).unwrap(), 1);
+    assert_eq!(store.load_provider_view_recipe_versions(&key).unwrap(), vec![3, 5]);
+    // L steps again and the answer names no view: view 5 goes as well.
+    set_answered(&store, &key, "L", None);
+    assert_eq!(roots(&store, &key), BTreeSet::from([3]));
+    assert_eq!(store.prune_provider_views_from_conversation(&key).unwrap(), 1);
+    assert_eq!(store.load_provider_view_recipe_versions(&key).unwrap(), vec![3]);
+
+    // A cold reopen reads the same per-lineage roots from the conversation row.
+    drop(store);
+    let store = open(dir.path());
+    assert_eq!(
+        store.provider_lineage_answered_views(&key).unwrap(),
+        BTreeMap::from([("F".to_string(), 3)])
+    );
+    assert_eq!(roots(&store, &key), BTreeSet::from([3]));
+
+    // Removing lineage F releases its view even though the entry remains.
+    store.save_provider_view_recipe(&key, &recipe(8, None, "produced")).unwrap();
+    set_answered(&store, &key, "L", Some(8));
+    store
+        .inner
+        .with_conn_fenced(|conn| {
+            conn.execute(
+                "DELETE FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id='F'",
+                [key.conversation_key()],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+    assert_eq!(
+        store.provider_lineage_answered_views(&key).unwrap(),
+        BTreeMap::from([("L".to_string(), 8)])
+    );
+    assert_eq!(roots(&store, &key), BTreeSet::from([8]));
+    assert_eq!(store.prune_provider_views_from_conversation(&key).unwrap(), 1);
+    assert_eq!(store.load_provider_view_recipe_versions(&key).unwrap(), vec![8]);
+}
+
 fn move_binding(cut: &str) -> crate::move_store::CutBinding {
     crate::move_store::CutBinding {
         cut_id: cut.into(),
