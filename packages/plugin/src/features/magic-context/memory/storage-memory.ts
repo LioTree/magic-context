@@ -1137,6 +1137,22 @@ function normalizeImportance(value: number): number {
     return Math.max(1, Math.min(100, Math.round(value)));
 }
 
+export function inheritMemorySafety(
+    sources: readonly Pick<Memory, "safetyCritical">[],
+    importance: number | null,
+): { safetyCritical: number | null; importance: number | null } {
+    // Unknown assessments must be retried; only unanimously assessed sources can establish false.
+    const safetyCritical = sources.some((source) => source.safetyCritical === 1)
+        ? 1
+        : sources.length > 0 && sources.every((source) => source.safetyCritical === 0)
+          ? 0
+          : null;
+    return {
+        safetyCritical,
+        importance: safetyCritical === 1 ? Math.max(importance ?? 50, 80) : importance,
+    };
+}
+
 export function setMemoryClassification(
     db: Database,
     id: number,

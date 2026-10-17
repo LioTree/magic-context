@@ -33216,7 +33216,7 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let resolver =
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, dir, project) =
+        let (handler, store, _dir, project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         let route = project.to_str().unwrap();
         let identity = "git:safety-module";
@@ -33237,13 +33237,13 @@ mod tests {
                 )
             })
             .collect();
-        let context_path = store.with_context_conn_for_test(|conn| {
+        store.with_context_conn_for_test(|conn| {
             conn.execute("UPDATE memories SET scope='ecosystem',shareable=0,source_type='historian'", [])?;
             conn.execute("UPDATE memories SET importance=95,classified_at=1 WHERE id=?1", [ids[1]])?;
             for id in [ids[0], ids[2]] {
                 conn.execute("INSERT INTO memory_classification_items(project_path,memory_id,saved_revision,source_session_id,tool_call_part_id,save_ordinal,excerpt) VALUES(?1,?2,1,'ses',?3,1,'excerpt')", params![identity, id, format!("part-{id}")])?;
             }
-            Ok(conn.path().unwrap().to_string())
+            Ok(())
         }).unwrap();
         store
             .record_memory_item_scores(
@@ -33260,31 +33260,25 @@ mod tests {
             store.get_memory_full(ids[0]).unwrap().unwrap().importance,
             Some(40)
         );
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
+        let selected: Value = serde_json::from_str(include_str!(
+            "../testdata/safety_critical_classify_selection.json"
+        ))
+        .unwrap();
+        // TypeScript's fixture test runs the classifier selector. Rust checks the active-memory
+        // read and applies the shared fixture rows through the real classification RPC.
+        let mut prompted: Vec<i64> = store
+            .load_active_memories(identity, 3)
             .unwrap()
-            .parent()
-            .unwrap();
-        let output = std::process::Command::new("bun")
-            .arg(root.join("packages/plugin/src/features/magic-context/dreamer/safety-critical-classify.fixture.ts"))
-            .args([&context_path, identity]).current_dir(root)
-            .env("HOME", dir.path()).env("XDG_DATA_HOME", dir.path())
-            .env("XDG_CONFIG_HOME", dir.path()).env("MAGIC_CONTEXT_LOG_PATH", dir.path().join("fixture.log"))
-            .env("NODE_ENV", "test").output().expect("run TypeScript selection fixture");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let selected: Value = serde_json::from_slice(&output.stdout).expect("selection JSON");
-        let mut prompted: Vec<i64> = selected["prompted"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|id| id.as_i64().unwrap())
+            .into_iter()
+            .map(|memory| memory.id)
             .collect();
         prompted.sort_unstable();
-        assert_eq!(prompted, ids, "{selected}");
+        assert_eq!(json!(prompted), selected["prompted"]);
+        let scored_inputs = ids.iter().map(|id| {
+            let row = store.get_memory_full(*id).unwrap().unwrap();
+            json!({"memory_id": row.id, "importance": row.importance, "classified_at": row.classified_at})
+        }).collect::<Vec<_>>();
+        assert_eq!(json!(scored_inputs), selected["scored_inputs"]);
         let mut submitted: Vec<i64> = selected["rows"]
             .as_array()
             .unwrap()

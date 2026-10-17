@@ -19,7 +19,6 @@ import { lifecycleTextHash } from "./lifecycle-text";
 import { getMemoryById, insertMemory, setMemoryClassification } from "./storage-memory";
 import { recordItemScores } from "./turn-two-scoring";
 
-const witnesses = process.env.MC_S02_WITNESSES === "1";
 function fixture() {
     const db = new Database(":memory:");
     initializeDatabase(db);
@@ -87,62 +86,56 @@ for (const [writer, apply] of [
     ["agent", applyAgentMemoryMutation],
     ["curate", applyCurateMemoryMutation],
 ] as const) {
-    test.skipIf(!witnesses)(
-        `s02 P1: ${writer} merge retains safety and floor on the canonical successor`,
-        () => {
-            const f = fixture();
-            try {
-                const result = apply(f.db, {
-                    key: `${writer}-merge`,
-                    projectPath: f.projectPath,
-                    sourceSessionId: "ses-review",
-                    operation: "merge",
-                    targets: [
-                        { id: f.rule.id, revision: 1 },
-                        { id: f.other.id, revision: 1 },
-                    ],
-                    content: "Never push without approval. Use the release branch for releases.",
-                });
-                expect(result.state).toBe("applied");
-                const successor = getMemoryById(f.db, result.memoryId!);
-                console.log(`${writer} merge successor`, {
-                    safety: successor?.safetyCritical,
-                    importance: successor?.importance,
-                });
-                expect(successor).toMatchObject({ safetyCritical: 1, importance: 80 });
-            } finally {
-                f.db.close();
-            }
-        },
-    );
-}
-
-test.skipIf(!witnesses)(
-    "s02 P1: identity collision cannot copy a low score onto a safety-critical target",
-    () => {
+    test(`s02 P1: ${writer} merge retains safety and floor on the canonical successor`, () => {
         const f = fixture();
         try {
-            const source = insertMemory(f.db, {
-                projectPath: "dir:old-s02",
-                category: "PROJECT_RULES",
-                content: f.rule.content,
+            const result = apply(f.db, {
+                key: `${writer}-merge`,
+                projectPath: f.projectPath,
+                sourceSessionId: "ses-review",
+                operation: "merge",
+                targets: [
+                    { id: f.rule.id, revision: 1 },
+                    { id: f.other.id, revision: 1 },
+                ],
+                content: "Never push without approval. Use the release branch for releases.",
             });
-            setMemoryClassification(f.db, source.id, { importance: 20, safetyCritical: false });
-            f.db.prepare("UPDATE memories SET classified_at=1 WHERE id=?").run(f.rule.id);
-            f.db.prepare("UPDATE memories SET classified_at=2 WHERE id=?").run(source.id);
-            mergeProjectIdentities(f.db, "dir:old-s02", f.projectPath, { now: 100 });
-            const target = getMemoryById(f.db, f.rule.id);
-            expect(target?.safetyCritical).toBe(1);
-            console.log("identity collision target", {
-                safety: target?.safetyCritical,
-                importance: target?.importance,
+            expect(result.state).toBe("applied");
+            const successor = getMemoryById(f.db, result.memoryId!);
+            console.log(`${writer} merge successor`, {
+                safety: successor?.safetyCritical,
+                importance: successor?.importance,
             });
-            expect(target?.importance).toBeGreaterThanOrEqual(80);
+            expect(successor).toMatchObject({ safetyCritical: 1, importance: 80 });
         } finally {
             f.db.close();
         }
-    },
-);
+    });
+}
+
+test("s02 P1: identity collision cannot copy a low score onto a safety-critical target", () => {
+    const f = fixture();
+    try {
+        const source = insertMemory(f.db, {
+            projectPath: "dir:old-s02",
+            category: "PROJECT_RULES",
+            content: f.rule.content,
+        });
+        setMemoryClassification(f.db, source.id, { importance: 20, safetyCritical: false });
+        f.db.prepare("UPDATE memories SET classified_at=1 WHERE id=?").run(f.rule.id);
+        f.db.prepare("UPDATE memories SET classified_at=2 WHERE id=?").run(source.id);
+        mergeProjectIdentities(f.db, "dir:old-s02", f.projectPath, { now: 100 });
+        const target = getMemoryById(f.db, f.rule.id);
+        expect(target?.safetyCritical).toBe(1);
+        console.log("identity collision target", {
+            safety: target?.safetyCritical,
+            importance: target?.importance,
+        });
+        expect(target?.importance).toBeGreaterThanOrEqual(80);
+    } finally {
+        f.db.close();
+    }
+});
 
 test("s02 review: update, dashboard edit, archive and audited undo preserve an assessed floor", () => {
     const f = fixture();
@@ -211,86 +204,82 @@ test("s02 review: update, dashboard edit, archive and audited undo preserve an a
     }
 });
 
-test.skipIf(!witnesses)(
-    "s02 P1: historian merge carries a retained safety clause into the survivor assessment",
-    async () => {
-        const f = fixture();
-        try {
-            const text = "Use the release branch for explicit releases.";
-            const evidence = { blockStartOrdinal: 42, excerpt: text };
-            const profile = {
-                provider: "review",
-                modelId: "review",
-                variant: null,
-                temperature: 0,
-                systemHash: "historian",
-            };
-            const sources = [f.rule.id, f.other.id].map((id) => ({
-                ...getMemoryById(f.db, id)!,
-                revision: 1,
-            }));
-            const receipt = await applyHistorianRevision(
-                f.db,
-                {
-                    key: "historian-merge",
-                    action: "merge",
-                    projectPath: f.projectPath,
-                    expectedSources: sources.map((s) => ({ id: s.id, revision: s.revision })),
-                    survivorId: f.other.id,
-                    finalText: `${text} ${f.rule.content}`,
-                    changes: [{ memoryId: f.other.id, ordinal: 1, replacement: true, evidence }],
-                    added: [{ text: `${text} `, evidence }],
-                },
-                {
-                    memoryEnabled: true,
-                    autoPromote: true,
-                    enabled: true,
-                    enforcedJson: true,
-                    anchorKnown: true,
-                    blocks: [
-                        {
-                            startOrdinal: 42,
-                            endOrdinal: 42,
-                            role: "user",
-                            parts: [text],
-                            joinedText: text,
-                        },
-                    ],
-                    sources,
-                    historianProfile: profile,
-                    validatedProfiles: [
-                        profile,
-                        ...Object.values(CHECK_SYSTEM_PROMPTS).map((system) => ({
-                            ...profile,
-                            systemHash: lifecycleTextHash(system),
-                        })),
-                    ],
-                },
-                { sessionId: "ses-review", harness: "review" },
-                async (request) => ({
-                    profile: { ...profile, systemHash: request.systemHash },
-                    usage: { tokens: 1 },
-                    verdicts: (request.kind === "compatibility"
-                        ? request.pairs
-                        : request.operands
-                    ).map((operand) => ({
+test("s02 P1: historian merge carries a retained safety clause into the survivor assessment", async () => {
+    const f = fixture();
+    try {
+        const text = "Use the release branch for explicit releases.";
+        const evidence = { blockStartOrdinal: 42, excerpt: text };
+        const profile = {
+            provider: "review",
+            modelId: "review",
+            variant: null,
+            temperature: 0,
+            systemHash: "historian",
+        };
+        const sources = [f.rule.id, f.other.id].map((id) => ({
+            ...getMemoryById(f.db, id)!,
+            revision: 1,
+        }));
+        const receipt = await applyHistorianRevision(
+            f.db,
+            {
+                key: "historian-merge",
+                action: "merge",
+                projectPath: f.projectPath,
+                expectedSources: sources.map((s) => ({ id: s.id, revision: s.revision })),
+                survivorId: f.other.id,
+                finalText: `${text} ${f.rule.content}`,
+                changes: [{ memoryId: f.other.id, ordinal: 1, replacement: true, evidence }],
+                added: [{ text: `${text} `, evidence }],
+            },
+            {
+                memoryEnabled: true,
+                autoPromote: true,
+                enabled: true,
+                enforcedJson: true,
+                anchorKnown: true,
+                blocks: [
+                    {
+                        startOrdinal: 42,
+                        endOrdinal: 42,
+                        role: "user",
+                        parts: [text],
+                        joinedText: text,
+                    },
+                ],
+                sources,
+                historianProfile: profile,
+                validatedProfiles: [
+                    profile,
+                    ...Object.values(CHECK_SYSTEM_PROMPTS).map((system) => ({
+                        ...profile,
+                        systemHash: lifecycleTextHash(system),
+                    })),
+                ],
+            },
+            { sessionId: "ses-review", harness: "review" },
+            async (request) => ({
+                profile: { ...profile, systemHash: request.systemHash },
+                usage: { tokens: 1 },
+                verdicts: (request.kind === "compatibility" ? request.pairs : request.operands).map(
+                    (operand) => ({
                         id: operand.id,
                         verdict:
                             request.kind === "disproof" || request.kind === "support"
                                 ? ("yes" as const)
                                 : ("no" as const),
-                    })),
-                }),
-            );
-            expect(receipt).toMatchObject({ state: "applied", reason: "merge" });
-            const survivor = getMemoryById(f.db, f.other.id);
-            console.log("historian merge survivor", {
-                safety: survivor?.safetyCritical,
-                importance: survivor?.importance,
-            });
-            expect(survivor).toMatchObject({ safetyCritical: 1, importance: 80 });
-        } finally {
-            f.db.close();
-        }
-    },
-);
+                    }),
+                ),
+            }),
+        );
+        expect(receipt).toMatchObject({ state: "applied", reason: "merge" });
+        const survivor = getMemoryById(f.db, f.other.id);
+        console.log("historian merge survivor", {
+            safety: survivor?.safetyCritical,
+            importance: survivor?.importance,
+        });
+        expect(survivor).toMatchObject({ safetyCritical: 1, importance: 80 });
+    } finally {
+        f.db.close();
+    }
+});

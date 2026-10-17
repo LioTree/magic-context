@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import selectionCase from "../../../../../../crates/mc-module/testdata/safety_critical_classify_selection.json";
 import scoreCases from "../../../../../../crates/mc-store/testdata/safety-score-cases.json";
 import { Database } from "../../../shared/sqlite";
 import {
@@ -93,6 +94,40 @@ test("normal classify flags historian-scored, legacy-classified and open-item ru
             "updated-safety-rule",
         );
         expect(getMemoryById(f.db, scored.id)?.safetyCritical).toBe(1);
+    } finally {
+        f.db.close();
+    }
+});
+
+test("module classify selection matches the Rust scored legacy and open-rule fixture", async () => {
+    const f = fixture();
+    try {
+        const [scored, legacy, open] = f.rows;
+        f.db.exec("UPDATE memories SET scope='ecosystem',shareable=0,source_type='historian'");
+        const item = f.enqueue(scored.id);
+        recordItemScores(f.db, [item], [{ item, importance: 40, proposedClass: "durable" }]);
+        f.db.prepare("UPDATE memories SET classified_at=2 WHERE id=?").run(scored.id);
+        f.db.prepare("UPDATE memories SET importance=95,classified_at=1 WHERE id=?").run(legacy.id);
+        f.enqueue(open.id);
+        expect(
+            f.db
+                .prepare(
+                    "SELECT id AS memory_id,importance,classified_at FROM memories ORDER BY id",
+                )
+                .all(),
+        ).toEqual(selectionCase.scored_inputs);
+        let submitted: Array<{ memory_id: number }> = [];
+        const selection = await classifySafetyFixture(f.db, f.project, {
+            call: async (request) => {
+                expect(request.method).toBe("memory.set_classification");
+                submitted = (request.body as { arguments: { rows: Array<{ memory_id: number }> } })
+                    .arguments.rows;
+                return { accepted: submitted.map((row) => row.memory_id), rejected: [] };
+            },
+        });
+        expect(selection.result).toMatchObject(selectionCase.result);
+        expect(selection.prompted.sort((a, b) => a - b)).toEqual(selectionCase.prompted);
+        expect(submitted.sort((a, b) => a.memory_id - b.memory_id)).toEqual(selectionCase.rows);
     } finally {
         f.db.close();
     }

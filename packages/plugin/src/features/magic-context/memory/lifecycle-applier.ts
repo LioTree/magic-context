@@ -36,6 +36,7 @@ import {
     archiveMemory,
     getMemoryByHash,
     getMemoryById,
+    inheritMemorySafety,
     insertMemory,
     ModuleMemoryAuthorityError,
     mergeMemoryStats,
@@ -849,6 +850,12 @@ function applyMemoryMutation(
                         sourceType: automated ? "dreamer" : "agent",
                     });
                 if (!duplicate) before.push(null);
+                const assessment = inheritMemorySafety(sources, canonical.importance);
+                db.prepare("UPDATE memories SET safety_critical=?,importance=? WHERE id=?").run(
+                    assessment.safetyCritical,
+                    assessment.importance,
+                    canonical.id,
+                );
                 const changed = canonical.content !== content || canonical.normalizedHash !== hash;
                 if (changed) {
                     updateMemoryContent(db, canonical.id, content!, hash!);
@@ -1137,6 +1144,10 @@ function commitMemoryRevision(
 ): ApplierReceipt {
     const before = context.sources.map((source) => memoryHistorySnapshot(db, source.id));
     const survivor = getMemoryById(db, decision.survivorId)!;
+    const assessment = inheritMemorySafety(
+        context.sources.map((source) => getMemoryById(db, source.id)!),
+        decision.action === "replaces" ? 50 : survivor.importance,
+    );
     let survivorId = survivor.id;
     if (decision.action === "replaces")
         survivorId = insertMemory(db, {
@@ -1193,6 +1204,11 @@ function commitMemoryRevision(
                 "INSERT INTO memory_clause_evidence(memory_id,revision,clause_ordinal,text_hash,evidence_json) VALUES(?,?,?,?,?)",
             ).run(survivorId, survivorRevision, clause.ordinal, hash, JSON.stringify(evidence));
     }
+    db.prepare("UPDATE memories SET safety_critical=?,importance=? WHERE id=?").run(
+        assessment.safetyCritical,
+        assessment.importance,
+        survivorId,
+    );
     const after = context.sources.map((source) => memoryHistorySnapshot(db, source.id)!);
     if (!context.sources.some((source) => source.id === survivorId)) {
         before.push(null);
