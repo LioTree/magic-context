@@ -15,7 +15,13 @@ import { createTagger } from "../../../features/magic-context/tagger";
 import type { PluginContext } from "../../../plugin/types";
 import { sessionLog } from "../../../shared/logger";
 import { resolveHistorianModel } from "../../../shared/model-resolution";
-import { boundMarkerEnvelope, markerEnvelopeKey } from "../marker-envelope";
+import {
+    boundMarkerEnvelope,
+    deriveMarkerEnvelopeReading,
+    hasUnobservedTools,
+    markerEnvelopeKey,
+    qualifyingMarkerEnvelopeUpper,
+} from "../marker-envelope";
 import { SubcModuleTransport } from "../module-transport";
 import { hasRawMessageProvider } from "../read-session-chunk";
 import { createRustModeTransform } from "../rust-mode-transform";
@@ -204,6 +210,17 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                             model,
                             envelope: markerEnvelopeKey(fact.material),
                             inputTokens,
+                            // Only a successful response's usage bounds the envelope: an
+                            // aborted or failed request may report partial input usage.
+                            envelopeReading:
+                                fact.outcome === "success"
+                                    ? deriveMarkerEnvelopeReading({
+                                          material: fact.material,
+                                          messages: sent.messages,
+                                          totalInput: inputTokens,
+                                          model,
+                                      })
+                                    : undefined,
                         });
                     }
                 }
@@ -321,6 +338,17 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             try {
                 const material = inputs.material && structuredClone(inputs.material);
                 if (!material || boundMarkerEnvelope(material, inputs.model) === undefined)
+                    return { kind: "deferred", reason: "native-marker-evidence-unavailable" };
+                // Unobserved tool schemas are bounded only by a qualifying reading: a
+                // served, successful request with the same model, tool names and system.
+                if (
+                    hasUnobservedTools(material) &&
+                    qualifyingMarkerEnvelopeUpper(
+                        provider.measuredUsage(id),
+                        material,
+                        inputs.model,
+                    ) === undefined
+                )
                     return { kind: "deferred", reason: "native-marker-evidence-unavailable" };
                 const envelope = markerEnvelopeKey(material);
                 const pending = getPendingCompactionMarkerState(db, id);

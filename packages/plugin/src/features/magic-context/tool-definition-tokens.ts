@@ -327,6 +327,17 @@ export function getMarkerToolDefinitions(
     return [...definitions.values()];
 }
 
+/** Sorted names of the tools the `tool.definition` hook reported for this route.
+ * OpenCode does not run that hook for MCP tools, so they are never listed. */
+export function getHookToolNames(
+    providerID: string,
+    modelID: string,
+    agentName: string | undefined,
+): string[] | undefined {
+    const measured = measurements.get(keyFor(providerID, modelID, agentName));
+    return measured && measured.size > 0 ? [...measured.keys()].sort() : undefined;
+}
+
 /** Inspection helper: snapshot the current store (for debug logging/tests). */
 export function getToolDefinitionSnapshot(): Array<{
     key: string;

@@ -199,7 +199,7 @@ import {
 import { isAnthropicFamilyRoute } from "./sentinel";
 import { SharedCompartmentBoundaryError } from "./shared-compartment-boundaries";
 import { singleStoreMigrationRequiredFailure } from "./single-store-refusal";
-import { measureStandaloneMarker } from "./standalone-marker-envelope";
+import { measureStandaloneMarker, standaloneMarkerIdentity } from "./standalone-marker-envelope";
 import { StorageBusyRefusalError } from "./storage-busy-refusal";
 import { STORE_AHEAD_OF_BINARY_CODE, storeAheadOfBinaryFailure } from "./store-ahead-refusal";
 import {
@@ -5280,6 +5280,13 @@ export function createRustModeTransform(
                         request: captureForCertificate.requestIdentity,
                         systemPromptTokens: captureForCertificate.systemPromptTokens,
                         agentName: captureForCertificate.agentName,
+                        // This is the array returned to OpenCode, so once the request
+                        // completes its usage can bound the next request's envelope.
+                        marker: standaloneMarkerIdentity(
+                            sessionId,
+                            captureForCertificate.requestIdentity,
+                            captureForCertificate.agentName,
+                        ),
                     });
                 }
                 captureForCertificate.eligibleForClean =

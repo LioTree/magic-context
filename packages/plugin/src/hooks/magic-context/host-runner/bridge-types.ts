@@ -66,7 +66,9 @@ export type BridgeHostFact = BridgeFactScope &
               usage?: { input: number; cacheRead: number; cacheWrite: number; output: number };
               /** Positive host-resolved usable input window, including auth/config route caps. */
               contextWindow: number;
-              /** System strings and tool definitions sent by requestId. Usage is reusable only for a matching model and envelope. */
+              /** System strings, visible tool definitions and unobserved tool names sent by requestId.
+               * Usage is reusable only for a matching model and envelope; a successful response's
+               * usage also derives the envelope reading that bounds unobserved tool schemas. */
               material?: MarkerEnvelope;
           }
         | {
@@ -123,7 +125,8 @@ export type BridgeMarkerInputs = Omit<
     BridgeFallbackInputs,
     "envelope" | "systemPromptTokens" | "toolDefinitionTokens" | "material"
 > & {
-    /** Final system-transform strings and the complete sent tool set, not host token estimates. */
+    /** Final system-transform strings, the visible sent tool definitions and the names of
+     * sent tools whose schema is not visible, not host token estimates. */
     material?: MarkerEnvelope;
 };
 
