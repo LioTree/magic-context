@@ -494,7 +494,7 @@ async fn claude_resident_restart_primes_from_stored_view_and_matches_full_rebuil
     off = claude(&b, &project, false);
     let ready = super::super::claude_code_tests::setup(&on).await;
     assert_eq!(ready, super::super::claude_code_tests::setup(&off).await);
-    let applied = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    let mut applied = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
     // The compartments are left unchanged, so the stored cut still matches the
     // current history source and the restarted fold may restore from it.
     for h in [&on, &off] {
@@ -558,6 +558,94 @@ async fn claude_resident_restart_primes_from_stored_view_and_matches_full_rebuil
         if pass == 2 {
             let response: Value = serde_json::from_slice(&response).unwrap();
             assert_eq!(response["answer"], "compaction_message", "{response}");
+            applied = json!({"compaction_id":response["compaction"]["compaction_id"],"version":response["compaction"]["version"]});
         }
     }
+
+    // Acknowledge that replacement, restart again, and make a hook the first
+    // call. The Claude Code hook path restores the fold state on its own cold
+    // rebuild, and the next fold runs on that restored state.
+    let mut request = step("cc", vec![], Some(newest));
+    request["harness"] = json!("claude-code");
+    request["request_id"] = json!("acknowledge-replacement");
+    request["now"] = json!(5000);
+    request["served_through_ordinal"] = json!(newest);
+    request["last_applied"] = applied;
+    assert_eq!(
+        String::from_utf8_lossy(&invoke(&on, "compaction.step", &request).await),
+        String::from_utf8_lossy(&invoke(&off, "compaction.step", &request).await),
+        "acknowledgement before the second restart"
+    );
+    drop(on);
+    drop(off);
+    on = claude(&a, &project, true);
+    off = claude(&b, &project, false);
+    let ready = super::super::claude_code_tests::setup(&on).await;
+    assert_eq!(ready, super::super::claude_code_tests::setup(&off).await);
+    let applied = json!({"compaction_id":ready["initial"]["compaction_id"],"version":ready["initial"]["version"]});
+    let store = on.store.get().unwrap();
+    let key = Key::new(&on.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+    // A stored MID cannot name different native bytes, so the hook repeats the
+    // newest message's stored raw_message.
+    let held = store
+        .load_provider_messages_since(&key.store_key(), "L", newest)
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&held[0].message_bytes).unwrap();
+    let hook = json!({"session":"cc","harness":"claude-code","step_id":"hook-after-restart","lineage_id":"L",
+        "params":{"serializer_profile":"claude-code-anthropic","observation":"answer"},"hook":"pre_user",
+        "subject_mid":format!("m{newest}"),"subject_ordinal":newest,"message":envelope["message"],
+        "raw_message":envelope["raw_message"],"blocks":[envelope["message"]["content"]]});
+    assert_eq!(
+        invoke(&on, "transform.hook", &hook).await,
+        invoke(&off, "transform.hook", &hook).await,
+        "first hook after the second restart"
+    );
+    let lease = on
+        .provider_resident
+        .begin(store.tag_cache_namespace(), &key)
+        .unwrap()
+        .unwrap();
+    assert!(
+        lease.state.fold_view.is_some(),
+        "the first hook after a restart must restore the fold state from the stored view"
+    );
+    lease.publish();
+    for h in [&on, &off] {
+        let store = h.store.get().unwrap();
+        let key = Key::new(&h.facade_binding(7).unwrap(), "cc", "claude-code").unwrap();
+        let namespace = store
+            .load_provider_conversation(&key.store_key())
+            .unwrap()
+            .unwrap()
+            .engine_namespace;
+        store
+            .replace_compartments(&namespace, &compartments(3, boundary))
+            .unwrap();
+        store.arm_soft_refresh(&namespace).unwrap();
+    }
+    newest += 1;
+    let mut request = step("cc", vec![cc_message(newest, "after hook")], Some(newest));
+    request["harness"] = json!("claude-code");
+    request["request_id"] = json!("after-hook");
+    request["now"] = json!(6000);
+    request["served_through_ordinal"] = json!(newest);
+    request["last_applied"] = applied;
+    let response = invoke(&on, "compaction.step", &request).await;
+    assert_eq!(
+        String::from_utf8_lossy(&response),
+        String::from_utf8_lossy(&invoke(&off, "compaction.step", &request).await),
+        "fold after the hook"
+    );
+    let response: Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(response["answer"], "compaction_message", "{response}");
+    let lease = on
+        .provider_resident
+        .begin(store.tag_cache_namespace(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lease.state.fold_tail_passes, 1,
+        "the fold after the restoring hook must run on the restored state"
+    );
+    lease.publish();
 }
