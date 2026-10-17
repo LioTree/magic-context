@@ -28,6 +28,7 @@ import {
     startSqliteWriteLocker,
 } from "../../shared/sqlite-write-locker-test-support";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { currentLkgRequestIdentity, noteLkgProviderResponse } from "./lkg-measured-request";
 import { createDbLkgPersistence, saveLkgSlotToDb } from "./lkg-persist";
 import { lkgServedArrayDigest } from "./lkg-recovery-fence";
 import { lkgDirtyRevision } from "./lkg-recovery-prefix";
@@ -36,6 +37,7 @@ import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slo
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
+import { recordMarkerSystem } from "./standalone-marker-envelope";
 import type { TransformDeps } from "./transform";
 import type { MessageLike } from "./transform-operations";
 import {
@@ -202,6 +204,19 @@ async function runPassUnderLock(args: {
     });
     updateSessionMeta(db, sessionId, { systemPromptTokens: 100 });
     meta.systemPromptTokens = 100;
+    // A native marker cut also requires the final raw system envelope of the
+    // current request; token totals alone no longer authorize it. Supply that
+    // material the way the system-prompt hook records it in production.
+    if (!currentLkgRequestIdentity(sessionId))
+        noteLkgProviderResponse({
+            sessionId,
+            modelKey: "test-provider/test-model",
+            responseId: `fixture-${sessionId}`,
+            inputTokens: 0,
+        });
+    recordMarkerSystem(sessionId, "test-provider/test-model", meta.systemPromptHash, [
+        "Fixture final system instructions.",
+    ]);
 
     const transform = createRustModeTransform(deps, {
         moduleClient,
