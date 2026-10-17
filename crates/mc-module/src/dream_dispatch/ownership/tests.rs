@@ -65,13 +65,25 @@ fn names(tasks: &[TaskName]) -> Vec<&'static str> {
     tasks.iter().map(|t| t.as_str()).collect()
 }
 
+/// The example claimants in the shared vector, each bound to its route harness.
+pub(crate) fn vector_claimant(name: &str) -> ClaimantDeclaration {
+    let vector = vector();
+    let entry = &vector["claimants"][name];
+    ClaimantDeclaration::parse(entry, 1)
+        .unwrap()
+        .on_route("harness-session", entry["harness"].as_str().unwrap())
+}
+
+const VECTOR_CLAIMANTS: [&str; 2] = ["fenceless", "fenceless_default_model"];
+
 #[test]
-fn shared_vector_publishes_only_what_each_opencode_claimant_can_carry() {
+fn shared_vector_publishes_only_what_each_declared_claimant_can_carry() {
     let vector = vector();
     let wiring = every_hosted_task();
     let config = host_config();
-    for harness in ["opencode", "opencode2"] {
-        let claimant = ClaimantDeclaration::parse(&vector["claimants"][harness], 1).unwrap();
+    for name in VECTOR_CLAIMANTS {
+        let claimant = vector_claimant(name);
+        let harness = claimant.harness.as_str();
         for settings in ["with_models", "without_models"] {
             let ownership = publish(&OwnershipInput {
                 config: &config,
@@ -80,25 +92,25 @@ fn shared_vector_publishes_only_what_each_opencode_claimant_can_carry() {
                 wiring: &wiring,
                 claimant: Some(&claimant),
             });
-            let expected: Vec<&str> = vector["expected"][harness][settings]
+            let expected: Vec<&str> = vector["expected"][name][settings]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|v| v.as_str().unwrap())
                 .collect();
-            assert_eq!(
-                names(&ownership.published),
-                expected,
-                "{harness} {settings}"
-            );
+            assert_eq!(names(&ownership.published), expected, "{name} {settings}");
             if settings == "with_models" {
                 for (task, reason) in &ownership.withheld {
                     assert_eq!(
-                        vector["withheld_with_models"][harness][task.as_str()],
+                        vector["withheld_with_models"][name][task.as_str()],
                         json!(reason),
-                        "{harness} {}",
+                        "{name} {}",
                         task.as_str()
                     );
+                }
+                if name == "fenceless" {
+                    // The plugin's reader decodes this exact answer.
+                    assert_eq!(ownership.to_json(), vector["answer_example"]);
                 }
             }
         }
@@ -110,8 +122,9 @@ fn verify_and_map_stay_with_typescript_without_a_filesystem_fence() {
     let vector = vector();
     let wiring = every_hosted_task();
     let config = host_config();
-    for harness in ["opencode", "opencode2"] {
-        let claimant = ClaimantDeclaration::parse(&vector["claimants"][harness], 1).unwrap();
+    for name in VECTOR_CLAIMANTS {
+        let claimant = vector_claimant(name);
+        let harness = claimant.harness.as_str();
         // Even a host that registered the mapper agent with its read tools is
         // refused while it declares no filesystem fence.
         let mut with_mapper = claimant.clone();
@@ -132,7 +145,7 @@ fn verify_and_map_stay_with_typescript_without_a_filesystem_fence() {
             claimant: Some(&with_mapper),
         });
         for task in [TaskName::Map, TaskName::Verify, TaskName::VerifyBroad] {
-            assert!(!ownership.owns(task), "{harness} {}", task.as_str());
+            assert!(!ownership.owns(task), "{name} {}", task.as_str());
             assert!(ownership
                 .withheld
                 .contains(&(task, "claimant_capability:filesystem_fence".into())));
@@ -294,25 +307,34 @@ fn claim_refusal_follows_the_claim_route_rules() {
 }
 
 #[test]
-fn declarations_expire_and_are_scoped_to_their_session() {
+fn declarations_expire_are_scoped_to_their_project_and_the_freshest_wins() {
     let registry = ClaimantRegistry::default();
-    registry.declare("p", "s", claimant_carrying_every_role(1_000));
-    assert!(registry.current("p", "s", 1_000).is_some());
-    assert!(registry.current("p", "other", 1_000).is_none());
-    assert!(registry.current("other", "s", 1_000).is_none());
+    registry.declare(
+        "p",
+        "s",
+        claimant_carrying_every_role(1_000).on_route("s", "opencode"),
+    );
+    assert_eq!(registry.current("p", 1_000).unwrap().session, "s");
+    assert!(registry.current("other", 1_000).is_none());
     assert!(registry
-        .current("p", "s", 1_000 + DECLARATION_TTL_MS - 1)
+        .current("p", 1_000 + DECLARATION_TTL_MS - 1)
         .is_some());
-    assert!(registry
-        .current("p", "s", 1_000 + DECLARATION_TTL_MS)
-        .is_none());
+    assert!(registry.current("p", 1_000 + DECLARATION_TTL_MS).is_none());
+    registry.declare(
+        "p",
+        "t",
+        claimant_carrying_every_role(2_000).on_route("t", "opencode2"),
+    );
+    assert_eq!(registry.current("p", 2_000).unwrap().harness, "opencode2");
+    registry.withdraw("p", "t");
+    assert_eq!(registry.current("p", 2_000).unwrap().session, "s");
     registry.withdraw("p", "s");
-    assert!(registry.current("p", "s", 1_000).is_none());
+    assert!(registry.current("p", 2_000).is_none());
 }
 
 #[test]
 fn malformed_declarations_are_refused_whole() {
-    let good = vector()["claimants"]["opencode"].clone();
+    let good = vector()["claimants"]["fenceless"].clone();
     assert!(ClaimantDeclaration::parse(&good, 1).is_ok());
     for (pointer, value) in [
         ("/capabilities", json!(null)),

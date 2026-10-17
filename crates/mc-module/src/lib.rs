@@ -21580,8 +21580,8 @@ mod tests {
             config.rust_background_enabled = true;
             config.smart_notes_enabled = true;
             let producer = Arc::new(ProducerState::default());
-            // A Host-runner route whose claimant can carry every role: publication
-            // then depends only on which tasks the fixture wires.
+            // A Host-runner project with a declared harness claimant that can carry
+            // every role: publication then depends only on which tasks are wired.
             config.dreamer_runner = Some(HistorianRunnerKind::Host);
             let (mut handler, store, _dir, project) =
                 handler_with_store(producer.clone(), config.clone());
@@ -21589,7 +21589,8 @@ mod tests {
             handler.dream_claimants.declare(
                 &lane_project_key(&store, &project),
                 "ses",
-                dream_dispatch::ownership::tests::claimant_carrying_every_role(now_ms()),
+                dream_dispatch::ownership::tests::claimant_carrying_every_role(now_ms())
+                    .on_route("ses", "mc-module-test"),
             );
             let mut settings = json!({"dreamer":{"tasks":{}}});
             for task in CANONICAL_TASKS {

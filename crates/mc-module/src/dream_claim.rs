@@ -80,8 +80,10 @@ impl McHandler {
         Wiring::production()
     }
 
-    /// The tasks Rust runs for this route right now, from the route's current
-    /// config, this build's wiring and the claimant this session last declared.
+    /// The tasks Rust runs for this project right now, from the route's current
+    /// config, this build's wiring and the freshest claimant declared on any of
+    /// the project's attested harness routes. A declared claimant's own harness
+    /// selects the runner and models, because its children run there.
     pub(crate) fn dream_ownership(&self, binding: &SessionBinding, project: &str) -> Ownership {
         let config = self.effective_config(&binding.project_root);
         // Settings are only read when activation could publish anything; a
@@ -90,37 +92,53 @@ impl McHandler {
             .rust_background_enabled()
             .then(|| self.dream_task_settings(&binding.project_root).ok())
             .flatten();
-        let claimant = self
-            .dream_claimants
-            .current(project, &binding.session, now_ms());
+        let claimant = self.dream_claimants.current(project, now_ms());
+        let harness = claimant
+            .as_ref()
+            .map_or(binding.harness.as_str(), |c| c.harness.as_str());
         let wiring = self.dream_wiring();
         ownership::publish(&OwnershipInput {
             config: &config,
             settings: settings.as_ref(),
-            harness: &binding.harness,
+            harness,
             wiring: &wiring,
             claimant: claimant.as_ref(),
         })
     }
 
-    /// `dream.ownership {v:1, claimant?}`: record what this session's claimant can
-    /// carry (or withdraw it when `claimant` is absent or null) and answer with
-    /// the published list. The answer is the only list the plugin's scheduler
-    /// consults; it never names a task Rust cannot run for this route.
+    /// `dream.ownership {v:1, claimant?}` answers with the published list for the
+    /// route's project; it is the only list a plugin's scheduler consults.
+    ///
+    /// Reading is open to plugin and attested harness routes. Only a
+    /// daemon-attested harness route (in mode 3, THALAMUS's harness) may declare a
+    /// claimant (`claimant: {capabilities, agents}`) or withdraw its own
+    /// (`claimant: null`): a plugin cannot make Rust take its own tasks away.
     pub(crate) fn handle_dream_ownership(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let (binding, project) = match self.dream_lane(channel, request, "dream.ownership") {
             Ok(lane) => lane,
             Err(refusal) => return refusal,
         };
-        match request.get("claimant") {
-            None | Some(Value::Null) => self.dream_claimants.withdraw(&project, &binding.session),
-            Some(value) => match ClaimantDeclaration::parse(value, now_ms()) {
-                Ok(declaration) => {
-                    self.dream_claimants
-                        .declare(&project, &binding.session, declaration)
+        if let Some(claimant) = request.get("claimant") {
+            // dream_lane already admitted any principal-bearing route as an attested
+            // harness; a principal-less route is a plugin's.
+            if binding.principal.is_none() {
+                return HandlerOutcome::Error {
+                    code: "claimant_requires_attested_harness".into(),
+                    message: "only an attested harness route can declare a dream claimant".into(),
+                };
+            }
+            if claimant.is_null() {
+                self.dream_claimants.withdraw(&project, &binding.session);
+            } else {
+                match ClaimantDeclaration::parse(claimant, now_ms()) {
+                    Ok(declaration) => self.dream_claimants.declare(
+                        &project,
+                        &binding.session,
+                        declaration.on_route(&binding.session, &binding.harness),
+                    ),
+                    Err(reason) => return invalid_params_error(reason),
                 }
-                Err(reason) => return invalid_params_error(reason),
-            },
+            }
         }
         respond(self.dream_ownership(&binding, &project).to_json())
     }

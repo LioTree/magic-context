@@ -1,19 +1,20 @@
 //! Which dream tasks Rust runs on a host: the single published list.
 //!
-//! The TypeScript scheduler reads this list over `dream.ownership` and skips
+//! A plugin attached to ck-mc reads this list over `dream.ownership` and skips
 //! exactly the tasks named in it; it keeps no list of its own. A task is
-//! published only when Rust can actually run it for the asking host:
+//! published for a project only when Rust can actually run it there:
 //!
 //! 1. the user enabled `rust_background_enabled`;
-//! 2. a production executor for the task is wired (see [`PRODUCTION_WIRING`]);
+//! 2. a production executor for the task is wired (see [`Wiring::production`]);
 //! 3. the carrier the user's runner choice selects can carry every child the
-//!    task opens. For the Host runner that means a claimant declared, within
-//!    [`DECLARATION_TTL_MS`], an agent registration and capabilities that the
-//!    claim route would admit. For Broca it means the user configured Broca and a
-//!    Broca transport is wired.
+//!    task opens. For the Host runner that means a daemon-attested harness
+//!    claimant (in mode 3, THALAMUS's harness) declared on one of the project's
+//!    routes, within [`DECLARATION_TTL_MS`], the agents and capabilities the
+//!    dream-claim-v1 claim route would admit. A plugin route cannot declare one.
+//!    For Broca it means the user configured Broca and a Broca transport is wired.
 //!
-//! Anything else stays with TypeScript, so turning the switch on never leaves a
-//! task that TypeScript runs today without a runner.
+//! Anything else stays with TypeScript, so a host without ck-mc, or with ck-mc
+//! but no capable claimant, keeps running every dreamer task as it does today.
 
 use crate::config::McModuleConfig;
 use crate::dream_runner::{resolve_task_models, DreamRole};
@@ -23,9 +24,9 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
-/// How long a claimant's declaration stays valid. It matches the TypeScript
-/// claimant's own polling window: a session it has not served for this long is
-/// no longer polled, so a child queued for it would never be claimed.
+/// How long a claimant's declaration stays valid. A claimant re-declares while it
+/// polls; one silent for longer may have stopped polling, and a child queued for
+/// it would never be claimed, so its tasks fall back to TypeScript.
 pub const DECLARATION_TTL_MS: i64 = 10 * 60_000;
 
 /// The guards every claimed child needs, whatever its tools.
@@ -91,12 +92,16 @@ pub fn task_roles(task: TaskName) -> Option<&'static [DreamRole]> {
 }
 
 /// What a running claimant can carry: its claim capabilities and, for each hidden
-/// agent it registers, the fixed tools that registration allows.
+/// agent it registers, the fixed tools that registration allows. `session` and
+/// `harness` come from the route it declared on, never from the request; Host
+/// children for its project are queued on that session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaimantDeclaration {
     pub capabilities: Value,
     pub agents: BTreeMap<String, Vec<String>>,
     pub declared_at_ms: i64,
+    pub session: String,
+    pub harness: String,
 }
 
 const MAX_DECLARED_NAMES: usize = 32;
@@ -165,11 +170,20 @@ impl ClaimantDeclaration {
             capabilities: Value::Object(kept),
             agents,
             declared_at_ms: now_ms,
+            session: String::new(),
+            harness: String::new(),
         })
     }
 
+    /// Attach the identity of the route the declaration arrived on.
+    pub fn on_route(mut self, session: &str, harness: &str) -> Self {
+        self.session = session.to_owned();
+        self.harness = harness.to_owned();
+        self
+    }
+
     /// Why this claimant cannot carry a child of `role`, or `None` when it can.
-    fn refusal(&self, role: DreamRole, model_missing: bool) -> Option<String> {
+    pub(crate) fn refusal(&self, role: DreamRole, model_missing: bool) -> Option<String> {
         let Some(carried) = self.agents.get(role.agent()) else {
             return Some(format!("claimant_agent:{}", role.agent()));
         };
@@ -186,7 +200,8 @@ impl ClaimantDeclaration {
 }
 
 /// Live claimant declarations per (project, session). Entries older than
-/// [`DECLARATION_TTL_MS`] no longer count; a newer declaration replaces an older one.
+/// [`DECLARATION_TTL_MS`] no longer count; a newer declaration replaces an older
+/// one for the same session.
 #[derive(Default)]
 pub struct ClaimantRegistry {
     entries: Mutex<HashMap<(String, String), ClaimantDeclaration>>,
@@ -207,21 +222,24 @@ impl ClaimantRegistry {
         }
     }
 
-    /// The declaration for this session, if it is still fresh at `now_ms`.
-    pub fn current(
-        &self,
-        project: &str,
-        session: &str,
-        now_ms: i64,
-    ) -> Option<ClaimantDeclaration> {
+    /// The most recent declaration still fresh at `now_ms` on any of the
+    /// project's sessions. Ties go to the lexically smallest session, so the
+    /// answer does not depend on map order.
+    pub fn current(&self, project: &str, now_ms: i64) -> Option<ClaimantDeclaration> {
         let entries = self.entries.lock().ok()?;
         entries
-            .get(&(project.to_owned(), session.to_owned()))
-            .filter(|d| {
-                d.declared_at_ms <= now_ms
+            .iter()
+            .filter(|((p, _), d)| {
+                p == project
+                    && d.declared_at_ms <= now_ms
                     && now_ms.saturating_sub(d.declared_at_ms) < DECLARATION_TTL_MS
             })
-            .cloned()
+            .max_by(|((_, a_session), a), ((_, b_session), b)| {
+                a.declared_at_ms
+                    .cmp(&b.declared_at_ms)
+                    .then_with(|| b_session.cmp(a_session))
+            })
+            .map(|(_, d)| d.clone())
     }
 }
 
@@ -259,8 +277,10 @@ pub struct OwnershipInput<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ownership {
     pub activated: bool,
-    /// The runner this route's dream children would use, and why.
+    /// The runner this project's dream children would use, and why.
     pub runner: ResolvedRunner,
+    /// Whether a fresh claimant declaration was considered.
+    pub claimant_declared: bool,
     pub published: Vec<TaskName>,
     /// Every canonical task that is not published, with the first reason found.
     pub withheld: Vec<(TaskName, String)>,
@@ -278,6 +298,7 @@ impl Ownership {
             "v": 1,
             "activated": self.activated,
             "runner": {"kind": runner.kind.as_str(), "source": runner.source.as_str()},
+            "claimant_declared": self.claimant_declared,
             "published": self.published.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             "withheld": self.withheld.iter().map(|(t, reason)| json!({"task": t.as_str(), "reason": reason})).collect::<Vec<_>>(),
         })
@@ -344,6 +365,7 @@ pub fn publish(input: &OwnershipInput<'_>) -> Ownership {
     Ownership {
         activated: input.config.rust_background_enabled(),
         runner: input.config.dreamer_runner_for(input.harness),
+        claimant_declared: input.claimant.is_some(),
         published,
         withheld,
     }

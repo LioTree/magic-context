@@ -1,20 +1,27 @@
 {
-  "comment": "dream.ownership v1 shared vector. Rust replays it through ownership::publish with every hosted task wired and the Host runner; the plugin checks that its real OpenCode claimant declarations equal these and that its reader honours the expected lists. Published lists are in canonical task order.",
+  "comment": "dream.ownership v1 shared vector. Rust replays it through ownership::publish and the real route, with every hosted task wired and the Host runner, for two example attested-harness claimants that declare no filesystem fence (one without default-model support). The plugin's ownership reader decodes answer_example. Published lists are in canonical task order.",
   "settings": {
     "with_models": {
       "dreamer": {
-        "opencode": { "model": "anthropic/claude-sonnet-4-5" },
+        "opencode": {
+          "model": "anthropic/claude-sonnet-4-5"
+        },
         "tasks": {}
       }
     },
     "without_models": {
-      "dreamer": { "tasks": {} }
+      "dreamer": {
+        "tasks": {}
+      }
     }
   },
   "claimants": {
-    "opencode": {
+    "fenceless": {
+      "harness": "opencode",
       "capabilities": {
-        "tools": ["ctx_memory"],
+        "tools": [
+          "ctx_memory"
+        ],
         "child_guard": true,
         "steps": true,
         "tokens": true,
@@ -25,14 +32,19 @@
         "default_model": false
       },
       "agents": {
-        "dreamer": ["ctx_memory"],
+        "dreamer": [
+          "ctx_memory"
+        ],
         "dreamer-classifier": [],
         "dreamer-reviewer": []
       }
     },
-    "opencode2": {
+    "fenceless_default_model": {
+      "harness": "opencode2",
       "capabilities": {
-        "tools": ["ctx_memory"],
+        "tools": [
+          "ctx_memory"
+        ],
         "child_guard": true,
         "steps": true,
         "tokens": true,
@@ -43,23 +55,35 @@
         "default_model": true
       },
       "agents": {
-        "dreamer": ["ctx_memory"],
+        "dreamer": [
+          "ctx_memory"
+        ],
         "dreamer-classifier": []
       }
     }
   },
   "expected": {
-    "opencode": {
-      "with_models": ["curate", "classify-memories", "review-user-memories"],
+    "fenceless": {
+      "with_models": [
+        "curate",
+        "classify-memories",
+        "review-user-memories"
+      ],
       "without_models": []
     },
-    "opencode2": {
-      "with_models": ["curate", "classify-memories"],
-      "without_models": ["curate", "classify-memories"]
+    "fenceless_default_model": {
+      "with_models": [
+        "curate",
+        "classify-memories"
+      ],
+      "without_models": [
+        "curate",
+        "classify-memories"
+      ]
     }
   },
   "withheld_with_models": {
-    "opencode": {
+    "fenceless": {
       "map-memories": "claimant_agent:dreamer-memory-mapper",
       "verify": "claimant_agent:dreamer-memory-mapper",
       "verify-broad": "claimant_agent:dreamer-memory-mapper",
@@ -70,7 +94,7 @@
       "promote-primers": "claimant_agent:dreamer-primer-investigator",
       "refresh-primers": "claimant_agent:dreamer-primer-investigator"
     },
-    "opencode2": {
+    "fenceless_default_model": {
       "map-memories": "claimant_agent:dreamer-memory-mapper",
       "verify": "claimant_agent:dreamer-memory-mapper",
       "verify-broad": "claimant_agent:dreamer-memory-mapper",
@@ -82,5 +106,58 @@
       "promote-primers": "claimant_agent:dreamer-primer-investigator",
       "refresh-primers": "claimant_agent:dreamer-primer-investigator"
     }
+  },
+  "answer_example": {
+    "ok": true,
+    "v": 1,
+    "activated": true,
+    "runner": {
+      "kind": "host",
+      "source": "default_for_harness"
+    },
+    "claimant_declared": true,
+    "published": [
+      "curate",
+      "classify-memories",
+      "review-user-memories"
+    ],
+    "withheld": [
+      {
+        "task": "map-memories",
+        "reason": "claimant_agent:dreamer-memory-mapper"
+      },
+      {
+        "task": "verify",
+        "reason": "claimant_agent:dreamer-memory-mapper"
+      },
+      {
+        "task": "verify-broad",
+        "reason": "claimant_agent:dreamer-memory-mapper"
+      },
+      {
+        "task": "compress-cues",
+        "reason": "no_rust_host"
+      },
+      {
+        "task": "retrospective",
+        "reason": "claimant_agent:dreamer-retrospective"
+      },
+      {
+        "task": "maintain-docs",
+        "reason": "no_rust_host"
+      },
+      {
+        "task": "evaluate-smart-notes",
+        "reason": "no_rust_host"
+      },
+      {
+        "task": "promote-primers",
+        "reason": "claimant_agent:dreamer-primer-investigator"
+      },
+      {
+        "task": "refresh-primers",
+        "reason": "claimant_agent:dreamer-primer-investigator"
+      }
+    ]
   }
 }
