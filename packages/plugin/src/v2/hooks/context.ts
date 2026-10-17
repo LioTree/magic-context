@@ -166,6 +166,7 @@ import { generateReplayAnchor, V2GenerateReplay } from "./generate";
 import {
     admitDreamChildStep,
     dreamChildToolRefusal,
+    publishDreamChildHost,
 } from "../../hooks/magic-context/dream-child-claimant";
 import { HiddenChildHook, hiddenToolCallRefusal, registerHiddenChildAgents } from "./hidden-child";
 import { hiddenTerminalError } from "./hidden-terminal-error";
@@ -927,6 +928,21 @@ export async function registerContext(context: V2Context) {
     // start they hold this stand-in, which reaches the executor recoverHiddenWork
     // wires later.
     const lateHiddenExecutor = createLateHiddenExecutor(() => hiddenCompletionExecutor);
+    // How a dream-child claimant for this directory builds its carrier on this
+    // instance's hidden executor. Inert: nothing is built until a claimant asks,
+    // and no claimant is built unless the transform is told to build one.
+    const withdrawDreamChildHost = publishDreamChildHost(directory, () =>
+        hiddenCompletionExecutor
+            ? createOpenCode2DreamChildHost({
+                  executor: hiddenCompletionExecutor,
+                  openReader: openStoreReader,
+                  getSession: (input) => context.session.get(input),
+                  directory,
+                  keepSubagents: config.keep_subagents === true,
+                  log: (message) => log(`[magic-context] ${message}`),
+              })
+            : undefined,
+    );
     let hiddenWorkRecovery: Promise<boolean> | undefined;
     /**
      * Wire the historian's executor and the dreamer on the first successful open
@@ -1786,18 +1802,6 @@ export async function registerContext(context: V2Context) {
                 historianExpandTools: config.historian?.expand_tools,
                 historianRunner: config.historian?.runner,
                 historianHostRunnerEnabled: config.historian?.host_runner?.enabled,
-                // Inert until the transform is told to build its dream-child claimant.
-                dreamChildHost: () =>
-                    hiddenCompletionExecutor
-                        ? createOpenCode2DreamChildHost({
-                              executor: hiddenCompletionExecutor,
-                              openReader: openStoreReader,
-                              getSession: (input) => context.session.get(input),
-                              directory,
-                              keepSubagents: config.keep_subagents === true,
-                              log: (message) => log(`[magic-context] ${message}`),
-                          })
-                        : undefined,
                 // TypeScript mode folds on the host's own compaction rows, so its marker
                 // carrier stays inert. Rust mode has no such row to write: the module's
                 // materialized boundary is recorded in the marker columns instead, and
@@ -2418,6 +2422,7 @@ export async function registerContext(context: V2Context) {
             rpcStopped = true;
             rpcServer.stop();
             transform?.disposeRust();
+            withdrawDreamChildHost();
             tools?.dispose();
             usageController.abort();
             await usageDone;

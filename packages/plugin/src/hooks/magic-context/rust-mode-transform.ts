@@ -91,7 +91,7 @@ import {
     createFinalWireUsageTracker,
     estimateFinalWireInputTokens,
 } from "./final-wire-token-estimate";
-import { DreamChildClaimant } from "./dream-child-claimant";
+import { DreamChildClaimant, publishedDreamChildHost } from "./dream-child-claimant";
 import { createOpenCode1DreamChildHost } from "./dream-child-hidden-host";
 import { createHistorianHostRunner } from "./historian-host-runner";
 import {
@@ -1873,8 +1873,10 @@ export function createRustModeTransform(
         if (dreamClaimant !== null) return dreamClaimant;
         try {
             const directory = options.projectRoot ?? deps.directory ?? process.cwd();
+            // OpenCode 2 publishes its native hidden-child carrier for its
+            // directory; OpenCode 1 builds the child-session carrier from its client.
             const host =
-                deps.dreamChildHost?.() ??
+                publishedDreamChildHost(directory) ??
                 (deps.client
                     ? createOpenCode1DreamChildHost({
                           client: deps.client,

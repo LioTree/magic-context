@@ -568,11 +568,6 @@ export interface TransformDeps {
      */
     dreamChildClaimantEnabled?: boolean;
     /**
-     * This host's dream-child carrier when it has its own (OpenCode 2). Read only
-     * when the claimant is built; OpenCode 1 builds its carrier from the client.
-     */
-    dreamChildHost?: () => import("./dream-child-claimant").DreamChildHost | undefined;
-    /**
      * Compaction-off mode (issue #266), boot-resolved and process-stable.
      * When true the transform runs additive-only: m[0]/m[1] memory/docs
      * injection, measurement and identity recording stay; every mutating

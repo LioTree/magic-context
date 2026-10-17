@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { log as defaultLog } from "../../shared/logger";
 
 /**
@@ -448,6 +449,53 @@ export function dreamChildToolRefusal(
 /** Host hook helper: admit a model step for a dream child; a no-op for any other session. */
 export async function admitDreamChildStep(sessionId: string | undefined): Promise<void> {
     await dreamChildGate(sessionId)?.admitStep();
+}
+
+// Process-wide for the same reason as the gates: the instance that owns a host's
+// hidden executor publishes how to build a dream child carrier on it, and the
+// claimant for that directory (wherever it is constructed) builds from it.
+const HOST_REGISTRY_KEY = Symbol.for("magic-context.dream-child-hosts");
+
+function hostRegistry(): Map<string, () => DreamChildHost | undefined> {
+    const holder = globalThis as unknown as Record<
+        symbol,
+        Map<string, () => DreamChildHost | undefined> | undefined
+    >;
+    let registry = holder[HOST_REGISTRY_KEY];
+    if (!registry) {
+        registry = new Map();
+        holder[HOST_REGISTRY_KEY] = registry;
+    }
+    return registry;
+}
+
+function directoryKey(directory: string): string {
+    try {
+        return realpathSync(directory);
+    } catch {
+        return directory;
+    }
+}
+
+/**
+ * Publish how to build a dream child carrier for the plugin instance serving
+ * `directory`. Building is deferred: nothing is created until a claimant asks.
+ * Returns the function that withdraws it (when the instance is disposed).
+ */
+export function publishDreamChildHost(
+    directory: string,
+    factory: () => DreamChildHost | undefined,
+): () => void {
+    const key = directoryKey(directory);
+    hostRegistry().set(key, factory);
+    return () => {
+        if (hostRegistry().get(key) === factory) hostRegistry().delete(key);
+    };
+}
+
+/** The carrier published for `directory`, built now, or undefined when none is. */
+export function publishedDreamChildHost(directory: string): DreamChildHost | undefined {
+    return hostRegistry().get(directoryKey(directory))?.();
 }
 
 export interface DreamChildCallArgs {
