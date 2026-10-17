@@ -139,6 +139,166 @@ pub mod decision_calibration;
 mod digest;
 pub mod divergence;
 mod dream_runner;
+/// Explicit background entries. None is called by a served transform or tool.
+/// Config resolution and all adapter work happen on the worker, not its caller.
+pub mod background {
+    use crate::config_parity::{ConfigResolveRequest, CoreConfig, CoreConfigResolver};
+    pub use crate::dream_runner::{
+        CarrierError, ChildRequest, Completion, DreamCarrier, DreamRequest, DreamRole, RunResult,
+    };
+    pub use crate::historian_numerical_drain::{
+        DrainMeta, DrainReservation, DrainReserveResult, DrainStore, ReserveRequest,
+    };
+    use mc_store::parity_schema_manifest::CapabilityResult;
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+
+    pub struct ConfigInput {
+        pub resolver: Arc<dyn CoreConfigResolver>,
+        pub request: ConfigResolveRequest,
+    }
+
+    /// Only an off-thread entry can construct a unit containing resolved config
+    /// and activation. Nested operations keep that activation value across toggles.
+    pub struct Unit {
+        config: CoreConfig,
+        activated: bool,
+    }
+
+    fn spawn<T: Send + 'static>(
+        name: &str,
+        input: ConfigInput,
+        work: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let config = match input.resolver.resolve(&input.request) {
+                    CapabilityResult::Available { value } => value,
+                    CapabilityResult::Degraded { reason, .. }
+                    | CapabilityResult::Unavailable { reason } => return Err(reason.code),
+                };
+                let activated = config.effective.rust_background_enabled();
+                if !activated {
+                    return Ok(None);
+                }
+                Ok(Some(work(Unit { config, activated })))
+            })
+    }
+
+    // The orchestration callback is trusted engine code or a hermetic fixture,
+    // never an RPC payload. Each tick and manual run captures config independently;
+    // no serving path calls these entries.
+    pub fn dreamer_tick<T: Send + 'static>(
+        input: ConfigInput,
+        dispatch: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-dreamer-tick", input, dispatch)
+    }
+
+    pub fn manual_dream<T: Send + 'static>(
+        input: ConfigInput,
+        dispatch: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-manual-dream", input, dispatch)
+    }
+
+    pub fn historian_drain<T: Send + 'static>(
+        input: ConfigInput,
+        drain: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-historian-drain", input, drain)
+    }
+
+    pub fn embedding_drain<T: Send + 'static>(
+        input: ConfigInput,
+        drain: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-embedding-drain", input, drain)
+    }
+
+    impl Unit {
+        pub fn run_dream_task<T>(
+            &self,
+            request: &DreamRequest<'_>,
+            carrier: &mut impl DreamCarrier,
+            validate: impl FnMut(&Completion) -> Result<T, String>,
+        ) -> RunResult<T> {
+            // Each worker owns its runtime; no model future blocks the serving runtime.
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("background runtime")
+                .block_on(crate::dream_runner::run_dream_task(
+                    self.activated,
+                    &self.config.effective,
+                    &self.config.settings,
+                    request,
+                    carrier,
+                    validate,
+                ))
+        }
+
+        pub fn reserve_historian<S: DrainStore>(
+            &self,
+            store: &S,
+            request: ReserveRequest<'_>,
+        ) -> Result<Option<DrainReserveResult>, S::Error> {
+            crate::historian_numerical_drain::reserve_protected_tail_drain_tokens(
+                store,
+                self.activated,
+                request,
+            )
+        }
+
+        pub fn refund_historian<S: DrainStore>(
+            &self,
+            store: &S,
+            reservation: &DrainReservation,
+        ) -> Result<(), S::Error> {
+            crate::historian_numerical_drain::rollback_protected_tail_drain_reservation(
+                store,
+                self.activated,
+                Some(reservation),
+            )
+        }
+
+        pub fn publish_historian(
+            &self,
+            store: &mc_store::McStore,
+            mut request: mc_store::HistorianPublishRequest<'_>,
+        ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
+            request.rust_background_enabled = self.activated;
+            store.publish_historian_chunk(request)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn drain_embeddings(
+            &self,
+            db: &mut rusqlite::Connection,
+            chunks: &dyn mc_store::retrieval_vectors::store::ChunkCatalog,
+            provider: &mut dyn mc_store::retrieval_vectors::drain::EmbeddingProvider,
+            registration: &mc_store::retrieval_vectors::drain::Registration,
+            limit: usize,
+            now: i64,
+            completed_at: impl FnOnce() -> i64,
+        ) -> Result<
+            Option<mc_store::retrieval_vectors::drain::FinishOutcome>,
+            mc_store::retrieval_vectors::drain::DrainError,
+        > {
+            mc_store::retrieval_vectors::queue::drain_once(
+                self.activated,
+                db,
+                chunks,
+                provider,
+                registration,
+                limit,
+                now,
+                completed_at,
+            )
+        }
+    }
+}
 pub mod healing;
 pub mod historian;
 pub mod historian_chunk;
@@ -3970,6 +4130,10 @@ pub struct McHandler {
     resolve_project_identity_for_test: AtomicBool,
     #[cfg(test)]
     fixed_config: Option<McModuleConfig>,
+    #[cfg(test)]
+    fixed_dream_settings: Option<Value>,
+    #[cfg(test)]
+    implemented_dream_tasks: HashSet<String>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
     live_historian_sessions: Arc<Mutex<HashMap<String, LiveHistorianSession>>>,
     wrapup_sessions: Arc<Mutex<HashMap<String, LiveWrapupSession>>>,
@@ -4838,6 +5002,10 @@ impl McHandler {
             resolve_project_identity_for_test: AtomicBool::new(false),
             #[cfg(test)]
             fixed_config: None,
+            #[cfg(test)]
+            fixed_dream_settings: None,
+            #[cfg(test)]
+            implemented_dream_tasks: HashSet::new(),
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -5260,6 +5428,8 @@ impl McHandler {
             #[cfg(test)]
             resolve_project_identity_for_test: AtomicBool::new(false),
             fixed_config: Some(config),
+            fixed_dream_settings: None,
+            implemented_dream_tasks: HashSet::new(),
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -13259,6 +13429,29 @@ impl McHandler {
             .contains(session_id)
     }
 
+    fn dream_task_settings(&self, project_root: &Path) -> Result<Value, HandlerOutcome> {
+        #[cfg(test)]
+        if let Some(settings) = &self.fixed_dream_settings {
+            return Ok(settings.clone());
+        }
+        use config_parity::CoreConfigResolver;
+        use mc_store::parity_schema_manifest::CapabilityResult;
+        match config_parity::TrustedConfigResolver::from_environment().resolve(
+            &config_parity::ConfigResolveRequest {
+                user_config_path: String::new(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                generation: mc_store::parity_schema_manifest::Generation(0),
+            },
+        ) {
+            CapabilityResult::Available { value } => Ok(value.settings),
+            CapabilityResult::Degraded { reason, .. }
+            | CapabilityResult::Unavailable { reason } => Err(HandlerOutcome::Error {
+                code: "unavailable_capability".into(),
+                message: format!("dreamer config unavailable: {}", reason.code),
+            }),
+        }
+    }
+
     async fn handle_dreamer_run_task(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let (ledger_session, binding) =
             match self.management_binding(channel, request, "dreamer.run_task") {
@@ -13271,6 +13464,40 @@ impl McHandler {
         let Some(task) = request.get("task").and_then(Value::as_str) else {
             return invalid_params_error("dreamer.run_task requires task");
         };
+        let config = self.effective_config(&binding.project_root);
+        let activated = config.rust_background_enabled();
+        if activated {
+            let available = mc_store::dream_scheduler::schedules::CANONICAL_TASKS
+                .iter()
+                .any(|name| name.as_str() == task)
+                && (config.smart_notes_enabled || task != "evaluate-smart-notes");
+            if !available {
+                return invalid_params_error(format!("unknown dreamer task {task:?}"));
+            }
+            let settings = match self.dream_task_settings(&binding.project_root) {
+                Ok(settings) => settings,
+                Err(outcome) => return outcome,
+            };
+            let enabled = settings["dreamer"]["tasks"][task]["schedule"]
+                .as_str()
+                .is_some_and(|schedule| !schedule.trim().is_empty());
+            if !enabled {
+                return invalid_params_error(format!("unknown dreamer task {task:?}"));
+            }
+            // No production task is ported yet. Only the in-process fixture can
+            // substitute an implemented set; wire fields and config cannot do so.
+            #[cfg(test)]
+            if self.implemented_dream_tasks.contains(task) {
+                return HandlerOutcome::Error {
+                    code: "rust_scheduler_owns_task".into(),
+                    message: format!("Rust scheduler owns dreamer task {task:?}"),
+                };
+            }
+            return HandlerOutcome::Error {
+                code: "unavailable_capability".into(),
+                message: format!("Rust implementation unavailable for dreamer task {task:?}"),
+            };
+        }
         if task != CLASSIFY_TASK {
             // Enumerating the task here is a capability boundary: callers cannot use this
             // route to select an arbitrary system prompt, model, or tool-enabled run.
@@ -20649,6 +20876,777 @@ mod tests {
     // The per-harness default runner, driven through real passes.
     mod default_runner;
     mod retrieval_parity;
+
+    mod i4_roots {
+        use super::*;
+        use crate::background::{self, ConfigInput, DreamCarrier, DreamRequest, DreamRole};
+        use crate::config_parity::{
+            ConfigResolveRequest, CoreConfig, CoreConfigResolver, ProtectedTokenTiers, TrustFlags,
+        };
+        use mc_store::dream_scheduler::schedules::CANONICAL_TASKS;
+        use mc_store::parity_schema_manifest::{Availability, CapabilityResult, Generation};
+
+        struct ConfigFixture {
+            on: AtomicBool,
+            reads: AtomicUsize,
+        }
+
+        impl CoreConfigResolver for ConfigFixture {
+            fn availability(&self) -> Availability {
+                Availability::Available
+            }
+
+            fn resolve(&self, _: &ConfigResolveRequest) -> CapabilityResult<CoreConfig> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                let mut effective = default_test_config();
+                effective.rust_background_enabled = self.on.load(Ordering::SeqCst);
+                effective.historian_runner = Some(HistorianRunnerKind::Host);
+                effective.dreamer_runner = Some(HistorianRunnerKind::Broca);
+                CapabilityResult::Available {
+                    value: CoreConfig {
+                        effective,
+                        generation: Generation(1),
+                        settings: json!({"dreamer":{"opencode":{"model":"fixture/primary",
+                            "fallback_models":["fixture/fallback"]}}}),
+                        warnings: Vec::new(),
+                        trust: TrustFlags::default(),
+                        protected_token_tiers: ProtectedTokenTiers::default(),
+                    },
+                }
+            }
+        }
+
+        fn input(on: bool) -> (Arc<ConfigFixture>, ConfigInput) {
+            let resolver = Arc::new(ConfigFixture {
+                on: AtomicBool::new(on),
+                reads: AtomicUsize::new(0),
+            });
+            let input = ConfigInput {
+                resolver: resolver.clone(),
+                request: ConfigResolveRequest {
+                    user_config_path: String::new(),
+                    project_root: "/recorded/project".into(),
+                    generation: Generation(1),
+                },
+            };
+            (resolver, input)
+        }
+
+        #[test]
+        fn off_roots_do_not_start_any_work() {
+            for root in [
+                background::dreamer_tick,
+                background::manual_dream,
+                background::historian_drain,
+                background::embedding_drain,
+            ] {
+                let (config, input) = input(false);
+                let result = root(input, |_: background::Unit| -> () {
+                    panic!("disabled background root started work")
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+                assert_eq!(result, None);
+                assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[derive(Default)]
+        struct Carrier {
+            calls: Vec<&'static str>,
+            models: Vec<String>,
+        }
+
+        impl DreamCarrier for Carrier {
+            async fn open(
+                &mut self,
+                request: &background::ChildRequest,
+            ) -> Result<String, background::CarrierError> {
+                self.calls.push("open");
+                assert_eq!(request.runner.kind, HistorianRunnerKind::Broca);
+                assert_eq!(request.temperature, None);
+                assert_eq!(request.directory, Path::new("/recorded/project"));
+                self.models
+                    .push(request.model.as_ref().unwrap().model.clone());
+                Ok(format!("child-{}", self.models.len()))
+            }
+
+            async fn complete(
+                &mut self,
+                _: &str,
+                _: &background::ChildRequest,
+            ) -> Result<background::Completion, background::CarrierError> {
+                self.calls.push("complete");
+                Ok(background::Completion {
+                    text: if self.models.len() == 1 {
+                        "bad"
+                    } else {
+                        "accepted"
+                    }
+                    .into(),
+                    ..Default::default()
+                })
+            }
+
+            async fn close(
+                &mut self,
+                _: &str,
+                settled: bool,
+            ) -> Result<(), background::CarrierError> {
+                self.calls.push(if settled { "settled" } else { "aborted" });
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn dream_roots_capture_once_and_resolve_every_role_off_thread() {
+            let caller = std::thread::current().id();
+            for manual in [false, true] {
+                let (config, input) = input(true);
+                let toggle = config.clone();
+                let run = move |unit: background::Unit| {
+                    assert_ne!(std::thread::current().id(), caller);
+                    toggle.on.store(false, Ordering::SeqCst);
+                    for role in [
+                        DreamRole::Classifier,
+                        DreamRole::MemoryMapper,
+                        DreamRole::Curate,
+                        DreamRole::Docs,
+                        DreamRole::Reviewer,
+                        DreamRole::PrimerInvestigator,
+                        DreamRole::Retrospective,
+                    ] {
+                        let mut carrier = Carrier::default();
+                        let result = unit.run_dream_task(
+                            &DreamRequest {
+                                task: "classify-memories",
+                                role,
+                                harness: "opencode",
+                                parent_session_id: "ses",
+                                directory: Path::new("/recorded/project"),
+                                system: "recorded system",
+                                prompt: "recorded input",
+                                timeout: Duration::from_secs(1),
+                                token_budget: Some(100),
+                                allow_empty: false,
+                            },
+                            &mut carrier,
+                            |output| {
+                                (output.text == "accepted")
+                                    .then_some(output.text.clone())
+                                    .ok_or_else(|| "invalid draft".into())
+                            },
+                        );
+                        assert_eq!(result.result.unwrap(), "accepted");
+                        assert_eq!(carrier.models, ["fixture/primary", "fixture/fallback"]);
+                        assert_eq!(
+                            carrier.calls,
+                            ["open", "complete", "aborted", "open", "complete", "settled"]
+                        );
+                    }
+                };
+                let job = if manual {
+                    background::manual_dream(input, run)
+                } else {
+                    background::dreamer_tick(input, run)
+                };
+                assert_eq!(job.unwrap().join().unwrap().unwrap(), Some(()));
+                assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[test]
+        fn runner_routes_use_the_canonical_host_set_and_dreamer_precedence() {
+            let mut config = default_test_config();
+            config.historian_runner = None;
+            config.dreamer_runner = None;
+            for harness in crate::historian_runner::HOST_RUNNER_HARNESSES {
+                assert_eq!(
+                    config.dreamer_runner_for(harness).kind,
+                    HistorianRunnerKind::Host
+                );
+            }
+            for harness in ["", "unknown", "broca"] {
+                assert_eq!(
+                    config.dreamer_runner_for(harness).kind,
+                    HistorianRunnerKind::Broca
+                );
+            }
+            config.historian_runner = Some(HistorianRunnerKind::Host);
+            assert_eq!(
+                config.dreamer_runner_for("").kind,
+                HistorianRunnerKind::Host
+            );
+            config.dreamer_runner = Some(HistorianRunnerKind::Broca);
+            assert_eq!(
+                config.dreamer_runner_for("pi").kind,
+                HistorianRunnerKind::Broca
+            );
+            config.historian_runner = None;
+            assert_eq!(
+                config.dreamer_runner_for("pi").kind,
+                HistorianRunnerKind::Broca
+            );
+        }
+
+        fn code(outcome: HandlerOutcome) -> String {
+            match outcome {
+                HandlerOutcome::Error { code, .. } => code,
+                other => panic!("expected refusal, got {other:?}"),
+            }
+        }
+
+        struct VectorQueue;
+        impl crate::memory_actions::MemoryEmbeddingQueue for VectorQueue {
+            fn enqueue_tx(
+                &self,
+                tx: &rusqlite::Transaction<'_>,
+                effect: &crate::memory_actions::EmbeddingEffect,
+            ) -> rusqlite::Result<()> {
+                let record = serde_json::from_value(serde_json::to_value(effect).unwrap()).unwrap();
+                mc_store::retrieval_vectors::queue::enqueue_tx(tx, &record)
+            }
+        }
+
+        fn memory_write(tx: &rusqlite::Transaction<'_>, project: &str) -> rusqlite::Result<String> {
+            use crate::memory_actions::*;
+            MemoryActions::default().execute_tx(
+                tx,
+                &VectorQueue,
+                &MemoryActionContext {
+                    project_path: project,
+                    session_id: "ses",
+                    harness: "opencode",
+                    role: MemoryRole::Dreamer,
+                    workspace_members: &[],
+                    shared_categories: &[],
+                    curate_category: Some("CONSTRAINTS"),
+                    memory_enabled: true,
+                    now_ms: 100,
+                    decision_key: "recorded-memory-task",
+                },
+                &serde_json::from_value(json!({"action":"write", "content":"Background memory fact", "category":"CONSTRAINTS"})).unwrap(),
+            )
+        }
+
+        fn scalar(db: &rusqlite::Connection, sql: &str) -> i64 {
+            db.query_row(sql, [], |row| row.get(0)).unwrap()
+        }
+
+        struct NoChunks;
+        impl mc_store::retrieval_vectors::store::ChunkCatalog for NoChunks {
+            fn pending(
+                &self,
+                _: &rusqlite::Connection,
+                _: &str,
+                _: &str,
+                _: usize,
+            ) -> rusqlite::Result<Vec<mc_store::retrieval_vectors::store::Passage>> {
+                Ok(Vec::new())
+            }
+            fn current(
+                &self,
+                _: &rusqlite::Connection,
+                _: &mc_store::retrieval_vectors::store::Passage,
+            ) -> rusqlite::Result<bool> {
+                panic!("memory-only drain requested chunks")
+            }
+        }
+
+        struct Embedder(Arc<AtomicUsize>);
+        impl mc_store::retrieval_vectors::drain::EmbeddingProvider for Embedder {
+            fn embed(
+                &mut self,
+                _: &mc_store::retrieval_vectors::drain::Registration,
+                passages: &[mc_store::retrieval_vectors::store::Passage],
+            ) -> Result<Vec<Vec<f32>>, String> {
+                self.0.fetch_add(passages.len(), Ordering::SeqCst);
+                Ok(vec![vec![0.25, 0.75]; passages.len()])
+            }
+        }
+
+        #[test]
+        fn embedding_root_drains_a_real_memory_action_only_when_on() {
+            use mc_store::retrieval_vectors::drain::{FinishOutcome, Registration};
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fixture.db");
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch(
+                &include_str!("../../mc-store/testdata/context_schema/schema.sql")
+                    .replace(":applied_at", "1"),
+            )
+            .unwrap();
+            let (_, task_input) = input(true);
+            let task_path = path.clone();
+            background::manual_dream(task_input, move |unit| {
+                let mut carrier = Carrier::default();
+                unit.run_dream_task(
+                    &DreamRequest {
+                        task: "curate",
+                        role: DreamRole::Curate,
+                        harness: "opencode",
+                        parent_session_id: "ses",
+                        directory: Path::new("/recorded/project"),
+                        system: "recorded memory-task system",
+                        prompt: "recorded memory-task input",
+                        timeout: Duration::from_secs(1),
+                        token_budget: Some(100),
+                        allow_empty: false,
+                    },
+                    &mut carrier,
+                    |output| {
+                        (output.text == "accepted")
+                            .then_some(())
+                            .ok_or_else(|| "invalid result".into())
+                    },
+                )
+                .result
+                .unwrap();
+                let mut db = rusqlite::Connection::open(task_path).unwrap();
+                let tx = db.transaction().unwrap();
+                assert_eq!(
+                    memory_write(&tx, "git:identity").unwrap(),
+                    "Saved memory [ID: 1] in CONSTRAINTS."
+                );
+                tx.commit().unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            // Exercise the TS entry points against the same memory-task database.
+            // Any executor entry would be a second writer, including turn two.
+            let ts = std::process::Command::new("bun")
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .args(["-e", r#"
+import { Database } from 'bun:sqlite';
+import { runDueTasksForProject, runManualDream } from '../../packages/plugin/src/features/magic-context/dreamer/task-scheduler.ts';
+import { CANONICAL_DREAM_TASKS } from '../../packages/plugin/src/features/magic-context/dreamer/task-registry.ts';
+const db = new Database(process.argv[1]);
+let executed = 0;
+const deps = { db, projectIdentity: 'git:identity', rust_background_enabled: true,
+  tasks: CANONICAL_DREAM_TASKS.map(task => ({task, schedule:'0 3 * * *'})),
+  executor: async () => { executed++; throw new Error('duplicate TS memory-task writer'); } };
+if (await runDueTasksForProject(deps) !== 0) throw new Error('TS due task ran');
+for (const task of CANONICAL_DREAM_TASKS) {
+  const result = await runManualDream({...deps, task});
+  if (result.ran.length || result.failed.length) throw new Error('TS manual task ran');
+}
+if (executed !== 0) throw new Error('TS executor reached insertMemory/runTurnTwo');
+console.log(`TS_EXECUTORS tasks=${executed} memory_rows=${db.query('SELECT COUNT(*) AS n FROM memories').get().n}`);
+db.close();
+"#])
+                .arg(&path)
+                .output()
+                .expect("Bun is required for the TS executor exclusion fixture");
+            assert!(
+                ts.status.success(),
+                "{}",
+                String::from_utf8_lossy(&ts.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&ts.stdout).contains("TS_EXECUTORS tasks=0 memory_rows=1")
+            );
+            let registration = Registration {
+                project: "git:identity".into(),
+                model_id: "fixture".into(),
+                chunk_model_id: "fixture:raw".into(),
+                fingerprint: "fixture-fingerprint".into(),
+                table_epoch: 1,
+                dimensions: 2,
+                generation: 1,
+            };
+            db.execute("INSERT INTO embedding_registrations(project_path,model_id,chunk_model_id,fingerprint,table_epoch,dims,generation) VALUES(?1,?2,?3,?4,1,2,1)", rusqlite::params![registration.project,registration.model_id,registration.chunk_model_id,registration.fingerprint]).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            for on in [false, true] {
+                let (config, input) = input(on);
+                let toggle = config.clone();
+                let path = path.clone();
+                let registration = registration.clone();
+                let mut provider = Embedder(calls.clone());
+                let result = background::embedding_drain(input, move |unit| {
+                    toggle.on.store(false, Ordering::SeqCst);
+                    let mut db = rusqlite::Connection::open(path).unwrap();
+                    unit.drain_embeddings(
+                        &mut db,
+                        &NoChunks,
+                        &mut provider,
+                        &registration,
+                        1,
+                        100,
+                        || 101,
+                    )
+                    .unwrap()
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+                if on {
+                    assert!(matches!(
+                        result,
+                        Some(Some(FinishOutcome::Published { accepted: 1, .. }))
+                    ));
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_embeddings"), 1);
+                } else {
+                    assert_eq!(result, None);
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_embeddings"), 0);
+                }
+                assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memories"), 1);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_journal"), 1);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_history"), 0);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM authority_managed"), 0);
+                assert_eq!(
+                    scalar(&db, "SELECT COUNT(*) FROM authority_repair_pending"),
+                    0
+                );
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_pending_facts WHERE reason='authority_elsewhere'"), 0);
+            }
+        }
+
+        #[derive(Default)]
+        struct DrainAccounting(Mutex<background::DrainMeta>);
+        impl background::DrainStore for DrainAccounting {
+            type Error = ();
+            fn with_immediate_transaction<T>(
+                &self,
+                _: &str,
+                apply: impl FnOnce(&mut background::DrainMeta) -> T,
+            ) -> Result<T, ()> {
+                Ok(apply(&mut self.0.lock().unwrap()))
+            }
+        }
+
+        #[test]
+        fn historian_root_keeps_reservation_and_refund_under_its_capture() {
+            let (config, input) = input(true);
+            let toggle = config.clone();
+            let result = background::historian_drain(input, move |unit| {
+                toggle.on.store(false, Ordering::SeqCst);
+                let accounting = DrainAccounting::default();
+                let reserved = unit
+                    .reserve_historian(
+                        &accounting,
+                        background::ReserveRequest {
+                            session_id: "ses",
+                            run_id: "run",
+                            true_raw_tokens: 30.0,
+                            usage_percentage: 70.0,
+                            usable: 100_000.0,
+                            per_run_cap: 50_000.0,
+                            execute_threshold_percentage: 65.0,
+                            now: 100,
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reserved.reserved_tokens, 30.0);
+                assert_eq!(
+                    accounting.0.lock().unwrap().protected_tail_drain_tokens,
+                    30.0
+                );
+                unit.refund_historian(&accounting, reserved.reservation.as_ref().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    accounting.0.lock().unwrap().protected_tail_drain_tokens,
+                    0.0
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+            assert_eq!(result, Some(()));
+            assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn enabled_background_results_wait_for_natural_rebuild_even_after_restart() {
+            let producer = Arc::new(ProducerState::default());
+            let mut config = default_test_config();
+            config.rust_background_enabled = true;
+            config.inject_docs = false;
+            config.temporal_awareness = false;
+            config.cache_ttl = "never".into();
+            let (handler, store, _dir, project) =
+                handler_with_store(producer.clone(), config.clone());
+            store.set_route_identity_for_test(project.to_str().unwrap(), "git:identity");
+            // Start with an already folded prefix. Legacy whole-array transforms
+            // deliberately materialize the first-ever compartment immediately.
+            store.with_context_conn_for_test(|tx| tx.execute_batch("INSERT INTO compartments(session_id,sequence,start_message,end_message,end_message_id,title,content,p1,created_at) VALUES('ses',1,1,1,'m1#0','Initial','Initial history','Initial history',1)")).unwrap();
+            let mut body = request_with_usage(
+                vec![
+                    ck("m1", 1, "hello"),
+                    ck("m2", 2, "new history"),
+                    ck("m3", 3, "keep raw tail"),
+                ],
+                1_000,
+                50_000,
+            );
+            body["memory_enabled"] = json!(true);
+            body["cache_ttl"] = json!("5m");
+            body["prev_response_completed_at_ms"] = json!(now_ms());
+            let first = call_transform_request(&handler, body.clone()).await;
+            assert_eq!(first["status"], "ok");
+            let stable = call_transform_request(&handler, body.clone()).await;
+            let before = store.load("ses").unwrap();
+            let (resolver, input) = input(true);
+            let toggle = resolver.clone();
+            let work_store = store.clone();
+            background::historian_drain(input, move |unit| {
+                let mut loaded = work_store.load("ses").unwrap();
+                let selected = vec![mc_store::HistorianSelectedMessageIdentity {
+                    mid: "m2".into(),
+                    block_identities: loaded.meta.block_identity_by_mid["m2"].clone(),
+                }];
+                let predicate = mc_store::HistorianPublishPredicate {
+                    firing_seq: 7,
+                    producer_run_id: "recorded-run".into(),
+                    producer_attempt: 0,
+                    chunk_fingerprint: "recorded-chunk".into(),
+                    selected_range_identities: selected.clone(),
+                    compartment_set_generation: mc_store::CompartmentSetGeneration {
+                        max_sequence: 1,
+                        count: 1,
+                    },
+                };
+                loaded.meta.historian = HistorianDurableState {
+                    state: HistorianPhase::Publishing,
+                    firing_seq: 7,
+                    producer_run_id: Some("recorded-run".into()),
+                    chunk_fingerprint: "recorded-chunk".into(),
+                    selected_range_identities: selected,
+                    compartment_set_generation: predicate.compartment_set_generation,
+                    ..Default::default()
+                };
+                let version = work_store
+                    .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                    .unwrap();
+                toggle.on.store(false, Ordering::SeqCst);
+                let publish = || unit.publish_historian(
+                    &work_store,
+                    mc_store::HistorianPublishRequest {
+                        rust_background_enabled: false,
+                        lifecycle_publication_id: None,
+                        harness: Some("opencode"),
+                        session_id: "ses",
+                        expected_row_version: Some(version),
+                        expected_revert_epoch: 0,
+                        predicate: &predicate,
+                        project_path: "git:identity",
+                        compartments: &[stored_comp(2, 2, 2, "m2", "Background historian summary")],
+                        facts: &[],
+                        promote_facts: false,
+                        events: &[],
+                        primer_candidates: &[],
+                        user_memory_candidates: &[],
+                        publication_floor_ordinal: 2,
+                        chunk_transcript: None,
+                        raw_chunk_messages: None,
+                    },
+                );
+                work_store.with_context_conn_for_test(|tx| {
+                    tx.execute("INSERT INTO compartment_state_lease(session_id,holder_id,acquired_at,expires_at) VALUES('ses','ts-wrapup',?1,?2)", rusqlite::params![now_ms(), now_ms()+60_000])?;
+                    Ok(())
+                }).unwrap();
+                assert!(matches!(publish(), Err(mc_store::HistorianPublishError::Deferred { reason }) if reason == "compartment lease busy"));
+                assert_eq!(work_store.load_compartments("ses").unwrap().len(), 1);
+                work_store.with_context_conn_for_test(|tx| tx.execute_batch("DELETE FROM compartment_state_lease WHERE session_id='ses'")).unwrap();
+                publish().unwrap();
+                work_store
+                    .with_context_conn_for_test(|tx| memory_write(tx, "git:identity"))
+                    .unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(resolver.reads.load(Ordering::SeqCst), 1);
+            let after = store.load("ses").unwrap();
+            assert_eq!(after.core, before.core);
+            assert_eq!(
+                after.meta.project_memory_epoch,
+                before.meta.project_memory_epoch
+            );
+            assert_eq!(
+                after.meta.project_memory_epoch_pending,
+                before.meta.project_memory_epoch_pending
+            );
+            assert_eq!(store.load_compartments("ses").unwrap().len(), 2);
+            let deferred = call_transform_request(&handler, body.clone()).await;
+            let restarted = McHandler::with_producer_factory_config_resolver(
+                Arc::new(TestProducerFactory {
+                    state: producer.clone(),
+                }),
+                config,
+                Arc::new(MissingSessionResolver),
+            );
+            restarted.store.set(store.clone()).ok().unwrap();
+            restarted.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+            let replay = call_transform_request(&restarted, body.clone()).await;
+            for response in [deferred, replay] {
+                assert_eq!(response["decision"], stable["decision"], "{response}");
+                assert_eq!(response["ck_messages"], stable["ck_messages"], "{response}");
+            }
+            body["model_key"] = json!("natural-model-change");
+            let rebuilt = call_transform_request(&restarted, body).await;
+            let text = serde_json::to_string(&rebuilt["ck_messages"]).unwrap();
+            assert!(text.contains("Background historian summary"), "{rebuilt}");
+            assert!(text.contains("Background memory fact"), "{rebuilt}");
+            assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn canonical_dream_task_matrix_preserves_off_and_refuses_enabled_tasks() {
+            let ts = include_str!(
+                "../../../packages/plugin/src/features/magic-context/dreamer/task-registry.ts"
+            );
+            let registry = ts
+                .split("export const CANONICAL_DREAM_TASKS = [")
+                .nth(1)
+                .unwrap()
+                .split("] as const")
+                .next()
+                .unwrap();
+            let ts_names: Vec<_> = registry
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix('"')?.split('"').next())
+                .collect();
+            assert_eq!(
+                CANONICAL_TASKS.map(|task| task.as_str()).as_slice(),
+                ts_names
+            );
+            let mut config = default_test_config();
+            config.rust_background_enabled = true;
+            config.smart_notes_enabled = true;
+            let producer = Arc::new(ProducerState::default());
+            let (mut handler, store, _dir, _) =
+                handler_with_store(producer.clone(), config.clone());
+            let mut settings = json!({"dreamer":{"tasks":{}}});
+            for task in CANONICAL_TASKS {
+                settings["dreamer"]["tasks"][task.as_str()] = json!({"schedule":"0 3 * * *"});
+            }
+            handler.fixed_dream_settings = Some(settings.clone());
+            for (channel, request, expected) in [
+                (
+                    7,
+                    json!({"session_id":"ses","task":"curate"}),
+                    "bad_request",
+                ),
+                (7, json!({"v":1,"task":"curate"}), "bad_request"),
+                (
+                    8,
+                    json!({"v":1,"session_id":"ses","task":"curate"}),
+                    "route_unbound",
+                ),
+                (
+                    7,
+                    json!({"v":1,"session_id":"foreign","task":"curate"}),
+                    "session_mismatch",
+                ),
+                (7, json!({"v":1,"session_id":"ses"}), "invalid_params"),
+                (
+                    7,
+                    json!({"v":1,"session_id":"ses","task":"unknown"}),
+                    "invalid_params",
+                ),
+            ] {
+                assert_eq!(
+                    code(handler.handle_dreamer_run_task(channel, &request).await),
+                    expected
+                );
+            }
+            for implemented in [false, true] {
+                for task in CANONICAL_TASKS {
+                    handler.implemented_dream_tasks.clear();
+                    if implemented {
+                        handler.implemented_dream_tasks.insert(task.as_str().into());
+                    }
+                    let request = json!({"v":1,"session_id":"ses","task":task.as_str(),
+                        "implemented":true,"model_chain":false,"payload":false,"command_id":false});
+                    assert_eq!(
+                        code(handler.handle_dreamer_run_task(7, &request).await),
+                        if implemented {
+                            "rust_scheduler_owns_task"
+                        } else {
+                            "unavailable_capability"
+                        },
+                        "{}",
+                        task.as_str()
+                    );
+                }
+            }
+            handler.implemented_dream_tasks.clear();
+            config.smart_notes_enabled = false;
+            handler.fixed_config = Some(config.clone());
+            handler
+                .implemented_dream_tasks
+                .insert("evaluate-smart-notes".into());
+            assert_eq!(
+                code(
+                    handler
+                        .handle_dreamer_run_task(
+                            7,
+                            &json!({"v":1,"session_id":"ses","task":"evaluate-smart-notes"})
+                        )
+                        .await
+                ),
+                "invalid_params"
+            );
+            handler.implemented_dream_tasks.clear();
+            config.smart_notes_enabled = true;
+            handler.fixed_config = Some(config.clone());
+            for task in CANONICAL_TASKS {
+                let mut disabled = settings.clone();
+                disabled["dreamer"]["tasks"][task.as_str()]["schedule"] = json!("  ");
+                handler.fixed_dream_settings = Some(disabled);
+                assert_eq!(
+                    code(
+                        handler
+                            .handle_dreamer_run_task(
+                                7,
+                                &json!({"v":1,"session_id":"ses","task":task.as_str()})
+                            )
+                            .await
+                    ),
+                    "invalid_params"
+                );
+            }
+            handler.fixed_dream_settings = Some(settings);
+            config.rust_background_enabled = false;
+            handler.fixed_config = Some(config);
+            for task in CANONICAL_TASKS {
+                assert_eq!(
+                    code(
+                        handler
+                            .handle_dreamer_run_task(
+                                7,
+                                &json!({"v":1,"session_id":"ses","task":task.as_str(),
+                    "command_id":"matrix","payload":{"prompt_body":"recorded","items":[]}})
+                            )
+                            .await
+                    ),
+                    if task.as_str() == CLASSIFY_TASK {
+                        "model_chain_missing"
+                    } else {
+                        "invalid_params"
+                    }
+                );
+            }
+            assert!(store
+                .load_dream_task_command("ses", "matrix")
+                .unwrap()
+                .is_none());
+            assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        }
+    }
 
     fn owner_prep_methods() -> impl Iterator<Item = &'static str> {
         non_served_contract::UI_METHODS.iter().copied().chain([
