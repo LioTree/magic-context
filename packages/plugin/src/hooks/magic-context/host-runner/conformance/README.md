@@ -190,12 +190,14 @@ PiAction =
   {kind: "branch", entries: string[]}
 ```
 
-`Exchange` is relay-v1's exchange, with the same field names and meaning. The Pi
+`Exchange` is relay-v1's exchange (see "Exact format" above), with the same field
+names and meaning. The Pi
 adapter also sends `state_sync`. An answer of the form `{"oracle_error": ...}`
 is how the oracle encodes a module error reply; it is recorded exactly like any
 other answer.
 
-Unlike relay-v1, the six cases are **one ordered session** against one MC store:
+Unlike relay-v1, whose cases each reset the oracle's store, the six Pi cases are
+**one ordered session** against one MC store:
 a case owns the steps recorded since the previous case, and its `expected` block
 describes the adapter's results at that point. A replay must therefore run every
 case, in order. Steps carry no per-step snapshot; `expected` is the only outcome.
