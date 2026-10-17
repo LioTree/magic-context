@@ -1,62 +1,60 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 
-import { RUST_COMPACTION_OFF_WARNING, resolveTransformMode } from "./transform-mode";
+import * as logger from "../shared/logger";
+import {
+    hasDeprecatedTransformKeys,
+    resetTransformModeDeprecationWarningForTest,
+    resolveTransformMode,
+    TRANSFORM_MODE_DEPRECATION_WARNING,
+    warnTransformModeDeprecatedOnce,
+} from "./transform-mode";
 
 describe("resolveTransformMode", () => {
-    it("falls back to ts and warns when rust lacks user-level subc", () => {
-        expect(
-            resolveTransformMode({
-                configured: "rust",
-                userTierHasSubc: false,
-                compactionEnabled: true,
-            }),
-        ).toEqual({
-            mode: "ts",
-            warnings: ["rust mode requires user-level subc configuration; running ts."],
-        });
-    });
-
-    it("keeps rust when trusted user-level subc is present", () => {
+    // These inputs used to activate the full-array Rust transform. Every host now
+    // runs the TypeScript transform whatever the config says.
+    it("resolves rust with user-level subc and compaction on to ts", () => {
         expect(
             resolveTransformMode({
                 configured: "rust",
                 userTierHasSubc: true,
                 compactionEnabled: true,
             }),
-        ).toEqual({ mode: "rust", warnings: [] });
+        ).toEqual({ mode: "ts" });
     });
 
-    it("keeps ts without warnings when ts is configured", () => {
-        expect(
-            resolveTransformMode({
-                configured: "ts",
-                userTierHasSubc: false,
-                compactionEnabled: true,
-            }),
-        ).toEqual({ mode: "ts", warnings: [] });
+    it("resolves every other combination to ts", () => {
+        for (const configured of ["ts", "rust"] as const)
+            for (const userTierHasSubc of [true, false])
+                for (const compactionEnabled of [true, false])
+                    expect(
+                        resolveTransformMode({ configured, userTierHasSubc, compactionEnabled })
+                            .mode,
+                    ).toBe("ts");
+        expect(resolveTransformMode().mode).toBe("ts");
+    });
+});
+
+describe("transform_mode deprecation", () => {
+    afterEach(() => resetTransformModeDeprecationWarningForTest());
+
+    it("detects either retired key in a raw config layer", () => {
+        expect(hasDeprecatedTransformKeys({ transform_mode: "ts" })).toBe(true);
+        expect(hasDeprecatedTransformKeys({ rust_pipeline: "provider" })).toBe(true);
+        expect(hasDeprecatedTransformKeys({ subc: { connection_file: "/s" } })).toBe(false);
+        expect(hasDeprecatedTransformKeys(undefined)).toBe(false);
     });
 
-    it("keeps rust in the default compaction-on mode without a warning", () => {
-        const result = resolveTransformMode({
-            configured: "rust",
-            userTierHasSubc: true,
-            compactionEnabled: true,
-        });
-
-        expect(result.mode).toBe("rust");
-        expect(result.warnings).toEqual([]);
-    });
-
-    it("downgrades rust to ts with one warning when compaction is off", () => {
-        expect(
-            resolveTransformMode({
-                configured: "rust",
-                userTierHasSubc: true,
-                compactionEnabled: false,
-            }),
-        ).toEqual({
-            mode: "ts",
-            warnings: [RUST_COMPACTION_OFF_WARNING],
-        });
+    it("logs the warning once per process", () => {
+        const log = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            warnTransformModeDeprecatedOnce();
+            warnTransformModeDeprecatedOnce();
+            warnTransformModeDeprecatedOnce();
+            expect(log.mock.calls).toEqual([
+                [`[magic-context] ${TRANSFORM_MODE_DEPRECATION_WARNING}`],
+            ]);
+        } finally {
+            log.mockRestore();
+        }
     });
 });

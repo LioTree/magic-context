@@ -34,6 +34,13 @@ export interface ModeManifestEntry {
 
 export interface ModeManifest {
     schema: number;
+    /**
+     * "retired" when no host runs the full-array Rust transform any more. The
+     * Rust hermetic lane then has nothing to run: no entry may have a rust
+     * invocation, and the lane's runner treats the empty selection as a pass.
+     * Without the marker an empty Rust selection is still an error.
+     */
+    rust_lane?: "retired";
     header: string;
     entries: ModeManifestEntry[];
 }
@@ -193,8 +200,18 @@ export function validateManifestDocument(
     if (!isRecord(raw) || raw.schema !== 1 || typeof raw.header !== "string" || !Array.isArray(raw.entries)) {
         throw new Error("mode manifest must be an object with schema: 1, header, and entries");
     }
+    if (raw.rust_lane !== undefined && raw.rust_lane !== "retired") {
+        throw new Error(`mode manifest rust_lane must be "retired" when present; got ${JSON.stringify(raw.rust_lane)}`);
+    }
+    const rustLaneRetired = raw.rust_lane === "retired";
 
     const entries = raw.entries.map(validateEntry);
+    if (rustLaneRetired) {
+        const stillRust = entries.filter((entry) => entry.invocation.rust).map((entry) => entry.path);
+        if (stillRust.length > 0) {
+            throw new Error(`rust_lane is retired but these entries still have a rust invocation: ${stillRust.join(", ")}`);
+        }
+    }
     const expectedSet = new Set(expectedFiles);
     const seen = new Map<string, number>();
     for (const entry of entries) {
@@ -223,9 +240,30 @@ export function validateManifestDocument(
     }
 
     return {
-        manifest: { schema: 1, header: raw.header, entries },
+        manifest: {
+            schema: 1,
+            ...(rustLaneRetired ? { rust_lane: "retired" as const } : {}),
+            header: raw.header,
+            entries,
+        },
         files: expectedFiles,
     };
+}
+
+export const RUST_LANE_RETIRED_MESSAGE =
+    "Rust hermetic e2e lane retired (transform_mode removed); no files selected";
+
+export function isRustLaneRetired(validation: ValidationResult): boolean {
+    return validation.manifest.rust_lane === "retired";
+}
+
+/**
+ * Whether an empty Rust selection may pass. Only the explicit `rust_lane:
+ * "retired"` marker allows it; otherwise an empty selection means the manifest
+ * or the selection broke, and the lane must fail.
+ */
+export function emptyRustSelectionAllowed(validation: ValidationResult, selected: string[]): boolean {
+    return selected.length === 0 && isRustLaneRetired(validation);
 }
 
 export function validateModeManifest(): ValidationResult {
@@ -244,12 +282,19 @@ export function filesForMode(
         .sort();
 }
 
-function parseArgs(args: string[]): { mode?: Mode; harness: HarnessSelection } {
+function parseArgs(args: string[]): {
+    mode?: Mode;
+    harness: HarnessSelection;
+    allowEmptyRustSelection: boolean;
+} {
     let mode: Mode | undefined;
     let harness: HarnessSelection = "all";
+    let allowEmptyRustSelection = false;
     for (let index = 0; index < args.length; index += 1) {
         const arg = args[index];
-        if (arg === "--mode") {
+        if (arg === "--allow-empty-rust-selection") {
+            allowEmptyRustSelection = true;
+        } else if (arg === "--mode") {
             const value = args[++index];
             if (value !== "ts" && value !== "rust") throw new Error("--mode must be ts or rust");
             mode = value;
@@ -261,21 +306,29 @@ function parseArgs(args: string[]): { mode?: Mode; harness: HarnessSelection } {
             harness = value as HarnessSelection;
         } else if (arg === "--help" || arg === "-h") {
             console.log(
-                "Usage: validate-mode-manifest.ts [--mode ts|rust] [--harness all|opencode|opencode2|pi|omp]",
+                "Usage: validate-mode-manifest.ts [--mode ts|rust] [--harness all|opencode|opencode2|pi|omp] [--allow-empty-rust-selection]",
             );
             process.exit(0);
         } else {
             throw new Error(`unknown argument: ${arg}`);
         }
     }
-    return { mode, harness };
+    return { mode, harness, allowEmptyRustSelection };
 }
 
 if (import.meta.main) {
     try {
-        const { mode, harness } = parseArgs(Bun.argv.slice(2));
+        const { mode, harness, allowEmptyRustSelection } = parseArgs(Bun.argv.slice(2));
         const validation = validateModeManifest();
-        if (!mode) {
+        if (allowEmptyRustSelection) {
+            // scripts/run-rust-hermetic-e2e.sh asks this when its selection is
+            // empty: exit 0 only for a retired Rust lane, otherwise fail.
+            if (!emptyRustSelectionAllowed(validation, filesForMode(validation, "rust"))) {
+                console.error("Error: Rust e2e manifest selected zero test files");
+                process.exit(1);
+            }
+            console.log(RUST_LANE_RETIRED_MESSAGE);
+        } else if (!mode) {
             console.log(`validated ${validation.files.length} e2e test entries`);
         } else {
             for (const path of filesForMode(validation, mode, harness)) console.log(path);

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+    emptyRustSelectionAllowed,
     filesForMode,
     validateManifestDocument,
     validateModeManifest,
@@ -33,11 +34,12 @@ describe("mode manifest validator", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
         expect(ts).toHaveLength(74);
-        expect(rust).toHaveLength(59);
-        expect(rust).toContain("tests/rust-tool-attachments.test.ts");
-        expect(rust).toContain("tests/rust-tool-attachment-upgrade.test.ts");
-        expect(rust).toContain("tests/idle-ttl-restart.test.ts");
-        expect(rust).toContain("tests/subagent-behavior.test.ts");
+        // The Rust lane is retired with transform_mode: no entry has a rust
+        // invocation. Former both-modes files stay in the TypeScript list.
+        expect(validation.manifest.rust_lane).toBe("retired");
+        expect(rust).toEqual([]);
+        expect(ts).toContain("tests/idle-ttl-restart.test.ts");
+        expect(ts).toContain("tests/subagent-behavior.test.ts");
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(5);
         expect(filesForMode(validation, "ts", "opencode")).toHaveLength(47);
         expect(filesForMode(validation, "ts", "opencode")).toContain("tests/processed-images.test.ts");
@@ -139,7 +141,10 @@ describe("mode manifest validator", () => {
             "tests/opencode2/rpc-s2-listener.test.ts",
             "tests/opencode2/runner.test.ts",
             "tests/opencode2/rust-mode-boundary-restart-gate.test.ts",
+            "tests/opencode2/rust-mode-fold-cadence.test.ts",
+            "tests/opencode2/rust-mode-host-runner-default.test.ts",
             "tests/opencode2/rust-mode-limitation.test.ts",
+            "tests/opencode2/rust-mode-module-served.test.ts",
             "tests/opencode2/session-api-cutover.test.ts",
             "tests/opencode2/session-project-binding.test.ts",
             "tests/opencode2/sidebar-component.test.ts",
@@ -153,11 +158,52 @@ describe("mode manifest validator", () => {
             "tests/opencode2/tool-result-image.test.ts",
             "tests/opencode2/ts-mode-on-migrated-real-store.test.ts",
             "tests/opencode2/v1-v2-reconversion.test.ts",
+            "tests/pi-rust-degradation-arc-1.test.ts",
+            "tests/pi-rust-degradation-arc-4.test.ts",
+            "tests/rust-adapter-perf.test.ts",
             "tests/rust-classify-host-runner.test.ts",
+            "tests/rust-classify-producer.test.ts",
+            "tests/rust-cold-seed-perf.test.ts",
+            "tests/rust-cold-seed-tag-surface.test.ts",
+            "tests/rust-cold-start-drop-seed.test.ts",
+            "tests/rust-compaction-marker-byte-identity.test.ts",
+            "tests/rust-ctx-reduce-roundtrip.test.ts",
+            "tests/rust-dangling-boundary-seed.test.ts",
+            "tests/rust-duplicate-tool-use-id.test.ts",
+            "tests/rust-fm-oc-1.test.ts",
+            "tests/rust-fm-oc-2.test.ts",
+            "tests/rust-fm-oc-3.test.ts",
+            "tests/rust-fm-oc-4.test.ts",
+            "tests/rust-fm-oc-5.test.ts",
+            "tests/rust-fm-oc-6.test.ts",
+            "tests/rust-fold-under-pressure.test.ts",
+            "tests/rust-frozen-restart-review-drill.test.ts",
             "tests/rust-full-sync-frame-cap.test.ts",
+            "tests/rust-historian-producer.test.ts",
+            "tests/rust-host-runner-default.test.ts",
+            "tests/rust-maintenance-contract.test.ts",
+            "tests/rust-memory-off-parity.test.ts",
+            "tests/rust-memory-update-reembed.test.ts",
+            "tests/rust-multi-frame-delta-perf.test.ts",
+            "tests/rust-oversize-reply.test.ts",
+            "tests/rust-paired-session-replay.test.ts",
+            "tests/rust-park-self-heal.test.ts",
+            "tests/rust-persisted-synthetic-prompt.test.ts",
             "tests/rust-plugin-stage-cache.test.ts",
             "tests/rust-provider-pipeline-opencode1.test.ts",
             "tests/rust-provider-pipeline-opencode2.test.ts",
+            "tests/rust-real-or-absent-drops.test.ts",
+            "tests/rust-removal-self-heal.test.ts",
+            "tests/rust-restart-variant-double-hard.test.ts",
+            "tests/rust-shared-memory-addressing.test.ts",
+            "tests/rust-smoke.test.ts",
+            "tests/rust-steady-state-byte-identity.test.ts",
+            "tests/rust-subagent-lkg-cycle.test.ts",
+            "tests/rust-tail-mutation-readopt.test.ts",
+            "tests/rust-timeout-double-hard.test.ts",
+            "tests/rust-timeout-epoch-recovery.test.ts",
+            "tests/rust-tool-attachment-upgrade.test.ts",
+            "tests/rust-tool-attachments.test.ts",
             "tests/system-prompt-change-order.test.ts",
             "tests/zen-primary-surface.test.ts",
         ]);
@@ -274,5 +320,45 @@ describe("mode manifest validator", () => {
                 validation.files,
             ),
         ).toThrow(/invocation disagrees with both-modes/);
+    });
+});
+
+describe("retired Rust lane marker", () => {
+    it("allows an empty Rust selection only when the manifest marks the lane retired", () => {
+        const entries = validation.manifest.entries;
+        const retired = validateManifestDocument(
+            { ...manifestWith(entries), rust_lane: "retired" },
+            validation.files,
+        );
+        const unmarked = validateManifestDocument(manifestWith(entries), validation.files);
+        expect(filesForMode(retired, "rust")).toEqual([]);
+        expect(filesForMode(unmarked, "rust")).toEqual([]);
+        expect(emptyRustSelectionAllowed(retired, [])).toBe(true);
+        // Without the marker, an empty selection still means something broke.
+        expect(emptyRustSelectionAllowed(unmarked, [])).toBe(false);
+        // A non-empty selection is never "allowed empty".
+        expect(emptyRustSelectionAllowed(retired, ["tests/smoke.test.ts"])).toBe(false);
+    });
+
+    it("rejects a retired lane that still has a rust invocation, and an unknown marker value", () => {
+        const entries = validation.manifest.entries;
+        const withRust = [
+            {
+                ...entries[0]!,
+                tier: "both-modes" as const,
+                invocation: { ts: true, rust: true },
+                contract_refs: ["PARITY.md"],
+            },
+            ...entries.slice(1),
+        ];
+        expect(() =>
+            validateManifestDocument({ ...manifestWith(withRust), rust_lane: "retired" }, validation.files),
+        ).toThrow(/rust_lane is retired but these entries still have a rust invocation/);
+        expect(() =>
+            validateManifestDocument(
+                { ...manifestWith(entries), rust_lane: "paused" } as unknown as ModeManifest,
+                validation.files,
+            ),
+        ).toThrow(/rust_lane must be "retired"/);
     });
 });

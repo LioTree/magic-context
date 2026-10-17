@@ -1,9 +1,10 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveEpochFloorForPass } from "../features/magic-context/storage-meta-persisted";
 import { buildOpenCodeConfigWarningBanner } from "../shared/config-warning-surface";
+import * as logger from "../shared/logger";
 import { resolveDreamerTaskModel, resolveHistorianModel } from "../shared/model-resolution";
 import { Database } from "../shared/sqlite";
 import { createTestTempDir, createTestTempDirFromPath } from "../shared/test-temp-dir";
@@ -16,7 +17,10 @@ import { resolveConfigProfile } from "./profiles";
 import { getProtectedTokensTierOverrides } from "./project-security";
 import { REMOVED_AGENT_CONFIG_WARNING } from "./removed-agent-config";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "./schema/magic-context";
-import { RUST_COMPACTION_OFF_WARNING } from "./transform-mode";
+import {
+    resetTransformModeDeprecationWarningForTest,
+    TRANSFORM_MODE_DEPRECATION_WARNING,
+} from "./transform-mode";
 
 /**
  * Writes a magic-context.jsonc file inside a fresh temp XDG_CONFIG_HOME tree
@@ -315,35 +319,72 @@ describe("loadPluginConfig — graduated mural config", () => {
     });
 });
 
-describe("loadPluginConfig — transform mode resolution", () => {
-    it("downgrades rust when compaction is off and emits one boot warning", () => {
-        const result = loadWithUserConfig(
-            JSON.stringify({
-                compaction: { enabled: false },
-                transform_mode: "rust",
-                subc: { connection_file: "/tmp/subc.sock" },
-            }),
-        );
+describe("loadPluginConfig — transform_mode and rust_pipeline are retired", () => {
+    afterEach(() => resetTransformModeDeprecationWarningForTest());
 
-        expect(result.transform_mode).toBe("ts");
-        expect(result.configWarnings?.filter((warning) => warning.includes("rust"))).toEqual([
-            `[config] ${RUST_COMPACTION_OFF_WARNING}`,
-        ]);
-    });
+    function deprecationLogs(log: ReturnType<typeof spyOn>): number {
+        return log.mock.calls.filter(
+            (call) => call[0] === `[magic-context] ${TRANSFORM_MODE_DEPRECATION_WARNING}`,
+        ).length;
+    }
 
-    it("keeps rust when compaction is on", () => {
-        const result = loadWithUserConfig(
-            JSON.stringify({
+    // This seat config used to run the full-array Rust transform: rust mode,
+    // trusted user-level subc and compaction on. It now boots the TypeScript
+    // transform, and repeated loads in one process log the deprecation once.
+    it("boots a rust seat config on the TypeScript transform with exactly one warning", () => {
+        resetTransformModeDeprecationWarningForTest();
+        const log = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            const seat = JSON.stringify({
                 compaction: { enabled: true },
                 transform_mode: "rust",
+                rust_pipeline: "provider",
                 subc: { connection_file: "/tmp/subc.sock" },
-            }),
-        );
+            });
+            const first = loadWithUserConfig(seat);
+            const second = loadWithUserConfig(seat);
+            const projectSeat = loadWithUserAndProjectConfig(
+                JSON.stringify({ subc: { connection_file: "/tmp/subc.sock" } }),
+                JSON.stringify({ transform_mode: "rust" }),
+            );
+            for (const config of [first, second, projectSeat]) {
+                expect(config.transform_mode).toBe("ts");
+                expect(config.rust_pipeline).toBe("full_request");
+                expect(
+                    (config.configWarnings ?? []).filter((warning) => warning.includes("rust")),
+                ).toEqual([]);
+            }
+            expect(deprecationLogs(log)).toBe(1);
+        } finally {
+            log.mockRestore();
+        }
+    });
 
-        expect(result.transform_mode).toBe("rust");
-        expect(result.configWarnings ?? []).not.toContain(
-            expect.stringContaining(RUST_COMPACTION_OFF_WARNING),
-        );
+    it("warns for a project-only rust_pipeline that the project guard strips", () => {
+        resetTransformModeDeprecationWarningForTest();
+        const log = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            const result = loadWithUserAndProjectConfig(
+                JSON.stringify({}),
+                JSON.stringify({ rust_pipeline: "provider" }),
+            );
+            expect(result.rust_pipeline).toBe("full_request");
+            expect(deprecationLogs(log)).toBe(1);
+        } finally {
+            log.mockRestore();
+        }
+    });
+
+    it("logs nothing when neither key is set", () => {
+        resetTransformModeDeprecationWarningForTest();
+        const log = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            const result = loadWithUserConfig(JSON.stringify({ compaction: { enabled: false } }));
+            expect(result.transform_mode).toBe("ts");
+            expect(deprecationLogs(log)).toBe(0);
+        } finally {
+            log.mockRestore();
+        }
     });
 });
 
@@ -1307,24 +1348,7 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
 });
 
 describe("transform_mode resolution", () => {
-    it("keeps project rust mode only when user config supplies subc", () => {
-        const withSubc = loadWithUserAndProjectConfig(
-            JSON.stringify({ subc: { connection_file: "~/.local/share/cortexkit/subc.json" } }),
-            JSON.stringify({ transform_mode: "rust" }),
-        );
-        expect(withSubc.transform_mode).toBe("rust");
-
-        const withoutSubc = loadWithUserAndProjectConfig(
-            JSON.stringify({}),
-            JSON.stringify({ transform_mode: "rust" }),
-        );
-        expect(withoutSubc.transform_mode).toBe("ts");
-        expect(withoutSubc.configWarnings?.join("\n")).toContain(
-            "rust mode requires user-level subc configuration; running ts.",
-        );
-    });
-
-    it("passes the resolved rust mode to the plugin config without mutating project trust", () => {
+    it("ignores project rust mode without mutating project trust", () => {
         const result = loadWithUserAndProjectConfig(
             JSON.stringify({
                 subc: { connection_file: "~/.local/share/cortexkit/subc.json" },
@@ -1335,7 +1359,6 @@ describe("transform_mode resolution", () => {
             }),
         );
 
-        expect(result.transform_mode).toBe("rust");
         expect(result.subc?.connection_file).not.toContain("project-controlled.sock");
     });
 });

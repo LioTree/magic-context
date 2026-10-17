@@ -34,7 +34,8 @@
     },
     "transform_mode": {
       "default": "ts",
-      "description": "Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); \"ts\" is the current TypeScript pipeline.",
+      "description": "Deprecated: ignored. Magic Context always runs its TypeScript transform; sessions on the Rust step contract are served by the CortexKit bridge. Remove this key; it no longer does anything.",
+      "deprecated": true,
       "type": "string",
       "enum": [
         "ts",
@@ -43,7 +44,8 @@
     },
     "rust_pipeline": {
       "default": "full_request",
-      "description": "Experimental, user-level only, not for production use: off by default (full_request). The provider pipeline applies only with transform_mode: \"rust\" on OpenCode; full_request keeps the legacy request adapter.",
+      "description": "Deprecated: ignored. The in-tree Rust provider pipeline is no longer selectable; sessions on the Rust step contract are served by the CortexKit bridge. Remove this key; it no longer does anything.",
+      "deprecated": true,
       "type": "string",
       "enum": [
         "full_request",

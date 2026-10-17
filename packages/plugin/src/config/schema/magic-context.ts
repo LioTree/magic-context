@@ -929,9 +929,9 @@ export interface MagicContextConfig {
     /** User-level setting that lets a session in the canonical home directory use project memory. */
     allow_home_project: boolean;
     mural: MuralConfig;
-    /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
+    /** Deprecated and ignored. The loader always resolves this to "ts": every host runs the TypeScript transform. */
     transform_mode: "ts" | "rust";
-    /** Opt-in host provider pipeline; full_request preserves the existing Rust adapter. */
+    /** Deprecated and ignored. The loader always resolves this to "full_request". */
     rust_pipeline?: "full_request" | "provider";
     /** User-only opt-in for unfinished signed-thinking trigger parking and release obligations. */
     signed_thinking_hold?: "off" | "on";
@@ -1143,14 +1143,16 @@ export const MagicContextConfigSchema = z
             .enum(["ts", "rust"])
             .default("ts")
             .describe(
-                'Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); "ts" is the current TypeScript pipeline.',
-            ),
+                "Deprecated: ignored. Magic Context always runs its TypeScript transform; sessions on the Rust step contract are served by the CortexKit bridge. Remove this key; it no longer does anything.",
+            )
+            .meta({ deprecated: true }),
         rust_pipeline: z
             .enum(["full_request", "provider"])
             .default("full_request")
             .describe(
-                'Experimental, user-level only, not for production use: off by default (full_request). The provider pipeline applies only with transform_mode: "rust" on OpenCode; full_request keeps the legacy request adapter.',
-            ),
+                "Deprecated: ignored. The in-tree Rust provider pipeline is no longer selectable; sessions on the Rust step contract are served by the CortexKit bridge. Remove this key; it no longer does anything.",
+            )
+            .meta({ deprecated: true }),
         signed_thinking_hold: z
             .enum(["off", "on"])
             .default("off")

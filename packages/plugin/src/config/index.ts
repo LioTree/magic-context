@@ -14,7 +14,7 @@ import {
 import { log } from "../shared/logger";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
-import { isCompactionEnabled, migrateLegacyAgentEnabledInMemory } from "./agent-disable";
+import { migrateLegacyAgentEnabledInMemory } from "./agent-disable";
 import { warnDeprecatedMuralModel, warnDeprecatedWindowOverlayPath } from "./deprecated-config";
 import {
     cortexKitProjectConfigBasePath,
@@ -42,7 +42,11 @@ import {
     MagicContextConfigSchema,
     PROTECTED_TOKENS_MIN,
 } from "./schema/magic-context";
-import { resolveTransformMode } from "./transform-mode";
+import {
+    hasDeprecatedTransformKeys,
+    resolveTransformMode,
+    warnTransformModeDeprecatedOnce,
+} from "./transform-mode";
 import { substituteConfigVariables } from "./variable";
 
 export interface MagicContextPluginConfig extends MagicContextConfig {
@@ -652,13 +656,6 @@ export function loadPluginConfig(
     return loadPluginConfigDetailed(directory).config;
 }
 
-function hasUserTierSubcConfig(config: Record<string, unknown> | undefined): boolean {
-    const subc = config?.subc;
-    if (typeof subc !== "object" || subc === null || Array.isArray(subc)) return false;
-    const connectionFile = (subc as Record<string, unknown>).connection_file;
-    return typeof connectionFile === "string" && connectionFile.trim().length > 0;
-}
-
 function collectEmptyStringPaths(value: unknown, prefix = ""): string[] {
     if (typeof value === "string") {
         return value === "" && prefix ? [prefix] : [];
@@ -788,6 +785,13 @@ export function loadPluginConfigDetailed(
         allWarnings.push(...userLoaded.warnings.map((w) => `[user config] ${w}`));
     }
 
+    // transform_mode and rust_pipeline are accepted but ignored: every host runs
+    // the TypeScript transform. Check the raw layers here, before the project
+    // guard below deletes rust_pipeline in place, so a key in any layer counts.
+    const deprecatedTransformKeysSet =
+        hasDeprecatedTransformKeys(userLoaded?.config) ||
+        hasDeprecatedTransformKeys(projectLoaded?.config);
+
     let projectRaw: Record<string, unknown> = {};
     if (projectLoaded) {
         allWarnings.push(...projectLoaded.warnings.map((w) => `[project config] ${w}`));
@@ -883,13 +887,11 @@ export function loadPluginConfigDetailed(
         );
     }
 
-    const resolvedTransformMode = resolveTransformMode({
-        configured: config.transform_mode,
-        userTierHasSubc: hasUserTierSubcConfig(userRaw),
-        compactionEnabled: isCompactionEnabled(config),
-    });
-    config.transform_mode = resolvedTransformMode.mode;
-    allWarnings.push(...resolvedTransformMode.warnings.map((warning) => `[config] ${warning}`));
+    if (deprecatedTransformKeysSet || hasDeprecatedTransformKeys(mergedRaw)) {
+        warnTransformModeDeprecatedOnce();
+    }
+    config.transform_mode = resolveTransformMode().mode;
+    config.rust_pipeline = "full_request";
 
     if (allWarnings.length > 0) {
         config.configWarnings = allWarnings;
