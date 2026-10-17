@@ -276,12 +276,31 @@ stable `code` and `reason` fields:
 | `bridge_rollback` | `rollback`: a previously rolled-back provider record cannot complete re-entry |
 | `bridge_provider_disabled` | `provider_disabled`: defensive low-level reason; unreachable with the bridge's fixed provider lane |
 | `bridge_raw_history_provider_missing` | `raw_history_provider_missing`: OpenCode 2 session has no registered raw-history provider |
+| `bridge_system_prompt_unmanaged` | `system_prompt_unmanaged`: the previous published request carried Magic Context's system prompt, but no `system_prompt` fact was accepted since the last `run()` attempt (`retryable: true`) |
+| `bridge_served_bytes_changed` | `served_bytes_changed`: the new view changes a message the bridge already returned, outside a rebuild, or a rebuild puts such a message back to the host's raw text (tags or other hook edits stripped) |
 
 No handoff refusal authorizes sending raw history. The caller may ask
 `isFallbackAdmissible` and send **only** its returned admissible view, or refuse the
 step. Other native failures (durability, store-ahead, transport and explicit
 provider refusal) retain their native error codes; they are not disguised as a
 full-request handoff.
+
+**System prompt ordering.** A bridged OpenCode 1 host that sends Magic Context's
+system prompt records the `system_prompt` host fact before **every** `run()`,
+recovery runs after a refused pass included, and sends the strings that fact
+returns. The bridge never sees the system bytes the host sends. Once a published
+request was preceded by an accepted `system_prompt` fact, a `run()` with no fact
+accepted since the previous attempt (published or refused) throws
+`bridge_system_prompt_unmanaged`; recording the fact and calling `run()` again
+serves the step. A host that never records the fact is not affected.
+
+**Served bytes.** Within one lineage, every admitted message the bridge returned in
+its last view comes back byte for byte unless the step rebuilds history (the step
+is classified `rebuild`, or the module applies a new view). Even a rebuild may not
+put such a message back to the host's raw text. While delivery stays pending
+(`served_through_ordinal` 0), ck-mc rebuilds from acknowledged hook answers only;
+the bridge then keeps the bytes it last returned for each message that rebuild
+would render raw, so tags already sent are not stripped.
 
 ### OpenCode 1 measured usage is not an automatic bridge witness
 

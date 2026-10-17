@@ -341,6 +341,36 @@ export function providerReplacementValid(
     );
 }
 
+/** The model-visible text of each part: message text, or a tool's output or error.
+ * Hook answers (tags, notes) change exactly these strings. */
+function visibleText(message: MessageLike): string {
+    return JSON.stringify(
+        (Array.isArray(message?.parts) ? message.parts : []).map((value) => {
+            const p = part(value);
+            if (p.type === "text") return ["text", p.text ?? ""];
+            if (p.type !== "tool") return [String(p.type)];
+            const state = part(p.state);
+            return ["tool", state[toolTextField(state)] ?? ""];
+        }),
+    );
+}
+
+/**
+ * Whether `next` puts a message back to the host's raw text after Magic Context had
+ * served it with its own changes (`served`): a tag or other hook edit was removed and
+ * nothing replaced it. A drop or a different edit renders other text and is not a
+ * reversion. `raw` is the host's own copy of the same message.
+ */
+export function providerRevertsToRaw(
+    served: MessageLike,
+    next: MessageLike,
+    raw: MessageLike,
+): boolean {
+    const host = visibleText(raw);
+    const before = visibleText(served);
+    return before !== host && visibleText(next) === host;
+}
+
 /** Same strict TTL clock and self-consuming baseline as the full-request renderer. */
 export function providerCold(
     meta: Pick<SessionMeta, "cacheTtl" | "lastResponseTime" | "cachedM0MaterializedAt">,
@@ -384,6 +414,10 @@ export interface OpenCodeProviderOptions {
     /** A bridge acknowledges messages after their request finishes cleanly, not before sending it. */
     deferServed?: boolean;
     servedThrough?: (sessionId: string, lineageId: string) => number;
+    /** Highest ordinal already returned to the host in a view for this lineage, acknowledged
+     * or not. A rebuild must not strip hook edits from those messages: their bytes may
+     * already have reached the provider. */
+    publishedThrough?: (sessionId: string, lineageId: string) => number;
     emitMeters?: (meters: ProviderPassMeters) => void;
     now?: () => number;
     /** Await newly saved hook ops/unavailability before serving messages; context.db owns their replay. */
@@ -884,6 +918,51 @@ export function createProviderTransform(
         await fresh.run(id, messages, output, meta);
     }
     const reseeded = new Map<string, Legacy>();
+    /**
+     * ck-mc rebuilds history only from hook answers whose delivery the host confirmed
+     * (`live` answers). A bridge that has not confirmed delivery has nevertheless
+     * returned tagged bytes to its host, which may already have sent them to the
+     * provider. Rendering those messages raw again would change bytes the model has
+     * seen and drop tags it may still name. For each replacement message the rebuild
+     * put back to the host's raw text, keep the bytes the bridge last returned for it.
+     * Drops and other edits render different text and pass through unchanged.
+     */
+    function keepPublishedHookEdits(
+        id: string,
+        s: Session,
+        compaction: RecordState["view"],
+        messages: MessageLike[],
+    ): RecordState["view"] {
+        if (codec || !Array.isArray(compaction?.replacement)) return compaction;
+        const through = options.publishedThrough?.(id, s.record.lineage_id) ?? 0;
+        if (through <= 0) return compaction;
+        const served = new Map<string, MessageLike>();
+        for (const message of s.record.view.replacement) {
+            const key = mid(message);
+            const at = key ? s.record.ids.get(key) : undefined;
+            if (key && at !== undefined && at <= through) served.set(key, message);
+        }
+        for (const entry of s.record.entries)
+            if (entry.ordinal <= through) served.set(entry.id, entry.served);
+        if (!served.size) return compaction;
+        const raw = new Map<string, MessageLike>();
+        for (const message of messages) {
+            const key = mid(message);
+            if (key && served.has(key)) raw.set(key, incoming(message).read());
+        }
+        let kept = 0;
+        const replacement = compaction.replacement.map((message) => {
+            const key = mid(message);
+            const before = key ? served.get(key) : undefined;
+            const host = key ? raw.get(key) : undefined;
+            if (!before || !host || !providerRevertsToRaw(before, message, host)) return message;
+            kept++;
+            return before;
+        });
+        if (!kept) return compaction;
+        log(id, `rebuild kept ${kept} served message(s) whose hook edits it rendered raw`);
+        return { ...compaction, replacement };
+    }
     function recover(id: string, messages: MessageLike[]): void {
         const meters = currentProviderMeters();
         if (meters) meters.recovery_count++;
@@ -945,12 +1024,18 @@ export function createProviderTransform(
         let applied = false;
         let coverage: RecordState["view"]["coverage"];
         if (a.answer === "compaction_message") {
+            const compaction = keepPublishedHookEdits(
+                id,
+                s,
+                a.compaction as unknown as RecordState["view"],
+                messages,
+            );
             const appliedResult = applyCompaction(
                 s.record,
                 {
                     request_id: result.request_id,
                     arrived_ms: result.arrived_ms,
-                    compaction: a.compaction as unknown as RecordState["view"],
+                    compaction,
                     coverage: a.coverage,
                 },
                 (all) => all.every((m) => providerReplacementValid(m, harness, incoming)),
@@ -1795,11 +1880,14 @@ export function createProviderTransform(
             output: { messages: unknown[] },
             meta: SessionMeta,
             pass: BridgeStep,
+            /** Runs after the pass and before its writes commit; a throw discards them. */
+            verify?: () => void,
         ): Promise<void> {
             await passContext.run(pass, async () => {
                 try {
                     await run(id, messages, output, meta);
                     pass.check();
+                    verify?.();
                     pass.commit(deps.db);
                 } catch (error) {
                     sessions.delete(id);
