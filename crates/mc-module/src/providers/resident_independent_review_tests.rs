@@ -24,7 +24,8 @@ async fn run_sequence(harness: &str, random_seed: u64) {
     let b = tempfile::tempdir().unwrap();
     let (ha, mut ba, sa, _) = handler(a.path(), Arc::new(NoReads::default()));
     let mut ha = ha.with_startup_provider_resident_enabled(true);
-    let (mut hb, mut bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+    let (hb, mut bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+    let mut hb = hb.with_startup_provider_resident_enabled(false);
     ba.harness = harness.into();
     bb.harness = harness.into();
     let mut views = Vec::new();
@@ -69,7 +70,7 @@ async fn run_sequence(harness: &str, random_seed: u64) {
             let mut next = McHandler::new();
             next.store.set(sb.clone()).ok().unwrap();
             next.provider_runner = Arc::new(NoReads::default());
-            hb = next;
+            hb = next.with_startup_provider_resident_enabled(false);
         }
         let mut answers = Vec::new();
         for (index, (h, binding, store)) in [(&ha, &ba, &sa), (&hb, &bb, &sb)].into_iter().enumerate() {
@@ -258,6 +259,7 @@ async fn review_appended_compartments_preserve_replay_identity() {
     let (ha, ba, sa, _) = handler(a.path(), Arc::new(NoReads::default()));
     let ha = ha.with_startup_provider_resident_enabled(true);
     let (hb, bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+    let hb = hb.with_startup_provider_resident_enabled(false);
     let mut views = [seed(&ha, &ba, &sa).await, seed(&hb, &bb, &sb).await];
     for through in [20, 22, 24, 26] {
         let mut answers = Vec::new();
@@ -296,6 +298,7 @@ async fn review_concurrent_two_session_hooks_match_replay() {
     let (ha, ba, _sa, _) = handler(a.path(), Arc::new(NoReads::default()));
     let ha = ha.with_startup_provider_resident_enabled(true);
     let (hb, bb, _sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+    let hb = hb.with_startup_provider_resident_enabled(false);
     for h in [&ha, &hb] {
         for session in ["s", "sibling"] {
             let mut binding = if std::ptr::eq(h, &ha) { ba.clone() } else { bb.clone() };
@@ -331,6 +334,7 @@ async fn review_memory_epoch_and_lane_rebuild_match_replay() {
     let (ha, mut ba, sa, _) = handler(a.path(), Arc::new(NoReads::default()));
     let ha = ha.with_startup_provider_resident_enabled(true);
     let (hb, mut bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+    let hb = hb.with_startup_provider_resident_enabled(false);
     ba.config.memory_enabled = true; bb.config.memory_enabled = true;
     let mut views = [seed(&ha, &ba, &sa).await, seed(&hb, &bb, &sb).await];
     for pass in 0..6 {
@@ -436,6 +440,7 @@ async fn review_kill_during_fold_reopens_with_full_replay_bytes() {
     request["request_id"] = json!("after-crash");
     let actual = answer(ha.provider_step(ba, &request).await);
     let (hb, mut bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+    let hb = hb.with_startup_provider_resident_enabled(false);
     bb.project_root = a.path().into();
     let expected = answer(hb.provider_step(bb, &request).await);
     assert_eq!(normalized_receipt(actual), normalized_receipt(expected));
@@ -452,10 +457,10 @@ fn branch_message(ordinal: u64, branch: &str) -> Value {
 
 /// Between folds, the conversation forks to new lineages whose fork point is
 /// after the summarized prefix (ordinal 20), and the session configuration
-/// (protected tokens, protected tools, history budget) changes. A handler with
-/// `rust_provider_resident` enabled keeps decoded tail, hygiene and serialized
-/// output caches across those changes; it must still serve exactly what a
-/// handler with the setting disabled serves on the same operations.
+/// (protected tokens, protected tools, history budget) changes. The resident
+/// step engine keeps decoded tail, hygiene and serialized output caches across
+/// those changes; it must still serve exactly what the non-resident test
+/// oracle serves on the same operations.
 #[tokio::test]
 async fn review_tail_descent_and_config_changes_match_replay() {
     let a = tempfile::tempdir().unwrap();
@@ -463,6 +468,7 @@ async fn review_tail_descent_and_config_changes_match_replay() {
     let (ha, mut ba, sa, _) = handler(a.path(), Arc::new(NoReads::default()));
     let ha = ha.with_startup_provider_resident_enabled(true);
     let (hb, mut bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+    let hb = hb.with_startup_provider_resident_enabled(false);
     let mut views = [seed(&ha, &ba, &sa).await, seed(&hb, &bb, &sb).await];
     let mut lineage = "L".to_string();
     let mut newest = 30u64;
@@ -523,8 +529,8 @@ fn tag_dump(dir: &std::path::Path) -> Vec<(i64, String)> {
 
 /// Summaries advance to cover every message the session has, so the fold's
 /// unsummarized tail is empty, and later folds append one message at a time.
-/// With `rust_provider_resident` enabled the fold must serve what the
-/// setting-disabled handler serves, never a refusal. The tag-table comparison
+/// The resident step engine's fold must serve what the non-resident test
+/// oracle serves, never a refusal. The tag-table comparison
 /// is a guard for a tail with no tagged blocks; this fixture mints no tags, so
 /// today only the receipt and baseline comparisons can fail.
 #[tokio::test]
@@ -534,6 +540,7 @@ async fn review_summaries_covering_the_newest_message_match_replay() {
     let (ha, ba, sa, _) = handler(a.path(), Arc::new(NoReads::default()));
     let ha = ha.with_startup_provider_resident_enabled(true);
     let (hb, bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+    let hb = hb.with_startup_provider_resident_enabled(false);
     let mut views = [seed(&ha, &ba, &sa).await, seed(&hb, &bb, &sb).await];
     let mut newest = 30u64;
     let mut differences = Vec::new();

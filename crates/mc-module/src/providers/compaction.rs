@@ -2938,6 +2938,7 @@ mod host_tests {
         let (ha, ba, sa, key) = handler(a.path(), Arc::new(NoReads::default()));
         let ha = ha.with_startup_provider_resident_enabled(true);
         let (hb, bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
+        let hb = hb.with_startup_provider_resident_enabled(false);
         let mut views = Vec::new();
         for (h, binding, store) in [(&ha, &ba, &sa), (&hb, &bb, &sb)] {
             answer(h.provider_setup(binding.clone(), &setup()).await);

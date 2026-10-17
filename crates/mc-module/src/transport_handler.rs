@@ -23,16 +23,19 @@ pub struct McTransportHandler<H: ModuleHandler = McHandler> {
 }
 
 impl<H: ModuleHandler> McTransportHandler<H> {
+    /// Production adapters always carry the admission layer that orders the
+    /// resident step engine's requests per route.
     pub fn new(inner: H) -> Self {
         Self {
             inner: Arc::new(inner),
             replies: Arc::new(Mutex::new(ReplyPages::default())),
-            admission: None,
+            admission: Some(Arc::new(crate::transport_admission::Admission::default())),
         }
     }
 
-    /// Use the same trusted startup flag as the inner handler's resident lane.
-    /// Disabled adapters retain their original dispatch path without admission.
+    /// Test builds only: `false` removes the admission layer so differentials
+    /// can run the non-resident step oracle on its original dispatch path.
+    #[cfg(test)]
     pub fn with_resident_admission(mut self, enabled: bool) -> Self {
         self.admission =
             enabled.then(|| Arc::new(crate::transport_admission::Admission::default()));
@@ -152,6 +155,12 @@ impl<H: ModuleHandler> ModuleHandler for McTransportHandler<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_adapter_always_has_admission_layer() {
+        let adapter = McTransportHandler::new(McHandler::new());
+        assert!(adapter.admission.is_some());
+    }
 
     #[test]
     fn disabled_resident_adapter_has_no_admission_layer() {

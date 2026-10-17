@@ -47,8 +47,10 @@ fn corpus_inputs(seed: u64, passes: usize, mixed_tool: &str) -> Vec<Vec<Value>> 
     }).collect()
 }
 fn fixture(dir: &Path, memory_budget: f64, temporal: bool) -> (McHandler, String) {
+    // Production always serves through the resident engine. MC_RESIDENT_HOOKS=0
+    // reruns these parity cases against the test-only non-resident oracle.
     let h = super::host_tests::handler(dir).with_startup_provider_resident_enabled(
-        std::env::var("MC_RESIDENT_HOOKS").as_deref() == Ok("1"),
+        std::env::var("MC_RESIDENT_HOOKS").as_deref() != Ok("0"),
     );
     let mut binding = h.facade_binding(7).unwrap();
     binding.history_budget_tokens = 2_000_000.0;
@@ -257,10 +259,16 @@ async fn host_message(h: &McHandler, raw: &Value, ordinal: u64, served: u64) -> 
             call["tool_call_id"] = p["callID"].clone();
             call["is_error"] = json!(false);
         }
-        let answer: HookAnswer = decode(&super::host_tests::response(
-            super::host_tests::dispatch(h, 7, "transform.hook", call.clone()).await,
-        ))
-        .unwrap();
+        let mut outcome = super::host_tests::dispatch(h, 7, "transform.hook", call.clone()).await;
+        // A cold resident rebuild that overruns the hook budget publishes its
+        // state and refuses retryably before recording the hook; hosts retry it.
+        // Loaded test machines can hit that budget, so retry exactly that refusal.
+        if matches!(&outcome, HandlerOutcome::Error { code, message }
+            if code == "transient" && message.starts_with("resident_not_ready: rebuild completed"))
+        {
+            outcome = super::host_tests::dispatch(h, 7, "transform.hook", call.clone()).await;
+        }
+        let answer: HookAnswer = decode(&super::host_tests::response(outcome)).unwrap();
         let rendered = match answer {
             HookAnswer::Pass => blocks.clone(),
             HookAnswer::Ops { ops } => hooks::answer::apply_ops(&blocks, &ops).unwrap(),

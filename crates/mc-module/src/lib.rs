@@ -5943,19 +5943,24 @@ impl McHandler {
         self
     }
 
-    /// Cache native-host hook policy totals and protection indexes in this process.
-    /// Generic runner callbacks still fetch transcripts at reminder cadence.
+    /// Test builds only: `false` swaps the resident step engine for the
+    /// non-resident oracle that byte-identical differentials compare against.
+    /// Production always serves step transforms through the resident engine.
+    #[cfg(test)]
     pub fn with_startup_provider_resident_enabled(mut self, enabled: bool) -> Self {
         self.provider_resident =
             Arc::new(providers::resident_hooks::ResidentHooks::enabled(enabled));
         self
     }
 
+    /// Limit the resident step engine's charged cache bytes (startup-only).
     pub fn with_startup_provider_resident_process_cap(mut self, bytes: usize) -> Self {
-        let enabled = self.provider_resident.is_enabled();
-        self.provider_resident = Arc::new(
-            providers::resident_hooks::ResidentHooks::enabled(enabled).with_process_cap(bytes),
-        );
+        #[cfg(test)]
+        let resident =
+            providers::resident_hooks::ResidentHooks::enabled(self.provider_resident.is_enabled());
+        #[cfg(not(test))]
+        let resident = providers::resident_hooks::ResidentHooks::default();
+        self.provider_resident = Arc::new(resident.with_process_cap(bytes));
         self
     }
 

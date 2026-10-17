@@ -153,6 +153,7 @@ async fn appended_tail_invalidates_the_resident_source_and_hygiene_descriptors()
     let (ha,ba,sa,key)=handler(a.path(),Arc::new(NoReads::default()));
     let ha=ha.with_startup_provider_resident_enabled(true);
     let (hb,bb,sb,_)=handler(b.path(),Arc::new(NoReads::default()));
+    let hb=hb.with_startup_provider_resident_enabled(false);
     let mut views=[seed(&ha,&ba,&sa).await,seed(&hb,&bb,&sb).await];
     for (index,(h,binding,store)) in [(&ha,&ba,&sa),(&hb,&bb,&sb)].into_iter().enumerate() {
         store.arm_soft_refresh("s").unwrap();

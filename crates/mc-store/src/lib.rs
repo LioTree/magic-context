@@ -10930,11 +10930,11 @@ impl McStore {
                 .optional()?;
             let (found_row_version, found_revert_epoch) = match current {
                 Some((row_version, meta_json)) => {
-                    let meta = serde_json::from_str::<ModuleMeta>(&meta_json).map_err(|error| {
+                    let meta = cache_codec::decode_small_meta(&meta_json).map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
                             1,
                             rusqlite::types::Type::Text,
-                            Box::new(error),
+                            Box::new(std::io::Error::other(error.to_string())),
                         )
                     })?;
                     (Some(row_version), meta.revert_epoch)
@@ -12455,7 +12455,7 @@ impl McStore {
         self.apply_compartment_dates(session_id, &mut compartments)?;
         let revert_epoch = match meta_json {
             Some(json) => {
-                serde_json::from_str::<ModuleMeta>(&json)
+                cache_codec::decode_small_meta(&json)
                     .map_err(|e| McStoreError::Serde(e.to_string()))?
                     .revert_epoch
             }
@@ -12672,7 +12672,7 @@ impl McStore {
                 let Some(candidate_meta) = candidate_meta else {
                     continue;
                 };
-                let candidate_meta: ModuleMeta = match serde_json::from_str(&candidate_meta) {
+                let candidate_meta = match cache_codec::decode_small_meta(&candidate_meta) {
                     Ok(meta) => meta,
                     Err(error) => {
                         return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
@@ -12879,7 +12879,7 @@ impl McStore {
                     "root prior lineage has no cache state for the publish fence".to_string(),
                 ));
             };
-            let mut prior_meta: ModuleMeta = match serde_json::from_str(&prior_meta_json) {
+            let mut prior_meta = match cache_codec::decode_small_meta(&prior_meta_json) {
                 Ok(meta) => meta,
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
             };
@@ -12888,7 +12888,7 @@ impl McStore {
                 "lineage descent edge {} fenced prior key at epoch {}",
                 request.edge_id, prior_meta.revert_epoch
             ));
-            let prior_meta_json = match serde_json::to_string(&prior_meta) {
+            let prior_meta_json = match reencode_small_meta(&prior_meta, &prior_meta_json) {
                 Ok(json) => json,
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
             };
@@ -13412,7 +13412,7 @@ impl McStore {
                 return Ok(TruncateTxnOutcome::CasConflict(current.max(0) as u64));
             }
 
-            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+            let mut meta = match cache_codec::decode_small_meta(&meta_json) {
                 Ok(meta) => meta,
                 Err(e) => return Ok(TruncateTxnOutcome::Serde(e.to_string())),
             };
@@ -13445,9 +13445,9 @@ impl McStore {
             ));
             meta.revert_epoch = next_epoch;
             meta.last_recut = last_recut.clone();
-            let meta_json = match serde_json::to_string(&meta) {
+            let meta_json = match reencode_small_meta(&meta, &meta_json) {
                 Ok(json) => json,
-                Err(e) => return Ok(TruncateTxnOutcome::Serde(e.to_string())),
+                Err(e) => return Ok(TruncateTxnOutcome::Serde(e)),
             };
 
             tx.execute(
@@ -14042,7 +14042,7 @@ impl McStore {
             let Some((current, meta_json)) = row else {
                 return Ok(AbandonHistorianTxnOutcome::Unchanged);
             };
-            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+            let mut meta = match cache_codec::decode_small_meta(&meta_json) {
                 Ok(meta) => meta,
                 Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
             };
@@ -14084,9 +14084,9 @@ impl McStore {
                 ..HistorianDurableState::default()
             };
             let next = current.max(0) as u64 + 1;
-            let meta_json = match serde_json::to_string(&meta) {
+            let meta_json = match reencode_small_meta(&meta, &meta_json) {
                 Ok(json) => json,
-                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error)),
             };
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
@@ -14123,7 +14123,7 @@ impl McStore {
             let Some((current, meta_json)) = row else {
                 return Ok(AbandonHistorianTxnOutcome::Unchanged);
             };
-            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+            let mut meta = match cache_codec::decode_small_meta(&meta_json) {
                 Ok(meta) => meta,
                 Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
             };
@@ -14142,9 +14142,9 @@ impl McStore {
                 .consecutive_publish_failures
                 .saturating_add(1);
             let next = current.max(0) as u64 + 1;
-            let meta_json = match serde_json::to_string(&meta) {
+            let meta_json = match reencode_small_meta(&meta, &meta_json) {
                 Ok(json) => json,
-                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error)),
             };
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3 WHERE session_id = ?1 AND row_version = ?4",
@@ -14282,7 +14282,7 @@ impl McStore {
                 });
             }
 
-            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+            let mut meta = match cache_codec::decode_small_meta(&meta_json) {
                 Ok(meta) => meta,
                 Err(e) => return Ok(PublishTxnOutcome::Serde(e.to_string())),
             };
@@ -14379,7 +14379,10 @@ impl McStore {
             let next = current as u64 + 1;
             meta.historian = idle_historian_after_success(&meta.historian);
             meta.historian.complete_latest_fire(current_time_ms(), next);
-            let meta_json = match encode_published_meta(&meta) {
+            let meta_json = match encode_published_meta(&meta).and_then(|json| {
+                cache_codec::preserve_native_marker(json, &meta_json)
+                    .map_err(|error| error.to_string())
+            }) {
                 Ok(json) => json,
                 Err(e) => return Ok(PublishTxnOutcome::Serde(e)),
             };
@@ -17680,6 +17683,15 @@ thread_local! {
 }
 
 /// The small-row meta JSON a historian publish stores.
+/// Serialize a meta-only write over the row's previous small `meta` blob. A fold
+/// served by the resident step engine replaces the hashed tail section's key in
+/// that blob with a native-tail reference; dropping it would make the tail
+/// section unreadable, so the reference is carried over unchanged.
+fn reencode_small_meta(meta: &ModuleMeta, old_meta_json: &str) -> Result<String, String> {
+    let json = serde_json::to_string(meta).map_err(|error| error.to_string())?;
+    cache_codec::preserve_native_marker(json, old_meta_json).map_err(|error| error.to_string())
+}
+
 fn encode_published_meta(meta: &ModuleMeta) -> Result<String, String> {
     #[cfg(test)]
     if FAIL_PUBLISH_META_ENCODE.with(|flag| flag.replace(false)) {

@@ -489,20 +489,6 @@ pub fn user_smart_notes_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Enable in-memory provider policy summaries from user configuration only.
-/// Project configuration and provider calls cannot enable the resident cache.
-pub fn user_provider_resident_enabled() -> bool {
-    fs::read_to_string(user_config_path())
-        .ok()
-        .and_then(|raw| parse_config_text(&raw).ok())
-        .and_then(|config| {
-            config
-                .get("rust_provider_resident")
-                .and_then(Value::as_bool)
-        })
-        .unwrap_or(false)
-}
-
 /// A startup-only limit on charged resident cache bytes, not process memory.
 /// SQLite caches, temporary rebuilds and allocator high-water are outside this
 /// charge; a 75-session fleet used about 0.82 GB charged and 2.3 GB RSS.

@@ -46,7 +46,7 @@ async fn restart_mid_ingest_retries_claimed_barrier_without_prefix_reads() {
     let dir = tempfile::tempdir().unwrap();
     let reference_dir = tempfile::tempdir().unwrap();
     let h = handler(dir.path());
-    let reference = handler(reference_dir.path());
+    let reference = handler(reference_dir.path()).with_startup_provider_resident_enabled(false);
     declare(&h).await;
     let entries = corpus();
     let inputs = json!({"usage":{"current_total_input_tokens":45000,"context_limit_tokens":50000}});
@@ -157,7 +157,7 @@ async fn current_resident_decoded_tail_avoids_native_reads_and_stale_tail_pages(
     let reference_dir = tempfile::tempdir().unwrap();
     let mut h = handler(dir.path());
     h.provider_resident = Arc::new(super::super::resident_hooks::ResidentHooks::enabled(true));
-    let reference = handler(reference_dir.path());
+    let reference = handler(reference_dir.path()).with_startup_provider_resident_enabled(false);
     declare(&h).await;
     let entries = corpus();
     let inputs = json!({"usage":{"current_total_input_tokens":45000,"context_limit_tokens":50000}});
