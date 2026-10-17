@@ -4782,8 +4782,6 @@ impl McHandler {
         prime_serving_wal: bool,
     ) {
         #[cfg(test)]
-        let trace_start = Instant::now();
-        #[cfg(test)]
         {
             let gate = coordinator
                 .open_gate
@@ -4791,19 +4789,13 @@ impl McHandler {
                 .expect("store open test gate")
                 .clone();
             if let Some(gate) = gate {
-                eprintln!("CATALOG {:?} store gate wait", std::time::SystemTime::now());
                 gate.notified().await;
-                eprintln!("CATALOG {:?} store gate released", std::time::SystemTime::now());
             }
         }
         let policy = *coordinator.policy.lock().expect("store open policy mutex");
         let mut last_lease_error = match Self::open_store_once(&descriptor, prime_serving_wal).await
         {
             Ok(opened) => {
-                #[cfg(test)]
-                if coordinator.open_gate.lock().unwrap().is_some() {
-                    eprintln!("CATALOG {:?} open success {:?}", trace_start.elapsed(), descriptor);
-                }
                 if coordinator.cancelled.load(Ordering::Acquire) {
                     coordinator.fail_and_idle(
                         STORE_OPEN_FAILURE_REASON_GENERIC,
@@ -4818,10 +4810,6 @@ impl McHandler {
             }
             Err(error) if store_open_error_is_live_lease(&error) => error,
             Err(error) => {
-                #[cfg(test)]
-                if coordinator.open_gate.lock().unwrap().is_some() {
-                    eprintln!("CATALOG {:?} open failure {:?} {}", trace_start.elapsed(), descriptor, error);
-                }
                 tracing::error!("mc-module: store open failed: {error}");
                 coordinator.fail_with_error_and_idle(&error, now_ms().max(0) as u64);
                 return;
@@ -20013,7 +20001,7 @@ mod tests {
     pub(crate) fn per_pass_fixed_now_ms() -> Option<i64> {
         per_pass_cost::fixed_now_ms()
     }
-    pub(super) mod catalog_startup;
+    mod catalog_startup;
     mod single_store_drill;
     mod tool_catalog;
     mod tool_catalog_conformance;
@@ -43904,14 +43892,5 @@ mod perf_audit;
 impl McHandler {
     pub fn registered_module_id(&self) -> &str {
         &self.registered_module_id
-    }
-}
-
-#[test]
-fn aaa_catalog_startup_loaded_repetition() {
-    for iteration in 1..=300 {
-        eprintln!("CATALOG STRESS iteration {iteration} start");
-        tests::catalog_startup::catalog_store_faults_preserve_pin_bytes_and_refuse_provider_by_name();
-        eprintln!("CATALOG STRESS iteration {iteration} passed");
     }
 }
