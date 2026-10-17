@@ -341,31 +341,16 @@ impl DreamQueue {
             }
             let epoch = field(request, "claimant_epoch")?.to_string();
             let caps = request.get("capabilities").ok_or("unavailable")?;
-            let tools = caps
-                .get("tools")
+            caps.get("tools")
                 .and_then(Value::as_array)
                 .ok_or("unavailable")?;
-            let mut required = vec![
-                "child_guard",
-                "steps",
-                "tokens",
-                "stop",
-                "retire",
-                "task_tools",
-            ];
-            if e.request.allowed_tools.iter().any(|t| *t != "ctx_memory") {
-                required.push("filesystem_fence");
-            }
-            if e.request.model.is_none() {
-                required.push("default_model");
-            }
-            if required
-                .iter()
-                .any(|k| caps.get(k).and_then(Value::as_bool) != Some(true))
-                || e.request
-                    .allowed_tools
-                    .iter()
-                    .any(|t| !tools.iter().any(|v| v.as_str() == Some(t)))
+            // Publication asks the same question before it names a task as Rust's.
+            if super::ownership::claim_refusal(
+                caps,
+                e.request.allowed_tools,
+                e.request.model.is_none(),
+            )
+            .is_some()
             {
                 e.stop = true;
                 // A refused descriptor was never handed out and cannot have a remote child.

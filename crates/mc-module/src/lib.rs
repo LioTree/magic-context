@@ -4137,6 +4137,9 @@ pub struct McHandler {
     /// A memory tool the runner dispatches on such a session reaches the task's
     /// router only through this record, never the foreground facade.
     broca_dream_tools: Arc<dream_dispatch::broca_carrier::BrocaToolRoute>,
+    /// What each plugin claimant last declared it can carry. Dream ownership is
+    /// published from these declarations; see `dream_dispatch::ownership`.
+    dream_claimants: Arc<dream_dispatch::ownership::ClaimantRegistry>,
     /// Which runner each session's most recent historian and dreamer completion
     /// used in this process, and why. Read by the status and health surfaces.
     runner_choices: Arc<Mutex<runner_choices::RunnerChoiceLog>>,
@@ -4154,8 +4157,10 @@ pub struct McHandler {
     fixed_config: Option<McModuleConfig>,
     #[cfg(test)]
     fixed_dream_settings: Option<Value>,
+    /// Replaces the production executor wiring in fixtures, so publication can be
+    /// exercised for tasks this build does not yet run.
     #[cfg(test)]
-    implemented_dream_tasks: HashSet<String>,
+    dream_wiring: Option<dream_dispatch::ownership::Wiring>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
     live_historian_sessions: Arc<Mutex<HashMap<String, LiveHistorianSession>>>,
     wrapup_sessions: Arc<Mutex<HashMap<String, LiveWrapupSession>>>,
@@ -5019,6 +5024,7 @@ impl McHandler {
             host_runs: Arc::new(HostRunLedger::new()),
             dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
             broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
+            dream_claimants: Arc::new(dream_dispatch::ownership::ClaimantRegistry::default()),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             memory_paused_routes: Arc::default(),
@@ -5029,7 +5035,7 @@ impl McHandler {
             #[cfg(test)]
             fixed_dream_settings: None,
             #[cfg(test)]
-            implemented_dream_tasks: HashSet::new(),
+            dream_wiring: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -5448,6 +5454,7 @@ impl McHandler {
             host_runs: Arc::new(HostRunLedger::new()),
             dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
             broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
+            dream_claimants: Arc::new(dream_dispatch::ownership::ClaimantRegistry::default()),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             memory_paused_routes: Arc::default(),
@@ -5455,7 +5462,7 @@ impl McHandler {
             resolve_project_identity_for_test: AtomicBool::new(false),
             fixed_config: Some(config),
             fixed_dream_settings: None,
-            implemented_dream_tasks: HashSet::new(),
+            dream_wiring: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -13492,10 +13499,20 @@ impl McHandler {
         };
         let config = self.effective_config(&binding.project_root);
         let activated = config.rust_background_enabled();
-        if activated {
-            let available = mc_store::dream_scheduler::schedules::CANONICAL_TASKS
-                .iter()
-                .any(|name| name.as_str() == task)
+        let canonical = mc_store::dream_scheduler::schedules::CANONICAL_TASKS
+            .into_iter()
+            .find(|name| name.as_str() == task);
+        // A plugin route still runs every task Rust has not published, exactly as
+        // with the switch off; only a published task belongs to the Rust scheduler.
+        if activated && dream_claim::plugin_lane(&binding) {
+            if canonical.is_some_and(|name| self.dream_task_published(&binding, name)) {
+                return HandlerOutcome::Error {
+                    code: "rust_scheduler_owns_task".into(),
+                    message: format!("Rust scheduler owns dreamer task {task:?}"),
+                };
+            }
+        } else if activated {
+            let available = canonical.is_some()
                 && (config.smart_notes_enabled || task != "evaluate-smart-notes");
             if !available {
                 return invalid_params_error(format!("unknown dreamer task {task:?}"));
@@ -13510,10 +13527,9 @@ impl McHandler {
             if !enabled {
                 return invalid_params_error(format!("unknown dreamer task {task:?}"));
             }
-            // No production task is ported yet. Only the in-process fixture can
-            // substitute an implemented set; wire fields and config cannot do so.
-            #[cfg(test)]
-            if self.implemented_dream_tasks.contains(task) {
+            // Ownership comes only from the published list; request fields and
+            // config alone cannot claim a task for Rust.
+            if canonical.is_some_and(|name| self.dream_task_published(&binding, name)) {
                 return HandlerOutcome::Error {
                     code: "rust_scheduler_owns_task".into(),
                     message: format!("Rust scheduler owns dreamer task {task:?}"),
@@ -16242,6 +16258,7 @@ impl McHandler {
                 | "dream.child.tool"
                 | "dream.child.cleanup"
                 | "dream.child.unavailable" => self.handle_dream_child(channel, method, &request),
+                "dream.ownership" => self.handle_dream_ownership(channel, &request),
                 "historian.pending" => self.handle_historian_pending_value(channel, &request),
                 "historian.claim" => self.handle_historian_claim_value(channel, &request),
                 "historian.heartbeat" => self.handle_historian_heartbeat_value(channel, &request),
@@ -21563,8 +21580,17 @@ mod tests {
             config.rust_background_enabled = true;
             config.smart_notes_enabled = true;
             let producer = Arc::new(ProducerState::default());
-            let (mut handler, store, _dir, _) =
+            // A Host-runner route whose claimant can carry every role: publication
+            // then depends only on which tasks the fixture wires.
+            config.dreamer_runner = Some(HistorianRunnerKind::Host);
+            let (mut handler, store, _dir, project) =
                 handler_with_store(producer.clone(), config.clone());
+            handler.fixed_config = Some(config.clone());
+            handler.dream_claimants.declare(
+                &lane_project_key(&store, &project),
+                "ses",
+                dream_dispatch::ownership::tests::claimant_carrying_every_role(now_ms()),
+            );
             let mut settings = json!({"dreamer":{"tasks":{}}});
             for task in CANONICAL_TASKS {
                 settings["dreamer"]["tasks"][task.as_str()] = json!({"schedule":"0 3 * * *"});
@@ -21599,17 +21625,20 @@ mod tests {
                     expected
                 );
             }
+            // Ownership is the published list: a wired task with a Rust host and a
+            // capable claimant is owned; a task with no Rust host (compress-cues,
+            // maintain-docs, evaluate-smart-notes) never is, even when wired.
             for implemented in [false, true] {
                 for task in CANONICAL_TASKS {
-                    handler.implemented_dream_tasks.clear();
-                    if implemented {
-                        handler.implemented_dream_tasks.insert(task.as_str().into());
-                    }
+                    handler.dream_wiring = Some(dream_dispatch::ownership::Wiring {
+                        tasks: if implemented { vec![task] } else { Vec::new() },
+                        broca: false,
+                    });
                     let request = json!({"v":1,"session_id":"ses","task":task.as_str(),
                         "implemented":true,"model_chain":false,"payload":false,"command_id":false});
                     assert_eq!(
                         code(handler.handle_dreamer_run_task(7, &request).await),
-                        if implemented {
+                        if implemented && dream_dispatch::ownership::task_roles(task).is_some() {
                             "rust_scheduler_owns_task"
                         } else {
                             "unavailable_capability"
@@ -21619,12 +21648,12 @@ mod tests {
                     );
                 }
             }
-            handler.implemented_dream_tasks.clear();
             config.smart_notes_enabled = false;
             handler.fixed_config = Some(config.clone());
-            handler
-                .implemented_dream_tasks
-                .insert("evaluate-smart-notes".into());
+            handler.dream_wiring = Some(dream_dispatch::ownership::Wiring {
+                tasks: vec![mc_store::dream_scheduler::schedules::TaskName::EvaluateSmartNotes],
+                broca: false,
+            });
             assert_eq!(
                 code(
                     handler
@@ -21636,7 +21665,7 @@ mod tests {
                 ),
                 "invalid_params"
             );
-            handler.implemented_dream_tasks.clear();
+            handler.dream_wiring = None;
             config.smart_notes_enabled = true;
             handler.fixed_config = Some(config.clone());
             for task in CANONICAL_TASKS {

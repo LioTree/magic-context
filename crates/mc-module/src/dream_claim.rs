@@ -1,10 +1,25 @@
-//! Versioned, session-confined Host dream claimant management routes.
+//! Versioned, session-confined Host dream claimant management routes, and the
+//! `dream.ownership` route that publishes which dream tasks Rust runs.
 
 use crate::dream_dispatch::host_carrier::DreamQueue;
-use crate::{providers, respond, McHandler};
+use crate::dream_dispatch::ownership::{
+    self, ClaimantDeclaration, Ownership, OwnershipInput, Wiring,
+};
+use crate::{invalid_params_error, now_ms, providers, respond, McHandler, SessionBinding};
+use mc_store::dream_scheduler::schedules::TaskName;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use subc_client_rs::HandlerOutcome;
+
+/// Harness names whose plugin opens a principal-less route and runs the
+/// TypeScript dreamer itself. Any other route needs a daemon-attested principal.
+const PLUGIN_HARNESSES: [&str; 4] = ["opencode", "opencode2", "pi", "omp"];
+
+/// True for a route opened by a Magic Context plugin, which still runs every
+/// dream task Rust has not published.
+pub(crate) fn plugin_lane(binding: &SessionBinding) -> bool {
+    binding.principal.is_none() && PLUGIN_HARNESSES.contains(&binding.harness.as_str())
+}
 
 impl McHandler {
     /// Off-thread executors share this queue with the management routes. Merely
@@ -13,36 +28,39 @@ impl McHandler {
         self.dream_children.clone()
     }
 
+    /// The bound route and its project key for a dream route, after the same lane
+    /// admission every claimant route uses.
+    fn dream_lane(
+        &self,
+        channel: u16,
+        request: &Value,
+        method: &str,
+    ) -> Result<(SessionBinding, String), HandlerOutcome> {
+        let binding = self.historian_lane_binding(channel, request, method)?;
+        if binding.principal.is_some() {
+            providers::admit_host_lane(&binding)
+                .and_then(|()| providers::admit_harness_module(&binding))?;
+        } else if !plugin_lane(&binding) {
+            return Err(HandlerOutcome::Error {
+                code: "host_lane_requires_plugin".into(),
+                message: "dream claims require a plugin or attested harness route".into(),
+            });
+        }
+        let Some(store) = self.store.get() else {
+            return Err(self.store_refusal());
+        };
+        let project = self.historian_lane_project(&binding, store)?;
+        Ok((binding, project))
+    }
+
     pub(crate) fn handle_dream_child(
         &self,
         channel: u16,
         method: &str,
         request: &Value,
     ) -> HandlerOutcome {
-        let binding = match self.historian_lane_binding(channel, request, method) {
-            Ok(binding) => binding,
-            Err(refusal) => return refusal,
-        };
-        if binding.principal.is_some() {
-            if let Err(refusal) = providers::admit_host_lane(&binding)
-                .and_then(|()| providers::admit_harness_module(&binding))
-            {
-                return refusal;
-            }
-        } else if !matches!(
-            binding.harness.as_str(),
-            "opencode" | "opencode2" | "pi" | "omp"
-        ) {
-            return HandlerOutcome::Error {
-                code: "host_lane_requires_plugin".into(),
-                message: "dream claims require a plugin or attested harness route".into(),
-            };
-        }
-        let Some(store) = self.store.get() else {
-            return self.store_refusal();
-        };
-        let project = match self.historian_lane_project(&binding, store) {
-            Ok(project) => project,
+        let (binding, project) = match self.dream_lane(channel, request, method) {
+            Ok(lane) => lane,
             Err(refusal) => return refusal,
         };
         match self
@@ -52,6 +70,70 @@ impl McHandler {
             Ok(body) => respond(body),
             Err(refusal) => respond(json!({"ok": false, "refusal": refusal})),
         }
+    }
+
+    fn dream_wiring(&self) -> Wiring {
+        #[cfg(test)]
+        if let Some(wiring) = &self.dream_wiring {
+            return wiring.clone();
+        }
+        Wiring::production()
+    }
+
+    /// The tasks Rust runs for this route right now, from the route's current
+    /// config, this build's wiring and the claimant this session last declared.
+    pub(crate) fn dream_ownership(&self, binding: &SessionBinding, project: &str) -> Ownership {
+        let config = self.effective_config(&binding.project_root);
+        // Settings are only read when activation could publish anything; a
+        // resolution failure publishes nothing rather than guessing.
+        let settings = config
+            .rust_background_enabled()
+            .then(|| self.dream_task_settings(&binding.project_root).ok())
+            .flatten();
+        let claimant = self
+            .dream_claimants
+            .current(project, &binding.session, now_ms());
+        let wiring = self.dream_wiring();
+        ownership::publish(&OwnershipInput {
+            config: &config,
+            settings: settings.as_ref(),
+            harness: &binding.harness,
+            wiring: &wiring,
+            claimant: claimant.as_ref(),
+        })
+    }
+
+    /// `dream.ownership {v:1, claimant?}`: record what this session's claimant can
+    /// carry (or withdraw it when `claimant` is absent or null) and answer with
+    /// the published list. The answer is the only list the plugin's scheduler
+    /// consults; it never names a task Rust cannot run for this route.
+    pub(crate) fn handle_dream_ownership(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (binding, project) = match self.dream_lane(channel, request, "dream.ownership") {
+            Ok(lane) => lane,
+            Err(refusal) => return refusal,
+        };
+        match request.get("claimant") {
+            None | Some(Value::Null) => self.dream_claimants.withdraw(&project, &binding.session),
+            Some(value) => match ClaimantDeclaration::parse(value, now_ms()) {
+                Ok(declaration) => {
+                    self.dream_claimants
+                        .declare(&project, &binding.session, declaration)
+                }
+                Err(reason) => return invalid_params_error(reason),
+            },
+        }
+        respond(self.dream_ownership(&binding, &project).to_json())
+    }
+
+    /// Whether Rust publishes `task` for this route; used by `dreamer.run_task`.
+    pub(crate) fn dream_task_published(&self, binding: &SessionBinding, task: TaskName) -> bool {
+        let Some(store) = self.store.get() else {
+            return false;
+        };
+        let Ok(project) = self.historian_lane_project(binding, store) else {
+            return false;
+        };
+        self.dream_ownership(binding, &project).owns(task)
     }
 }
 

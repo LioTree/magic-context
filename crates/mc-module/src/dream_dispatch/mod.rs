@@ -10,6 +10,7 @@ pub mod curate_host;
 pub mod dispatcher;
 pub mod domain_control;
 pub mod host_carrier;
+pub mod ownership;
 pub mod primer_host;
 pub mod retrospective_host;
 pub mod verify_host;
