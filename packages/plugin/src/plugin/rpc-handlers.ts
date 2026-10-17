@@ -1827,7 +1827,7 @@ export function registerRpcHandlers(
         } else {
             const db = readDatabase();
             if (!db) return { ok: false, error: "db unavailable" };
-            message = executeFlush(db, sessionId);
+            message = executeFlush(db, sessionId, config.signed_thinking_hold === "on");
         }
         // The user asked for a full refresh, so signal all three one-shot sets:
         // rebuild <session-history>, re-read the system-prompt adjuncts, and force

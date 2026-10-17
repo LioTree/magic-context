@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, test } from "bun:test";
+import { Database } from "../../shared/sqlite";
 import { ParkedBustTriggers } from "./trigger-parking";
 
 describe("parked bust triggers", () => {
@@ -68,4 +69,61 @@ describe("parked bust triggers", () => {
         expect(triggers.pending).toBe(false);
         expect(triggers.permissions(true, false, false, false).history).toBe(false);
     });
+});
+
+function database() {
+    const db = new Database(":memory:");
+    db.exec(
+        "CREATE TABLE session_meta (session_id TEXT PRIMARY KEY, held_release TEXT); INSERT INTO session_meta VALUES ('session', NULL)",
+    );
+    return db;
+}
+
+test("held obligations hydrate independently with original reasons and settle only their own work", () => {
+    const db = database();
+    try {
+        const held = ParkedBustTriggers.load(db, "session");
+        held.holdMaterialization("user_flush");
+        held.holdMaterialization("thinking_hold");
+        held.holdForce();
+        held.persist(db, "session");
+        const restarted = ParkedBustTriggers.load(db, "session");
+        expect(restarted.reason("materialization")).toBe("user_flush");
+        expect(restarted.permissions(true, true, true)).toEqual({
+            materialization: false,
+            force: false,
+            history: false,
+        });
+        restarted.settle(true, false);
+        restarted.persist(db, "session");
+        const afterTailReclaim = ParkedBustTriggers.load(db, "session");
+        expect(afterTailReclaim.reason("force")).toBeUndefined();
+        expect(afterTailReclaim.permissions(false, true, false)).toEqual({
+            materialization: true,
+            force: false,
+            history: false,
+        });
+        afterTailReclaim.settle(false, false);
+        afterTailReclaim.persist(db, "session");
+        expect(db.prepare("SELECT held_release FROM session_meta").get()).toEqual({
+            held_release: null,
+        });
+    } finally {
+        db.close();
+    }
+});
+
+test("held obligation CAS conflict refuses the stale writer without deleting the peer request", () => {
+    const db = database();
+    try {
+        const first = ParkedBustTriggers.load(db, "session");
+        const stale = ParkedBustTriggers.load(db, "session");
+        first.holdMaterialization("user_flush");
+        first.persist(db, "session");
+        stale.holdForce();
+        expect(() => stale.persist(db, "session")).toThrow("Held release changed during transform");
+        expect(ParkedBustTriggers.load(db, "session").reasons).toEqual(["user_flush"]);
+    } finally {
+        db.close();
+    }
 });

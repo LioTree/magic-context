@@ -1463,6 +1463,14 @@ fn step2_review_parked_lanes_replay_and_release_after_store_reopen() {
             before_reopen,
             "{lane:?}: reopen changed held bytes"
         );
+        if matches!(lane, Lane::Flush) {
+            let persisted = f.store.load_meta(&f.req.session_id).unwrap().meta;
+            audit_assert_eq!(
+                persisted.held_release.as_ref().unwrap()["obligations"]["soft_refresh"],
+                "explicit_flush"
+            );
+            audit_assert!(persisted.soft_refresh_pending);
+        }
         audit_assert!(!f.served.prefix_bust_permitted);
         f.next_user_turn("review-reopen-release");
         audit_assert!(
@@ -1474,6 +1482,11 @@ fn step2_review_parked_lanes_replay_and_release_after_store_reopen() {
             "{lane:?}: release lost work"
         );
         audit_assert_eq!(f.mock.check(&f.wire()), None);
+        if matches!(lane, Lane::Flush) {
+            let released = f.store.load_meta(&f.req.session_id).unwrap().meta;
+            audit_assert!(released.held_release.is_none());
+            audit_assert!(!released.soft_refresh_pending);
+        }
         f.served = f.pass();
         audit_assert!(
             !f.served.prefix_bust_permitted,

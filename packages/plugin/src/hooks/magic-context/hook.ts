@@ -999,6 +999,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         });
     };
     const commandHandler = createMagicContextCommandHandler({
+        signedThinkingHold: deps.config.signed_thinking_hold,
         smartNotesEnabled: deps.config.smart_notes?.enabled,
         db,
         compactionOff,

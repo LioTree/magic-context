@@ -32,7 +32,10 @@ function isStructuralNoisePart(part: unknown): boolean {
  * Idempotent: sentinels are themselves recognized on subsequent passes and
  * skipped (not re-mutated, not re-counted).
  */
-export function stripStructuralNoise(messages: MessageLike[]): number {
+export function stripStructuralNoise(
+    messages: MessageLike[],
+    options: { preserveNativeSteps?: boolean } = {},
+): number {
     let strippedParts = 0;
 
     for (const message of messages) {
@@ -42,6 +45,15 @@ export function stripStructuralNoise(messages: MessageLike[]): number {
 
         for (let i = 0; i < message.parts.length; i++) {
             const part = message.parts[i];
+            // OpenCode serializes an empty-text sentinel as a space on signed-reasoning
+            // assistants. Native step markers serialize to nothing, so keep them rather
+            // than manufacturing a new block before the provider's signed thinking.
+            if (
+                options.preserveNativeSteps &&
+                isRecord(part) &&
+                (part.type === "step-start" || part.type === "step-finish")
+            )
+                continue;
             if (isSentinel(part)) continue;
             if (!isStructuralNoisePart(part)) continue;
             message.parts[i] = makeSentinel(part);

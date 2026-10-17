@@ -2203,7 +2203,11 @@ async function startPiMagicContextRuntime(
 	registerStatusLine(pi, { db, projectIdentity });
 	info("registered magic-context status line");
 
-	registerCtxFlushCommand(pi, { db, compactionOff });
+	registerCtxFlushCommand(pi, {
+		db,
+		compactionOff,
+		signedThinkingHold: config.signed_thinking_hold,
+	});
 	info("registered /ctx-flush");
 
 	// /ctx-recomp uses its own PiSubagentRunner instance — recomp can run

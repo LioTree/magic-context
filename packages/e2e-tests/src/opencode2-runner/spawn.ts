@@ -259,6 +259,8 @@ export async function waitForPluginActive(
 
 
 export interface OpenCode2SpawnOptions {
+    thinkingScope?: (body: Record<string, unknown>) => string | undefined;
+    prefixBinding?: boolean;
     /** Explicit host binary for a same-store upgrade scenario. */
     cli?: string;
     /** Built plugin snapshot used before a same-store upgrade. */
@@ -328,7 +330,7 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 			throw new Error("Build the plugin before booting v2");
 		}
 		const mock = options.existingMock?.mock ?? new MockProvider();
-		const provider = options.existingMock ?? await mock.start(); // Existing mock explicitly binds 127.0.0.1 and captures parsed wire bodies.
+		const provider = options.existingMock ?? await mock.start({ thinkingScope: options.thinkingScope, prefixBinding: options.prefixBinding });
 		// 2.0.5 title generation hits the mock on session.create, before tests
 		// install matchers, and uses a host title model rather than mock-model.
 	    if (!options.existingMock) {

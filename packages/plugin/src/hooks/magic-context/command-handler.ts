@@ -482,6 +482,7 @@ export function createMagicContextCommandHandler(deps: {
     db: Database;
     /** Boot-resolved mode; command paths must not re-read configuration. */
     compactionOff?: boolean;
+    signedThinkingHold?: "off" | "on";
     smartNotesEnabled?: boolean;
     executeThresholdPercentage?: number | { default: number; [modelKey: string]: number };
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined };
@@ -715,7 +716,7 @@ export function createMagicContextCommandHandler(deps: {
                         result = renderCapabilityRefusal("context_cleanup");
                     }
                 } else {
-                    result = executeFlush(deps.db, sessionId);
+                    result = executeFlush(deps.db, sessionId, deps.signedThinkingHold === "on");
                 }
                 deps.onFlush?.(sessionId);
                 if (isTuiConnected(sessionId)) {
