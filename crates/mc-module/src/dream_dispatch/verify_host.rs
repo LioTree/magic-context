@@ -124,7 +124,7 @@ impl<C: DreamCarrier> VerifyHost<C> {
                 })
                 .collect();
             let head = self.head();
-            self.commit(
+            self.commit_verify_batch(
                 &snapshot,
                 &batch,
                 &verdicts,
@@ -191,7 +191,7 @@ impl<C: DreamCarrier> VerifyHost<C> {
                     .collect();
             }
             let current = self.head();
-            let counts = self.commit(
+            let counts = self.commit_verify_batch(
                 &snapshot,
                 batch,
                 &verdicts,
@@ -310,7 +310,7 @@ impl<C: DreamCarrier> VerifyHost<C> {
         mc_store::dream_domain::require_tx(tx, &self.context.domain_lease, self.context.now_ms())
     }
 
-    fn commit(
+    fn commit_verify_batch(
         &self,
         snapshot: &[VerifyMemory],
         batch: &[Memory],
