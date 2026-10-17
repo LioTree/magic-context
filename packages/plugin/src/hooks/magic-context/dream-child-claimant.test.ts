@@ -358,7 +358,7 @@ describe("dream child claimant", () => {
         await run();
         const child = host.runs[0];
         expect(child?.providerCalls).toBe(2);
-        expect(events(peer).filter((event) => event.kind === "step")).toHaveLength(2);
+        expect(peer.entry(entryId).steps).toBe(2);
         expect(peer.entry(entryId).cleaned).toBe(true);
         expect(child?.retired).toBe(true);
     });
@@ -596,8 +596,9 @@ describe("dream child claimant", () => {
         });
         const original = peer.route.bind(peer);
         peer.route = (session, method, body) => {
-            // Once the prompt is out, the module goes silent.
-            if (host.runs[0]?.prompts) throw new Error("connection lost");
+            // Once the first step is admitted, the module goes silent: every later
+            // heartbeat fails, and the model never answers.
+            if (peer.entry(entryId).steps >= 1) throw new Error("connection lost");
             return original(session, method, body);
         };
         const started = Date.now();
