@@ -1,0 +1,215 @@
+{
+    "schema": "mc-relay-pi/v1",
+    "generator": {
+        "version": 1,
+        "source_base": "919bc9862839c3c1820b4e673e3ba210782a1d7c",
+        "oracle": "providers::relay_conformance::oracle"
+    },
+    "cases": [
+        {
+            "id": "single-op-retry",
+            "expected": {
+                "wire_sha256": "902d3a7cd8eda0d8ae8c7722546d051445ead420662ed12359b0f65b579a2ae2",
+                "receipt": {
+                    "request_id": "identity-1",
+                    "delivery": "pending",
+                    "lineage_id": "identity-2",
+                    "served_through_ordinal": 0,
+                    "unserved_subjects": [],
+                    "last_applied": {
+                        "compaction_id": "identity-3",
+                        "version": 3,
+                        "range": {
+                            "from": 1,
+                            "to": 2
+                        }
+                    }
+                },
+                "hook_calls": 1
+            }
+        },
+        {
+            "id": "hook-timeout-fallback-freeze",
+            "expected": {
+                "wire_sha256": "b2a907475fa0c1afe6ff8c94be00f19d6ced145ff44c085289831704e268999d",
+                "receipt": {
+                    "request_id": "identity-4",
+                    "delivery": "pending",
+                    "lineage_id": "identity-2",
+                    "served_through_ordinal": 0,
+                    "unserved_subjects": [
+                        {
+                            "hook": "pre_user",
+                            "subject_mid": "pi-entry-003",
+                            "blocks": [
+                                "Timeout raw bytes."
+                            ]
+                        }
+                    ],
+                    "last_applied": {
+                        "compaction_id": "identity-3",
+                        "version": 3,
+                        "range": {
+                            "from": 1,
+                            "to": 2
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "id": "receipt-publish-and-complete",
+            "expected": {
+                "pending": {
+                    "request_id": "identity-4",
+                    "delivery": "pending",
+                    "lineage_id": "identity-2",
+                    "served_through_ordinal": 0,
+                    "unserved_subjects": [
+                        {
+                            "hook": "pre_user",
+                            "subject_mid": "pi-entry-003",
+                            "blocks": [
+                                "Timeout raw bytes."
+                            ]
+                        }
+                    ],
+                    "last_applied": {
+                        "compaction_id": "identity-3",
+                        "version": 3,
+                        "range": {
+                            "from": 1,
+                            "to": 2
+                        }
+                    }
+                },
+                "headers": {
+                    "request_id": "identity-4",
+                    "delivery": "pending",
+                    "lineage_id": "identity-2",
+                    "served_through_ordinal": 0,
+                    "unserved_subjects": [
+                        {
+                            "hook": "pre_user",
+                            "subject_mid": "pi-entry-003",
+                            "blocks": [
+                                "Timeout raw bytes."
+                            ]
+                        }
+                    ],
+                    "last_applied": {
+                        "compaction_id": "identity-3",
+                        "version": 3,
+                        "range": {
+                            "from": 1,
+                            "to": 2
+                        }
+                    }
+                },
+                "complete": {
+                    "request_id": "identity-4",
+                    "delivery": "clean",
+                    "lineage_id": "identity-2",
+                    "served_through_ordinal": 3,
+                    "unserved_subjects": [
+                        {
+                            "hook": "pre_user",
+                            "subject_mid": "pi-entry-003",
+                            "blocks": [
+                                "Timeout raw bytes."
+                            ]
+                        }
+                    ],
+                    "last_applied": {
+                        "compaction_id": "identity-3",
+                        "version": 3,
+                        "range": {
+                            "from": 1,
+                            "to": 2
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "id": "native-cut-applied-and-recovered",
+            "expected": {
+                "receipt": {
+                    "request_id": "identity-5",
+                    "delivery": "clean",
+                    "lineage_id": "identity-2",
+                    "served_through_ordinal": 3,
+                    "unserved_subjects": [],
+                    "last_applied": {
+                        "compaction_id": "identity-3",
+                        "version": 5,
+                        "range": {
+                            "from": 1,
+                            "to": 4
+                        }
+                    },
+                    "coverage": {
+                        "end_mid": "pi-entry-001",
+                        "ordinal": 1
+                    }
+                },
+                "uncertain": {
+                    "kind": "unknown",
+                    "reason": "native-write-outcome-unknown"
+                },
+                "recovered": {
+                    "kind": "applied"
+                },
+                "appends": 1,
+                "wire_sha256": "de89e085da5136d305b368aca1f29967d66ba68a2a083190660dedf74d22c109"
+            }
+        },
+        {
+            "id": "tree-branch-switch",
+            "expected": {
+                "receipt": {
+                    "request_id": "identity-6",
+                    "delivery": "pending",
+                    "lineage_id": "identity-7",
+                    "served_through_ordinal": 0,
+                    "unserved_subjects": [],
+                    "last_applied": {
+                        "compaction_id": "identity-3",
+                        "version": 7,
+                        "range": {
+                            "from": 1,
+                            "to": 3
+                        }
+                    },
+                    "coverage": {
+                        "end_mid": "pi-entry-001",
+                        "ordinal": 1
+                    }
+                },
+                "wire_sha256": "42add1049cc5c2596d9ecac74b4b1bd27204a3d695af08e9c409768606fe16db"
+            }
+        },
+        {
+            "id": "forked-session",
+            "expected": {
+                "receipt": {
+                    "request_id": "identity-8",
+                    "delivery": "pending",
+                    "lineage_id": "identity-9",
+                    "served_through_ordinal": 0,
+                    "unserved_subjects": [],
+                    "last_applied": {
+                        "compaction_id": "identity-10",
+                        "version": 3,
+                        "range": {
+                            "from": 1,
+                            "to": 3
+                        }
+                    }
+                },
+                "wire_sha256": "f0234a465251a12b4e0d1420ad8f5fc04ca46d595452f09a8c59ad1781920f76",
+                "kind": "bootstrap"
+            }
+        }
+    ]
+}

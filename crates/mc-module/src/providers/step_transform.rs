@@ -493,7 +493,8 @@ impl McHandler {
         &self,
         binding: &SessionBinding,
     ) -> Option<(Key, mc_store::provider_records::ProviderConversation)> {
-        if !host_binding(binding) {
+        if !host_binding(binding) || (binding.harness == "pi" && admit_host_lane(binding).is_err())
+        {
             return None;
         }
         let key = Key::new(binding, &binding.session, &binding.harness).ok()?;
@@ -995,21 +996,23 @@ impl McHandler {
         #[cfg(test)]
         probe.stage("conversation_lineage_read");
         let decoded = if binding.harness == "pi" {
-            super::codec_pi::decode_messages(&[entry])?
+            super::codec_pi::decode_hook_messages(&store, &key, lineage_id, entry)?
         } else {
             super::codec_opencode::decode_messages(&[entry])?
         };
-        let ingress = &decoded.messages[0];
+        let ingress = decoded.messages.last().expect("hook ingress");
         let projection = ck_wire::project_messages(&decoded.messages).map_err(transient)?;
         let shell = decoded.sidecar.messages.get(mid).expect("decoded sidecar");
         let targets = projection
             .blocks
             .iter()
+            .filter(|block| block.mid == mid)
             .filter(|b| match hook {
                 Hook::PreUser => b.role == "user" && b.kind_tag == "text",
                 Hook::PostAssistant => b.role == "assistant" && b.kind_tag == "text",
                 Hook::PostTool => {
                     b.kind_tag == "tool_result"
+                        && (binding.harness != "pi" || b.scalar_text().is_some())
                         && shell.blocks.iter().any(|meta| {
                             meta.block_index == b.block_index
                                 && (if binding.harness == "pi" {

@@ -13513,10 +13513,14 @@ impl McHandler {
             binding.harness == OPENCODE_HARNESS || binding.harness == "opencode2";
         let transform_session_known =
             self.module_knows_transform_session(bound_session, &binding.project_root);
+        // Pi's route already names the real journal session. A daemon-authorized
+        // Thalamus declaration saved for this exact session confirms that binding;
+        // a harness string or full transform alone still requires host resolution.
+        let provider_session_known = self.host_provider_conversation(&binding).is_some();
         let conversation_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
             self.provider_store.tool_key(&binding)?.engine_key()
-        } else if opencode_harness
-            && (transform_session_known || self.host_provider_conversation(&binding).is_some())
+        } else if (opencode_harness && transform_session_known)
+            || ((opencode_harness || binding.harness == "pi") && provider_session_known)
         {
             bound_session.to_string()
         } else {

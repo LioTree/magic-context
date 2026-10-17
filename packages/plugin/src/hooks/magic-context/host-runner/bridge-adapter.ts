@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { isAbsolute, join } from "node:path";
 import { loadPluginConfigDetailed } from "../../../config";
 import { resolveProjectIdentityForSession } from "../../../features/magic-context/memory/project-identity";
-import { createScheduler } from "../../../features/magic-context/scheduler";
+
 import { recordSessionProjectIdentity } from "../../../features/magic-context/session-project-storage";
 import { openBridgeDatabase } from "../../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../../features/magic-context/storage-meta";
@@ -11,14 +11,15 @@ import {
     getPendingCompactionMarkerState,
     getPersistedCompactionMarkerState,
 } from "../../../features/magic-context/storage-meta-persisted";
-import { createTagger } from "../../../features/magic-context/tagger";
+
 import type { PluginContext } from "../../../plugin/types";
 import { sessionLog } from "../../../shared/logger";
-import { resolveHistorianModel } from "../../../shared/model-resolution";
+
 import { SubcModuleTransport } from "../module-transport";
 import { hasRawMessageProvider } from "../read-session-chunk";
 import { createRustModeTransform } from "../rust-mode-transform";
 import type { TransformDeps } from "../transform";
+import { createBridgeDeps } from "./bridge-deps";
 import { createBridgeHostFacts } from "./bridge-host-facts";
 import { type BridgeMarkerOutcome, createBridgeReceiptStore } from "./bridge-marker";
 import { openCodeCutProblem, openCodeCutSources } from "./bridge-native-cut";
@@ -66,44 +67,17 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
     const observations = new Set<Promise<void>>();
     const observingSession = new AsyncLocalStorage<string>();
     try {
-        const historian = resolveHistorianModel(config, "opencode");
-        deps = {
-            db,
-            client: v2 ? undefined : (options.openCodeClient as PluginContext["client"]),
-            directory: options.projectRoot,
-            rustModeProjectRoot: options.projectRoot,
-            allowHomeProject: config.allow_home_project,
-            storeGeneration: v2 ? "v2" : "v1",
-            // The calling integration owns bridge opt-in; transform_mode/rust_pipeline only select the in-tree plugin renderer.
-            transformMode: "rust",
-            rustPipeline: "provider",
-            rustModeModuleClient: transport,
-            tagger: createTagger(),
-            scheduler: createScheduler({
-                executeThresholdPercentage: config.execute_threshold_percentage,
-            }),
-            contextUsageMap: new Map(),
-            liveModelBySession: new Map(),
-            historyRefreshSessions: new Set(),
-            pendingMaterializationSessions: new Set(),
-            lastHeuristicsTurnId: new Map(),
-            cacheTtlConfig: config.cache_ttl,
-            cacheTtlConfigured: config.cacheTtlConfigured,
-            protectedTokens: config.protected_tokens,
-            protectedTools: config.protected_tools,
-            keepReasoningTokens: config.keep_reasoning_tokens,
-            historyBudgetPercentage: config.history_budget_percentage,
-            executeThresholdPercentage: config.execute_threshold_percentage,
-            executeThresholdTokens: config.execute_threshold_tokens,
-            historianModel: historian.primary,
-            fallbackModels: historian.fallbacks,
-            historianMaxOutputTokens: config.historian?.maxTokens,
-            historianTimeoutMs: config.historian_timeout_ms,
-            historianRunner: config.historian?.runner,
-            historianHostRunnerEnabled: config.historian?.host_runner?.enabled,
-            historianRunnable: config.historian?.disable !== true,
-            promptSurface: config.prompt_surface,
-        };
+        deps = createBridgeDeps(
+            config,
+            {
+                db,
+                client: v2 ? undefined : (options.openCodeClient as PluginContext["client"]),
+                directory: options.projectRoot,
+                storeGeneration: v2 ? "v2" : "v1",
+                rustModeModuleClient: transport,
+            },
+            "opencode",
+        );
         // Reuse the Rust transform's message-id/ordinal cache for bootstrap, but refuse its full-request execution path.
         legacy = createRustModeTransform(deps, {
             moduleClient: transport,

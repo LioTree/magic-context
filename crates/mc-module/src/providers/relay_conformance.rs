@@ -68,7 +68,14 @@ async fn oracle() {
         return;
     }
     let mut dir = tempfile::tempdir().unwrap();
-    let mut mc = handler(dir.path());
+    let context_root = std::env::var_os("MC_PI_BRIDGE_ROOT").map(PathBuf::from);
+    if let Some(root) = &context_root {
+        assert!(
+            root.starts_with(std::env::temp_dir().join("magic-context/pi-bridge")),
+            "Pi oracle root must be disposable"
+        );
+    }
+    let mut mc = handler(context_root.as_deref().unwrap_or(dir.path()));
     for line in std::io::stdin().lock().lines() {
         let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
         let answer = match request["control"].as_str() {
@@ -87,7 +94,7 @@ async fn oracle() {
             }
             Some("restart") => {
                 drop(mc);
-                mc = handler(dir.path());
+                mc = handler(context_root.as_deref().unwrap_or(dir.path()));
                 String::new()
             }
             Some("scheduler") => {

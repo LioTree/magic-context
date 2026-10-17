@@ -71,6 +71,49 @@ pub(super) fn encode_view(
     ))
 }
 
+/// Pi stores tool results separately from their assistant's calls. Read the
+/// actual preceding assistant and intervening results (at most 64 prior rows)
+/// so tool-pair validation never invents a missing call.
+pub(super) fn decode_hook_messages(
+    store: &McStore,
+    key: &Key,
+    lineage: &str,
+    entry: compact::status::StatusMessage,
+) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
+    let mut entries = Vec::new();
+    if entry
+        .message
+        .pointer("/message/role")
+        .and_then(Value::as_str)
+        == Some("toolResult")
+    {
+        let prior = store
+            .load_provider_messages_page(
+                &key.store_key(),
+                lineage,
+                entry.ordinal.saturating_sub(64),
+                entry.ordinal.saturating_sub(1),
+                64,
+            )
+            .map_err(transient)?;
+        for source in prior {
+            let message: Value =
+                serde_json::from_slice(&source.message_bytes).map_err(transient)?;
+            if message.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
+                entries.clear();
+            }
+            entries.push(compact::status::StatusMessage {
+                raw_message: None,
+                mid: source.mid,
+                ordinal: source.ordinal,
+                message,
+            });
+        }
+    }
+    entries.push(entry);
+    decode_messages(&entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -189,3 +189,34 @@ async fn host_lane_check_leaves_broca_and_claude_code_admission_unchanged() {
         "{outcome:?}"
     );
 }
+
+#[tokio::test]
+async fn pi_provider_tool_facade_requires_attestation_even_when_the_plan_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = super::claude_code_tests::handler(dir.path(), None);
+    bind(
+        &h,
+        dir.path(),
+        "pi",
+        Some(harness_principal()),
+        Some(scope()),
+    )
+    .await;
+    let declaration = h.dispatch_value(7, json!({"method":"transform.declare","params":{"session":"s","harness":"pi","preset":"head","params":{"serializer_profile":"pi","observation":"answer"}}})).await;
+    assert!(matches!(declaration, HandlerOutcome::Response(_)));
+    let response = h
+        .dispatch_value(7, json!({"name":"ctx_reduce","arguments":{"drop":"1"}}))
+        .await;
+    assert!(
+        matches!(response, HandlerOutcome::Response(_)),
+        "{response:?}"
+    );
+    bind(&h, dir.path(), "pi", Some(Principal::Direct), Some(scope())).await;
+    let response = h
+        .dispatch_value(7, json!({"name":"ctx_reduce","arguments":{"drop":"1"}}))
+        .await;
+    assert!(
+        !matches!(response, HandlerOutcome::Response(_)),
+        "unattested Pi caller reused the host plan: {response:?}"
+    );
+}
