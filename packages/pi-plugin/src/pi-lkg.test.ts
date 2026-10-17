@@ -330,6 +330,8 @@ describe("Pi incremental LKG capture", () => {
 			servedCaptureId: 1,
 			fullCoverage: true,
 			slotState: "captured",
+			// No bytes are saved under the id yet, so it certifies nothing.
+			servedDigest: null,
 		});
 		expect(checkLkgDurability(harness.db, "move-pi")).toEqual({
 			durable: true,
