@@ -286,6 +286,44 @@ test("real managed handler certifies the request it returns, and a late commit s
 	}
 });
 
+test("a request the dispatch wrapper refuses after the handler returns stays uncertified and unhydrated", async () => {
+	await fixture(async (db, sessionId, root) => {
+		const fake = createFakePi();
+		let now = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		// The handler's last hook runs after its own deadline checks: crossing the
+		// deadline here lets the handler return, and the wrapper then refuses.
+		registerPiContextHandler(fake.pi as never, {
+			db,
+			onPostprocess: () => {
+				now = 26_000;
+			},
+		});
+		const handler = fake.handlers.get("context");
+		if (!handler) throw new Error("context handler missing");
+		const raw = [userMessage("refused after return", 1)];
+		const ctx = fakeContext(sessionId, root, ["entry-1"], raw);
+		try {
+			await expect(
+				handler({ messages: raw } as never, ctx as never),
+			).rejects.toThrow("elapsed=26000ms");
+			expect(
+				persistence.loadPersistedLkgSlot(db, sessionId)?.jsonPrefix,
+			).toContain("refused after return");
+			expect(checkLkgDurability(db, sessionId)).toEqual({
+				durable: true,
+				servedCaptureId: null,
+				certified: false,
+			});
+			expect(
+				persistence.createDbLkgPersistence(db).load(sessionId),
+			).toBeUndefined();
+		} finally {
+			clock.mockRestore();
+		}
+	});
+});
+
 for (const limitation of [
 	"branch-unavailable",
 	"identical-unsaved-twins",
