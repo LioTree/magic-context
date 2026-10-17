@@ -516,7 +516,8 @@ fn v2_pi_recipe_round_trips_the_whole_host_view() {
             .iter()
             .any(|segment| matches!(segment, ProviderViewSegment::NativeRange { .. })));
         let loaded = load(&store, &key, version).unwrap().unwrap();
-        // The bytes served to Pi, the wire view, are identical to what was saved.
+        // The wire view (the Pi journal entries the module sends back to the Pi
+        // harness) is byte-identical to what was saved.
         assert_eq!(
             serde_json::to_string(&loaded.wire).unwrap(),
             serde_json::to_string(&host.wire).unwrap()

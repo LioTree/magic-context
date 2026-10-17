@@ -33,7 +33,7 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(74);
+        expect(ts).toHaveLength(75);
         // The Rust lane is retired with transform_mode: no entry has a rust
         // invocation. Former both-modes files stay in the TypeScript list.
         expect(validation.manifest.rust_lane).toBe("retired");
