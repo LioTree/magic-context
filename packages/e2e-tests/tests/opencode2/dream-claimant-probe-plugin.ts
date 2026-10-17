@@ -10,7 +10,15 @@
  * each result is written to `dream-probe-result-<seq>.json`. The file
  * `dream-probe-ready` appears once the real instance's carrier is published.
  */
-import { existsSync, readdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    readdirSync,
+    readFileSync,
+    realpathSync,
+    renameSync,
+    unlinkSync,
+    writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { publishedDreamChildHost } from "../../../plugin/src/hooks/magic-context/dream-child-claimant";
 import { type DreamProbeScenario, runDreamProbe } from "../../src/dream-claimant-probe";
@@ -35,12 +43,12 @@ export default {
                 void runDreamProbe(host, directory, scenario)
                     .then((result) => result as unknown)
                     .catch((error: unknown) => ({ error: String(error) }))
-                    .then((result) =>
-                        writeFileSync(
-                            join(directory, `dream-probe-result-${match[1]}.json`),
-                            JSON.stringify(result),
-                        ),
-                    );
+                    .then((result) => {
+                        // Written whole, then renamed, so the test never reads half a file.
+                        const target = join(directory, `dream-probe-result-${match[1]}.json`);
+                        writeFileSync(`${target}.tmp`, JSON.stringify(result));
+                        renameSync(`${target}.tmp`, target);
+                    });
             }
         };
         const timer = setInterval(tick, 50);
