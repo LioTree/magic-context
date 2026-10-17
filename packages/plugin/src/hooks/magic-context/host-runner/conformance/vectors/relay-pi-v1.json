@@ -8,6 +8,160 @@
     "cases": [
         {
             "id": "single-op-retry",
+            "steps": [
+                {
+                    "action": {
+                        "kind": "bind",
+                        "harness": "pi",
+                        "session": "relay-pi-v1"
+                    },
+                    "exchanges": []
+                },
+                {
+                    "action": {
+                        "kind": "run",
+                        "session": "relay-pi-v1",
+                        "system": "Pi conformance system.",
+                        "entries": [
+                            {
+                                "type": "message",
+                                "id": "pi-entry-001",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Covered user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            }
+                        ]
+                    },
+                    "exchanges": [
+                        {
+                            "method": "transform.declare",
+                            "request_bytes": "{\"method\":\"transform.declare\",\"params\":{\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"}}}",
+                            "answer_bytes": "{\"subscriptions\":[{\"hook\":\"pre_user\",\"ops\":[\"prepend\",\"append\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500},{\"hook\":\"post_tool\",\"ops\":[\"prepend\",\"append\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500},{\"hook\":\"post_assistant\",\"ops\":[\"prepend\",\"replace\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500}]}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "compaction.setup",
+                            "request_bytes": "{\"method\":\"compaction.setup\",\"params\":{\"model\":\"fixture/model\",\"step_id\":\"pi-entry-001\",\"step_kind\":\"model\",\"context_window\":100000,\"estimate\":{\"request_tokens\":0},\"composition\":{},\"session\":\"relay-pi-v1\",\"harness\":\"pi\",\"request_id\":\"pi-request-0001\",\"lineage_id\":\"pi-lineage-0001\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"now\":1000}}",
+                            "answer_bytes": "{\"answer\":\"ready\",\"request_id\":\"pi-request-0001\",\"initial\":{\"compaction_id\":\"mc-1037009a8d33f9f19f720739517cc0a18d3a45ba3d5eca71b5754b8907300726\",\"version\":1,\"range\":{\"from\":0,\"to\":0},\"replacement\":[{\"content\":[{\"text\":\"<session-history></session-history>\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}],\"role\":\"user\"}]},\"stability\":[{\"index\":0,\"rank\":2},{\"index\":1,\"rank\":1}],\"call_when\":{\"default\":0.65}}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "state_sync",
+                            "request_bytes": "{\"method\":\"state_sync\",\"shadow_generation\":0,\"expected_shadow_seq\":0,\"seed_id\":\"pi-seed-0001\",\"seed_generation\":0,\"seed_batch_index\":0,\"seed_batch_total\":1,\"seed_complete\":true,\"resolved_compartment_boundaries\":[],\"pending_agent_drops\":[],\"note_nudge_anchors\":[],\"auto_search_hint_decisions\":[],\"seed_boundary_id\":null,\"last_todo_state\":\"\",\"acked_watermarks\":{\"compartment_sequence\":-1,\"memory_id\":0,\"m0_mutation_id\":0,\"memory_mutation_id\":0,\"last_todo_state_hash\":\"2114556b3e7818ffe1b246a56ad1604d20d7057f405e749ca5f4006b21870706\",\"project_memory_epoch\":0,\"project_user_profile_version\":0,\"workspace_fingerprint\":null,\"reasoning_cleared_through_tag\":0,\"note_evaluation_available\":true},\"note_evaluation_available\":true,\"todo_synthetic_anchor\":null,\"emergency_latches\":{\"last_input_sample\":0,\"has_prior_drop\":false,\"last_execute_ordinal\":0},\"pending_compaction_marker\":null,\"channel2_nudge_state\":\"\",\"reasoning_cleared_through_tag\":0,\"pass_complete\":true,\"historian_model_chain\":[],\"accept_reply_pages\":true}",
+                            "answer_bytes": "{\"auto_search_hint_skipped\":0,\"drop_seeds_skipped\":0,\"emergency_latches_seeded\":true,\"note_nudge_anchors_seeded\":0,\"ok\":true,\"pending_agent_drops_seeded\":0,\"pending_agent_drops_skipped\":0,\"row_version\":1,\"seeds_skipped_frozen_discarded\":0,\"shadow_generation\":0,\"shadow_seq\":1,\"strip_seeds_skipped\":0,\"todo_synthetic_anchor_seeded\":false,\"user_hint_seeds_seeded\":0}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "compaction.step",
+                            "request_bytes": "{\"method\":\"compaction.step\",\"params\":{\"model\":\"fixture/model\",\"step_id\":\"pi-entry-001\",\"step_kind\":\"model\",\"context_window\":100000,\"estimate\":{\"request_tokens\":0},\"newest\":{\"ordinal\":1,\"mid\":\"pi-entry-001\"},\"prefix_rebuilding\":{\"reason\":\"pipeline_switch\"},\"session\":\"relay-pi-v1\",\"harness\":\"pi\",\"now\":1001,\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"last_applied\":{\"compaction_id\":\"mc-1037009a8d33f9f19f720739517cc0a18d3a45ba3d5eca71b5754b8907300726\",\"version\":1},\"lineage_id\":\"pi-lineage-0001\",\"served_through_ordinal\":0,\"after_ordinal\":0,\"request_id\":\"pi-request-0002\",\"messages\":[{\"ordinal\":1,\"mid\":\"pi-entry-001\",\"message\":{\"type\":\"message\",\"id\":\"pi-entry-001\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Covered user.\"}],\"timestamp\":1}}}]}}",
+                            "answer_bytes": "{\"answer\":\"compaction_message\",\"compaction\":{\"compaction_id\":\"mc-1037009a8d33f9f19f720739517cc0a18d3a45ba3d5eca71b5754b8907300726\",\"range\":{\"from\":1,\"to\":2},\"replacement\":[{\"content\":[{\"text\":\"<session-history></session-history>\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}],\"role\":\"user\"},{\"id\":\"pi-entry-001\",\"message\":{\"content\":[{\"text\":\"Covered user.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":1},\"parentId\":null,\"type\":\"message\"}],\"version\":3},\"request_id\":\"pi-request-0002\"}",
+                            "delivery": "answer"
+                        }
+                    ]
+                },
+                {
+                    "action": {
+                        "kind": "run",
+                        "session": "relay-pi-v1",
+                        "system": "Pi conformance system.",
+                        "entries": [
+                            {
+                                "type": "message",
+                                "id": "pi-entry-001",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Covered user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-entry-002",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Retained user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            }
+                        ]
+                    },
+                    "exchanges": [
+                        {
+                            "method": "transform.hook",
+                            "request_bytes": "{\"method\":\"transform.hook\",\"params\":{\"hook\":\"pre_user\",\"subject_mid\":\"pi-entry-002\",\"blocks\":[\"Retained user.\"],\"subject_ordinal\":2,\"session\":\"relay-pi-v1\",\"harness\":\"pi\",\"lineage_id\":\"pi-lineage-0001\",\"request_id\":\"pi-request-0003\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"served_through_ordinal\":0,\"pass_complete\":true,\"budget_ms\":1500,\"on_unavailable\":\"pass\",\"message\":{\"type\":\"message\",\"id\":\"pi-entry-002\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Retained user.\"}],\"timestamp\":1}}}}",
+                            "answer_bytes": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§1§ \"}]}",
+                            "delivery": "answer"
+                        }
+                    ]
+                },
+                {
+                    "action": {
+                        "kind": "run",
+                        "session": "relay-pi-v1",
+                        "system": "Pi conformance system.",
+                        "entries": [
+                            {
+                                "type": "message",
+                                "id": "pi-entry-001",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Covered user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-entry-002",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Retained user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            }
+                        ]
+                    },
+                    "exchanges": [
+                        {
+                            "method": "state_sync",
+                            "request_bytes": "{\"method\":\"state_sync\",\"session_id\":\"relay-pi-v1\",\"shadow_generation\":0,\"expected_shadow_seq\":1,\"pass_complete\":true,\"historian_model_chain\":[],\"accept_reply_pages\":true}",
+                            "answer_bytes": "{\"auto_search_hint_skipped\":0,\"drop_seeds_skipped\":0,\"emergency_latches_seeded\":false,\"note_nudge_anchors_seeded\":0,\"ok\":true,\"pending_agent_drops_seeded\":0,\"pending_agent_drops_skipped\":0,\"row_version\":3,\"seeds_skipped_frozen_discarded\":0,\"shadow_generation\":0,\"shadow_seq\":2,\"strip_seeds_skipped\":0,\"todo_synthetic_anchor_seeded\":false,\"user_hint_seeds_seeded\":0}",
+                            "delivery": "answer"
+                        }
+                    ]
+                }
+            ],
             "expected": {
                 "wire_sha256": "902d3a7cd8eda0d8ae8c7722546d051445ead420662ed12359b0f65b579a2ae2",
                 "receipt": {
@@ -30,6 +184,74 @@
         },
         {
             "id": "hook-timeout-fallback-freeze",
+            "steps": [
+                {
+                    "action": {
+                        "kind": "run",
+                        "session": "relay-pi-v1",
+                        "system": "Pi conformance system.",
+                        "entries": [
+                            {
+                                "type": "message",
+                                "id": "pi-entry-001",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Covered user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-entry-002",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Retained user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-entry-003",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Timeout raw bytes."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            }
+                        ],
+                        "fault": {
+                            "method": "transform.hook",
+                            "mode": "timeout"
+                        }
+                    },
+                    "exchanges": [
+                        {
+                            "method": "transform.hook",
+                            "request_bytes": "{\"method\":\"transform.hook\",\"params\":{\"hook\":\"pre_user\",\"subject_mid\":\"pi-entry-003\",\"blocks\":[\"Timeout raw bytes.\"],\"subject_ordinal\":3,\"session\":\"relay-pi-v1\",\"harness\":\"pi\",\"lineage_id\":\"pi-lineage-0001\",\"request_id\":\"pi-request-0004\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"served_through_ordinal\":0,\"pass_complete\":true,\"budget_ms\":1500,\"on_unavailable\":\"pass\",\"message\":{\"type\":\"message\",\"id\":\"pi-entry-003\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Timeout raw bytes.\"}],\"timestamp\":1}}}}",
+                            "answer_bytes": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§2§ \"}]}",
+                            "delivery": "timeout"
+                        }
+                    ]
+                }
+            ],
             "expected": {
                 "wire_sha256": "b2a907475fa0c1afe6ff8c94be00f19d6ced145ff44c085289831704e268999d",
                 "receipt": {
@@ -59,6 +281,28 @@
         },
         {
             "id": "receipt-publish-and-complete",
+            "steps": [
+                {
+                    "action": {
+                        "kind": "delivery",
+                        "session": "relay-pi-v1",
+                        "request_id": "pi-request-0005",
+                        "status": 200,
+                        "cleanEnd": false
+                    },
+                    "exchanges": []
+                },
+                {
+                    "action": {
+                        "kind": "delivery",
+                        "session": "relay-pi-v1",
+                        "request_id": "pi-request-0005",
+                        "status": 200,
+                        "cleanEnd": true
+                    },
+                    "exchanges": []
+                }
+            ],
             "expected": {
                 "pending": {
                     "request_id": "identity-4",
@@ -133,6 +377,237 @@
         },
         {
             "id": "native-cut-applied-and-recovered",
+            "steps": [
+                {
+                    "action": {
+                        "kind": "publish",
+                        "session": "relay-pi-v1",
+                        "compartment": {
+                            "sequence": 0,
+                            "startMessage": 1,
+                            "endMessage": 1,
+                            "startMessageId": "pi-entry-001",
+                            "endMessageId": "pi-entry-001",
+                            "title": "Covered history",
+                            "content": "Covered first user."
+                        },
+                        "pending_marker": {
+                            "firstKeptEntryId": "pi-entry-002",
+                            "endMessageId": "pi-entry-001",
+                            "ordinal": 1,
+                            "tokensBefore": 20,
+                            "summary": "Covered history",
+                            "publishedAt": 1
+                        }
+                    },
+                    "exchanges": []
+                },
+                {
+                    "action": {
+                        "kind": "run",
+                        "session": "relay-pi-v1",
+                        "system": "A natural system change.",
+                        "entries": [
+                            {
+                                "type": "message",
+                                "id": "pi-entry-001",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Covered user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-entry-002",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Retained user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-entry-003",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Timeout raw bytes."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            }
+                        ]
+                    },
+                    "exchanges": [
+                        {
+                            "method": "state_sync",
+                            "request_bytes": "{\"method\":\"state_sync\",\"shadow_generation\":0,\"expected_shadow_seq\":1,\"last_todo_state\":\"\",\"acked_watermarks\":{\"compartment_sequence\":0,\"memory_id\":0,\"m0_mutation_id\":0,\"memory_mutation_id\":0,\"last_todo_state_hash\":\"2114556b3e7818ffe1b246a56ad1604d20d7057f405e749ca5f4006b21870706\",\"project_memory_epoch\":0,\"project_user_profile_version\":0,\"workspace_fingerprint\":null,\"reasoning_cleared_through_tag\":0,\"note_evaluation_available\":true},\"note_evaluation_available\":true,\"pass_complete\":true,\"historian_model_chain\":[],\"accept_reply_pages\":true}",
+                            "answer_bytes": "{\"oracle_error\":{\"code\":\"authority_seq_mismatch\",\"message\":\"{\\\"code\\\":\\\"authority_seq_mismatch\\\",\\\"durable_authority_seq\\\":2,\\\"expected_authority_seq\\\":1}\",\"source\":\"module\"}}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "state_sync",
+                            "request_bytes": "{\"method\":\"state_sync\",\"shadow_generation\":0,\"expected_shadow_seq\":2,\"seed_id\":\"pi-seed-0002\",\"seed_generation\":0,\"seed_batch_index\":0,\"seed_batch_total\":1,\"seed_complete\":true,\"resolved_compartment_boundaries\":[{\"sequence\":0,\"source_start_message\":1,\"source_end_message\":1,\"source_start_message_id\":\"pi-entry-001\",\"source_start_block_index\":null,\"source_end_message_id\":\"pi-entry-001\",\"source_end_block_index\":null,\"start_message\":1,\"end_message\":1,\"start_message_id\":\"pi-entry-001#0\",\"end_message_id\":\"pi-entry-001#0\",\"start_date\":null,\"end_date\":null}],\"pending_agent_drops\":[],\"note_nudge_anchors\":[],\"auto_search_hint_decisions\":[],\"seed_boundary_id\":\"pi-entry-001#0\",\"last_todo_state\":\"\",\"acked_watermarks\":{\"compartment_sequence\":0,\"memory_id\":0,\"m0_mutation_id\":0,\"memory_mutation_id\":0,\"last_todo_state_hash\":\"2114556b3e7818ffe1b246a56ad1604d20d7057f405e749ca5f4006b21870706\",\"project_memory_epoch\":0,\"project_user_profile_version\":0,\"workspace_fingerprint\":null,\"reasoning_cleared_through_tag\":0,\"note_evaluation_available\":true},\"note_evaluation_available\":true,\"todo_synthetic_anchor\":null,\"emergency_latches\":{\"last_input_sample\":0,\"has_prior_drop\":false,\"last_execute_ordinal\":0},\"pending_compaction_marker\":null,\"channel2_nudge_state\":\"\",\"reasoning_cleared_through_tag\":0,\"pass_complete\":true,\"historian_model_chain\":[],\"accept_reply_pages\":true}",
+                            "answer_bytes": "{\"auto_search_hint_skipped\":0,\"drop_seeds_skipped\":0,\"emergency_latches_seeded\":true,\"note_nudge_anchors_seeded\":0,\"ok\":true,\"pending_agent_drops_seeded\":0,\"pending_agent_drops_skipped\":0,\"row_version\":4,\"seeds_skipped_frozen_discarded\":0,\"shadow_generation\":0,\"shadow_seq\":3,\"strip_seeds_skipped\":0,\"todo_synthetic_anchor_seeded\":false,\"user_hint_seeds_seeded\":0}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "compaction.step",
+                            "request_bytes": "{\"method\":\"compaction.step\",\"params\":{\"model\":\"fixture/model\",\"step_id\":\"pi-entry-003\",\"step_kind\":\"model\",\"context_window\":100000,\"estimate\":{\"request_tokens\":0},\"newest\":{\"ordinal\":3,\"mid\":\"pi-entry-003\"},\"prefix_rebuilding\":{\"reason\":\"manifest_change\"},\"session\":\"relay-pi-v1\",\"harness\":\"pi\",\"now\":1002,\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"last_applied\":{\"compaction_id\":\"mc-1037009a8d33f9f19f720739517cc0a18d3a45ba3d5eca71b5754b8907300726\",\"version\":3},\"unserved_subjects\":[{\"subject_mid\":\"pi-entry-003\",\"hook\":\"pre_user\",\"blocks\":[\"Timeout raw bytes.\"]}],\"lineage_id\":\"pi-lineage-0001\",\"served_through_ordinal\":3,\"after_ordinal\":2,\"request_id\":\"pi-request-0006\",\"messages\":[{\"ordinal\":3,\"mid\":\"pi-entry-003\",\"message\":{\"type\":\"message\",\"id\":\"pi-entry-003\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Timeout raw bytes.\"}],\"timestamp\":1}}}]}}",
+                            "answer_bytes": "{\"answer\":\"compaction_message\",\"compaction\":{\"compaction_id\":\"mc-1037009a8d33f9f19f720739517cc0a18d3a45ba3d5eca71b5754b8907300726\",\"range\":{\"from\":1,\"to\":4},\"replacement\":[{\"content\":[{\"text\":\"<session-history>\\n## 1-1 · Covered history\\n</session-history>\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}],\"role\":\"user\"},{\"id\":\"pi-entry-002\",\"message\":{\"content\":[{\"text\":\"Retained user.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":1},\"parentId\":null,\"type\":\"message\"},{\"id\":\"pi-entry-003\",\"message\":{\"content\":[{\"text\":\"Timeout raw bytes.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":1},\"parentId\":null,\"type\":\"message\"}],\"version\":5},\"coverage\":{\"end_mid\":\"pi-entry-001\",\"ordinal\":1},\"request_id\":\"pi-request-0006\"}",
+                            "delivery": "answer"
+                        }
+                    ]
+                },
+                {
+                    "action": {
+                        "kind": "delivery",
+                        "session": "relay-pi-v1",
+                        "request_id": "pi-request-0007",
+                        "status": 200,
+                        "cleanEnd": true
+                    },
+                    "exchanges": []
+                },
+                {
+                    "action": {
+                        "kind": "native_marker",
+                        "session": "relay-pi-v1",
+                        "request_id": "pi-request-0007",
+                        "fit": {
+                            "messages": [
+                                "pi-entry-001",
+                                "pi-entry-002",
+                                "pi-entry-003"
+                            ],
+                            "model": "fixture/model",
+                            "envelope": "system+tools",
+                            "contextWindow": 100000,
+                            "systemPromptTokens": 20,
+                            "toolDefinitionTokens": 0
+                        }
+                    },
+                    "exchanges": []
+                },
+                {
+                    "action": {
+                        "kind": "native_marker",
+                        "session": "relay-pi-v1",
+                        "request_id": "pi-request-0007",
+                        "fit": {
+                            "messages": [
+                                "pi-entry-001",
+                                "pi-entry-002",
+                                "pi-entry-003"
+                            ],
+                            "model": "fixture/model",
+                            "envelope": "system+tools",
+                            "contextWindow": 100000,
+                            "systemPromptTokens": 20,
+                            "toolDefinitionTokens": 0
+                        }
+                    },
+                    "exchanges": []
+                },
+                {
+                    "action": {
+                        "kind": "run",
+                        "session": "relay-pi-v1",
+                        "system": "A natural system change.",
+                        "entries": [
+                            {
+                                "type": "compaction",
+                                "id": "pi-native-cut",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Native placeholder, not provider history."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-entry-002",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Retained user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-entry-003",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Timeout raw bytes."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            }
+                        ]
+                    },
+                    "exchanges": [
+                        {
+                            "method": "state_sync",
+                            "request_bytes": "{\"method\":\"state_sync\",\"session_id\":\"relay-pi-v1\",\"shadow_generation\":0,\"expected_shadow_seq\":3,\"pass_complete\":true,\"historian_model_chain\":[],\"accept_reply_pages\":true}",
+                            "answer_bytes": "{\"auto_search_hint_skipped\":0,\"drop_seeds_skipped\":0,\"emergency_latches_seeded\":false,\"note_nudge_anchors_seeded\":0,\"ok\":true,\"pending_agent_drops_seeded\":0,\"pending_agent_drops_skipped\":0,\"row_version\":6,\"seeds_skipped_frozen_discarded\":0,\"shadow_generation\":0,\"shadow_seq\":4,\"strip_seeds_skipped\":0,\"todo_synthetic_anchor_seeded\":false,\"user_hint_seeds_seeded\":0}",
+                            "delivery": "answer"
+                        }
+                    ]
+                },
+                {
+                    "action": {
+                        "kind": "fallback_check",
+                        "session": "relay-pi-v1",
+                        "fit": {
+                            "messages": [
+                                "pi-native-cut",
+                                "pi-entry-002",
+                                "pi-entry-003"
+                            ],
+                            "model": "fixture/model",
+                            "envelope": "system+tools",
+                            "contextWindow": 100000,
+                            "systemPromptTokens": 20,
+                            "toolDefinitionTokens": 0
+                        }
+                    },
+                    "exchanges": []
+                }
+            ],
             "expected": {
                 "receipt": {
                     "request_id": "identity-5",
@@ -166,6 +641,71 @@
         },
         {
             "id": "tree-branch-switch",
+            "steps": [
+                {
+                    "action": {
+                        "kind": "branch",
+                        "entries": [
+                            "pi-entry-001",
+                            "pi-tree-right"
+                        ]
+                    },
+                    "exchanges": []
+                },
+                {
+                    "action": {
+                        "kind": "run",
+                        "session": "relay-pi-v1",
+                        "system": "A natural system change.",
+                        "entries": [
+                            {
+                                "type": "message",
+                                "id": "pi-entry-001",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Covered user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-tree-right",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Selected /tree branch."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            }
+                        ]
+                    },
+                    "exchanges": [
+                        {
+                            "method": "transform.hook",
+                            "request_bytes": "{\"method\":\"transform.hook\",\"params\":{\"hook\":\"pre_user\",\"subject_mid\":\"pi-tree-right\",\"blocks\":[\"Selected /tree branch.\"],\"subject_ordinal\":2,\"session\":\"relay-pi-v1\",\"harness\":\"pi\",\"lineage_id\":\"pi-lineage-0002\",\"request_id\":\"pi-request-0008\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"served_through_ordinal\":1,\"descends_from\":{\"lineage_id\":\"pi-lineage-0001\",\"through_ordinal\":1},\"pass_complete\":true,\"budget_ms\":1500,\"on_unavailable\":\"pass\",\"message\":{\"type\":\"message\",\"id\":\"pi-tree-right\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Selected /tree branch.\"}],\"timestamp\":1}}}}",
+                            "answer_bytes": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§3§ \"}]}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "compaction.step",
+                            "request_bytes": "{\"method\":\"compaction.step\",\"params\":{\"model\":\"fixture/model\",\"step_id\":\"pi-tree-right\",\"step_kind\":\"model\",\"context_window\":100000,\"estimate\":{\"request_tokens\":0},\"newest\":{\"ordinal\":2,\"mid\":\"pi-tree-right\"},\"prefix_rebuilding\":{\"reason\":\"revert\"},\"session\":\"relay-pi-v1\",\"harness\":\"pi\",\"now\":1003,\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"last_applied\":{\"compaction_id\":\"mc-1037009a8d33f9f19f720739517cc0a18d3a45ba3d5eca71b5754b8907300726\",\"version\":5},\"descends_from\":{\"lineage_id\":\"pi-lineage-0001\",\"through_ordinal\":1},\"lineage_id\":\"pi-lineage-0002\",\"served_through_ordinal\":1,\"after_ordinal\":2,\"request_id\":\"pi-request-0009\",\"messages\":[]}}",
+                            "answer_bytes": "{\"answer\":\"compaction_message\",\"compaction\":{\"compaction_id\":\"mc-1037009a8d33f9f19f720739517cc0a18d3a45ba3d5eca71b5754b8907300726\",\"range\":{\"from\":1,\"to\":3},\"replacement\":[{\"content\":[{\"text\":\"<session-history>\\n## 1-1 · Covered history\\n</session-history>\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}],\"role\":\"user\"},{\"id\":\"pi-tree-right\",\"message\":{\"content\":[{\"text\":\"Selected /tree branch.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":1},\"parentId\":null,\"type\":\"message\"}],\"version\":7},\"coverage\":{\"end_mid\":\"pi-entry-001\",\"ordinal\":1},\"request_id\":\"pi-request-0009\"}",
+                            "delivery": "answer"
+                        }
+                    ]
+                }
+            ],
             "expected": {
                 "receipt": {
                     "request_id": "identity-6",
@@ -191,6 +731,81 @@
         },
         {
             "id": "forked-session",
+            "steps": [
+                {
+                    "action": {
+                        "kind": "bind",
+                        "harness": "pi",
+                        "session": "relay-pi-fork"
+                    },
+                    "exchanges": []
+                },
+                {
+                    "action": {
+                        "kind": "run",
+                        "session": "relay-pi-fork",
+                        "system": "Pi conformance system.",
+                        "entries": [
+                            {
+                                "type": "message",
+                                "id": "pi-entry-001",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Covered user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-tree-right",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Selected /tree branch."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            }
+                        ]
+                    },
+                    "exchanges": [
+                        {
+                            "method": "transform.declare",
+                            "request_bytes": "{\"method\":\"transform.declare\",\"params\":{\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"}}}",
+                            "answer_bytes": "{\"subscriptions\":[{\"hook\":\"pre_user\",\"ops\":[\"prepend\",\"append\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500},{\"hook\":\"post_tool\",\"ops\":[\"prepend\",\"append\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500},{\"hook\":\"post_assistant\",\"ops\":[\"prepend\",\"replace\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500}]}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "compaction.setup",
+                            "request_bytes": "{\"method\":\"compaction.setup\",\"params\":{\"model\":\"fixture/model\",\"step_id\":\"pi-tree-right\",\"step_kind\":\"model\",\"context_window\":100000,\"estimate\":{\"request_tokens\":0},\"composition\":{},\"session\":\"relay-pi-fork\",\"harness\":\"pi\",\"request_id\":\"pi-request-0010\",\"lineage_id\":\"pi-lineage-0003\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"now\":1004}}",
+                            "answer_bytes": "{\"answer\":\"ready\",\"request_id\":\"pi-request-0010\",\"initial\":{\"compaction_id\":\"mc-96a28428373a02874b93280574c6681313ec3661ce20112085d3c0147b9aea42\",\"version\":1,\"range\":{\"from\":0,\"to\":0},\"replacement\":[{\"content\":[{\"text\":\"<session-history></session-history>\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}],\"role\":\"user\"}]},\"stability\":[{\"index\":0,\"rank\":2},{\"index\":1,\"rank\":1}],\"call_when\":{\"default\":0.65}}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "state_sync",
+                            "request_bytes": "{\"method\":\"state_sync\",\"shadow_generation\":0,\"expected_shadow_seq\":0,\"seed_id\":\"pi-seed-0003\",\"seed_generation\":0,\"seed_batch_index\":0,\"seed_batch_total\":1,\"seed_complete\":true,\"resolved_compartment_boundaries\":[],\"pending_agent_drops\":[],\"note_nudge_anchors\":[],\"auto_search_hint_decisions\":[],\"seed_boundary_id\":null,\"last_todo_state\":\"\",\"acked_watermarks\":{\"compartment_sequence\":-1,\"memory_id\":0,\"m0_mutation_id\":0,\"memory_mutation_id\":0,\"last_todo_state_hash\":\"2114556b3e7818ffe1b246a56ad1604d20d7057f405e749ca5f4006b21870706\",\"project_memory_epoch\":0,\"project_user_profile_version\":0,\"workspace_fingerprint\":null,\"reasoning_cleared_through_tag\":0,\"note_evaluation_available\":true},\"note_evaluation_available\":true,\"todo_synthetic_anchor\":null,\"emergency_latches\":{\"last_input_sample\":0,\"has_prior_drop\":false,\"last_execute_ordinal\":0},\"pending_compaction_marker\":null,\"channel2_nudge_state\":\"\",\"reasoning_cleared_through_tag\":0,\"pass_complete\":true,\"historian_model_chain\":[],\"accept_reply_pages\":true}",
+                            "answer_bytes": "{\"auto_search_hint_skipped\":0,\"drop_seeds_skipped\":0,\"emergency_latches_seeded\":true,\"note_nudge_anchors_seeded\":0,\"ok\":true,\"pending_agent_drops_seeded\":0,\"pending_agent_drops_skipped\":0,\"row_version\":1,\"seeds_skipped_frozen_discarded\":0,\"shadow_generation\":0,\"shadow_seq\":1,\"strip_seeds_skipped\":0,\"todo_synthetic_anchor_seeded\":false,\"user_hint_seeds_seeded\":0}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "compaction.step",
+                            "request_bytes": "{\"method\":\"compaction.step\",\"params\":{\"model\":\"fixture/model\",\"step_id\":\"pi-tree-right\",\"step_kind\":\"model\",\"context_window\":100000,\"estimate\":{\"request_tokens\":0},\"newest\":{\"ordinal\":2,\"mid\":\"pi-tree-right\"},\"prefix_rebuilding\":{\"reason\":\"pipeline_switch\"},\"session\":\"relay-pi-fork\",\"harness\":\"pi\",\"now\":1005,\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"last_applied\":{\"compaction_id\":\"mc-96a28428373a02874b93280574c6681313ec3661ce20112085d3c0147b9aea42\",\"version\":1},\"lineage_id\":\"pi-lineage-0003\",\"served_through_ordinal\":0,\"after_ordinal\":0,\"request_id\":\"pi-request-0011\",\"messages\":[{\"ordinal\":1,\"mid\":\"pi-entry-001\",\"message\":{\"type\":\"message\",\"id\":\"pi-entry-001\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Covered user.\"}],\"timestamp\":1}}},{\"ordinal\":2,\"mid\":\"pi-tree-right\",\"message\":{\"type\":\"message\",\"id\":\"pi-tree-right\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Selected /tree branch.\"}],\"timestamp\":1}}}]}}",
+                            "answer_bytes": "{\"answer\":\"compaction_message\",\"compaction\":{\"compaction_id\":\"mc-96a28428373a02874b93280574c6681313ec3661ce20112085d3c0147b9aea42\",\"range\":{\"from\":1,\"to\":3},\"replacement\":[{\"content\":[{\"text\":\"<session-history></session-history>\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}],\"role\":\"user\"},{\"id\":\"pi-entry-001\",\"message\":{\"content\":[{\"text\":\"Covered user.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":1},\"parentId\":null,\"type\":\"message\"},{\"id\":\"pi-tree-right\",\"message\":{\"content\":[{\"text\":\"Selected /tree branch.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":1},\"parentId\":null,\"type\":\"message\"}],\"version\":3},\"request_id\":\"pi-request-0011\"}",
+                            "delivery": "answer"
+                        }
+                    ]
+                }
+            ],
             "expected": {
                 "receipt": {
                     "request_id": "identity-8",

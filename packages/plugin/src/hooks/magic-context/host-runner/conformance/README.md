@@ -158,3 +158,58 @@ controls: accepting a hook at/after its deadline, ignoring the persisted op
 version on restart, and bypassing structural compaction admission. Each is run
 against a specifically named replay test, without regenerating expected values.
 No mutation is part of the committed fixture or generator.
+
+## Pi bridge vectors
+
+`vectors/relay-pi-v1.json` is produced by
+`packages/pi-plugin/src/host-runner/conformance/generate.ts`, which drives the
+public Pi bridge adapter against the same Rust oracle. From `packages/plugin`:
+
+```sh
+bun src/hooks/magic-context/host-runner/conformance/generate.ts --pi --write
+bun src/hooks/magic-context/host-runner/conformance/generate.ts --pi
+```
+
+From `packages/pi-plugin`, `bun test src/host-runner/conformance/relay-pi.test.ts`
+regenerates the file twice (both must equal the committed bytes) and replays it.
+
+```text
+PiVectorFile = {
+  schema: "mc-relay-pi/v1",
+  generator: {version: 1, source_base: string, oracle: string},
+  cases: [{id: string, steps: [{action: PiAction, exchanges: Exchange[]}], expected: object}]
+}
+PiAction =
+  {kind: "bind", harness: "pi", session: string} |            // oracle control
+  {kind: "run", session: string, system: string, entries: PiBridgeEntry[],
+   fault?: {method: "transform.hook", mode: "timeout"}} |
+  {kind: "delivery", session: string, request_id: string, status: number, cleanEnd: boolean} |
+  {kind: "publish", session: string, compartment: object, pending_marker: object} |
+  {kind: "native_marker", session: string, request_id: string, fit: object} |
+  {kind: "fallback_check", session: string, fit: object} |
+  {kind: "branch", entries: string[]}
+```
+
+`Exchange` is relay-v1's exchange, with the same field names and meaning. The Pi
+adapter also sends `state_sync`. An answer of the form `{"oracle_error": ...}`
+is how the oracle encodes a module error reply; it is recorded exactly like any
+other answer.
+
+Unlike relay-v1, the six cases are **one ordered session** against one MC store:
+a case owns the steps recorded since the previous case, and its `expected` block
+describes the adapter's results at that point. A replay must therefore run every
+case, in order. Steps carry no per-step snapshot; `expected` is the only outcome.
+
+The adapter mints random UUIDs and reads the wall clock. Its harness transport
+replaces `request_id`, `lineage_id` and `seed_id` values with numbered stand-ins
+(`pi-request-0001` and so on) and each `now` with a logical clock starting at
+1000, before MC sees the request, then restores the adapter's IDs in each
+answer. `request_bytes` and `answer_bytes` are exactly what MC received and
+sent. Action `request_id`s use the same stand-ins.
+
+The replay test starts a fresh oracle in a throwaway root under
+`$TMPDIR/magic-context/relay-pi-exchanges/`, sends each recorded `bind`, seeds
+each `publish` into context.db (MC reads compartments from it), and sends every
+recorded request. Each answer must equal its `answer_bytes` byte for byte. A
+second test changes one byte of a recorded hook answer and requires the replay to
+fail at that exchange.
