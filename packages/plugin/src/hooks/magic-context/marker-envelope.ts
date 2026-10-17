@@ -257,25 +257,49 @@ export function boundMarkerMessages(messages: readonly MessageLike[], model: str
 }
 
 /**
- * Lower bound on the provider tokens of a served request's message rows, at the
- * model's smallest calibration ratio. Only text OpenCode 1 certainly sends is
- * counted: non-empty, non-ignored text parts of user messages and of assistant
- * messages without an error (OpenCode drops most errored assistant turns). Tool
- * calls and results (outputs may be cleared or truncated), reasoning (providers may
- * strip earlier thinking) and every wrapper count zero. Leading and trailing
- * whitespace is not counted, since a provider adapter may trim it. If the local
- * tokenizer is unavailable the bound is 0.
+ * The text of one served message that its host certainly sends to the provider
+ * unchanged. Each host drops or rewrites different messages before the provider
+ * sees them, so each host supplies its own. Returning less text is always safe;
+ * returning text the host drops or rewrites makes the subtracted message bound too
+ * large, and the envelope bound derived from usage could then under-count.
  */
-export function lowerBoundMarkerMessages(messages: readonly MessageLike[], model: string): number {
+export type MarkerSentText = (message: MessageLike) => readonly string[];
+
+/**
+ * OpenCode 1: non-ignored text parts of user messages and of assistant messages
+ * without an error (OpenCode drops most errored assistant turns).
+ */
+export const openCodeSentText: MarkerSentText = (message) => {
+    const info = message.info as { role?: unknown; error?: unknown };
+    if (info.role !== "user" && (info.role !== "assistant" || info.error)) return [];
+    const texts: string[] = [];
+    for (const part of message.parts) {
+        const p = part as { type?: unknown; text?: unknown; ignored?: unknown };
+        if (p?.type !== "text" || p.ignored || typeof p.text !== "string") continue;
+        texts.push(p.text);
+    }
+    return texts;
+};
+
+/**
+ * Lower bound on the provider tokens of a served request's message rows, at the
+ * model's smallest calibration ratio. Only text the host certainly sends is
+ * counted, as chosen by `sentText` (OpenCode 1's rule by default). Tool calls and
+ * results (outputs may be cleared or truncated), reasoning (providers may strip
+ * earlier thinking) and every wrapper count zero. Leading and trailing whitespace
+ * is not counted, since a provider adapter may trim it. If the local tokenizer is
+ * unavailable the bound is 0.
+ */
+export function lowerBoundMarkerMessages(
+    messages: readonly MessageLike[],
+    model: string,
+    sentText: MarkerSentText = openCodeSentText,
+): number {
     const count = materialCounter("zero");
     let local = 0;
     for (const message of messages) {
-        const info = message.info as { role?: unknown; error?: unknown };
-        if (info.role !== "user" && (info.role !== "assistant" || info.error)) continue;
-        for (const part of message.parts) {
-            const p = part as { type?: unknown; text?: unknown; ignored?: unknown };
-            if (p?.type !== "text" || p.ignored || typeof p.text !== "string") continue;
-            const text = p.text.trim();
+        for (const raw of sentText(message)) {
+            const text = raw.trim();
             if (text) local += count(text);
         }
     }
@@ -287,17 +311,19 @@ export function lowerBoundMarkerMessages(messages: readonly MessageLike[], model
  * Derive an envelope reading from a completed request Magic Context served:
  * envelope_upper = total input − messages_lower(served messages). Returns
  * undefined when the material is invalid or the subtraction leaves nothing.
+ * `sentText` picks the message text the host certainly sends; see MarkerSentText.
  */
 export function deriveMarkerEnvelopeReading(args: {
     material: MarkerEnvelope;
     messages: readonly MessageLike[];
     totalInput: number;
     model: string;
+    sentText?: MarkerSentText;
 }): MarkerEnvelopeReading | undefined {
     const identity = markerEnvelopeIdentity(args.material);
     if (!identity || !Number.isSafeInteger(args.totalInput) || args.totalInput <= 0)
         return undefined;
-    const messagesLower = lowerBoundMarkerMessages(args.messages, args.model);
+    const messagesLower = lowerBoundMarkerMessages(args.messages, args.model, args.sentText);
     const envelopeUpper = args.totalInput - messagesLower;
     if (!Number.isSafeInteger(messagesLower) || envelopeUpper <= 0) return undefined;
     return {

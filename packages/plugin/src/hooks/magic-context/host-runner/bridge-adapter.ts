@@ -16,7 +16,6 @@ import type { PluginContext } from "../../../plugin/types";
 import { sessionLog } from "../../../shared/logger";
 import {
     boundMarkerEnvelope,
-    deriveMarkerEnvelopeReading,
     hasUnobservedTools,
     markerEnvelopeKey,
     qualifyingMarkerEnvelopeUpper,
@@ -30,6 +29,7 @@ import { createBridgeHostFacts } from "./bridge-host-facts";
 import { type BridgeMarkerOutcome, createBridgeReceiptStore } from "./bridge-marker";
 import { openCodeCutProblem, openCodeCutSources } from "./bridge-native-cut";
 import type { BridgeReceipt, BridgeRequestCompletion } from "./bridge-receipt";
+import { providerUsageFromHostFact } from "./bridge-provider-usage";
 import { BridgeStep } from "./bridge-step";
 import {
     type BridgeAdapterOptions,
@@ -163,40 +163,10 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             observations.add(observing);
             try {
                 const result = await pending;
-                if (
-                    result.accepted &&
-                    fact.kind === "provider_response" &&
-                    fact.material &&
-                    fact.usage
-                ) {
-                    const sent = published.get(fact.sessionId);
-                    const model = `${fact.model.providerID}/${fact.model.modelID}`;
-                    const inputTokens =
-                        fact.usage.input + fact.usage.cacheRead + fact.usage.cacheWrite;
-                    if (
-                        sent?.requestId === fact.requestId &&
-                        inputTokens > 0 &&
-                        boundMarkerEnvelope(fact.material, model) !== undefined
-                    ) {
-                        provider.recordProviderUsage(fact.sessionId, {
-                            messages: sent.messages,
-                            model,
-                            envelope: markerEnvelopeKey(fact.material),
-                            inputTokens,
-                            // Only a successful response's usage bounds the envelope: an
-                            // aborted or failed request may report partial input usage.
-                            envelopeReading:
-                                fact.outcome === "success"
-                                    ? deriveMarkerEnvelopeReading({
-                                          material: fact.material,
-                                          messages: sent.messages,
-                                          totalInput: inputTokens,
-                                          model,
-                                      })
-                                    : undefined,
-                        });
-                    }
-                }
+                const usage = result.accepted
+                    ? providerUsageFromHostFact(fact, published.get(fact.sessionId))
+                    : undefined;
+                if (usage) provider.recordProviderUsage(fact.sessionId, usage);
                 return result;
             } finally {
                 activeSessions.delete(fact.sessionId);
