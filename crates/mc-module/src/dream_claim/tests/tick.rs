@@ -506,14 +506,19 @@ async fn a_user_memory_review_runs_through_rust_and_commits_its_verdict_once() {
     let verdict = r#"{"promote":[{"content":"Prefers bounded checks","candidate_ids":[1,2]}],"update_existing":[{"memory_id":1,"content":"Prefers concise reports","candidate_ids":[3]}],"dismiss_existing":[{"memory_id":2,"reason":"unsupported"}],"consume_candidate_ids":[1,2,3]}"#;
     serve_child(&p, Script::Complete(verdict.into())).await;
     let report = join(job).await.unwrap().unwrap().unwrap();
-    assert!(finished(&report, TaskName::ReviewUserMemories), "{report:?}");
+    assert!(
+        finished(&report, TaskName::ReviewUserMemories),
+        "{report:?}"
+    );
     assert_eq!(p.scalar("SELECT COUNT(*) FROM user_memory_candidates"), 0);
     assert_eq!(
         p.scalar("SELECT COUNT(*) FROM user_memories WHERE id=3 AND content='Prefers bounded checks' AND status='active'"),
         1
     );
     assert_eq!(
-        p.scalar("SELECT COUNT(*) FROM user_memories WHERE id=1 AND content='Prefers concise reports'"),
+        p.scalar(
+            "SELECT COUNT(*) FROM user_memories WHERE id=1 AND content='Prefers concise reports'"
+        ),
         1
     );
     assert_eq!(

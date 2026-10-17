@@ -63,7 +63,13 @@ impl SessionReader for ArchiveSessionReader {
                 .is_none_or(|cutoff| watermark_ms >= cutoff);
         self.store
             .with_context_read(|db| {
-                read_sessions(db, project, &self.harness, since, overlap.then_some(watermark_ms))
+                read_sessions(
+                    db,
+                    project,
+                    &self.harness,
+                    since,
+                    overlap.then_some(watermark_ms),
+                )
             })
             .map_err(|e| e.to_string())
     }
@@ -146,13 +152,24 @@ struct Row {
     ts: i64,
 }
 
-fn rows(db: &Connection, sql: &str, session: &str, bound: i64, limit: usize) -> rusqlite::Result<Vec<Row>> {
+fn rows(
+    db: &Connection,
+    sql: &str,
+    session: &str,
+    bound: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<Row>> {
     db.prepare(sql)?
         .query_map(params![session, bound, limit as i64], |r| {
             let raw: String = r.get(0)?;
             let ts: i64 = r.get(1)?;
-            let value: Value = serde_json::from_str(&raw)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+            let value: Value = serde_json::from_str(&raw).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
             Ok(Row {
                 role: value["role"].as_str().unwrap_or("unknown").to_owned(),
                 parts: value["parts"].as_array().cloned().unwrap_or_default(),
@@ -163,7 +180,11 @@ fn rows(db: &Connection, sql: &str, session: &str, bound: i64, limit: usize) -> 
 }
 
 /// The oldest messages after `since`, plus whether more were left unread.
-fn read_since(db: &Connection, session: &str, since: i64) -> rusqlite::Result<(Vec<Message>, bool)> {
+fn read_since(
+    db: &Connection,
+    session: &str,
+    since: i64,
+) -> rusqlite::Result<(Vec<Message>, bool)> {
     let mut read = rows(
         db,
         "SELECT message_json, json_extract(message_json,'$.createdAt') AS ts FROM raw_archive_messages
@@ -276,8 +297,12 @@ fn has_meaningful_user_text(parts: &[&Value]) -> bool {
             return false;
         };
         let removed = reminder_regex().replace_all(text, "");
-        let cleaned = js_trim(&js_trim(&removed).replacen(OMO_INTERNAL_INITIATOR_MARKER, "", 1)).to_owned();
-        !cleaned.is_empty() && !cleaned.trim_start_matches(js_space).starts_with(SYSTEM_DIRECTIVE_PREFIX)
+        let cleaned =
+            js_trim(&js_trim(&removed).replacen(OMO_INTERNAL_INITIATOR_MARKER, "", 1)).to_owned();
+        !cleaned.is_empty()
+            && !cleaned
+                .trim_start_matches(js_space)
+                .starts_with(SYSTEM_DIRECTIVE_PREFIX)
     })
 }
 

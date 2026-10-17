@@ -437,17 +437,17 @@ async fn primer_promotion_and_refresh_run_through_rust_when_wired() {
     }
     let report = join(job).await.unwrap().unwrap().unwrap();
     assert!(
-        report
-            .iter()
-            .any(|(t, o)| *t == TaskName::RefreshPrimers
-                && *o == DispatchOutcome::Finished(RunStatus::Completed)),
+        report.iter().any(|(t, o)| *t == TaskName::RefreshPrimers
+            && *o == DispatchOutcome::Finished(RunStatus::Completed)),
         "{report:?}"
     );
     // The investigator's read tools run inside the host, so Rust sees no
     // investigation tool call and, like the TypeScript grounding gate for a
     // transcript without tool calls, keeps the current answer.
     assert_eq!(
-        p.scalar("SELECT COUNT(*) FROM primers WHERE answer<>'' OR answer_refreshed_at IS NOT NULL"),
+        p.scalar(
+            "SELECT COUNT(*) FROM primers WHERE answer<>'' OR answer_refreshed_at IS NOT NULL"
+        ),
         0
     );
     assert_eq!(p.pending(), 0);

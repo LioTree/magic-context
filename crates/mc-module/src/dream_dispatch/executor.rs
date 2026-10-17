@@ -23,9 +23,7 @@ use super::verify_host::VerifyHost;
 use crate::dream_runner::{
     resolve_task_models, CarrierError, ChildRequest, Completion, DreamCarrier,
 };
-use crate::dream_tasks::{
-    classify::SensitiveContext, classify::TaskError, curate::CurateCarrier,
-};
+use crate::dream_tasks::{classify::SensitiveContext, classify::TaskError, curate::CurateCarrier};
 use mc_store::dream_scheduler::schedules::{RunOutcome, RunStatus, ScheduleState, TaskName};
 use mc_store::dream_scheduler::SqliteDreamScheduler;
 use mc_store::parity_schema_manifest::StoreScope;

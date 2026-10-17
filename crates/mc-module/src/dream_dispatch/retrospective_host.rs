@@ -1163,7 +1163,11 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            assert_eq!(f.time.0.load(Ordering::SeqCst), 1000, "the golden writes at 1000 ms");
+            assert_eq!(
+                f.time.0.load(Ordering::SeqCst),
+                1000,
+                "the golden writes at 1000 ms"
+            );
             let mut carrier = f.carrier();
             carrier.answers = case["answer"]
                 .as_str()
