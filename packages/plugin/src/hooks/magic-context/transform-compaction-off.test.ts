@@ -56,7 +56,6 @@ import type { PluginContext } from "../../plugin/types";
 import { clearModelsDevCache } from "../../shared/models-dev-cache";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { __ignoredNotificationTest } from "./send-session-notification";
 import { createTransform } from "./transform";
 
@@ -151,8 +150,6 @@ function makeOffTransform(args: {
     isSubagent?: boolean;
     maybeAutoEmbedSession?: (sessionId: string) => void;
     commitSeenLastPass?: Map<string, boolean>;
-    transformMode?: "ts" | "rust";
-    rustModuleCall?: (request: Record<string, unknown>) => Promise<unknown>;
 }) {
     const scheduler: Scheduler = {
         shouldExecute: mock(() => (args.schedulerDecision ?? "defer") as "execute" | "defer"),
@@ -188,10 +185,6 @@ function makeOffTransform(args: {
         client: args.client,
         maybeAutoEmbedSession: args.maybeAutoEmbedSession,
         commitSeenLastPass: args.commitSeenLastPass,
-        transformMode: args.transformMode,
-        rustModeModuleClient: args.rustModuleCall
-            ? ({ call: args.rustModuleCall } as never)
-            : undefined,
     });
     return { db, transform };
 }
@@ -268,151 +261,24 @@ function guardDeepMutations<T extends object>(
 }
 
 describe("compaction-off transform — additive-only proof (issue #266 S3)", () => {
-    it("reconciles a Rust session flip before additive-only module dispatch", async () => {
-        useTempDataHome("co-rust-transition-");
-        const sessionId = "ses-rust-off";
+    it("fires the commit-detection note trigger on the first pass that sees a new commit", async () => {
+        useTempDataHome("commit-nudge-");
+        const sessionId = "ses-commit-nudge";
         createOpenCodeDbForSession(sessionId);
-        const opencodePath = join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db");
-        const opencode = new Database(opencodePath);
-        opencode
-            .prepare(
-                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
-            )
-            .run(
-                "msg-mc-summary",
-                sessionId,
-                2,
-                2,
-                JSON.stringify({
-                    id: "msg-mc-summary",
-                    role: "assistant",
-                    sessionID: sessionId,
-                    parentID: "m-user-1",
-                    summary: true,
-                    finish: "stop",
-                    providerID: "magic-context",
-                    modelID: "magic-context",
-                }),
-            );
-        opencode
-            .prepare(
-                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .run(
-                "prt-mc-compaction",
-                "m-user-1",
-                sessionId,
-                2,
-                2,
-                JSON.stringify({ type: "compaction", auto: true }),
-            );
-        opencode
-            .prepare(
-                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .run(
-                "prt-mc-summary-text",
-                "msg-mc-summary",
-                sessionId,
-                3,
-                3,
-                JSON.stringify({ type: "text", text: MARKER_SUMMARY_TEXT }),
-            );
-        opencode.close();
-
-        const db = openDatabase();
-        getOrCreateSessionMeta(db, sessionId);
-        setCompactionModeRecord(db, sessionId, "on");
-        queuePendingOp(db, sessionId, 1, "drop");
-        const moduleCall = mock(async (request: Record<string, unknown>) => {
-            if (request.method !== "transform") return { ok: true };
-            return {
-                action: "SOFT+",
-                native_messages: [
-                    {
-                        info: { role: "user", sessionID: sessionId, syntheticHead: true },
-                        parts: [{ type: "text", text: "additive m0", synthetic: true }],
-                    },
-                    {
-                        info: { role: "user", sessionID: sessionId, syntheticHead: true },
-                        parts: [{ type: "text", text: "additive m1", synthetic: true }],
-                    },
-                    ...makeMessages(sessionId),
-                ],
-            };
-        });
-        const autoEmbed = mock((_sessionId: string) => {});
-        const { transform } = makeOffTransform({
-            sessionId,
-            transformMode: "rust",
-            rustModuleCall: moduleCall,
-            maybeAutoEmbedSession: autoEmbed,
-        });
-        const first = makeMessages(sessionId);
-        const raw = JSON.parse(JSON.stringify(first)) as TestMessage[];
-
-        await transform({}, { messages: first });
-
-        expect(first).toHaveLength(raw.length + 2);
-        expect(textOf(first[0]!, 0)).toBe("additive m0");
-        expect(
-            moduleCall.mock.calls.some(
-                (call) => (call[0] as Record<string, unknown>).method === "transform",
-            ),
-        ).toBe(true);
-        expect(getPendingOps(db, sessionId)).toHaveLength(0);
-        expect(getCompactionModeRecord(db, sessionId)).toBe("off");
-        expect(autoEmbed).toHaveBeenCalledWith(sessionId);
-        const cleaned = new Database(opencodePath, { readonly: true });
-        expect(
-            cleaned.prepare("SELECT id FROM part WHERE id = ?").get("prt-mc-compaction"),
-        ).toBeNull();
-        expect(
-            cleaned.prepare("SELECT id FROM message WHERE id = ?").get("msg-mc-summary"),
-        ).toBeNull();
-        cleaned.close();
-
-        const firstBytes = JSON.stringify(first);
-        const stable = makeMessages(sessionId);
-        await transform({}, { messages: stable });
-        expect(JSON.stringify(stable)).toBe(firstBytes);
-        expect(
-            moduleCall.mock.calls.filter(
-                (call) => (call[0] as Record<string, unknown>).method === "transform",
-            ),
-        ).toHaveLength(2);
-    });
-
-    it("fires the shared commit-detection note trigger before Rust authority dispatch", async () => {
-        useTempDataHome("rust-commit-nudge-");
-        const sessionId = "ses-rust-commit-nudge";
-        createOpenCodeDbForSession(sessionId);
-        const nativeByPass: TestMessage[][] = [];
-        const moduleCall = mock(async (request: Record<string, unknown>) => {
-            if (request.method !== "transform") return { ok: true };
-            return {
-                action: "SOFT+",
-                native_messages: nativeByPass.shift() ?? [],
-            };
-        });
         const commitSeenLastPass = new Map<string, boolean>();
         const { db, transform } = makeOffTransform({
             sessionId,
             compactionOff: false,
-            transformMode: "rust",
-            rustModuleCall: moduleCall,
             commitSeenLastPass,
         });
 
         const baseline = makeMessages(sessionId);
-        nativeByPass.push(baseline);
         await transform({}, { messages: baseline });
         expect(getPersistedNoteNudge(db, sessionId).triggerPending).toBe(false);
 
         const committed = makeMessages(sessionId);
         const assistantText = committed[1]?.parts[0];
         if (assistantText?.type === "text") assistantText.text = "Committed abcdef1";
-        nativeByPass.push(committed);
         await transform({}, { messages: committed });
 
         expect(commitSeenLastPass.get(sessionId)).toBe(true);

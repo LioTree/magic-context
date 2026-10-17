@@ -643,7 +643,6 @@ describe("a pass that falls back to the launch directory", () => {
             expect(existsSync(lkgRecoveryFencePath(sessionId))).toBe(false);
         } finally {
             restore();
-            transform.disposeRust();
         }
     });
 

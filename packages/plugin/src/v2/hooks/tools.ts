@@ -7,7 +7,6 @@ import { getObservedEpochFloor } from "../../features/magic-context/storage-meta
 import { agentSaveClassificationAnchor } from "../../hooks/magic-context/agent-save-classification";
 import { setCtxReduceRegisteredGlobally } from "../../hooks/magic-context/ctx-reduce-availability";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
-import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import { subagentToolRefusal } from "../../plugin/subagent-tool-policy";
 import { type Database, withAsyncPrivilegedWriter } from "../../shared/sqlite";
 import { createCtxExpandTools } from "../../tools/ctx-expand";
@@ -20,17 +19,11 @@ import type { V2Context } from "./types";
 /**
  * OpenCode 2 requires explicit tool-editor registration; it does not load the v1
  * tool map.
- *
- * `rustToolBackends` is what routes a tool call through the module instead of
- * writing only the host read model. Registering these tools without it in Rust
- * mode would let an agent's note or memory land in `context.db` alone, where the
- * module — the authority for both — would never see it.
  */
 export async function registerTools(
     context: V2Context,
     db: Database,
     config: MagicContextPluginConfig,
-    rustToolBackends?: RustToolBackends,
     isInternalChild?: (sessionId: string) => boolean,
 ) {
     const compaction = isCompactionEnabled(config);
@@ -52,7 +45,6 @@ export async function registerTools(
                           sessionID,
                           getObservedEpochFloor(db, sessionID),
                       ),
-                  ...(rustToolBackends ? { rustToolBackends } : {}),
               })
             : {}),
         ...createCtxExpandTools({ db, expandTools: config.historian?.expand_tools }),
@@ -60,22 +52,16 @@ export async function registerTools(
             ...project,
             dreamerEnabled: isDreamerRunnable(config),
             smartNotesEnabled: config.smart_notes.enabled,
-            ...(rustToolBackends ? { rustToolBackends } : {}),
         }),
         ...createCtxSearchTools({ ...project, rerankConnectionFile: config.subc?.connection_file }),
         ...(config.memory.enabled
             ? {
                   ...createCtxMemoryTools({
                       ...project,
-                      memoryAuthority: config.transform_mode === "rust" ? "module" : "ts",
-                      ...(rustToolBackends ? { rustToolBackends } : {}),
                       agentSaveClassificationAnchor: (location) =>
                           agentSaveClassificationAnchor(location),
                   }),
-                  ...createCtxMemoryListTools({
-                      ...project,
-                      ...(rustToolBackends ? { rustToolBackends } : {}),
-                  }),
+                  ...createCtxMemoryListTools(project),
               }
             : {}),
     };
@@ -88,8 +74,8 @@ export async function registerTools(
                 input: tool.schema.toJSONSchema(tool.schema.object(definition.args)),
                 options: { codemode: false },
                 async execute(input, call) {
-                    // A stale or invented call must not bypass request-local hiding,
-                    // reach a module backend, or acquire a write transaction.
+                    // A stale or invented call must not bypass request-local hiding
+                    // or acquire a write transaction.
                     const refusal = subagentToolRefusal(db, name, call.sessionID, isInternalChild);
                     if (refusal) return { content: refusal };
                     // Admit write tools asynchronously before their synchronous storage helpers run.

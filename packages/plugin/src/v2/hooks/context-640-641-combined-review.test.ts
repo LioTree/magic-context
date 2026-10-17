@@ -56,11 +56,7 @@ test("combined review: v2 exhausted admission still fits replay against current 
                 providerKey: "openai",
             });
         },
-        {
-            isProviderSession: () => false,
-            getRustReplayParticipant: () => null,
-            disposeRust: () => {},
-        },
+        { clearSessionLogState: () => {} },
     );
     const transform = spyOn(transformModule, "createTransform").mockReturnValue(
         fakeTransform as ReturnType<typeof transformModule.createTransform>,

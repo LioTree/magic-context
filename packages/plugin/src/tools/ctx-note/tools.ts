@@ -29,7 +29,6 @@ import {
     projectNeedsSingleStoreMigration,
     renderSingleStoreMigrationRequiredRefusal,
 } from "../../hooks/magic-context/single-store-refusal";
-import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import {
@@ -60,7 +59,6 @@ export interface CtxNoteToolDeps {
      * explanatory error.
      */
     resolveProjectPath?: (directory: string) => string | undefined;
-    rustToolBackends?: RustToolBackends;
 }
 
 /** Capture the live-tail message ordinal so a note can be traced back to the

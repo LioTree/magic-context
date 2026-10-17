@@ -294,7 +294,7 @@ for (const method of ["memory.edit", "memory.restore"] as const)
                           operationId: "undo",
                           expectedRevisions: [{ memoryId: f.row.id, revision: 2 }],
                       };
-            const receipt = await memoryHistoryRpc({ db: f.db, directory: f.dir }, method, {
+            const receipt = await memoryHistoryRpc({ db: f.db }, method, {
                 ...request,
             });
             expect(receipt.state).toBe("applied");

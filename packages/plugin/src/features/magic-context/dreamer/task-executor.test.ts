@@ -1,15 +1,11 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { createDreamTimerModuleClient } from "../../../plugin/dream-timer-module-client";
 import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { userFacingFailureCode } from "../../../shared/user-facing-codes";
-import {
-    ensureContextStoreUuid,
-    installAuthorityManagedMarker,
-} from "../legacy-authority-fixture.test-support";
+import { installAuthorityManagedMarker } from "../legacy-authority-fixture.test-support";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -1959,7 +1955,6 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             client: client as never,
             sessionDirectory: process.cwd(),
             openOpenCodeDb: () => null,
-            transformMode: "ts",
         });
         const leaseKey = leaseKeyFor("classify-memories", project);
         expect(acquireLease(db, "ts-holder", leaseKey)).toBe(true);
@@ -2122,76 +2117,6 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             lastStatus: "failed",
             retryCount: 1,
         });
-    });
-    test("module failures are transient and never fall back to a TypeScript child", async () => {
-        db = freshDb();
-        const project = "/repo/rust-classify-failure";
-        ensureContextStoreUuid(db);
-        for (let i = 0; i < 12; i += 1) {
-            const memory = insertMemory(db, {
-                projectPath: project,
-                category: "ARCHITECTURE",
-                content: `Module classification failure fixture ${i}.`,
-            });
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
-            ).run(project, 11000 + i, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
-            ).run(project, 11000 + i, memory.category, memory.normalizedHash);
-        }
-
-        const client = {
-            session: {
-                list: mock(async () => ({
-                    data: [{ id: "ses-parent", title: "ordinary session" }],
-                })),
-                create: mock(async () => ({ data: { id: "must-not-create" } })),
-                delete: mock(async () => ({})),
-            },
-        };
-        const moduleCalls: string[] = [];
-        class FailingTimerModuleClient {
-            private readonly instanceState = "timer-transport";
-
-            async authorityStatus() {
-                if (this.instanceState !== "timer-transport")
-                    throw new Error("lost transport this");
-                return { authority: { state: "MODULE", generation: 9 } };
-            }
-
-            async call(args: { method: string }) {
-                if (this.instanceState !== "timer-transport")
-                    throw new Error("lost transport this");
-                moduleCalls.push(args.method);
-                throw new Error("module transport unavailable");
-            }
-        }
-        const moduleClient = createDreamTimerModuleClient(new FailingTimerModuleClient() as never);
-        const executor = createDreamTaskExecutor({
-            client: client as never,
-            sessionDirectory: project,
-            openOpenCodeDb: () => null,
-            moduleClient: moduleClient as never,
-        });
-        const leaseKey = leaseKeyFor("classify-memories", project);
-        expect(acquireLease(db, "holder-rust-classify-failure", leaseKey)).toBe(true);
-
-        const result = await executor(
-            { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
-            {
-                db,
-                projectIdentity: project,
-                holderId: "holder-rust-classify-failure",
-                leaseKey,
-            },
-        );
-
-        expect(result.status).toBe("failed");
-        expect(result.transient).toBe(true);
-        expect(result.error).toContain("Rust classify module failed");
-        expect(client.session.create).not.toHaveBeenCalled();
-        expect(moduleCalls).toEqual(["dreamer.run_task"]);
     });
 });
 

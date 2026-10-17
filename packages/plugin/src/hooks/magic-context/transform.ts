@@ -50,10 +50,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { isTagOwnerSummaryReady } from "../../features/magic-context/storage-tags";
 import type { CoordinateGeneration } from "../../features/magic-context/store-generation-rebase";
-import {
-    readCoordinateGeneration,
-    rebaseSessionCoordinatesAsync,
-} from "../../features/magic-context/store-generation-rebase";
+import { rebaseSessionCoordinatesAsync } from "../../features/magic-context/store-generation-rebase";
 import type { Tagger } from "../../features/magic-context/tagger";
 import { observeTemporalDecisions } from "../../features/magic-context/temporal-decisions";
 import {
@@ -117,7 +114,6 @@ import {
 } from "./final-wire-token-estimate";
 import { isHistorianDrainBudgetSpent } from "./historian-drain-gate";
 import type { LiveModelBySession } from "./hook-handlers";
-import { createOpenCodeProviderTransform } from "./host-runner/opencode-adapter";
 import {
     capturePrefixTrimSourceOrder,
     findHostCompactionWindow,
@@ -180,7 +176,7 @@ import {
     projectOpencodeReasoningBudgetCutoff,
     resolveKeepReasoningTokens,
 } from "./reasoning-budget";
-import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
+import type { RustModeModuleClient } from "./rust-mode-transform";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
 import {
@@ -204,7 +200,6 @@ import {
 import { findLastUserMessageId, findSessionId } from "./transform-message-helpers";
 import {
     applyFlushedStatuses,
-    hasRecentAssistantCommit,
     type MessageLike,
     stripStructuralNoise,
     type TagTarget,
@@ -213,7 +208,6 @@ import {
 import {
     abortSessionFailClosed,
     type CompactionMarkerStrategy,
-    clearRustModeBoundaryRecord,
     defaultCompactionMarkerStrategy,
     evaluateEmergencyFailClosed,
     runPostTransformPhase,
@@ -570,8 +564,9 @@ export interface TransformDeps {
     /** False when historian.disable=true, blocking historian-backed child agents. */
     historianRunnable?: boolean;
     /**
-     * Which side runs the historian completion in Rust transform mode
-     * (`historian.runner`). Absent means the harness default, which for OpenCode 1
+     * Which side runs the historian completion for a session the ck-mc module
+     * serves (`historian.runner`). Read by the bridge adapters, not by
+     * createTransform. Absent means the harness default, which for OpenCode 1
      * and OpenCode 2 is the host: the module queues the completion and this
      * process's pull loop runs it. Only "broca" leaves the pull loop unbuilt.
      */
@@ -667,22 +662,24 @@ export interface TransformDeps {
     /** Fire-and-forget active-session embed backfill after transform returns. */
     maybeAutoEmbedSession?: (sessionId: string) => void;
     /**
-     * Called once per pass, before either renderer runs, with the session and the
+     * Called once per pass, before the transform runs, with the session and the
      * host's input messages: the request these messages belong to is being built.
      */
     onMessagesPassStarted?: (sessionId: string, messages: readonly MessageLike[]) => void;
     /** Report postprocessing's actual cache-bust permission; changed bytes alone do not authorize a bust. */
     onPostprocess?: (result: { bustedThisPass: boolean }) => void;
-    /** Resolved project mode. Rust mode bypasses every TS mutation below. */
+    /**
+     * Set only by the bridge adapters' own deps. createTransform ignores it and
+     * always runs the TypeScript transform.
+     */
     transformMode?: "ts" | "rust";
-    /** Prompt-surface routing and USER description overrides forwarded to Rust mode. */
+    /** Prompt-surface routing and USER description overrides, read by the bridge adapters. */
     promptSurface?: PromptSurfaceConfig;
     /** Resolves trusted USER guidance files before crossing the module boundary. */
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     /** Module transport injected by the hook; tests use a deterministic mock. */
     rustModeModuleClient?: RustModeModuleClient;
     rustModeProjectRoot?: string;
-    onRustModeParked?: (sessionId: string, message: string) => void;
     onRustEngineReconnectRefusal?: (args: {
         sessionId: string;
         projectRoot: string;
@@ -746,35 +743,6 @@ export function createTransform(deps: TransformDeps) {
     // window, because the usage reading such a pass sees is not this request's:
     // it is missing, or on an OpenCode 2 fork it is the parent's last reply.
     const unmanagedOverWindowSessions = new Set<string>();
-    const rustModeTransform =
-        deps.transformMode === "rust" && deps.rustModeModuleClient
-            ? createRustModeTransform(deps, {
-                  moduleClient: deps.rustModeModuleClient,
-                  hostClient: deps.client,
-                  projectRoot: deps.rustModeProjectRoot,
-                  notifyParked: deps.onRustModeParked,
-                  onEngineReconnectRefusal: deps.onRustEngineReconnectRefusal,
-                  memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
-              })
-            : undefined;
-    let providerTransform =
-        rustModeTransform && !deps.compactionOff && deps.rustPipeline === "provider"
-            ? createOpenCodeProviderTransform(deps, rustModeTransform)
-            : undefined;
-    const providerForSession = (id: string) => {
-        if (!rustModeTransform || deps.compactionOff) return undefined;
-        if (
-            !providerTransform &&
-            deps.db
-                .prepare("SELECT 1 FROM host_runner_state WHERE session_id=? AND harness=?")
-                .get(id, deps.storeGeneration === "v2" ? "opencode2" : "opencode")
-        ) {
-            providerTransform = createOpenCodeProviderTransform(deps, rustModeTransform);
-        }
-        return deps.rustPipeline === "provider" || providerTransform?.hasRecord(id)
-            ? providerTransform
-            : undefined;
-    };
     let entryReuse: { reused: number; retained: number; retainedBytes: number } | undefined;
     const projectEntry = createLkgEntryProjector({
         onReuse: (stats) => {
@@ -834,30 +802,6 @@ export function createTransform(deps: TransformDeps) {
                 systemDateRequestIdentity(output),
             );
         bindSystemDateRequest(output, dateRequest);
-        if (
-            providerTransform &&
-            deps.rustPipeline === "provider" &&
-            !deps.internalChildSessions?.has(sessionId)
-        ) {
-            const meta = getOrCreateSessionMeta(deps.db, sessionId);
-            const ttlModel =
-                findNewestUserModel(messages) ??
-                deps.liveModelBySession?.get(sessionId) ??
-                findLastAssistantModel(messages);
-            const ttlConfig = deps.sampleCacheTtlConfig?.();
-            meta.cacheTtl = resolveSessionCacheTtl(
-                deps.db,
-                sessionId,
-                ttlConfig?.cache_ttl ?? deps.cacheTtlConfig,
-                ttlModel ? `${ttlModel.providerID}/${ttlModel.modelID}` : undefined,
-                ttlConfig?.cacheTtlConfigured ?? deps.cacheTtlConfigured,
-            ).value;
-            // Provider records own admission, replay and the id-only prefix scan.
-            // Legacy temporal, marker and commit walks must not read their prefix.
-            await providerTransform.run(sessionId, messages, output, meta);
-            withoutSqliteTransformPass(() => deps.maybeAutoEmbedSession?.(sessionId));
-            return;
-        }
         const temporalCandidates = deps.experimentalTemporalAwareness
             ? collectTemporalCandidates(messages)
             : undefined;
@@ -866,20 +810,17 @@ export function createTransform(deps: TransformDeps) {
             : undefined;
         logTransformTiming(sessionId, "findSessionId", tSessionId, `messages=${messages.length}`);
         const tLkgEntry = performance.now();
-        // The Rust adapter captures its own last-known-good input snapshot and returns
-        // before the TypeScript capture, so it does not need this entry projection.
-        const lkgInput = deps.transformMode === "rust" ? [] : projectEntry(sessionId, messages);
-        const recovery =
-            deps.compactionOff || deps.transformMode === "rust"
-                ? {}
-                : readLkgRecoveryPrefix(sessionId, lkgInput, messages, deps.db);
+        const lkgInput = projectEntry(sessionId, messages);
+        const recovery = deps.compactionOff
+            ? {}
+            : readLkgRecoveryPrefix(sessionId, lkgInput, messages, deps.db);
         logTransformTiming(
             sessionId,
             "lkg.entryProjection",
             tLkgEntry,
-            deps.transformMode === "rust" || !entryReuse
-                ? undefined
-                : `reused=${entryReuse.reused} retained=${entryReuse.retained} retainedBytes=${entryReuse.retainedBytes}`,
+            entryReuse
+                ? `reused=${entryReuse.reused} retained=${entryReuse.retained} retainedBytes=${entryReuse.retainedBytes}`
+                : undefined,
         );
         const resolvedSessionId = sessionId;
         const runNotificationParams = (sid: string) => {
@@ -888,7 +829,7 @@ export function createTransform(deps: TransformDeps) {
                 ? params
                 : { ...params, toastDurationMs: historianRun.toastDurationMs };
         };
-        if (!providerTransform?.isProviderSession(sessionId)) beginLkgPass(sessionId);
+        beginLkgPass(sessionId);
         clearOpenCodePendingTransformDecision(sessionId);
 
         const db = deps.db;
@@ -933,24 +874,6 @@ export function createTransform(deps: TransformDeps) {
         // success, so the next pass retries.
         if (deps.storeGeneration !== undefined) {
             try {
-                // The module keeps its own copy of this conversation, keyed on the
-                // numbering the previous host served. Nothing re-derives that copy,
-                // so it is deleted before the host rows are renumbered and re-seeded
-                // cold from the rebased rows on this same pass. Doing it first is
-                // what makes a failure recoverable: the generation stamp is written
-                // by the rebase below, so throwing here leaves the session on its old
-                // generation and the next pass tries the whole sequence again.
-                if (
-                    rustModeTransform &&
-                    readCoordinateGeneration(db, sessionId) !== deps.storeGeneration
-                ) {
-                    clearRustModeBoundaryRecord(db, sessionId);
-                    await rustModeTransform.clearSession(sessionId);
-                    sessionLog(
-                        sessionId,
-                        `rust module session deleted before the store projection rebase to ${deps.storeGeneration}; the next serve seeds cold`,
-                    );
-                }
                 await rebaseSessionCoordinatesAsync({
                     db,
                     sessionId,
@@ -1038,9 +961,8 @@ export function createTransform(deps: TransformDeps) {
             return;
         }
 
-        // Compaction mode is session hygiene shared by both renderer authorities.
-        // Resolve it before either mode can return so stale markers and latches are
-        // reconciled even when Rust owns normal transform rendering.
+        // Compaction mode is session hygiene: resolve it first so stale markers and
+        // latches are reconciled on every pass.
         const compactionOff = deps.compactionOff === true;
 
         // Mode-transition reconciliation runs on every pass and is a no-op
@@ -1121,8 +1043,8 @@ export function createTransform(deps: TransformDeps) {
             failPass("compaction-mode-transition-failure", error);
         }
 
-        // Read the agent and session permissions for ctx_reduce before either
-        // renderer freezes the ctx_reduce verdict below. OpenCode keeps those
+        // Read the agent and session permissions for ctx_reduce before the
+        // transform freezes the ctx_reduce verdict below. OpenCode keeps those
         // permissions off the first user message's tools map, so without this
         // read a session whose agent denies ctx_reduce would still get §N§ tags,
         // reduce guidance, and nudges. This is a no-op once the verdict froze,
@@ -1133,37 +1055,6 @@ export function createTransform(deps: TransformDeps) {
                 sessionId,
                 spawnAgentFromMessages(messages),
             );
-        }
-
-        // Rust mode is an authority adapter, not a second implementation of the
-        // TypeScript renderer. Compaction-off still dispatches so the module can
-        // provide the shared additive-only memory/docs contract.
-        if (deps.transformMode === "rust" && (!compactionOff || deps.rustPipeline !== "provider")) {
-            if (!rustModeTransform) {
-                // Production wiring always builds a module client in Rust mode,
-                // so this is a wiring fault. Returning would serve the raw input.
-                sessionLog(sessionId, "rust transform unavailable; not serving raw messages");
-                failPass(
-                    "rust-transform-unavailable",
-                    new Error("Rust mode is configured without a module client"),
-                );
-                return;
-            }
-            if (!compactionOff) {
-                observeCommitNudgeTransition(
-                    sessionId,
-                    hasRecentAssistantCommit(messages),
-                    sessionMeta.isSubagent,
-                );
-            }
-            const sessionProvider = providerForSession(sessionId);
-            if (sessionProvider)
-                await sessionProvider.run(sessionId, messages, output, sessionMeta);
-            else await rustModeTransform.run(sessionId, messages, output, sessionMeta);
-            // Rust returns before the TypeScript post-pass hook below. Run the
-            // host-owned embedding trigger after either implementation publishes.
-            withoutSqliteTransformPass(() => deps.maybeAutoEmbedSession?.(sessionId));
-            return;
         }
 
         // System prompt change detection is handled in experimental.chat.system.transform
@@ -3776,39 +3667,7 @@ export function createTransform(deps: TransformDeps) {
         passReturned = true;
     };
 
-    return Object.assign(transform, {
-        isProviderSession: (id: string) => providerForSession(id)?.isProviderSession(id) ?? false,
-        recoverProviderOutput: (id: string, output: { messages: unknown[] }) =>
-            providerTransform?.recoverOutput(id, output) ?? false,
-        providerOrdinals: (id: string) => providerForSession(id)?.ordinals(id),
-        clearSessionLogState,
-        invalidateRustWireState(sessionId: string): void {
-            rustModeTransform?.invalidateWireState(sessionId);
-        },
-        async clearRustSession(sessionId: string): Promise<void> {
-            clearSessionLogState(sessionId);
-            await rustModeTransform?.clearSession(sessionId);
-        },
-        /** The host disposed this instance; release the Rust adapter's process-wide registrations. */
-        disposeRust(): void {
-            providerTransform?.dispose();
-            rustModeTransform?.dispose();
-        },
-        /** This instance's Rust adapter, for its own messages-transform wrapper; null in TypeScript mode. */
-        getRustReplayParticipant() {
-            return rustModeTransform?.replayParticipant ?? null;
-        },
-        getRustWireCacheHeapStats() {
-            return (
-                rustModeTransform?.getHeapStats() ?? {
-                    snapshots: 0,
-                    rawContentSnapshots: 0,
-                    estimatedBytes: 0,
-                    sessions: [],
-                }
-            );
-        },
-    });
+    return Object.assign(transform, { clearSessionLogState });
 }
 
 export function resolveHistoryBudgetTokens(

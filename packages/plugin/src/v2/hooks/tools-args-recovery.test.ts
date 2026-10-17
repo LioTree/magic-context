@@ -58,7 +58,7 @@ async function registeredSearch(): Promise<RegisteredTool> {
             },
         },
     } as unknown as V2Context;
-    await registerTools(context, db, parsePluginConfig({ memory: { enabled: true } }), undefined);
+    await registerTools(context, db, parsePluginConfig({ memory: { enabled: true } }));
     const search = registered.find((tool) => tool.name === "ctx_search");
     if (!search) throw new Error("ctx_search was not registered");
     return search;

@@ -1,9 +1,9 @@
 # Compartment rescoring
 
 `/ctx-rescore` repairs the importance of stored, tiered history without rebuilding
-its summaries or invalidating the provider's frozen prefix. The host runs a shared
-TypeScript job service in both TypeScript and Rust transform modes. OpenCode 1,
-OpenCode 2 and Pi/OMP use the same argument parser and durable job tables.
+its summaries or invalidating the provider's frozen prefix. The host runs it as a
+shared TypeScript job service. OpenCode 1, OpenCode 2 and Pi/OMP use the same
+argument parser and durable job tables.
 
 ## Commands
 

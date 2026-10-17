@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import type { ProtectionWindowResult } from "../../features/magic-context/protection-window";
 import { parseRangeString } from "../../features/magic-context/range-parser";
@@ -10,11 +9,8 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { getInertWhitespaceAssistantTagsByNumbers } from "../../features/magic-context/storage-tags";
-import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import { getErrorMessage } from "../../shared/error-message";
-import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { renderCapabilityRefusal } from "../../shared/user-facing-codes";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_REDUCE_DESCRIPTION, formatCtxReduceReply } from "./constants";
 import type { CtxReduceArgs } from "./types";
@@ -33,7 +29,6 @@ export interface CtxReduceToolDeps {
     getProtectionWindow?: (sessionId: string) => ProtectionWindowResult;
     floor?: number;
     getSessionTokens?: (sessionId: string) => number;
-    rustToolBackends?: RustToolBackends;
 }
 
 const ctxReduceArgsShape = {
@@ -48,28 +43,6 @@ const ctxReduceArgsShape = {
 const ctxReduceArgsSchema = tool.schema.object(ctxReduceArgsShape).passthrough();
 
 function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
-    let fallbackCommandSequence = 0;
-
-    const commandIdForInvocation = (sessionId: string, toolContext: unknown): string => {
-        const context =
-            toolContext !== null && typeof toolContext === "object"
-                ? (toolContext as Record<string, unknown>)
-                : {};
-        const callId =
-            (typeof context.callID === "string" && context.callID.trim()) ||
-            (typeof context.callId === "string" && context.callId.trim());
-        if (callId) {
-            const stableId = `oc-${sessionId}-${callId}`;
-            if (Buffer.byteLength(stableId) <= 128) return stableId;
-            return `oc-${createHash("sha256").update(stableId).digest("hex")}`;
-        }
-        fallbackCommandSequence += 1;
-        const monotonicId = `oc-${sessionId}-${fallbackCommandSequence}`;
-        return Buffer.byteLength(monotonicId) <= 128
-            ? monotonicId
-            : `oc-${createHash("sha256").update(monotonicId).digest("hex")}`;
-    };
-
     return tool({
         description: CTX_REDUCE_DESCRIPTION,
         args: ctxReduceArgsShape,
@@ -81,89 +54,6 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
 
             if (!args.drop) {
                 return "Error: 'drop' must be provided.";
-            }
-
-            const rustReduce = deps.rustToolBackends?.reduce;
-            if (rustReduce) {
-                try {
-                    const response = await rustReduce({
-                        sessionId,
-                        projectRoot: toolContext.directory,
-                        drop: args.drop,
-                        commandId: commandIdForInvocation(sessionId, toolContext),
-                    });
-                    const value =
-                        response !== null && typeof response === "object" && "result" in response
-                            ? (response as { result?: unknown }).result
-                            : response;
-                    const record =
-                        value !== null && typeof value === "object"
-                            ? (value as Record<string, unknown>)
-                            : null;
-                    if (record === null || record.ok !== true) {
-                        const error =
-                            record && "error" in record
-                                ? (record as { error?: unknown }).error
-                                : undefined;
-                        const errorRecord =
-                            error !== null && typeof error === "object"
-                                ? (error as { message?: unknown })
-                                : undefined;
-                        const message =
-                            (typeof error === "string" && error.trim() ? error : undefined) ??
-                            (typeof errorRecord?.message === "string" && errorRecord.message.trim()
-                                ? errorRecord.message
-                                : undefined) ??
-                            (typeof record?.message === "string" && record.message.trim()
-                                ? record.message
-                                : "module rejected agent_drops.append");
-                        sessionLog(sessionId, "ctx_reduce capability refusal", message);
-                        return renderCapabilityRefusal("context_cleanup");
-                    }
-                    const queued = typeof record.queued === "number" ? record.queued : 0;
-                    const refusedStamps = Array.isArray(record.ctx_reduce_self_stamps)
-                        ? record.ctx_reduce_self_stamps.filter(
-                              (tagNumber): tagNumber is number =>
-                                  typeof tagNumber === "number" && Number.isInteger(tagNumber),
-                          )
-                        : [];
-                    const refusedStampCount = new Set(refusedStamps).size;
-                    const acceptedTagNumbers = Array.isArray(record.ctx_reduce_queued_tags)
-                        ? record.ctx_reduce_queued_tags.filter(
-                              (tagNumber): tagNumber is number =>
-                                  typeof tagNumber === "number" && Number.isInteger(tagNumber),
-                          )
-                        : null;
-                    if (queued <= 0) {
-                        const alreadyStampedCount = acceptedTagNumbers
-                            ? new Set(acceptedTagNumbers).size
-                            : 0;
-                        const reply = formatCtxReduceReply(alreadyStampedCount, refusedStampCount);
-                        if (reply) return reply;
-                        return "All requested tags were already queued or processed. No new action is needed.";
-                    }
-                    const reportedTagNumbers = [
-                        ...(Array.isArray(record.held_tag_numbers)
-                            ? record.held_tag_numbers.filter(
-                                  (number): number is number => typeof number === "number",
-                              )
-                            : []),
-                        ...(Array.isArray(record.immediate_tag_numbers)
-                            ? record.immediate_tag_numbers.filter(
-                                  (number): number is number => typeof number === "number",
-                              )
-                            : []),
-                    ];
-                    const stampedCount = acceptedTagNumbers
-                        ? new Set(acceptedTagNumbers).size
-                        : reportedTagNumbers.length > 0
-                          ? new Set(reportedTagNumbers).size
-                          : queued;
-                    return formatCtxReduceReply(stampedCount, refusedStampCount);
-                } catch (error) {
-                    sessionLog(sessionId, "ctx_reduce capability refusal", error);
-                    return renderCapabilityRefusal("context_cleanup");
-                }
             }
 
             let dropIds: number[] = [];

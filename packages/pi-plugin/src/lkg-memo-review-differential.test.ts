@@ -453,7 +453,6 @@ test.skipIf(!host || !root)(
 			prefixSpy.mockRestore();
 			coordinatorSpy.mockRestore();
 			for (const session of sessions) clearContextHandlerSession(session);
-			transform.disposeRust();
 			if (host === "pi") db.close();
 			else closeDatabase();
 			resetCtxReduceRegisteredGloballyForTest();

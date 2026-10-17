@@ -32,7 +32,6 @@ import {
     recordDetectedContextLimit,
     recordOverflowDetected,
 } from "../../features/magic-context/storage";
-import { getPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
 import { clearSession } from "../../features/magic-context/storage-meta-session";
 import { rebaseSessionCoordinatesAsync } from "../../features/magic-context/store-generation-rebase";
 import { createTagger } from "../../features/magic-context/tagger";
@@ -77,14 +76,12 @@ import {
 } from "../../hooks/magic-context/lkg-measured-request";
 import { lkgReplayLimit, measureLkgReplay } from "../../hooks/magic-context/lkg-replay-fit";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
-import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
 import {
     estimateTokens,
     preloadTokenizer,
 } from "../../hooks/magic-context/read-session-formatting";
-import { servedModuleM0Text } from "../../hooks/magic-context/rust-served-m0";
 import {
     STORAGE_BUSY_MESSAGE,
     StorageBusyRefusalError,
@@ -132,7 +129,6 @@ import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/use
 import { CTX_NOTE_DESCRIPTION, withoutSmartNoteText } from "../../tools/ctx-note/constants";
 import { CTX_NOTE_LIGHT_DESCRIPTION } from "../../tools/light-descriptions";
 import { applyJsonSchemaParameterDescriptions } from "../../tools/parameter-descriptions";
-import { createV2RustCompactionMarkerStrategy, trimToRecordedBoundary } from "../fold/boundary";
 import { hostMediaAsset, hostUsesMediaAssets, rememberHostMedia } from "../fold/host-media";
 import { v2CompactionMarkerStrategy } from "../fold/markers";
 import { nativeFoldCache } from "../fold/memory-cache";
@@ -172,7 +168,6 @@ import { adaptPayload, HEAD_IDS } from "./payload";
 import { interruptBeforeProvider, V2ContextRefusal } from "./refusal";
 import { RestoredRowCache } from "./restore-rows";
 import { createV2RpcLiveSessionState } from "./rpc-live-state";
-import { createV2RustRefusalRecovery, resolveV2RustModeModuleClient } from "./rust-mode";
 import { hasRequiredSessionAPI, OPENCODE2_SESSION_API_NOTICE } from "./session-api-gate";
 import { runV2SessionProjectBackfill } from "./session-project-backfill";
 import { createV2StorageGate, probeV2StorageAtBoot } from "./storage-gate";
@@ -188,7 +183,6 @@ import {
     createV2RawMessageReader,
     readAllV2RawMessagesForConversion,
     readV2RawMessagePagesForConversion,
-    resolveV2BoundaryUserMessage,
     servedBoundaryRow,
 } from "./store";
 import { bindV2SystemPromptResponse } from "./system-prompt-response";
@@ -728,29 +722,10 @@ export async function registerContext(context: V2Context) {
         storageNoticeBySession.set(sessionID, message);
         storeStorageNotice(sessionID, message, "refusal");
     };
-    // Rust mode reaches the `ck-mc` module over the same subc client the OpenCode 1
-    // lane builds. Building it is inert until a pass actually calls the module, so
-    // it is safe to hold one here for the whole process. It is resolved before the
-    // tools are registered because the tool facades are part of the same wiring:
-    // registering `ctx_note`/`ctx_memory` without them would let an agent's write
-    // land in the host read model alone, where the module never sees it.
-    const rustModeModuleClient = resolveV2RustModeModuleClient(config, directory);
-    const rustMemorySyncRequestedSessions = new Set<string>();
-    const moduleToolBackends =
-        db && isDatabasePersisted(db)
-            ? createModuleToolBackends({
-                  db,
-                  moduleClient: rustModeModuleClient,
-                  directory,
-                  memorySyncRequestedSessions: rustMemorySyncRequestedSessions,
-              })
-            : undefined;
     const hiddenChildHook = new HiddenChildHook();
     const tools =
         db && isDatabasePersisted(db)
-            ? await registerTools(context, db, config, moduleToolBackends?.backends, (id) =>
-                  hiddenChildHook.owns(id),
-              )
+            ? await registerTools(context, db, config, (id) => hiddenChildHook.owns(id))
             : undefined;
     const usage: TransformDeps["contextUsageMap"] = new Map();
     const generateReplay = new V2GenerateReplay();
@@ -1036,25 +1011,6 @@ export async function registerContext(context: V2Context) {
     }
     const readAllForConversion = (sessionID: string) =>
         readAllV2RawMessagesForConversion(openStoreReader, sessionID);
-    // Refusal recovery only needs to know whether a user turn followed the refused
-    // one, so it reads the rows from that message onward, never the whole session.
-    const readRowsFrom = (sessionID: string, messageID: string) => {
-        const reader = openStoreReader();
-        try {
-            const seq = reader.sequenceForId(sessionID, messageID);
-            if (seq === undefined) return [];
-            return reader.range(sessionID, seq - 1, reader.latestSequence(sessionID));
-        } finally {
-            reader.close();
-        }
-    };
-    const rustRefusalRecovery = rustModeModuleClient
-        ? createV2RustRefusalRecovery({
-              context,
-              moduleClient: rustModeModuleClient,
-              readRowsFrom,
-          })
-        : undefined;
     const lkgSystems = new V2LkgSystemReplay();
     let transform: ReturnType<typeof createTransform> | undefined;
     let systemPrompt: ReturnType<typeof createSystemPromptHashHandler> | undefined;
@@ -1387,35 +1343,18 @@ export async function registerContext(context: V2Context) {
                 draft.messages.flatMap((message) => (message.id ? [message.id] : [])),
             );
             const running = reader.latestRunningCompaction(draft.sessionID);
-            // In Rust mode the module composes m[0] and the host renders none, so the
-            // checkpoint has to be the module's own baseline. Composing a TypeScript one
-            // here would give the session two different histories: the one the host
-            // stores in its checkpoint and the one the module keeps serving.
-            const moduleBaseline = rustModeModuleClient
-                ? servedModuleM0Text(draft.sessionID)
-                : undefined;
             // This hook ALWAYS answers, and leaving `result` unset is not an option.
             // On GA 2.0.5 an unanswered request is not a polite decline: the host
             // summarizes with its own model and, when that answer is not in the
             // template it requires, records a `compaction.failed` row and ends the
             // turn with idle outcome=failed. Measured on the real host, a session
             // whose hook declined produced a failed compaction and no provider
-            // request at all on every turn after the first. When the module has
-            // served nothing yet there is no module baseline to answer with, so the
-            // TypeScript one is supplied instead: still Magic Context's own account
-            // of the session, rather than a host-composed summary of history the
-            // module never served, or a dead turn.
-            const source = !rustModeModuleClient
-                ? "typescript"
-                : moduleBaseline === null
-                  ? "typescript_fallback"
-                  : "module";
+            // request at all on every turn after the first.
             if (nativeFoldReplay) {
                 try {
                     if (await nativeFoldReplay.canReplay(draft.sessionID, reader)) {
                         const state = getOrCreateSessionMeta(storage.require(), draft.sessionID);
                         const summary =
-                            moduleBaseline ??
                             (await nativeFoldReplay.baseline(draft.sessionID)) ??
                             state.cachedM0Bytes?.toString("utf8") ??
                             "<session-history></session-history>";
@@ -1445,12 +1384,15 @@ export async function registerContext(context: V2Context) {
                 runningCut: running?.seq,
                 // Kept lazy for the TypeScript lane: materializing writes cache state and
                 // must only happen when the fold identity is actually new.
-                materialize: () => moduleBaseline ?? materialize(draft),
+                materialize: () => materialize(draft),
             });
             // One line per request with the baseline it was answered from. The
             // host's rate and ours are separate facts, and only reading both
             // explains a session's checkpoint cadence.
-            sessionLog(draft.sessionID, `v2 compaction hook: fired answered=true source=${source}`);
+            sessionLog(
+                draft.sessionID,
+                "v2 compaction hook: fired answered=true source=typescript",
+            );
             draft.result = { summary: fold.submitted };
         } catch (cause) {
             await refuseBeforeProvider(context.session, draft.sessionID, "compaction-fold", cause);
@@ -1474,24 +1416,8 @@ export async function registerContext(context: V2Context) {
         // A deletion that races an in-flight pass must not let that pass rebuild
         // the state just cleared by the one deletion event.
         if (deletedSessions.has(draft.sessionID)) return;
-        const durableProvider =
-            config.transform_mode === "rust" &&
-            !compactionOff &&
-            config.rust_pipeline === "provider" &&
-            db
-                ? (db
-                      .prepare(
-                          "SELECT setup_json FROM host_runner_state WHERE session_id=? AND harness='opencode2' AND pipeline_exit_json IS NULL",
-                      )
-                      .get(draft.sessionID) as { setup_json: string | null } | null)
-                : null;
-        const providerAtEntry =
-            transform?.isProviderSession(draft.sessionID) === true ||
-            (durableProvider?.setup_json
-                ? JSON.parse(durableProvider.setup_json).active === true
-                : false);
-        const systemAtEntry = providerAtEntry ? draft.system : structuredClone(draft.system);
-        const slotAtEntry = providerAtEntry ? undefined : getSlot(draft.sessionID);
+        const systemAtEntry = structuredClone(draft.system);
+        const slotAtEntry = getSlot(draft.sessionID);
         const restoreLkgSystem = () => {
             retirePendingSystemPromptDelivery(draft.sessionID);
             if (
@@ -1596,11 +1522,6 @@ export async function registerContext(context: V2Context) {
             if (!compactionOff && admissionDb)
                 await withAsyncPrivilegedWriter(admissionDb, () => undefined, {
                     beforeRetry: (error) => {
-                        // The Rust provider pipeline recovers from its stored runner
-                        // record. A saved request from the legacy transform must not
-                        // bypass that owner's admission.
-                        if (providerAtEntry || transform?.isProviderSession(draft.sessionID))
-                            return;
                         const mapped = adaptPayload(draft);
                         if (
                             tryMessagesTransformLkgReplay({
@@ -1610,7 +1531,6 @@ export async function registerContext(context: V2Context) {
                                 sessionId: draft.sessionID,
                                 error,
                                 agent: draft.agent,
-                                rust: transform?.getRustReplayParticipant() ?? undefined,
                                 replayFits,
                                 onLkgReplay: restoreLkgSystem,
                             })
@@ -1653,9 +1573,7 @@ export async function registerContext(context: V2Context) {
                 pushNotification("toast", { message, variant: "info" }, draft.sessionID);
                 storeStorageNotice(draft.sessionID, message, "recovery");
             }
-            // TypeScript mode only: in Rust mode the module owns the session's
-            // history and this state is not what it serves.
-            if (!rustModeModuleClient && !compactionOff) inheritForkState(db, draft.sessionID);
+            if (!compactionOff) inheritForkState(db, draft.sessionID);
             // OpenCode 2 exposes system and message transformation through one
             // context hook, with the system handler running first below. Rebase
             // before it so a converted session initializes the new host's prompt
@@ -1807,45 +1725,12 @@ export async function registerContext(context: V2Context) {
                 historianExpandTools: config.historian?.expand_tools,
                 historianRunner: config.historian?.runner,
                 historianHostRunnerEnabled: config.historian?.host_runner?.enabled,
-                // TypeScript mode folds on the host's own compaction rows, so its marker
-                // carrier stays inert. Rust mode has no such row to write: the module's
-                // materialized boundary is recorded in the marker columns instead, and
-                // the compaction hook above answers the host from it.
-                compactionMarkerStrategy: rustModeModuleClient
-                    ? createV2RustCompactionMarkerStrategy((sessionID, endMessageID) => {
-                          const reader = openStoreReader();
-                          try {
-                              return resolveV2BoundaryUserMessage(reader, sessionID, endMessageID);
-                          } finally {
-                              reader.close();
-                          }
-                      })
-                    : v2CompactionMarkerStrategy,
-                transformMode: config.transform_mode,
-                rustPipeline: config.rust_pipeline,
+                // OpenCode 2 folds on the host's own compaction rows, so the marker
+                // carrier stays inert.
+                compactionMarkerStrategy: v2CompactionMarkerStrategy,
                 signedThinkingHold: config.signed_thinking_hold,
-                rustProviderPreparation: config.rust_provider_preparation,
-                rustModeModuleClient,
-                rustModeProjectRoot: directory,
-                rustMemorySyncRequestedSessions,
-                // OpenCode 1 puts this on the host's toast surface through its SDK
-                // client. This host exposes no such client to a plugin, so it goes
-                // out on the notification socket the TUI already reads — the same
-                // carrier a finished dream reports on. Without it a parked module
-                // is invisible: the session keeps answering from the last good
-                // output and nothing says why it stopped moving.
-                onRustModeParked: (sessionId, message) =>
-                    pushNotification(
-                        "toast",
-                        {
-                            message: `Rust Magic Context paused: ${message}`,
-                            variant: "warning",
-                        },
-                        sessionId,
-                    ),
                 promptSurface: config.prompt_surface,
                 promptSurfaceRuntime,
-                onRustEngineReconnectRefusal: (refusal) => rustRefusalRecovery?.arm(refusal),
                 memoryConfig: {
                     enabled: config.memory.enabled,
                     injectionBudgetTokens: config.memory.injection_budget_tokens,
@@ -1874,11 +1759,9 @@ export async function registerContext(context: V2Context) {
                 const cut = reader.latestCompaction(draft.sessionID);
                 if (nativeFoldReplay) await nativeFoldReplay.observeSource(draft.sessionID, reader);
                 // Before anything restores or trims against the history boundary,
-                // make sure the host store still has it. Only TypeScript mode keeps
-                // its boundary in the compartments this checks; Rust mode's module
-                // owns its own.
+                // make sure the host store still has it.
                 const boundaryRepair =
-                    !rustModeModuleClient && db && !compactionOff
+                    db && !compactionOff
                         ? checkHistoryBoundary(db, reader, draft.sessionID)
                         : undefined;
                 if (
@@ -1903,7 +1786,7 @@ export async function registerContext(context: V2Context) {
                             draft.sessionID,
                             cut,
                             `${draft.model.providerID}/${draft.model.id}`,
-                            { bounded: !rustModeModuleClient },
+                            { bounded: true },
                         );
                     } catch (error) {
                         nativeFoldReplay.invalidate(draft.sessionID, true);
@@ -1968,17 +1851,7 @@ export async function registerContext(context: V2Context) {
                     submitted = identity.rendered
                         ? (identity.renderedSummary ?? identity.submitted)
                         : (cut.data.summary ?? "");
-                    // Rust mode restores against the boundary the module itself published and
-                    // keeps that boundary row, because the array handed to the module has to
-                    // begin there — exactly where an OpenCode 1 compaction row would have made
-                    // the host begin it. TypeScript mode restores after its own m0 baseline.
-                    const moduleBoundaryID = rustModeModuleClient
-                        ? (getPersistedCompactionMarkerState(db, draft.sessionID)
-                              ?.boundaryMessageId ?? null)
-                        : null;
-                    const moduleBoundarySeq = moduleBoundaryID
-                        ? reader.sequenceForId(draft.sessionID, moduleBoundaryID)
-                        : undefined;
+                    // The restore starts after the session's own m0 baseline.
                     // After a boundary repair the cached prefix is gone and this pass
                     // rebuilds it against the anchor, so restore from the anchor: the
                     // same rows every later pass restores from the rebuilt baseline.
@@ -2007,15 +1880,9 @@ export async function registerContext(context: V2Context) {
                         ? servedBoundaryRow(reader, draft.sessionID, boundaryID)
                         : null;
                     const boundary =
-                        (moduleBoundarySeq !== undefined ? moduleBoundarySeq - 1 : undefined) ??
                         servedBoundary?.seq ??
                         reader.sequenceForId(draft.sessionID, boundaryID) ??
                         (reader.earliestSequence(draft.sessionID) ?? 0) - 1;
-                    if (moduleBoundarySeq !== undefined)
-                        sessionLog(
-                            draft.sessionID,
-                            `v2 restore: from the module boundary ${moduleBoundaryID} to the host checkpoint`,
-                        );
                     const present = new Set(draft.messages.map((message) => message.id));
                     const restored = restoredRows
                         .rows(reader, draft.sessionID, boundary, cut.seq)
@@ -2046,25 +1913,6 @@ export async function registerContext(context: V2Context) {
             } finally {
                 reader.close();
             }
-            // On a turn the host did not compact, the array still starts at the top
-            // of the conversation, and the module would be handed the whole history
-            // again — the cost the fold exists to remove. On a turn it did compact,
-            // the boundary message is already gone from the array and this is a
-            // no-op. Both happen in an ordinary session.
-            if (rustModeModuleClient && db) {
-                const runnerOrdinals = transform?.providerOrdinals(draft.sessionID);
-                if (runnerOrdinals) {
-                    for (const message of draft.messages) {
-                        if (message.id) message.ordinal = runnerOrdinals.get(message.id);
-                    }
-                }
-                const dropped = trimToRecordedBoundary(db, draft.sessionID, draft.messages);
-                if (dropped > 0)
-                    sessionLog(
-                        draft.sessionID,
-                        `v2 boundary trim: dropped ${dropped} messages before the module boundary`,
-                    );
-            }
             let nativeMessages: V2Message[] | undefined;
             if (nativeFoldReplay) {
                 try {
@@ -2075,18 +1923,20 @@ export async function registerContext(context: V2Context) {
             }
             const mapped = adaptPayload(draft, admitted);
             bindSystemDateRequestIdentity(mapped, draft);
-            if (!transform?.isProviderSession(draft.sessionID))
-                beginV2LkgRequest(
-                    draft.sessionID,
-                    `${draft.model.providerID}/${draft.model.id}`,
-                    latestLkgResponseIds.get(draft.sessionID),
-                );
+            beginV2LkgRequest(
+                draft.sessionID,
+                `${draft.model.providerID}/${draft.model.id}`,
+                latestLkgResponseIds.get(draft.sessionID),
+            );
             await createMessagesTransformHandler({
                 magicContext: { "experimental.chat.messages.transform": transform },
                 compactionOff,
                 replayFits,
                 onLkgReplay: restoreLkgSystem,
-                rustReplayParticipant: () => transform?.getRustReplayParticipant() ?? null,
+                // This host builds no Rust adapter. Answering null, rather than
+                // omitting the option, keeps the wrapper from consulting the
+                // process-wide adapter registry.
+                rustReplayParticipant: () => null,
             })(
                 {},
                 mapped as unknown as Parameters<
@@ -2138,9 +1988,7 @@ export async function registerContext(context: V2Context) {
                     );
                 }
             }
-            const capturedSlot = transform?.isProviderSession(draft.sessionID)
-                ? undefined
-                : getSlot(draft.sessionID);
+            const capturedSlot = getSlot(draft.sessionID);
             if (
                 capturedSlot &&
                 (!slotAtEntry ||
@@ -2155,7 +2003,6 @@ export async function registerContext(context: V2Context) {
             if (error instanceof V2ContextRefusal) throw error;
             if (
                 !compactionOff &&
-                !transform?.isProviderSession(draft.sessionID) &&
                 (isTransientSqliteError(error) || error instanceof StorageBusyRefusalError)
             ) {
                 if (isTransientSqliteError(error)) {
@@ -2164,8 +2011,7 @@ export async function registerContext(context: V2Context) {
                         await createMessagesTransformHandler({
                             replayFits,
                             onLkgReplay: restoreLkgSystem,
-                            rustReplayParticipant: () =>
-                                transform?.getRustReplayParticipant() ?? null,
+                            rustReplayParticipant: () => null,
                             magicContext: {
                                 "experimental.chat.messages.transform": async () => {
                                     throw error;
@@ -2301,7 +2147,6 @@ export async function registerContext(context: V2Context) {
                 return null;
             }
         },
-        rustModeModuleClient,
         hiddenCompletionExecutor: storageOpenedAtBoot
             ? hiddenCompletionExecutor
             : lateHiddenExecutor,
@@ -2435,7 +2280,6 @@ export async function registerContext(context: V2Context) {
         async dispose() {
             rpcStopped = true;
             rpcServer.stop();
-            transform?.disposeRust();
             tools?.dispose();
             usageController.abort();
             await usageDone;

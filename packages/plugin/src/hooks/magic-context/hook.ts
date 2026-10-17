@@ -10,7 +10,6 @@ import {
     type HistorianConfig,
     type MagicContextConfig,
 } from "../../config/schema/magic-context";
-import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
@@ -55,7 +54,6 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
 import { buildStatusDetail } from "../../plugin/rpc-handlers";
-import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
 import type { ConfigParseFailure } from "../../shared/config-diagnostics";
 import { isEmbeddingHostBusy } from "../../shared/embedding-activity";
@@ -97,14 +95,10 @@ import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { createDbLkgPersistence } from "./lkg-persist";
 import { dropSlot, registerLkgPersistence } from "./lkg-slot";
-import { createSubcModuleClient } from "./module-client";
-import { createModuleToolBackends } from "./module-tool-backends";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import { runManagedRecomp } from "./recomp-orchestrator";
 import { openCodeRescoreCommand } from "./rescore-opencode";
-import { type RustModeModuleClient, rustWrapupHistorianFields } from "./rust-mode-transform";
-import { createRustRefusalRecovery } from "./rust-refusal-recovery";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
@@ -191,14 +185,7 @@ export interface MagicContextDeps {
             enabled: boolean;
             min_chars: number;
         };
-        transform_mode?: ResolvedTransformMode;
-        rust_pipeline?: "full_request" | "provider";
         signed_thinking_hold?: "off" | "on";
-        rust_provider_preparation?: boolean;
-        /** Path to the subc daemon's connection file. Threaded to the module
-         *  transport so a host that publishes it outside the default data-dir
-         *  location (e.g. a systemd RuntimeDirectory) is actually reachable. */
-        subc?: { connection_file: string };
         /** Compaction-off mode gate (issue #266). Resolved ONCE here at the
          *  session-hook construction boundary via isCompactionEnabled; the
          *  resolved boolean is threaded to the transform phases. */
@@ -207,8 +194,6 @@ export interface MagicContextDeps {
     };
     /** Registration-owned prompt-surface loader shared with the tool registry. */
     promptSurfaceRuntime?: PromptSurfaceRuntime;
-    /** Test seam for the Rust authority adapter; production creates the subc client. */
-    rustModeModuleClient?: RustModeModuleClient;
     /** Test and async-boot seam for supplying a database already opened by the caller. */
     openDatabaseForHook?: () => Database | null;
     /** Plugin-factory diagnostics for the boot-time storage phases. */
@@ -664,59 +649,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         })();
     };
 
-    const rustMemorySyncRequestedSessions = new Set<string>();
-    const rustModeModuleClient =
-        deps.config.transform_mode === "rust"
-            ? (deps.rustModeModuleClient ??
-              createSubcModuleClient({
-                  ...(deps.config.subc?.connection_file !== undefined
-                      ? { connectionFile: deps.config.subc.connection_file }
-                      : {}),
-                  projectRoot: deps.directory,
-              }))
-            : undefined;
-    const rustRefusalRecovery = rustModeModuleClient
-        ? createRustRefusalRecovery({
-              moduleClient: rustModeModuleClient,
-              client: deps.client,
-          })
-        : undefined;
-    // Both host lanes share the module backend for drop state; memories and notes
-    // use the host tools against context.db directly.
-    const moduleToolBackends = createModuleToolBackends({
-        db,
-        moduleClient: rustModeModuleClient,
-        directory: deps.directory,
-        memorySyncRequestedSessions: rustMemorySyncRequestedSessions,
-    });
-    const rustToolBackends: RustToolBackends | undefined = moduleToolBackends?.backends;
-    const notifyRustModeParked = (sessionId: string, message: string): void => {
-        const client = deps.client as {
-            tui?: {
-                showToast?: (input: {
-                    body: {
-                        title: string;
-                        message: string;
-                        variant?: "warning" | "error" | "info" | "success";
-                        duration?: number;
-                    };
-                }) => Promise<unknown>;
-            };
-        };
-        void client.tui
-            ?.showToast?.({
-                body: {
-                    title: "Rust Magic Context paused",
-                    message,
-                    variant: "warning",
-                    duration: 8000,
-                },
-            })
-            .catch((error) =>
-                log(`[magic-context] rust park toast failed for ${sessionId}:`, error),
-            );
-    };
-
     // Durable LKG replay: register the db-backed backend so slot drops clear the
     // persisted row and in-memory misses (notably the first pass after a
     // process restart) hydrate the snapshot captured by the last applied pass.
@@ -811,8 +743,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historianHostRunnerEnabled: deps.config.historian?.host_runner?.enabled,
         liveModelBySession,
         sessionDirectoryBySession,
-        // Keep the resolved controls available to both renderers. Rust mode must receive
-        // an explicit false here rather than falling back to the module default.
         autoSearch: {
             enabled: deps.config.memory?.auto_search?.enabled ?? true,
             scoreThreshold: deps.config.memory?.auto_search?.score_threshold ?? 0.6,
@@ -836,18 +766,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 }
               : undefined,
         maybeAutoEmbedSession,
-        transformMode: deps.config.transform_mode,
-        rustPipeline: deps.config.rust_pipeline,
         signedThinkingHold: deps.config.signed_thinking_hold,
-        rustProviderPreparation: deps.config.rust_provider_preparation,
         promptSurface: deps.config.prompt_surface,
         promptSurfaceRuntime: deps.promptSurfaceRuntime,
-        rustModeModuleClient,
-
-        rustMemorySyncRequestedSessions,
-        onRustModeParked: notifyRustModeParked,
-
-        onRustEngineReconnectRefusal: (args) => rustRefusalRecovery?.arm(args),
     });
     const eventHandler = createEventHandler({
         sampleCacheTtlConfig: () => deps.sampleHistorianConfig?.() ?? deps.config,
@@ -856,7 +777,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         config: deps.config,
         allowHomeProject: deps.config.allow_home_project,
         compactionOff,
-        thinkingBindingRecoveryEnabled: deps.config.transform_mode !== "rust",
         tagger: deps.tagger,
         db,
         client: deps.client,
@@ -876,36 +796,25 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             clearInjectionCache(sessionId);
             deps.onSessionCacheInvalidated?.(sessionId);
         },
-        onRustWireInvalidated: (sessionId: string) => {
-            transform.invalidateRustWireState(sessionId);
-        },
-        rustSessionCleanup: rustModeModuleClient !== undefined,
-        // Remove module-owned state before the context database drops the durable
-        // session→project binding needed to retry a failed module deletion.
         onSessionDeleted: async (sessionId: string) => {
-            rustRefusalRecovery?.forget(sessionId);
             dropSlot(sessionId, "session-deleted");
-            try {
-                await transform.clearRustSession(sessionId);
-            } finally {
-                systemPromptHash.clearSession(sessionId);
-                requestHookOrder.clearSession(sessionId);
-                // Prune every per-session map this hook closure owns. These maps
-                // otherwise accumulate for the lifetime of a long-running plugin process.
-                lastHeuristicsTurnId.delete(sessionId);
-                clearToolPermissionDenied(sessionId);
-                commitSeenLastPass.delete(sessionId);
-                variantBySession.delete(sessionId);
-                liveModelBySession.delete(sessionId);
-                agentBySession.delete(sessionId);
-                sessionDirectoryBySession.delete(sessionId);
-                recompProgressBySession.delete(sessionId);
-                internalChildSessions.delete(sessionId);
-                rustMemorySyncRequestedSessions.delete(sessionId);
-                channel1StateBySession.delete(sessionId);
-                channel2DirectiveTextBySession.delete(sessionId);
-                clearEmbedSessionState(sessionId);
-            }
+            transform.clearSessionLogState(sessionId);
+            systemPromptHash.clearSession(sessionId);
+            requestHookOrder.clearSession(sessionId);
+            // Prune every per-session map this hook closure owns. These maps
+            // otherwise accumulate for the lifetime of a long-running plugin process.
+            lastHeuristicsTurnId.delete(sessionId);
+            clearToolPermissionDenied(sessionId);
+            commitSeenLastPass.delete(sessionId);
+            variantBySession.delete(sessionId);
+            liveModelBySession.delete(sessionId);
+            agentBySession.delete(sessionId);
+            sessionDirectoryBySession.delete(sessionId);
+            recompProgressBySession.delete(sessionId);
+            internalChildSessions.delete(sessionId);
+            channel1StateBySession.delete(sessionId);
+            channel2DirectiveTextBySession.delete(sessionId);
+            clearEmbedSessionState(sessionId);
         },
     });
 
@@ -956,13 +865,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             language: deps.config.language,
             retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
             smartNotesEnabled: deps.config.smart_notes?.enabled,
-            transformMode: deps.config.transform_mode,
-            // Scheduled/message-triggered runs must share the same direct
-            // authority.status transport as the transform path. The
-            // executor uses the live MODULE verdict, not transform state
-            // cached in a session, so a cold process cannot fall back to
-            // the guarded TypeScript child path.
-            moduleClient: rustModeModuleClient,
             onProgress: (progress, completedTask) => {
                 if (progress) {
                     dreamerProgressByProject.set(projectPath, progress);
@@ -1008,18 +910,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         executeThresholdPercentage: deps.config.execute_threshold_percentage ?? 65,
         executeThresholdTokens: deps.config.execute_threshold_tokens,
         historyBudgetPercentage: deps.config.history_budget_percentage,
-        transformMode: deps.config.transform_mode,
-        rustModeModuleClient,
-        resolveRustWrapupHistorianFields: () => {
-            const run = sampleHistorian();
-            return rustWrapupHistorianFields({
-                historianModel: run.model,
-                fallbackModels: run.fallbackModels,
-                timeoutMs: run.timeoutMs,
-                maxOutputTokens: run.maxOutputTokens,
-            });
-        },
-        projectRoot: deps.directory,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
         sampleCommitClusterTrigger: () =>
             (deps.sampleHistorianConfig?.() ?? deps.config).commit_cluster_trigger,
@@ -1034,7 +924,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             const model = resolveLiveModel(sessionId);
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         },
-        getStatusDetail: (sessionId, moduleStatus) => {
+        getStatusDetail: (sessionId) => {
             const model = resolveLiveModel(sessionId);
             return buildStatusDetail(
                 db,
@@ -1044,7 +934,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 deps.config as unknown as Record<string, unknown>,
                 deps.liveSessionState,
                 deps.config.memory?.injection_budget_tokens,
-                moduleStatus,
                 !compactionOff,
             );
         },
@@ -1125,11 +1014,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   deps.config.memory?.injection_budget_tokens,
                               retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
                               smartNotesEnabled: deps.config.smart_notes?.enabled,
-                              transformMode: deps.config.transform_mode,
-                              // Manual /ctx-dream uses the same live authority
-                              // lookup and module transport as scheduled runs.
-                              // Do not rely on a transform-populated cache.
-                              moduleClient: rustModeModuleClient,
                               onProgress: (progress, completedTask) => {
                                   if (progress) {
                                       dreamerProgressByProject.set(projectPath, progress);
@@ -1260,47 +1144,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             db,
             channel1StateBySession,
             client: deps.client,
-            transformMode: deps.config.transform_mode,
-            todoStateSet:
-                deps.config.transform_mode === "rust" && rustModeModuleClient
-                    ? ({ sessionId, stateJson, ownerMessageId }) =>
-                          rustModeModuleClient.call({
-                              sessionId,
-                              projectRoot: deps.directory,
-                              method: "todo_state.set",
-                              body: {
-                                  method: "todo_state.set",
-                                  v: 1,
-                                  session_id: sessionId,
-                                  state_json: stateJson,
-                                  owner_message_id: ownerMessageId,
-                              },
-                          })
-                    : undefined,
         }),
     };
     const hooksWithBackends = hooks as typeof hooks & {
-        rustToolBackends?: RustToolBackends;
-        disposeRustAdapter?: () => void;
-        getRustReplayParticipant?: () => ReturnType<typeof transform.getRustReplayParticipant>;
         getDebugMemoryHolders?: () => {
             taggerCache: ReturnType<NonNullable<Tagger["getHeapStats"]>>;
-            wireCache: ReturnType<typeof transform.getRustWireCacheHeapStats>;
         };
     };
     Object.defineProperties(hooksWithBackends, {
-        rustToolBackends: {
-            value: rustToolBackends,
-            enumerable: false,
-        },
-        disposeRustAdapter: {
-            value: () => transform.disposeRust(),
-            enumerable: false,
-        },
-        getRustReplayParticipant: {
-            value: () => transform.getRustReplayParticipant(),
-            enumerable: false,
-        },
         getDebugMemoryHolders: {
             value: () => ({
                 taggerCache: deps.tagger.getHeapStats?.() ?? {
@@ -1310,7 +1161,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     loadSignatureEntries: 0,
                     sessions: [],
                 },
-                wireCache: transform.getRustWireCacheHeapStats(),
             }),
             enumerable: false,
         },

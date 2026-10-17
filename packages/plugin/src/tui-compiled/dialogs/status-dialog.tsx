@@ -1,4 +1,3 @@
-import { createTextNode as _$createTextNode } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { spread as _$spread } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { mergeProps as _$mergeProps } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { memo as _$memo } from "opentui:runtime-module:%40opentui%2Fsolid";
@@ -23,7 +22,6 @@ import { createElement as _$createElement } from "opentui:runtime-module:%40open
 import { createMemo, createSignal, onCleanup } from "opentui:runtime-module:solid-js";
 import packageJson from "../../../package.json";
 import { buildStatusViewFor, distributeBarWidths, statusColumnsFor } from "../../shared/status-view";
-import { RUST_MODE_HOST_PATHS_LINE } from "../../shared/rust-mode-status";
 const R = props => (() => {
   var _el$ = _$createElement("box"),
     _el$2 = _$createElement("text"),
@@ -148,7 +146,6 @@ export const StatusDialog = props => {
   const ready = () => props.status.state === "ready" ? props.status : null;
   const compactionOff = () => ready()?.source.compaction_enabled === false;
   const recompProgress = () => ready()?.extras.recompProgress ?? null;
-  const hostBackendsModuleSide = () => ready()?.extras.hostBackendsModuleSide === true;
 
   // Which rows exist, what they are called and which colour they carry is
   // decided by the shared model, so this dialog and Pi's overlay cannot drift
@@ -432,104 +429,76 @@ export const StatusDialog = props => {
       })();
     })(), _el$20);
     _$insert(_el$1, (() => {
-      var _c$4 = _$memo(() => !!hostBackendsModuleSide());
-      return () => _c$4() && (() => {
+      var _c$4 = _$memo(() => !!columns().twoColumn);
+      return () => _c$4() ? (() => {
         var _el$30 = _$createElement("box"),
-          _el$31 = _$createElement("text"),
-          _el$32 = _$createElement("b"),
-          _el$34 = _$createElement("text");
+          _el$31 = _$createElement("box"),
+          _el$32 = _$createElement("box");
         _$insertNode(_el$30, _el$31);
-        _$insertNode(_el$30, _el$34);
-        _$setProp(_el$30, "marginTop", 1);
+        _$insertNode(_el$30, _el$32);
+        _$setProp(_el$30, "flexDirection", "row");
         _$setProp(_el$30, "width", "100%");
-        _$setProp(_el$30, "flexDirection", "column");
-        _$insertNode(_el$31, _el$32);
-        _$insertNode(_el$32, _$createTextNode(`Rust Mode`));
-        _$insert(_el$34, RUST_MODE_HOST_PATHS_LINE);
+        _$setProp(_el$30, "gap", 4);
+        _$setProp(_el$31, "flexDirection", "column");
+        _$setProp(_el$31, "flexGrow", 0);
+        _$setProp(_el$31, "flexShrink", 1);
+        _$setProp(_el$31, "minWidth", 0);
+        _$setProp(_el$31, "overflow", "hidden");
+        _$insert(_el$31, () => columnSections(0).map(section => _$createComponent(StatusSectionView, {
+          get t() {
+            return t();
+          },
+          section: section
+        })));
+        _$setProp(_el$32, "flexDirection", "column");
+        _$setProp(_el$32, "flexGrow", 0);
+        _$setProp(_el$32, "flexShrink", 1);
+        _$setProp(_el$32, "minWidth", 0);
+        _$setProp(_el$32, "overflow", "hidden");
+        _$insert(_el$32, () => columnSections(1).map(section => _$createComponent(StatusSectionView, {
+          get t() {
+            return t();
+          },
+          section: section
+        })));
         _$effect(_p$ => {
-          var _v$12 = t().text,
-            _v$13 = t().textMuted;
-          _v$12 !== _p$.e && (_p$.e = _$setProp(_el$31, "fg", _v$12, _p$.e));
-          _v$13 !== _p$.t && (_p$.t = _$setProp(_el$34, "fg", _v$13, _p$.t));
+          var _v$12 = columns().leftWidth,
+            _v$13 = columns().rightWidth;
+          _v$12 !== _p$.e && (_p$.e = _$setProp(_el$31, "flexBasis", _v$12, _p$.e));
+          _v$13 !== _p$.t && (_p$.t = _$setProp(_el$32, "flexBasis", _v$13, _p$.t));
           return _p$;
         }, {
           e: undefined,
           t: undefined
         });
         return _el$30;
-      })();
-    })(), _el$20);
-    _$insert(_el$1, (() => {
-      var _c$5 = _$memo(() => !!columns().twoColumn);
-      return () => _c$5() ? (() => {
-        var _el$35 = _$createElement("box"),
-          _el$36 = _$createElement("box"),
-          _el$37 = _$createElement("box");
-        _$insertNode(_el$35, _el$36);
-        _$insertNode(_el$35, _el$37);
-        _$setProp(_el$35, "flexDirection", "row");
-        _$setProp(_el$35, "width", "100%");
-        _$setProp(_el$35, "gap", 4);
-        _$setProp(_el$36, "flexDirection", "column");
-        _$setProp(_el$36, "flexGrow", 0);
-        _$setProp(_el$36, "flexShrink", 1);
-        _$setProp(_el$36, "minWidth", 0);
-        _$setProp(_el$36, "overflow", "hidden");
-        _$insert(_el$36, () => columnSections(0).map(section => _$createComponent(StatusSectionView, {
-          get t() {
-            return t();
-          },
-          section: section
-        })));
-        _$setProp(_el$37, "flexDirection", "column");
-        _$setProp(_el$37, "flexGrow", 0);
-        _$setProp(_el$37, "flexShrink", 1);
-        _$setProp(_el$37, "minWidth", 0);
-        _$setProp(_el$37, "overflow", "hidden");
-        _$insert(_el$37, () => columnSections(1).map(section => _$createComponent(StatusSectionView, {
-          get t() {
-            return t();
-          },
-          section: section
-        })));
-        _$effect(_p$ => {
-          var _v$14 = columns().leftWidth,
-            _v$15 = columns().rightWidth;
-          _v$14 !== _p$.e && (_p$.e = _$setProp(_el$36, "flexBasis", _v$14, _p$.e));
-          _v$15 !== _p$.t && (_p$.t = _$setProp(_el$37, "flexBasis", _v$15, _p$.t));
-          return _p$;
-        }, {
-          e: undefined,
-          t: undefined
-        });
-        return _el$35;
       })() : (() => {
-        var _el$38 = _$createElement("box");
-        _$setProp(_el$38, "flexDirection", "column");
-        _$setProp(_el$38, "width", "100%");
-        _$insert(_el$38, () => view().sections.map(section => _$createComponent(StatusSectionView, {
+        var _el$33 = _$createElement("box");
+        _$setProp(_el$33, "flexDirection", "column");
+        _$setProp(_el$33, "width", "100%");
+        _$insert(_el$33, () => view().sections.map(section => _$createComponent(StatusSectionView, {
           get t() {
             return t();
           },
           section: section
         })));
-        return _el$38;
+        return _el$33;
       })();
     })(), _el$20);
     _$insert(_el$1, (() => {
-      var _c$6 = _$memo(() => view().warnings.length > 0);
-      return () => _c$6() && (() => {
-        var _el$39 = _$createElement("box");
-        _$setProp(_el$39, "marginTop", 1);
-        _$setProp(_el$39, "width", "100%");
-        _$setProp(_el$39, "flexDirection", "column");
-        _$insert(_el$39, () => view().warnings.map(warning => (() => {
-          var _el$40 = _$createElement("text");
-          _$insert(_el$40, () => warning.text);
-          _$effect(_$p => _$setProp(_el$40, "fg", warning.tone === "error" ? t().error : t().warning, _$p));
-          return _el$40;
+      var _c$5 = _$memo(() => view().warnings.length > 0);
+      return () => _c$5() && (() => {
+        var _el$34 = _$createElement("box");
+        _$setProp(_el$34, "marginTop", 1);
+        _$setProp(_el$34, "width", "100%");
+        _$setProp(_el$34, "flexDirection", "column");
+        _$insert(_el$34, () => view().warnings.map(warning => (() => {
+          var _el$35 = _$createElement("text");
+          _$insert(_el$35, () => warning.text);
+          _$effect(_$p => _$setProp(_el$35, "fg", warning.tone === "error" ? t().error : t().warning, _$p));
+          return _el$35;
         })()));
-        return _el$39;
+        return _el$34;
       })();
     })(), _el$20);
     _$insertNode(_el$20, _el$21);
