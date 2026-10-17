@@ -2,6 +2,7 @@ use super::*;
 
 mod ownership;
 mod restart;
+mod tick;
 mod vectors;
 use crate::dream_dispatch::context::*;
 use crate::dream_dispatch::domain_control::available;

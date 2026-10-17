@@ -154,10 +154,18 @@ fn verify_and_map_stay_with_typescript_without_a_filesystem_fence() {
     }
 }
 
+/// The production wiring names exactly the tasks with an end-to-end Rust path
+/// (`dispatcher::OPERATIONAL_TASKS`); a claimant able to carry every role still
+/// gets nothing else, and every other hosted task stays `host_unwired`.
 #[test]
-fn production_wiring_publishes_nothing_even_for_a_fully_capable_claimant() {
+fn production_wiring_publishes_only_the_operational_tasks() {
     let claimant = claimant_carrying_every_role(1);
     let settings = vector()["settings"]["with_models"].clone();
+    let operational: Vec<TaskName> = CANONICAL_TASKS
+        .into_iter()
+        .filter(|t| super::super::dispatcher::OPERATIONAL_TASKS.contains(t))
+        .collect();
+    assert_eq!(operational, [TaskName::Curate, TaskName::Classify]);
     for harness in ["opencode", "opencode2"] {
         let ownership = publish(&OwnershipInput {
             config: &host_config(),
@@ -167,7 +175,21 @@ fn production_wiring_publishes_nothing_even_for_a_fully_capable_claimant() {
             claimant: Some(&claimant),
         });
         assert!(ownership.activated);
-        assert_eq!(ownership.published, Vec::<TaskName>::new(), "{harness}");
+        assert_eq!(ownership.published, operational, "{harness}");
+        for (task, reason) in &ownership.withheld {
+            if task_roles(*task).is_some() {
+                assert_eq!(reason, "host_unwired", "{harness} {task:?}");
+            }
+        }
+        // Without a claimant the same wiring publishes nothing.
+        let alone = publish(&OwnershipInput {
+            config: &host_config(),
+            settings: Some(&settings),
+            harness,
+            wiring: &Wiring::production(),
+            claimant: None,
+        });
+        assert_eq!(alone.published, Vec::<TaskName>::new(), "{harness}");
     }
 }
 

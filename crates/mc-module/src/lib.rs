@@ -4140,6 +4140,8 @@ pub struct McHandler {
     /// What each plugin claimant last declared it can carry. Dream ownership is
     /// published from these declarations; see `dream_dispatch::ownership`.
     dream_claimants: Arc<dream_dispatch::ownership::ClaimantRegistry>,
+    /// The Rust dreamer's projects, timer and transports; see `dream_dispatch::tick`.
+    dream_runs: Arc<dream_dispatch::tick::DreamRuns>,
     /// Which runner each session's most recent historian and dreamer completion
     /// used in this process, and why. Read by the status and health surfaces.
     runner_choices: Arc<Mutex<runner_choices::RunnerChoiceLog>>,
@@ -4981,6 +4983,10 @@ impl McHandler {
         connection_file: Option<PathBuf>,
         route_targets: RouteTargetConfig,
     ) -> Self {
+        let dream_runs = Arc::new(dream_dispatch::tick::DreamRuns::new(
+            connection_file.clone(),
+            &route_targets,
+        ));
         let retrieval_reranker = connection_file.as_ref().map(|path| {
             Arc::new(retrieval_store::RerankTransport {
                 connection_file: path.clone(),
@@ -5025,6 +5031,7 @@ impl McHandler {
             dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
             broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
             dream_claimants: Arc::new(dream_dispatch::ownership::ClaimantRegistry::default()),
+            dream_runs,
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             memory_paused_routes: Arc::default(),
@@ -5455,6 +5462,10 @@ impl McHandler {
             dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
             broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
             dream_claimants: Arc::new(dream_dispatch::ownership::ClaimantRegistry::default()),
+            dream_runs: Arc::new(dream_dispatch::tick::DreamRuns::new(
+                None,
+                &RouteTargetConfig::default(),
+            )),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             memory_paused_routes: Arc::default(),
@@ -16259,6 +16270,7 @@ impl McHandler {
                 | "dream.child.cleanup"
                 | "dream.child.unavailable" => self.handle_dream_child(channel, method, &request),
                 "dream.ownership" => self.handle_dream_ownership(channel, &request),
+                "dream.run" => self.handle_dream_run(channel, &request),
                 "historian.pending" => self.handle_historian_pending_value(channel, &request),
                 "historian.claim" => self.handle_historian_claim_value(channel, &request),
                 "historian.heartbeat" => self.handle_historian_heartbeat_value(channel, &request),

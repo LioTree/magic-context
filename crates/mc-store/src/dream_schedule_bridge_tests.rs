@@ -114,10 +114,11 @@ impl Fixture {
         if let Some(legacy) = &legacy {
             available(self.scheduler.adopt_legacy(&scope(), &config, legacy));
         }
-        let due = available(
-            self.scheduler
-                .plan_due(&scope(), &[config.clone()], now, true),
-        );
+        let due =
+            available(
+                self.scheduler
+                    .plan_due(&scope(), std::slice::from_ref(&config), now, true),
+            );
         for due in due {
             let lease = available(self.scheduler.claim_task(
                 &DreamClaimRequest {
