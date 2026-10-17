@@ -21,6 +21,7 @@ pub use cache_codec::{
 pub mod context_boundaries;
 pub use context_boundaries::ResolvedContextBoundary;
 pub mod archive_index;
+pub mod background_state;
 pub mod context_schema;
 pub mod context_writes;
 pub mod dream_scheduler;
@@ -54,6 +55,7 @@ pub use provider_preparation::{
 #[cfg(any(test, feature = "test-support"))]
 pub use provider_resident_read::ProviderResidentAuthority;
 pub mod provider_records;
+pub mod recomp_staging;
 pub mod retrieval_vectors;
 
 /// Reserved embedding-effect queue API for transactional memory writers and
