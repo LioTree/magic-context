@@ -43,7 +43,6 @@ import {
     ModuleMemoryAuthorityError,
 } from "../../features/magic-context/memory/storage-memory";
 import { normalizeStoredProjectPath } from "../../features/magic-context/storage";
-import { dreamChildGate } from "../../hooks/magic-context/dream-child-claimant";
 import {
     projectNeedsSingleStoreMigration,
     renderSingleStoreMigrationRequiredRefusal,
@@ -425,12 +424,6 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
         description: CTX_MEMORY_DESCRIPTION,
         args: ctxMemoryArgsShape,
         async execute(rawArgs: CtxMemoryArgs, toolContext) {
-            // In a claimed dream child this tool is the task writer: the call goes to
-            // the module on the attempt's own credentials, and the module's task
-            // router applies it under the task's leases. The arguments travel as
-            // data; nothing in them selects the attempt.
-            const dreamGate = dreamChildGate(toolContext.sessionID);
-            if (dreamGate) return dreamGate.runTaskTool("ctx_memory", rawArgs);
             const parsedArgs = ctxMemoryArgsSchema.safeParse(rawArgs);
             let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxMemoryArgs;
             args = unwrapImitatedReducedArgs(args, ["action"], {

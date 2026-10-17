@@ -11,7 +11,6 @@ import {
 import { getObservedEpochFloor } from "../features/magic-context/storage-meta-persisted";
 import { agentSaveClassificationAnchor } from "../hooks/magic-context/agent-save-classification";
 import { setCtxReduceRegisteredGlobally } from "../hooks/magic-context/ctx-reduce-availability";
-import { dreamChildGate } from "../hooks/magic-context/dream-child-claimant";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
@@ -259,8 +258,6 @@ export function createToolRegistry(args: {
     return guardSubagentTools(
         surfacedTools,
         db,
-        // A claimed dream child is this plugin's own hidden child even before the
-        // host's session event marks it.
-        (id) => args.internalChildSessions?.has(id) === true || dreamChildGate(id) !== undefined,
+        (id) => args.internalChildSessions?.has(id) === true,
     );
 }

@@ -52,11 +52,6 @@ import {
     resolveKnownHistorianContextLimit,
 } from "../../hooks/magic-context/derive-budgets";
 import {
-    admitDreamChildStep,
-    dreamChildToolRefusal,
-    publishDreamChildHost,
-} from "../../hooks/magic-context/dream-child-claimant";
-import {
     assertExecutableToolInput,
     createDroppedInputGuard,
     recordToolParameters,
@@ -135,7 +130,6 @@ import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/use
 import { CTX_NOTE_DESCRIPTION, withoutSmartNoteText } from "../../tools/ctx-note/constants";
 import { CTX_NOTE_LIGHT_DESCRIPTION } from "../../tools/light-descriptions";
 import { applyJsonSchemaParameterDescriptions } from "../../tools/parameter-descriptions";
-import { createOpenCode2DreamChildHost } from "../dream-child-host";
 import { createV2RustCompactionMarkerStrategy, trimToRecordedBoundary } from "../fold/boundary";
 import { hostMediaAsset, hostUsesMediaAssets, rememberHostMedia } from "../fold/host-media";
 import { v2CompactionMarkerStrategy } from "../fold/markers";
@@ -808,11 +802,7 @@ export async function registerContext(context: V2Context) {
     // permissions allow: the host appends the user's rules after the agent's
     // own, so the agent registration alone cannot keep edit or shell away.
     await context.tool.hook("execute.before", (draft) => {
-        // A claimed dream child is checked against its own gate first: the
-        // descriptor's tools, its stop state and its token budget.
-        const refusal =
-            dreamChildToolRefusal(draft.sessionID, draft.tool) ??
-            hiddenToolCallRefusal(draft, hiddenChildHook);
+        const refusal = hiddenToolCallRefusal(draft, hiddenChildHook);
         if (refusal === undefined) return;
         sessionLog(draft.sessionID, "hidden child tool call refused", {
             tool: draft.tool,
@@ -934,21 +924,6 @@ export async function registerContext(context: V2Context) {
     // start they hold this stand-in, which reaches the executor recoverHiddenWork
     // wires later.
     const lateHiddenExecutor = createLateHiddenExecutor(() => hiddenCompletionExecutor);
-    // How a dream-child claimant for this directory builds its carrier on this
-    // instance's hidden executor. Inert: nothing is built until a claimant asks,
-    // and no claimant is built unless the transform is told to build one.
-    const withdrawDreamChildHost = publishDreamChildHost(directory, () =>
-        hiddenCompletionExecutor
-            ? createOpenCode2DreamChildHost({
-                  executor: hiddenCompletionExecutor,
-                  openReader: openStoreReader,
-                  getSession: (input) => context.session.get(input),
-                  directory,
-                  keepSubagents: config.keep_subagents === true,
-                  log: (message) => log(`[magic-context] ${message}`),
-              })
-            : undefined,
-    );
     let hiddenWorkRecovery: Promise<boolean> | undefined;
     /**
      * Wire the historian's executor and the dreamer on the first successful open
@@ -1484,10 +1459,6 @@ export async function registerContext(context: V2Context) {
         // Learn the host's message and attachment classes, so attachments on rows restored
         // after a host checkpoint can be rebuilt in the host's own shape.
         rememberHostMedia(draft.messages, draft.sessionID);
-        // The context hook runs once per model step. A claimed dream child's step
-        // is admitted here before the hidden-child bridge shapes it; a refusal
-        // throws and the host stops the child before calling the provider.
-        await admitDreamChildStep(draft.sessionID);
         if (hiddenChildHook.apply(draft)) return;
         // A dreamer that was off at boot and has since been turned on in the
         // config starts here; startDreamer stays a no-op while it is off.
@@ -2431,7 +2402,6 @@ export async function registerContext(context: V2Context) {
             rpcStopped = true;
             rpcServer.stop();
             transform?.disposeRust();
-            withdrawDreamChildHost();
             tools?.dispose();
             usageController.abort();
             await usageDone;
