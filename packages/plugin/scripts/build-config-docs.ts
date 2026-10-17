@@ -203,10 +203,11 @@ const DEV_ONLY_KEYS = new Set<string>([
     // Unsupported until the fleet stack ships publicly: activating it requires a
     // subc daemon no public install has, and documenting it would let the dev
     // gate calcify into a de-facto public mode before the cutover release.
-    "transform_mode",
-    "rust_pipeline",
     "signed_thinking_hold",
 ]);
+// transform_mode and rust_pipeline are no longer dev-only: they are deprecated
+// and ignored, and are documented as such so users with the key in an existing
+// config can see that it does nothing.
 
 export function buildConfigDocs(): string {
     const schema = buildSchema() as JsonSchema;

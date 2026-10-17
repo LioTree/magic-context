@@ -1115,8 +1115,11 @@ describe("Rust mode authority adapter", () => {
         databases.push(recoveredDb);
         registerLkgPersistence(createDbLkgPersistence(recoveredDb));
         expect(listSessionCompactionMarkers(record.sid)).toHaveLength(1);
-        expect(isRustMarkerAdmissionFenced(recoveredDb, record.sid)).toBe(true);
-        expect(loadPersistedLkgSlot(recoveredDb, record.sid)).toBeUndefined();
+        // The fence the killed child left on disk is stale in this process. Only
+        // the full-array Rust transform writes it and no host runs that transform
+        // after a restart, so it no longer blocks LKG disk hydration.
+        expect(isRustMarkerAdmissionFenced(recoveredDb, record.sid)).toBe(false);
+        expect(loadPersistedLkgSlot(recoveredDb, record.sid)).toBeDefined();
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) =>
                 method === "transform"

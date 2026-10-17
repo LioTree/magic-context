@@ -343,9 +343,9 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    where private memory/search/commit text is embedded. Query/document prefix
  *    overrides also remain user-owned so a repository cannot alter the text sent
  *    to that destination or silently force a corpus re-embed.
- *  - `transform_mode` is intentionally allowed at project tier so a repository
- *    can opt its own runtime into the experimental Rust pipeline. The resolver
- *    requires trusted user-level `subc` configuration before Rust can activate.
+ *  - `transform_mode` is accepted at project tier but ignored, like every other
+ *    tier: every host runs the TypeScript transform. `rust_pipeline` is still
+ *    stripped from project config below, although it no longer selects anything.
  *  - historian model-resolution fields (model, fallback_models, variant,
  *    thinking_level) and `runner`, including both per-harness blocks — historian
  *    model spend is user-level only. Qualifiers merge onto the user's historian

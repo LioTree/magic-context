@@ -4,6 +4,10 @@ import {
     LKG_SLOT_CHUNKS_DDL,
     LKG_SLOTS_DDL,
 } from "../../features/magic-context/migration-v94-write-split";
+import {
+    isRustMarkerAdmissionFenced,
+    setRustMarkerAdmissionFence,
+} from "../../features/magic-context/storage-replay-document";
 import type { Database } from "../../shared/sqlite";
 import {
     clearPersistedLkgSlot,
@@ -59,20 +63,35 @@ describe("LKG durable write discipline", () => {
             raw.close();
         }
     });
-    it("does not hydrate a durable slot while marker rebuilding admission is fenced", () => {
+    // Only the full-array Rust transform writes this fence, and no host runs it
+    // any more. A fence left on disk by an earlier process has no adapter to
+    // clear it, so it must not disable disk hydration for that session.
+    it("hydrates a durable slot when the fence on disk was left by an earlier process", () => {
         const { db, raw } = fixture();
         try {
-            expect(saveLkgSlotToDb(db, "ses", slot)).toBe(true);
+            expect(saveLkgSlotToDb(db, "ses-stale-fence", slot)).toBe(true);
             raw.query("INSERT INTO session_meta VALUES (?, ?)").run(
-                "ses",
+                "ses-stale-fence",
                 '{"version":2,"trailingBlank":{},"rustMarkerAdmissionFence":true}',
             );
-            expect(loadPersistedLkgSlot(db, "ses")).toBeUndefined();
-            raw.query("UPDATE session_meta SET trailing_blank_decisions=? WHERE session_id=?").run(
+            expect(isRustMarkerAdmissionFenced(db, "ses-stale-fence")).toBe(false);
+            expect(loadPersistedLkgSlot(db, "ses-stale-fence")?.jsonPrefix).toBe(slot.jsonPrefix);
+        } finally {
+            raw.close();
+        }
+    });
+    it("does not hydrate a durable slot while marker rebuilding admission is fenced in this process", () => {
+        const { db, raw } = fixture();
+        try {
+            expect(saveLkgSlotToDb(db, "ses-live-fence", slot)).toBe(true);
+            raw.query("INSERT INTO session_meta VALUES (?, ?)").run(
+                "ses-live-fence",
                 '{"version":2,"trailingBlank":{}}',
-                "ses",
             );
-            expect(loadPersistedLkgSlot(db, "ses")?.jsonPrefix).toBe(slot.jsonPrefix);
+            setRustMarkerAdmissionFence(db, "ses-live-fence", true);
+            expect(loadPersistedLkgSlot(db, "ses-live-fence")).toBeUndefined();
+            setRustMarkerAdmissionFence(db, "ses-live-fence", false);
+            expect(loadPersistedLkgSlot(db, "ses-live-fence")?.jsonPrefix).toBe(slot.jsonPrefix);
         } finally {
             raw.close();
         }

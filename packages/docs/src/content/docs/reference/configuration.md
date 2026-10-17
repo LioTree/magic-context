@@ -259,6 +259,8 @@ Behavior tuning most installs never need to touch.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `transform_mode` | `"ts"` \| `"rust"` | `"ts"` | Deprecated: ignored. Magic Context always runs its TypeScript transform; sessions on the Rust step contract are served by the CortexKit bridge. Remove this key; it no longer does anything. |
+| `rust_pipeline` | `"full_request"` \| `"provider"` | `"full_request"` | Deprecated: ignored. The in-tree Rust provider pipeline is no longer selectable; sessions on the Rust step contract are served by the CortexKit bridge. Remove this key; it no longer does anything. |
 | `rust_provider_preparation` | boolean | `false` | Experimental, user-level only: consume revision-matched provider hook preparation; disabled by default pending byte/state and timing review. |
 | `smart_notes.enabled` | boolean | `true` | Enable smart-note authoring and condition evaluation. User-level only: tool definitions are process-wide. Changes require a host restart and rebuild each session's cached prompt once. Pending notes remain stored and unchecked; already-ready notes still surface. |
 | `smart_notes.retina_handoff` | boolean | `false` | When true, dreamer skips smart notes whose surface conditions compiled to retina provider configs at authoring time. Default false keeps both paths active until the retina consumer is deployed. |

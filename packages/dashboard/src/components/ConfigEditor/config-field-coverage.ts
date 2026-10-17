@@ -141,9 +141,9 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
   subc: "user-only subc daemon routing; raw JSONC because project configs cannot provide this connection",
   shadow_embedding: "developer-only shadow embedding lane; raw JSONC and never a dashboard knob",
   transform_mode:
-    "experimental project-wide Rust runtime cutover; requires user-level subc configuration and is not exposed in the dashboard yet",
+    "deprecated and ignored; every host runs the TypeScript transform and old configs remain loadable",
   rust_pipeline:
-    "experimental user-only Rust provider pipeline; applies only to OpenCode with Rust transform mode and remains editable in Raw JSONC",
+    "deprecated and ignored; the in-tree Rust provider pipeline is no longer selectable and old configs remain loadable",
   rust_provider_preparation:
     "experimental user-only switch for prepared provider policy in the Rust provider pipeline; off by default and editable in Raw JSONC",
   signed_thinking_hold:

@@ -39,11 +39,23 @@ export function invalidateReplayEnvelopeSnapshot(db: Database, sessionId: string
 }
 
 /**
+ * Sessions whose fence was set by a Rust adapter running in this process. Only
+ * the full-array Rust transform writes the fence, and no host selects that
+ * transform any more, so a fence found on disk was left by an earlier process.
+ * Such a stale fence has no adapter left to clear it; honoring it would disable
+ * LKG disk hydration and move certification for that session for good.
+ */
+const fencedThisProcess = new Set<string>();
+
+/**
  * A marker may make the host omit earlier messages on its next request.
  * Block last-known-good request (LKG) replay until that change is proven not to
  * have happened, or a rebuilt request passes all send checks and is saved.
+ * Only a fence set in this process counts; a persisted fence from an earlier
+ * process is ignored (see `fencedThisProcess`).
  */
 export function isRustMarkerAdmissionFenced(db: Database, sessionId: string): boolean {
+    if (!fencedThisProcess.has(sessionId)) return false;
     const row = db
         .prepare(
             "SELECT COALESCE(json_extract(NULLIF(trailing_blank_decisions, ''), '$.rustMarkerAdmissionFence'), 0) AS fenced FROM session_meta WHERE session_id=?",
@@ -66,6 +78,8 @@ export function setRustMarkerAdmissionFence(
         })
     )
         throw new Error("cannot persist Rust marker admission fence");
+    if (fenced) fencedThisProcess.add(sessionId);
+    else fencedThisProcess.delete(sessionId);
 }
 
 export type PersistedTrailingBlankDecision = "keep" | `keep:${number}` | "strip";
