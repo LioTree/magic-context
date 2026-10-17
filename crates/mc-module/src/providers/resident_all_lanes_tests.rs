@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "resident_all_lanes_review_tests.rs"]
+mod independent_review;
+
 fn synthetic() -> tempfile::TempDir {
     let root = std::env::temp_dir().join("magic-context/resident-all-lanes");
     std::fs::create_dir_all(&root).unwrap();

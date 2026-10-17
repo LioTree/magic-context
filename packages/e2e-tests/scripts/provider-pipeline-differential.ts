@@ -165,7 +165,8 @@ fn provider_pipeline_driver() {
                 }
                 handler.store.set(store.clone()).ok().unwrap();
                 let binding = SessionBinding {
-                    connection_incarnation: 0, native_generation: None, principal: None,
+                    connection_incarnation: 0, native_generation: None,
+                    principal: (cmd["attest_claude_code"] == true).then(||subc_protocol::Principal::Reserved { module_id: "thalamus".into() }),
                     project_root: project, harness: cmd["harness"].as_str().unwrap().into(),
                     session: "session".into(), model_key: None, config,
                     history_budget_tokens: 100000.0,
@@ -686,7 +687,7 @@ export function buildDriver(directory: string): string {
             // optimized test executable avoids measuring debug-code overhead as a
             // provider outage; this oracle does not claim production timings.
             cwd: overlay,
-            env: { ...process.env, CARGO_TARGET_DIR: target, CARGO_PROFILE_TEST_OPT_LEVEL: "3" },
+            env: { ...process.env, CARGO_TARGET_DIR: target, CARGO_PROFILE_TEST_OPT_LEVEL: process.env.MC_PROVIDER_DRIVER_OPT_LEVEL ?? "3" },
             encoding: "utf8",
             maxBuffer: 64 * 1024 * 1024,
         },
