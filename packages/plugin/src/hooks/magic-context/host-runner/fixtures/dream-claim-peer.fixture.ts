@@ -34,7 +34,10 @@ export type PeerRouter = (
     child: string,
     tool: string,
     args: unknown,
-) => { output: unknown; receipt: { tool: string; affected_ids: string[]; details: unknown } | null };
+) => {
+    output: unknown;
+    receipt: { tool: string; affected_ids: string[]; details: unknown } | null;
+};
 
 interface PeerEntry {
     id: string;
@@ -57,7 +60,10 @@ interface PeerEntry {
     cleanupEvidence: { quiescent: boolean; retired: boolean } | null;
 }
 
-/** `TokenBudget` from mc-store, transcribed. */
+/**
+ * The charging rules of mc-store's `TokenBudget` (dream_scheduler/budget.rs),
+ * copied so this peer answers usage the way the module does.
+ */
 class PeerBudget {
     spent = 0;
     finalizeFired = false;
@@ -101,7 +107,10 @@ export class DreamClaimPeer {
     readonly effects: Array<{ child: string; tool: string; args: unknown }> = [];
     autoStart = true;
     autoClose = true;
-    /** The module answers 5000; tests may shorten it so a stop arrives sooner. */
+    /**
+     * Heartbeat interval this peer reports in control answers. The module reports
+     * 5000 ms; tests may shorten it so a stop reaches the claimant sooner.
+     */
     heartbeatIntervalMs = 5000;
 
     constructor(
@@ -146,7 +155,10 @@ export class DreamClaimPeer {
         return entry;
     }
 
-    /** Drop the open future: the module stops the entry (`DreamQueue::stop`). */
+    /**
+     * The runner stopped waiting for the child to open (its `HostCarrier::open`
+     * future was dropped): the module stops the entry, as `DreamQueue::stop` does.
+     */
     cancelOpen(id: string): void {
         const entry = this.entry(id);
         entry.stop = true;
@@ -238,7 +250,12 @@ export class DreamClaimPeer {
                     invocation: "invocation-1",
                     task: d.task ?? "curate",
                     task_lease: { scope, invocation: "invocation-1", expires_at_ms: d.deadlineMs },
-                    domain: { key: "dreaming", holder: "owner", generation: 1, expires_at_ms: d.deadlineMs },
+                    domain: {
+                        key: "dreaming",
+                        holder: "owner",
+                        generation: 1,
+                        expires_at_ms: d.deadlineMs,
+                    },
                     parent_session_id: d.session,
                     child_id: entry.child,
                     directory: d.directory,
@@ -317,7 +334,9 @@ export class DreamClaimPeer {
         const payload = JSON.stringify(body.event);
         const previous = entry.events.get(seq);
         if (previous) {
-            return previous.payload === payload ? previous.response : this.refuse("sequence_conflict");
+            return previous.payload === payload
+                ? previous.response
+                : this.refuse("sequence_conflict");
         }
         if (!entry.start || entry.hostChild === null || entry.completion)
             return this.refuse("not_running");
@@ -336,7 +355,8 @@ export class DreamClaimPeer {
             case "message": {
                 const id = String(event.message_id);
                 const known = entry.messages.get(id);
-                if (known !== undefined && known !== payload) return this.refuse("message_conflict");
+                if (known !== undefined && known !== payload)
+                    return this.refuse("message_conflict");
                 entry.messages.set(id, payload);
                 break;
             }
@@ -385,7 +405,8 @@ export class DreamClaimPeer {
         const tool = String(body.tool);
         const input = JSON.stringify({ tool, arguments: body.arguments });
         const previous = entry.calls.get(callId);
-        if (previous) return previous.input === input ? previous.response : this.refuse("call_conflict");
+        if (previous)
+            return previous.input === input ? previous.response : this.refuse("call_conflict");
         if (!entry.descriptor.allowedTools.includes(tool)) return this.refuse("tool_not_admitted");
         if (entry.budget?.refuseTool()) return this.refuse("token_budget");
         const child = entry.hostChild ?? "";

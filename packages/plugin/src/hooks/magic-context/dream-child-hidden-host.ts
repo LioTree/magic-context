@@ -44,8 +44,6 @@ export interface HiddenDreamChildHostOptions {
     /** The directory this plugin instance serves; children run only there. */
     directory: string;
     transcript(childId: string): Promise<DreamChildTranscriptMessage[]>;
-    /** Removes the child, when the executor's own close does not. */
-    remove?(childId: string): Promise<void>;
     /** True only once the host confirms the child no longer exists. */
     confirmRemoved(childId: string): Promise<boolean>;
     /**
@@ -126,7 +124,9 @@ export function createHiddenDreamChildHost(options: HiddenDreamChildHostOptions)
             const model = descriptor.model
                 ? {
                       model: descriptor.model.model,
-                      ...(descriptor.model.qualifier ? { qualifier: descriptor.model.qualifier } : {}),
+                      ...(descriptor.model.qualifier
+                          ? { qualifier: descriptor.model.qualifier }
+                          : {}),
                   }
                 : undefined;
             const handle: HiddenRunHandle = await options.executor.open({
@@ -180,10 +180,13 @@ export function createHiddenDreamChildHost(options: HiddenDreamChildHostOptions)
                         return false;
                     }
                 },
-                async retire() {
+                async retire(quiescent) {
                     try {
+                        // A child the host confirmed idle has settled, whether its
+                        // prompt finished or was interrupted: the executor's close
+                        // then removes it instead of keeping it for later recovery.
                         await options.executor.close(handle, {
-                            promptSettled: settled,
+                            promptSettled: settled || quiescent,
                             privacySensitive: true,
                             context: "[magic-context] dream child",
                             log: note,
@@ -191,14 +194,8 @@ export function createHiddenDreamChildHost(options: HiddenDreamChildHostOptions)
                     } catch (error) {
                         note(`dream child ${childId} close failed: ${String(error)}`);
                     }
-                    if (options.remove && !(await options.confirmRemoved(childId))) {
-                        try {
-                            await options.remove(childId);
-                        } catch (error) {
-                            note(`dream child ${childId} removal failed: ${String(error)}`);
-                        }
-                    }
-                    // Only the host's own answer counts as evidence of retirement.
+                    // Retirement is reported only when the host itself no longer finds
+                    // the session; a close that returned without error is not proof.
                     return options.confirmRemoved(childId);
                 },
             };
@@ -206,6 +203,8 @@ export function createHiddenDreamChildHost(options: HiddenDreamChildHostOptions)
         },
     };
 }
+
+const DREAM_CHILD_MESSAGE_LIMIT = 1_000;
 
 /** The dream agents OpenCode 1 registers (see hidden-agent-registrations.ts) and their tools. */
 export const OPENCODE1_DREAM_AGENT_TOOLS: Readonly<Record<string, readonly string[]>> = {
@@ -222,8 +221,9 @@ export const OPENCODE1_DREAM_AGENT_TOOLS: Readonly<Record<string, readonly strin
  *   locked allow-only permission map is a second layer.
  * - `steps`, `tokens`: `chat.params` runs before every model call; the gate
  *   reports the host's recorded usage there and admits the step with the module.
- * - `stop`, `retire`: `session.abort`, then `session.delete` confirmed by a
- *   failing `session.get`. With `keep_subagents` on the child is kept, so
+ * - `stop`, `retire`: `session.abort` until the host reports the child idle,
+ *   then the carrier's own teardown deletes it, confirmed by a failing
+ *   `session.get`. With `keep_subagents` on the child is kept, so
  *   retirement is not promised.
  * - `task_tools`: `ctx_memory` in a dream child goes to `dream.child.tool`.
  * - `filesystem_fence`: not declared. OpenCode's native read/grep/glob open and
@@ -258,9 +258,7 @@ function partsText(parts: unknown): string {
 }
 
 function tokenCount(value: unknown): number {
-    return typeof value === "number" && Number.isFinite(value) && value > 0
-        ? Math.floor(value)
-        : 0;
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
 /** OpenCode 1 assistant messages as the host records them, with their own usage. */
@@ -307,20 +305,17 @@ export function createOpenCode1DreamChildHost(args: {
         directory,
         ...(args.log ? { log: args.log } : {}),
         async transcript(childId) {
+            // A dream child holds at most its step cap of assistant turns plus
+            // their tool results; this bound covers the largest cap (150).
             const response = await client.session.messages({
                 path: { id: childId },
-                query: { directory },
+                query: { directory, limit: DREAM_CHILD_MESSAGE_LIMIT },
             });
             return openCode1Transcript(
                 shared.normalizeSDKResponse(response, [] as unknown[], {
                     preferResponseOnMissingData: true,
                 }),
             );
-        },
-        // The OpenCode 1 carrier keeps an unsettled child for its age-gated sweep;
-        // a dream child is deleted whether or not its prompt settled.
-        async remove(childId) {
-            await client.session.delete({ path: { id: childId }, query: { directory } });
         },
         // The dreamer's hidden agents carry the user's dreamer overrides, so a
         // dreamer turned off in config leaves them disabled on this host.
@@ -389,7 +384,9 @@ export interface OpenCode2AssistantRow {
     };
 }
 
-export function openCode2Transcript(rows: readonly OpenCode2AssistantRow[]): DreamChildTranscriptMessage[] {
+export function openCode2Transcript(
+    rows: readonly OpenCode2AssistantRow[],
+): DreamChildTranscriptMessage[] {
     return rows.map((row) => {
         const tokens = row.data.tokens;
         return {

@@ -73,6 +73,8 @@ import {
     resolveHistorianProducerLimits,
     resolveKnownHistorianContextLimit,
 } from "./derive-budgets";
+import { DreamChildClaimant, publishedDreamChildHost } from "./dream-child-claimant";
+import { createOpenCode1DreamChildHost } from "./dream-child-hidden-host";
 import { isEditTool } from "./edit-marker";
 import { invalidateAutoEmbedSession } from "./embed-session-state";
 import {
@@ -91,8 +93,6 @@ import {
     createFinalWireUsageTracker,
     estimateFinalWireInputTokens,
 } from "./final-wire-token-estimate";
-import { DreamChildClaimant, publishedDreamChildHost } from "./dream-child-claimant";
-import { createOpenCode1DreamChildHost } from "./dream-child-hidden-host";
 import { createHistorianHostRunner } from "./historian-host-runner";
 import {
     hasActiveAnthropicThinkingTurn,

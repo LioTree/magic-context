@@ -59,7 +59,7 @@ function marker(name: string): string {
     return `DREAM-PROBE-${name}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** Provider requests the dream child of scenario `id` made. */
+/** How many provider requests carry the scenario marker `id`: the dream child's own requests. */
 function providerCalls(id: string): number {
     return h.mock.requests().filter((request) => JSON.stringify(request.body).includes(id)).length;
 }
@@ -174,17 +174,17 @@ describe.skipIf(!ENABLED)("OpenCode 1 dream child claimant at the host boundary"
     test("forbidden tools: shell, file writes and subagents never execute, the permitted call beside them does", async () => {
         const sentinel = join(realpathSync(h.workdir), "dream-probe-bash-sentinel");
         const written = join(realpathSync(h.workdir), "dream-probe-write-sentinel");
-        const escape = marker("subagent-escape");
+        const escapeMarker = marker("subagent-escape");
         const { id, result } = await probe("forbidden", (call) =>
             call === 1
                 ? toolTurn(
                       toolUse("bash", { command: `touch ${sentinel}`, description: "touch" }),
                       toolUse("write", { filePath: written, content: "escaped" }),
-                      // The host offers `task` to every agent; run, it would start a
-                      // subagent outside the dream child's limits.
+                      // The host offers `task` to every agent; if it ran, it would start
+                      // a subagent outside the dream child's limits.
                       toolUse("task", {
                           description: "escape",
-                          prompt: `Run outside the dream child. ${escape}`,
+                          prompt: `Run outside the dream child. ${escapeMarker}`,
                           subagent_type: "general",
                       }),
                       toolUse("ctx_memory", { action: "get", ids: [1] }),
@@ -204,7 +204,7 @@ describe.skipIf(!ENABLED)("OpenCode 1 dream child claimant at the host boundary"
         // escape are the dream child's own, which carry its tool call.
         const subagentCalls = h.mock.requests().filter((request) => {
             const body = JSON.stringify(request.body);
-            return body.includes(escape) && !body.includes(id);
+            return body.includes(escapeMarker) && !body.includes(id);
         });
         expect(subagentCalls).toHaveLength(0);
         expect(results.some((line) => line.includes("task refused"))).toBe(true);

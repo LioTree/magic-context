@@ -52,6 +52,11 @@ import {
     resolveKnownHistorianContextLimit,
 } from "../../hooks/magic-context/derive-budgets";
 import {
+    admitDreamChildStep,
+    dreamChildToolRefusal,
+    publishDreamChildHost,
+} from "../../hooks/magic-context/dream-child-claimant";
+import {
     assertExecutableToolInput,
     createDroppedInputGuard,
     recordToolParameters,
@@ -130,6 +135,7 @@ import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/use
 import { CTX_NOTE_DESCRIPTION, withoutSmartNoteText } from "../../tools/ctx-note/constants";
 import { CTX_NOTE_LIGHT_DESCRIPTION } from "../../tools/light-descriptions";
 import { applyJsonSchemaParameterDescriptions } from "../../tools/parameter-descriptions";
+import { createOpenCode2DreamChildHost } from "../dream-child-host";
 import { createV2RustCompactionMarkerStrategy, trimToRecordedBoundary } from "../fold/boundary";
 import { hostMediaAsset, hostUsesMediaAssets, rememberHostMedia } from "../fold/host-media";
 import { v2CompactionMarkerStrategy } from "../fold/markers";
@@ -146,7 +152,6 @@ import { restoreRow } from "../fold/restore";
 import { seedV2ForkFromParent, sessionHasMagicContextState } from "../fork-inheritance";
 import { cleanupLegacyHiddenChildren } from "../hidden-child-cleanup";
 import { nativeSessionRemove } from "../hidden-child-native";
-import { createOpenCode2DreamChildHost } from "../dream-child-host";
 import { createLateHiddenExecutor, createV2HiddenCompletionExecutor } from "../hidden-completion";
 import { gaDatabasePath, type V2StoreReader, V2StoreReaderPool } from "../store-reader";
 import {
@@ -163,11 +168,6 @@ import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
 import { registerV2DreamScheduleTimer } from "./dream-timer";
 import { startDreamTrigger } from "./dream-trigger";
 import { generateReplayAnchor, V2GenerateReplay } from "./generate";
-import {
-    admitDreamChildStep,
-    dreamChildToolRefusal,
-    publishDreamChildHost,
-} from "../../hooks/magic-context/dream-child-claimant";
 import { HiddenChildHook, hiddenToolCallRefusal, registerHiddenChildAgents } from "./hidden-child";
 import { hiddenTerminalError } from "./hidden-terminal-error";
 import { V2LkgSystemReplay } from "./lkg-system";

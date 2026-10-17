@@ -2,10 +2,10 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+    admitDreamChildStep,
     type DreamChildCapabilities,
     DreamChildClaimant,
     type DreamChildCredential,
-    type DreamChildDescriptor,
     type DreamChildEvent,
     type DreamChildHost,
     type DreamChildRun,
@@ -18,7 +18,6 @@ import {
     dreamChildGate,
     dreamClaimWire,
     dreamRefusalOf,
-    admitDreamChildStep,
 } from "../../dream-child-claimant";
 
 /**
@@ -93,7 +92,12 @@ function encode(vector: VectorCase): Record<string, unknown> {
             body = dreamClaimWire.event(credentialOf(r), Number(r.seq), r.event as DreamChildEvent);
             break;
         case "dream.child.tool":
-            body = dreamClaimWire.tool(credentialOf(r), String(r.call_id), String(r.tool), r.arguments);
+            body = dreamClaimWire.tool(
+                credentialOf(r),
+                String(r.call_id),
+                String(r.tool),
+                r.arguments,
+            );
             break;
         case "dream.child.cleanup":
             body = dreamClaimWire.cleanup(credentialOf(r), {
@@ -254,7 +258,7 @@ describe("dream-claim-v1 lifecycle replay through the running claimant", () => {
         const host: DreamChildHost = {
             capabilities,
             refusal: () => undefined,
-            create: async (descriptor: DreamChildDescriptor) =>
+            create: async () =>
                 new VectorRun("host-child-1", (forged.request.arguments as unknown) ?? {}),
         };
         const control = (stop: boolean) => ({
@@ -277,7 +281,10 @@ describe("dream-claim-v1 lifecycle replay through the running claimant", () => {
                 sent.push(request);
                 switch (method) {
                     case "dream.child.pending":
-                        return { ok: true, entries: [{ entry_id: "<entry-1>", deadline_ms: 70_000 }] };
+                        return {
+                            ok: true,
+                            entries: [{ entry_id: "<entry-1>", deadline_ms: 70_000 }],
+                        };
                     case "dream.child.claim":
                         return claim.response;
                     case "dream.child.opened":
@@ -332,7 +339,10 @@ describe("dream-claim-v1 lifecycle replay through the running claimant", () => {
                 sent.push({ ...body, method });
                 switch (method) {
                     case "dream.child.pending":
-                        return { ok: true, entries: [{ entry_id: "<entry-2>", deadline_ms: 70_000 }] };
+                        return {
+                            ok: true,
+                            entries: [{ entry_id: "<entry-2>", deadline_ms: 70_000 }],
+                        };
                     case "dream.child.claim": {
                         const granted = structuredClone(
                             vector("fresh_attempt_after_cleanup").response,

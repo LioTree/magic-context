@@ -11,6 +11,7 @@ import {
 import { getObservedEpochFloor } from "../features/magic-context/storage-meta-persisted";
 import { agentSaveClassificationAnchor } from "../hooks/magic-context/agent-save-classification";
 import { setCtxReduceRegisteredGlobally } from "../hooks/magic-context/ctx-reduce-availability";
+import { dreamChildGate } from "../hooks/magic-context/dream-child-claimant";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
@@ -32,7 +33,6 @@ import { parameterDescriptionsFor } from "../tools/parameter-descriptions";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
 import type { RustToolBackends } from "./rust-tool-backends";
-import { dreamChildGate } from "../hooks/magic-context/dream-child-claimant";
 import { guardSubagentTools } from "./subagent-tool-policy";
 import type { PluginContext } from "./types";
 

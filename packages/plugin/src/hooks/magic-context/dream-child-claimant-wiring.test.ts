@@ -5,10 +5,10 @@ import type { ContextDatabase } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { Database } from "../../shared/sqlite";
+import { publishDreamChildHost } from "./dream-child-claimant";
 import { resetLkgSlotsForTest } from "./lkg-slot";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
-import { publishDreamChildHost } from "./dream-child-claimant";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
 import type { TransformDeps } from "./transform";
 import type { MessageLike } from "./transform-operations";
@@ -83,7 +83,8 @@ function createFixture(sessionId: string, dreamChildClaimantEnabled?: boolean) {
         sessionDirectoryBySession: new Map([[sessionId, project]]),
         transformMode: "rust",
         rustModeModuleClient: moduleClient,
-        // Broca: the historian pull loop stays out, so only dream-child traffic is new.
+        // With the historian on Broca this transform polls no historian runs, so any
+        // new module traffic is the dream-child claimant's.
         historianRunner: "broca",
         ...(dreamChildClaimantEnabled !== undefined ? { dreamChildClaimantEnabled } : {}),
     };
@@ -112,7 +113,6 @@ function createFixture(sessionId: string, dreamChildClaimantEnabled?: boolean) {
     };
 }
 
-
 test("off by default: passes send no dream-child operation and serve the same messages", async () => {
     const off = createFixture("dream-wiring-default");
     const explicit = createFixture("dream-wiring-default", false);
@@ -130,7 +130,8 @@ test("off by default: passes send no dream-child operation and serve the same me
 });
 
 test("switched on, each pass looks for dream children on its own session's route", async () => {
-    // The carrier OpenCode 2 publishes for its directory; nothing is created here.
+    // Stands in for the dream child carrier an OpenCode 2 instance publishes for
+    // its directory; no child is created in this test.
     const withdraw = publishDreamChildHost(project, () => ({
         capabilities: {
             tools: ["ctx_memory"],
@@ -153,7 +154,10 @@ test("switched on, each pass looks for dream children on its own session's route
         await fixture.run();
         await fixture.run();
         const lane = fixture.bodies.filter(({ method }) => method.startsWith("dream.child."));
-        expect(lane.map(({ method }) => method)).toEqual(["dream.child.pending", "dream.child.pending"]);
+        expect(lane.map(({ method }) => method)).toEqual([
+            "dream.child.pending",
+            "dream.child.pending",
+        ]);
         for (const { method, body } of lane) expect(body).toEqual({ method, v: 1 });
     } finally {
         await fixture.dispose();

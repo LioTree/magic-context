@@ -3,8 +3,8 @@ import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildHiddenAgentRegistrations } from "../../agents/hidden-agent-registrations";
-import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { Database } from "../../shared/sqlite";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { createCtxMemoryTools } from "../../tools/ctx-memory";
 import { hiddenAgentAllowedTools } from "../../v2/hooks/hidden-child";
 import type {
@@ -82,9 +82,9 @@ describe("what each host declares and refuses", () => {
             historianDisallowed: [],
         });
         for (const [agent, tools] of Object.entries(OPENCODE1_DREAM_AGENT_TOOLS)) {
-            expect(registered.find((registration) => registration.id === agent)?.allowedTools).toEqual(
-                [...tools],
-            );
+            expect(
+                registered.find((registration) => registration.id === agent)?.allowedTools,
+            ).toEqual([...tools]);
         }
         for (const [agent, tools] of Object.entries(OPENCODE2_DREAM_AGENT_TOOLS)) {
             expect(hiddenAgentAllowedTools(agent)).toEqual([...tools]);
@@ -98,14 +98,19 @@ describe("what each host declares and refuses", () => {
 
     it("refuses a descriptor needing a native read tool, because neither host fences paths", () => {
         const mapper = descriptor({ agent: "dreamer-memory-mapper", allowedTools: ["read"] });
-        expect(hiddenDreamChildRefusal(mapper, oc1)).toBe("agent_unsupported:dreamer-memory-mapper");
+        expect(hiddenDreamChildRefusal(mapper, oc1)).toBe(
+            "agent_unsupported:dreamer-memory-mapper",
+        );
         const fenced = {
             ...oc1,
             capabilities: { ...oc1.capabilities, tools: ["ctx_memory", "read"] },
             agentTools: { ...oc1.agentTools, reader: ["read"] },
         };
         expect(
-            hiddenDreamChildRefusal(descriptor({ agent: "reader", allowedTools: ["read"] }), fenced),
+            hiddenDreamChildRefusal(
+                descriptor({ agent: "reader", allowedTools: ["read"] }),
+                fenced,
+            ),
         ).toBe("filesystem_fence_unavailable:read");
     });
 
@@ -116,9 +121,12 @@ describe("what each host declares and refuses", () => {
                 oc1,
             ),
         ).toBe("tool_not_carried:dreamer-classifier:ctx_memory");
-        expect(hiddenDreamChildRefusal(descriptor({ agent: "dreamer-reviewer", allowedTools: [] }), oc2)).toBe(
-            "agent_unsupported:dreamer-reviewer",
-        );
+        expect(
+            hiddenDreamChildRefusal(
+                descriptor({ agent: "dreamer-reviewer", allowedTools: [] }),
+                oc2,
+            ),
+        ).toBe("agent_unsupported:dreamer-reviewer");
     });
 
     it("refuses a missing model where the host cannot honour the creating session's default", () => {
@@ -165,8 +173,13 @@ class FakeExecutor implements HiddenCompletionExecutor {
     async recoveryState() {
         return this.state;
     }
-    async close(): Promise<void> {
+    settlements: boolean[] = [];
+    async close(
+        _handle: HiddenRunHandle | null,
+        settlement: { promptSettled: boolean },
+    ): Promise<void> {
         this.closed += 1;
+        this.settlements.push(settlement.promptSettled);
     }
 }
 
@@ -182,7 +195,10 @@ describe("hidden child carrier", () => {
 
     it("opens a dream-task child with the exact selected model and sends the claim's prompt once", async () => {
         const executor = new FakeExecutor();
-        const run = await build(executor, () => true).create(descriptor(), new AbortController().signal);
+        const run = await build(executor, () => true).create(
+            descriptor(),
+            new AbortController().signal,
+        );
         expect(executor.opened[0]).toMatchObject({
             parentSessionId: "parent",
             agent: "dreamer",
@@ -209,7 +225,10 @@ describe("hidden child carrier", () => {
     it("reports quiescence from the host's record when there was nothing left to interrupt", async () => {
         const executor = new FakeExecutor();
         executor.interruptFails = true;
-        const run = await build(executor, () => true).create(descriptor(), new AbortController().signal);
+        const run = await build(executor, () => true).create(
+            descriptor(),
+            new AbortController().signal,
+        );
         expect(await run.abort()).toBe(true);
         executor.state = "active";
         expect(await run.abort()).toBe(false);
@@ -218,10 +237,17 @@ describe("hidden child carrier", () => {
     it("reports retirement only when the host confirms the child is gone", async () => {
         const executor = new FakeExecutor();
         let gone = false;
-        const run = await build(executor, () => gone).create(descriptor(), new AbortController().signal);
-        expect(await run.retire()).toBe(false);
+        const run = await build(executor, () => gone).create(
+            descriptor(),
+            new AbortController().signal,
+        );
+        expect(await run.retire(true)).toBe(false);
         gone = true;
-        expect(await run.retire()).toBe(true);
+        expect(await run.retire(true)).toBe(true);
+        // A child confirmed idle is closed as settled, so the carrier removes it
+        // rather than keeping it for recovery; one not confirmed idle is not.
+        await run.retire(false);
+        expect(executor.settlements).toEqual([true, true, false]);
     });
 
     it("refuses an agent the host does not currently register", async () => {
@@ -248,7 +274,12 @@ describe("host transcripts", () => {
                         id: "a1",
                         role: "assistant",
                         finish: "tool-calls",
-                        tokens: { input: 10, output: 5, reasoning: 3, cache: { read: 2, write: 1 } },
+                        tokens: {
+                            input: 10,
+                            output: 5,
+                            reasoning: 3,
+                            cache: { read: 2, write: 1 },
+                        },
                     },
                     parts: [{ type: "text", text: "hi" }, { type: "tool" }],
                 },
@@ -344,4 +375,3 @@ describe("ctx_memory in a claimed dream child", () => {
         }
     });
 });
-

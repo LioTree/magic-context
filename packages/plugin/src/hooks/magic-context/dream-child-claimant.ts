@@ -194,7 +194,10 @@ export const dreamClaimWire = {
         quiescent: evidence.quiescent,
         retired: evidence.retired,
     }),
-    /** Pre-start give-back. Only sent when nothing was created or the child is already retired. */
+    /**
+     * Hands a claimed entry back before it started. Sent only when no child was
+     * created, or the created child is already confirmed idle and removed.
+     */
     unavailable: (credential: DreamChildCredential): Record<string, unknown> => ({
         v: DREAM_CLAIM_VERSION,
         ...credentialFields(credential),
@@ -204,7 +207,8 @@ export const dreamClaimWire = {
 };
 
 function credentialFields(credential: DreamChildCredential): DreamChildCredential {
-    // Copied field by field so nothing else the record holds can ride along.
+    // Only the four credential fields, so no other property of the object passed
+    // in can reach the wire.
     return {
         entry_id: credential.entry_id,
         token: credential.token,
@@ -385,8 +389,12 @@ export interface DreamChildRun {
     transcript(): Promise<DreamChildTranscriptMessage[]>;
     /** Interrupts the child; resolves true only once the host confirms it is idle. */
     abort(): Promise<boolean>;
-    /** Removes the child; resolves true only once the host confirms it is gone. */
-    retire(): Promise<boolean>;
+    /**
+     * Removes the child; resolves true only once the host confirms it is gone.
+     * `quiescent` says the host confirmed the child idle, so nothing of it is
+     * still running when it is removed.
+     */
+    retire(quiescent: boolean): Promise<boolean>;
 }
 
 /** The host-specific half: which descriptors it can carry and how it creates a child. */
@@ -635,7 +643,9 @@ export class DreamChildAttempt implements DreamChildGate {
         }
         if (this.run && !this.aborting) {
             this.aborting = this.run.abort().catch((error) => {
-                this.deps.log(`dream child ${this.hostChildId} abort failed: ${describeError(error)}`);
+                this.deps.log(
+                    `dream child ${this.hostChildId} abort failed: ${describeError(error)}`,
+                );
                 return false;
             });
         }
@@ -723,7 +733,9 @@ export class DreamChildAttempt implements DreamChildGate {
     /** Ordered event delivery: one in flight at a time, each with the next sequence number. */
     private sendEvent(
         event: DreamChildEvent,
-    ): Promise<{ ok: true; budgetAction: DreamBudgetAction | null } | { ok: false; refusal: string }> {
+    ): Promise<
+        { ok: true; budgetAction: DreamBudgetAction | null } | { ok: false; refusal: string }
+    > {
         const next = this.eventTail.then(async () => {
             this.seq += 1;
             const body = dreamClaimWire.event(this.credential, this.seq, event);
@@ -880,7 +892,9 @@ export class DreamChildAttempt implements DreamChildGate {
             await this.reportUsage(true);
             messages = await run.transcript();
         } catch (error) {
-            this.deps.log(`dream child ${this.hostChildId} transcript unreadable: ${describeError(error)}`);
+            this.deps.log(
+                `dream child ${this.hostChildId} transcript unreadable: ${describeError(error)}`,
+            );
         }
         for (const message of messages) {
             if (!message.finished || message.text.length === 0 || this.announced.has(message.id))
@@ -900,7 +914,8 @@ export class DreamChildAttempt implements DreamChildGate {
             text: last?.text ?? "",
             length_capped: last?.finish === "length" || last?.finish === "max_tokens",
         });
-        if (!ack.ok) this.deps.log(`dream child ${this.hostChildId} completion refused: ${ack.refusal}`);
+        if (!ack.ok)
+            this.deps.log(`dream child ${this.hostChildId} completion refused: ${ack.refusal}`);
     }
 
     /** Give back an entry with no child: nothing was created, so nothing runs. */
@@ -929,14 +944,14 @@ export class DreamChildAttempt implements DreamChildGate {
         const quiescent = await this.stop(this.stopReason ?? "cleanup");
         let retired = false;
         try {
-            retired = await run.retire();
+            retired = await run.retire(quiescent);
         } catch (error) {
             this.deps.log(`dream child ${this.hostChildId} retire failed: ${describeError(error)}`);
         }
         const evidence = { quiescent, retired };
         if (!this.started && !this.moduleStopped) {
-            // Stopped here before start while the module still waits: the explicit
-            // pre-start give-back, with the same quiescent+retired evidence.
+            // This claimant stopped before the module started the attempt: hand the
+            // entry back as unavailable, with the same quiescent+retired evidence.
             const response = await this.send(
                 "dream.child.unavailable",
                 dreamClaimWire.cleanup(this.credential, evidence),
@@ -946,8 +961,8 @@ export class DreamChildAttempt implements DreamChildGate {
                 if (refusal !== null) this.deps.log(`dream unavailable refused: ${refusal}`);
                 return;
             }
-            // The module started the attempt before this host saw it; take the
-            // ordinary completion-and-cleanup path.
+            // The module had already started the attempt (this claimant had not seen
+            // the start yet), so take the ordinary completion-and-cleanup path.
             this.started = true;
         }
         if (this.started) await this.report();
@@ -964,9 +979,10 @@ export class DreamChildAttempt implements DreamChildGate {
                 );
                 return;
             }
-            // The module has not latched its stop yet: it is still waiting for the
-            // completion just reported, or for its own deadline. Ask again until it
-            // does. Past the deadline any heartbeat latches it.
+            // The module accepts cleanup only after it has stopped the entry, which
+            // it does once it has the completion just reported (and closes the
+            // child) or once the deadline passes. Keep asking until then; past the
+            // deadline any heartbeat makes the module stop the entry.
             if (this.deps.now() > this.descriptor.deadlineMs + 10_000) {
                 this.deps.log(`dream cleanup for ${this.hostChildId} gave up: ${refusal}`);
                 return;
@@ -1016,8 +1032,8 @@ export class DreamChildAttempt implements DreamChildGate {
             // tool the host runs on it from now on goes through this gate.
             gateRegistry().set(run.hostChildId, this);
             if (this.stopReason) void this.stop(this.stopReason);
-            // A child created after a stop is still reported, so the module can pin
-            // it and expect its cleanup.
+            // A child created after a stop is still reported: the module records its
+            // native id and then accepts the cleanup acknowledgement for it.
             let opened: ControlRead;
             try {
                 opened = this.readControl(
@@ -1051,13 +1067,16 @@ export class DreamChildAttempt implements DreamChildGate {
                 await run.prompt(this.abortController.signal);
             } catch (error) {
                 if (!this.stopReason) {
-                    this.deps.log(`dream child ${run.hostChildId} prompt failed: ${describeError(error)}`);
+                    this.deps.log(
+                        `dream child ${run.hostChildId} prompt failed: ${describeError(error)}`,
+                    );
                 }
             }
             this.settling = true;
             await this.report();
             this.wake?.();
-            // The module closes the child once it has the result; wait for that stop.
+            // Once the module has the result it closes the child, which shows up as
+            // stop on the next heartbeat; the control loop ends when it sees it.
             await Promise.all(background);
         } finally {
             this.cancelDeadline?.();
@@ -1085,7 +1104,10 @@ export class DreamChildAttempt implements DreamChildGate {
  * than by a pass.
  */
 export class DreamChildClaimant {
-    private readonly attempts = new Map<string, { attempt: DreamChildAttempt; done: Promise<void> }>();
+    private readonly attempts = new Map<
+        string,
+        { attempt: DreamChildAttempt; done: Promise<void> }
+    >();
     private readonly sessions = new Map<string, number>();
     private readonly polling = new Map<string, Promise<void>>();
     private readonly epoch: string;
@@ -1212,7 +1234,8 @@ export class DreamChildClaimant {
             const record = response as Record<string, unknown>;
             const descriptor = isRecord(record.descriptor) ? record.descriptor : {};
             if (typeof record.token === "string" && typeof descriptor.child_id === "string") {
-                // Nothing was created, so the explicit give-back is honest.
+                // No child was created for an unreadable claim, so handing the entry
+                // back with quiescent+retired evidence is truthful.
                 await this.deps
                     .call({
                         method: "dream.child.unavailable",
@@ -1249,7 +1272,9 @@ export class DreamChildClaimant {
         // Started, not awaited: one slow child must not delay claiming another.
         const done = attempt
             .execute()
-            .catch((error) => this.log(`attempt ${entryId} ended unexpectedly: ${describeError(error)}`))
+            .catch((error) =>
+                this.log(`attempt ${entryId} ended unexpectedly: ${describeError(error)}`),
+            )
             .finally(() => this.attempts.delete(entryId));
         this.attempts.set(entryId, { attempt, done });
     }

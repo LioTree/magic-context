@@ -6,8 +6,8 @@ import {
     openCode2DreamChildCapabilities,
     openCode2Transcript,
 } from "../hooks/magic-context/dream-child-hidden-host";
-import type { HiddenChildRows } from "./hidden-child-record";
 import { isSessionNotFound } from "./hidden-child-native";
+import type { HiddenChildRows } from "./hidden-child-record";
 
 /**
  * The OpenCode 2 carrier for a claimed dream child: the native hidden-child

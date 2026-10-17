@@ -43,11 +43,11 @@ import {
     ModuleMemoryAuthorityError,
 } from "../../features/magic-context/memory/storage-memory";
 import { normalizeStoredProjectPath } from "../../features/magic-context/storage";
+import { dreamChildGate } from "../../hooks/magic-context/dream-child-claimant";
 import {
     projectNeedsSingleStoreMigration,
     renderSingleStoreMigrationRequiredRefusal,
 } from "../../hooks/magic-context/single-store-refusal";
-import { dreamChildGate } from "../../hooks/magic-context/dream-child-claimant";
 import { sessionLog } from "../../shared/logger";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import {

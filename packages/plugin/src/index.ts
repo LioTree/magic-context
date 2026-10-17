@@ -42,6 +42,10 @@ import {
     COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT,
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./hooks/magic-context/compartment-prompt";
+import {
+    admitDreamChildStep,
+    dreamChildToolRefusal,
+} from "./hooks/magic-context/dream-child-claimant";
 import { recordToolParameters } from "./hooks/magic-context/dropped-input-guard";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
 import {
@@ -103,10 +107,6 @@ import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 import { importPluginModule } from "./shared/stale-plugin-build";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
-import {
-    admitDreamChildStep,
-    dreamChildToolRefusal,
-} from "./hooks/magic-context/dream-child-claimant";
 import { applyHiddenSubagentTemperature } from "./shared/subagent-temperature";
 import { reloadWindowOverlay } from "./shared/window-geometry";
 import { registerStandalonePluginMarker } from "./standalone-plugin-marker";

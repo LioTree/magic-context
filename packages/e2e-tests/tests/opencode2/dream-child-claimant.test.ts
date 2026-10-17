@@ -177,8 +177,8 @@ describe.skipIf(!ENABLED)("OpenCode 2 dream child claimant at the host boundary"
             model: { providerID: "openai", id: "mock-model" },
         } as never);
         parent = (created as { id: string }).id;
-        // Magic Context opens its store, and with it the hidden executor the
-        // carrier runs on, when the first session turn reaches it.
+        // Magic Context opens its store on the first session turn, and only then
+        // builds the hidden-child executor the probe's dream children run on.
         await client.session.prompt({ sessionID: parent, text: "bootstrap the dream probe" } as never);
         await client.session.wait({ sessionID: parent } as never, { signal: AbortSignal.timeout(60_000) } as never);
         await waitFile(join(host.cwd, "dream-probe-ready"));
@@ -218,13 +218,13 @@ describe.skipIf(!ENABLED)("OpenCode 2 dream child claimant at the host boundary"
     test("forbidden tools: shell, file writes and subagents never execute, the permitted call beside them does", async () => {
         const sentinel = join(realpathSync(host.cwd), "dream-probe-bash-sentinel");
         const written = join(realpathSync(host.cwd), "dream-probe-write-sentinel");
-        const escape = marker("subagent-escape");
+        const escapeMarker = marker("subagent-escape");
         const { id, result } = await probe("forbidden", (call) =>
             call === 1
                 ? toolTurn(
                       functionCall("bash", { command: `touch ${sentinel}`, description: "touch" }),
                       functionCall("write", { filePath: written, content: "escaped" }),
-                      functionCall("task", { description: "escape", prompt: `Run outside. ${escape}`, subagent_type: "general" }),
+                      functionCall("task", { description: "escape", prompt: `Run outside. ${escapeMarker}`, subagent_type: "general" }),
                       functionCall("ctx_memory", { action: "get", ids: [1] }),
                   )
                 : { text: "forbidden probe done", usage: USAGE as never },
@@ -233,7 +233,7 @@ describe.skipIf(!ENABLED)("OpenCode 2 dream child claimant at the host boundary"
         expect(existsSync(written)).toBe(false);
         const subagentCalls = host.mock.requests().filter((request) => {
             const body = JSON.stringify(request.body);
-            return body.includes(escape) && !body.includes(id);
+            return body.includes(escapeMarker) && !body.includes(id);
         });
         expect(subagentCalls).toHaveLength(0);
         expect(result.effects.map((effect) => effect.tool)).toEqual(["ctx_memory"]);

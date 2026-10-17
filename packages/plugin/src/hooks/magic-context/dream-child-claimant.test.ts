@@ -3,8 +3,8 @@ import {
     admitDreamChildStep,
     DREAM_TASK_ROUTED_TOOLS,
     type DreamChildCapabilities,
-    type DreamChildDescriptor,
     DreamChildClaimant,
+    type DreamChildDescriptor,
     type DreamChildHost,
     type DreamChildRun,
     type DreamChildTranscriptMessage,
@@ -202,11 +202,11 @@ function setup(args: {
     return { peer, host, claimant, entryId, logs, run };
 }
 
-
 /**
- * A module that admits every step and applies every tool call: the claimant's
- * own guards are then the only thing between the child and the next step or
- * effect, which is what these tests pin.
+ * A module that admits every step and applies every tool call. The claimant's
+ * own step cap, budget stop, finalize block and stop on a terminal tool refusal
+ * are then the only thing between the child and its next step or effect; the
+ * tests using this pin each of those guards on its own.
  */
 function permissive(peer: DreamClaimPeer, options: { leaseLostOnSecondTool?: boolean } = {}): void {
     const original = peer.route.bind(peer);
@@ -224,7 +224,8 @@ function permissive(peer: DreamClaimPeer, options: { leaseLostOnSecondTool?: boo
         }
         if (method === "dream.child.tool") {
             tools += 1;
-            if (options.leaseLostOnSecondTool && tools === 2) return { ok: false, refusal: "LeaseLost" };
+            if (options.leaseLostOnSecondTool && tools === 2)
+                return { ok: false, refusal: "LeaseLost" };
             peer.effects.push({ child: "", tool: String(body.tool), args: body.arguments });
             return { ok: true, output: { effect: "applied" }, receipt: null };
         }
@@ -246,7 +247,11 @@ describe("dream child claimant", () => {
     it("runs one selected attempt: create, report, wait for start, prompt once, report, clean up", async () => {
         const { peer, host, entryId, run } = setup({
             script: [
-                { text: "looking", tools: [{ name: "ctx_memory", args: { action: "list" } }], usage: { input: 10, output: 5, cache_read: 2, cache_write: 1 } },
+                {
+                    text: "looking",
+                    tools: [{ name: "ctx_memory", args: { action: "list" } }],
+                    usage: { input: 10, output: 5, cache_read: 2, cache_write: 1 },
+                },
                 { text: "done", usage: { input: 20, output: 7, cache_read: 0, cache_write: 0 } },
             ],
         });
@@ -324,12 +329,15 @@ describe("dream child claimant", () => {
 
     it("refuses a native tool the descriptor allows when the host declares no filesystem fence", async () => {
         const { peer, host, run } = setup({
-            script: [{ tools: [{ name: "read", args: { filePath: "../outside" } }] }, { text: "done" }],
+            script: [
+                { tools: [{ name: "read", args: { filePath: "../outside" } }] },
+                { text: "done" },
+            ],
             descriptor: { allowedTools: ["ctx_memory", "read"] },
             capabilities: { ...CAPABILITIES, tools: ["ctx_memory", "read"] },
         });
-        // A module that wrongly admitted the claim without the fence capability:
-        // the host's own tool hook must still refuse the native read.
+        // Simulates a module that admits the claim although the host declared no
+        // filesystem fence: the host's own tool hook must still refuse the read.
         const original = peer.route.bind(peer);
         peer.route = (session, method, body) =>
             original(
@@ -347,7 +355,9 @@ describe("dream child claimant", () => {
             );
         await run();
         expect(host.runs[0]?.nativeEffects).toEqual([]);
-        expect(host.runs[0]?.refusals.some((refusal) => refusal.includes("read refused"))).toBe(true);
+        expect(host.runs[0]?.refusals.some((refusal) => refusal.includes("read refused"))).toBe(
+            true,
+        );
     });
 
     it("stops before step N+1 when the step cap N is reached", async () => {
@@ -366,7 +376,10 @@ describe("dream child claimant", () => {
     it("refuses the next step and tool once reported usage exhausts the token budget", async () => {
         const { peer, host, entryId, run } = setup({
             script: [
-                { text: "expensive", usage: { input: 90, output: 1000, cache_read: 10, cache_write: 1 } },
+                {
+                    text: "expensive",
+                    usage: { input: 90, output: 1000, cache_read: 10, cache_write: 1 },
+                },
                 { tools: [{ name: "ctx_memory", args: { action: "list" } }] },
                 { text: "never" },
             ],
@@ -377,7 +390,9 @@ describe("dream child claimant", () => {
         expect(child?.providerCalls).toBe(1);
         expect(peer.effects).toEqual([]);
         const usage = events(peer).find((event) => event.kind === "usage");
-        expect(usage).toMatchObject({ usage: { input: 90, output: 1000, cache_read: 10, cache_write: 1 } });
+        expect(usage).toMatchObject({
+            usage: { input: 90, output: 1000, cache_read: 10, cache_write: 1 },
+        });
         expect(peer.entry(entryId).cleaned).toBe(true);
     });
 
@@ -441,7 +456,7 @@ describe("dream child claimant", () => {
                 peer.close(entryId);
             return original(session, method, body);
         };
-        // A short heartbeat interval so the stop arrives quickly.
+        // A short heartbeat interval, so the module's stop reaches the claimant quickly.
         peer.heartbeatIntervalMs = 20;
         await run();
         expect(host.runs[0]?.aborted).toBe(true);
@@ -468,7 +483,11 @@ describe("dream child claimant", () => {
         const original = peer.route.bind(peer);
         let heartbeats = 0;
         peer.route = (session, method, body) => {
-            if (method === "dream.child.heartbeat" && peer.entry(entryId).hostChild && ++heartbeats === 4)
+            if (
+                method === "dream.child.heartbeat" &&
+                peer.entry(entryId).hostChild &&
+                ++heartbeats === 4
+            )
                 peer.entry(entryId).start = true;
             return original(session, method, body);
         };
@@ -524,16 +543,20 @@ describe("dream child claimant", () => {
         expect(methods(peer)).toEqual(["dream.child.pending", "dream.child.claim"]);
     });
 
-
     it("refuses a task tool its descriptor does not allow, even one the host carries", async () => {
         const { peer, host, run } = setup({
-            script: [{ tools: [{ name: "ctx_memory", args: { action: "archive", ids: [1] } }] }, { text: "done" }],
+            script: [
+                { tools: [{ name: "ctx_memory", args: { action: "archive", ids: [1] } }] },
+                { text: "done" },
+            ],
             descriptor: { allowedTools: [] },
         });
         await run();
         expect(peer.effects).toEqual([]);
         expect(peer.requests.some((request) => request.method === "dream.child.tool")).toBe(false);
-        expect(host.runs[0]?.refusals.some((refusal) => refusal.includes("ctx_memory refused"))).toBe(true);
+        expect(
+            host.runs[0]?.refusals.some((refusal) => refusal.includes("ctx_memory refused")),
+        ).toBe(true);
     });
 
     it("keeps its own step cap against a module that would admit another step", async () => {
@@ -549,7 +572,10 @@ describe("dream child claimant", () => {
     it("keeps its own budget stop against a module that would admit another step", async () => {
         const { peer, host, run } = setup({
             script: [
-                { text: "expensive", usage: { input: 150, output: 0, cache_read: 0, cache_write: 0 } },
+                {
+                    text: "expensive",
+                    usage: { input: 150, output: 0, cache_read: 0, cache_write: 0 },
+                },
                 { text: "never" },
             ],
             descriptor: { tokenBudget: 100 },
@@ -606,7 +632,8 @@ describe("dream child claimant", () => {
         await claimant.settled();
         expect(host.runs[0]?.aborted).toBe(true);
         expect(host.runs[0]?.retired).toBe(true);
-        // Aborted by its own deadline, not by anything the silent module said.
+        // Aborted by the claimant's own deadline timer: the module could not be
+        // reached to report a stop.
         expect((host.runs[0]?.abortedAt ?? 0) - started).toBeLessThan(4_000);
         expect(peer.entry(entryId).completion).toBeNull();
     }, 20_000);
