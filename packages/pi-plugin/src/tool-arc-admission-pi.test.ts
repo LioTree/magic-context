@@ -48,8 +48,11 @@ it("Pi compound admission holds a straddling parallel batch at its call, not its
 	const target: TagTarget = {
 		mutationParts: [
 			{
-				message: { info: { id: assistant.id }, parts: [] } as MessageLike,
-				part: {},
+				message: {
+					info: { id: assistant.id },
+					parts: assistant.content,
+				} as MessageLike,
+				part: { kind: "tool_use", id: "a" },
 			},
 		],
 		canDrop: () => true,
@@ -65,12 +68,12 @@ it("Pi compound admission holds a straddling parallel batch at its call, not its
 	if (!guarded) throw new Error("missing tool target");
 	expect(guarded.canDrop?.()).toBe(false);
 	expect(guarded.drop?.()).toBe("incomplete");
-	expect(batches.get(assistant.id)).toContainEqual({
+	expect(batches.get(assistant.id)?.get("a")).toContainEqual({
 		kind: "message",
 		id: "entry-a",
 		block: 0,
 	});
-	expect(batches.get(assistant.id)).toContainEqual({
+	expect(batches.get(assistant.id)?.get("a")).toContainEqual({
 		kind: "message",
 		id: "entry-b",
 		block: 0,

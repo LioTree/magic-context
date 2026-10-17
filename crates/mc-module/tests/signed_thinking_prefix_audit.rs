@@ -177,6 +177,7 @@ fn tool_pairing_error(request: &[Block]) -> bool {
 
 fn mixed_wall(subagent: bool) {
     let mut f = Fixture::new("opencode-aisdk", subagent, Lane::Wall95, "mixed-parallel");
+    f.req.mid_turn = true;
     f.tool_loop(3);
     let n = f.step + 1;
     let a = format!("parallel-{n}-a");
@@ -209,10 +210,18 @@ fn mixed_wall(subagent: bool) {
     f.set_usage(95_000);
     f.served = f.pass();
     let after = f.wire();
+    let parallel_result_bytes = |wire: &[Block]| {
+        wire.iter()
+            .filter(|block| {
+                block[1]["type"] == "tool_result" && (block[1]["id"] == a || block[1]["id"] == b)
+            })
+            .map(|block| block[1]["output"].to_string().len())
+            .sum::<usize>()
+    };
     audit_assert_eq!(f.mock.check(&after), None);
     audit_assert_eq!(before_boundary(&after), before_boundary(&before));
     audit_assert!(
-        without_thinking(&before) != without_thinking(&after),
+        parallel_result_bytes(&after) < parallel_result_bytes(&before),
         "wall must reclaim the admitted parallel tail"
     );
     audit_assert_eq!(f.triggers().pending_drops, 1, "older drop must stay queued");
@@ -227,6 +236,7 @@ fn mixed_wall(subagent: bool) {
     audit_assert_eq!(f.wire(), after, "unchanged input repeats identical bytes");
     f.tool_loop(2);
     if !subagent {
+        f.req.mid_turn = false;
         f.next_user_turn("mixed-release");
         audit_assert_eq!(f.mock.check(&f.wire()), None);
         audit_assert_eq!(

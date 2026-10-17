@@ -9,7 +9,11 @@ const thinking = { type: "reasoning", signature: "boundary", text: "reasoning" }
 const message = (id: string, role: string, parts: unknown[]): MessageLike =>
     ({ info: { id, role }, parts }) as MessageLike;
 
-function guarded(messages: MessageLike[], owner: MessageLike) {
+function guarded(
+    messages: MessageLike[],
+    owner: MessageLike,
+    part = owner.parts.find((part) => part !== thinking),
+) {
     const admission = createEditAdmission({
         messages,
         stableId: (m) => m.info.id,
@@ -20,7 +24,7 @@ function guarded(messages: MessageLike[], owner: MessageLike) {
         anchorOf: thinkingAnchor,
     });
     const target: TagTarget = {
-        mutationParts: [{ message: owner, part: owner.parts[0] }],
+        mutationParts: [{ message: owner, part }],
         canDrop: () => true,
         drop: () => "removed",
         setContent: () => true,
@@ -64,6 +68,19 @@ describe("OpenCode compound tool admission", () => {
         ];
         expect(guarded(messages, old).canDrop?.()).toBe(false);
         expect(guarded(messages, owner).canDrop?.()).toBe(true);
+    });
+    it("does not merge independent batches whose results share a carrier", () => {
+        const old = message("old", "assistant", [call("old")]);
+        const owner = message("assistant", "assistant", [thinking, call("tail")]);
+        const results = message("results", "user", [result("old"), result("tail")]);
+        const messages = [old, owner, results];
+        expect(guarded(messages, results, results.parts[0]).canDrop?.()).toBe(false);
+        expect(guarded(messages, results, results.parts[1]).canDrop?.()).toBe(true);
+    });
+    it("holds an orphan result even beside an admitted result", () => {
+        const owner = message("assistant", "assistant", [thinking, call("tail")]);
+        const results = message("results", "user", [result("tail"), result("orphan")]);
+        expect(guarded([owner, results], results, results.parts[1]).canDrop?.()).toBe(false);
     });
     it("a completed OpenCode part answers its earlier invocation without becoming a new batch", () => {
         const owner = message("assistant", "assistant", [

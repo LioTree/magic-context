@@ -838,8 +838,8 @@ for (const generation of ["v1", "v2"] as const) {
                                 getPendingOps(f.db, f.sessionId).some((op) => op.tagId === older),
                             ).toBe(true);
                             expect(wire((await f.pass()).messages)).toEqual(after);
-                            // Usage is still at 95%, so new tool output must be reducible even
-                            // after this pressure episode has already reclaimed an earlier batch.
+                            // Usage is still at 95%, so new tool output must remain reducible
+                            // even after an earlier batch was reclaimed.
                             await toolLoop(f, 1, parallel);
                             expect(f.mock.check(wire(f.served))).toBeNull();
                             expect(f.tagStatus("call-9-a")).toBe("dropped");
