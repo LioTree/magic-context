@@ -1238,6 +1238,48 @@ mod tests {
         }
     }
 
+    /// Curate edits made in Rust leave the same audited rows as the TypeScript
+    /// dreamer's for the same update, merge (sources plus survivor) and archive:
+    /// memory revisions, status and successor links, and history rows carrying the
+    /// before/after snapshots an undo restores from. The golden comes from the
+    /// TypeScript tool (`gen/gen-curate-history-golden.ts`).
+    ///
+    /// Integration debt: when parity-w3 merges into the train, add a test that
+    /// undoes a Rust curate edit (update, merge, archive) through the train's
+    /// audited undo; this branch has no memory undo API.
+    #[test]
+    fn curate_update_merge_archive_history_matches_the_typescript_dreamer() {
+        let vectors: Vec<Value> = serde_json::from_str(include_str!(
+            "../../testdata/memory_actions/curate_history.json"
+        ))
+        .unwrap();
+        assert_eq!(vectors.len(), 7);
+        let mut conn = database();
+        let mut tools = plan("CONFIG_VALUES").tools(context());
+        for (i, vector) in vectors.iter().enumerate() {
+            let reply = tools
+                .execute(
+                    &mut conn,
+                    &Queue,
+                    &format!("curate-{i}"),
+                    NOW,
+                    &vector["args"],
+                )
+                .unwrap();
+            assert_eq!(reply, vector["reply"], "reply {i}");
+            assert_eq!(
+                rows(&conn, "SELECT id,category,content,status,revision,superseded_by_memory_id FROM memories ORDER BY id"),
+                vector["memories"],
+                "memories {i}"
+            );
+            assert_eq!(
+                rows(&conn, "SELECT memory_id,revision,previous_text,after_text,before_json,after_json,applied_at,reason,evidence_json,source_ids_json FROM memory_history ORDER BY id"),
+                vector["history"],
+                "history {i}"
+            );
+        }
+    }
+
     #[test]
     fn tool_scope_and_workspace_preflight_refuse_without_writes() {
         let mut conn = database();

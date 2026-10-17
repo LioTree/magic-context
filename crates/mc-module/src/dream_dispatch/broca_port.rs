@@ -1,0 +1,199 @@
+//! The production `BrocaPort`: llm-runner/v1 ops of one dream child carried over
+//! subc routes to the configured runner module.
+//!
+//! Each op goes to the runner's management surface (the same target the historian
+//! uses, `RegisteredRoute::HistorianRunner`) on a route bound to the child's Broca
+//! session, with the `{method, params}` envelope Broca serves. `next_unit` follows
+//! the session's `session.subscribe` stream from its start. `release` closes the
+//! routes; it never deletes anything, since erasure is the runner's retention
+//! promise fixed on the first send.
+
+use super::broca_carrier::{BrocaPort, PortError};
+use super::executor::BrocaPorts;
+use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
+use serde_json::{json, Value};
+use std::path::PathBuf;
+use std::time::Duration;
+use subc_client_rs::{
+    CallError, CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer, SubscribeOptions,
+    Subscription,
+};
+use subc_protocol::{BindIdentity, RouteTarget};
+
+/// One op's deadline. A Broca op answers at once; model work is followed on the
+/// subscription, never awaited inside a unary op.
+const OP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How to reach the configured Broca runner from this process.
+#[derive(Clone)]
+pub struct SubcBroca {
+    pub connection_file: PathBuf,
+    pub route_targets: RouteTargetConfig,
+    pub project_root: PathBuf,
+    pub harness: String,
+}
+
+impl SubcBroca {
+    /// The runner target, or `None` when no background-completion route to a
+    /// runner module is declared for this process.
+    pub fn target(route_targets: &RouteTargetConfig) -> Option<RouteTarget> {
+        route_targets.target(RegisteredRoute::HistorianRunner)
+    }
+}
+
+impl BrocaPorts for SubcBroca {
+    type Port = SubcBrocaPort;
+    fn port(&self) -> SubcBrocaPort {
+        SubcBrocaPort {
+            config: self.clone(),
+            consumer: None,
+            subscription: None,
+        }
+    }
+}
+
+pub struct SubcBrocaPort {
+    config: SubcBroca,
+    consumer: Option<SubcConsumer>,
+    subscription: Option<(String, Subscription)>,
+}
+
+fn port_error(code: &str, message: impl Into<String>, outcome_unknown: bool) -> PortError {
+    PortError {
+        code: code.into(),
+        message: message.into(),
+        detail: Value::Null,
+        outcome_unknown,
+    }
+}
+
+/// A module refusal is a definite answer: the op had no effect. Anything else
+/// (a timeout, a dropped connection) may have reached the runner first.
+fn call_error(error: CallError) -> PortError {
+    match error {
+        CallError::Module(body) => PortError {
+            code: body.code.clone(),
+            message: body.message.clone(),
+            detail: json!({"code": body.code, "message": body.message}),
+            outcome_unknown: false,
+        },
+        other => port_error("transport", other.to_string(), true),
+    }
+}
+
+impl SubcBrocaPort {
+    async fn consumer(&mut self) -> Result<&SubcConsumer, PortError> {
+        if self.consumer.is_none() {
+            let options = ConsumerOptions {
+                handshake_timeout: OP_TIMEOUT,
+                call_timeout: OP_TIMEOUT,
+                ..ConsumerOptions::default()
+            };
+            let consumer = SubcConsumer::connect(&self.config.connection_file, options)
+                .await
+                .map_err(|e| port_error("transport", e.to_string(), false))?;
+            self.consumer = Some(consumer);
+        }
+        Ok(self.consumer.as_ref().expect("consumer was just connected"))
+    }
+
+    fn route(&self, session: &str) -> Result<(RouteTarget, BindIdentity), PortError> {
+        let target = SubcBroca::target(&self.config.route_targets)
+            .ok_or_else(|| port_error("broca_unwired", "no runner route is declared", false))?;
+        Ok((
+            target,
+            BindIdentity::new(
+                self.config.project_root.clone(),
+                self.config.harness.clone(),
+                session,
+            ),
+        ))
+    }
+}
+
+impl BrocaPort for SubcBrocaPort {
+    async fn call(&mut self, session: &str, op: &str, params: Value) -> Result<Value, PortError> {
+        let (target, identity) = self.route(session)?;
+        let body = serde_json::to_vec(&json!({"method": op, "params": params}))
+            .map_err(|e| port_error("invalid_params", e.to_string(), false))?;
+        let consumer = self.consumer().await?;
+        let bytes = consumer
+            .call(
+                target,
+                identity,
+                body,
+                CallOptions {
+                    timeout: OP_TIMEOUT,
+                    route_retry_deadline: OP_TIMEOUT,
+                    ..CallOptions::default()
+                },
+            )
+            .await
+            .map_err(call_error)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| port_error("invalid_response", e.to_string(), true))
+    }
+
+    async fn next_unit(&mut self, session: &str) -> Result<Option<Value>, PortError> {
+        if self
+            .subscription
+            .as_ref()
+            .is_none_or(|(subscribed, _)| subscribed != session)
+        {
+            let (target, identity) = self.route(session)?;
+            let body = serde_json::to_vec(
+                &json!({"method": "session.subscribe", "params": {"from": "start"}}),
+            )
+            .map_err(|e| port_error("invalid_params", e.to_string(), false))?;
+            let consumer = self.consumer().await?;
+            let subscription = consumer
+                .subscribe(
+                    target,
+                    identity,
+                    body,
+                    SubscribeOptions {
+                        route_open_timeout: OP_TIMEOUT,
+                        route_retry_deadline: OP_TIMEOUT,
+                        ..SubscribeOptions::default()
+                    },
+                )
+                .await
+                .map_err(call_error)?;
+            self.subscription = Some((session.to_owned(), subscription));
+        }
+        let (_, subscription) = self.subscription.as_mut().expect("subscribed above");
+        match subscription.events().try_recv() {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| port_error("invalid_unit", e.to_string(), false)),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                self.subscription = None;
+                Err(port_error(
+                    "subscription_closed",
+                    "the session stream closed",
+                    false,
+                ))
+            }
+        }
+    }
+
+    async fn release(&mut self, session: &str) {
+        if let Some((_, subscription)) = self.subscription.take() {
+            let _ = subscription.unsubscribe();
+        }
+        if let (Ok((target, identity)), Some(consumer)) = (self.route(session), &self.consumer) {
+            consumer
+                .close_route(target, identity, CloseRouteOptions::default())
+                .await;
+        }
+    }
+}
+
+impl Drop for SubcBrocaPort {
+    fn drop(&mut self) {
+        if let Some((_, subscription)) = self.subscription.take() {
+            let _ = subscription.unsubscribe();
+        }
+    }
+}

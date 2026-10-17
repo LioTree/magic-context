@@ -29,6 +29,7 @@ pub mod dream_domain;
 pub mod dream_memory;
 pub mod dream_primer;
 pub mod dream_retrospective;
+pub mod dream_schedule_bridge;
 pub mod dream_scheduler;
 pub mod dream_verify;
 pub mod git_archive;
@@ -8138,6 +8139,12 @@ impl McStore {
             conn.pragma_update(None, "query_only", true)?;
             read(conn)
         })
+    }
+
+    /// The directory holding this store's `store.db`, which is the module's data
+    /// root; `None` for a store not backed by a SQLite file.
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.move_path.as_deref().and_then(std::path::Path::parent)
     }
 
     /// Run `read` against `context.db` in one read snapshot.

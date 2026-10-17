@@ -102,6 +102,8 @@ pub struct ClaimantDeclaration {
     pub declared_at_ms: i64,
     pub session: String,
     pub harness: String,
+    /// The project root of the declaring route: the directory its children work in.
+    pub directory: std::path::PathBuf,
 }
 
 const MAX_DECLARED_NAMES: usize = 32;
@@ -172,6 +174,7 @@ impl ClaimantDeclaration {
             declared_at_ms: now_ms,
             session: String::new(),
             harness: String::new(),
+            directory: std::path::PathBuf::new(),
         })
     }
 
@@ -179,6 +182,12 @@ impl ClaimantDeclaration {
     pub fn on_route(mut self, session: &str, harness: &str) -> Self {
         self.session = session.to_owned();
         self.harness = harness.to_owned();
+        self
+    }
+
+    /// Attach the declaring route's project root.
+    pub fn in_directory(mut self, directory: &std::path::Path) -> Self {
+        self.directory = directory.to_owned();
         self
     }
 

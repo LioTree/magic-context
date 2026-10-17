@@ -609,7 +609,8 @@ async fn unavailable_and_due_manual_gate_matrix_preserve_schedules() {
             .await,
         DispatchOutcome::Finished(RunStatus::Completed)
     );
-    assert!(OPERATIONAL_TASKS.is_empty());
+    // The unsupported task above has no production executor either.
+    assert!(!OPERATIONAL_TASKS.contains(&TaskName::EvaluateSmartNotes));
 }
 
 struct FlipResolver {

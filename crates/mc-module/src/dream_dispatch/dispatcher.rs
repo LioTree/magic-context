@@ -15,8 +15,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Register only tasks proven to apply durable effects through real model-session
-/// transports. Planners alone cannot take execution away from TypeScript.
-pub const OPERATIONAL_TASKS: &[TaskName] = &[];
+/// transports. Planners alone cannot take execution away from TypeScript. Each one
+/// here has an end-to-end test through `dream_dispatch::tick` with a scripted
+/// dream-claim-v1 claimant (`dream_dispatch::tick_tests`).
+pub const OPERATIONAL_TASKS: &[TaskName] = &[TaskName::Curate, TaskName::Classify];
+
+/// An executor that could not start any work, for a reason that says nothing
+/// about the task (an earlier process's child may still be running), reports a
+/// failed outcome whose error starts with this prefix. The dispatcher then gives
+/// the claim back without recording a run, so the slot stays due and is retried
+/// on a later tick instead of being counted as a failed attempt.
+pub const ABANDON_PREFIX: &str = "abandon:";
 
 #[allow(async_fn_in_trait)]
 pub trait TaskExecutor {
@@ -248,6 +257,16 @@ impl<E: TaskExecutor> Dispatcher<E> {
             Err(_) => return DispatchOutcome::Aborted(super::context::ControlError::Deadline),
         };
         guard.stop();
+        if outcome.status == mc_store::dream_scheduler::schedules::RunStatus::Failed
+            && outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(ABANDON_PREFIX))
+        {
+            // Dropping the unfinished guard abandons the scheduler claim and
+            // releases the domain; the schedule row is left as it was.
+            return DispatchOutcome::Refused(outcome.error.unwrap_or_default());
+        }
         // Exhausting the prompt-token budget stops further tool effects but still
         // records this run's outcome and provider-reported input/cache token count.
         if let Err(error) = context.check_control() {

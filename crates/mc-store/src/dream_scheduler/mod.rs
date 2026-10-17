@@ -175,6 +175,60 @@ impl SqliteDreamScheduler {
         }))
     }
 
+    /// Take over the TypeScript dreamer's progress on a task before planning it.
+    ///
+    /// The two runtimes keep separate schedule rows, and ownership of a task can
+    /// move between them. Without this, a task TypeScript already ran in the
+    /// current cron period would look due here again (a second run), and a task
+    /// TypeScript had due but not yet run would be seeded at the next slot after
+    /// now (a skipped run). When the TypeScript row was computed from the same
+    /// schedule and its `next_due_at` is later than this row's, this row moves to
+    /// it; an absent row is seeded from it. Returns whether the row changed.
+    pub fn adopt_legacy(
+        &self,
+        scope: &StoreScope,
+        config: &TaskConfig,
+        legacy: &schedules::LegacySchedule,
+    ) -> CapabilityResult<bool> {
+        if self.db.is_none() {
+            return capability(Ok(false));
+        }
+        capability((|| {
+            validate_scope(scope)?;
+            let Some(legacy_next) = legacy.next_due_at.filter(|n| *n > 0) else {
+                return Ok(false);
+            };
+            if config.schedule.trim().is_empty()
+                || legacy.schedule.as_deref() != Some(config.schedule.as_str())
+            {
+                return Ok(false);
+            }
+            let legacy_last = legacy.last_run_at.filter(|n| *n > 0);
+            self.write(|db| {
+                let state = match schedules::read(db, &scope.project.0, config.task)? {
+                    None => ScheduleState {
+                        last_run_at: legacy_last,
+                        next_due_at: Some(legacy_next),
+                        ..schedules::seeded(config, None)
+                    },
+                    Some(mut state) => {
+                        if state.schedule.as_deref() != Some(config.schedule.as_str())
+                            || state.next_due_at.is_none_or(|n| n >= legacy_next)
+                        {
+                            return Ok(false);
+                        }
+                        state.next_due_at = Some(legacy_next);
+                        state.retry_count = 0;
+                        state.last_run_at = state.last_run_at.max(legacy_last);
+                        state
+                    }
+                };
+                schedules::write(db, &scope.project.0, config.task, &state)?;
+                Ok(true)
+            })
+        })())
+    }
+
     /// Advance a scheduled slot when an activity check finds no work, without
     /// changing the last successful run's cutoff. The slot comparison prevents a
     /// stale planner from consuming a newer slot.

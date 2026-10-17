@@ -26,7 +26,7 @@ fn vector() -> Value {
     serde_json::from_str(VECTOR).unwrap()
 }
 
-fn attested(mut binding: SessionBinding, harness: &str) -> SessionBinding {
+pub(super) fn attested(mut binding: SessionBinding, harness: &str) -> SessionBinding {
     binding.harness = harness.into();
     binding.session = "harness-session".into();
     binding.principal = Some(subc_protocol::Principal::Reserved {
@@ -175,17 +175,25 @@ async fn a_plugin_route_cannot_declare_a_claimant_and_keeps_every_task() {
     assert_eq!(published(&answer), Vec::<String>::new());
 }
 
+/// The production wiring publishes the claimant's carriable tasks among the
+/// operational ones only; with the switch off it publishes nothing.
 #[tokio::test]
-async fn nothing_is_published_in_this_build_or_with_the_switch_off() {
+async fn production_publishes_only_operational_tasks_and_nothing_with_the_switch_off() {
     let production = route("opencode2", "fenceless", true, None);
+    let operational = crate::dream_dispatch::dispatcher::OPERATIONAL_TASKS;
+    let expected: Vec<String> = vector()["expected"]["fenceless"]["with_models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .filter(|name| operational.iter().any(|t| t.as_str() == name))
+        .collect();
+    assert!(!expected.is_empty());
     assert_eq!(
         published(&declare(&production.handler, "fenceless").await),
-        Vec::<String>::new()
+        expected
     );
-    assert_eq!(
-        published(&read(&production.handler).await),
-        Vec::<String>::new()
-    );
+    assert_eq!(published(&read(&production.handler).await), expected);
     let off = route("opencode2", "fenceless", false, Some(every_hosted_task()));
     let answer = declare(&off.handler, "fenceless").await;
     assert_eq!(answer["activated"], false);
