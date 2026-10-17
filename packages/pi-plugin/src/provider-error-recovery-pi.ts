@@ -155,6 +155,11 @@ interface PiAssistantMessage {
 	content?: unknown;
 }
 
+/** Whether a Pi message is an assistant message carrying any thinking block. */
+export function piMessageHasThinking(message: unknown): boolean {
+	return hasThinkingPart(message);
+}
+
 function hasThinkingPart(message: unknown): boolean {
 	if (!message || typeof message !== "object") return false;
 	const assistant = message as PiAssistantMessage;

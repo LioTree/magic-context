@@ -153,6 +153,7 @@ import { protectNewTagMutations, retainedActiveThinkingParts } from "./latest-as
 import { markNoteNudgeDelivered, observeNoteNudgeServe, peekNoteNudgeText } from "./note-nudger";
 import { hasVisibleNoteReadCall } from "./note-visibility";
 import {
+    editOutsideCompanionTransaction,
     pairedThinkingEdit,
     snapshotSessionFlag,
     snapshotSessionValue,
@@ -422,7 +423,7 @@ export async function applyTodoSynthesis(args: {
                 ["reasoning", "thinking", "redacted_thinking"].includes(String(part.type)),
         ),
     }));
-    const apply = (): number => {
+    const apply = (requirePairing?: () => never): number => {
         const replay = (): number => {
             if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
                 const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
@@ -454,8 +455,11 @@ export async function applyTodoSynthesis(args: {
                         : { kind: "append", afterId: newAnchor },
                 );
             }
-            if (coords.every((coord) => !args.editAdmission || args.editAdmission.admit(coord)))
+            if (coords.every((coord) => !args.editAdmission || args.editAdmission.admit(coord))) {
+                // Every admitted todo change is followed by a write.
+                requirePairing?.();
                 return true;
+            }
             if (args.editAdmission?.frame.kind === "boundary") {
                 sessionLog(
                     args.sessionId,
@@ -550,21 +554,24 @@ export async function applyTodoSynthesis(args: {
         // last_todo_state, so a real todowrite between passes cannot change bytes.
         return replay();
     };
-    return args.persistCompanion
-        ? pairedThinkingEdit({
-              db: args.db,
-              messages: args.messages,
-              edit: apply,
-              needsCompanion: () =>
-                  todoCompanionRequired(
-                      persistedAnchor,
-                      getPersistedTodoSyntheticAnchor(args.db, args.sessionId),
-                      source,
-                      TODO_HEAD_ANCHOR_ID,
-                  ),
-              persistCompanion: args.persistCompanion,
-          })
-        : apply();
+    if (!args.persistCompanion) return apply();
+    // A pass that only replays the saved pair writes nothing, so it takes no
+    // write lock; one that changes the pair reruns paired with its strip.
+    const replayed = editOutsideCompanionTransaction({ messages: args.messages, edit: apply });
+    if (replayed) return replayed.result;
+    return pairedThinkingEdit({
+        db: args.db,
+        messages: args.messages,
+        edit: () => apply(),
+        needsCompanion: () =>
+            todoCompanionRequired(
+                persistedAnchor,
+                getPersistedTodoSyntheticAnchor(args.db, args.sessionId),
+                source,
+                TODO_HEAD_ANCHOR_ID,
+            ),
+        persistCompanion: args.persistCompanion,
+    });
 }
 
 /** An armed binding-recovery flag consumed by one live pass. */

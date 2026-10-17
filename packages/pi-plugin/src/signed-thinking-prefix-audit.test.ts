@@ -11,7 +11,7 @@
  * Findings: .cortexkit/internal-docs/investigations/reports/signed-thinking-prefix-edits-audit.md. Run with
  * MC_AUDIT_STRICT=1 to make every exposed lane fail on its strict-binding 400.
  */
-import { describe, it } from "bun:test";
+import { describe, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	appendCompartments,
@@ -27,7 +27,9 @@ import {
 	queuePendingOp,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
+import { getMergedReasoningStrippedIds } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import * as writeTiming from "@magic-context/core/shared/write-transaction-timing";
 import { assertAdmissionParity } from "../../plugin/src/hooks/magic-context/__tests__/admission-parity.test";
 import {
 	auditName,
@@ -55,6 +57,7 @@ import {
 	signalPiPendingMaterialization,
 	signalPiSystemHashChange,
 } from "./context-handler";
+import { queuePiIdentityRebuild } from "./pi-tag-identity-repair";
 import { processSystemPromptForCache } from "./system-prompt";
 import {
 	createFakePi,
@@ -781,6 +784,111 @@ it(
 		},
 		"strip-system-edit",
 		false,
+	),
+);
+
+// A pass that keeps current-turn signed thinking runs outside the companion
+// transaction, because admission holds every edit before that thinking. A
+// pending tag-identity repair still forces such a pass to omit every signed
+// block and rewrite its prefix. That rewrite and its omissions must commit
+// together: the attempt outside the transaction stops before writing the
+// omissions, and the pass reruns inside it.
+/** Spy the write-lock hold clock and collect the transaction sites it reports. */
+async function holdSites(run: () => Promise<unknown>): Promise<string[]> {
+	const sites: string[] = [];
+	const timing = spyOn(writeTiming, "logSlowWriteTransaction");
+	timing.mockImplementation((site: string) => {
+		sites.push(site);
+	});
+	try {
+		await run();
+	} finally {
+		timing.mockRestore();
+	}
+	return sites;
+}
+
+/** A mid-loop fixture with a pending tag-identity repair, which forces a rewrite. */
+async function forceHeldRewrite(f: Fixture): Promise<() => string[]> {
+	await toolLoop(f, 4);
+	expect(f.mock.hasCurrentTurnThinking(wire(f.served))).toBe(true);
+	const tool = getTagsBySession(f.db, f.sessionId).find(
+		(tag) => tag.type === "tool",
+	);
+	if (!tool) throw new Error("no tool tag to repair");
+	queuePiIdentityRebuild(f.db, f.sessionId, {
+		key: "forced-rewrite",
+		kept: tool.tagNumber,
+		removed: [],
+		kind: "tool",
+	});
+	// Thinking omissions only; a failed repair also records itself, on purpose,
+	// so that a persistent failure cannot refuse every later turn.
+	return () =>
+		[...getMergedReasoningStrippedIds(f.db, f.sessionId)]
+			.filter((id) => id.startsWith("binding_mismatch"))
+			.sort();
+}
+
+it(
+	"Pi/OMP: an ordinary held step opens no companion transaction",
+	withFixture(
+		false,
+		"ctx_reduce drop (full removal)",
+		async (f) => {
+			await toolLoop(f, 4);
+			expect(await holdSites(() => toolLoop(f, 1))).not.toContain(
+				"paired_thinking_edit",
+			);
+		},
+		"held-no-transaction",
+	),
+);
+
+it(
+	"Pi/OMP: a held pass forced into a prefix rewrite reruns inside the companion transaction",
+	withFixture(
+		false,
+		"ctx_reduce drop (full removal)",
+		async (f) => {
+			const thinkingOmissions = await forceHeldRewrite(f);
+			const before = thinkingOmissions();
+			let rewritten = "";
+			const sites = await holdSites(async () => {
+				rewritten = thinkingBlocks(wire((await f.pass()).messages));
+			});
+			expect(rewritten).toBe("[]");
+			expect(sites).toContain("paired_thinking_edit");
+			expect(thinkingOmissions().length).toBeGreaterThan(before.length);
+		},
+		"forced-rewrite",
+	),
+);
+
+// The pass outside the companion transaction must stop before the rewrite
+// writes its omissions: when the rewrite then fails, no omission survives it.
+it(
+	"Pi/OMP: a failed forced rewrite on a held pass leaves no thinking omission behind",
+	withFixture(
+		false,
+		"ctx_reduce drop (full removal)",
+		async (f) => {
+			const thinkingOmissions = await forceHeldRewrite(f);
+			const before = thinkingOmissions();
+			// The rewrite's own cache clear fails after its omissions were planned.
+			f.db.exec(
+				"CREATE TRIGGER reject_rewrite BEFORE UPDATE OF cached_m0_bytes ON session_meta WHEN NEW.cached_m0_bytes IS NULL AND OLD.cached_m0_bytes IS NOT NULL BEGIN SELECT RAISE(ABORT, 'reject rewrite'); END",
+			);
+			let failed = false;
+			try {
+				await f.pass();
+			} catch {
+				failed = true;
+			}
+			expect(failed).toBe(true);
+			expect(thinkingOmissions()).toEqual(before);
+		},
+		"forced-rewrite-failure",
 	),
 );
 

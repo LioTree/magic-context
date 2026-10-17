@@ -7939,6 +7939,56 @@ describe("final message representation", () => {
         expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
     });
 
+    // Holding the merged-reasoning strip behind kept current-turn thinking applies
+    // only when that thinking is bound to the bytes before it. Other Anthropic
+    // models report the same thinking boundary but hold no edit behind it, so
+    // their merged-reasoning strip still lands on a busting pass, as before.
+    it("a non-prefix-bound model keeps its merged-reasoning strip while current-turn thinking is kept", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-merged-reasoning-not-prefix-bound";
+        const messages = [
+            { info: { id: "user-old", role: "user" }, parts: [{ type: "text", text: "start" }] },
+            {
+                info: { id: "assistant-first", role: "assistant" },
+                parts: [{ type: "text", text: "first assistant content" }],
+            },
+            {
+                info: { id: "assistant-merged", role: "assistant" },
+                parts: [
+                    { type: "thinking", thinking: "merged reasoning", signature: "merged-sig" },
+                    { type: "text", text: "tool-use continuation" },
+                ],
+            },
+            { info: { id: "user", role: "user" }, parts: [{ type: "text", text: "continue" }] },
+            {
+                info: { id: "assistant-current", role: "assistant" },
+                parts: [
+                    { type: "thinking", thinking: "current reasoning", signature: "current-sig" },
+                    { type: "text", text: "current step" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const current = JSON.stringify(findMessage(messages, "assistant-current").parts);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
+                resolvedProviderID: "anthropic",
+                resolvedModelID: "claude-opus-4-6",
+                thinkingBindingRecoveryEnabledForModel: false,
+                signedThinkingHold: "on",
+                activeThinkingTurn: true,
+            }),
+        );
+        expect(findMessage(messages, "assistant-merged").parts[0]).toEqual({
+            type: "text",
+            text: "",
+        });
+        expect(getMergedReasoningStrippedIds(db, sessionId).has("assistant-merged")).toBe(true);
+        expect(JSON.stringify(findMessage(messages, "assistant-current").parts)).toBe(current);
+    });
+
     it("freezes first merged-strip application onto a bust and replays it across fresh rebuilds", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);

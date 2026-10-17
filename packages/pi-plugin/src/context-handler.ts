@@ -226,6 +226,8 @@ import {
 	peekNoteNudgeText,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
 import {
+	CompanionPairingRequired,
+	editOutsideCompanionTransaction,
 	pairedThinkingEdit,
 	snapshotSessionFlag,
 	snapshotSessionValue,
@@ -448,6 +450,7 @@ import {
 	applyPiThinkingBindingRecovery,
 	assertPiThinkingEntryIds,
 	frozenBindingEntryIds,
+	piMessageHasThinking,
 	resolvePiBindingStripOrder,
 } from "./provider-error-recovery-pi";
 import {
@@ -8422,22 +8425,61 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		snapshotSessionValue(routinePressureAppliedBySession, args.sessionId),
 	];
 	const rollbackObservations: (() => void)[] = [];
+	const resetSessionState = () => {
+		for (const reset of restore) reset();
+		parkedBustTriggersBySession.delete(args.sessionId);
+		clearPiInjectionTokenCountCache(args.sessionId);
+		clearPiMuralProcessCache(args.sessionId);
+	};
+	const needsCompanion = (result: RunPipelineResult) =>
+		!result.strictThinkingKept &&
+		(systemPromptEdited ||
+			(result.prefixBustPermitted && result.prefixEditBesidesReasoningTrim));
+	// Most passes cannot need a companion strip: a pass that keeps current-turn
+	// signed thinking holds every edit before it (and keeps the system-prompt
+	// record), and a pass whose messages carry no thinking has nothing to strip.
+	// Those run without the write transaction, as an unpaired pass did. The
+	// pipeline confirms the prediction itself and aborts the attempt before
+	// any write that would need a strip; the pass then reruns paired below.
+	if (piPassMayNeedNoCompanion(args)) {
+		const attempt = editOutsideCompanionTransaction({
+			messages: args.messages as unknown[],
+			state: args.sessionMeta,
+			// Writes outside the transaction were not rolled back, so the
+			// observations that re-record them after a rollback must not run.
+			onRollback: () => {
+				resetSessionState();
+				rollbackObservations.length = 0;
+			},
+			edit: (requirePairing) =>
+				runSynchronousPipeline(args, rollbackObservations, requirePairing),
+		});
+		if (attempt) {
+			const { result } = attempt;
+			// Unreachable when the pipeline's checks hold; refusing here keeps an
+			// edit from being served without the strip its thinking needs.
+			if (
+				needsCompanion(result) &&
+				(result.messages as unknown[]).some(piMessageHasThinking)
+			)
+				throw new Error(
+					"A pass run outside the companion transaction needed thinking omissions",
+				);
+			if (!result.strictThinkingKept)
+				clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
+			return result;
+		}
+	}
 	const result = pairedThinkingEdit({
 		db: args.db,
 		messages: args.messages as unknown[],
 		state: args.sessionMeta,
 		onRollback: () => {
-			for (const reset of restore) reset();
-			parkedBustTriggersBySession.delete(args.sessionId);
-			clearPiInjectionTokenCountCache(args.sessionId);
-			clearPiMuralProcessCache(args.sessionId);
+			resetSessionState();
 			for (const observation of rollbackObservations) observation();
 		},
 		edit: () => runSynchronousPipeline(args, rollbackObservations),
-		needsCompanion: (result) =>
-			!result.strictThinkingKept &&
-			(systemPromptEdited ||
-				(result.prefixBustPermitted && result.prefixEditBesidesReasoningTrim)),
+		needsCompanion,
 		persistCompanion: (result) => {
 			const messages = result.messages;
 			applyPiProactiveThinkingStrip({
@@ -8464,9 +8506,24 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	return result;
 }
 
+/** A cheap guess, confirmed inside the pipeline, that this pass needs no companion strip. */
+function piPassMayNeedNoCompanion(args: RunPipelineArgs): boolean {
+	if (!(args.messages as unknown[]).some(piMessageHasThinking)) return true;
+	return (
+		args.reasoningClearing?.prefixBound === true &&
+		!args.recoveryRebuildReason &&
+		hasActiveAnthropicThinkingTurn(
+			args.messages,
+			args.resolvedProviderID,
+			args.resolvedModelID,
+		)
+	);
+}
+
 function runSynchronousPipeline(
 	args: RunPipelineArgs,
 	rollbackObservations?: (() => void)[],
+	requirePairing?: () => never,
 ): RunPipelineResult {
 	args.assertCurrentPass?.();
 	const prefixTagStart = isPrefixBoundThinkingModel(
@@ -8533,6 +8590,9 @@ function runSynchronousPipeline(
 	let rewritingSignedPrefix = false;
 	let workingForRewrite: unknown[] | undefined;
 	const stripForPrefixRewrite = () => {
+		// Omitting every signed block is a companion write: it must commit with
+		// the rewrite that needs it.
+		requirePairing?.();
 		const messages = workingForRewrite ?? args.messages;
 		const result = applyPiProactiveThinkingStrip({
 			db: args.db,
@@ -8566,6 +8626,15 @@ function runSynchronousPipeline(
 		(!holdEnabled && args.forceSignedRebuildForFit && protectedSignedPrefix)
 	)
 		stripForPrefixRewrite();
+	// Outside the companion transaction, only a pass that keeps its current-turn
+	// signed thinking (every edit before it is held) or carries no thinking at all
+	// may continue; anything else needs its edits paired with their strip.
+	if (
+		requirePairing &&
+		!protectedSignedPrefix &&
+		(args.messages as unknown[]).some(piMessageHasThinking)
+	)
+		requirePairing();
 	// Messages without a real entry id get a position-independent fallback id
 	// computed once from this pass's input, before any stage edits content.
 	// Every stage below resolves by the index it was given into this same array
@@ -8910,6 +8979,7 @@ function runSynchronousPipeline(
 				);
 			}
 		} catch (error) {
+			if (error instanceof CompanionPairingRequired) throw error;
 			piM0State.preparedPrefix = cachedPrefixBeforePreflight;
 			prefixPreflightContended = true;
 			sessionLog(

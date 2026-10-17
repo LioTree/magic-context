@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
-import { pairedThinkingEdit } from "./paired-thinking-edit";
+import { editOutsideCompanionTransaction, pairedThinkingEdit } from "./paired-thinking-edit";
 import {
     clearPendingMaterialization,
     hasOnlySystemHashMaterialization,
@@ -148,4 +148,75 @@ it("a failed pair restores the trigger's original reasons and in-memory metadata
     } finally {
         db.close();
     }
+});
+
+describe("edits outside the companion transaction", () => {
+    it("open no write transaction and keep their writes", () => {
+        const db = new Database(":memory:");
+        db.exec("CREATE TABLE decisions (kind TEXT PRIMARY KEY)");
+        try {
+            const outcome = editOutsideCompanionTransaction({
+                messages: [],
+                edit: () => {
+                    expect(db.inTransaction).toBe(false);
+                    db.exec("INSERT INTO decisions VALUES ('held')");
+                    return 1;
+                },
+            });
+            expect(outcome).toEqual({ result: 1 });
+            expect(db.prepare("SELECT kind FROM decisions").all()).toEqual([{ kind: "held" }]);
+        } finally {
+            db.close();
+        }
+    });
+
+    it("stop before a write that needs omissions, so the rerun pairs it with its strip", () => {
+        const db = new Database(":memory:");
+        db.exec("CREATE TABLE decisions (kind TEXT PRIMARY KEY)");
+        const original = { text: "unchanged", parts: ["kept"] };
+        const messages: unknown[] = [original];
+        const state = { watermark: 0 };
+        let rolledBack = 0;
+        // The edit's second write fails, after the omissions it needs were planned.
+        const edit = (requirePairing?: () => never) => {
+            db.exec("INSERT OR IGNORE INTO decisions VALUES ('held')");
+            original.text = "changed";
+            original.parts.push("added");
+            messages.push({ text: "appended" });
+            state.watermark = 10;
+            requirePairing?.();
+            db.exec("INSERT INTO decisions VALUES ('strip')");
+            throw new Error("edit failed");
+        };
+        try {
+            expect(
+                editOutsideCompanionTransaction({
+                    messages,
+                    state,
+                    edit,
+                    onRollback: () => rolledBack++,
+                }),
+            ).toBeUndefined();
+            // Hosts map message objects to entry ids, so the rerun needs the same objects.
+            expect(messages).toEqual([{ text: "unchanged", parts: ["kept"] }]);
+            expect(messages[0]).toBe(original);
+            expect(state.watermark).toBe(0);
+            expect(rolledBack).toBe(1);
+            expect(() =>
+                pairedThinkingEdit({
+                    db,
+                    messages,
+                    edit: () => edit(),
+                    needsCompanion: () => true,
+                    persistCompanion: () => {},
+                }),
+            ).toThrow("edit failed");
+            // Only the write a held pass makes anyway survives; no strip without its edit.
+            expect(db.prepare("SELECT kind FROM decisions ORDER BY kind").all()).toEqual([
+                { kind: "held" },
+            ]);
+        } finally {
+            db.close();
+        }
+    });
 });

@@ -41,6 +41,7 @@ import type {
 	EditCoord,
 } from "@magic-context/core/hooks/magic-context/edit-admission";
 import {
+	editOutsideCompanionTransaction,
 	pairedThinkingEdit,
 	todoCompanionRequired,
 } from "@magic-context/core/hooks/magic-context/paired-thinking-edit";
@@ -284,7 +285,7 @@ export function injectSyntheticTodowriteForPi(args: {
 					),
 			),
 	}));
-	const apply = (): PiMessage[] => {
+	const apply = (requirePairing?: () => never): PiMessage[] => {
 		const replay = (): PiMessage[] => {
 			if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
 				const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
@@ -345,8 +346,11 @@ export function injectSyntheticTodowriteForPi(args: {
 				coords.every(
 					(coord) => !args.editAdmission || args.editAdmission.admit(coord),
 				)
-			)
+			) {
+				// Every admitted todo change is followed by a write.
+				requirePairing?.();
 				return true;
+			}
 			if (args.editAdmission?.frame.kind === "boundary") {
 				sessionLog(
 					args.sessionId,
@@ -436,18 +440,24 @@ export function injectSyntheticTodowriteForPi(args: {
 		// If its saved assistant is missing, skip replay instead of moving the pair.
 		return replay();
 	};
-	return args.persistCompanion
-		? pairedThinkingEdit({
-				db: args.db,
-				messages: args.messages,
-				edit: apply,
-				needsCompanion: () =>
-					todoCompanionRequired(
-						persistedAnchor,
-						getPersistedTodoSyntheticAnchor(args.db, args.sessionId),
-						source,
-					),
-				persistCompanion: args.persistCompanion,
-			})
-		: apply();
+	if (!args.persistCompanion) return apply();
+	// A pass that only replays the saved pair writes nothing, so it takes no
+	// write lock; one that changes the pair reruns paired with its strip.
+	const replayed = editOutsideCompanionTransaction({
+		messages: args.messages,
+		edit: apply,
+	});
+	if (replayed) return replayed.result;
+	return pairedThinkingEdit({
+		db: args.db,
+		messages: args.messages,
+		edit: () => apply(),
+		needsCompanion: () =>
+			todoCompanionRequired(
+				persistedAnchor,
+				getPersistedTodoSyntheticAnchor(args.db, args.sessionId),
+				source,
+			),
+		persistCompanion: args.persistCompanion,
+	});
 }
