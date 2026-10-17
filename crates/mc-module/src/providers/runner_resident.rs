@@ -342,7 +342,8 @@ impl RunnerRecord<'_> {
         self.state.record.wait_view = wait;
         let raw = serde_json::to_string(&raw).map_err(transient)?;
         let metadata_bytes = raw.len() * 4;
-        let result = storage.save_delta(key, &self.state.record, &raw, &self.state.token);
+        let result =
+            storage.save_delta(key, &self.state.record, &messages, &raw, &self.state.token);
         self.state.record.messages = messages;
         result?;
         self.state.native_bytes += appended_bytes;

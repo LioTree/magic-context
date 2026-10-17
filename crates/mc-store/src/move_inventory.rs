@@ -7,9 +7,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Section-inventory protocol version serialized in move manifests.
-pub const INVENTORY_VERSION: u32 = 7;
+pub const INVENTORY_VERSION: u32 = 8;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 101;
-pub const STORE_SCHEMA_VERSION: u32 = 72;
+pub const STORE_SCHEMA_VERSION: u32 = 73;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3016,29 +3016,6 @@ pub const TABLES: &[TableInventory] = &[
         RowSelector::Predicate("engine_namespace IN (SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE session = ?1)"),
         &["engine_namespace", "tag_number"],
         &["engine_namespace", "tag_number", "session"],
-        &[],
-        Some(KeyPolicy::PreserveOrRefuseCollision),
-        None
-    ),
-    table!(
-        Module,
-        "mc_provider_views_v1",
-        Ship,
-        RowSelector::Predicate(
-            "conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"
-        ),
-        &["conv_key", "version"],
-        &[
-            "conv_key",
-            "version",
-            "lineage_id",
-            "range_from",
-            "range_to",
-            "replacement_json",
-            "state",
-            "view_json",
-            "session"
-        ],
         &[],
         Some(KeyPolicy::PreserveOrRefuseCollision),
         None

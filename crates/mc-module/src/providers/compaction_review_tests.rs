@@ -1185,10 +1185,8 @@ async fn hookcost_review_durable_wire_fragment_is_not_response_wire_fragment() {
     let answer: Value = serde_json::from_slice(&answer_bytes).unwrap();
     assert_eq!(answer["answer"], "compaction_message");
     let version = answer["compaction"]["version"].as_u64().unwrap();
-    let row = store
-        .load_provider_view(&key.store_key(), version)
-        .unwrap()
-        .unwrap();
+    let row =
+        crate::providers::view_recipe::stored_view(&store, &key.store_key(), version).unwrap();
     let view: HostView = serde_json::from_str(&row.replacement_json).unwrap();
     let durable_fragment = serde_json::to_string(&view.wire).unwrap();
     let response_fragment = serde_json::to_string(&answer["compaction"]).unwrap();

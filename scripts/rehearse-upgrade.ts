@@ -368,6 +368,7 @@ function writeReport(): void {
 		"- store 70: rebuilds mc_provider_conversations_v2 with native generation columns, preserving existing columns/identities; recreated dependent triggers.",
 		"- store 71: adds policy revision/preparation caches and revision triggers; invalidates derived preparations on input changes. No release-63 table rewrite.",
 		"- store 72: discards undeployed OpenCode provider projections (introduced at 65+), adds frozen-policy facts, cut/override/view tables and a frontier invalidation trigger. These tables do not exist in released store 63; every released row remains subject to exact preservation checks.",
+		"- store 73: resets only conversations that own a mc_provider_views_v1 row (introduced at 66, never released) and drops that table; Broca and Claude Code views now persist as mc_provider_views_v2 recipes. Released store 63 has no such rows.",
 		"",
 		"## Coverage",
 		"",
@@ -377,7 +378,7 @@ function writeReport(): void {
 		"",
 		"Five ordered sessions use the real old/candidate materializeM0 renderer, both m[0] and m[1], defaults, frozen clock and an empty project-docs directory. This is the prefix renderer, not a live provider request. Rendering runs on separate copies so cache/render side effects cannot conceal migration loss.",
 		"",
-		"Crash barriers cover three uncommitted context migration transactions per implementation and five store migration transactions. Store crashes use an ignored unit-test helper to install a ledger hook on the real cortexkit-store migrator and McStore SQL chain; reopen uses McStore::open. SIGKILL step peak RSS is the paused child process VmHWM from /proc; all other peaks come from GNU time.",
+		"Crash barriers cover three uncommitted context migration transactions per implementation and six store migration transactions. Store crashes use an ignored unit-test helper to install a ledger hook on the real cortexkit-store migrator and McStore SQL chain; reopen uses McStore::open. SIGKILL step peak RSS is the paused child process VmHWM from /proc; all other peaks come from GNU time.",
 		"",
 		"Old plugin refusal and the placed release ck-mc offline command are checked on both paired and individually advanced stores, with DB/WAL hashes before/after. The release McStore opener is checked separately; the offline command is not a live subc handshake.",
 		"",
@@ -604,7 +605,7 @@ try {
 	check("fresh TypeScript/Rust parity", () =>
 		assertFingerprint(freshFp, hostFp),
 	);
-	if (freshFp.store_version > 72 || freshFp.context_version > 100)
+	if (freshFp.store_version > 73 || freshFp.context_version > 100)
 		findings.push(
 			`Migration effects manifest needs review for candidate context ${freshFp.context_version} / store ${freshFp.store_version}; identify every new reset/rewrite before approving it`,
 		);
@@ -822,7 +823,7 @@ try {
 				);
 			}
 		}
-	for (const migration of [64, 66, 70, 71, 72]) {
+	for (const migration of [64, 66, 70, 71, 72, 73]) {
 		const dir = pairCopy(baseline, `crash-store-${migration}`);
 		try {
 			await crash(

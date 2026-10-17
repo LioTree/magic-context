@@ -3314,6 +3314,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 72,
         statements: include_str!("migrations/store_072_provider_policy_baselines_views.sql"),
     },
+    Migration {
+        version: 73,
+        // Retire whole-copy provider views; every lane now stores v2 recipes.
+        statements: include_str!("migrations/store_073_provider_views_v1_retired.sql"),
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
