@@ -90,16 +90,20 @@ export function createLkgEntryProjector(
                   maxSessions: 16,
               });
     return (sessionId: string, messages: MessageLike[]): LkgEntryProjection[] => {
-        const { digests, stats } = cache.digests(sessionId, messages);
+        const { digests, moveDigests, stats } = cache.digests(
+            sessionId,
+            messages,
+            moveMessageDigestFromFields,
+        );
         options.onReuse?.(stats);
-        return projectEntryWithDigests(messages, digests);
+        return projectEntryWithDigests(messages, digests, moveDigests);
     };
 }
 
 function projectEntryWithDigests(
     messages: MessageLike[],
     digests: readonly (string | null)[],
-    snapshots?: readonly ReturnType<typeof lkgContentFields>[],
+    moveDigests?: readonly ((() => string) | undefined)[],
 ): LkgEntryProjection[] {
     return messages.map((message, index) => {
         const info = messageInfo(message);
@@ -151,9 +155,13 @@ function projectEntryWithDigests(
             value: () => contentDigest,
             enumerable: false,
         });
-        const fields = snapshots?.[index] ?? lkgContentFields(message);
+        // Cached projectors already retained the pristine tokens while checking
+        // replay digests. Only the uncached projector needs another snapshot.
+        const moveDigest = moveDigests?.[index];
+        const fields = moveDigests ? undefined : lkgContentFields(message);
         Object.defineProperty(projection, "moveDigest", {
             value: () => {
+                if (moveDigest) return moveDigest();
                 if (!fields) throw new Error("portable input snapshot unavailable");
                 return moveMessageDigestFromFields(fields);
             },

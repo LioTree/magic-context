@@ -1,0 +1,12 @@
+{
+    "extends": "../packages/plugin/tsconfig.json",
+    "compilerOptions": {
+        "rootDir": "..",
+        "noEmit": true,
+        "emitDeclarationOnly": false,
+        "types": ["bun"],
+        "typeRoots": ["../node_modules/@types", "../packages/plugin/node_modules/@types"]
+    },
+    "include": ["train-warm-pass-overhead.ts", "train-warm-pass-worker.ts"],
+    "exclude": []
+}
