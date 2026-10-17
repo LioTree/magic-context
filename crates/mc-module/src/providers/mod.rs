@@ -141,15 +141,15 @@ fn host_binding(binding: &SessionBinding) -> bool {
     matches!(binding.harness.as_str(), "opencode" | "opencode2") || attested_claude_code(binding)
 }
 
-fn admit_host_lane(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
-    if !matches!(binding.harness.as_str(), "opencode" | "opencode2") {
+pub(crate) fn admit_host_lane(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
+    if !matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi") {
         return Ok(());
     }
     if !matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "thalamus-harness")
     {
         return Err(error(
             "host_lane_requires_harness_module",
-            "OpenCode provider lane requires reserved:thalamus-harness",
+            "Host lane requires reserved:thalamus-harness",
         ));
     }
     if !binding.scope.as_ref().is_some_and(|scope| {
@@ -158,7 +158,7 @@ fn admit_host_lane(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
     }) {
         return Err(error(
             "host_lane_scope_missing",
-            "OpenCode provider lane requires an authorized reserved:prefrontal-core scope",
+            "Host lane requires an authorized reserved:prefrontal-core scope",
         ));
     }
     Ok(())

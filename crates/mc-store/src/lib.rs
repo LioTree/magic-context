@@ -25,6 +25,8 @@ pub mod context_writes;
 pub mod dream_scheduler;
 pub mod git_archive;
 mod historian_claim;
+#[cfg(feature = "test-support")]
+pub use historian_claim::with_historian_claim_fixture_entropy;
 mod historian_telemetry;
 pub use historian_telemetry::{HistorianInvocation, HistorianRunTelemetry};
 pub mod memory_history;
