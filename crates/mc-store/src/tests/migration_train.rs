@@ -609,7 +609,7 @@ fn seed_context(path: &std::path::Path) -> Snapshot {
          INSERT INTO lkg_slots(session_id,json_prefix_chars,json_prefix_chunks,json_prefix_hash,input_id_seq,input_content_digests,last_input_message_id,captured_at,row_version,capture_sequence,served_capture_id,input_move_digests)
              VALUES('provider-opencode',20,1,'prefix-hash','[\"m4\"]','[\"digest\"]','m4',10,7,9,9,'[\"move-digest\"]');
          INSERT INTO lkg_slot_chunks VALUES('provider-opencode',0,'chunk-hash','opaque last-known-good body');
-         INSERT INTO lkg_served_markers VALUES('provider-opencode',9,1,'served');
+         INSERT INTO lkg_served_markers(session_id,served_capture_id,full_coverage,slot_state) VALUES('provider-opencode',9,1,'served');
          INSERT INTO host_runner_state(session_id,harness,lineage_id,ancestry_json,next_ordinal,cursor,served_through_ordinal,unserved_json)
              VALUES('provider-opencode','opencode','L','[]',5,5,4,'[]');
          INSERT INTO host_runner_views(session_id,harness,lineage_id,compaction_id,version,range_from,range_to,replacement_json,state,applied_at)

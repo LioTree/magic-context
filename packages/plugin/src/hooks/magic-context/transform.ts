@@ -150,7 +150,13 @@ import {
 } from "./lkg-recovery-prefix";
 import { captureLkgSlot, createLkgEntryProjector, resolveLkgModelKeys } from "./lkg-replay";
 import { recordServedCapture } from "./lkg-served-marker";
-import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
+import {
+    beginLkgPass,
+    dropSlot,
+    getInMemorySlot,
+    type LkgSlot,
+    releaseWithheldServedCapture,
+} from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
 import {
     createPassOutcome,
@@ -3423,6 +3429,16 @@ export function createTransform(deps: TransformDeps) {
         // returned message, including its already-served raw tail. Models whose
         // thinking signatures depend on earlier bytes also need complete arrays
         // to reproduce those bytes after restart.
+        //
+        // The served-capture certificate is allocated only when this pass returns
+        // (at its end), and the deferred save runs only for a pass that returned.
+        // A pass that throws after capturing never served these bytes, so it must
+        // not move the session's certificate or overwrite another writer's slot.
+        let servedAtReturn:
+            | { slot: LkgSlot; fullCoverage: boolean; prior: LkgSlot | undefined }
+            | undefined;
+        let savedAtReturn: LkgSlot | undefined;
+        let passReturned = false;
         if (passOutcome.captureEligible || recovery.prefix || recoveryReleaseReason) {
             const keys = resolveLkgModelKeys(messages);
             const modelKey = modelForBudget
@@ -3444,18 +3460,21 @@ export function createTransform(deps: TransformDeps) {
                 onPrepared: deps.compactionOff
                     ? undefined
                     : (slot, fullCoverage) => {
-                          slot.servedCaptureId = recordServedCapture(
-                              db,
-                              sessionId,
-                              fullCoverage,
+                          // Compare with the capture served before this one, which
+                          // captureLkgSlot is about to replace in memory.
+                          servedAtReturn = {
                               slot,
-                          );
+                              fullCoverage,
+                              prior: getInMemorySlot(sessionId),
+                          };
+                          slot.servedCaptureWithheld = true;
                       },
             });
             if (captured) {
                 // Preserve ordinary publication timing. Recovery already published
                 // dirty before returning, so its fence stays dirty until this save lands.
                 const capturedSlot = getInMemorySlot(sessionId);
+                savedAtReturn = capturedSlot;
                 if (capturedSlot) {
                     const revision =
                         lkgDirtyRevision(sessionId) ??
@@ -3472,6 +3491,9 @@ export function createTransform(deps: TransformDeps) {
                     };
                     withoutSqliteTransformPass(() =>
                         setImmediate(() => {
+                            // A pass that threw after capturing did not return these
+                            // bytes; saving them would publish a request never served.
+                            if (!passReturned) return;
                             // Ordinary saves preserve base's ordered deferred callbacks.
                             // Recovery certification additionally rejects superseded captures.
                             if (fence.requiredRevision) {
@@ -3740,6 +3762,18 @@ export function createTransform(deps: TransformDeps) {
                 systemPromptHash: sessionMeta.systemPromptHash,
             });
         deps.onPostprocess?.({ bustedThisPass: postTransformResult.bustedThisPass });
+        // The pass is about to return its request to the host, so the capture of that
+        // request was really served: give it its served-capture id now.
+        if (servedAtReturn) {
+            const { slot, fullCoverage, prior } = servedAtReturn;
+            const servedCaptureId = recordServedCapture(db, sessionId, fullCoverage, slot, prior);
+            releaseWithheldServedCapture(sessionId, slot, servedCaptureId);
+            if (savedAtReturn) {
+                savedAtReturn.servedCaptureId = servedCaptureId;
+                savedAtReturn.servedCaptureWithheld = undefined;
+            }
+        }
+        passReturned = true;
     };
 
     return Object.assign(transform, {

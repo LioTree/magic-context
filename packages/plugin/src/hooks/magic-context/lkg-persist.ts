@@ -200,6 +200,110 @@ function rememberFingerprint(db: Database, sessionId: string, fingerprint: strin
     saved.set(sessionId, fingerprint);
 }
 
+/**
+ * The identity a served-capture certificate binds, in exactly the text form the
+ * `lkg_slots` row stores, so a reader can recompute the digest from the row alone.
+ * `prefixHash` is the row's `json_prefix_hash`; loads verify it against every
+ * stored slice. Capture time and the process-local capture ordinal are excluded:
+ * a repeated serve of identical bytes keeps its certificate.
+ */
+export interface LkgCertifiedIdentity {
+    prefixHash: string;
+    inputIdSeq: string;
+    inputContentDigests: string;
+    inputContentSignatures: string | null;
+    inputMoveDigests: string | null;
+    lastInputMessageId: string;
+    modelKey: string | null;
+    providerKey: string | null;
+    rowVersion: number | null;
+}
+
+export function lkgCertificateDigest(identity: LkgCertifiedIdentity): string {
+    return createHash("sha256")
+        .update(
+            JSON.stringify([
+                "lkg-served-certificate-v1",
+                identity.prefixHash,
+                identity.inputIdSeq,
+                identity.inputContentDigests,
+                identity.inputContentSignatures,
+                identity.inputMoveDigests,
+                identity.lastInputMessageId,
+                identity.modelKey,
+                identity.providerKey,
+                identity.rowVersion,
+            ]),
+        )
+        .digest("hex");
+}
+
+/** Serialize a slot's certified identity the same way `persistLkgSlot` stores it. */
+function certifiedIdentity(slot: LkgSlot, prefixHash: string): LkgCertifiedIdentity {
+    return {
+        prefixHash,
+        inputIdSeq: JSON.stringify(
+            slot.piOutputEntryIds
+                ? { version: 1, inputIds: slot.inputIdSeq, piOutputEntryIds: slot.piOutputEntryIds }
+                : slot.inputIdSeq,
+        ),
+        inputContentDigests: JSON.stringify(slot.inputContentDigests),
+        inputContentSignatures: slot.inputContentSignatures
+            ? JSON.stringify(slot.inputContentSignatures)
+            : null,
+        inputMoveDigests: slot.inputMoveDigests ? JSON.stringify(slot.inputMoveDigests) : null,
+        lastInputMessageId: slot.lastInputMessageId,
+        modelKey: slot.modelKey,
+        providerKey: slot.providerKey,
+        rowVersion: slot.rowVersion ?? null,
+    };
+}
+
+/**
+ * The certificate digest of a slot's exact bytes. Hashes the whole prefix, so
+ * callers on the serve path use `boundLkgCertificate` instead.
+ */
+export function lkgSlotCertificateDigest(slot: LkgSlot): string {
+    return lkgCertificateDigest(certifiedIdentity(slot, layoutLkgPrefix(slot.jsonPrefix).hash));
+}
+
+/**
+ * The certificate this connection last bound for a session: its id, digest and
+ * prefix. A repeated serve compares its prefix with this record instead of
+ * hashing the request again.
+ */
+export interface BoundLkgCertificate {
+    servedCaptureId: number;
+    digest: string;
+    jsonPrefix: string;
+}
+const boundCertificates = new WeakMap<Database, Map<string, BoundLkgCertificate>>();
+
+export function boundLkgCertificate(
+    db: Database,
+    sessionId: string,
+): BoundLkgCertificate | undefined {
+    return boundCertificates.get(db)?.get(sessionId);
+}
+
+function rememberBoundCertificate(
+    db: Database,
+    sessionId: string,
+    certificate: BoundLkgCertificate,
+): void {
+    let bound = boundCertificates.get(db);
+    if (!bound) {
+        bound = new Map();
+        boundCertificates.set(db, bound);
+    }
+    bound.delete(sessionId);
+    if (bound.size >= PERSISTED_FINGERPRINT_MAX_SESSIONS) {
+        const oldest = bound.keys().next().value;
+        if (oldest !== undefined) bound.delete(oldest);
+    }
+    bound.set(sessionId, certificate);
+}
+
 function slotFingerprint(slot: LkgSlot): string {
     // capturedAt is the time of this capture, not part of the served request.
     // Keep all replay fences and metadata in the fingerprint so a changed slot
@@ -276,15 +380,10 @@ function persistLkgSlot(
     try {
         // Ownership arrays grow with the session. Serialize them before BEGIN so
         // preparing a large saved request does not exclude another host's writer.
-        const inputIdSeq = JSON.stringify(
-            slot.piOutputEntryIds
-                ? { version: 1, inputIds: slot.inputIdSeq, piOutputEntryIds: slot.piOutputEntryIds }
-                : slot.inputIdSeq,
-        );
-        const inputContentDigests = JSON.stringify(slot.inputContentDigests);
-        const inputContentSignatures = slot.inputContentSignatures
-            ? JSON.stringify(slot.inputContentSignatures)
-            : null;
+        const identity = certifiedIdentity(slot, layout.hash);
+        const { inputIdSeq, inputContentDigests, inputContentSignatures } = identity;
+        const certificateDigest =
+            slot.servedCaptureId !== undefined ? lkgCertificateDigest(identity) : undefined;
         db.transaction(() => {
             // Historical migration fixtures also save pre-marker slots. When the
             // columns exist, an uncertified overwrite must clear their old ids.
@@ -300,6 +399,11 @@ function persistLkgSlot(
                     marker.slotState !== "captured"
                 )
                     throw new Error("LKG capture was superseded or invalidated");
+                // Once a save has bound an id to bytes, no other bytes may claim that
+                // id. A writer can hold an equal id for different bytes after the
+                // session's counter restarted (its marker row was deleted).
+                if (marker.servedDigest !== null && marker.servedDigest !== certificateDigest)
+                    throw new Error("LKG capture id is bound to different bytes");
             }
             const storedHashes = new Map<unknown, unknown>();
             for (const row of db
@@ -354,16 +458,25 @@ function persistLkgSlot(
                 slot.rowVersion ?? null,
                 slot.captureSequence ?? null,
                 ...(withServedMetadata
-                    ? [
-                          slot.servedCaptureId ?? null,
-                          slot.inputMoveDigests ? JSON.stringify(slot.inputMoveDigests) : null,
-                      ]
+                    ? [slot.servedCaptureId ?? null, identity.inputMoveDigests]
                     : []),
             );
+            // Bind the marker to these exact bytes in the same transaction that
+            // writes them, so no reader ever sees the id without its bytes.
+            if (slot.servedCaptureId !== undefined)
+                db.prepare(
+                    "UPDATE lkg_served_markers SET served_digest = ? WHERE session_id = ? AND served_capture_id = ?",
+                ).run(certificateDigest ?? null, sessionId, slot.servedCaptureId);
             // Safety metadata must share the request's commit, not a later callback.
             publishMetadata?.();
         }).immediate();
         if (fingerprint !== undefined) rememberFingerprint(db, sessionId, fingerprint);
+        if (slot.servedCaptureId !== undefined && certificateDigest !== undefined)
+            rememberBoundCertificate(db, sessionId, {
+                servedCaptureId: slot.servedCaptureId,
+                digest: certificateDigest,
+                jsonPrefix: slot.jsonPrefix,
+            });
         return true;
     } catch (error) {
         // Paired Pi publication reports its optional failure once per session/reason.
@@ -423,6 +536,7 @@ export function clearPersistedLkgSlotStrict(
             .immediate(),
     );
     persistedFingerprints.get(db)?.delete(sessionId);
+    boundCertificates.get(db)?.delete(sessionId);
 }
 
 export function loadPersistedLkgSlot(
@@ -531,6 +645,7 @@ function pruneStaleLkgSlotsBatch(db: Database, now: number): { slots: number; ch
         logSlowWriteTransaction("lkg_stale_gc", transactionStartedAt);
         if (changes.slots && slot) {
             persistedFingerprints.get(db)?.delete(slot.session_id);
+            boundCertificates.get(db)?.delete(slot.session_id);
         }
         return changes;
     } finally {

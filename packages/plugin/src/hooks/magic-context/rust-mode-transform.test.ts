@@ -106,7 +106,12 @@ import {
     currentLkgRequestIdentity,
     noteLkgProviderResponse,
 } from "./lkg-measured-request";
-import { createDbLkgPersistence, loadPersistedLkgSlot, saveLkgSlotToDb } from "./lkg-persist";
+import {
+    createDbLkgPersistence,
+    lkgSlotCertificateDigest,
+    loadPersistedLkgSlot,
+    saveLkgSlotToDb,
+} from "./lkg-persist";
 import {
     certifyCommittedLkgCapture,
     hasCleanLkgRecoveryFence,
@@ -114,7 +119,7 @@ import {
     lkgServedArrayDigest,
 } from "./lkg-recovery-fence";
 import { lkgDirtyRevision } from "./lkg-recovery-prefix";
-import { checkLkgDurability, readServedMarker } from "./lkg-served-marker";
+import { checkLkgDurability, readServedMarker, recordServedCapture } from "./lkg-served-marker";
 import * as lkgSlot from "./lkg-slot";
 import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
 import { boundMarkerEnvelope } from "./marker-envelope";
@@ -5914,6 +5919,77 @@ describe("Rust mode authority adapter", () => {
         ).rejects.toBeInstanceOf(EmergencyFailClosedError);
         expect(JSON.stringify(output.messages)).toBe(JSON.stringify(input));
         expect(JSON.stringify(output.messages)).not.toContain("captured module output");
+    });
+
+    it("a pass that throws after capturing leaves another connection's certified slot and marker untouched", async () => {
+        const sessionId = `rust-unreturned-capture-${Date.now()}`;
+        sessions.push(sessionId);
+        const directory = createTestTempDirFromPath(join(tmpdir(), "rust-unreturned-"));
+        availabilityDataHomes.push(directory);
+        const db = openDatabase(join(directory, "context.db")) as ContextDatabase | null;
+        if (!db) throw new Error("file-backed test database did not open");
+        databases.push(db);
+        registerLkgPersistence(createDbLkgPersistence(db));
+        const sibling = new Database(join(directory, "context.db")) as ContextDatabase;
+        databases.push(sibling);
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        const scheduled: Array<() => void> = [];
+        let pass = 0;
+        let failAfterCapture = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                return {
+                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1,
+                    row_version: pass,
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: `module output ${pass}` }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            scheduleLkgCapture: (capture) => scheduled.push(capture),
+            afterLkgCaptureScheduledForTests: () => {
+                if (failAfterCapture) throw new Error("injected failure after capture");
+            },
+        });
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        const firstStatus = checkLkgDurability(db, sessionId);
+        expect(firstStatus.durable && typeof firstStatus.servedCaptureId).toBe("number");
+        // Another connection serves and certifies a different request.
+        const siblingSlot = {
+            ...loadPersistedLkgSlot(sibling, sessionId)!,
+            jsonPrefix: '[{"text":"sibling served bytes"}]',
+            servedCaptureId: recordServedCapture(sibling, sessionId, true),
+        };
+        expect(saveLkgSlotToDb(sibling, sessionId, siblingSlot, { force: true })).toBe(true);
+        const siblingMarker = readServedMarker(sibling, sessionId);
+        expect(siblingMarker?.servedDigest).toBe(lkgSlotCertificateDigest(siblingSlot));
+
+        failAfterCapture = true;
+        const output = { messages: [...input] as unknown[] };
+        await transform
+            .run(sessionId, input, output, makeMeta(db, sessionId))
+            .catch(() => undefined);
+        expect(JSON.stringify(output.messages)).not.toContain("module output 2");
+        // The failed pass did prepare and queue its capture; the queue must not save it.
+        expect(scheduled).toHaveLength(1);
+        for (const capture of scheduled.splice(0)) capture();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(readServedMarker(db, sessionId)).toEqual(siblingMarker);
+        expect(loadPersistedLkgSlot(db, sessionId)?.jsonPrefix).toBe(siblingSlot.jsonPrefix);
+        expect(checkLkgDurability(db, sessionId)).toEqual({
+            durable: true,
+            servedCaptureId: siblingSlot.servedCaptureId!,
+        });
     });
 
     it("refreshes the LKG snapshot after an applied SOFT+ pass", async () => {

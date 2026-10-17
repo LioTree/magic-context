@@ -126,7 +126,11 @@ import {
     measureLkgReplayRequest,
     RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN,
 } from "./lkg-replay-fit";
-import { recordServedCapture, recordServedSlotState } from "./lkg-served-marker";
+import {
+    failedPassRestoreMode,
+    recordServedCapture,
+    recordServedSlotState,
+} from "./lkg-served-marker";
 import {
     captureSlot,
     contentSnapshotValue,
@@ -353,6 +357,10 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
 
 interface RustLkgCapturePlan {
     servedCaptureId?: number;
+    /** The served-capture certificate was decided (allocated, reused or withheld). */
+    servedIdAllocated?: boolean;
+    /** The pass threw after preparing this capture, so it never returned its bytes. */
+    passFailed?: boolean;
     prepared?: {
         slot: LkgSlot;
         inputs: { id: string; fields: MessageContentSnapshot["fields"] }[];
@@ -568,6 +576,11 @@ export interface RustModeTransformOptions {
     }) => void;
     /** Disable hot-path I/O caches to establish an uncached differential-timing baseline. */
     disableHotPathIoCachesForTests?: boolean;
+    /**
+     * Test-only callback after this pass prepared and scheduled its capture, before
+     * the pass returns. Throwing here simulates a pass that fails after capturing.
+     */
+    afterLkgCaptureScheduledForTests?: (sessionId: string) => void;
     /** Test-only callback after a capture is accepted, reporting the reused digest prefix length. */
     onLkgCaptureForTests?: (reusedPrefix: number) => void;
     /** Test-only override for the stalled-request health-probe threshold. */
@@ -2596,6 +2609,20 @@ export function createRustModeTransform(
         };
     };
 
+    /**
+     * Take the served-capture certificate for a prepared capture, once, when the
+     * request carrying its bytes is being returned to the host. `reusable: false`
+     * forces a fresh id, for a returned request that no earlier certificate names.
+     */
+    const allocateServedCapture = (plan: RustLkgCapturePlan, reusable = true): void => {
+        if (plan.servedIdAllocated || !plan.prepared) return;
+        plan.servedIdAllocated = true;
+        const slot = plan.prepared.slot;
+        slot.servedCaptureId = plan.servedCaptureId = deps.compactionOff
+            ? undefined
+            : recordServedCapture(deps.db, plan.sessionId, true, reusable ? slot : undefined);
+    };
+
     const commitRustCapture = (
         state: RustSessionState,
         plan: RustLkgCapturePlan,
@@ -2605,7 +2632,10 @@ export function createRustModeTransform(
         if (
             states.get(plan.sessionId) !== state ||
             plan.captureSequence !== state.lkgCaptureSequence ||
-            plan.rowVersion < state.lkgLastCapturedRowVersion
+            plan.rowVersion < state.lkgLastCapturedRowVersion ||
+            // The pass threw after preparing this capture and served a replay,
+            // raw fallback or refusal instead; its bytes were never returned.
+            plan.passFailed
         ) {
             return "superseded";
         }
@@ -2650,14 +2680,16 @@ export function createRustModeTransform(
                 fullCoverage: true,
                 inputMoveDigests: inputs.map((input) => moveMessageDigestFromFields(input.fields)),
             };
-            slot.servedCaptureId = plan.servedCaptureId = deps.compactionOff
-                ? undefined
-                : recordServedCapture(deps.db, plan.sessionId, true, slot);
             plan.prepared = { slot, inputs, reusedPrefix };
         }
         const { slot, inputs, reusedPrefix } = plan.prepared;
         const rejection = lkgSlotRejection(plan.sessionId, slot);
         if (prepareOnly) return rejection === null ? "captured" : "superseded";
+        // A capture committed before its pass returns (a synchronous capture, or a
+        // test scheduler that runs inline) is served by that same pass, so it
+        // allocates its served-capture id here. Any other capture was given its id
+        // when its pass returned, and this call does nothing.
+        allocateServedCapture(plan);
         const captured = rejection === null && captureSlot(plan.sessionId, slot);
         if (!captured)
             throw new Error(
@@ -5059,6 +5091,7 @@ export function createRustModeTransform(
                         captureFailed("async", error);
                     }
                 }
+                options.afterLkgCaptureScheduledForTests?.(sessionId);
                 logStage(
                     sessionId,
                     "lkgSnapshot",
@@ -5268,11 +5301,26 @@ export function createRustModeTransform(
             state.lkgLatestServedDigest = lkgServedArrayDigest(returnedJson);
             if (captureForCertificate) {
                 captureForCertificate.returnedDigest = state.lkgLatestServedDigest;
+                const returnedPrepared =
+                    lkgServedArrayDigest(captureForCertificate.jsonPrefix) ===
+                    state.lkgLatestServedDigest;
                 if (
                     captureForCertificate.prepared &&
                     captureForCertificate.captureSequence === state.lkgCaptureSequence &&
                     captureForCertificate.rowVersion >= state.lkgLastCapturedRowVersion
                 ) {
+                    // This pass is returning its request, so its capture takes the
+                    // served certificate now (a capture already committed inside the
+                    // pass took it then). When later work changed the returned bytes,
+                    // the prepared bytes the deferred save writes were not served:
+                    // still allocate a new id so no earlier capture stays
+                    // certified, but save these prepared bytes without that id.
+                    if (!captureForCertificate.servedIdAllocated) {
+                        allocateServedCapture(captureForCertificate, returnedPrepared);
+                        if (!returnedPrepared)
+                            captureForCertificate.prepared.slot.servedCaptureId =
+                                captureForCertificate.servedCaptureId = undefined;
+                    }
                     const returnedSlot = {
                         ...captureForCertificate.prepared.slot,
                         jsonPrefix: returnedJson,
@@ -5293,9 +5341,7 @@ export function createRustModeTransform(
                         ),
                     });
                 }
-                captureForCertificate.eligibleForClean =
-                    lkgServedArrayDigest(captureForCertificate.jsonPrefix) ===
-                    state.lkgLatestServedDigest;
+                captureForCertificate.eligibleForClean = returnedPrepared;
                 if (
                     (!captureForCertificate.committed || !captureForCertificate.eligibleForClean) &&
                     captureForCertificate.prepared &&
@@ -5346,19 +5392,35 @@ export function createRustModeTransform(
                 );
             }
         } catch (error) {
+            // Whatever this pass serves from here on (a replay, the raw input or a
+            // refusal), it is not the prepared capture, so its deferred save must not run.
+            if (captureForCertificate) captureForCertificate.passFailed = true;
             if (markerDefinitelyNoCut) {
                 try {
                     // A snapshot write can finish before later bookkeeping fails, even
                     // when the host marker stayed unchanged. Restore the previous saved
-                    // request in storage before allowing it to be replayed.
+                    // request in storage before allowing it to be replayed. This pass
+                    // served neither request, so when another connection has certified
+                    // since, its slot and certificate are left alone; only this pass's
+                    // own stored bytes are replaced, and then without a certificate.
                     deps.db
                         .transaction(() => {
-                            if (markerSafeSnapshot) {
+                            const restoreMode = failedPassRestoreMode(
+                                deps.db,
+                                sessionId,
+                                [
+                                    markerSafeSnapshot?.servedCaptureId,
+                                    captureForCertificate?.servedCaptureId,
+                                ],
+                                captureForCertificate?.jsonPrefix,
+                            );
+                            if (markerSafeSnapshot && restoreMode !== "leave") {
                                 markerSafeSnapshot = {
                                     ...markerSafeSnapshot,
-                                    servedCaptureId: deps.compactionOff
-                                        ? undefined
-                                        : recordServedCapture(deps.db, sessionId, true),
+                                    servedCaptureId:
+                                        deps.compactionOff || restoreMode !== "certify"
+                                            ? undefined
+                                            : recordServedCapture(deps.db, sessionId, true),
                                 };
                                 if (
                                     !saveLkgSlotToDb(
@@ -5373,7 +5435,7 @@ export function createRustModeTransform(
                                     )
                                 )
                                     throw new Error("could not restore the unchanged-boundary LKG");
-                            } else {
+                            } else if (!markerSafeSnapshot && restoreMode !== "leave") {
                                 clearPersistedLkgSlotStrict(deps.db, sessionId);
                             }
                             setRustMarkerAdmissionFence(deps.db, sessionId, false);

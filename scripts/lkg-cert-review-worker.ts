@@ -1,0 +1,229 @@
+/** Disposable real-host worker for the adversarial LKG certificate differential. */
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+import { join, resolve } from "node:path";
+import { spyOn } from "bun:test";
+import { generateSyntheticFixture } from "../packages/pi-plugin/scripts/experiments/perf/fixtures";
+
+const [source, host] = process.argv.slice(2) as [string, string];
+const root = process.env.LKG_CERT_REVIEW_ROOT;
+assert(root && root.includes("/magic-context/lkg-cert-review/"));
+for (const key of ["HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "OPENCODE_DB", "MAGIC_CONTEXT_STORAGE_DIR", "MAGIC_CONTEXT_TEST_DATA_DIR", "PI_CODING_AGENT_DIR"])
+    assert(resolve(process.env[key] ?? "").startsWith(root), `${key} escaped disposable root`);
+const project = process.env.LKG_CERT_REVIEW_PROJECT!;
+mkdirSync(project, { recursive: true });
+mkdirSync(join(root, "pi"), { recursive: true });
+const load = (path: string) => import(join(source, path));
+const core = "packages/plugin/src/";
+let stages: Record<string, number> = {};
+let spans: Record<string, number> = {};
+let decisions: string[] = [];
+let logLines: string[] = [];
+const globalHooks = globalThis as typeof globalThis & {
+    __trainOverheadStage?: (stage: string, elapsed: number) => void;
+    __trainOverheadSpan?: (stage: string, elapsed: number) => void;
+};
+globalHooks.__trainOverheadStage = (name, ms) => { stages[name] = (stages[name] ?? 0) + ms; };
+globalHooks.__trainOverheadSpan = (name, ms) => { spans[name] = (spans[name] ?? 0) + ms; };
+// Initialize product modules only after HOME, XDG and database paths point to
+// the disposable root; some modules resolve storage paths during import.
+delete process.env.NODE_ENV;
+const logger = await load(`${core}shared/logger.ts`);
+process.env.NODE_ENV = "test";
+logger.setLogLineForwarder((line: string) => {
+    logLines.push(line);
+    const decision = /transform(?: scheduler)?:.*decision=(defer|execute)/.exec(line)?.[1];
+    if (decision) decisions.push(decision);
+});
+const { setHarness } = await load(`${core}shared/harness.ts`);
+setHarness(host === "pi" ? "pi" : "opencode");
+const { Database } = await load(`${core}shared/sqlite.ts`);
+const { openDatabase, closeDatabase } = await load(`${core}features/magic-context/storage-db.ts`);
+const db = openDatabase();
+const { getOrCreateSessionMeta, updateSessionMeta } = await load(`${core}features/magic-context/storage-meta.ts`);
+const { resolveProjectIdentityForSession } = await load(`${core}features/magic-context/memory/project-identity.ts`);
+const { insertMemory } = await load(`${core}features/magic-context/memory/storage-memory.ts`);
+const projectIdentity = resolveProjectIdentityForSession(project);
+assert(projectIdentity, "synthetic project identity unavailable");
+let sessionId = "cert-review-synthetic";
+const model = host === "opencode2"
+    ? { providerID: "anthropic", modelID: "claude-opus-5-5" }
+    : { providerID: "openai", modelID: "gpt-4.1" };
+const window = 1_000_000;
+const epoch = 1_792_000_000_000;
+let passNumber = 0;
+Date.now = () => epoch + passNumber * 1000;
+getOrCreateSessionMeta(db, sessionId);
+const fixture = generateSyntheticFixture({ messages: 240, systemEntry: true, toolResultRepeat: 180 });
+// Pi uses a model without signed-thinking binding, so random edits are served
+// rather than held to preserve a thinking signature. OpenCode 2 uses a model
+// requiring the entire request in LKG, since its native payload has no per-message
+// creation times with which the legacy partial-prefix capture finds an anchor.
+let entries = fixture.entries.filter((e) => e.type === "message" && (e as any).message.role !== "system") as any[];
+for (const entry of entries) {
+    if (entry.message.role === "assistant") { entry.message.provider = model.providerID; entry.message.model = model.modelID; entry.message.api = "openai-completions"; }
+}
+let piRaw = entries.map((e) => e.message);
+let raw: any[] = [];
+for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const m = entry.message;
+    if (m.role === "toolResult") continue;
+    const id = entry.id;
+    const content = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content;
+    const parts = content.filter((p: any) => p.type !== "thinking").map((p: any, j: number) => {
+        const base = { id: `${id}-p${j}`, messageID: id, sessionID: sessionId };
+        if (p.type === "toolCall") {
+            const result = entries[i + 1]?.message;
+            assert.equal(result?.role, "toolResult");
+            return { ...base, type: "tool", callID: p.id, tool: p.name, state: { status: "completed", input: p.arguments, output: result.content[0].text, title: "Synthetic read", metadata: {}, time: { start: epoch - 2000, end: epoch - 1000 } } };
+        }
+        return { ...base, ...p };
+    });
+    raw.push({ info: { id, sessionID: sessionId, role: m.role, time: { created: m.timestamp, completed: m.timestamp + 1 }, ...(m.role === "assistant" ? { ...model, finish: m.stopReason === "toolUse" ? "tool-calls" : "stop", tokens: { input: 100, output: 20, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0 } : { model }) }, parts });
+}
+const statePath = join(root, "fixture.json");
+if (existsSync(statePath)) {
+    const saved = JSON.parse(readFileSync(statePath, "utf8"));
+    ({ entries, piRaw, raw, sessionId, passNumber } = saved);
+}
+const saveState = () => writeFileSync(statePath, JSON.stringify({ entries, piRaw, raw, sessionId, passNumber }));
+let runRequest: () => Promise<unknown>;
+let dispose: () => Promise<void> = async () => {};
+let storeRaw = () => {};
+const usage = new Map();
+const settle = () => {
+    updateSessionMeta(db, sessionId, { lastResponseTime: Date.now(), lastContextPercentage: 20, lastInputTokens: 200_000 });
+    usage.set(sessionId, { usage: { percentage: 20, inputTokens: 200_000 }, updatedAt: Date.now(), lastResponseTime: Date.now(), hasUsageTokens: true });
+};
+if (host === "pi") {
+    const { registerPiContextHandler } = await load("packages/pi-plugin/src/context-handler.ts");
+    const { setPiTransformTimingObserver } = await load("packages/pi-plugin/src/context-perf-hooks.ts");
+    setPiTransformTimingObserver((sample: { stage: string; elapsedMs: number }) => { stages[sample.stage] = (stages[sample.stage] ?? 0) + sample.elapsedMs; });
+    let handler: any;
+    registerPiContextHandler({ getAllTools: () => [{ name: "read", description: "Read a file", parameters: { type: "object", properties: {} } }], on: (name: string, callback: any) => { if (name === "context") handler = callback; } }, {
+        db, protectedTags: 10, scheduler: { executeThresholdPercentage: 95 },
+        injection: { memoryEnabled: true, injectDocs: false, injectionBudgetTokens: 4000, temporalAwareness: false },
+        heuristics: { caveman: { enabled: false, minChars: 2000 } },
+    });
+    assert(handler);
+    runRequest = async () => {
+        const event = { messages: structuredClone(piRaw) };
+        const branch = entries.map((e, i) => ({ ...e, message: event.messages[i] }));
+        const byId = new Map(branch.map((e) => [e.id, e]));
+        const context = { cwd: project, hasUI: false, getSystemPrompt: () => "You are a synthetic coding agent.", signal: new AbortController().signal, ui: { notify() {} },
+            model: { provider: model.providerID, id: model.modelID, contextWindow: window },
+            sessionManager: { getSessionId: () => sessionId, getLeafId: () => branch.at(-1)?.id, getBranch: () => branch, getEntry: (id: string) => byId.get(id) },
+            getContextUsage: () => ({ tokens: 200_000, percent: 20, contextWindow: window }),
+        };
+        // Constructing Pi's input message clone and branch lookup is host work,
+        // not work inside the registered context handler being timed.
+        const start = performance.now();
+        const result = await handler(event, context);
+        return { ms: performance.now() - start, wire: result?.messages ?? event.messages };
+    };
+} else {
+    const store = new Database(process.env.OPENCODE_DB);
+    if (host === "opencode1") {
+        store.exec("CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT); CREATE TABLE IF NOT EXISTS part(id TEXT PRIMARY KEY,message_id TEXT,session_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT)");
+        storeRaw = () => store.transaction(() => {
+            store.exec("DELETE FROM part; DELETE FROM message");
+            for (const m of raw) {
+                store.prepare("INSERT OR REPLACE INTO message VALUES(?,?,?,?,?)").run(m.info.id, sessionId, m.info.time.created, m.info.time.created, JSON.stringify(m.info));
+                for (const p of m.parts) store.prepare("INSERT OR REPLACE INTO part VALUES(?,?,?,?,?,?)").run(p.id, m.info.id, sessionId, m.info.time.created, m.info.time.created, JSON.stringify(p));
+            }
+        })();
+        storeRaw();
+        const { createTransform } = await load(`${core}hooks/magic-context/transform.ts`);
+        const { createTagger } = await load(`${core}features/magic-context/tagger.ts`);
+        const { createMessagesTransformHandler } = await load(`${core}plugin/messages-transform.ts`);
+        const { refreshModelLimitsFromApi } = await load(`${core}shared/models-dev-cache.ts`);
+        await refreshModelLimitsFromApi({ config: { providers: async () => ({ data: { providers: [{ id: model.providerID, models: { [model.modelID]: { limit: { context: window, output: 32000 } } } }] } }) } });
+        const transform = createTransform({ db, tagger: createTagger(), storeGeneration: "v1", scheduler: { shouldExecute: () => "defer" }, contextUsageMap: usage,
+            historyRefreshSessions: new Set(), pendingMaterializationSessions: new Set(), lastHeuristicsTurnId: new Map(),
+            clearReasoningAge: 50, protectedTokens: 0, historianRunnable: false, channel1StateBySession: new Map(),
+            liveModelBySession: new Map([[sessionId, model]]), directory: project, projectPath: projectIdentity,
+            memoryConfig: { enabled: true, injectionBudgetTokens: 4000, autoPromote: false },
+            autoSearch: { enabled: false, scoreThreshold: 0.6, minPromptChars: 20, directory: project },
+        });
+        const handler = createMessagesTransformHandler({ magicContext: { "experimental.chat.messages.transform": transform } });
+        runRequest = async () => {
+            const output = { messages: structuredClone(raw) };
+            const start = performance.now();
+            await handler({}, output);
+            return { ms: performance.now() - start, wire: output.messages };
+        };
+    } else {
+        store.exec("CREATE TABLE IF NOT EXISTS session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,time_created INTEGER,data TEXT); CREATE TABLE IF NOT EXISTS session_v2(id TEXT PRIMARY KEY,directory TEXT NOT NULL)");
+        const { MagicContextConfigSchema } = await load(`${core}config/schema/magic-context.ts`);
+        const configModule = await load(`${core}config/index.ts`);
+        const gateModule = await load(`${core}v2/hooks/storage-gate.ts`);
+        const configSpy = spyOn(configModule, "loadPluginConfigDetailed").mockReturnValue({ config: MagicContextConfigSchema.parse({ historian: { disable: true }, dreamer: { disable: true, inject_docs: false }, memory: { enabled: true, auto_search: { enabled: false } }, temporal_awareness: false, compressor: { enabled: false }, scheduler: { execute_threshold_percentage: 95 } }) });
+        const gateSpy = spyOn(gateModule, "createV2StorageGate").mockReturnValue({ current: () => db, probe: async () => db, require: () => db, reason: () => null });
+        const { registerContext } = await load(`${core}v2/hooks/context.ts`);
+        let handler: any;
+        const context = { location: { directory: project }, agent: { transform: async () => {}, reload: async () => {} }, model: { list: () => [] }, storage: { get: async () => undefined, set: async () => {} }, event: { subscribe: async function* () {} }, tool: { hook: async () => {}, transform: async () => {} },
+            session: { remove: async () => {}, compact: async () => {}, interrupt: async () => { throw Error("unexpected refusal"); }, wait: async () => {}, get: async () => ({ location: { directory: project } }), hook: async (name: string, callback: any) => { if (name === "context") handler = callback; } },
+        };
+        const duties = await registerContext(context);
+        assert(handler);
+        storeRaw = () => store.transaction(() => {
+            store.exec("DELETE FROM session_message");
+            for (const [i, m] of raw.entries()) store.prepare("INSERT OR REPLACE INTO session_message VALUES(?,?,?,?,?,?)").run(m.info.id, sessionId, m.info.role, i, m.info.time.created, JSON.stringify({ role: m.info.role, content: m.parts }));
+        })();
+        storeRaw();
+        runRequest = async () => {
+            const draft = { sessionID: sessionId, agent: "build", model: { providerID: model.providerID, id: model.modelID, limit: { context: window } }, system: [], options: {}, tools: { read: { description: "Read fixture", input: { type: "object" } } }, messages: raw.map((m) => ({ id: m.info.id, role: m.info.role, content: structuredClone(m.parts) })) };
+            const start = performance.now();
+            await handler(draft);
+            return { ms: performance.now() - start, wire: draft };
+        };
+        dispose = async () => { await duties?.dispose(); configSpy.mockRestore(); gateSpy.mockRestore(); };
+    }
+}
+
+const { getInMemorySlot, getSlot } = await load(`${core}hooks/magic-context/lkg-slot.ts`);
+const { checkLkgDurability, readServedMarker } = await load(`${core}hooks/magic-context/lkg-served-marker.ts`);
+const { replayLkg } = await load(`${core}hooks/magic-context/lkg-replay.ts`);
+const { clearSession } = await load(`${core}features/magic-context/storage-meta-session.ts`);
+async function invoke() {
+    settle();
+    stages = {}; spans = {}; decisions = []; logLines = [];
+    const result = await runRequest() as { ms: number; wire: unknown };
+    const foregroundStages = { ...stages };
+    const foregroundSpans = { ...spans };
+    const foregroundDecisions = [...decisions];
+    // Drain deferred LKG saves before the next request replaces their in-memory
+    // capture. The measured result.ms covers only the host handler, not this
+    // drain or the output hashing below.
+    await new Promise<void>((done) => setImmediate(done));
+    await new Promise<void>((done) => setImmediate(done));
+    const meta = getOrCreateSessionMeta(db, sessionId);
+    const slot = getSlot(sessionId);
+    // Probe the actual replay validator without destroying the live host's slot on
+    // expected negative cases. Successful replay must agree on complete bytes too.
+    const replay = host === "pi" ? undefined : replayLkg({ sessionId, messages: structuredClone(raw), modelKey: model.modelID, providerKey: model.providerID });
+    const durability = checkLkgDurability(db, sessionId);
+    const recovery = { slot: Boolean(slot), fullCoverage: slot?.fullCoverage, replay: replay?.ok === true ? createHash("sha256").update(JSON.stringify(replay.messages)).digest("hex") : replay?.reason, durability: { ...durability, servedCaptureId: "servedCaptureId" in durability ? durability.servedCaptureId !== null : undefined }, error: meta.lastTransformError ?? null, logs: logLines.filter((line) => /LKG|recovery|refus|recover|lkg_/.test(line)).map((line) => line.replace(/\\d{4}-\\d\\d-\\d\\dT[^ ]+ /g, "")) };
+    return { wire: createHash("sha256").update(JSON.stringify(result.wire)).digest("hex"), decision: foregroundDecisions, recovery: { ...recovery, logs: undefined }, marker: readServedMarker(db, sessionId), slotHash: slot ? createHash("sha256").update(slot.jsonPrefix).digest("hex") : null };
+}
+// Seed the history and memories before the first head render, then let the
+// handler allocate tags before installing dropped statuses on eight of them.
+db.transaction(() => {
+    db.prepare("INSERT INTO compartments(session_id,sequence,start_message,end_message,title,content,p1,p2,p3,p4,created_at) VALUES(?,0,0,12,'Completed investigation',?,?,?,?,?,?)").run(sessionId, ...Array(5).fill("The earlier investigation established the parser contract and tests. ".repeat(20)), epoch);
+    for (let i = 0; i < 8; i++) insertMemory(db, {
+        projectPath: projectIdentity, category: "PROJECT_RULES", sourceType: "agent",
+        content: `Project convention ${i}: preserve transaction boundaries and include regression coverage.`,
+    });
+})();
+await invoke(false);
+db.prepare("UPDATE tags SET status='dropped' WHERE session_id=? AND tag_number BETWEEN 5 AND 12").run(sessionId);
+console.error(`${host} ${source}: initial tags installed`);
+for (let i = 0; i < 60; i++) {
+    await invoke(false);
+}
+console.error(`${host} ${source}: preheated`);
+let rng = 0x49a7;
+function random(n: number) { rng = (Math.imul(rng, 1664525) + 1013904223) >>> 0; return rng % n; }

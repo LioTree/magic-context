@@ -853,6 +853,28 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
                 { name: "idx_tags_session_message_nocase" },
                 { name: "idx_tags_session_tool_owner" },
             ]);
+            // Fresh initialization already has the served digest column. Remove it
+            // and insert a pre-102 served marker row, so migration 102 must add the
+            // column to a store that already holds marker rows.
+            db.exec(`ALTER TABLE lkg_served_markers DROP COLUMN served_digest;
+                INSERT INTO lkg_served_markers(session_id, served_capture_id, full_coverage, slot_state)
+                VALUES ('armed-v101', 7, 1, 'captured');`);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 102:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(
+                db
+                    .prepare(
+                        "SELECT served_capture_id, full_coverage, slot_state, served_digest FROM lkg_served_markers WHERE session_id='armed-v101'",
+                    )
+                    .get(),
+            ).toEqual({
+                served_capture_id: 7,
+                full_coverage: 1,
+                slot_state: "captured",
+                served_digest: null,
+            });
             populateModuleOwnedRows(db, version, state);
             return;
         case 100:
