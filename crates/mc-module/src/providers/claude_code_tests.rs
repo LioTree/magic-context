@@ -16,6 +16,8 @@ mod late_descent_tests;
 mod native_endpoint_tests;
 #[path = "pending_hook_pairing_tests.rs"]
 mod pending_hook_pairing_tests;
+#[path = "real_envelope_tests.rs"]
+mod real_envelope_tests;
 #[path = "tag_high_water_tests.rs"]
 mod tag_high_water_tests;
 
@@ -780,6 +782,7 @@ async fn cc_attested_status_before_first_step_has_unknown_legacy_counts() {
     assert_eq!(status["tag_count"], Value::Null);
     assert_eq!(status["compartment_count"], Value::Null);
     assert_eq!(status["step_lane"]["applied_drops_last_step"], Value::Null);
+    assert_eq!(status["step_lane"]["queued_drops"]["holds"], Value::Null);
 }
 
 #[tokio::test]

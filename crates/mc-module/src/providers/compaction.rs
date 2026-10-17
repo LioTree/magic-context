@@ -86,6 +86,13 @@ struct HostSetup {
     repair_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cache_policy: Option<Value>,
+    // Remember which queued tags already produced a notice, including across
+    // setup retries. Recent tool outputs stay queued until newer tool results
+    // satisfy both the token floor and the minimum of three distinct tags.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    logged_protection_holds: BTreeSet<i64>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    protection_held_tags: BTreeSet<i64>,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct HostView {
@@ -944,11 +951,11 @@ fn can_skip_host_step(
 fn producer_context<'a>(
     work: &'a Work,
     model: &str,
-    window: u64,
+    usable_soft: u64,
     historian_active: bool,
 ) -> transform::ProducerContext<'a> {
     let config = &work.binding.config;
-    let protected = config.resolve_protected_tokens(window);
+    let protected = config.resolve_protected_tokens(usable_soft);
     let ttl = config.resolve_cache_ttl_with_provenance(Some(model));
     transform::ProducerContext {
         signed_thinking_hold: config.signed_thinking_hold,
@@ -1111,10 +1118,17 @@ fn execute_host_with_healing(
     // surface during transport adoption; the host overlay renders live hook
     // tags independently, without inventing a new tagger epoch on the switch.
     template.tool_present = !meta.initialized || meta.tagging_surface_active || meta.cc_u1_active;
+    // Derive how much recent tool output to protect from the scheduling input
+    // budget, not the provider's larger total limit before reserved space.
+    let protection_window = template
+        .geometry
+        .as_ref()
+        .filter(|_| codec == Codec::ClaudeCodeAnthropic)
+        .map_or(status.context_window, |geometry| geometry.usable_soft);
     let mut context = producer_context(
         work,
         &setup.setup.request.model,
-        status.context_window,
+        protection_window,
         meta.historian.state != mc_store::HistorianPhase::Idle,
     );
     // The host owns idle detection on this lane. Without a trusted prior-response
@@ -1196,6 +1210,7 @@ fn execute_host_with_healing(
                 transient(error)
             }
         })?;
+    setup.protection_held_tags.clear();
     // Keep only scalars in Setup. Engine and native bytes are committed together
     // in one immutable view row below, before publishing their reference.
     setup.setup.state.version_high_water = state.version_high_water;
@@ -1278,7 +1293,7 @@ fn execute_host_with_healing(
             .load_meta(&conversation.engine_namespace)
             .map_err(transient)?
             .meta;
-        let mut protected_blocks =
+        let protection_window =
             crate::protection_window::ProtectionWindow::from_persisted_rows_calibrated(
                 tag_rows,
                 current
@@ -1288,9 +1303,27 @@ fn execute_host_with_healing(
                     .decision_calibration
                     .as_ref()
                     .map_or(1.0, |c| c.tools_ratio),
-            )
-            .row_identities
-            .block_ids;
+            );
+        if output.prefix_bust_permitted && output.engine.historian_tags.is_some() {
+            for tag in &protection_window.member_rows {
+                if native_pending.contains(&tag.block_id) {
+                    let number = live
+                        .iter()
+                        .filter(|answer| answer.state == "live")
+                        .flat_map(|answer| &answer.answer.tags)
+                        .find(|candidate| candidate.block_id == tag.block_id)
+                        .map_or(tag.tag_number, |candidate| candidate.number);
+                    setup.protection_held_tags.insert(number);
+                    if setup.logged_protection_holds.insert(number) {
+                        tracing::info!(
+                            "mc-module: pending drop held session={} tag={} reason=protection_window scheduler={:?}",
+                            conversation.engine_namespace, number, output.engine.scheduler_pass
+                        );
+                    }
+                }
+            }
+        }
+        let mut protected_blocks = protection_window.row_identities.block_ids;
         let live_blocks = output.engine.projection.blocks.iter().collect::<Vec<_>>();
         let selection_items = transform::tail_sel_items(
             &live_blocks,
@@ -2016,6 +2049,8 @@ impl McHandler {
                 applied: None,
                 produced: None,
                 invalidated: false,
+                logged_protection_holds: BTreeSet::new(),
+                protection_held_tags: BTreeSet::new(),
                 repair_pending: false,
                 cache_policy: if codec == Codec::ClaudeCodeAnthropic {
                     Some(super::cache_policy::resolve(
@@ -2600,6 +2635,7 @@ impl McHandler {
             "no_change"
         };
         let mut replacement_range = Value::Null;
+        setup.protection_held_tags.clear();
         let answer = if incomplete {
             // Host paging never owns asynchronous wait work or a ready callback.
             // The lock's guard belongs to the request and drops at this return.
@@ -2721,10 +2757,14 @@ impl McHandler {
         let mut receipt: Value =
             serde_json::from_str(&answer_receipt(&answer)).map_err(transient)?;
         if codec == Codec::ClaudeCodeAnthropic {
+            let protection_window = request
+                .geometry
+                .as_ref()
+                .map_or(normalized.context_window, |geometry| geometry.usable_soft);
             let protected = work
                 .binding
                 .config
-                .resolve_protected_tokens(normalized.context_window);
+                .resolve_protected_tokens(protection_window);
             receipt["step_lane"] = json!({
                 "lineage_id": lineage.lineage_id,
                 "last_step": {
@@ -3128,9 +3168,11 @@ impl McHandler {
             .map(str::to_owned)
             .unwrap_or_else(|| key.engine_key());
         let mut queued_tag_ids = step_lane_pending_tag_ids(store, &key, &engine_namespace)?;
+        let mut protection_held_tags = BTreeSet::new();
         if let Some(conversation) = &conversation {
             if let Some(raw_setup) = &conversation.setup_json {
                 let setup: HostSetup = serde_json::from_str(raw_setup).map_err(transient)?;
+                protection_held_tags = setup.protection_held_tags.clone();
                 for summary in [setup.produced.as_ref(), setup.applied.as_ref()]
                     .into_iter()
                     .flatten()
@@ -3175,12 +3217,22 @@ impl McHandler {
         let applied_drops_last_step = step_record
             .get("applied_drops_last_step")
             .and_then(Value::as_u64);
+        let holds = if step_record.is_null() {
+            Value::Null
+        } else {
+            json!(protection_held_tags
+                .intersection(&queued_tag_ids.iter().copied().collect())
+                .take(64)
+                .map(|tag| json!({"tag_id":tag,"reason":"protection_window"}))
+                .collect::<Vec<_>>())
+        };
         Ok(json!({
             "last_step": last_step,
             "protected_tokens": protected_tokens,
             "queued_drops": {
                 "tag_ids": queued_tag_ids.iter().take(64).copied().collect::<Vec<_>>(),
                 "total_count": queued_tag_ids.len(),
+                "holds": holds,
             },
             "applied_drops_last_step": applied_drops_last_step,
         }))

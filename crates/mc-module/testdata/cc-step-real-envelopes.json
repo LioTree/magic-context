@@ -1,0 +1,712 @@
+[
+ {
+  "sequence": 3,
+  "method": "compaction.setup",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "claude_code": {
+    "bootstrap_complete": false,
+    "cache_policy_revision": "1",
+    "canonical_reduce": true,
+    "capability": "claude-code-step/v1",
+    "caps": {
+     "hook_envelope_bytes": 3145728,
+     "ingress_envelope_bytes": 3145728,
+     "single_message_bytes": 3145727,
+     "view_page_bytes": 3145727
+    },
+    "commons_revision": "563e0984e2765710672220bbfecfb46a3b7f56c7",
+    "digest": "sha256",
+    "epochs": {
+     "codec": 1,
+     "compartment": 2,
+     "memory": 3,
+     "raw_provenance": 1,
+     "render": 3,
+     "tagger": 4
+    },
+    "exact_endpoint": "native_top_level_inclusive",
+    "guidance": true,
+    "harness": "claude-code",
+    "notice_dispatch_ack": false,
+    "observation": "answer",
+    "package_versions": {
+     "compaction-provider": "0.2.2",
+     "step-transform-provider": "0.2.1"
+    },
+    "partial_message_cut": false,
+    "principal": "reserved:thalamus",
+    "profile": "claude-code-anthropic",
+    "profile_generation": "codec-sha256:06f52a38618f8d1ad2b09f7cd415aa1868c67231da6ef33c8861f7b81cb701a5",
+    "provider_generation": "key-sha256:cbd1f54d6cce6316eb35133cfdbc60bccef3942bf9c5b93a0b8267cbdaa9559b",
+    "raw_view_read": true,
+    "wire_majors": {
+     "compaction-provider": "v1",
+     "step-transform-provider": "v1"
+    }
+   },
+   "composition": {
+    "compaction": {
+     "provider": "magic-context"
+    }
+   },
+   "harness": "claude-code",
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-3978806560559b706a2d2cf774549a6bac7b7614e36b1df929704e6d32c408d5",
+    "ordinal": 1
+   },
+   "now": 1792195660362,
+   "params": {
+    "observation": "answer",
+    "serializer_profile": "claude-code-anthropic"
+   },
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-setup-1792195660362-1",
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c"
+  }
+ },
+ {
+  "sequence": 5,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "estimate": {
+    "request_tokens": 2415
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 1
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 3186,
+    "sha256": "064a9bf94e86ade86cfc85081133eaea096e415b37b1538e1a752204d2e04559",
+    "count": 2
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-3978806560559b706a2d2cf774549a6bac7b7614e36b1df929704e6d32c408d5",
+    "ordinal": 1
+   },
+   "now": 1792195660386,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195660386-2",
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195660386-2",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 8,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 1,
+   "estimate": {
+    "previous_input": 3934,
+    "request_tokens": 2504
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 1255,
+    "sha256": "f3e9097e37ba37688c355822a056ea6e9775d42d5f8b21a0c2ae66317d4237c5",
+    "count": 3
+   },
+   "mid_turn": true,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-241e7dbda5babb28706c96f444a839be6645aa05ff0b4b24fd0c95315a6ee30f",
+    "ordinal": 4
+   },
+   "now": 1792195660438,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195660438-5",
+   "served_through_ordinal": 1,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195660438-5",
+   "step_kind": "tool_step"
+  }
+ },
+ {
+  "sequence": 12,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 4,
+   "estimate": {
+    "previous_input": 4043,
+    "request_tokens": 2649
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 1638,
+    "sha256": "f61292505b302ea4b9c7726f39139408284c7a8363b771f9219e666901093d7a",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-97e776c78ecb9446416cd9a578b91608abd7b66ba4cead98f1dbae915440a687",
+    "ordinal": 7
+   },
+   "now": 1792195660790,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195660790-8",
+   "served_through_ordinal": 4,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195660790-8",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 15,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 7,
+   "estimate": {
+    "previous_input": 4205,
+    "request_tokens": 2735
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 1159,
+    "sha256": "2ed87198d588c894e1e07df6e729b463bb323b03ddf737cb9ef9ac76c8fb645e",
+    "count": 3
+   },
+   "mid_turn": true,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-1ef686b9436a1d756f3792d580957a8ec258e5cb956e02c55207d637ba096ac7",
+    "ordinal": 10
+   },
+   "now": 1792195660829,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195660829-11",
+   "served_through_ordinal": 7,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195660829-11",
+   "step_kind": "tool_step"
+  }
+ },
+ {
+  "sequence": 19,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 10,
+   "estimate": {
+    "previous_input": 4293,
+    "request_tokens": 5352
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21475,
+    "sha256": "87528e21894133723c3d2c70dd308733a6e7c952ddd9f87a50e228a89b4d5856",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-8a286f80ae63d953c2255fa35cb170d4777ccef47ad0bf2a694e98645b70df32",
+    "ordinal": 13
+   },
+   "now": 1792195661245,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195661245-14",
+   "served_through_ordinal": 10,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195661245-14",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 23,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 13,
+   "estimate": {
+    "previous_input": 6922,
+    "request_tokens": 7979
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21475,
+    "sha256": "37b1daf330bf45a53c4f982d3bbbab7a42eae8ed33d20e55278f4f71d28f08a4",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-56adb3226039bef100f09c2269439a4770e4b22e298301ef55186a3c3a556495",
+    "ordinal": 16
+   },
+   "now": 1792195661783,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195661783-17",
+   "served_through_ordinal": 13,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195661783-17",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 27,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 16,
+   "estimate": {
+    "previous_input": 9552,
+    "request_tokens": 10607
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21475,
+    "sha256": "6d2415fe18b0780a801c3c913fb0a86889ea091af67de4b042e3184c3fd1f455",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-aeebcbc22710718dbc26cddae387801ed2eef4700ca92f45729e7c519f199fee",
+    "ordinal": 19
+   },
+   "now": 1792195662206,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195662206-20",
+   "served_through_ordinal": 16,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195662206-20",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 31,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 19,
+   "estimate": {
+    "previous_input": 12182,
+    "request_tokens": 13234
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21475,
+    "sha256": "28ecbde5151ae54aeeab511cfc618dea50742be5c3625b6ea9540a85abfd5d5e",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-204d7d40551a46e7aaeb53dbf7e6b9e2dc181903e97cb730199e9148822f67fa",
+    "ordinal": 22
+   },
+   "now": 1792195662649,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195662648-23",
+   "served_through_ordinal": 19,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195662648-23",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 35,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 22,
+   "estimate": {
+    "previous_input": 14813,
+    "request_tokens": 15861
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21475,
+    "sha256": "8c2a10bff4bde4539248e8b80cd13f57f99cffa3f528e0a96b1234301ae0ef0d",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-cb13d63da9973ad7b27a5964bb43b948d83bd078d49c894b5eefd31e4a49f979",
+    "ordinal": 25
+   },
+   "now": 1792195663149,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195663149-26",
+   "served_through_ordinal": 22,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195663149-26",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 39,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 25,
+   "estimate": {
+    "previous_input": 17443,
+    "request_tokens": 18488
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21475,
+    "sha256": "e9a9c1737c87ff3f4b509f7e4f3d5f519120f00d04e12e29677ca43643c0f6cf",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-ef6453e2f356123813591fce27a326c97c353bb2637d1eb2264742b0e39d278a",
+    "ordinal": 28
+   },
+   "now": 1792195663629,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195663629-29",
+   "served_through_ordinal": 25,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195663629-29",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 43,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 28,
+   "estimate": {
+    "previous_input": 20073,
+    "request_tokens": 21115
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21475,
+    "sha256": "2e363c7e082bd98a6c9117e1432d71e5e0d9331fb5b8687c989142ba9b5d4a80",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-a4d5ae7d6fdd3585f3da8c543a35850d2f9302c2564c3cb3484af4036c31b375",
+    "ordinal": 31
+   },
+   "now": 1792195664094,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195664094-32",
+   "served_through_ordinal": 28,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195664094-32",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 47,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 31,
+   "estimate": {
+    "previous_input": 22703,
+    "request_tokens": 23741
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21475,
+    "sha256": "94f9d2aa57b5079c0571fa43a554db20b8ed52f5d026d490b693a782a1772b89",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-0cdc30fc448bf999d921c0ffa52ed707e29d3840f84d0f923668f6c7b369f7b0",
+    "ordinal": 34
+   },
+   "now": 1792195664566,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195664566-35",
+   "served_through_ordinal": 31,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195664566-35",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 51,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 34,
+   "estimate": {
+    "previous_input": 25334,
+    "request_tokens": 26369
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21475,
+    "sha256": "b5ecbb2477419a8f9c3c980adb76919b4d371f576f25ba7c30c9d4aca38d506a",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-26acc45dc487685a92aebc45b549314a101d0d939706188781c9c156c5983794",
+    "ordinal": 37
+   },
+   "now": 1792195665052,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195665052-38",
+   "served_through_ordinal": 34,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195665052-38",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 55,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 37,
+   "estimate": {
+    "previous_input": 27964,
+    "request_tokens": 29041
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21837,
+    "sha256": "7cc7eacb21aab489605ca35abde11d6bd14e43830dc2ab19021c03caef3b0f47",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-844d1811d03031fd08d28441cedd718f61f2d792cba462c00f7362aa2a3e38c1",
+    "ordinal": 40
+   },
+   "now": 1792195665544,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195665544-41",
+   "served_through_ordinal": 37,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195665544-41",
+   "step_kind": "user_turn"
+  }
+ },
+ {
+  "sequence": 59,
+  "method": "compaction.step",
+  "request_id": null,
+  "error_code": null,
+  "params": {
+   "after_ordinal": 40,
+   "estimate": {
+    "previous_input": 30639,
+    "request_tokens": 31712
+   },
+   "geometry": {
+    "absolute_wall": 200000,
+    "derivation": "claude-code/200000 window; soft = 24000 (harness compaction buffer held back from the window)",
+    "usable_hard": 72000,
+    "usable_soft": 24000
+   },
+   "harness": "claude-code",
+   "last_applied": {
+    "compaction_id": "mc-5745e150d98c5821af41f5eccdd5f945b99e637b9cbf4788ed066727bcc12571",
+    "version": 3
+   },
+   "lineage_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "messages": {
+    "omitted_bytes": 21837,
+    "sha256": "afbed1970cdead47a729dad43d64c27d3a30d08d14ab8c244a92e78452c23f54",
+    "count": 3
+   },
+   "mid_turn": false,
+   "model": "claude-sonnet-5-5",
+   "newest": {
+    "mid": "ccs-f81fc4f28d1c673e11d6b91f752d8442c8211d2afd2939d708659f303c70930f",
+    "ordinal": 43
+   },
+   "now": 1792195666051,
+   "output_reserve": 128000,
+   "request_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195666051-44",
+   "served_through_ordinal": 40,
+   "session": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c",
+   "step_id": "ccl-fbb9dcaa8b60e27de571c600601e62bbe5f97c5fc7b72f554c36a46b55521d9c-step-1792195666051-44",
+   "step_kind": "user_turn"
+  }
+ }
+]
