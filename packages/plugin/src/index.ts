@@ -574,10 +574,12 @@ const server: Plugin = async (ctx) => {
                             keepSubagents: pluginConfig.keep_subagents === true,
                         },
                         gitCommitIndexing: dreaming.memory.git_commit_indexing,
+                        rustBackgroundEnabled: dreaming.rust_background_enabled === true,
                     };
                 },
                 language: pluginConfig.language,
                 transformMode: pluginConfig.transform_mode,
+                rustBackgroundEnabled: pluginConfig.rust_background_enabled === true,
                 embeddingConfig: pluginConfig.embedding,
                 memoryEnabled: pluginConfig.memory?.enabled === true,
                 memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,

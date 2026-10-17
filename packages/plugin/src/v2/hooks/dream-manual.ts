@@ -1,4 +1,6 @@
 import type { DreamerConfig } from "../../config/schema/magic-context";
+import type { ClassifyModuleClient } from "../../features/magic-context/dreamer/classify";
+import { readRustOwnedDreamTasks } from "../../features/magic-context/dreamer/rust-ownership";
 import { buildDreamTaskRuntimeConfigs } from "../../features/magic-context/dreamer/task-config";
 import { createDreamTaskExecutor } from "../../features/magic-context/dreamer/task-executor";
 import {
@@ -77,6 +79,10 @@ export async function runManualDreamNow(args: {
     executor: HiddenCompletionExecutor;
     sessionId: string;
     task?: DreamTaskName;
+    /** The live `rust_background_enabled` for this run. */
+    rustBackgroundEnabled?: boolean;
+    /** Present only when this host is attached to ck-mc; see rust-ownership.ts. */
+    moduleClient?: ClassifyModuleClient;
 }): Promise<ManualDreamOutcome> {
     const tasks = buildDreamTaskRuntimeConfigs(
         args.dreamer,
@@ -99,9 +105,16 @@ export async function runManualDreamNow(args: {
         toolsSupported: args.executor.capabilities.tools === true,
         ...(args.task !== undefined ? { requestedTask: args.task } : {}),
     });
+    const rustOwnedTasks = await readRustOwnedDreamTasks({
+        rustBackgroundEnabled: args.rustBackgroundEnabled,
+        moduleClient: args.moduleClient,
+        projectIdentity: args.projectIdentity,
+        projectRoot: args.directory,
+    });
     const summary = await runManualDream({
         db: args.db,
         projectIdentity: args.projectIdentity,
+        rustOwnedTasks,
         tasks: selection.runnable,
         executor,
         ...(args.task !== undefined ? { task: args.task } : {}),

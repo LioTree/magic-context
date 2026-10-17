@@ -77,7 +77,11 @@ export function registerV2DreamScheduleTimer(args: {
         dreamerConfig: dreamer,
         sampleDreamRun: () => {
             const current = dreamerRunConfig(config, args.liveConfig());
-            return { dreamerConfig: current.dreamer ?? dreamer, mural: current.mural };
+            return {
+                dreamerConfig: current.dreamer ?? dreamer,
+                mural: current.mural,
+                rustBackgroundEnabled: current.rust_background_enabled === true,
+            };
         },
         // Scheduled and manual runs share one capability filter, so a host
         // without a tool loop never records tasks it cannot run as failed.

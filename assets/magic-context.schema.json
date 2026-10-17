@@ -64,6 +64,12 @@
       "description": "Experimental, user-level only: consume revision-matched provider hook preparation; disabled by default pending byte/state and timing review.",
       "type": "boolean"
     },
+    "rust_background_enabled": {
+      "default": false,
+      "description": "Experimental, user-level only: let the ck-mc module run the dream tasks it publishes as its own. A host attached to ck-mc then skips exactly those tasks; every other task, and every task on a host without ck-mc, keeps running here. Off by default.",
+      "x-mc-live-reload": true,
+      "type": "boolean"
+    },
     "auto_update": {
       "description": "Enable automatic npm self-update checks for the OpenCode plugin. Security: USER-only in config loader, so hostile project configs cannot suppress updates.",
       "type": "boolean"

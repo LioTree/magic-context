@@ -101,8 +101,12 @@ export interface RunDueTasksDeps {
     projectIdentity: string;
     tasks: readonly DreamTaskRuntimeConfig[];
     executor: TaskExecutor;
-    /** Captured once per run: Rust owns dream execution when true; absent keeps TS scheduling. */
-    rust_background_enabled?: boolean;
+    /**
+     * Tasks the ck-mc module published as its own, read once per run (see
+     * rust-ownership.ts). Exactly these are skipped: they are neither planned,
+     * seeded, advanced nor executed here. Absent or empty runs every task.
+     */
+    rustOwnedTasks?: ReadonlySet<DreamTaskName>;
     now?: number;
     /**
      * The host's `memory.enabled` for this project. `false` means this caller
@@ -563,7 +567,7 @@ export interface ManualRunResult {
 export async function runManualDream(
     deps: Omit<RunDueTasksDeps, "now"> & { task?: DreamTaskName },
 ): Promise<ManualRunResult> {
-    const rustBackgroundEnabled = deps.rust_background_enabled === true;
+    const rustOwned = deps.rustOwnedTasks;
     const now = Date.now();
     const result: ManualRunResult = {
         ran: [],
@@ -576,7 +580,6 @@ export async function runManualDream(
         backlogAfter: {},
     };
 
-    if (rustBackgroundEnabled) return result;
     if (!isUsableProjectIdentity(deps.projectIdentity)) return result;
     let selected: readonly DreamTaskRuntimeConfig[];
     let forceGate = false;
@@ -588,6 +591,16 @@ export async function runManualDream(
     } else {
         // All enabled tasks (schedule != ""); disabled tasks stay off even manually.
         selected = deps.tasks.filter((t) => t.schedule.trim() !== "");
+    }
+    if (rustOwned && rustOwned.size > 0) {
+        // Rust runs these on its own schedule; reporting them keeps a manual run
+        // from looking as if the task were silently dropped.
+        for (const config of selected) {
+            if (rustOwned.has(config.task)) {
+                (result.skipped ??= []).push(`${config.task}: run by ck-mc`);
+            }
+        }
+        selected = selected.filter((config) => !rustOwned.has(config.task));
     }
     if (selected.length === 0) return result;
 
@@ -680,8 +693,6 @@ export async function runManualDream(
  * number of tasks actually executed (for logging/tests).
  */
 export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<number> {
-    // Stop before planning: even a gated task would seed or advance schedule rows.
-    if (deps.rust_background_enabled === true) return 0;
     // A blank identity is an unresolved directory, not a project; running tasks
     // for it would read and write project-scoped rows under the key "".
     if (!isUsableProjectIdentity(deps.projectIdentity)) return 0;
@@ -693,7 +704,16 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
     // rows to the daily idle prune instead.
     if (deps.projectMemoryEnabled === false) return 0;
     const now = deps.now ?? Date.now();
-    const due = planDueTasks(deps.db, deps.projectIdentity, deps.tasks, now);
+    // Filter before planning: even a gated task would seed or advance its row.
+    const owned = deps.rustOwnedTasks;
+    const tasks =
+        owned && owned.size > 0
+            ? deps.tasks.filter((config) => !owned.has(config.task))
+            : deps.tasks;
+    // Rust owns every configured task: this pass has nothing of its own to plan,
+    // and planning would still write this store's schedule maintenance rows.
+    if (tasks.length === 0 && deps.tasks.length > 0) return 0;
+    const due = planDueTasks(deps.db, deps.projectIdentity, tasks, now);
     if (due.length === 0) return 0;
 
     // Pre-lease gate: cheap filter so we don't even acquire a lease for a task

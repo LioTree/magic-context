@@ -1086,6 +1086,96 @@ describe("magic-context hook", () => {
         expect(promptMocks.createSession).not.toHaveBeenCalled();
     });
 
+    // The manual /ctx-dream path reads ck-mc's published list when the switch is
+    // on, and skips exactly the published task; unpublished tasks still run here.
+    for (const owned of [true, false]) {
+        it(`manual ctx-dream ${owned ? "skips" : "runs"} classify when ck-mc ${owned ? "publishes" : "does not publish"} it`, async () => {
+            process.env.XDG_DATA_HOME = makeTempDir("hook-classify-ownership-manual-");
+            const promptMocks = createPromptMocks();
+            const deps = createMockDeps(promptMocks);
+            const projectPath = resolveProjectIdentity("/tmp");
+            deps.config = {
+                ...deps.config,
+                transform_mode: "rust",
+                rust_background_enabled: true,
+                dreamer: {
+                    tasks: {
+                        "classify-memories": { schedule: "0 3 * * *", timeout_minutes: 10 },
+                    },
+                },
+            } as never;
+            const methods: string[] = [];
+            deps.rustModeModuleClient = {
+                authorityStatus: async () => ({ authority: { state: "MODULE", generation: 4 } }),
+                call: async (args: { method: string; body: unknown }) => {
+                    methods.push(args.method);
+                    if (args.method === "dream.ownership") {
+                        return {
+                            ok: true,
+                            v: 1,
+                            activated: true,
+                            published: owned ? ["classify-memories"] : [],
+                        };
+                    }
+                    if (args.method === "dreamer.run_task") {
+                        const body = args.body as {
+                            payload: { items: Array<{ memory_id: number }> };
+                        };
+                        return {
+                            manifest_text: `<classify>${body.payload.items
+                                .map(
+                                    ({ memory_id }) =>
+                                        `<memory id="${memory_id}" importance="75" scope="project" shareable="false"/>`,
+                                )
+                                .join("")}</classify>`,
+                            truncated: false,
+                        };
+                    }
+                    return {
+                        accepted: (
+                            args.body as { arguments: { rows: Array<{ memory_id: number }> } }
+                        ).arguments.rows.map((row) => row.memory_id),
+                        rejected: [],
+                    };
+                },
+            } as never;
+            const hook = requireHook(createMagicContextHook(deps));
+            const db = openDatabase();
+            ensureContextStoreUuid(db);
+            for (let i = 0; i < 12; i += 1) {
+                const memory = insertMemory(db, {
+                    projectPath,
+                    category: "ARCHITECTURE",
+                    content: `Ownership classify memory ${i}.`,
+                });
+                db.prepare(
+                    "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+                ).run(projectPath, 13000 + i, memory.id);
+                db.prepare(
+                    "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
+                ).run(projectPath, 13000 + i, memory.category, memory.normalizedHash);
+            }
+
+            await expectSentinel(
+                hook["command.execute.before"]!(
+                    {
+                        command: "ctx-dream",
+                        sessionID: "ses-classify-ownership",
+                        arguments: "classify-memories",
+                    },
+                    { parts: [{ type: "text", text: "" }] },
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-DREAM_HANDLED__",
+            );
+
+            expect(methods).toEqual(
+                owned
+                    ? ["dream.ownership"]
+                    : ["dream.ownership", "dreamer.run_task", "memory.set_classification"],
+            );
+        });
+    }
+
     it("checks the dream schedule in the background after message updates", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-dream-schedule-");
         const promptMocks = createPromptMocks();
@@ -1182,6 +1272,106 @@ describe("magic-context hook", () => {
             Date.now = originalDateNow;
         }
     });
+
+    // The message-triggered scheduled path reads ck-mc's published list when the
+    // switch is on, and leaves exactly the published task to Rust.
+    for (const owned of [true, false]) {
+        it(`scheduled dreaming ${owned ? "leaves" : "runs"} classify ${owned ? "to" : "without"} ck-mc`, async () => {
+            process.env.XDG_DATA_HOME = makeTempDir("hook-classify-ownership-scheduled-");
+            const promptMocks = createPromptMocks();
+            const deps = createMockDeps(promptMocks);
+            deps.directory = "/repo/ownership";
+            deps.config = {
+                ...deps.config,
+                transform_mode: "rust",
+                rust_background_enabled: true,
+                dreamer: {
+                    tasks: {
+                        "classify-memories": { schedule: "0 3 * * *", timeout_minutes: 10 },
+                    },
+                },
+            } as never;
+            const methods: string[] = [];
+            deps.rustModeModuleClient = {
+                authorityStatus: async () => ({ authority: { state: "MODULE", generation: 4 } }),
+                call: async (args: { method: string }) => {
+                    methods.push(args.method);
+                    if (args.method === "dream.ownership") {
+                        return {
+                            ok: true,
+                            v: 1,
+                            activated: true,
+                            published: owned ? ["classify-memories"] : [],
+                        };
+                    }
+                    throw new Error(`unexpected module call ${args.method}`);
+                },
+            } as never;
+            const originalDateNow = Date.now;
+            Date.now = () => originalDateNow() + 2 * 60 * 60 * 1000;
+            try {
+                const hook = requireHook(createMagicContextHook(deps));
+                const db = openDatabase();
+                ensureContextStoreUuid(db);
+                const projectPath = resolveProjectIdentity("/repo/ownership");
+                const due = Date.now() - 1000;
+                insertMemory(db, {
+                    projectPath,
+                    category: "ARCHITECTURE",
+                    content: "Ownership scheduled memory.",
+                });
+                writeTaskScheduleState(db, {
+                    projectPath,
+                    task: "classify-memories",
+                    lastRunAt: null,
+                    nextDueAt: due,
+                    schedule: "0 3 * * *",
+                    lastStatus: null,
+                    lastError: null,
+                    retryCount: 0,
+                });
+                await hook.event!({
+                    event: {
+                        type: "message.updated",
+                        properties: {
+                            info: {
+                                role: "assistant",
+                                finish: "stop",
+                                sessionID: "ses-ownership-schedule",
+                                providerID: "openai",
+                                modelID: "gpt-4o",
+                                tokens: { input: 10, output: 10, cache: { read: 0, write: 0 } },
+                            },
+                        },
+                    },
+                });
+                const row = () =>
+                    db
+                        .prepare(
+                            "SELECT next_due_at, last_status FROM task_schedule_state WHERE project_path = ? AND task = 'classify-memories'",
+                        )
+                        .get(projectPath) as { next_due_at: number; last_status: string | null };
+                for (
+                    let attempt = 0;
+                    attempt < 400 && (owned ? methods.length === 0 : row().last_status === null);
+                    attempt += 1
+                ) {
+                    await new Promise((resolve) => setTimeout(resolve, 5));
+                }
+                // Let the owned pass finish whatever it would still do.
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                expect(methods[0]).toBe("dream.ownership");
+                if (owned) {
+                    expect(methods).toEqual(["dream.ownership"]);
+                    expect(row()).toEqual({ next_due_at: due, last_status: null });
+                } else {
+                    expect(row().last_status).not.toBeNull();
+                }
+            } finally {
+                Date.now = originalDateNow;
+            }
+        });
+    }
 
     it("clears the reasoning watermark when message.updated reports a model change", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-model-change-watermark-");

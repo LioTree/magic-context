@@ -1,11 +1,19 @@
 import { expect, test } from "bun:test";
+import { DreamerConfigSchema } from "../../config/schema/magic-context";
 import { summarizeManualDream } from "../../features/magic-context/dreamer/manual-summary";
 import {
     formatUnsupportedDreamTasks,
     toolLoopDreamTasks,
 } from "../../features/magic-context/dreamer/task-registry";
 import type { DreamTaskRuntimeConfig } from "../../features/magic-context/dreamer/task-scheduler";
-import { resolveManualDreamTask, selectRunnableDreamTasks } from "./dream-manual";
+import { runMigrations } from "../../features/magic-context/migrations";
+import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { Database } from "../../shared/sqlite";
+import {
+    resolveManualDreamTask,
+    runManualDreamNow,
+    selectRunnableDreamTasks,
+} from "./dream-manual";
 
 test("no argument runs every enabled task", () => {
     expect(resolveManualDreamTask(undefined)).toEqual({});
@@ -125,3 +133,63 @@ test("an explicitly requested tool-requiring task is reported unsupported, not r
         selectRunnableDreamTasks({ tasks, toolsSupported: false, requestedTask: "verify" }),
     ).toEqual({ runnable: [], unsupported: ["verify"] });
 });
+
+// The v2 manual command reads ck-mc's published list only when attached; an
+// owned task is reported as run by ck-mc and never executed here.
+for (const attached of [true, false]) {
+    test(`manual dream ${attached ? "reports a ck-mc task instead of running it" : "without ck-mc runs it"}`, async () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        runMigrations(db);
+        const calls: string[] = [];
+        const opened: string[] = [];
+        const outcome = await runManualDreamNow({
+            db: db as never,
+            dreamer: DreamerConfigSchema.parse({}),
+            projectIdentity: "git:v2-manual-ownership",
+            directory: "/tmp/v2-manual-ownership",
+            executor: {
+                capabilities: { tools: false },
+                open: async () => {
+                    opened.push("child");
+                    throw new Error("no child in this test");
+                },
+            } as never,
+            sessionId: "ses-v2-manual",
+            task: "classify-memories",
+            rustBackgroundEnabled: true,
+            ...(attached
+                ? {
+                      moduleClient: {
+                          call: async (args: { method: string }) => {
+                              calls.push(args.method);
+                              return {
+                                  ok: true,
+                                  v: 1,
+                                  activated: true,
+                                  published: ["classify-memories"],
+                              };
+                          },
+                      },
+                  }
+                : {}),
+        });
+        if (attached) {
+            expect(calls).toEqual(["dream.ownership"]);
+            expect(outcome.summary.skipped).toEqual(["classify-memories: run by ck-mc"]);
+            expect(outcome.summary.ran).toEqual([]);
+            expect(outcome.summary.failed).toEqual([]);
+        } else {
+            expect(calls).toEqual([]);
+            expect(outcome.summary.skipped ?? []).not.toContain("classify-memories: run by ck-mc");
+            // The task reached the scheduler: it ran, failed, or found no work.
+            expect([
+                ...outcome.summary.ran,
+                ...outcome.summary.failed,
+                ...outcome.summary.skippedNoWork,
+                ...(outcome.summary.skipped ?? []),
+            ]).toContain("classify-memories");
+        }
+        db.close();
+    });
+}

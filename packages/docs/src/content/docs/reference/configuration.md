@@ -260,6 +260,7 @@ Behavior tuning most installs never need to touch.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `rust_provider_preparation` | boolean | `false` | Experimental, user-level only: consume revision-matched provider hook preparation; disabled by default pending byte/state and timing review. |
+| `rust_background_enabled` **Live** | boolean | `false` | Experimental, user-level only: let the ck-mc module run the dream tasks it publishes as its own. A host attached to ck-mc then skips exactly those tasks; every other task, and every task on a host without ck-mc, keeps running here. Off by default. |
 | `smart_notes.enabled` | boolean | `true` | Enable smart-note authoring and condition evaluation. User-level only: tool definitions are process-wide. Changes require a host restart and rebuild each session's cached prompt once. Pending notes remain stored and unchecked; already-ready notes still surface. |
 | `smart_notes.retina_handoff` | boolean | `false` | When true, dreamer skips smart notes whose surface conditions compiled to retina provider configs at authoring time. Default false keeps both paths active until the retina consumer is deployed. |
 | `models.window_overlay_path` | string | — |  |

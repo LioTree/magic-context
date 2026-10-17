@@ -20,7 +20,7 @@ const referencePath = resolve(
 const oracleSources = [
     [
         "packages/plugin/src/features/magic-context/dreamer/task-scheduler.ts",
-        "7bd836fc2ab2114c846eb0e0899603467384fb58a8d906cca0b963f55c09391c",
+        "57867c6ffc1993378d44fe2c61c1e768a4375cd9c5f3eac3d49fa63081881d8f",
     ],
     [
         "packages/plugin/src/features/magic-context/dreamer/task-registry.ts",
@@ -54,7 +54,9 @@ async function runOracle(): Promise<ReferenceOutput> {
     const deps = {
         db,
         projectIdentity: "git:identity",
-        rust_background_enabled: true,
+        // Rust owns work only per task, from its published list; with every
+        // canonical task published, no TS entry point may reach an executor.
+        rustOwnedTasks: new Set(CANONICAL_DREAM_TASKS),
         tasks: CANONICAL_DREAM_TASKS.map((task) => ({ task, schedule: "0 3 * * *" })),
         executor: async () => {
             executed++;

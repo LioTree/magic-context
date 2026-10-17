@@ -14,6 +14,7 @@ import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
+import { readRustOwnedDreamTasks } from "../../features/magic-context/dreamer/rust-ownership";
 import {
     buildDreamTaskRuntimeConfigs,
     userMemoryCollectionEnabled,
@@ -195,6 +196,8 @@ export interface MagicContextDeps {
         rust_pipeline?: "full_request" | "provider";
         signed_thinking_hold?: "off" | "on";
         rust_provider_preparation?: boolean;
+        /** Live-sampled: lets ck-mc run the dream tasks it publishes as its own. */
+        rust_background_enabled?: boolean;
         /** Path to the subc daemon's connection file. Threaded to the module
          *  transport so a host that publishes it outside the default data-dir
          *  location (e.g. a systemd RuntimeDirectory) is actually reachable. */
@@ -971,15 +974,27 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 }
             },
         });
-        void runDueTasksForProject({
-            db,
+        // Ownership is read only from ck-mc's published list, and only when this
+        // host is attached to ck-mc; a standalone host skips nothing.
+        void readRustOwnedDreamTasks({
+            rustBackgroundEnabled: sampledDream.rust_background_enabled,
+            moduleClient: rustModeModuleClient,
             projectIdentity: projectPath,
-            tasks: runtimeConfigs,
-            executor,
-            projectMemoryEnabled: deps.config.memory?.enabled !== false,
-        }).catch((error: unknown) => {
-            log("[dreamer] scheduled task run failed:", error);
-        });
+            projectRoot: deps.directory,
+        })
+            .then((rustOwnedTasks) =>
+                runDueTasksForProject({
+                    db,
+                    projectIdentity: projectPath,
+                    tasks: runtimeConfigs,
+                    executor,
+                    projectMemoryEnabled: deps.config.memory?.enabled !== false,
+                    rustOwnedTasks,
+                }),
+            )
+            .catch((error: unknown) => {
+                log("[dreamer] scheduled task run failed:", error);
+            });
     };
 
     const sendCommandNotification = async (
@@ -1095,11 +1110,18 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   // Manual /ctx-dream → Dreamer v2 per-task scheduler. Runs in this
                   // hook's own checkout (not a stale sibling worktree from the
                   // shared git:<sha> identity map).
-                  runManual: (task) => {
+                  runManual: async (task) => {
                       const sampledDream = deps.sampleDreamConfig?.() ?? deps.config;
                       const currentDreamer = sampledDream.dreamer ?? dreamerConfig;
+                      const rustOwnedTasks = await readRustOwnedDreamTasks({
+                          rustBackgroundEnabled: sampledDream.rust_background_enabled,
+                          moduleClient: rustModeModuleClient,
+                          projectIdentity: projectPath,
+                          projectRoot: deps.directory,
+                      });
                       return runManualDream({
                           db,
+                          rustOwnedTasks,
                           projectIdentity: projectPath,
                           tasks: buildDreamTaskRuntimeConfigs(
                               currentDreamer,

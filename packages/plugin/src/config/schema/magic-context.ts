@@ -936,6 +936,8 @@ export interface MagicContextConfig {
     /** User-only opt-in for unfinished signed-thinking trigger parking and release obligations. */
     signed_thinking_hold?: "off" | "on";
     rust_provider_preparation?: boolean;
+    /** User-only opt-in that lets ck-mc run the dream tasks it publishes as its own. */
+    rust_background_enabled?: boolean;
     /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
      *  USER config only; project configs cannot disable it. Default: true. */
     auto_update?: boolean;
@@ -1162,6 +1164,12 @@ export const MagicContextConfigSchema = z
             .default(false)
             .describe(
                 "Experimental, user-level only: consume revision-matched provider hook preparation; disabled by default pending byte/state and timing review.",
+            ),
+        rust_background_enabled: z
+            .boolean()
+            .default(false)
+            .describe(
+                "Experimental, user-level only: let the ck-mc module run the dream tasks it publishes as its own. A host attached to ck-mc then skips exactly those tasks; every other task, and every task on a host without ck-mc, keeps running here. Off by default.",
             ),
         auto_update: z
             .boolean()
@@ -1648,6 +1656,7 @@ export const LIVE_RELOAD_CONFIG_PATHS = [
     "commit_cluster_trigger.enabled",
     "commit_cluster_trigger.min_clusters",
     "memory.auto_promote",
+    "rust_background_enabled",
     "dreamer.disable",
     "dreamer.maxTokens",
     "dreamer.opencode.model",

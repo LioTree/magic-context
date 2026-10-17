@@ -478,6 +478,15 @@ it("signed_thinking_hold is off by default and cannot be changed by a project", 
     }
 });
 
+it("a project cannot hand dream tasks to the Rust module", () => {
+    const raw: Record<string, unknown> = { rust_background_enabled: true, transform_mode: "rust" };
+    const warnings = stripUnsafeProjectConfigFields(raw);
+    expect(raw).toEqual({ transform_mode: "rust" });
+    expect(warnings).toEqual([
+        "Ignoring rust_background_enabled from project config (security: only user-level config may hand dream tasks to the Rust module).",
+    ]);
+});
+
 it("a project cannot enable prepared provider policy consumption", () => {
     const raw: Record<string, unknown> = {
         rust_provider_preparation: true,

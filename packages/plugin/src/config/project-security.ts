@@ -377,6 +377,12 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
             "Ignoring rust_pipeline from project config (security: only user-level config may select the Rust provider pipeline).",
         );
     }
+    if ("rust_background_enabled" in projectRaw) {
+        delete projectRaw.rust_background_enabled;
+        warnings.push(
+            "Ignoring rust_background_enabled from project config (security: only user-level config may hand dream tasks to the Rust module).",
+        );
+    }
     if ("rust_provider_preparation" in projectRaw) {
         delete projectRaw.rust_provider_preparation;
         warnings.push(
