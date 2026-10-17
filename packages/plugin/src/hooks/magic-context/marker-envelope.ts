@@ -1,20 +1,47 @@
 import { createHash } from "node:crypto";
-import { createRequire } from "node:module";
 import { calibrationForModelKey, providerMass } from "./decision-calibration";
 import { countTokensExactly } from "./token-count-exact";
+import { loadTokenizerSync, type TokenizerLike } from "./tokenizer-loader";
 
-let tokenizer: unknown;
-function countMaterial(text: string): number {
-    // Importing the package must not open stores, start timers or register process
-    // listeners. Reuse the Claude vocabulary and exact counter, loading them only
-    // when needed; importing read-session-formatting would register a logger exit listener.
-    if (!tokenizer) {
-        const require = createRequire(import.meta.url);
-        const module = require("ai-" + "tokenizer");
-        const Tokenizer = module.default ?? module.Tokenizer;
-        tokenizer = new Tokenizer(require("ai-tokenizer/encoding/" + "claude"));
+let tokenizer: TokenizerLike | undefined;
+let byteBoundWarningSent = false;
+
+function warnByteBound(error: unknown): void {
+    if (byteBoundWarningSent) return;
+    byteBoundWarningSent = true;
+    // Import the logger only after counting needs a fallback; importing the
+    // public host-runner package must not register the logger's exit listener.
+    void import("../../shared/logger")
+        .then(({ log }) =>
+            log(
+                "[magic-context] ai-tokenizer unavailable for marker admission; using a conservative approximate UTF-8 byte bound:",
+                error instanceof Error ? error.message : String(error),
+            ),
+        )
+        .catch(() => {});
+}
+
+function materialCounter(): (text: string) => number {
+    let active = tokenizer;
+    try {
+        active ??= tokenizer = loadTokenizerSync();
+    } catch (error) {
+        warnByteBound(error);
     }
-    return countTokensExactly(tokenizer, text);
+    return (text) => {
+        if (active) {
+            try {
+                return countTokensExactly(active, text);
+            } catch (error) {
+                active = tokenizer = undefined;
+                warnByteBound(error);
+            }
+        }
+        // These inputs are JSON-stringified fields. Each Claude byte-pair token
+        // consumes at least one UTF-8 byte, so their byte lengths bound the local
+        // count even for escaped/non-ASCII text, before applying model ratios.
+        return Buffer.byteLength(text, "utf8");
+    };
 }
 
 export interface MarkerToolDefinition {
@@ -61,7 +88,7 @@ export function boundMarkerEnvelope(material: MarkerEnvelope, model: string): nu
             )
         )
             return undefined;
-        countMaterial("");
+        const countMaterial = materialCounter();
         // Count JSON strings, not unescaped text: control characters and quotes can
         // grow during provider serialization. Separate fields cannot hide array costs.
         const system = material.system.reduce(

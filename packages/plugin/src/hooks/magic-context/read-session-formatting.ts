@@ -1,13 +1,17 @@
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { createRequire } from "node:module";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { COMMIT_VERB_PATTERN, createCommitHashExtractPattern } from "../../shared/commit-detection";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
 import { log } from "../../shared/logger";
 import { isSystemDirective, removeSystemReminders } from "../../shared/system-directive";
 import { countTokensExactly } from "./token-count-exact";
+import {
+    loadInstalledTokenizer,
+    loadPrimaryTokenizer,
+    type TokenizerLike,
+} from "./tokenizer-loader";
+
+export { tokenizerPackageRoots } from "./tokenizer-loader";
 
 export interface SessionChunkLine {
     ordinal: number;
@@ -134,19 +138,8 @@ function truncateArg(value: string, maxLen = 60): string {
     return `${value.slice(0, maxLen)}…`;
 }
 
-// Keep ai-tokenizer out of the eager module graph. Pi imports this module through
-// its system-prompt path during cold start, while token estimates are not needed
-// until the first real prompt is processed. Synchronous require preserves the
-// estimateTokens API and defers both package loads until that first non-empty call.
-type TokenizerLike = {
-    encode: (text: string, allowedSpecial: string) => number[];
-};
-type TokenizerConstructor = new (encoding: unknown) => TokenizerLike;
-
-const TOKENIZER_PACKAGE_DIRS = [
-    ["@cortexkit", "opencode-magic-context"],
-    ["@cortexkit", "pi-magic-context"],
-] as const;
+// Loading stays lazy: Pi imports this module during cold start, before any
+// estimates are needed. The shared loader owns all package probing.
 let tokenizer: TokenizerLike | undefined;
 let tokenizerLoadAttempted = false;
 let tokenizerLoadPromise: Promise<boolean> | undefined;
@@ -154,148 +147,17 @@ let tokenizerWarningSent = false;
 let tokenizerEncodingPath: string | undefined;
 let tokenizerSerializedTableBytes: number | null | undefined;
 
-/** Candidate `ai-tokenizer` package directories, in probe order. Exported for
- *  read-session-formatting-tokenizer-roots.test.ts, which pins the compiled-host
- *  case where only the extension's own install tree or the host plugin root can
- *  supply the dependency. */
-export function tokenizerPackageRoots(): string[] {
-    const cwd = process.cwd();
-    const openCodeCache = join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), "opencode");
-    const candidates: string[] = [];
-    // Probe a root for both a dependency nested under the plugin package and a
-    // copy hoisted directly into the root's own node_modules.
-    const probeRoot = (root: string): void => {
-        for (const packageDir of TOKENIZER_PACKAGE_DIRS) {
-            // Prefer a dependency nested under the plugin over a conflicting
-            // version hoisted by the host application.
-            candidates.push(
-                join(root, "node_modules", ...packageDir, "node_modules", "ai-tokenizer"),
-            );
-        }
-        candidates.push(join(root, "node_modules", "ai-tokenizer"));
-    };
-    // `findTokenizerImportPaths` binds the first candidate whose package.json
-    // resolves, so probe order IS the precedence contract: the launch root and
-    // the OpenCode cache are host-specific trees, then the plugin's own install
-    // tree (below), and only LAST the host-wide OMP plugin tree.
-    for (const root of [cwd, openCodeCache]) {
-        probeRoot(root);
-    }
-
-    const pushAncestors = (startDir: string): void => {
-        let ancestor = startDir;
-        while (true) {
-            candidates.push(join(ancestor, "node_modules", "ai-tokenizer"));
-            const parent = dirname(ancestor);
-            if (parent === ancestor) break;
-            ancestor = parent;
-        }
-    };
-
-    pushAncestors(process.argv[1] ? dirname(resolve(process.argv[1])) : cwd);
-
-    // The tree the extension was actually loaded from is the authoritative
-    // root: ai-tokenizer is a declared dependency of this package, so its
-    // node_modules chain is where a correct install keeps it. The argv walk
-    // above cannot reach it under a compiled host binary -- OMP ships as a
-    // `bun build --compile` executable whose process.argv[1] is a user CLI
-    // argument rather than the module path -- which is exactly when this
-    // probe runs, so the run fell back to approximate character counts while
-    // ~/.omp/plugins/node_modules/ai-tokenizer sat unused on disk.
-    // The host appends a `?mtime=` cache-bust to the loaded module's identity;
-    // fileURLToPath drops the query, and dirname is applied to the FILE path so
-    // no segment is lost to a trailing slash.
-    const ownDir = dirname(fileURLToPath(new URL(import.meta.url)));
-    pushAncestors(ownDir);
-
-    // OMP's plugin tree, where a linked install (`omp plugin install <dir>`)
-    // leaves the package's hoisted dependencies while the module itself loads
-    // from the linked source directory. Same class of host-specific root as the
-    // OpenCode cache above, but it MUST stay below the plugin's own install tree:
-    // `~/.omp/plugins/node_modules` is a long-lived host-wide tree, so a stale or
-    // plugin-unrelated `ai-tokenizer` hoisted there must never outrank the version
-    // this package declares in its own tree (probed just above) -- a wrong copy
-    // would silently change the vocabulary behind persisted per-message counts and
-    // budget/compartment decisions. It is still probed, last, so the linked-source
-    // case (where only the host tree carries the dependency) keeps working.
-    probeRoot(join(homedir(), ".omp", "plugins"));
-
-    return [...new Set(candidates)];
-}
-
-function packageImportTarget(value: unknown): string | undefined {
-    if (typeof value === "string") return value;
-    if (!value || typeof value !== "object") return undefined;
-    const conditions = value as Record<string, unknown>;
-    return packageImportTarget(conditions.import) ?? packageImportTarget(conditions.default);
-}
-
-function findTokenizerImportPaths(): { tokenizerPath: string; encodingPath: string } | undefined {
-    for (const packageRoot of tokenizerPackageRoots()) {
-        const packageJsonPath = join(packageRoot, "package.json");
-        if (!existsSync(packageJsonPath)) continue;
-        try {
-            const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
-                module?: unknown;
-                main?: unknown;
-                exports?: Record<string, unknown>;
-            };
-            const tokenizerTarget =
-                packageImportTarget(packageJson.exports?.["."]) ??
-                (typeof packageJson.module === "string" ? packageJson.module : undefined) ??
-                (typeof packageJson.main === "string" ? packageJson.main : undefined);
-            const encodingTarget = packageImportTarget(packageJson.exports?.["./encoding/claude"]);
-            if (!tokenizerTarget || !encodingTarget) continue;
-            return {
-                tokenizerPath: realpathSync(join(packageRoot, tokenizerTarget)),
-                encodingPath: realpathSync(join(packageRoot, encodingTarget)),
-            };
-        } catch {
-            // Try the next npm layout; the caller warns if none is usable.
-        }
-    }
-    return undefined;
-}
-
-function constructTokenizer(tokenizerModule: unknown, claudeEncoding: unknown): TokenizerLike {
-    const typedModule = tokenizerModule as {
-        default?: TokenizerConstructor;
-        Tokenizer?: TokenizerConstructor;
-    };
-    const Tokenizer = typedModule.default ?? typedModule.Tokenizer;
-    if (!Tokenizer) {
-        throw new Error("ai-tokenizer does not expose a Tokenizer constructor");
-    }
-    return new Tokenizer(claudeEncoding);
+function recordTokenizerEncodingPath(path: string): void {
+    tokenizerEncodingPath = path;
+    tokenizerSerializedTableBytes = undefined;
 }
 
 function loadTokenizer(): TokenizerLike {
-    // Non-literal specifiers keep Bun's bundler static analysis from folding the
-    // Claude vocabulary into the eager chunk.
-    const requireFromThisModule = createRequire(import.meta.url);
-    const encodingSpecifier = "ai-tokenizer/encoding/" + "claude";
-    tokenizerEncodingPath = requireFromThisModule.resolve(encodingSpecifier);
-    tokenizerSerializedTableBytes = undefined;
-    return constructTokenizer(
-        requireFromThisModule("ai-" + "tokenizer"),
-        requireFromThisModule(encodingSpecifier),
-    );
+    return loadPrimaryTokenizer(recordTokenizerEncodingPath);
 }
 
 async function loadTokenizerFromInstalledPackage(): Promise<TokenizerLike> {
-    const installedPaths = findTokenizerImportPaths();
-    if (!installedPaths) {
-        throw new Error(
-            "ai-tokenizer was not found under the project, runtime, or OpenCode cache node_modules roots",
-        );
-    }
-    const [tokenizerModule, claudeEncoding] = await Promise.all([
-        import(pathToFileURL(installedPaths.tokenizerPath).href),
-        import(pathToFileURL(installedPaths.encodingPath).href),
-    ]);
-    tokenizerEncodingPath = installedPaths.encodingPath;
-    tokenizerSerializedTableBytes = undefined;
-    return constructTokenizer(tokenizerModule, claudeEncoding);
+    return loadInstalledTokenizer(recordTokenizerEncodingPath);
 }
 
 export interface TokenizerNativeMemoryStats {
