@@ -50,15 +50,30 @@ pub(super) fn settings(scheduled: &[&str]) -> Value {
     json!({"dreamer": {"tasks": tasks, "opencode": {"model": "provider/model"}}})
 }
 
-/// What a claimant that can carry the classifier, the curator and the reviewer declares.
+/// The tools the primer investigator reads with, which the host runs itself.
+const READ_TOOLS: [&str; 7] = [
+    "read",
+    "grep",
+    "glob",
+    "aft_outline",
+    "aft_zoom",
+    "aft_search",
+    "ctx_search",
+];
+
+/// What a claimant that can carry the classifier, the curator, the reviewer, the
+/// retrospective and the primer investigator declares.
 pub(super) fn claimant() -> Value {
     json!({"capabilities": claimant_capabilities(),
-        "agents": {"dreamer-classifier": [], "dreamer": ["ctx_memory"], "dreamer-reviewer": []}})
+        "agents": {"dreamer-classifier": [], "dreamer": ["ctx_memory"], "dreamer-reviewer": [],
+            "dreamer-retrospective": ["ctx_search"], "dreamer-primer-investigator": READ_TOOLS}})
 }
 
 pub(super) fn claimant_capabilities() -> Value {
-    json!({"tools": ["ctx_memory"], "child_guard": true, "steps": true, "tokens": true,
-        "stop": true, "retire": true, "task_tools": true})
+    let mut tools = vec!["ctx_memory"];
+    tools.extend(READ_TOOLS);
+    json!({"tools": tools, "child_guard": true, "steps": true, "tokens": true,
+        "stop": true, "retire": true, "task_tools": true, "filesystem_fence": true})
 }
 
 pub(super) struct Project {
@@ -72,6 +87,17 @@ impl Project {
     /// A handler over a fresh store in `root`, or over an existing one when the
     /// root is given (a restarted process).
     pub fn open(on: bool, scheduled: &[&str], at: Option<&std::path::Path>) -> Self {
+        Self::open_wired(on, scheduled, at, None)
+    }
+
+    /// As [`Project::open`], with the wiring publication and the executor use
+    /// instead of the production one when given.
+    pub fn open_wired(
+        on: bool,
+        scheduled: &[&str],
+        at: Option<&std::path::Path>,
+        wiring: Option<crate::dream_dispatch::ownership::Wiring>,
+    ) -> Self {
         let owned = at.is_none().then(|| {
             let base = std::env::temp_dir().join("magic-context/i5-stage-e");
             std::fs::create_dir_all(&base).unwrap();
@@ -89,6 +115,7 @@ impl Project {
         );
         let mut handler = McHandler::new();
         assert!(handler.store.set(store).is_ok());
+        handler.dream_wiring = wiring;
         handler.fixed_config = Some(McModuleConfig {
             rust_background_enabled: on,
             ..Default::default()
@@ -327,7 +354,7 @@ pub(super) fn classify_answer() -> String {
     )
 }
 
-fn finished(report: &RunReport, task: TaskName) -> bool {
+pub(super) fn finished(report: &RunReport, task: TaskName) -> bool {
     report
         .iter()
         .any(|(t, o)| *t == task && *o == DispatchOutcome::Finished(RunStatus::Completed))

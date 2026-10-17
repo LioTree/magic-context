@@ -1,5 +1,6 @@
 use super::*;
 
+mod history_tasks;
 mod ownership;
 mod restart;
 mod tick;
