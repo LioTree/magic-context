@@ -266,6 +266,12 @@ pub(crate) fn save_engine_policy_tx(
         }
         let mut counters = parse(&raw)?;
         counters["engine_policy"] = policy.settings.clone();
+        // The compartment source revision detects edits to summarized history
+        // before reusing a cached prefix. Save it with the frozen baseline in
+        // the cut's policy_key, not in hook counters shared with uncached calls.
+        if let Some(settings) = counters["engine_policy"].as_object_mut() {
+            settings.remove("native_compartment_source_revision");
+        }
         if native_v2 {
             let mut parts = Vec::new();
             if let Some(coverage) = coverage {

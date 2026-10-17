@@ -22,14 +22,21 @@ fn fold_counters_tx(
         params![conv, conversation.lineage_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     ).optional()?;
-    if let Some((cut, settings)) = cut {
+    // Initial insertion recipes use the literal key "setup", not engine settings.
+    // They have no summarized prefix to restore into a resident fold.
+    if let Some((cut, settings)) = cut.filter(|(_, settings)| settings != "setup") {
+        let settings: Value = serde_json::from_str(&settings).map_err(crate::serde_to_sql_error)?;
         // Runner metadata saves replace hook counters on both serving paths.
-        // The immutable cut, not those counters, owns the resident fold baseline.
+        // Each immutable cut keeps the settings for its summarized prefix, so
+        // recover those settings here when the counters no longer contain them.
         if counters.get("engine_policy").is_none() {
-            counters["engine_policy"] = serde_json::from_str(&settings)
-                .map_err(crate::serde_to_sql_error)?;
+            counters["engine_policy"] = settings.clone();
         }
-        // This reference is a read-time cache input, never shared policy state.
+        if let Some(revision) = settings.get("native_compartment_source_revision") {
+            counters["engine_policy"]["native_compartment_source_revision"] = revision.clone();
+        }
+        // baseline_cut_id ties cached prefix measurements to this stored cut.
+        // Synthesize it for the reader without changing durable hook counters.
         counters["engine_policy"]["baseline_cut_id"] = serde_json::json!(cut);
     }
     Ok(counters)
@@ -55,8 +62,10 @@ pub struct ProviderResidentAuthority {
 }
 
 impl McStore {
-    /// Prove obsolete targets from immutable covered policy facts. Missing rows
-    /// are not proof: a partial request can omit a still-live queued target.
+    /// Prove that each target exists in the active lineage at or below the
+    /// retained coverage boundary. Coverage only advances, so those blocks are
+    /// permanently retired even when the current request omits them. Missing
+    /// rows are not proof: a partial request can omit a still-live queued target.
     pub fn provider_covered_drop_targets(
         &self,
         namespace: &str,
@@ -97,10 +106,17 @@ impl McStore {
     }
 
     pub fn provider_fold_settings(&self, key: &ProviderSessionKey) -> Result<Value, ProviderError> {
-        self.inner.with_conn(|conn| {
-            let conversation = conversation_tx(conn, key)?.ok_or(rusqlite::Error::InvalidQuery)?;
-            Ok(fold_counters_tx(conn, &key.conversation_key(), &conversation)?["engine_policy"].clone())
-        }).map_err(|error| ProviderError::Storage(error.into()))
+        self.inner
+            .with_conn(|conn| {
+                let conversation =
+                    conversation_tx(conn, key)?.ok_or(rusqlite::Error::InvalidQuery)?;
+                Ok(
+                    fold_counters_tx(conn, &key.conversation_key(), &conversation)?
+                        ["engine_policy"]
+                        .clone(),
+                )
+            })
+            .map_err(|error| ProviderError::Storage(error.into()))
     }
     /// Includes every compartment write, including interior boundary edits that
     /// leave the last covered message unchanged. Fold reuse needs that stronger

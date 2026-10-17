@@ -602,7 +602,10 @@ fn host_engine_step(
     }
 }
 
-pub(super) fn fold_structure(compartments: &[mc_store::StoredCompartment], through: u64) -> [u8; 32] {
+pub(super) fn fold_structure(
+    compartments: &[mc_store::StoredCompartment],
+    through: u64,
+) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     for compartment in compartments
@@ -738,7 +741,10 @@ pub(super) fn prime_resident_fold(
             })
         })
         .collect::<Result<Vec<_>, HandlerOutcome>>()?;
-    let decoded = users.iter().map(|message| codec.decode_message(message)).collect::<Result<Vec<_>, _>>()?;
+    let decoded = users
+        .iter()
+        .map(|message| codec.decode_message(message))
+        .collect::<Result<Vec<_>, _>>()?;
     prefix.users = decoded
         .iter()
         .filter(|message| {
@@ -1256,7 +1262,9 @@ fn execute_host(
         }
     }
     if let Some(lease) = resident.as_mut() {
-        let settings = store.provider_fold_settings(&work.key.store_key()).map_err(transient)?;
+        let settings = store
+            .provider_fold_settings(&work.key.store_key())
+            .map_err(transient)?;
         if let Some(mut prefix) = template.native_fold_prefix.clone().filter(|prefix| {
             settings["coverage"]
                 .as_u64()
@@ -1363,12 +1371,28 @@ fn execute_host(
     // the cut ends at its final content block and preserves signed native bytes.
     if codec == Codec::ClaudeCodeAnthropic && template.native_fold_prefix.is_some() {
         if let Some(ordinal) = output.engine.response.coverage_ordinal {
-            if !template.messages.iter().any(|message| message.ordinal == ordinal) {
+            if !template
+                .messages
+                .iter()
+                .any(|message| message.ordinal == ordinal)
+            {
                 let boundary = non_tag_messages_since(store, &work.key, lineage, ordinal)?
-                    .into_iter().find(|message| message.ordinal == ordinal)
-                    .ok_or_else(|| error("native_endpoint_unrepresentable", "covered native message is missing"))?;
-                template.messages.insert(0, codec.decode_message(&boundary)?);
-                template.native_messages.as_mut().expect("native codec").insert(0, boundary.message.clone());
+                    .into_iter()
+                    .find(|message| message.ordinal == ordinal)
+                    .ok_or_else(|| {
+                        error(
+                            "native_endpoint_unrepresentable",
+                            "covered native message is missing",
+                        )
+                    })?;
+                template
+                    .messages
+                    .insert(0, codec.decode_message(&boundary)?);
+                template
+                    .native_messages
+                    .as_mut()
+                    .expect("native codec")
+                    .insert(0, boundary.message.clone());
                 messages.push(boundary);
             }
         }
@@ -1425,10 +1449,9 @@ fn execute_host(
                 None
             };
             if cached.is_none() {
-                if let Some(lease) = resident
-                    .as_ref()
-                    .filter(|_| template.native_fold_prefix.is_some() && codec == Codec::OpencodeAiSdk)
-                {
+                if let Some(lease) = resident.as_ref().filter(|_| {
+                    template.native_fold_prefix.is_some() && codec == Codec::OpencodeAiSdk
+                }) {
                     if let Some(working) = &lease.state.fold_working {
                         template.native_fold_sidecar =
                             Some(working.sidecar(&lease.state.fold_arena)?);
@@ -1494,10 +1517,8 @@ fn execute_host(
                     )
                 })?;
             let boundary = store
-                .load(&conversation.engine_namespace)
-                .map_err(transient)?
-                .core
-                .boundary_id;
+                .load_boundary_id(&conversation.engine_namespace)
+                .map_err(transient)?;
             coverage.endpoint = Some(super::codec_claude_code::whole_message_endpoint(
                 message, &boundary,
             )?);
@@ -2661,7 +2682,9 @@ impl McHandler {
                 fault("WaitAnswered");
                 let _serial = serial.lock_for(&key).await;
                 let result = async {
-                    let mut record = super::runner_resident::RunnerRecord::load(&storage, &resident, &store, &key)?;
+                    let mut record = super::runner_resident::RunnerRecord::load(
+                        &storage, &resident, &store, &key,
+                    )?;
                     if record.wait_request.as_deref() != Some(&request.request_id) {
                         return Ok(());
                     }

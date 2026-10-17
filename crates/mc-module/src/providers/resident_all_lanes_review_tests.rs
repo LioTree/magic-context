@@ -399,6 +399,11 @@ async fn review_claude_live_tail_drop_retires_with_residency_on_and_off() {
 }
 
 #[tokio::test]
+async fn review_claude_absent_drop_is_not_retired_by_prefix() {
+    seeded_identity(true, 0x13a5, 4, Some("pending_drops"), 0).await;
+}
+
+#[tokio::test]
 async fn review_broca_strict_frozen_view_ack_identity_witness() {
     let root = review_root();
     let project = root.path().join("project");

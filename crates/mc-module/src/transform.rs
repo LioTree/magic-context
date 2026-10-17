@@ -8398,12 +8398,26 @@ fn apply_once(
         &projection,
         meta.coverage_ordinal,
     );
-    if let Some(prefix) = req.native_fold_prefix.as_ref().filter(|_| !pending_agent_drops.is_empty()) {
-        let targets = pending_agent_drops.iter().map(|drop| drop.target_id.as_str()).collect::<Vec<_>>();
-        let covered = store.provider_covered_drop_targets(&req.session_id, prefix.through, &targets)?;
-        consumed_drop_ids.extend(pending_agent_drops.iter()
-            .filter(|drop| covered.contains(&drop.target_id) && !consumed_drop_ids.contains(&drop.id))
-            .map(|drop| drop.id).collect::<Vec<_>>());
+    if let Some(prefix) = req
+        .native_fold_prefix
+        .as_ref()
+        .filter(|_| !pending_agent_drops.is_empty())
+    {
+        let targets = pending_agent_drops
+            .iter()
+            .map(|drop| drop.target_id.as_str())
+            .collect::<Vec<_>>();
+        let covered =
+            store.provider_covered_drop_targets(&req.session_id, prefix.through, &targets)?;
+        consumed_drop_ids.extend(
+            pending_agent_drops
+                .iter()
+                .filter(|drop| {
+                    covered.contains(&drop.target_id) && !consumed_drop_ids.contains(&drop.id)
+                })
+                .map(|drop| drop.id)
+                .collect::<Vec<_>>(),
+        );
     }
     // Only current trusted ingress evidence can authorize a native refusal. This
     // counts the protected results still live after this plan's actual fold;

@@ -192,8 +192,13 @@ fn save_inner(
         if let Some(view) = original.pointer(path) {
             if references && view.get("replacement").is_none() && !view.is_null() {
                 let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2)", params![conv, view["version"].as_u64()], |row| row.get(0))?;
-                if !exists { return Err(rusqlite::Error::InvalidQuery); }
-                conn.execute("UPDATE mc_provider_views_v1 SET state=?3 WHERE conv_key=?1 AND version=?2", params![conv, view["version"].as_u64(), state])?;
+                if !exists {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                conn.execute(
+                    "UPDATE mc_provider_views_v1 SET state=?3 WHERE conv_key=?1 AND version=?2",
+                    params![conv, view["version"].as_u64(), state],
+                )?;
                 continue;
             }
             view_tx(conn, &conv, view, state)?;

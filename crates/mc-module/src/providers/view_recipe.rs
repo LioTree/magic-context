@@ -213,7 +213,9 @@ pub(super) fn save_with_base(
         range_from: view.engine.range.from,
         range_to: view.engine.range.to,
         base_version: previous_view.map(|previous| previous.version()),
-        policy_cut_id: store.provider_fold_settings(&key.store_key()).map_err(transient)?
+        policy_cut_id: store
+            .provider_fold_settings(&key.store_key())
+            .map_err(transient)?
             .get("baseline_cut_id")
             .and_then(Value::as_u64),
         metadata,

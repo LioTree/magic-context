@@ -595,7 +595,9 @@ impl RunnerRecord<'_> {
         let Some(lease) = self.lease.as_mut() else {
             return Ok(());
         };
-        let settings = store.provider_fold_settings(&key.store_key()).map_err(transient)?;
+        let settings = store
+            .provider_fold_settings(&key.store_key())
+            .map_err(transient)?;
         if template
             .native_fold_prefix
             .as_ref()

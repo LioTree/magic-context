@@ -1123,6 +1123,18 @@ fn reset_for_recomp_clears_every_split_row() {
 }
 
 #[test]
+fn boundary_header_matches_full_load_for_empty_and_committed_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(dir.path());
+    assert_eq!(store.load_boundary_id(SESSION).unwrap(), "");
+    seeded(&store);
+    assert_eq!(
+        store.load_boundary_id(SESSION).unwrap(),
+        store.load(SESSION).unwrap().core.boundary_id
+    );
+}
+
+#[test]
 fn load_meta_reads_the_small_row_and_commit_meta_writes_only_it() {
     let dir = tempfile::tempdir().unwrap();
     let store = open_store(dir.path());

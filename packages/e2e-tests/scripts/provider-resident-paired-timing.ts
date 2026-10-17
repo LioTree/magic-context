@@ -184,7 +184,9 @@ export async function brocaResidentTiming(samples = 50, claude = false) {
             const selected = rows.filter(row => row.lane === lane && row.kind === kind);
             return { lane, kind, samples: selected.length, p50_ms: percentile(selected.map(row => row.module_ms), .5),
                 p99_ms: percentile(selected.map(row => row.module_ms), .99),
+                cpu_p50_ms: percentile(selected.map(row => row.cpu_ms), .5),
                 cpu_p99_ms: percentile(selected.map(row => row.cpu_ms), .99),
+                scheduler_wait_p50_ms: percentile(selected.map(row => row.scheduler_wait_ms), .5),
                 scheduler_wait_p99_ms: percentile(selected.map(row => row.scheduler_wait_ms), .99) };
         }));
         const resident = await driver.send({ op: "resident_stats", rig: "on" });
@@ -193,8 +195,11 @@ export async function brocaResidentTiming(samples = 50, claude = false) {
         if (process.env.MC_PAIR_RESULT_OUT) writeFileSync(process.env.MC_PAIR_RESULT_OUT, JSON.stringify(result, null, 2) + "\n");
         console.log(`ALL_LANES_PAIRED_TIMING_RESULT=${JSON.stringify({ bun: result.bun, cpus: result.cpus, harness, history: through, lanes })}`);
         console.log(`ALL_LANES_TIMING_DIAGNOSTICS=${JSON.stringify({ resident, psi: result.psi,
+            cpu_pressure: { before: before.host_cpu_pressure, after: after.host_cpu_pressure },
+            worst_resident_hook: rows.filter(row => row.lane === "on" && row.kind === "hook").sort((a, b) => b.module_ms - a.module_ms)[0],
             worst_resident_fold: rows.filter(row => row.lane === "on" && row.kind === "fold").sort((a, b) => b.module_ms - a.module_ms)[0] })}`);
         assert.ok(lanes.find(row => row.lane === "on" && row.kind === "fold")!.p99_ms < 250, "resident fold p99 must stay below 250 ms");
+        if (claude) assert.ok(lanes.find(row => row.lane === "on" && row.kind === "hook")!.p99_ms <= 10, "resident hook p99 must stay at or under 10 ms");
         return result;
     } finally { await driver.close(); }
 }

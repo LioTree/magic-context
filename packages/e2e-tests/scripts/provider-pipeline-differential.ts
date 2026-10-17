@@ -27,6 +27,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { instrumentNativeFold } from "./provider-native-fold-profile";
 import { createScheduler } from "../../plugin/src/features/magic-context/scheduler";
 import { runMigrations } from "../../plugin/src/features/magic-context/migrations";
 import { initializeDatabase } from "../../plugin/src/features/magic-context/storage-db";
@@ -657,6 +658,9 @@ export function buildDriver(directory: string): string {
     // compile the mutated source, not a cached source surrogate.
     const transformPath = join(generated, "src/transform.rs");
     if (existsSync(transformPath)) rmSync(transformPath);
+    const providersPath = join(generated, "src/providers");
+    if (existsSync(providersPath) && !lstatSync(providersPath).isSymbolicLink())
+        rmSync(providersPath, { recursive: true });
     for (const name of readdirSync(join(original, "src"))) {
         if (name !== "lib.rs") link(join(original, "src", name), join(generated, "src", name));
     }
@@ -666,7 +670,8 @@ export function buildDriver(directory: string): string {
     writeCurrent(driverPath, DRIVER);
     writeCurrent(
         join(generated, "src/lib.rs"),
-        lib.replace("mod tests {", `mod tests {\ninclude!(${JSON.stringify(driverPath)});`),
+        instrumentNativeFold(ROOT, generated,
+            lib.replace("mod tests {", `mod tests {\ninclude!(${JSON.stringify(driverPath)});`)),
     );
     const target = resolve(process.env.CARGO_TARGET_DIR ?? join(ROOT, "target"));
     const built = spawnSync(
