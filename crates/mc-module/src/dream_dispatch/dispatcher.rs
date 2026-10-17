@@ -18,7 +18,11 @@ use std::time::Duration;
 /// transports. Planners alone cannot take execution away from TypeScript. Each one
 /// here has an end-to-end test through `dream_dispatch::tick` with a scripted
 /// dream-claim-v1 claimant (`dream_dispatch::tick_tests`).
-pub const OPERATIONAL_TASKS: &[TaskName] = &[TaskName::Curate, TaskName::Classify];
+pub const OPERATIONAL_TASKS: &[TaskName] = &[
+    TaskName::Curate,
+    TaskName::Classify,
+    TaskName::ReviewUserMemories,
+];
 
 /// An executor that could not start any work, for a reason that says nothing
 /// about the task (an earlier process's child may still be running), reports a

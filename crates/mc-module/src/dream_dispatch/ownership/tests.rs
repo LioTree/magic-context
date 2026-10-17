@@ -165,7 +165,14 @@ fn production_wiring_publishes_only_the_operational_tasks() {
         .into_iter()
         .filter(|t| super::super::dispatcher::OPERATIONAL_TASKS.contains(t))
         .collect();
-    assert_eq!(operational, [TaskName::Curate, TaskName::Classify]);
+    assert_eq!(
+        operational,
+        [
+            TaskName::Curate,
+            TaskName::Classify,
+            TaskName::ReviewUserMemories
+        ]
+    );
     for harness in ["opencode", "opencode2"] {
         let ownership = publish(&OwnershipInput {
             config: &host_config(),

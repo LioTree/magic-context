@@ -11,13 +11,16 @@
 use super::broca_carrier::{BrocaCarrier, BrocaPolicy, BrocaPort, BrocaToolRoute};
 use super::classify_host::ClassifyHost;
 use super::context::{
-    ChildEvent, ChildObserver, TaskContext, TaskToolRouter, ToolError, ToolResult,
+    ChildEvent, ChildObserver, ControlError, TaskContext, TaskToolRouter, ToolError, ToolResult,
 };
 use super::curate_host::{CurateError, CurateHost};
 use super::dispatcher::TaskExecutor;
 use super::host_carrier::{DreamQueue, HostCarrier};
+use super::retrospective_host::{HostError, RetrospectiveHost};
 use super::verify_host::VerifyHost;
-use crate::dream_runner::{CarrierError, ChildRequest, Completion, DreamCarrier};
+use crate::dream_runner::{
+    resolve_task_models, CarrierError, ChildRequest, Completion, DreamCarrier,
+};
 use crate::dream_tasks::{classify::SensitiveContext, classify::TaskError, curate::CurateCarrier};
 use mc_store::dream_scheduler::schedules::{RunOutcome, RunStatus, ScheduleState, TaskName};
 use mc_store::dream_scheduler::SqliteDreamScheduler;
@@ -389,7 +392,36 @@ impl<B: BrocaPorts> TaskExecutor for DreamExecutor<B> {
                     Err(error) => failed(format!("{error:?}")),
                 }
             }
+            TaskName::ReviewUserMemories => {
+                // `dreamer.tasks["review-user-memories"].promotion_threshold ?? 3`,
+                // as task-config.ts `userMemoryPromotionThreshold` reads it.
+                let threshold = resolve_task_models(
+                    &context.config.effective,
+                    &context.config.harness,
+                    context.task.as_str(),
+                )
+                .promotion_threshold
+                // `candidates.length < threshold` over whole counts is the same
+                // test as against the threshold rounded up.
+                .map_or(3, |t| t.max(0.0).ceil() as usize);
+                let carrier = self.carrier(&context, Arc::new(NoTools));
+                let mut host = RetrospectiveHost::new(carrier, self.store.clone(), context);
+                match host.run_user_review(threshold).await {
+                    Ok(_) => RunOutcome::new(RunStatus::Completed),
+                    Err(error) => host_error(error),
+                }
+            }
             other => failed(format!("unavailable_capability: {}", other.as_str())),
         }
+    }
+}
+
+fn host_error(error: HostError) -> RunOutcome {
+    match error {
+        HostError::Model(failure) => task_error(TaskError::Runner(failure)),
+        HostError::Control(ControlError::BudgetExhausted) => task_error(TaskError::Budget),
+        HostError::Control(_) => task_error(TaskError::LeaseLost),
+        HostError::Store(error) => failed(error.to_string()),
+        HostError::Input(message) => failed(message),
     }
 }

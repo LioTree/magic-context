@@ -50,10 +50,10 @@ pub(super) fn settings(scheduled: &[&str]) -> Value {
     json!({"dreamer": {"tasks": tasks, "opencode": {"model": "provider/model"}}})
 }
 
-/// What a claimant that can carry the classifier and the curator declares.
+/// What a claimant that can carry the classifier, the curator and the reviewer declares.
 pub(super) fn claimant() -> Value {
     json!({"capabilities": claimant_capabilities(),
-        "agents": {"dreamer-classifier": [], "dreamer": ["ctx_memory"]}})
+        "agents": {"dreamer-classifier": [], "dreamer": ["ctx_memory"], "dreamer-reviewer": []}})
 }
 
 pub(super) fn claimant_capabilities() -> Value {
@@ -452,6 +452,69 @@ async fn a_curate_edit_runs_through_the_task_router_with_history_and_revisions()
         1
     );
     assert_eq!(p.scalar("SELECT COUNT(*) FROM memory_journal"), 1);
+}
+
+#[tokio::test]
+async fn a_user_memory_review_runs_through_rust_and_commits_its_verdict_once() {
+    let p = Project::open(true, &["review-user-memories"], None);
+    let published = p.declare().await;
+    assert!(
+        published["published"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("review-user-memories")),
+        "{published}"
+    );
+    // Three candidates reach the default promotion threshold of 3.
+    p.exec(
+        "INSERT INTO user_memory_candidates(id,content,session_id,created_at,source_compartment_start,source_compartment_end) VALUES
+            (1,'Prefers bounded checks','source-1',strftime('%s','now')*1000,10,20),
+            (2,'Prefers bounded checks','source-2',strftime('%s','now')*1000,10,20),
+            (3,'Prefers bounded checks','source-3',strftime('%s','now')*1000,10,20);
+         INSERT INTO user_memories(id,content,status,promoted_at,created_at,updated_at) VALUES
+            (1,'Prefers long reports','active',1,1,1),(2,'Likes guesses','active',1,1,1);",
+    );
+    let due = p.due_in_typescript("review-user-memories");
+    let job = p.start(None).expect("a run starts");
+    let verdict = r#"{"promote":[{"content":"Prefers bounded checks","candidate_ids":[1,2]}],"update_existing":[{"memory_id":1,"content":"Prefers concise reports","candidate_ids":[3]}],"dismiss_existing":[{"memory_id":2,"reason":"unsupported"}],"consume_candidate_ids":[1,2,3]}"#;
+    serve_child(&p, Script::Complete(verdict.into())).await;
+    let report = join(job).await.unwrap().unwrap().unwrap();
+    assert!(finished(&report, TaskName::ReviewUserMemories), "{report:?}");
+    assert_eq!(p.scalar("SELECT COUNT(*) FROM user_memory_candidates"), 0);
+    assert_eq!(
+        p.scalar("SELECT COUNT(*) FROM user_memories WHERE id=3 AND content='Prefers bounded checks' AND status='active'"),
+        1
+    );
+    assert_eq!(
+        p.scalar("SELECT COUNT(*) FROM user_memories WHERE id=1 AND content='Prefers concise reports'"),
+        1
+    );
+    assert_eq!(
+        p.scalar("SELECT COUNT(*) FROM user_memories WHERE id=2 AND status='dismissed'"),
+        1
+    );
+    assert_eq!(
+        p.scalar("SELECT project_user_profile_version FROM project_state WHERE project_path='__global__'"),
+        1
+    );
+    assert!(
+        p.scalar(&format!(
+            "SELECT next_due_at FROM task_schedule_state WHERE project_path='{}' AND task='review-user-memories'",
+            p.project
+        )) > due
+    );
+    // The same period never runs the review a second time.
+    let again = join(p.start(None).unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(again.is_empty(), "{again:?}");
+    assert_eq!(p.pending(), 0);
+    assert_eq!(
+        p.scalar("SELECT COUNT(*) FROM memory_journal WHERE operation='user_profile_review'"),
+        1
+    );
 }
 
 #[tokio::test]
