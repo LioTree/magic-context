@@ -249,9 +249,6 @@ export function tryMessagesTransformLkgReplay(args: {
     replayFits?: (messages: MessageLike[]) => boolean;
 }): boolean {
     const { output, sessionId, error, agent } = args;
-    // A capture whose pass never returned it was never sent; neither the entry
-    // note nor the replay below may be taken against it.
-    discardWithheldServedCapture(sessionId);
     const slotAtEntry = getSlot(sessionId);
     let entry = args.entry;
     if (entry === undefined && slotAtEntry) {
