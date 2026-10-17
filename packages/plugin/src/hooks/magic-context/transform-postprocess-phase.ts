@@ -4581,9 +4581,11 @@ export async function runPostTransformPhase(
         (m0M1InjectedThisPass && historyWasConsumedThisPass) ||
         historyWasConsumedThisPass;
     // Permission is not evidence that bytes changed. While current-turn signed
-    // thinking is kept, removing completed-turn thinking changes protected bytes too.
+    // thinking is kept on a prefix-bound model, removing completed-turn thinking
+    // changes bytes that signature covers too.
+    const signedBoundaryKept = !editAdmission.admit({ kind: "prefix" });
     const proactiveThinkingStripPermitted =
-        isCacheBustingPass && !activeThinkingPrefixHold && editAdmission.frame.kind !== "boundary";
+        isCacheBustingPass && !activeThinkingPrefixHold && !signedBoundaryKept;
 
     // Final representation strips run once, after all topology mutations; execute
     // and defer must serialize identical prefixes. Do not add message, tool-target,
@@ -4673,11 +4675,7 @@ export async function runPostTransformPhase(
                     }
                 }
 
-                if (
-                    canUseEmptySentinels &&
-                    canEditWholePrefix &&
-                    editAdmission.frame.kind !== "boundary"
-                ) {
+                if (canUseEmptySentinels && canEditWholePrefix && !signedBoundaryKept) {
                     pair(() => {
                         const candidates = findMergedReasoningStripDecisions(
                             args.messages,
