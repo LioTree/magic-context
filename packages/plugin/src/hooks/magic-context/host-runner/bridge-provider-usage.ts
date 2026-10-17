@@ -22,7 +22,7 @@ export interface BridgePublishedRequest {
  * usage also derives the envelope reading that bounds unobserved tool schemas: an
  * aborted or failed request may report partial input usage. `sentText` is the
  * host's rule for which served message text certainly reaches the provider; it
- * defaults to OpenCode 1's.
+ * defaults to `openCodeSentText`, OpenCode 1's rule.
  */
 export function providerUsageFromHostFact(
     fact: BridgeHostFact,

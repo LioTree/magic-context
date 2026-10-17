@@ -160,7 +160,9 @@ function randomPiHistory(
 				content.push({
 					type: "thinking",
 					thinking: text(),
-					// openai-responses parses same-model signatures as JSON reasoning items.
+					// When an assistant turn came from the request's own model, the
+					// openai-responses serializer replays its signature by parsing it as a
+					// JSON reasoning item, so signatures here must be valid JSON.
 					...(next() < 0.5
 						? {
 								thinkingSignature: JSON.stringify({

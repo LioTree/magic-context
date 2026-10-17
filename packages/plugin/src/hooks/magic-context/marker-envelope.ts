@@ -284,7 +284,7 @@ export const openCodeSentText: MarkerSentText = (message) => {
 /**
  * Lower bound on the provider tokens of a served request's message rows, at the
  * model's smallest calibration ratio. Only text the host certainly sends is
- * counted, as chosen by `sentText` (OpenCode 1's rule by default). Tool calls and
+ * counted, as chosen by `sentText` (`openCodeSentText` by default). Tool calls and
  * results (outputs may be cleared or truncated), reasoning (providers may strip
  * earlier thinking) and every wrapper count zero. Leading and trailing whitespace
  * is not counted, since a provider adapter may trim it. If the local tokenizer is

@@ -684,7 +684,8 @@ test("Pi bridge session with unobserved tools waits for a matching provider usag
 			).toMatchObject({ kind: "deferred", reason: "fit-unproven" });
 			expect(appends).toBe(0);
 		};
-		// No usage reading at all: the marker waits.
+		// No usage reading at all: nothing bounds the unobserved tool schemas, so
+		// the native marker waits.
 		waits();
 		let observedAt = Date.now();
 		const respond = async (
@@ -730,7 +731,8 @@ test("Pi bridge session with unobserved tools waits for a matching provider usag
 			expect(await respond(served)).toEqual({ accepted: true });
 			waits();
 		}
-		// A failed response's usage may be partial, so it is not a reading.
+		// A failed response may report only partial input usage, so it does not
+		// derive an envelope reading.
 		expect(await respond(material, undefined, "failed")).toEqual({
 			accepted: true,
 		});
