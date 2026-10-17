@@ -1285,8 +1285,8 @@ fn review_module_move_preserves_populated_projection_and_fragment_references() {
 
 #[test]
 fn inventory_versions_six_and_seven_refuse_cross_order_before_writes() {
-    // Version 8 only dropped the retired provider view section; the section
-    // order this test rebuilds is unchanged from version 7.
+    // Version 8 only dropped the `mc_provider_views_v1` section; the order of
+    // the sections this test rebuilds is unchanged from version 7.
     assert_eq!(move_inventory::INVENTORY_VERSION, 8);
     let source_dir = tempfile::tempdir().unwrap();
     let source = seeded(source_dir.path(), 1, 10);

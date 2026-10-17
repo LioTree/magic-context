@@ -303,9 +303,10 @@ impl McStore {
             .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
     }
 
-    /// One read snapshot of the replayable view versions and the native source
-    /// ranges those views stream. Source conversion must not touch a row in
-    /// `sources` while any version in `versions` can still be served.
+    /// One read snapshot of the view versions that can still be replayed and the
+    /// stored native message ranges those views read their bytes from. Any later
+    /// rewrite of stored native messages must leave every row in `sources`
+    /// unchanged while a version in `versions` can still be served.
     pub fn provider_view_source_roots(
         &self,
         key: &ProviderSessionKey,
@@ -440,9 +441,11 @@ pub(crate) fn save_recipe_tx(
                         recipe.base_version=None;
                     }
                 }
-                // A view without a baseline cut links to the conversation's current
-                // cut. Only a conversation with no cut at all gets a Setup cut: a new
-                // cut would become the current one that policy and fold reads use.
+                // Every recipe row must name a policy cut. A view saved without the
+                // conversation's baseline cut links to its newest cut instead. Only a
+                // conversation with no cut gets a new placeholder "setup" cut: the
+                // newest cut is the one policy and fold reads treat as current, so
+                // adding one on every view save would change what they read.
                 let current=match recipe.policy_cut_id {
                     Some(cut)=>Some(cut),
                     None=>crate::provider_policy_overlay::current_cut_tx(conn,&conv)?,
@@ -474,8 +477,9 @@ pub(crate) fn save_recipe_tx(
     Ok(bytes)
 }
 
-/// Delete every recipe that no root reaches through its base chain, then the
-/// policy cuts nothing references any longer. See `prune_provider_view_recipes`.
+/// Delete recipes that no root reaches through its base chain, then delete the
+/// policy cuts that no remaining recipe or policy override references. See
+/// `prune_provider_view_recipes`.
 pub(crate) fn prune_tx(
     conn: &rusqlite::Connection,
     conv: &str,
@@ -556,8 +560,9 @@ pub(crate) fn view_roots_tx(
     for version in q.query_map([conv], |r| r.get::<_, u64>(0))? {
         roots.insert(version?);
     }
-    // A reference whose recipe was never stored cannot be protected; keeping it
-    // would only make pruning refuse. Readers already treat it as absent.
+    // A version named by a reference but never stored has nothing to protect.
+    // Leave it out: `prune_tx` refuses a root whose recipe is missing, and the
+    // record and view readers already treat that version as absent.
     let mut exists = conn.prepare_cached(
         "SELECT EXISTS(SELECT 1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2)",
     )?;

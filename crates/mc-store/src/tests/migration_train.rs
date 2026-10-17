@@ -92,9 +92,9 @@ fn record() -> serde_json::Value {
     })
 }
 
-/// The populated record without its view bodies. Since migration 73 a runner
-/// record names its views by version and stores each as a recipe, so a whole
-/// view body is refused on save.
+/// The populated record without its view bodies. The current record writer
+/// takes views only as version references with v2 recipes and refuses a
+/// record that carries a whole view body.
 fn record_without_views() -> serde_json::Value {
     let mut record = record();
     let state = record["setup"]["state"].as_object_mut().unwrap();
@@ -490,7 +490,8 @@ fn assert_fault_rolls_back(descriptor: &StorageDescriptor, before: &Snapshot, ta
                     AuthAction::CreateIndex { index_name, .. } => {
                         target == 70 && index_name == "mc_provider_conversations_session"
                     }
-                    // 73 creates nothing; fail its final statement after every reset.
+                    // Migration 73 creates no table. Deny its last statement, the
+                    // table drop, so every reset before it must roll back too.
                     AuthAction::DropTable { table_name } => {
                         target == 73 && table_name == "mc_provider_views_v1"
                     }

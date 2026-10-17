@@ -13,10 +13,11 @@
  * Run: bun packages/e2e-tests/scripts/provider-views-v2-differential.ts <base-root>
  * Environment: MC_VIEWS_V2_OUT (result JSON path), MC_VIEWS_V2_SIZE_HISTORY
  * (paired-fixture history length, default 17000), MC_VIEWS_V2_SIZE_FOLDS
- * (default 52), MC_VIEWS_V2_SKIP_SIZE=1 to compare bytes only.
+ * (default 52), MC_VIEWS_V2_SKIP_SIZE=1 to compare bytes only,
+ * MC_VIEWS_V2_ONLY=<lane name> to run one flow lane.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as tip from "./provider-pipeline-differential";
@@ -232,7 +233,11 @@ async function storeSize(lane: Lane, directory: string) {
     return out;
 }
 
-/** The paired fixture of provider-resident-paired-timing.ts: 17,000 messages, then folds. */
+/**
+ * The size fixture of provider-resident-paired-timing.ts's Broca and Claude
+ * lanes: 17,000 short text messages, all but the newest 500 covered by
+ * compartments, then one fold per changed compartment.
+ */
 async function pairedSize(lane: Lane, directory: string, through: number, folds: number) {
     const messages = Array.from({ length: through }, (_, i) => {
         const message = { role: i % 5 === 0 ? "user" : "assistant", content: [{ type: "text", text: `Fixture ${i}: café 🦀 exact source` }] };
@@ -274,8 +279,10 @@ function generationTokens(entries: Entry[]): string[] {
 }
 
 /**
- * Non-vacuity: equal bytes mean nothing if both runs used one writer. The base
- * revision must have written whole-copy v1 views and the tip only recipes.
+ * Equal bytes prove nothing if both runs used the same view writer, for
+ * example because both drivers were the same executable. Check the stores:
+ * the base revision must have written whole-copy v1 views and the tip only
+ * v2 recipes.
  */
 async function assertWriter(lane: Lane, revision: Revision) {
     const scalar = async (sql: string) => (await lane.driver.send({ op: "sql", rig: lane.rig, sql }))[0]?.[0] ?? null;
@@ -336,6 +343,7 @@ export async function viewsV2Differential(baseRoot: string) {
     for (const claude of [false, true]) {
         for (const resident of [false, true]) {
             const name = `${claude ? "claude-code" : "broca-runner"}-resident-${resident ? "on" : "off"}`;
+            if (process.env.MC_VIEWS_V2_ONLY && process.env.MC_VIEWS_V2_ONLY !== name) continue;
             // Both revisions run in the same directory: the project path is part
             // of every session key, and so of compaction and view identities.
             const lanes = {} as Record<Revision, Lane>;
@@ -347,6 +355,7 @@ export async function viewsV2Differential(baseRoot: string) {
                 await flow(lanes[revision]);
                 writers[`${name}-${revision}`] = await assertWriter(lanes[revision], revision);
                 await driver.close();
+                if (process.env.MC_VIEWS_V2_KEEP) cpSync(join(directory, "flow"), join(process.env.MC_VIEWS_V2_KEEP, name, revision), { recursive: true });
             }
             comparisons.push(compare(name, lanes.base.entries, lanes.tip.entries));
         }

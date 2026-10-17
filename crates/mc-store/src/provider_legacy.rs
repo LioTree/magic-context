@@ -243,8 +243,10 @@ pub(crate) fn load_tx(
     };
     if has("messages") {
         let mut messages = json!({});
-        // The view-recipe writer anchors a Setup policy cut on the empty lineage
-        // ID, which host ingest cannot name. It is not part of the transcript.
+        // A recipe saved before any policy cut exists gets a placeholder cut,
+        // and that cut needs a lineage row. The recipe writer uses the empty
+        // lineage ID, which no host transcript page can carry, so the row is
+        // bookkeeping rather than a transcript lineage and is left out here.
         let mut lineages = conn.prepare(
             "SELECT lineage_id FROM mc_provider_lineages_v1 l WHERE conv_key=?1 AND (lineage_id<>'' OR EXISTS(SELECT 1 FROM mc_provider_messages_v1 m WHERE m.conv_key=l.conv_key AND m.lineage_id=''))",
         )?;

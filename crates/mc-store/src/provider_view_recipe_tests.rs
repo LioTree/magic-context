@@ -1,5 +1,5 @@
-//! Retention roots of stored view recipes, and runner records whose views are
-//! recipes moving between stores.
+//! Which stored view recipes pruning keeps, and a runner record that names its
+//! view by version moving to another store through agent move.
 use super::*;
 use crate::move_snapshot as codec;
 use crate::provider_log::{ProviderConversation, ProviderLineage, ProviderMessage, ProviderStatusPage};
@@ -223,9 +223,10 @@ fn runner_record_view_recipe_moves_and_v7_section_streams_are_refused() {
         view.messages.iter().map(|(l, m)| (l.clone(), m.mid.clone(), m.message_bytes.clone())).collect::<Vec<_>>()
     );
 
-    // An inventory-7 stream still carries the retired view section just
-    // before the legacy tag section. Rebuild one from the captured sections:
-    // the current importer refuses it before reserving or writing anything.
+    // Move inventory version 7 shipped an `mc_provider_views_v1` section just
+    // before `mc_provider_legacy_tags_v1`; version 8 has no such section.
+    // Rebuild a version-7-shaped stream from the captured sections: the
+    // current importer refuses it before reserving or writing anything.
     let bytes = std::fs::read(&staging).unwrap();
     let mut input = std::io::Cursor::new(&bytes);
     let mut sections = Vec::new();
@@ -267,8 +268,9 @@ fn runner_record_view_recipe_moves_and_v7_section_streams_are_refused() {
         "inventory_mismatch"
     );
     assert!(fresh.load_provider_record(&key).unwrap().is_none());
-    // An inventory-7 receiver expects that retired section where the current
-    // stream has the legacy tag section, so its strict name check refuses too.
+    // A version-7 receiver reads sections in its own order and expects
+    // `mc_provider_views_v1` at the position where this stream has
+    // `mc_provider_legacy_tags_v1`, so its strict name check refuses as well.
     let legacy_tags = codec::ship_tables(crate::move_inventory::Store::Module)
         .find(|table| table.table == "mc_provider_legacy_tags_v1")
         .unwrap();

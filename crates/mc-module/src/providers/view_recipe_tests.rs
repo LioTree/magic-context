@@ -314,7 +314,8 @@ async fn runner_call(h: &McHandler, method: &str, params: Value) -> Value {
 
 /// Runner records name their views by version. Reading the record back, from
 /// the resident session or a cold process, resolves each reference to the view
-/// the runner was served, and the native survivors are not copied.
+/// the runner was served, and the native messages that view kept unchanged are
+/// read from their stored rows rather than copied into the recipe.
 #[tokio::test]
 async fn runner_record_view_references_resolve_to_the_served_views() {
     for resident in [false, true] {
