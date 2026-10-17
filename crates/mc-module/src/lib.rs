@@ -4133,6 +4133,10 @@ pub struct McHandler {
     /// waiting on. Empty under the in-module runner.
     host_runs: Arc<HostRunLedger>,
     dream_children: Arc<dream_dispatch::host_carrier::DreamQueue>,
+    /// Live Broca dream children, keyed by the Broca session each one runs in.
+    /// A memory tool the runner dispatches on such a session reaches the task's
+    /// router only through this record, never the foreground facade.
+    broca_dream_tools: Arc<dream_dispatch::broca_carrier::BrocaToolRoute>,
     /// Which runner each session's most recent historian and dreamer completion
     /// used in this process, and why. Read by the status and health surfaces.
     runner_choices: Arc<Mutex<runner_choices::RunnerChoiceLog>>,
@@ -5014,6 +5018,7 @@ impl McHandler {
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
             dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
+            broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             memory_paused_routes: Arc::default(),
@@ -5442,6 +5447,7 @@ impl McHandler {
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
             dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
+            broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             memory_paused_routes: Arc::default(),
@@ -16146,6 +16152,11 @@ impl McHandler {
                 return self.handle_non_served_method(channel, &request, "mc.memory")
             }
             _ => {}
+        }
+        // A route bound to a Broca dream child's session serves only that child's
+        // admitted task tools (plus read-only discovery), whatever the request says.
+        if let Some(outcome) = self.broca_dream_route(channel, method, &request) {
+            return outcome;
         }
         let provider_operation = if method == Some("tools/call") {
             request.pointer("/params/name").and_then(Value::as_str)
