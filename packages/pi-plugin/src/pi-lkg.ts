@@ -2,6 +2,7 @@ import {
 	certifyDispatchedLkgSlot,
 	createDbLkgPersistence,
 	loadPersistedLkgSlot,
+	refuseUndispatchedLkgSlot,
 	saveLkgSlotToDb,
 } from "@magic-context/core/hooks/magic-context/lkg-persist";
 import {
@@ -455,6 +456,13 @@ export interface PiLkgCoordinator {
 	 * restart. Never throws.
 	 */
 	certifyDispatched(snapshot: PiLkgPassSnapshot): void;
+	/**
+	 * Call when the context handler throws instead of returning this pass's
+	 * request, so it is never dispatched. The request its publication saved stays
+	 * durable but is marked refused: it never certifies and is not hydrated after a
+	 * restart. Never throws.
+	 */
+	refuseDispatch(snapshot: PiLkgPassSnapshot): void;
 }
 
 /** A request that cannot be saved for replay can still be served with its admitted tag numbers recorded. */
@@ -1095,6 +1103,15 @@ export function createPiLkgCoordinator(
 		}
 		const slot = getSlot(snapshot.sessionId);
 		const start = slot?.inputIdSeq.indexOf(snapshot.inputs[0]?.id ?? "") ?? -1;
+		// A request saved just before its process stopped may never have been sent.
+		// Replaying it is safe only for exactly the input it was built from, where it
+		// equals rebuilding the same request; any other input could make it the anchor
+		// for bytes the provider never saw.
+		if (
+			slot?.dispatchUnconfirmed &&
+			(start !== 0 || snapshot.inputs.length !== slot.inputIdSeq.length)
+		)
+			return { ok: false, reason: "lkg_dispatch_unconfirmed" };
 		if (slot && start > 0) {
 			const ownership = slot.piOutputEntryIds;
 			if (!ownership)
@@ -1380,7 +1397,10 @@ export function createPiLkgCoordinator(
 				? undefined
 				: unchanged &&
 						!state.syncCaptureRequired &&
-						livePrior.servedCaptureId !== undefined
+						livePrior.servedCaptureId !== undefined &&
+						// An id whose dispatch was never confirmed (loaded after a
+						// restart) belongs to the stopped process; take a fresh one.
+						!livePrior.dispatchUnconfirmed
 					? livePrior.servedCaptureId
 					: recordServedCapture(db, snapshot.sessionId, true);
 		// Keep all N stable inputs flattened before returning from this context handler.
@@ -1541,9 +1561,30 @@ export function createPiLkgCoordinator(
 					) {
 						throw new Error("Pi LKG/served publication failed");
 					}
+					// The request is durable but not dispatched: the context handler binds
+					// its certificate when it returns the request to Pi, and records a
+					// refusal if it throws instead.
+					if (plan.servedCaptureId !== undefined)
+						state.pendingDispatch = {
+							snapshot,
+							servedCaptureId: plan.servedCaptureId,
+						};
 					// SQLite can return after the outcome deadline. The request and identities
 					// are durable, but the handler must refuse rather than dispatch a late result.
-					args.assertCurrentPass?.();
+					// A pass past its deadline, cancelled or superseded is never dispatched, so
+					// record that refusal: a restarted process must not replay these bytes.
+					try {
+						args.assertCurrentPass?.();
+					} catch (error) {
+						state.pendingDispatch = undefined;
+						if (plan.servedCaptureId !== undefined)
+							refuseUndispatchedLkgSlot(
+								db,
+								plan.sessionId,
+								plan.servedCaptureId,
+							);
+						throw error;
+					}
 				}
 				if (!captureSlot(plan.sessionId, slot)) {
 					throw new Error("LKG slot rejected the Pi snapshot");
@@ -1584,14 +1625,7 @@ export function createPiLkgCoordinator(
 							retainDirtyRevision: state.recoveryPrefix?.fenceRevision,
 						});
 				state.syncCaptureRequired = !persisted;
-				if (args.publishServedNumbers) {
-					noteCapturedRequest();
-					if (plan.servedCaptureId !== undefined)
-						state.pendingDispatch = {
-							snapshot,
-							servedCaptureId: plan.servedCaptureId,
-						};
-				}
+				if (args.publishServedNumbers) noteCapturedRequest();
 			} catch (error) {
 				if (args.publishServedNumbers) {
 					state.syncCaptureRequired = true;
@@ -1705,6 +1739,25 @@ export function createPiLkgCoordinator(
 				sessionLog(
 					snapshot.sessionId,
 					"LKG dispatch certification skipped:",
+					error,
+				);
+			}
+		},
+		refuseDispatch(snapshot) {
+			try {
+				const state = piLkgSessionStates.get(snapshot.sessionId);
+				const pending = state?.pendingDispatch;
+				if (!state || pending?.snapshot !== snapshot) return;
+				state.pendingDispatch = undefined;
+				refuseUndispatchedLkgSlot(
+					db,
+					snapshot.sessionId,
+					pending.servedCaptureId,
+				);
+			} catch (error) {
+				sessionLog(
+					snapshot.sessionId,
+					"LKG dispatch refusal not recorded:",
 					error,
 				);
 			}

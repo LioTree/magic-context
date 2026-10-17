@@ -5,6 +5,7 @@ import { sessionLog } from "../../shared/logger";
 import { type Database, withSqliteBackgroundWriter } from "../../shared/sqlite";
 import {
     boundLkgCertificate,
+    isPreparedUndispatchedLkgSlot,
     lkgCertificateDigest,
     lkgSlotCertificateDigest,
     saveLkgSlotToDb,
@@ -421,6 +422,15 @@ export function repairLkgDurability(db: Database, sessionId: string): LkgDurabil
     // The pass that captured this slot never returned it to the host, so these
     // bytes were never served and must not be certified.
     if (slot.servedCaptureWithheld) return uncertified;
+    // A request saved before dispatch is not known to have been sent until its
+    // dispatch binds the certificate: one loaded after its process stopped
+    // (dispatch unconfirmed), or one this connection saved and has not yet
+    // dispatched.
+    if (
+        slot.dispatchUnconfirmed ||
+        isPreparedUndispatchedLkgSlot(db, sessionId, slot.servedCaptureId)
+    )
+        return uncertified;
     if (!status.durable && slot.servedCaptureId !== undefined) return status;
     const marker = readServedMarker(db, sessionId);
     if (status.durable && status.certified !== false && status.servedCaptureId !== null) {

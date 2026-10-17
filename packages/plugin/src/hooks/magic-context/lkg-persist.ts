@@ -5,7 +5,7 @@ import { isRustMarkerAdmissionFenced } from "../../features/magic-context/storag
 import { drainBackgroundBatches } from "../../shared/background-batch-drain";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
-import type { Database } from "../../shared/sqlite";
+import { type Database, withoutSqliteTransformPass } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { clearLkgRecoveryFence, commitLkgWithRecoveryFence } from "./lkg-recovery-fence";
 import {
@@ -320,6 +320,8 @@ interface PreparedLkgCertificate extends BoundLkgCertificate {
     unboundValue: string | null;
 }
 const preparedCertificates = new WeakMap<Database, Map<string, PreparedLkgCertificate>>();
+/** Marker slot state of a request saved before dispatch whose pass was then refused. */
+const UNDISPATCHED_SLOT_STATE = "undispatched";
 
 function rememberPreparedCertificate(
     db: Database,
@@ -337,6 +339,53 @@ function rememberPreparedCertificate(
         if (oldest !== undefined) prepared.delete(oldest);
     }
     prepared.set(sessionId, certificate);
+}
+
+/**
+ * Record that a request saved with `deferCertificate` will never be dispatched:
+ * its pass was refused after the save committed. The bytes stay durable, but the
+ * marker's slot state becomes `undispatched`, so the id never certifies and a
+ * restarted process does not hydrate them. Only the writer that saved them can
+ * mark them. Never throws.
+ */
+export function refuseUndispatchedLkgSlot(
+    db: Database,
+    sessionId: string,
+    servedCaptureId: number,
+): boolean {
+    const prepared = preparedCertificates.get(db)?.get(sessionId);
+    if (!prepared || prepared.servedCaptureId !== servedCaptureId) return false;
+    preparedCertificates.get(db)?.delete(sessionId);
+    try {
+        // A refused pass is often refused because it ran past its deadline, and a
+        // pass's write guard then blocks its writes. Recording that its request was
+        // never sent publishes nothing for it, so it runs outside that guard.
+        return withoutSqliteTransformPass(
+            () =>
+                db
+                    .prepare(
+                        `UPDATE lkg_served_markers SET slot_state = '${UNDISPATCHED_SLOT_STATE}'
+                    WHERE session_id = ? AND served_capture_id = ? AND slot_state = 'captured'
+                    AND served_digest IS ?`,
+                    )
+                    .run(sessionId, servedCaptureId, prepared.unboundValue).changes > 0,
+        );
+    } catch (error) {
+        sessionLog(sessionId, "LKG refused request could not be marked undispatched:", error);
+        return false;
+    }
+}
+
+/** Whether this connection saved the slot's bytes with their certificate deferred, not yet dispatched. */
+export function isPreparedUndispatchedLkgSlot(
+    db: Database,
+    sessionId: string,
+    servedCaptureId: number | undefined,
+): boolean {
+    return (
+        servedCaptureId !== undefined &&
+        preparedCertificates.get(db)?.get(sessionId)?.servedCaptureId === servedCaptureId
+    );
 }
 
 /**
@@ -793,15 +842,25 @@ export async function drainStaleLkgSlots(
 }
 
 /**
- * Whether the stored slot was saved with its certificate deferred and its request
- * was never confirmed dispatched: its id is the marker's id and that marker is still
- * a pending allocation. An ordinary save binds its id in the same transaction as
- * the bytes, so only a deferred-certificate save leaves this state.
+ * How a stored slot saved with its certificate deferred relates to dispatch, from
+ * its marker: `refused` when its pass was refused after the save (the bytes were
+ * never sent), `unconfirmed` when the marker still names it as a pending allocation
+ * (the process may have died before or after sending it), else `settled`. An
+ * ordinary save binds its id in the same transaction as the bytes, so only a
+ * deferred-certificate save leaves the first two states.
  */
-function savedButNotDispatched(db: Database, sessionId: string, slot: LkgSlot): boolean {
-    if (slot.servedCaptureId === undefined) return false;
+function dispatchState(
+    db: Database,
+    sessionId: string,
+    slot: LkgSlot,
+): "refused" | "unconfirmed" | "settled" {
+    if (slot.servedCaptureId === undefined) return "settled";
     const marker = readServedMarkerRow(db, sessionId);
-    return marker?.servedCaptureId === slot.servedCaptureId && marker.pendingToken !== null;
+    if (marker?.servedCaptureId !== slot.servedCaptureId) return "settled";
+    if (marker.slotState === UNDISPATCHED_SLOT_STATE) return "refused";
+    return marker.pendingToken !== null && marker.slotState === "captured"
+        ? "unconfirmed"
+        : "settled";
 }
 
 /** Backend bound to one database handle, for registration with the slot store. */
@@ -811,12 +870,20 @@ export function createDbLkgPersistence(db: Database): LkgPersistenceBackend {
             const slot = loadPersistedLkgSlot(db, sessionId);
             if (!slot) return undefined;
             try {
-                // Replay serves the last request sent. A request saved before its
-                // dispatch and then refused stays durable, but is not that request.
-                if (savedButNotDispatched(db, sessionId, slot)) {
-                    sessionLog(sessionId, "LKG durable slot was never dispatched; not hydrated");
+                const state = dispatchState(db, sessionId, slot);
+                // Replay serves the last request sent. A request whose pass was
+                // refused after saving it stays durable, but was never sent.
+                if (state === "refused") {
+                    sessionLog(
+                        sessionId,
+                        "LKG durable slot was refused before dispatch; not hydrated",
+                    );
                     return undefined;
                 }
+                // A request saved just before the process died has an unknown
+                // outcome, but it was valid for its input: it loads uncertified and
+                // may replay only for that exact input.
+                if (state === "unconfirmed") return { ...slot, dispatchUnconfirmed: true };
             } catch (error) {
                 // Without a readable marker there is no certificate to consult; keep
                 // hydrating as before certificates were bound to dispatch.

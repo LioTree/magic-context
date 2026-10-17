@@ -35,6 +35,13 @@ export interface LkgSlot {
      * certify it. The pass clears it when it returns these bytes.
      */
     servedCaptureWithheld?: boolean;
+    /**
+     * Set on a slot loaded from storage whose request was saved before dispatch
+     * and whose dispatch was never confirmed (the process stopped in between). It
+     * certifies nothing and may replay only for exactly the input it was built
+     * from, where replaying it equals rebuilding the same request.
+     */
+    dispatchUnconfirmed?: boolean;
     /** RFC 8785 message digests for the portable hostCut frontier. */
     inputMoveDigests?: string[];
 }
