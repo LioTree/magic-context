@@ -146,6 +146,7 @@ import { restoreRow } from "../fold/restore";
 import { seedV2ForkFromParent, sessionHasMagicContextState } from "../fork-inheritance";
 import { cleanupLegacyHiddenChildren } from "../hidden-child-cleanup";
 import { nativeSessionRemove } from "../hidden-child-native";
+import { createOpenCode2DreamChildHost } from "../dream-child-host";
 import { createLateHiddenExecutor, createV2HiddenCompletionExecutor } from "../hidden-completion";
 import { gaDatabasePath, type V2StoreReader, V2StoreReaderPool } from "../store-reader";
 import {
@@ -162,6 +163,10 @@ import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
 import { registerV2DreamScheduleTimer } from "./dream-timer";
 import { startDreamTrigger } from "./dream-trigger";
 import { generateReplayAnchor, V2GenerateReplay } from "./generate";
+import {
+    admitDreamChildStep,
+    dreamChildToolRefusal,
+} from "../../hooks/magic-context/dream-child-claimant";
 import { HiddenChildHook, hiddenToolCallRefusal, registerHiddenChildAgents } from "./hidden-child";
 import { hiddenTerminalError } from "./hidden-terminal-error";
 import { V2LkgSystemReplay } from "./lkg-system";
@@ -802,7 +807,11 @@ export async function registerContext(context: V2Context) {
     // permissions allow: the host appends the user's rules after the agent's
     // own, so the agent registration alone cannot keep edit or shell away.
     await context.tool.hook("execute.before", (draft) => {
-        const refusal = hiddenToolCallRefusal(draft, hiddenChildHook);
+        // A claimed dream child is checked against its own gate first: the
+        // descriptor's tools, its stop state and its token budget.
+        const refusal =
+            dreamChildToolRefusal(draft.sessionID, draft.tool) ??
+            hiddenToolCallRefusal(draft, hiddenChildHook);
         if (refusal === undefined) return;
         sessionLog(draft.sessionID, "hidden child tool call refused", {
             tool: draft.tool,
@@ -1453,6 +1462,10 @@ export async function registerContext(context: V2Context) {
         // Learn the host's message and attachment classes, so attachments on rows restored
         // after a host checkpoint can be rebuilt in the host's own shape.
         rememberHostMedia(draft.messages, draft.sessionID);
+        // The context hook runs once per model step. A claimed dream child's step
+        // is admitted here before the hidden-child bridge shapes it; a refusal
+        // throws and the host stops the child before calling the provider.
+        await admitDreamChildStep(draft.sessionID);
         if (hiddenChildHook.apply(draft)) return;
         // A dreamer that was off at boot and has since been turned on in the
         // config starts here; startDreamer stays a no-op while it is off.
@@ -1773,6 +1786,18 @@ export async function registerContext(context: V2Context) {
                 historianExpandTools: config.historian?.expand_tools,
                 historianRunner: config.historian?.runner,
                 historianHostRunnerEnabled: config.historian?.host_runner?.enabled,
+                // Inert until the transform is told to build its dream-child claimant.
+                dreamChildHost: () =>
+                    hiddenCompletionExecutor
+                        ? createOpenCode2DreamChildHost({
+                              executor: hiddenCompletionExecutor,
+                              openReader: openStoreReader,
+                              getSession: (input) => context.session.get(input),
+                              directory,
+                              keepSubagents: config.keep_subagents === true,
+                              log: (message) => log(`[magic-context] ${message}`),
+                          })
+                        : undefined,
                 // TypeScript mode folds on the host's own compaction rows, so its marker
                 // carrier stays inert. Rust mode has no such row to write: the module's
                 // materialized boundary is recorded in the marker columns instead, and

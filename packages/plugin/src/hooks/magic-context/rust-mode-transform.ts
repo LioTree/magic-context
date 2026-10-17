@@ -91,6 +91,8 @@ import {
     createFinalWireUsageTracker,
     estimateFinalWireInputTokens,
 } from "./final-wire-token-estimate";
+import { DreamChildClaimant } from "./dream-child-claimant";
+import { createOpenCode1DreamChildHost } from "./dream-child-hidden-host";
 import { createHistorianHostRunner } from "./historian-host-runner";
 import {
     hasActiveAnthropicThinkingTurn,
@@ -556,6 +558,8 @@ export interface RustModeTransformOptions {
      * Tests use it to drive the loop deterministically; production never sets it.
      */
     historianHostRunnerForTests?: HistorianHostRunnerSeam;
+    /** Replaces the dream-child claimant this transform would build for itself. Tests only. */
+    dreamChildClaimantForTests?: HistorianHostRunnerSeam;
 }
 
 /** What the transform needs from the historian pull loop, and nothing more. */
@@ -1858,6 +1862,44 @@ export function createRustModeTransform(
             log(`[magic-context] historian host runner unavailable: ${String(error)}`);
         }
         return hostRunner ?? undefined;
+    };
+
+    // Built only when the host opts in (see `dreamChildClaimantEnabled`). Off,
+    // nothing here runs and no dream-child operation is ever sent.
+    let dreamClaimant: HistorianHostRunnerSeam | undefined | null =
+        options.dreamChildClaimantForTests ??
+        (deps.dreamChildClaimantEnabled === true ? null : undefined);
+    const resolveDreamClaimant = (): HistorianHostRunnerSeam | undefined => {
+        if (dreamClaimant !== null) return dreamClaimant;
+        try {
+            const directory = options.projectRoot ?? deps.directory ?? process.cwd();
+            const host =
+                deps.dreamChildHost?.() ??
+                (deps.client
+                    ? createOpenCode1DreamChildHost({
+                          client: deps.client,
+                          db: deps.db,
+                          directory,
+                          log: (message) => log(`[magic-context] ${message}`),
+                      })
+                    : undefined);
+            dreamClaimant = host
+                ? new DreamChildClaimant({
+                      call: (args) =>
+                          options.moduleClient.call({
+                              method: args.method,
+                              sessionId: args.sessionId,
+                              projectRoot: directory,
+                              body: { ...args.body, method: args.method },
+                          }),
+                      host,
+                  })
+                : undefined;
+        } catch (error) {
+            dreamClaimant = undefined;
+            log(`[magic-context] dream child claimant unavailable: ${String(error)}`);
+        }
+        return dreamClaimant ?? undefined;
     };
 
     const resolveMuralForPass = (
@@ -5155,6 +5197,11 @@ export function createRustModeTransform(
                 // response this pass just built is already correct without it.
                 try {
                     void withoutSqliteTransformPass(() => resolveHostRunner()?.pump(sessionId));
+                    if (dreamClaimant !== undefined) {
+                        void withoutSqliteTransformPass(() =>
+                            resolveDreamClaimant()?.pump(sessionId),
+                        );
+                    }
                 } catch (error) {
                     // Failure to start background summarization must not reject the request
                     // already validated and saved for the host's current history.
@@ -5190,7 +5237,10 @@ export function createRustModeTransform(
         },
         invalidateWireState,
         async stopHostRunner(): Promise<void> {
-            await (hostRunner ?? undefined)?.stop();
+            await Promise.all([
+                (hostRunner ?? undefined)?.stop(),
+                (dreamClaimant ?? undefined)?.stop(),
+            ]);
         },
         /**
          * The host disposed the instance that owns this adapter. Stop offering it

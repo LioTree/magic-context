@@ -32,6 +32,7 @@ import { parameterDescriptionsFor } from "../tools/parameter-descriptions";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
 import type { RustToolBackends } from "./rust-tool-backends";
+import { dreamChildGate } from "../hooks/magic-context/dream-child-claimant";
 import { guardSubagentTools } from "./subagent-tool-policy";
 import type { PluginContext } from "./types";
 
@@ -258,6 +259,8 @@ export function createToolRegistry(args: {
     return guardSubagentTools(
         surfacedTools,
         db,
-        (id) => args.internalChildSessions?.has(id) === true,
+        // A claimed dream child is this plugin's own hidden child even before the
+        // host's session event marks it.
+        (id) => args.internalChildSessions?.has(id) === true || dreamChildGate(id) !== undefined,
     );
 }

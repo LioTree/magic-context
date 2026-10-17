@@ -561,6 +561,18 @@ export interface TransformDeps {
      */
     historianHostRunnerEnabled?: boolean;
     /**
+     * Builds this process's dream-child claimant (`dream-claim-v1`) in Rust mode.
+     * Off unless set to true; nothing sets it yet. When it is set, this host
+     * claims the dream children the module queues for the sessions it serves;
+     * which tasks the module owns is the module's decision, not this flag's.
+     */
+    dreamChildClaimantEnabled?: boolean;
+    /**
+     * This host's dream-child carrier when it has its own (OpenCode 2). Read only
+     * when the claimant is built; OpenCode 1 builds its carrier from the client.
+     */
+    dreamChildHost?: () => import("./dream-child-claimant").DreamChildHost | undefined;
+    /**
      * Compaction-off mode (issue #266), boot-resolved and process-stable.
      * When true the transform runs additive-only: m[0]/m[1] memory/docs
      * injection, measurement and identity recording stay; every mutating
