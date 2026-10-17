@@ -1086,8 +1086,8 @@ describe("magic-context hook", () => {
         expect(promptMocks.createSession).not.toHaveBeenCalled();
     });
 
-    // The manual /ctx-dream path reads ck-mc's published list when the switch is
-    // on; a published task is started in ck-mc over `dream.run` instead of running
+    // The manual /ctx-dream path reads ck-mc's published list when
+    // rust_background_enabled is on; a published task is started in ck-mc over `dream.run` instead of running
     // here, and unpublished tasks still run here.
     for (const owned of [true, false]) {
         it(`manual ctx-dream ${owned ? "starts classify in ck-mc" : "runs classify here"} when ck-mc ${owned ? "publishes" : "does not publish"} it`, async () => {

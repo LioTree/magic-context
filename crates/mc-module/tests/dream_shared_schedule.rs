@@ -256,7 +256,11 @@ impl Shared {
 
     /// The step the Rust tick takes before planning: adopt the TypeScript row.
     fn adopt(&self) {
-        if let Some(legacy) = self.store.legacy_task_schedule(&self.project, TASK).unwrap() {
+        if let Some(legacy) = self
+            .store
+            .legacy_task_schedule(&self.project, TASK)
+            .unwrap()
+        {
             let _ = self
                 .scheduler
                 .adopt_legacy(&scope(&self.project), &self.config(), &legacy);
@@ -301,7 +305,10 @@ impl Shared {
     }
 
     fn runtimes(&self) -> Vec<String> {
-        self.runs().into_iter().map(|(runtime, _, _)| runtime).collect()
+        self.runs()
+            .into_iter()
+            .map(|(runtime, _, _)| runtime)
+            .collect()
     }
 
     /// Exactly one run in the slot, by `runtime`; no two runs overlapped; and the
@@ -434,7 +441,8 @@ fn a_typescript_pass_during_a_rust_run_waits_and_then_runs_nothing() {
     let child_root = shared.root.path().to_path_buf();
     let project = shared.project.clone();
     let during: Box<dyn FnMut() + Send> = Box::new(move || {
-        // The same Bun pass `typescript_pass` runs, started from inside the run.
+        // One TypeScript scheduler pass, the same command `Shared::typescript_pass`
+        // runs, started while this Rust run holds the domain lease.
         let home = child_root.join("home");
         std::fs::create_dir_all(&home).unwrap();
         let signals = child_root.join("during");

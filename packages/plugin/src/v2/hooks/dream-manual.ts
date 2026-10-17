@@ -118,7 +118,7 @@ export async function runManualDreamNow(args: {
         db: args.db,
         projectIdentity: args.projectIdentity,
         rustOwnedTasks,
-        // Attached to ck-mc: a task it owns is started there now.
+        // With a ck-mc module client (the Rust module), a task ck-mc owns is started there now.
         ...(args.moduleClient
             ? {
                   runRustOwnedTask: createRustOwnedDreamRunner({
