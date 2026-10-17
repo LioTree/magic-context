@@ -15,13 +15,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Register only tasks proven to apply durable effects through real model-session
-/// transports. Planners alone cannot take execution away from TypeScript. Each one
-/// here has an end-to-end test through `dream_dispatch::tick` with a scripted
-/// dream-claim-v1 claimant (`dream_dispatch::tick_tests`).
+/// transports. Planners alone cannot take execution away from TypeScript. Curate,
+/// classify and review-user-memories have an end-to-end test through
+/// `dream_dispatch::tick` with a scripted dream-claim-v1 claimant
+/// (`dream_claim::tests::tick`). map-memories, verify and verify-broad read the
+/// repository, so publication names them only for a carrier that declares file
+/// reads (a claimant with a filesystem fence and the read tools, or a Broca runner
+/// with `Wiring::broca_file_read`); their end-to-end tests run through the Broca
+/// executor with the fake Broca reading a fixture repository
+/// (`broca_carrier::tests::executor`).
 pub const OPERATIONAL_TASKS: &[TaskName] = &[
     TaskName::Curate,
     TaskName::Classify,
     TaskName::ReviewUserMemories,
+    TaskName::Map,
+    TaskName::Verify,
+    TaskName::VerifyBroad,
 ];
 
 /// An executor that could not start any work, for a reason that says nothing
@@ -131,6 +140,9 @@ impl<E: TaskExecutor> Dispatcher<E> {
         ))?;
         let mut outcomes = Vec::new();
         for due in due {
+            let Some(config) = supported.iter().find(|c| c.task == due.task) else {
+                continue;
+            };
             let invocation = format!(
                 "due:{}:{}:{}",
                 due.task.as_str(),
@@ -139,14 +151,8 @@ impl<E: TaskExecutor> Dispatcher<E> {
             );
             outcomes.push((
                 due.task,
-                self.dispatch(
-                    due.task,
-                    &invocation,
-                    None,
-                    timeout,
-                    Cancellation::default(),
-                )
-                .await,
+                self.dispatch(config, &invocation, false, timeout, Cancellation::default())
+                    .await,
             ));
         }
         Ok(outcomes)
@@ -161,18 +167,48 @@ impl<E: TaskExecutor> Dispatcher<E> {
         timeout: Duration,
         cancellation: Cancellation,
     ) -> DispatchOutcome {
-        self.dispatch(config.task, command_id, Some(config), timeout, cancellation)
+        self.dispatch(config, command_id, true, timeout, cancellation)
             .await
+    }
+
+    /// Move this task's Rust schedule forward to the TypeScript dreamer's row when
+    /// TypeScript is further ahead. Called while this run holds the shared domain
+    /// lease: TypeScript writes its row before it releases that lease, so a slot
+    /// TypeScript ran after this tick planned is seen here and not run again.
+    fn adopt_typescript_progress(&self, config: &TaskConfig) {
+        if let Ok(Some(legacy)) = self
+            .store
+            .legacy_task_schedule(&self.scope.project.0, config.task)
+        {
+            let _ = self.scheduler.adopt_legacy(&self.scope, config, &legacy);
+        }
+    }
+
+    /// Copy this task's Rust schedule into the TypeScript dreamer's row (forward
+    /// only, see `McStore::publish_task_schedule`). Called before the shared domain
+    /// lease is released, so a TypeScript dreamer that takes the lease next, even
+    /// one that never asks ck-mc which tasks it owns, already sees the slot as run.
+    fn publish_progress(&self, task: TaskName) {
+        if let mc_store::parity_schema_manifest::CapabilityResult::Available {
+            value: Some(state),
+        } = self.scheduler.schedule(&self.scope, task)
+        {
+            let _ = self
+                .store
+                .publish_task_schedule(&self.scope.project.0, task, &state);
+        }
     }
 
     async fn dispatch(
         &mut self,
-        task: TaskName,
+        config: &TaskConfig,
         invocation: &str,
-        manual: Option<&TaskConfig>,
+        manual: bool,
         timeout: Duration,
         cancellation: Cancellation,
     ) -> DispatchOutcome {
+        let task = config.task;
+        let manual = manual.then_some(config);
         if !self.config.activated {
             return DispatchOutcome::Inactive;
         }
@@ -199,6 +235,7 @@ impl<E: TaskExecutor> Dispatcher<E> {
             Ok(None) => return DispatchOutcome::Refused("domain_busy".into()),
             Err(e) => return DispatchOutcome::Refused(e.to_string()),
         };
+        self.adopt_typescript_progress(config);
         let claim = DreamClaimRequest {
             scope: self.scope.clone(),
             task: background_task(task),
@@ -221,6 +258,10 @@ impl<E: TaskExecutor> Dispatcher<E> {
             ) {
                 Ok(lease) => lease,
                 Err(reason) => {
+                    // A closed gate advanced the Rust slot as skipped.
+                    if reason == "gate_closed" {
+                        self.publish_progress(task);
+                    }
                     let _ = self.store.release_dream_domain(&domain);
                     return DispatchOutcome::Refused(reason);
                 }
@@ -293,6 +334,9 @@ impl<E: TaskExecutor> Dispatcher<E> {
             &outcome,
         )) {
             Ok(_) => {
+                // The guard still holds the domain lease here; it is released when
+                // the guard drops at the end of this function.
+                self.publish_progress(task);
                 guard.finished();
                 DispatchOutcome::Finished(outcome.status)
             }

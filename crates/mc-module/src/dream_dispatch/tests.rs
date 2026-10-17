@@ -802,3 +802,112 @@ async fn budget_cancellation_deadline_and_failed_heartbeat_stop_run_control() {
         }
     }
 }
+
+/// The TypeScript dreamer's row for classify with the slot at 60 000 due, as the
+/// Rust tick sees it before planning (it adopts that row first).
+fn due_typescript_row(d: &Dispatcher<Effects>, path: &std::path::Path) {
+    Connection::open(path)
+        .unwrap()
+        .execute(
+            "INSERT INTO task_schedule_state(project_path,task,next_due_at,schedule,retry_count) VALUES('project','classify-memories',60000,'* * * * *',0)",
+            [],
+        )
+        .unwrap();
+    let legacy = d
+        .store
+        .legacy_task_schedule("project", TaskName::Classify)
+        .unwrap()
+        .unwrap();
+    assert!(available(d.scheduler.adopt_legacy(&d.scope, &config(), &legacy)).unwrap());
+}
+
+/// A TypeScript dreamer with no ck-mc module client never asks which tasks Rust
+/// owns; it plans from its own row as soon as it can take the domain lease. So
+/// the Rust dispatcher must have written its progress into that row before the
+/// lease is released, not after. SQLite triggers record the order of the row
+/// write and the release of the lease's holder row.
+#[tokio::test]
+async fn rust_writes_the_typescript_row_before_releasing_the_domain() {
+    let (mut d, dir, _) = fixture();
+    let path = dir.path().join("context.db");
+    due_typescript_row(&d, &path);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE write_order(seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL);
+             CREATE TRIGGER typescript_row_written AFTER UPDATE ON task_schedule_state
+               BEGIN INSERT INTO write_order(event) VALUES('row:' || NEW.next_due_at); END;
+             CREATE TRIGGER domain_released AFTER DELETE ON dream_state WHEN OLD.key LIKE 'lease:%:holder'
+               BEGIN INSERT INTO write_order(event) VALUES('released'); END;",
+        )
+        .unwrap();
+    let report = d.tick(&[config()], true, TIMEOUT).await.unwrap();
+    assert_eq!(
+        report,
+        vec![(
+            TaskName::Classify,
+            DispatchOutcome::Finished(RunStatus::Completed)
+        )]
+    );
+    assert_eq!(effects(&path), 1);
+    let db = Connection::open(&path).unwrap();
+    let events: Vec<String> = db
+        .prepare("SELECT event FROM write_order ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(events, ["row:120000", "released"]);
+}
+
+/// The TypeScript dreamer runs the slot after the Rust tick planned it and
+/// before the dispatcher takes the domain lease. The dispatcher re-reads the
+/// TypeScript row once it holds the lease, so it does not run the slot again.
+#[tokio::test]
+async fn a_slot_typescript_ran_after_rust_planned_it_is_not_run_again() {
+    struct Hooked {
+        calls: AtomicUsize,
+        path: PathBuf,
+    }
+    impl Clock for Hooked {
+        fn now_ms(&self) -> i64 {
+            // Reading 1 plans the tick; reading 2 is taken just before the
+            // dispatcher asks for the domain lease. In between, TypeScript runs the
+            // slot: it advances its row to the next minute and releases its lease.
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                Connection::open(&self.path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE task_schedule_state SET last_run_at=60000,next_due_at=120000,last_status='completed' WHERE project_path='project' AND task='classify-memories'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            60_000
+        }
+    }
+    let (mut d, dir, _) = fixture();
+    let path = dir.path().join("context.db");
+    due_typescript_row(&d, &path);
+    d.clock = Arc::new(Hooked {
+        calls: AtomicUsize::new(0),
+        path: path.clone(),
+    });
+    let report = d.tick(&[config()], true, TIMEOUT).await.unwrap();
+    assert_eq!(
+        report,
+        vec![(
+            TaskName::Classify,
+            DispatchOutcome::Refused("not_due".into())
+        )]
+    );
+    assert_eq!(effects(&path), 0);
+    assert_eq!(
+        available(d.scheduler.schedule(&d.scope, TaskName::Classify))
+            .unwrap()
+            .unwrap()
+            .next_due_at,
+        Some(120_000)
+    );
+}

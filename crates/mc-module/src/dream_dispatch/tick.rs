@@ -11,7 +11,11 @@
 //! Before planning, each task's Rust schedule adopts the TypeScript scheduler's
 //! progress, and after the run the TypeScript row adopts Rust's (see
 //! `mc_store::dream_schedule_bridge`), so a flip of ownership inside one cron
-//! period neither repeats nor skips a run.
+//! period neither repeats nor skips a run. The dispatcher repeats both steps
+//! while it holds the shared domain lease (adopt before claiming, publish before
+//! releasing), which is what keeps a TypeScript dreamer that never asks ck-mc
+//! for its published list from running the same slot; the publish after the run
+//! here only repeats that write.
 
 use super::broca_carrier::BrocaToolRoute;
 use super::broca_port::SubcBroca;

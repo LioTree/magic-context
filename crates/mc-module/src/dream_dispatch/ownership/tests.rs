@@ -19,6 +19,7 @@ pub(crate) fn every_hosted_task() -> Wiring {
             .filter(|task| task_roles(*task).is_some())
             .collect(),
         broca: false,
+        broca_file_read: false,
     }
 }
 
@@ -168,6 +169,9 @@ fn production_wiring_publishes_only_the_operational_tasks() {
     assert_eq!(
         operational,
         [
+            TaskName::Map,
+            TaskName::Verify,
+            TaskName::VerifyBroad,
             TaskName::Curate,
             TaskName::Classify,
             TaskName::ReviewUserMemories
@@ -198,6 +202,102 @@ fn production_wiring_publishes_only_the_operational_tasks() {
         });
         assert_eq!(alone.published, Vec::<TaskName>::new(), "{harness}");
     }
+}
+
+/// A memory-only claimant (the THALAMUS harness shape: `ctx_memory` only, no
+/// filesystem fence, no mapper agent) gets the memory tasks and never the tasks
+/// that read files, under the production wiring; a claimant that declares the
+/// fence and the read tools gets all of them.
+#[test]
+fn file_reading_tasks_are_published_only_to_a_claimant_declaring_file_reads() {
+    let settings = vector()["settings"]["with_models"].clone();
+    let memory_only = vector_claimant("fenceless");
+    let ownership = publish(&OwnershipInput {
+        config: &host_config(),
+        settings: Some(&settings),
+        harness: memory_only.harness.as_str(),
+        wiring: &Wiring::production(),
+        claimant: Some(&memory_only),
+    });
+    assert_eq!(
+        ownership.published,
+        [TaskName::Curate, TaskName::Classify],
+        "{:?}",
+        ownership.withheld
+    );
+    for task in [TaskName::Map, TaskName::Verify, TaskName::VerifyBroad] {
+        let reason = &ownership
+            .withheld
+            .iter()
+            .find(|(t, _)| *t == task)
+            .unwrap()
+            .1;
+        assert!(reason.starts_with("claimant_"), "{task:?} {reason}");
+    }
+    let reader = claimant_carrying_every_role(1).on_route("s", "opencode");
+    let ownership = publish(&OwnershipInput {
+        config: &host_config(),
+        settings: Some(&settings),
+        harness: "opencode",
+        wiring: &Wiring::production(),
+        claimant: Some(&reader),
+    });
+    for task in [TaskName::Map, TaskName::Verify, TaskName::VerifyBroad] {
+        assert!(ownership.owns(task), "{task:?}");
+    }
+}
+
+/// A configured Broca runner gets the file-reading tasks only when it is known
+/// to admit AFT's read tools. Production cannot know that yet, so a production
+/// Broca wiring publishes only the memory-only operational tasks.
+#[test]
+fn broca_publishes_file_reading_tasks_only_when_it_declares_file_reads() {
+    let settings = json!({"dreamer": {"claude-code": {"model": "anthropic/claude-sonnet-4-5"}}});
+    let configured = McModuleConfig {
+        dreamer_runner: Some(HistorianRunnerKind::Broca),
+        ..host_config()
+    };
+    let production = Wiring {
+        broca: true,
+        ..Wiring::production()
+    };
+    assert!(!production.broca_file_read);
+    let memory_only = publish(&OwnershipInput {
+        config: &configured,
+        settings: Some(&settings),
+        harness: "claude-code",
+        wiring: &production,
+        claimant: None,
+    });
+    assert_eq!(
+        memory_only.published,
+        [TaskName::Curate, TaskName::Classify]
+    );
+    for task in [TaskName::Map, TaskName::Verify, TaskName::VerifyBroad] {
+        assert!(memory_only
+            .withheld
+            .contains(&(task, "broca_file_read".into())));
+    }
+    let reading = publish(&OwnershipInput {
+        config: &configured,
+        settings: Some(&settings),
+        harness: "claude-code",
+        wiring: &Wiring {
+            broca_file_read: true,
+            ..production
+        },
+        claimant: None,
+    });
+    assert_eq!(
+        reading.published,
+        [
+            TaskName::Map,
+            TaskName::Verify,
+            TaskName::VerifyBroad,
+            TaskName::Curate,
+            TaskName::Classify
+        ]
+    );
 }
 
 #[test]
@@ -284,6 +384,9 @@ fn broca_is_chosen_only_when_the_user_configured_it() {
         .contains(&(TaskName::Curate, "broca_unwired".into())));
 
     wiring.broca = true;
+    // This test is about runner choice, so the runner also declares file reads
+    // and every hosted task can be carried.
+    wiring.broca_file_read = true;
     let wired = publish(&OwnershipInput {
         config: &configured,
         settings: Some(&settings),

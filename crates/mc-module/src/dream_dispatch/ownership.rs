@@ -259,6 +259,18 @@ pub struct Wiring {
     pub tasks: Vec<TaskName>,
     /// Whether a Broca transport is wired for dream children.
     pub broca: bool,
+    /// Whether the wired Broca runner is known to admit AFT's read tools
+    /// (read, grep, glob, aft_outline, aft_zoom, aft_search) for a dream child.
+    /// map-memories, verify and verify-broad read the repository, so a Broca run
+    /// publishes them only when this holds.
+    ///
+    /// Production leaves it false: Broca has no way to declare which tools it
+    /// admits. llm-runner/v1 `role.describe` lists capability groups only, and
+    /// whether Broca admits the `aft` plan item is decided by Broca's own
+    /// allowlist, which Magic Context cannot see. The real fix is Broca declaring
+    /// its tool capability in `role.describe`; until then those three tasks stay
+    /// with TypeScript for Broca users.
+    pub broca_file_read: bool,
 }
 
 impl Wiring {
@@ -268,6 +280,7 @@ impl Wiring {
         Self {
             tasks: super::dispatcher::OPERATIONAL_TASKS.to_vec(),
             broca: false,
+            broca_file_read: false,
         }
     }
 }
@@ -346,6 +359,16 @@ fn withheld_reason(task: TaskName, input: &OwnershipInput<'_>) -> Option<String>
                 .is_none()
             {
                 return Some("broca_model_required".into());
+            }
+            // A child whose tools are not all served by Magic Context itself reads
+            // files through AFT, which only a runner declaring file reads carries.
+            let reads_files = roles.iter().any(|role| {
+                role.tools()
+                    .iter()
+                    .any(|tool| !super::broca_carrier::MC_TOOLS.contains(tool))
+            });
+            if reads_files && !input.wiring.broca_file_read {
+                return Some("broca_file_read".into());
             }
             None
         }

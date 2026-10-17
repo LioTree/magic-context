@@ -126,6 +126,9 @@ struct Run {
     units: VecDeque<Value>,
     terminal: Option<RunResult>,
     cancel: bool,
+    /// The `aft` plan item's root and tools: the calls AFT serves for this run
+    /// instead of Magic Context. See [`FakeBroca::aft`].
+    files: Option<(std::path::PathBuf, Vec<String>)>,
 }
 
 #[derive(Default)]
@@ -151,7 +154,12 @@ struct State {
     /// Calls given the runner's never-executed result instead of a dispatch.
     never_executed: Vec<(String, String)>,
     released: Vec<String>,
+    /// When set, a step without tool calls answers with this text computed from
+    /// every tool result so far, as a model would answer from what it read.
+    compose: Option<ComposeFn>,
 }
+
+type ComposeFn = Box<dyn Fn(&[(String, Value)]) -> String + Send>;
 
 #[derive(Clone)]
 struct FakeBroca {
@@ -243,10 +251,19 @@ impl FakeBroca {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let mut files = None;
         for item in items {
-            for tool in item["params"]["tools"].as_array().into_iter().flatten() {
-                allow.push(tool.as_str().unwrap().into());
+            let tools: Vec<String> = item["params"]["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|tool| tool.as_str().unwrap().to_string())
+                .collect();
+            if item["provider"] == FILE_TOOL_PROVIDER {
+                let root = item["params"]["root"].as_str().unwrap_or_default();
+                files = Some((std::path::PathBuf::from(root), tools.clone()));
             }
+            allow.extend(tools);
         }
         s.run = Some(Run {
             id: "run-1".into(),
@@ -261,6 +278,7 @@ impl FakeBroca {
             units: VecDeque::new(),
             terminal: None,
             cancel: false,
+            files,
         });
         let reply = serde_json::to_value(SendReply::new("active").with_run_id("run-1")).unwrap();
         s.sends
@@ -388,6 +406,15 @@ impl FakeBroca {
     }
 
     async fn dispatch(&self, name: &str, arguments: &Value, key: &str) -> Value {
+        let files = self
+            .state()
+            .run
+            .as_ref()
+            .and_then(|run| run.files.clone())
+            .filter(|(_, tools)| tools.iter().any(|tool| tool == name));
+        if let Some((root, _)) = files {
+            return Self::aft(&root, name, arguments);
+        }
         let request = json!({"name": name, "arguments": arguments, "call_key": key});
         match Box::pin(self.handler.dispatch_value(TOOL_CHANNEL, request)).await {
             HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
@@ -427,17 +454,72 @@ impl FakeBroca {
             }
         }
         let mut s = self.state();
+        let composed = calls
+            .is_empty()
+            .then(|| s.compose.as_ref().map(|compose| compose(&s.results)))
+            .flatten();
         let run = s.run.as_mut().unwrap();
         if calls.is_empty() {
-            if let Some(text) = text {
+            if let Some(text) = composed.or(text.map(str::to_string)) {
                 run.terminal = Some(
                     RunResult::new(run.id.clone(), "completed").with_final_message(FinalMessage {
                         ordinal: run.done as u64,
                         mid: format!("m{}", run.done),
-                        text: text.into(),
+                        text,
                     }),
                 );
             }
+        }
+    }
+
+    /// The read tools as AFT serves them to a Broca child: real reads of the
+    /// files under the plan item's `root`, refusing any path that resolves
+    /// outside it. Only `read` and `grep` are needed by the tests.
+    fn aft(root: &std::path::Path, name: &str, arguments: &Value) -> Value {
+        let Ok(root) = root.canonicalize() else {
+            return json!({"ok": false, "error": "root_unavailable"});
+        };
+        let inside = |relative: &str| {
+            root.join(relative)
+                .canonicalize()
+                .ok()
+                .filter(|path| path.starts_with(&root) && path.is_file())
+        };
+        match name {
+            "read" => {
+                let relative = arguments["filePath"].as_str().unwrap_or_default();
+                match inside(relative).and_then(|path| std::fs::read_to_string(path).ok()) {
+                    Some(content) => json!({"ok": true, "path": relative, "content": content}),
+                    None => json!({"ok": false, "error": "path_not_readable", "path": relative}),
+                }
+            }
+            "grep" => {
+                let pattern = arguments["pattern"].as_str().unwrap_or_default();
+                let mut matches = Vec::new();
+                let mut pending = vec![root.clone()];
+                while let Some(dir) = pending.pop() {
+                    let Ok(entries) = std::fs::read_dir(&dir) else {
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.file_name().is_some_and(|n| n == ".git") {
+                            continue;
+                        }
+                        if path.is_dir() {
+                            pending.push(path);
+                        } else if std::fs::read_to_string(&path)
+                            .is_ok_and(|content| content.contains(pattern))
+                        {
+                            let relative = path.strip_prefix(&root).unwrap();
+                            matches.push(relative.to_string_lossy().replace('\\', "/"));
+                        }
+                    }
+                }
+                matches.sort();
+                json!({"ok": true, "files": matches})
+            }
+            other => json!({"ok": false, "error": "unknown_tool", "tool": other}),
         }
     }
 }

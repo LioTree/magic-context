@@ -21646,6 +21646,7 @@ mod tests {
                     handler.dream_wiring = Some(dream_dispatch::ownership::Wiring {
                         tasks: if implemented { vec![task] } else { Vec::new() },
                         broca: false,
+                        broca_file_read: false,
                     });
                     let request = json!({"v":1,"session_id":"ses","task":task.as_str(),
                         "implemented":true,"model_chain":false,"payload":false,"command_id":false});
@@ -21666,6 +21667,7 @@ mod tests {
             handler.dream_wiring = Some(dream_dispatch::ownership::Wiring {
                 tasks: vec![mc_store::dream_scheduler::schedules::TaskName::EvaluateSmartNotes],
                 broca: false,
+                broca_file_read: false,
             });
             assert_eq!(
                 code(

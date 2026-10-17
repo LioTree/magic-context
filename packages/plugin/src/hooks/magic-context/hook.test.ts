@@ -1086,10 +1086,11 @@ describe("magic-context hook", () => {
         expect(promptMocks.createSession).not.toHaveBeenCalled();
     });
 
-    // The manual /ctx-dream path reads ck-mc's published list when the switch is
-    // on, and skips exactly the published task; unpublished tasks still run here.
+    // The manual /ctx-dream path reads ck-mc's published list when
+    // rust_background_enabled is on; a published task is started in ck-mc over `dream.run` instead of running
+    // here, and unpublished tasks still run here.
     for (const owned of [true, false]) {
-        it(`manual ctx-dream ${owned ? "skips" : "runs"} classify when ck-mc ${owned ? "publishes" : "does not publish"} it`, async () => {
+        it(`manual ctx-dream ${owned ? "starts classify in ck-mc" : "runs classify here"} when ck-mc ${owned ? "publishes" : "does not publish"} it`, async () => {
             process.env.XDG_DATA_HOME = makeTempDir("hook-classify-ownership-manual-");
             const promptMocks = createPromptMocks();
             const deps = createMockDeps(promptMocks);
@@ -1105,10 +1106,15 @@ describe("magic-context hook", () => {
                 },
             } as never;
             const methods: string[] = [];
+            const runRequests: unknown[] = [];
             deps.rustModeModuleClient = {
                 authorityStatus: async () => ({ authority: { state: "MODULE", generation: 4 } }),
                 call: async (args: { method: string; body: unknown }) => {
                     methods.push(args.method);
+                    if (args.method === "dream.run") {
+                        runRequests.push(args.body);
+                        return { ok: true, started: true };
+                    }
                     if (args.method === "dream.ownership") {
                         return {
                             ok: true,
@@ -1170,9 +1176,18 @@ describe("magic-context hook", () => {
 
             expect(methods).toEqual(
                 owned
-                    ? ["dream.ownership"]
+                    ? ["dream.ownership", "dream.run"]
                     : ["dream.ownership", "dreamer.run_task", "memory.set_classification"],
             );
+            if (owned) {
+                expect(runRequests).toEqual([
+                    expect.objectContaining({
+                        method: "dream.run",
+                        v: 1,
+                        task: "classify-memories",
+                    }),
+                ]);
+            }
         });
     }
 
