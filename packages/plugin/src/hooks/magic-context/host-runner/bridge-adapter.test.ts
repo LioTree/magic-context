@@ -308,7 +308,7 @@ describe("supported bridge constructor", () => {
         ).toEqual({ kind: "deferred", reason: "native-marker-evidence-unavailable" });
         expect(marker).not.toHaveBeenCalled();
         expect(
-            adapter.isFallbackAdmissible("session", { ...inputs, contextWindow: 199 }).admissible,
+            adapter.isFallbackAdmissible("session", { ...inputs, contextWindow: 600 }).admissible,
         ).toBe(true);
         const fact = {
             kind: "provider_response" as const,
@@ -322,7 +322,7 @@ describe("supported bridge constructor", () => {
             outcome: "success" as const,
             contextWindow: 100_000,
             material: inputs.material,
-            usage: { input: 100, cacheRead: 80, cacheWrite: 20, output: 99_999 },
+            usage: { input: 600, cacheRead: 80, cacheWrite: 20, output: 99_999 },
         };
         expect(await adapter.recordHostFact({ ...fact, requestId: "unrelated" })).toEqual({
             accepted: false,
@@ -332,7 +332,7 @@ describe("supported bridge constructor", () => {
             (
                 await adapter.advanceNativeMarker("session", view.receipt, {
                     ...inputs,
-                    contextWindow: 199,
+                    contextWindow: 600,
                 })
             ).kind,
         ).toBe("deferred");
@@ -390,6 +390,108 @@ describe("supported bridge constructor", () => {
                 kind: "model",
             }),
         ).rejects.toMatchObject({ reason: "covered_range_changed" });
+    });
+    test("bridge session with unobserved built-in tools defers until a qualifying usage reading, then advances", async () => {
+        const options = fixture();
+        const preparation = spyOn(
+            markerCandidates,
+            "prepareCompactionMarkerCandidates",
+        ).mockResolvedValue(true);
+        cleanups.push(() => preparation.mockRestore());
+        const wire = fakeModule();
+        wire.setReply((request) => {
+            if (request.method !== "compaction.step") return;
+            return {
+                answer: "compaction_message",
+                request_id: request.params.request_id,
+                compaction: {
+                    compaction_id: "covering-pending",
+                    version: 2,
+                    range: { from: 1, to: 3 },
+                    replacement: [message("summary")],
+                },
+                coverage: { end_mid: "first", ordinal: 2 },
+            };
+        });
+        const rows = [message("prefix"), message("first"), message("second")];
+        canonicalRows(rows);
+        const adapter = await createBridgeAdapter(options);
+        cleanups.push(() => adapter.dispose());
+        const view = await adapter.run({ sessionId: "session", messages: rows, kind: "model" });
+        const db = new Database(options.dbPath);
+        cleanups.push(() => db.close());
+        setPendingCompactionMarkerState(db, "session", {
+            endMessageId: "first",
+            ordinal: 2,
+            publishedAt: 1,
+        });
+        const marker = spyOn(markerManager, "applyDeferredCompactionMarker").mockImplementation(
+            (writerDb) => {
+                persistNativePair(writerDb, rows[1], 2);
+                return { kind: "applied", markerOrdinal: 2 };
+            },
+        );
+        cleanups.push(() => marker.mockRestore());
+        // OpenCode 1.18.35 built-ins: their JSON schemas are generated after the
+        // plugin hook, so only their names are known to the host.
+        const material = {
+            system: ["Final system"],
+            tools: [{ name: "ctx_search", description: "Search", inputSchema: { type: "object" } }],
+            unobserved_tools: ["bash", "read", "task"],
+        };
+        const inputs = {
+            messages: rows,
+            model: "openai/gpt-5.6",
+            contextWindow: 100_000,
+            material,
+        };
+        const evidenceMissing = { kind: "deferred", reason: "native-marker-evidence-unavailable" };
+        expect(await adapter.advanceNativeMarker("session", view.receipt, inputs)).toEqual(
+            evidenceMissing,
+        );
+        let observedAt = Date.now();
+        const respond = async (
+            served: typeof material,
+            outcome: "success" | "failed" = "success",
+        ) =>
+            (
+                await adapter.recordHostFact({
+                    kind: "provider_response",
+                    sessionId: "session",
+                    lineageId: view.receipt.lineage_id,
+                    requestId: view.receipt.request_id,
+                    model: { providerID: "openai", modelID: "gpt-5.6" },
+                    observedAt: ++observedAt,
+                    completedAt: observedAt - 1,
+                    finishReason: "stop",
+                    outcome,
+                    contextWindow: 100_000,
+                    material: served,
+                    usage: { input: 900, cacheRead: 5000, cacheWrite: 100, output: 50 },
+                })
+            ).accepted;
+        // A failed response's usage is not a reading, so the marker stays deferred.
+        // Tool-name and system mismatches are covered in fallback-admissibility.test.ts.
+        expect(await respond(material, "failed")).toBe(true);
+        expect(await adapter.advanceNativeMarker("session", view.receipt, inputs)).toEqual(
+            evidenceMissing,
+        );
+        expect(marker).not.toHaveBeenCalled();
+        expect(await respond(material)).toBe(true);
+        // The usage-derived envelope (6000 total input minus served text) must still fit.
+        expect(
+            (
+                await adapter.advanceNativeMarker("session", view.receipt, {
+                    ...inputs,
+                    contextWindow: 6000,
+                })
+            ).kind,
+        ).toBe("deferred");
+        expect(marker).not.toHaveBeenCalled();
+        expect((await adapter.advanceNativeMarker("session", view.receipt, inputs)).kind).toBe(
+            "applied",
+        );
+        expect(marker).toHaveBeenCalledTimes(1);
     });
     test("applied bridge receipt round-trips and acknowledges only a clean carrying response", async () => {
         const preparation = spyOn(

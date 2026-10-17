@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
@@ -15,13 +15,21 @@ import { Database } from "../../shared/sqlite";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
 import { measureLkgReplay } from "./lkg-fit-measure";
-import { noteLkgProviderResponse } from "./lkg-measured-request";
+import {
+    __setLkgMarkerReadingForTests,
+    clearLkgMeasuredRequest,
+    currentLkgRequestIdentity,
+    noteCapturedLkgRequest,
+    noteLkgProviderResponse,
+} from "./lkg-measured-request";
+import { boundMarkerEnvelope } from "./marker-envelope";
 import { markerRandom, randomMarkerEnvelope } from "./marker-envelope-test-support";
 import { estimateTokens } from "./read-session-formatting";
 import {
     clearMarkerSystem,
     measureStandaloneMarker,
     recordMarkerSystem,
+    standaloneMarkerIdentity,
 } from "./standalone-marker-envelope";
 import type { MessageLike } from "./transform-operations";
 import {
@@ -33,9 +41,10 @@ import {
 afterEach(() => {
     __resetToolDefinitionMeasurements();
     clearMarkerSystem("marker-envelope-session");
+    clearLkgMeasuredRequest("marker-envelope-session");
 });
 
-test("standalone marker requires raw material from the current request and model", () => {
+test("standalone marker needs a completed-request reading for the current envelope", () => {
     const args = {
         sessionId: "marker-envelope-session",
         model: "unknown/model",
@@ -44,26 +53,134 @@ test("standalone marker requires raw material from the current request and model
         limit: 10000,
     };
     expect(measureStandaloneMarker(args).fit).toBe("unproven");
-    noteLkgProviderResponse({
-        sessionId: args.sessionId,
-        modelKey: args.model,
-        responseId: "first",
-        inputTokens: 0,
-    });
-    recordMarkerSystem(args.sessionId, args.model, args.systemHash, ["Final system"]);
+    startRequest(args.sessionId, args.model, "first", ["Final system"]);
     expect(measureStandaloneMarker(args).fit).toBe("unproven");
+    // Even complete-looking JSON definitions cannot prove which tools were sent:
+    // MCP tools never reach the hook, so a completed request's usage is required.
     recordToolDefinition("unknown", "model", undefined, "read", "Read file", { type: "object" });
+    expect(measureStandaloneMarker(args).fit).toBe("unproven");
+    serveCurrent(args.sessionId, args.messages);
+    expect(measureStandaloneMarker(args).fit).toBe("unproven");
+    complete(args.sessionId, args.model, "first", 800);
+    startRequest(args.sessionId, args.model, "second", ["Final system"]);
     expect(measureStandaloneMarker(args).fit).toBe("under");
+    // The first request's 800 input tokens bound the envelope, so a 700 window fails.
+    expect(measureStandaloneMarker({ ...args, limit: 700 }).fit).toBe("over");
     expect(measureStandaloneMarker({ ...args, model: "different/model" }).fit).toBe("unproven");
     expect(measureStandaloneMarker({ ...args, systemHash: "different" }).fit).toBe("unproven");
-    noteLkgProviderResponse({
-        sessionId: args.sessionId,
-        modelKey: args.model,
-        responseId: "second",
-        inputTokens: 0,
-    });
-    expect(measureStandaloneMarker(args).fit).toBe("unproven");
 });
+
+describe("standalone fresh-reading rule", () => {
+    const args = {
+        sessionId: "marker-envelope-session",
+        model: "unknown/model",
+        systemHash: "hash",
+        messages: [{ info: { id: "m", role: "user" }, parts: [{ type: "text", text: "hello" }] }],
+        limit: 10000,
+    };
+    function qualified() {
+        recordToolDefinition("unknown", "model", undefined, "read", "Read file", {
+            type: "object",
+        });
+        startRequest(args.sessionId, args.model, "first", ["Final system"]);
+        serveCurrent(args.sessionId, args.messages);
+        complete(args.sessionId, args.model, "first", 800);
+        startRequest(args.sessionId, args.model, "second", ["Final system"]);
+        expect(measureStandaloneMarker(args).fit).toBe("under");
+    }
+
+    test("a change to the hook-visible tool-name set resets the reading", () => {
+        qualified();
+        recordToolDefinition("unknown", "model", undefined, "bash", "Run", { type: "object" });
+        expect(measureStandaloneMarker(args).fit).toBe("unproven");
+    });
+
+    test("a change to the system strings resets the reading", () => {
+        qualified();
+        startRequest(args.sessionId, args.model, "third", ["Changed system"]);
+        expect(measureStandaloneMarker(args).fit).toBe("unproven");
+    });
+
+    test("a newer captured request that has not completed keeps the last completed reading", () => {
+        qualified();
+        serveCurrent(args.sessionId, args.messages);
+        expect(measureStandaloneMarker(args).fit).toBe("under");
+        // Repeated updates of the first response (finish, then completed) keep its reading.
+        complete(args.sessionId, args.model, "first", 800);
+        expect(measureStandaloneMarker(args).fit).toBe("under");
+    });
+
+    test("a later completion without a known served array clears the reading", () => {
+        qualified();
+        // The second request completes, but its returned array was never captured,
+        // so its usage cannot bound anything and the older reading is dropped too.
+        complete(args.sessionId, args.model, "second", 900);
+        startRequest(args.sessionId, args.model, "third", ["Final system"]);
+        expect(measureStandaloneMarker(args).fit).toBe("unproven");
+    });
+
+    test("a later completion replaces the reading with its own usage", () => {
+        qualified();
+        serveCurrent(args.sessionId, args.messages);
+        complete(args.sessionId, args.model, "second", 9900);
+        startRequest(args.sessionId, args.model, "third", ["Final system"]);
+        expect(measureStandaloneMarker(args).fit).toBe("over");
+    });
+
+    test("a failed completion is not a reading", () => {
+        recordToolDefinition("unknown", "model", undefined, "read", "Read file", {
+            type: "object",
+        });
+        startRequest(args.sessionId, args.model, "first", ["Final system"]);
+        serveCurrent(args.sessionId, args.messages);
+        complete(args.sessionId, args.model, "first", 800, { name: "APIError" });
+        startRequest(args.sessionId, args.model, "second", ["Final system"]);
+        expect(measureStandaloneMarker(args).fit).toBe("unproven");
+    });
+});
+
+function startRequest(sessionId: string, model: string, responseId: string, system: string[]) {
+    noteLkgProviderResponse({ sessionId, modelKey: model, responseId, inputTokens: 0 });
+    recordMarkerSystem(sessionId, model, "hash", system);
+}
+
+/** Record the message array the Rust transform returned to OpenCode for the current request. */
+function serveCurrent(sessionId: string, messages: unknown[]) {
+    const request = currentLkgRequestIdentity(sessionId);
+    noteCapturedLkgRequest({
+        sessionId,
+        slot: {
+            jsonPrefix: JSON.stringify(messages),
+            inputIdSeq: [],
+            inputContentDigests: [],
+            lastInputMessageId: "m",
+            modelKey: request?.modelKey ?? null,
+            providerKey: null,
+            capturedAt: Date.now(),
+        },
+        request,
+        systemPromptTokens: 0,
+        marker: standaloneMarkerIdentity(sessionId, request, undefined),
+    });
+}
+
+function complete(
+    sessionId: string,
+    model: string,
+    responseId: string,
+    inputTokens: number,
+    error?: unknown,
+) {
+    noteLkgProviderResponse({
+        sessionId,
+        modelKey: model,
+        responseId,
+        inputTokens,
+        finish: "stop",
+        completedAt: Date.now(),
+        error,
+    });
+}
 
 test("standalone randomized marker timing preserves full defer bytes and attributes inherited summary differences", () => {
     const next = markerRandom(0x5e12beef);
@@ -227,6 +344,18 @@ test("standalone randomized marker timing preserves full defer bytes and attribu
                     inputTokens: 0,
                 });
                 recordMarkerSystem(sessionId, model, `hash-${ordinal}`, system);
+                // An earlier completed request with this ordinal's system and tools;
+                // its usage stands in for the provider's count of that envelope.
+                __setLkgMarkerReadingForTests(sessionId, {
+                    responseId: `random-${pass}-completed`,
+                    inputTokens: boundMarkerEnvelope({ system, tools }, model)!,
+                    jsonPrefix: "[]",
+                    marker: standaloneMarkerIdentity(
+                        sessionId,
+                        currentLkgRequestIdentity(sessionId),
+                        undefined,
+                    )!,
+                });
                 const legacy =
                     measureLkgReplay({ messages, limit, estimate: oldEstimate }).fit === "under";
                 const admitted =

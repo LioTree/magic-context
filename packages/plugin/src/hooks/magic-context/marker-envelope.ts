@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import { calibrationForModelKey, providerMass } from "./decision-calibration";
 import { countTokensExactly } from "./token-count-exact";
+import { UNKNOWN_FIT_RATIO, UNKNOWN_LOWER_RATIO } from "./tokenizer-calibration";
 import { loadTokenizerSync, type TokenizerLike } from "./tokenizer-loader";
+import type { MessageLike } from "./transform-operations";
+import { serializedWireText, visitWireContent } from "./wire-content";
 
 let tokenizer: TokenizerLike | undefined;
 let byteBoundWarningSent = false;
@@ -21,7 +24,10 @@ function warnByteBound(error: unknown): void {
         .catch(() => {});
 }
 
-function materialCounter(): (text: string) => number {
+/** When the tokenizer is unavailable, `bytes` counts UTF-8 bytes (an upper bound on
+ * tokens) and `zero` counts nothing (the only safe lower bound, used for message
+ * text that is subtracted from provider usage). */
+function materialCounter(fallback: "bytes" | "zero" = "bytes"): (text: string) => number {
     let active = tokenizer;
     try {
         active ??= tokenizer = loadTokenizerSync();
@@ -40,7 +46,7 @@ function materialCounter(): (text: string) => number {
         // These inputs are JSON-stringified fields. Each Claude byte-pair token
         // consumes at least one UTF-8 byte, so their byte lengths bound the local
         // count even for escaped/non-ASCII text, before applying model ratios.
-        return Buffer.byteLength(text, "utf8");
+        return fallback === "bytes" ? Buffer.byteLength(text, "utf8") : 0;
     };
 }
 
@@ -52,8 +58,39 @@ export interface MarkerToolDefinition {
 
 /** Complete, final host material; an explicit empty array is different from missing evidence. */
 export interface MarkerEnvelope {
+    /** Exact final system strings, in order. */
     system: readonly string[];
+    /** Tools whose final name/description/JSON input schema the host can see exactly. */
     tools: readonly MarkerToolDefinition[];
+    /**
+     * Names of the other sent tools, whose final schema the host cannot see (for
+     * example OpenCode built-ins whose JSON schema is generated after the plugin
+     * hook, or MCP tools that bypass it). Their size is bounded only through a
+     * qualifying provider usage reading. Absent means every sent tool is in `tools`.
+     */
+    unobserved_tools?: readonly string[];
+}
+
+/** What a provider usage reading must share with a later request before its envelope bound applies. */
+export interface MarkerEnvelopeIdentity {
+    /** Sorted names of every sent tool, visible and unobserved. */
+    tool_names: string[];
+    /** SHA-256 of the JSON array of exact final system strings. */
+    system_digest: string;
+    /** SHA-256 of the JSON array of visible tool definitions, as sent. */
+    visible_tools_digest: string;
+}
+
+/**
+ * Upper bound on a request's system/tool envelope, derived from one completed
+ * request Magic Context served: provider input usage (uncached + cache read +
+ * cache write) minus a lower bound on that request's message tokens. All values
+ * are provider tokens.
+ */
+export interface MarkerEnvelopeReading extends MarkerEnvelopeIdentity {
+    total_input: number;
+    messages_lower: number;
+    envelope_upper: number;
 }
 
 // Source: marker-envelope.test.ts tokenizes real and randomized AI SDK/Anthropic/
@@ -70,24 +107,80 @@ export function markerEnvelopeKey(material: MarkerEnvelope): string {
     return createHash("sha256").update(JSON.stringify(material)).digest("hex");
 }
 
-/** Only marker admission uses this bound; it never rewrites the request or changes serving. */
+function validMarkerEnvelope(material: MarkerEnvelope): boolean {
+    if (
+        !material ||
+        !Array.isArray(material.system) ||
+        !material.system.every((text) => typeof text === "string") ||
+        !Array.isArray(material.tools) ||
+        !material.tools.every(
+            (tool) =>
+                tool &&
+                typeof tool.name === "string" &&
+                typeof tool.description === "string" &&
+                tool.inputSchema !== null &&
+                typeof tool.inputSchema === "object" &&
+                !Array.isArray(tool.inputSchema),
+        )
+    )
+        return false;
+    const unobserved = material.unobserved_tools;
+    if (unobserved === undefined) return true;
+    if (
+        !Array.isArray(unobserved) ||
+        !unobserved.every((name) => typeof name === "string" && name.length > 0)
+    )
+        return false;
+    // A name listed both ways, or twice, makes the sent tool set ambiguous.
+    return (
+        new Set(unobserved).size === unobserved.length &&
+        material.tools.every((tool) => !unobserved.includes(tool.name))
+    );
+}
+
+export function markerEnvelopeIdentity(
+    material: MarkerEnvelope,
+): MarkerEnvelopeIdentity | undefined {
+    try {
+        if (!validMarkerEnvelope(material)) return undefined;
+        const digest = (value: unknown) =>
+            createHash("sha256").update(JSON.stringify(value)).digest("hex");
+        return {
+            tool_names: [
+                ...material.tools.map((tool) => tool.name),
+                ...(material.unobserved_tools ?? []),
+            ].sort(),
+            system_digest: digest(material.system),
+            visible_tools_digest: digest(material.tools),
+        };
+    } catch {
+        return undefined;
+    }
+}
+
+/** Whether some sent tool can be bounded only through a provider usage reading. */
+export function hasUnobservedTools(material: MarkerEnvelope): boolean {
+    return (material.unobserved_tools?.length ?? 0) > 0;
+}
+
+/**
+ * The smallest and largest static calibration ratio (provider tokens per local
+ * Claude token) that `tokenizer-calibration.ts` seeds give this model across its
+ * system, tools and prose buckets. Unmeasured models use UNKNOWN_LOWER_RATIO and
+ * UNKNOWN_FIT_RATIO, the same fallbacks fit checks use.
+ */
+export function markerRatioRange(model: string): { lower: number; upper: number } {
+    const seed = calibrationForModelKey(model);
+    if (!seed.seeded) return { lower: UNKNOWN_LOWER_RATIO, upper: UNKNOWN_FIT_RATIO };
+    const ratios = [seed.systemRatio, seed.toolsRatio, seed.proseRatio];
+    return { lower: Math.min(...ratios), upper: Math.max(...ratios) };
+}
+
+/** Only marker admission uses this bound; it never rewrites the request or changes serving.
+ * It covers the system strings and visible tools; unobserved tools are not included. */
 export function boundMarkerEnvelope(material: MarkerEnvelope, model: string): number | undefined {
     try {
-        if (
-            !Array.isArray(material.system) ||
-            !material.system.every((text) => typeof text === "string") ||
-            !Array.isArray(material.tools) ||
-            !material.tools.every(
-                (tool) =>
-                    tool &&
-                    typeof tool.name === "string" &&
-                    typeof tool.description === "string" &&
-                    tool.inputSchema !== null &&
-                    typeof tool.inputSchema === "object" &&
-                    !Array.isArray(tool.inputSchema),
-            )
-        )
-            return undefined;
+        if (!validMarkerEnvelope(material)) return undefined;
         const countMaterial = materialCounter();
         // Count JSON strings, not unescaped text: control characters and quotes can
         // grow during provider serialization. Separate fields cannot hide array costs.
@@ -117,4 +210,130 @@ export function boundMarkerEnvelope(material: MarkerEnvelope, model: string): nu
     } catch {
         return undefined;
     }
+}
+
+// Wrapper allowances for message rows, in local tokens, on top of the JSON-escaped
+// UTF-8 bytes of every sent field. Source: marker-usage-bound.test.ts serializes
+// randomized OpenCode histories through OpenCode 1.18.35's own toModelMessages and
+// into AI SDK, Anthropic, OpenAI-compatible and Gemini wire forms; see the
+// measured maxima it prints. Tool call ids and names are counted separately.
+export const MARKER_MESSAGE_ALLOWANCE = 32;
+export const MARKER_PART_ALLOWANCE = 64;
+
+const TOOL_IDENTITY_FIELDS = ["callID", "callId", "toolCallId", "tool", "toolName"] as const;
+
+/**
+ * Upper bound on the provider tokens of a request's message rows, at the model's
+ * largest calibration ratio. Every sent field counts its JSON-escaped UTF-8 bytes
+ * (each local token holds at least one byte), plus fixed per-message and per-part
+ * wrapper allowances, plus tool call ids and names twice (call and result).
+ * Callers separately require countable parts; this does not prove that.
+ */
+export function boundMarkerMessages(messages: readonly MessageLike[], model: string): number {
+    let local = 0;
+    for (const message of messages) {
+        local += MARKER_MESSAGE_ALLOWANCE;
+        for (const part of message.parts) {
+            local += MARKER_PART_ALLOWANCE;
+            if (!part || typeof part !== "object") continue;
+            const fields = part as unknown as Record<string, unknown>;
+            for (const field of TOOL_IDENTITY_FIELDS) {
+                const value = fields[field];
+                if (typeof value === "string")
+                    local += 2 * Buffer.byteLength(JSON.stringify(value), "utf8");
+            }
+        }
+        visitWireContent(message, {
+            text: (_bucket, value) => {
+                local += Buffer.byteLength(JSON.stringify(serializedWireText(value)), "utf8");
+            },
+            image: (_bucket, tokens) => {
+                local += tokens;
+            },
+        });
+    }
+    const total = local * markerRatioRange(model).upper;
+    return Number.isFinite(total) ? Math.ceil(total) : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Lower bound on the provider tokens of a served request's message rows, at the
+ * model's smallest calibration ratio. Only text OpenCode 1 certainly sends is
+ * counted: non-empty, non-ignored text parts of user messages and of assistant
+ * messages without an error (OpenCode drops most errored assistant turns). Tool
+ * calls and results (outputs may be cleared or truncated), reasoning (providers may
+ * strip earlier thinking) and every wrapper count zero. Leading and trailing
+ * whitespace is not counted, since a provider adapter may trim it. If the local
+ * tokenizer is unavailable the bound is 0.
+ */
+export function lowerBoundMarkerMessages(messages: readonly MessageLike[], model: string): number {
+    const count = materialCounter("zero");
+    let local = 0;
+    for (const message of messages) {
+        const info = message.info as { role?: unknown; error?: unknown };
+        if (info.role !== "user" && (info.role !== "assistant" || info.error)) continue;
+        for (const part of message.parts) {
+            const p = part as { type?: unknown; text?: unknown; ignored?: unknown };
+            if (p?.type !== "text" || p.ignored || typeof p.text !== "string") continue;
+            const text = p.text.trim();
+            if (text) local += count(text);
+        }
+    }
+    const total = local * markerRatioRange(model).lower;
+    return Number.isFinite(total) && total >= 0 ? Math.floor(total) : 0;
+}
+
+/**
+ * Derive an envelope reading from a completed request Magic Context served:
+ * envelope_upper = total input − messages_lower(served messages). Returns
+ * undefined when the material is invalid or the subtraction leaves nothing.
+ */
+export function deriveMarkerEnvelopeReading(args: {
+    material: MarkerEnvelope;
+    messages: readonly MessageLike[];
+    totalInput: number;
+    model: string;
+}): MarkerEnvelopeReading | undefined {
+    const identity = markerEnvelopeIdentity(args.material);
+    if (!identity || !Number.isSafeInteger(args.totalInput) || args.totalInput <= 0)
+        return undefined;
+    const messagesLower = lowerBoundMarkerMessages(args.messages, args.model);
+    const envelopeUpper = args.totalInput - messagesLower;
+    if (!Number.isSafeInteger(messagesLower) || envelopeUpper <= 0) return undefined;
+    return {
+        ...identity,
+        total_input: args.totalInput,
+        messages_lower: messagesLower,
+        envelope_upper: envelopeUpper,
+    };
+}
+
+/**
+ * The envelope bound from a reading taken with the same model, the same sorted
+ * set of sent tool names, the same system digest and the same visible tool
+ * definitions as `material`; undefined when any of them differs.
+ */
+export function qualifyingMarkerEnvelopeUpper(
+    reading: { model: string; envelope_reading?: MarkerEnvelopeReading } | undefined,
+    material: MarkerEnvelope,
+    model: string,
+): number | undefined {
+    const held = reading?.envelope_reading;
+    const identity = markerEnvelopeIdentity(material);
+    if (!held || !identity || reading.model !== model) return undefined;
+    if (
+        !Array.isArray(held.tool_names) ||
+        held.tool_names.length !== identity.tool_names.length ||
+        held.tool_names.some((name, index) => name !== identity.tool_names[index])
+    )
+        return undefined;
+    if (held.system_digest !== identity.system_digest) return undefined;
+    if (held.visible_tools_digest !== identity.visible_tools_digest) return undefined;
+    if (
+        !Number.isSafeInteger(held.envelope_upper) ||
+        held.envelope_upper <= 0 ||
+        held.envelope_upper !== held.total_input - held.messages_lower
+    )
+        return undefined;
+    return held.envelope_upper;
 }

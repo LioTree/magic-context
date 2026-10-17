@@ -51,3 +51,54 @@ export function randomMarkerEnvelope(next: () => number): MarkerEnvelope {
         }),
     };
 }
+
+// Independent provider wire shapes: AI SDK LanguageModelV3 function tools,
+// @ai-sdk/anthropic 3.0.82, @ai-sdk/openai-compatible 2.0.41, and the Gemini
+// parametersJsonSchema countTokens request in scripts/calibrate-tokenizer/providers/gemini.ts.
+export function serializeEnvelopes(material: MarkerEnvelope) {
+    return {
+        sdk: {
+            system: material.system,
+            tools: material.tools.map((tool) => ({ type: "function", ...tool })),
+        },
+        anthropic: {
+            system: material.system.map((text) => ({
+                type: "text",
+                text,
+                cache_control: { type: "ephemeral", ttl: "1h" },
+            })),
+            tools: material.tools.map((tool) => ({
+                name: tool.name,
+                description: tool.description,
+                input_schema: tool.inputSchema,
+                cache_control: { type: "ephemeral", ttl: "1h" },
+                eager_input_streaming: true,
+                strict: true,
+            })),
+        },
+        openai: {
+            messages: material.system.map((content) => ({ role: "system", content })),
+            tools: material.tools.map((tool) => ({
+                type: "function",
+                function: {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.inputSchema,
+                    strict: true,
+                },
+            })),
+        },
+        google: {
+            systemInstruction: { parts: material.system.map((text) => ({ text })) },
+            tools: [
+                {
+                    functionDeclarations: material.tools.map((tool) => ({
+                        name: tool.name,
+                        description: tool.description,
+                        parametersJsonSchema: tool.inputSchema,
+                    })),
+                },
+            ],
+        },
+    };
+}

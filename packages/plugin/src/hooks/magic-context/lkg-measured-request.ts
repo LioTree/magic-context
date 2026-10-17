@@ -21,11 +21,23 @@ export type LkgRequestIdentity =
 
 const requests = new BoundedSessionMap<LkgRequestIdentity>(1000);
 const claimedRequests = new WeakSet<LkgRequestIdentity>();
+/** Identity of a served request's system/tool envelope, compared before its usage
+ * may bound a later request's envelope (see standalone-marker-envelope.ts). */
+export interface LkgMarkerIdentity {
+    model: string;
+    systemDigest: string;
+    toolNames: readonly string[];
+}
+
 const captures = new BoundedSessionMap<{
     request: LkgRequestIdentity;
     slot: string;
     prefixCount: number;
     envelope: string;
+    /** The exact message array returned to the host for this request. Set only when
+     * `marker` is, so a reading never subtracts messages the host did not receive. */
+    jsonPrefix?: string;
+    marker?: LkgMarkerIdentity;
     usage?: { responseId: string; inputTokens: number };
 }>(1000);
 
@@ -112,6 +124,9 @@ export function noteCapturedLkgRequest(args: {
     request?: LkgRequestIdentity;
     systemPromptTokens: number;
     agentName?: string;
+    /** Only for the array actually returned to the host. Once this request completes,
+     * its usage can bound the system/tool envelope of later requests. */
+    marker?: LkgMarkerIdentity;
 }): void {
     const request = args.request;
     if (!request || request.modelKey !== args.slot.modelKey) {
@@ -124,7 +139,32 @@ export function noteCapturedLkgRequest(args: {
         prefixCount:
             args.prefixMessageCount ?? (JSON.parse(args.slot.jsonPrefix) as unknown[]).length,
         envelope: envelope(request.modelKey, args.systemPromptTokens, args.agentName),
+        ...(args.marker ? { marker: args.marker, jsonPrefix: args.slot.jsonPrefix } : {}),
     });
+}
+
+interface LkgMarkerReading {
+    responseId: string;
+    inputTokens: number;
+    jsonPrefix: string;
+    marker: LkgMarkerIdentity;
+}
+
+// The most recent successfully completed request per session, frozen when its
+// usage is attributed. A newer request that has only been captured leaves it in
+// place; the next successful completion replaces it, or clears it when that
+// request's returned array or envelope identity is unknown.
+const markerReadings = new BoundedSessionMap<LkgMarkerReading>(1000);
+
+/** Usage, returned message array and envelope identity of the session's most
+ * recent successfully completed request, when all three are known. */
+export function lkgMarkerReading(sessionId: string): LkgMarkerReading | undefined {
+    return markerReadings.get(sessionId);
+}
+
+/** Test helper: install a completed-request reading without a provider response. */
+export function __setLkgMarkerReadingForTests(sessionId: string, reading: LkgMarkerReading): void {
+    markerReadings.set(sessionId, reading);
 }
 
 /** Record the provider's measured input size (cache reads and writes, system
@@ -159,6 +199,16 @@ export function noteLkgProviderResponse(args: {
         return;
     }
     acknowledgeSystemPromptDelivery({ ...args, request: requests.get(args.sessionId) });
+    const succeeded =
+        Number.isSafeInteger(args.inputTokens) &&
+        args.inputTokens > 0 &&
+        !providerResponseFailed(args) &&
+        Boolean(args.completedAt || args.finish);
+    // Any other successful completion becomes the most recent completed request;
+    // an unattributable one leaves no envelope reading. Repeated updates of the
+    // reading's own response keep it.
+    if (succeeded && markerReadings.get(args.sessionId)?.responseId !== args.responseId)
+        markerReadings.delete(args.sessionId);
     const capture = captures.get(args.sessionId);
     if (
         !capture ||
@@ -182,6 +232,13 @@ export function noteLkgProviderResponse(args: {
     )
         return;
     capture.usage = { responseId: args.responseId, inputTokens: args.inputTokens };
+    if (capture.marker && capture.jsonPrefix !== undefined)
+        markerReadings.set(args.sessionId, {
+            responseId: args.responseId,
+            inputTokens: args.inputTokens,
+            jsonPrefix: capture.jsonPrefix,
+            marker: capture.marker,
+        });
 }
 
 export function measuredLkgPrefix(args: {
@@ -216,6 +273,7 @@ export function measuredLkgPrefix(args: {
 export function clearLkgMeasuredRequest(sessionId: string): void {
     requests.delete(sessionId);
     captures.delete(sessionId);
+    markerReadings.delete(sessionId);
     clearSystemPromptDelivery(sessionId);
 }
 

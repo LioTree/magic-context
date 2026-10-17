@@ -100,6 +100,7 @@ import {
 } from "./emergency-fail-closed";
 import { getVisibleMemoryIds } from "./inject-compartments";
 import {
+    __setLkgMarkerReadingForTests,
     beginV2LkgRequest,
     clearLkgMeasuredRequest,
     currentLkgRequestIdentity,
@@ -116,6 +117,7 @@ import { lkgDirtyRevision } from "./lkg-recovery-prefix";
 import { checkLkgDurability, readServedMarker } from "./lkg-served-marker";
 import * as lkgSlot from "./lkg-slot";
 import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
+import { boundMarkerEnvelope } from "./marker-envelope";
 import { MODULE_ORDINAL_PAGE_SIZE, MODULE_PAGE_MAX_BYTES } from "./module-wire";
 import { moveInputs, persistedMoveInputs } from "./move-inputs";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
@@ -135,7 +137,7 @@ import {
     type RustModeModuleClient,
 } from "./rust-mode-transform";
 import { rustRawRebuild, servedRawBlockIds } from "./rust-served-raw";
-import { recordMarkerSystem } from "./standalone-marker-envelope";
+import { recordMarkerSystem, standaloneMarkerIdentity } from "./standalone-marker-envelope";
 import { StorageBusyRefusalError } from "./storage-busy-refusal";
 import { registerSystemDateRefresh } from "./system-date-refresh";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
@@ -346,6 +348,32 @@ function makeMeta(
     recordMarkerSystem(sessionId, "test-provider/test-model", meta.systemPromptHash, [
         "Fixture final system instructions.",
     ]);
+    // Stand in for an earlier completed request with this same envelope: a native
+    // cut needs that request's usage to bound tool schemas the plugin cannot see.
+    const marker = standaloneMarkerIdentity(
+        sessionId,
+        currentLkgRequestIdentity(sessionId),
+        undefined,
+    );
+    if (marker)
+        __setLkgMarkerReadingForTests(sessionId, {
+            responseId: `fixture-${sessionId}-completed`,
+            inputTokens: boundMarkerEnvelope(
+                {
+                    system: ["Fixture final system instructions."],
+                    tools: [
+                        {
+                            name: "read",
+                            description: "read fixture",
+                            inputSchema: { type: "object" },
+                        },
+                    ],
+                },
+                "test-provider/test-model",
+            )!,
+            jsonPrefix: "[]",
+            marker,
+        });
     return meta;
 }
 

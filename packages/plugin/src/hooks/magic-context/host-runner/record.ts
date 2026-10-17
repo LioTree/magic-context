@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { MarkerEnvelopeReading } from "../marker-envelope";
 
 /**
  * Deterministic runner-record transitions. There is no transport or storage here.
@@ -117,6 +118,8 @@ export interface ProviderMeasuredUsage {
     lineage_id: string;
     view_version: number;
     message_digests: readonly string[];
+    /** Envelope bound derived from this successful response's usage and served messages. */
+    envelope_reading?: MarkerEnvelopeReading;
 }
 
 /** Hash the original input JSON so transformed output cannot hide later source edits. */

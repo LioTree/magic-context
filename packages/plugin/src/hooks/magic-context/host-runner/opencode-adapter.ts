@@ -1818,6 +1818,11 @@ export function createOpenCodeProviderTransform(
                 throw error;
             }
         },
+        /** Latest provider usage attributed to this session's served request, if any. */
+        measuredUsage(id: string): RecordState["measured_usage"] {
+            const s = hydrate(id);
+            return s?.record.measured_usage && structuredClone(s.record.measured_usage);
+        },
         bootstrapDeclines: () => declines,
         hasRecord: (id: string) => hydrate(id) !== undefined,
         dispose() {

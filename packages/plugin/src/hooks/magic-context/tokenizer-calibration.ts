@@ -53,6 +53,17 @@ export const UNKNOWN_FIT_RATIO = Math.max(
     ]),
 );
 
+/** Mirror of UNKNOWN_FIT_RATIO for lower bounds: an unmeasured provider tokenizer is
+ * assumed to need no fewer than half the local count, or the smallest seeded ratio. */
+export const UNKNOWN_LOWER_RATIO = Math.min(
+    0.5,
+    ...CALIBRATION_TABLE.flatMap((entry) => [
+        entry.systemRatio,
+        entry.toolsRatio,
+        entry.proseRatio ?? 1,
+    ]),
+);
+
 /** Whether the resolver found a measured or family-inherited seed, including neutral measurements. */
 export function hasModelCalibration(
     providerId: string | undefined,
