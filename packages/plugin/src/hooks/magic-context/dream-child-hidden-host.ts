@@ -170,6 +170,12 @@ export function createHiddenDreamChildHost(options: HiddenDreamChildHostOptions)
                         await options.executor.interrupt(childId);
                         return true;
                     } catch (error) {
+                        // A child that already ended its turn (a refused step ends it)
+                        // has nothing to interrupt; the host's own record says so.
+                        const state = await options.executor
+                            .recoveryState?.(childId)
+                            .catch(() => "unknown" as const);
+                        if (state === "terminal" || state === "unavailable") return true;
                         note(`dream child ${childId} interrupt unconfirmed: ${String(error)}`);
                         return false;
                     }

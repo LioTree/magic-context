@@ -160,7 +160,7 @@ describe.skipIf(!ENABLED)("OpenCode 1 dream child claimant at the host boundary"
     test("permitted control: a task tool reaches the task route and the child completes and is retired", async () => {
         const { result } = await probe("permitted", (call) =>
             call === 1
-                ? toolTurn(toolUse("ctx_memory", { action: "list" }))
+                ? toolTurn(toolUse("ctx_memory", { action: "get", ids: [1] }))
                 : { text: "probe complete", usage: USAGE },
         );
         expect(result.effects.map((effect) => effect.tool)).toEqual(["ctx_memory"]);
@@ -171,7 +171,7 @@ describe.skipIf(!ENABLED)("OpenCode 1 dream child claimant at the host boundary"
         expect(await sessionGone(result.entry.hostChild)).toBe(true);
     }, 120_000);
 
-    test("forbidden tools: shell and file writes never execute, the permitted call beside them does", async () => {
+    test("forbidden tools: shell, file writes and subagents never execute, the permitted call beside them does", async () => {
         const sentinel = join(realpathSync(h.workdir), "dream-probe-bash-sentinel");
         const written = join(realpathSync(h.workdir), "dream-probe-write-sentinel");
         const escape = marker("subagent-escape");
@@ -187,7 +187,7 @@ describe.skipIf(!ENABLED)("OpenCode 1 dream child claimant at the host boundary"
                           prompt: `Run outside the dream child. ${escape}`,
                           subagent_type: "general",
                       }),
-                      toolUse("ctx_memory", { action: "list" }),
+                      toolUse("ctx_memory", { action: "get", ids: [1] }),
                   )
                 : { text: "forbidden probe done", usage: USAGE },
         );
@@ -216,7 +216,7 @@ describe.skipIf(!ENABLED)("OpenCode 1 dream child claimant at the host boundary"
     test("step overflow: step N+1 never reaches the provider after cap N", async () => {
         const { id, result } = await probe(
             "steps",
-            () => toolTurn(toolUse("ctx_memory", { action: "list" })),
+            () => toolTurn(toolUse("ctx_memory", { action: "get", ids: [1] })),
             { maxSteps: 2 },
         );
         expect(providerCalls(id)).toBe(2);
@@ -230,7 +230,7 @@ describe.skipIf(!ENABLED)("OpenCode 1 dream child claimant at the host boundary"
         const { id, result } = await probe(
             "tokens",
             () => ({
-                ...toolTurn(toolUse("ctx_memory", { action: "list" })),
+                ...toolTurn(toolUse("ctx_memory", { action: "get", ids: [1] })),
                 usage: { ...USAGE, input_tokens: 150, output_tokens: 4_000 },
             }),
             { tokenBudget: 100 },
@@ -247,7 +247,7 @@ describe.skipIf(!ENABLED)("OpenCode 1 dream child claimant at the host boundary"
     test("lease loss: after the task lease is revoked no step or effect follows", async () => {
         const { id, result } = await probe(
             "lease",
-            () => toolTurn(toolUse("ctx_memory", { action: "list" })),
+            () => toolTurn(toolUse("ctx_memory", { action: "get", ids: [1] })),
             { revokeLeaseAfterEffects: 1, maxSteps: 10 },
         );
         expect(result.effects).toHaveLength(1);

@@ -21,7 +21,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { OpenCode } from "@opencode/client";
 import type { DreamProbeResult, DreamProbeScenario } from "../../src/dream-claimant-probe";
 import type { MockResponse } from "../../src/mock-provider/server";
-import { assertOpenPaths, spawnOpencode2 } from "../../src/opencode2-runner/spawn";
+import { assertOpenPaths, readPluginLog, spawnOpencode2 } from "../../src/opencode2-runner/spawn";
 
 const ENABLED = process.env.MC_E2E_DREAM_CLAIMANT_OC2 === "1";
 const MODEL = { model: "openai/mock-model", qualifier: null };
@@ -104,6 +104,16 @@ async function probe(
         `[dream-probe-oc2 ${name}] provider_calls=${providerCalls(id)} steps=${result.entry.steps} effects=${result.effects.length} cleaned=${result.entry.cleaned} completion=${JSON.stringify(result.entry.completion)} methods=${result.requests.map((r) => String(r.method).replace("dream.child.", "")).join(",")}`,
     );
     for (const line of result.logs) console.log(`[dream-probe-oc2 ${name}] log: ${line}`);
+    if (process.env.MC_E2E_DREAM_CLAIMANT_DEBUG === "1") {
+        const last = host.mock
+            .requests()
+            .filter((request) => JSON.stringify(request.body).includes(id))
+            .at(-1);
+        const outputs = JSON.stringify(last?.body ?? {}).match(/function_call_output[^}]*/g) ?? [];
+        for (const line of outputs) console.log(`[dream-probe-oc2 ${name}] tool: ${line.slice(0, 300)}`);
+        const tools = (last?.body as { tools?: Array<{ name?: string }> } | undefined)?.tools ?? [];
+        console.log(`[dream-probe-oc2 ${name}] offered tools: ${tools.map((t) => t.name).join(",")}`);
+    }
     return { id, result };
 }
 
@@ -167,12 +177,21 @@ describe.skipIf(!ENABLED)("OpenCode 2 dream child claimant at the host boundary"
             model: { providerID: "openai", id: "mock-model" },
         } as never);
         parent = (created as { id: string }).id;
+        // Magic Context opens its store, and with it the hidden executor the
+        // carrier runs on, when the first session turn reaches it.
+        await client.session.prompt({ sessionID: parent, text: "bootstrap the dream probe" } as never);
+        await client.session.wait({ sessionID: parent } as never, { signal: AbortSignal.timeout(60_000) } as never);
         await waitFile(join(host.cwd, "dream-probe-ready"));
         assertIsolation();
     }, 240_000);
 
     afterAll(async () => {
         if (host) {
+            if (process.env.MC_E2E_DREAM_CLAIMANT_DEBUG === "1") {
+                const lines = readPluginLog(host.env).split("\n");
+                for (const line of lines.filter((l) => /hidden child|dream|refus|ctx_memory|remove/i.test(l)).slice(-60))
+                    console.log(`[plugin-log] ${line.slice(0, 400)}`);
+            }
             try {
                 assertIsolation();
             } finally {
@@ -186,7 +205,7 @@ describe.skipIf(!ENABLED)("OpenCode 2 dream child claimant at the host boundary"
 
     test("permitted control: a task tool reaches the task route and the child completes and is retired", async () => {
         const { result } = await probe("permitted", (call) =>
-            call === 1 ? toolTurn(functionCall("ctx_memory", { action: "list" })) : { text: "probe complete", usage: USAGE as never },
+            call === 1 ? toolTurn(functionCall("ctx_memory", { action: "get", ids: [1] })) : { text: "probe complete", usage: USAGE as never },
         );
         expect(result.effects.map((effect) => effect.tool)).toEqual(["ctx_memory"]);
         expect(result.entry.completion?.text).toBe("probe complete");
@@ -206,7 +225,7 @@ describe.skipIf(!ENABLED)("OpenCode 2 dream child claimant at the host boundary"
                       functionCall("bash", { command: `touch ${sentinel}`, description: "touch" }),
                       functionCall("write", { filePath: written, content: "escaped" }),
                       functionCall("task", { description: "escape", prompt: `Run outside. ${escape}`, subagent_type: "general" }),
-                      functionCall("ctx_memory", { action: "list" }),
+                      functionCall("ctx_memory", { action: "get", ids: [1] }),
                   )
                 : { text: "forbidden probe done", usage: USAGE as never },
         );
@@ -222,7 +241,7 @@ describe.skipIf(!ENABLED)("OpenCode 2 dream child claimant at the host boundary"
     }, 120_000);
 
     test("step overflow: step N+1 never reaches the provider after cap N", async () => {
-        const { id, result } = await probe("steps", () => toolTurn(functionCall("ctx_memory", { action: "list" })), {
+        const { id, result } = await probe("steps", () => toolTurn(functionCall("ctx_memory", { action: "get", ids: [1] })), {
             maxSteps: 2,
         });
         expect(providerCalls(id)).toBe(2);
@@ -235,7 +254,7 @@ describe.skipIf(!ENABLED)("OpenCode 2 dream child claimant at the host boundary"
     test("token overflow: once reported usage exhausts the budget, no further step or tool runs", async () => {
         const { id, result } = await probe(
             "tokens",
-            () => ({ ...toolTurn(functionCall("ctx_memory", { action: "list" })), usage: { input_tokens: 150, output_tokens: 4_000 } as never }),
+            () => ({ ...toolTurn(functionCall("ctx_memory", { action: "get", ids: [1] })), usage: { input_tokens: 150, output_tokens: 4_000 } as never }),
             { tokenBudget: 100 },
         );
         expect(providerCalls(id)).toBe(1);
@@ -247,7 +266,7 @@ describe.skipIf(!ENABLED)("OpenCode 2 dream child claimant at the host boundary"
     }, 120_000);
 
     test("lease loss: after the task lease is revoked no step or effect follows", async () => {
-        const { id, result } = await probe("lease", () => toolTurn(functionCall("ctx_memory", { action: "list" })), {
+        const { id, result } = await probe("lease", () => toolTurn(functionCall("ctx_memory", { action: "get", ids: [1] })), {
             revokeLeaseAfterEffects: 1,
             maxSteps: 10,
         });

@@ -959,7 +959,9 @@ export class DreamChildAttempt implements DreamChildGate {
             const refusal = dreamRefusalOf(response);
             if (refusal === null) return;
             if (refusal !== "stop_required" && !refusal.startsWith("unsent:")) {
-                this.deps.log(`dream cleanup for ${this.hostChildId} refused: ${refusal}`);
+                this.deps.log(
+                    `dream cleanup for ${this.hostChildId} refused: ${refusal} (quiescent=${quiescent}, retired=${retired})`,
+                );
                 return;
             }
             // The module has not latched its stop yet: it is still waiting for the
