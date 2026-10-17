@@ -21701,7 +21701,10 @@ mod tests {
         let line = supported_fences_line();
         assert_eq!(
             line,
-            format!("context.db=101 store.db={LATEST_MIGRATION_VERSION}")
+            format!(
+                "context.db={} store.db={LATEST_MIGRATION_VERSION}",
+                mc_store::move_inventory::CONTEXT_SCHEMA_VERSION
+            )
         );
     }
 

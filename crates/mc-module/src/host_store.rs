@@ -67,7 +67,10 @@ pub const SINGLE_STORE_CAPABLE: bool = mc_store::SINGLE_STORE_CAPABLE;
 /// this binary was built; whether that migration changed anything these writers depend
 /// on is answered per table by the fingerprints, so a migration that touched only tables
 /// the module never writes does not stop the module writing.
-pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 101;
+///
+/// It is the context schema version the store's move inventory is pinned to, so the
+/// two cannot drift apart when a context migration lands.
+pub const BUILT_CONTEXT_FENCE_VERSION: i64 = mc_store::move_inventory::CONTEXT_SCHEMA_VERSION as i64;
 
 /// Versions at or above this number belong to downstream forks and are excluded when
 /// reading the persisted lane, matching the host's own fence arithmetic.

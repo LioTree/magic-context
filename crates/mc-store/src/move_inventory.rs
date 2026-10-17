@@ -3769,13 +3769,18 @@ mod tests {
             import { runMigrations } from './packages/plugin/src/features/magic-context/migrations';
             const db = new Database(process.env.MOVE_TEST_CONTEXT);
             initializeDatabase(db); runMigrations(db);
-            if (LATEST_SUPPORTED_VERSION !== 102 || db.prepare('SELECT MAX(version) AS v FROM schema_migrations WHERE version < 10000').get().v !== 102) throw new Error('update the schema-pinned inventory');
+            const pinned = Number(process.env.MOVE_TEST_CONTEXT_VERSION);
+            if (LATEST_SUPPORTED_VERSION !== pinned || db.prepare('SELECT MAX(version) AS v FROM schema_migrations WHERE version < 10000').get().v !== pinned) throw new Error('update the schema-pinned inventory');
             db.close();
         "#;
         let output = Command::new("bun")
             .current_dir(&root)
             .args(["-e", script])
             .env("MOVE_TEST_CONTEXT", dir.path().join("context.db"))
+            .env(
+                "MOVE_TEST_CONTEXT_VERSION",
+                CONTEXT_SCHEMA_VERSION.to_string(),
+            )
             .output()
             .unwrap();
         assert_bun_succeeded(&output);

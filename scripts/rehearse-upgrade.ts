@@ -359,6 +359,8 @@ function writeReport(): void {
 		"- context 98: new rescore/score tables, session_meta watermark default 0 and activation clock; compartments/history remain unchanged.",
 		"- context 99: memory lifecycle tables and additive memory revision/verification columns; original memory content remains unchanged.",
 		"- context 100: nullable session_meta served_prefix / held_release; old keys remain unchanged.",
+		"- context 101: indexes for trimmed-source tag retirement; no table content rewrite.",
+		"- context 102: nullable lkg_served_markers.served_digest; existing markers keep NULL, which certifies nothing until the next served save binds it. No old content rewrite.",
 		"- store 64: new move inventory tables; no release-domain content reset.",
 		"- store 65: new provider sessions/catalogs; no old cache reset.",
 		"- store 66: copies provider records into conversation/message/answer/view/tag ledgers. Release 63 has no deployed provider rows.",
@@ -605,7 +607,7 @@ try {
 	check("fresh TypeScript/Rust parity", () =>
 		assertFingerprint(freshFp, hostFp),
 	);
-	if (freshFp.store_version > 73 || freshFp.context_version > 100)
+	if (freshFp.store_version > 73 || freshFp.context_version > 102)
 		findings.push(
 			`Migration effects manifest needs review for candidate context ${freshFp.context_version} / store ${freshFp.store_version}; identify every new reset/rewrite before approving it`,
 		);
