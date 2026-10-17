@@ -20,6 +20,7 @@ fn wired(extra: &[TaskName]) -> Wiring {
     Wiring {
         tasks,
         broca: false,
+        broca_file_read: false,
     }
 }
 
