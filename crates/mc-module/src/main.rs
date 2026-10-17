@@ -80,7 +80,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         RouteTargetConfig::for_configured_runners(mc_module::config::user_configured_runners());
     let smart_notes_enabled = mc_module::config::user_smart_notes_enabled();
     // Step transforms always run on the resident engine; no configuration value
-    // selects the non-resident path. Only its charged-memory cap is configurable.
+    // selects the non-resident path. The resident engine's charged-memory cap
+    // (rust_provider_resident_process_cap_mb) is the only residency setting read.
     subc_client_rs::serve_with(
         &connection_file,
         manifest_with_route_targets_and_smart_notes(

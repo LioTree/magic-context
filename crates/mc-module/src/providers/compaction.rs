@@ -1635,8 +1635,9 @@ fn covered_boundary_span(
     let start = (0..decoded.len())
         .rev()
         .find(|start| !unpaired_results(&decoded[*start..]))
-        // An orphan result has no call to bring; keep only the boundary and let
-        // the renderer refuse the split exchange as before.
+        // A tool result whose tool_use message is not stored has no paired
+        // call to add. Return only the coverage boundary message; encode_view
+        // then refuses the split tool exchange.
         .unwrap_or(decoded.len() - 1);
     covered.drain(..start);
     decoded.drain(..start);

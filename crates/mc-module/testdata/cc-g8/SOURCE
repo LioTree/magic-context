@@ -1,0 +1,14 @@
+[
+  {
+    "repository": "thalamus",
+    "path": "probes/cc_step_replay/g8/synthetic-hooks.json",
+    "commit": "92f237e8586de13ea393c210fbcb20a8f15060d6",
+    "sha256": "4e6edf1df4477231cf70946334f743a3f8b0a38958115a844d8b46fe51b6cfba"
+  },
+  {
+    "repository": "thalamus",
+    "path": "probes/cc_step_replay/g8/live-hooks.json",
+    "commit": "92f237e8586de13ea393c210fbcb20a8f15060d6",
+    "sha256": "7fb42dc3eaa8da1e5bffdbcd623fbcad6f88431462e368ff0c12ac000ff30a67"
+  }
+]
