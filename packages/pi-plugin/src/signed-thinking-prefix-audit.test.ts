@@ -785,7 +785,58 @@ for (const subagent of [false, true]) {
 				}),
 			);
 		}
-		if (subagent) return;
+		if (subagent) {
+			it(
+				"wall reduces whole parallel tail arcs while the older drop stays held for the run",
+				withFixture(
+					true,
+					"emergency 95% wall",
+					async (f) => {
+						await toolLoop(f, 3);
+						const parallel = () =>
+							f.respond(
+								(n) =>
+									["a", "b"].map((suffix) =>
+										read(`call-${n}-${suffix}`, `/project/${n}-${suffix}.ts`),
+									),
+								(n) =>
+									["a", "b"].map(
+										(suffix) =>
+											[
+												`call-${n}-${suffix}`,
+												`export const ${suffix} = ${n};\n`.repeat(1000),
+											] as [string, string],
+									),
+							);
+						parallel();
+						f.served = (await f.pass()).messages;
+						const older = f.tag("old-read-b");
+						queuePendingOp(f.db, f.sessionId, older, "drop");
+						f.setPercent(85);
+						f.served = (await f.pass()).messages;
+						const before = wire(f.served);
+						f.setPercent(95);
+						f.served = (await f.pass()).messages;
+						const after = wire(f.served);
+						expect(f.mock.check(after)).toBeNull();
+						expect(beforeLastThinking(after)).toBe(beforeLastThinking(before));
+						expect(withoutThinking(after)).not.toBe(withoutThinking(before));
+						expect(f.tagStatus("old-read-b")).not.toBe("dropped");
+						expect(
+							getPendingOps(f.db, f.sessionId).some((op) => op.tagId === older),
+						).toBe(true);
+						expect(wire((await f.pass()).messages)).toEqual(after);
+						parallel();
+						f.served = (await f.pass()).messages;
+						expect(f.mock.check(wire(f.served))).toBeNull();
+						expect(f.tagStatus("call-9-a")).toBe("dropped");
+						expect(f.tagStatus("old-read-b")).not.toBe("dropped");
+					},
+					"parallel-wall-run",
+				),
+			);
+			return;
+		}
 		it(
 			"pass returns the postprocess bust verdict",
 			withFixture(

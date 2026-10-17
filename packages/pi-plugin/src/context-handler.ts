@@ -254,6 +254,7 @@ import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-cont
 import { formatTailHygienePrefixMismatch } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
 import { admitTemporalCandidates } from "@magic-context/core/hooks/magic-context/temporal-admission";
 import { readServedTemporalDecisions } from "@magic-context/core/hooks/magic-context/temporal-served-projection";
+import { protectToolBatchMutations } from "@magic-context/core/hooks/magic-context/tool-arc-admission";
 import {
 	advanceToolReclaimWatermarkToCurrentMax,
 	buildSyntheticToolReclaimOps,
@@ -502,6 +503,7 @@ import {
 	type PiMessageTokenCacheEntry,
 	tokenizePiMessages,
 } from "./tokenize-pi-messages";
+import { piToolBatchCoordinates } from "./tool-arc-admission-pi";
 import { createPiTranscript } from "./transcript-pi";
 
 /** Emergency-block threshold — mirrors OpenCode's >=95% emergency path. */
@@ -9420,16 +9422,20 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			args.sessionId,
 			`edit admission: held lane=materialization coords=prefix boundary=${editAdmission.frame.kind === "boundary" ? editAdmission.frame.messageId : "<unresolved>"} held_edits=1`,
 		);
-	let newTargets = new Map(
-		protectNewTagMutations(
-			mutationView.map((message) => ({
-				info: message.info,
-				parts: message.parts,
-			})),
-			targets,
-			protectedThinkingProxies,
-			args.reasoningClearing?.prefixBound === true,
+	let newTargets = protectToolBatchMutations(
+		new Map(
+			protectNewTagMutations(
+				mutationView.map((message) => ({
+					info: message.info,
+					parts: message.parts,
+				})),
+				targets,
+				protectedThinkingProxies,
+				args.reasoningClearing?.prefixBound === true,
+			),
 		),
+		editAdmission,
+		piToolBatchCoordinates(workingMessages, stableIdResolver),
 	);
 	if (
 		!holdEnabled &&

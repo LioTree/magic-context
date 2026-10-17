@@ -42,6 +42,56 @@ export interface BridgeRunInput {
     kind: "model";
 }
 
+export interface BridgeFactScope {
+    sessionId: string;
+    lineageId: string;
+    model: { providerID: string; modelID: string };
+    /** Unix milliseconds; older observations of the same kind are ignored. */
+    observedAt: number;
+}
+
+/** Observations do not certify delivery or authorize removing history from the host store. */
+export type BridgeHostFact = BridgeFactScope &
+    (
+        | {
+              kind: "provider_response";
+              requestId: string;
+              completedAt: number;
+              finishReason: string;
+              /** Terminal request outcome, independent of receipt/delivery acknowledgement. */
+              outcome: "success" | "failed" | "aborted";
+              error?: unknown;
+              /** Raw usage components; scheduling uses input + cacheRead + cacheWrite, never output. */
+              usage?: { input: number; cacheRead: number; cacheWrite: number; output: number };
+              /** Positive host-resolved usable input window, including auth/config route caps. */
+              contextWindow: number;
+          }
+        | {
+              kind: "system_prompt";
+              /** Effective host prompt, including date fields; use the returned normalized bytes. */
+              system: string[];
+          }
+        | {
+              kind: "todowrite";
+              tool: "todowrite";
+              ownerMessageId: string;
+              /** Host's current permission verdict for the exact native tool. */
+              callable: boolean;
+              todos: {
+                  id?: string;
+                  content: string;
+                  status: "pending" | "in_progress" | "completed" | "cancelled";
+                  priority: "high" | "medium" | "low";
+              }[];
+          }
+    );
+
+export interface BridgeHostFactResult {
+    accepted: boolean;
+    /** Present for system_prompt; these are the bytes the host must send. */
+    system?: string[];
+}
+
 export type BridgeStepKind = "ordinary" | "bootstrap" | "rebuild";
 
 export interface BridgeView {

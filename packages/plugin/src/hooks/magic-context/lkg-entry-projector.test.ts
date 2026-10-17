@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { createLkgEntryProjector, projectLkgEntry } from "./lkg-replay";
 import * as slot from "./lkg-slot";
+import * as move from "./move-inputs";
 import type { MessageLike } from "./transform-operations";
 
 const messages = (): MessageLike[] =>
@@ -27,6 +28,67 @@ const messages = (): MessageLike[] =>
     }));
 const digests = (entry: ReturnType<typeof projectLkgEntry>) =>
     entry.map((p) => p.contentDigest?.());
+
+test("entry digest session deletion releases only that session's accounted bytes", () => {
+    const cache = new slot.LkgEntryDigestCache({
+        sessionMaxBytes: 1024 * 1024,
+        totalMaxBytes: 2 * 1024 * 1024,
+        maxSessions: 16,
+    });
+    cache.digests("ended", messages().slice(0, 1));
+    cache.digests("active", messages().slice(0, 2));
+    const active = cache.stats().sessions.find((entry) => entry.sessionId === "active");
+    expect(active?.bytes).toBeGreaterThan(0);
+    cache.deleteSession("ended");
+    cache.deleteSession("ended");
+    expect(cache.stats()).toEqual({ totalBytes: active?.bytes, sessions: [active] });
+    expect(cache.digests("active", messages().slice(0, 2)).stats.reused).toBe(2);
+    expect(cache.digests("ended", messages().slice(0, 1)).stats.reused).toBe(0);
+});
+
+test("portable input certification reuses only exact pristine entries", () => {
+    const project = createLkgEntryProjector({ maxBytes: 8 * 1024 * 1024 });
+    const raw = messages().slice(0, 4);
+    const portable = (wire: MessageLike[]) =>
+        project("portable", wire).map((entry) => entry.moveDigest?.());
+    const full = (wire: MessageLike[]) =>
+        projectLkgEntry(wire).map((entry) => entry.moveDigest?.());
+    const expected = full(raw);
+    const hash = spyOn(move, "moveMessageDigestFromFields");
+    try {
+        const first = project("portable", raw);
+        expect(hash).toHaveBeenCalledTimes(0);
+        (raw[0]!.parts[0] as { text: string }).text = "tagged after projection";
+        expect(first.map((entry) => entry.moveDigest?.())).toEqual(expected);
+        expect(hash).toHaveBeenCalledTimes(4);
+        const pristine = messages().slice(0, 4);
+        hash.mockClear();
+        expect(portable(pristine)).toEqual(expected);
+        expect(hash).toHaveBeenCalledTimes(0);
+        (pristine[1]!.parts[1] as { state: { output: unknown } }).state.output = {
+            nested: ["edited α"],
+        };
+        hash.mockClear();
+        const changed = portable(pristine);
+        const calls = hash.mock.calls.length;
+        expect(changed).toEqual(full(pristine));
+        expect(calls).toBe(1);
+        expect(changed[1]).not.toBe(expected[1]);
+    } finally {
+        hash.mockRestore();
+    }
+});
+
+test("portable input certification stays correct without retained cache space", () => {
+    const project = createLkgEntryProjector({ maxBytes: 0 });
+    const raw = messages().slice(0, 4);
+    const expected = projectLkgEntry(raw).map((entry) => entry.moveDigest?.());
+    for (let pass = 0; pass < 2; pass++) {
+        expect(
+            project("uncached", structuredClone(raw)).map((entry) => entry.moveDigest?.()),
+        ).toEqual(expected);
+    }
+});
 
 test("entry projector hashes only the new tail while matching pristine full digests", () => {
     const project = createLkgEntryProjector();

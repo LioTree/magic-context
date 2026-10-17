@@ -8,7 +8,8 @@
 		"rehearse-upgrade.ts",
 		"rehearse-upgrade.test.ts",
 		"lib/upgrade-audit.ts",
-		"lib/upgrade-host.ts"
+		"lib/upgrade-host.ts",
+		"lib/upgrade-live-hosts.ts"
 	],
 	"exclude": [],
 	"references": []

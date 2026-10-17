@@ -9088,11 +9088,13 @@ impl McHandler {
         };
         let summary = sanitize_status_text(
             &format!(
-                "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}{raw_passthrough_summary}, {} pending {}, {} {}, pending m1 delta {}, last historian: {historian}, {publish_health}, surface {surface}",
+                "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}{raw_passthrough_summary}, {} pending {} ({} unserved, {} provider drops applied), {} {}, pending m1 delta {}, last historian: {historian}, {publish_health}, surface {surface}",
                 compartment_count,
                 plural_word(compartment_count, "compartment"),
                 pending_drop_count,
                 plural_word(pending_drop_count, "drop"),
+                snapshot.provider_unserved_drop_count,
+                snapshot.provider_applied_drop_count,
                 tag_count,
                 plural_word(tag_count, "tag"),
                 pending_m1_age_ms
@@ -9137,6 +9139,9 @@ impl McHandler {
             "compartment_count": compartment_count,
             "compartment_tokens": compartment_tokens,
             "pending_drop_count": pending_drop_count,
+            "provider_queued_drop_count": snapshot.provider_queued_drop_count,
+            "provider_unserved_drop_count": snapshot.provider_unserved_drop_count,
+            "provider_applied_drop_count": snapshot.provider_applied_drop_count,
             "tag_count": tag_count,
             "pending_m1_delta": pending_m1_delta,
             "pending_m1_age_ms": pending_m1_age_ms,
@@ -15224,6 +15229,48 @@ impl McHandler {
             .await
     }
 
+    fn redact_unserved_tool_tags(&self, channel: u16, outcome: HandlerOutcome) -> HandlerOutcome {
+        let Ok(binding) = self.facade_binding(channel) else {
+            return outcome;
+        };
+        let Some((key, _)) = self.host_provider_conversation(&binding) else {
+            return outcome;
+        };
+        let Some(store) = self.store.get() else {
+            return self.store_refusal();
+        };
+        let numbers = match store.unserved_provider_tag_numbers(&key.store_key()) {
+            Ok(numbers) => numbers,
+            Err(error) => return tool_error_result(format!("Error reading served tags: {error}")),
+        };
+        if numbers.is_empty() {
+            return outcome;
+        }
+        let HandlerOutcome::Response(bytes) = outcome else {
+            return outcome;
+        };
+        let mut value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return tool_error_result("Error reading tool response"),
+        };
+        // Filter every result string, including raw recovered text, snippets,
+        // error echoes and status details. Transform/hook answers deliberately
+        // bypass this boundary: they introduce the message's own tag, and retries
+        // must replay that exact tagged payload rather than a redacted variant.
+        fn redact(value: &mut Value, numbers: &BTreeSet<i64>) {
+            match value {
+                Value::String(text) => {
+                    *text = redact_unserved_tag_text(text, numbers);
+                }
+                Value::Array(values) => values.iter_mut().for_each(|v| redact(v, numbers)),
+                Value::Object(values) => values.values_mut().for_each(|v| redact(v, numbers)),
+                _ => {}
+            }
+        }
+        redact(&mut value, &numbers);
+        respond(value)
+    }
+
     async fn dispatch_value_with_inbound_bytes(
         &self,
         channel: u16,
@@ -15340,7 +15387,10 @@ impl McHandler {
                 "todo_state.set" => self.handle_todo_state_set_value(channel, &request),
                 "session.flush" => self.handle_session_flush_value(channel, &request),
                 "session.recomp" => self.handle_session_recomp_value(channel, &request),
-                "session.status" => self.handle_session_status_value(channel, &request),
+                "session.status" => self.redact_unserved_tool_tags(
+                    channel,
+                    self.handle_session_status_value(channel, &request),
+                ),
                 "session.delete" => self.handle_session_delete_value(channel, &request),
                 "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
                 // Explicit wire-debugging echo. Opt-in only: echoing every
@@ -15352,10 +15402,28 @@ impl McHandler {
             };
         }
         if request.get("name").is_some() && request.get("arguments").is_some() {
-            return self.handle_facade_value(channel, request).await;
+            let outcome = self.handle_facade_value(channel, request).await;
+            return self.redact_unserved_tool_tags(channel, outcome);
         }
         unrecognized_request_error(&request)
     }
+}
+
+fn redact_unserved_tag_text(text: &str, numbers: &BTreeSet<i64>) -> String {
+    static TAG: OnceLock<regex::Regex> = OnceLock::new();
+    let tag = TAG.get_or_init(|| regex::Regex::new(r"§([0-9]+)§").expect("tag regex"));
+    tag.replace_all(text, |captures: &regex::Captures<'_>| {
+        if captures[1]
+            .parse()
+            .ok()
+            .is_some_and(|n| numbers.contains(&n))
+        {
+            "[unserved tag]".to_string()
+        } else {
+            captures[0].to_string()
+        }
+    })
+    .into_owned()
 }
 
 fn has_transform_page_fields(request: &Value) -> bool {

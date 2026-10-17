@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { failedRequiredJobs } from "./check-ci-results";
 
@@ -121,6 +123,7 @@ test("raw replay review reuses the hermetic driver and requires the pinned live 
     const fetch = review.steps.find((step) => step.name === "Fetch pinned master baseline")!;
     expect(fetch.run).toContain("scripts/rust-raw-replay-baseline.commit");
     expect(fetch.run).toContain("git fetch --no-tags --depth=1 origin");
+    expect(fetch.run).toContain("Cargo.toml Cargo.lock crates");
     const pin = await Bun.file(resolve(root, "scripts/rust-raw-replay-baseline.commit")).text();
     expect(pin.trim()).toMatch(/^[0-9a-f]{40}$/);
 
@@ -133,4 +136,84 @@ test("raw replay review reuses the hermetic driver and requires the pinned live 
     expect(run.run).toContain("release recovery census");
     expect(run.run).toContain("no-freeze SQL");
     expect(run.run).toContain("seed (a19f37|badc0de|c001d00d|92e41b|67d5a3)");
+});
+
+test("raw replay baseline assembly keeps release sources separate from train sources", () => {
+    const fixture = mkdtempSync(resolve(tmpdir(), "raw-replay-assembly-"));
+    const put = (path: string, contents: string) => {
+        const full = resolve(fixture, path);
+        mkdirSync(resolve(full, ".."), { recursive: true });
+        writeFileSync(full, contents);
+    };
+    try {
+        for (const path of ["scripts", "node_modules", "packages/plugin/node_modules", "baseline/crates/mc-module/examples"])
+            mkdirSync(resolve(fixture, path), { recursive: true });
+        put("scripts/test-rust-raw-replay.sh", readFileSync(resolve(root, "scripts/test-rust-raw-replay.sh"), "utf8"));
+        put("scripts/rust-raw-replay-baseline.rs", "offline driver");
+        for (const prefix of ["", "baseline/"]) {
+            const revision = prefix ? "release" : "train";
+            put(`${prefix}Cargo.toml`, revision);
+            put(`${prefix}Cargo.lock`, revision);
+            put(`${prefix}crates/mc-module/src/transform.rs`, `${revision} transform`);
+            put(`${prefix}crates/mc-module/src/transform/active_anthropic_turn.rs`, `${revision} helper`);
+            put(`${prefix}packages/plugin/src/hooks/magic-context/rust-mode-transform.ts`, `${revision} adapter`);
+        }
+        const archive = resolve(fixture, "baseline.tar");
+        expect(Bun.spawnSync(["tar", "-cf", archive, "-C", resolve(fixture, "baseline"), "."]).exitCode).toBe(0);
+        put("bin/cargo", `#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == --version ]] && { echo 'cargo fixture'; exit; }
+manifest= target= profile=debug locked=0
+while (($#)); do
+    case "$1" in
+        --manifest-path) manifest="$2"; shift;;
+        --target-dir) target="$2"; shift;;
+        --release) profile=release;;
+        --locked) locked=1;;
+    esac
+    shift
+done
+[[ "$locked" == 1 && -n "$manifest" && -n "$target" ]]
+base="$(dirname "$manifest")"
+[[ "$(< "$manifest")" == release && "$(< "$base/Cargo.lock")" == release ]]
+[[ "$(< "$base/crates/mc-module/src/transform.rs")" == 'release transform' ]]
+[[ "$(< "$base/crates/mc-module/src/transform/active_anthropic_turn.rs")" == 'release helper' ]]
+[[ "$(< "$base/crates/mc-module/examples/transform_replay.rs")" == 'offline driver' ]]
+mkdir -p "$target/$profile/examples"
+printf '#!/bin/sh\\nexit 0\\n' > "$target/$profile/examples/transform_replay"
+chmod +x "$target/$profile/examples/transform_replay"
+`);
+        put("bin/bun", `#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == --version ]] && { echo 'bun fixture'; exit; }
+[[ -x "$MC_RAW_REPLAY_PROBE" && -x "$MC_RAW_REPLAY_BASELINE" ]]
+[[ "$(< "$MC_RAW_REPLAY_BASELINE_ADAPTER")" == 'release adapter' ]]
+[[ "$(< "$MC_REVIEW_BASELINE_ROOT/Cargo.lock")" == release ]]
+echo 'baseline witnesses invoked'
+`);
+        put("bin/rustc", "#!/bin/sh\necho 'rustc fixture'\n");
+        for (const binary of ["cargo", "bun", "rustc"]) chmodSync(resolve(fixture, "bin", binary), 0o755);
+        for (const release of ["0", "1"]) {
+            const result = Bun.spawnSync(["bash", "scripts/test-rust-raw-replay.sh"], {
+                cwd: fixture,
+                env: { ...process.env, PATH: `${resolve(fixture, "bin")}:${process.env.PATH}`, MC_RAW_REPLAY_BASELINE_ARCHIVE: archive, MC_RAW_REPLAY_BASELINE_RELEASE: release, MC_RAW_REPLAY_PROBE: resolve(fixture, "bin/bun") },
+            });
+            expect({ exitCode: result.exitCode, stderr: result.stderr.toString() }).toEqual({ exitCode: 0, stderr: "" });
+            expect(result.stdout.toString()).toContain("baseline witnesses invoked");
+            expect(readFileSync(resolve(fixture, "crates/mc-module/src/transform.rs"), "utf8")).toBe("train transform");
+            expect(readFileSync(resolve(fixture, "crates/mc-module/src/transform/active_anthropic_turn.rs"), "utf8")).toBe("train helper");
+        }
+    } finally {
+        rmSync(fixture, { recursive: true, force: true });
+    }
+});
+
+test("required raw replay lane names a missing baseline archive instead of skipping", () => {
+    const result = Bun.spawnSync(["bash", "scripts/test-rust-raw-replay.sh"], {
+        cwd: root,
+        env: { ...process.env, MC_RAW_REPLAY_REQUIRED: "1", MC_RAW_REPLAY_BASELINE_ARCHIVE: "" },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain("Required MC_RAW_REPLAY_BASELINE_ARCHIVE");
+    expect(result.stdout.toString()).not.toContain("skipped");
 });

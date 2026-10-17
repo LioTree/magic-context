@@ -23,7 +23,12 @@ import {
     __setProjectIdentityTestHooks,
     resolveProjectIdentity,
 } from "../../features/magic-context/memory/project-identity";
-import { __resetMessageIndexAsyncForTests } from "../../features/magic-context/message-index-async";
+import {
+    __resetMessageIndexAsyncForTests,
+    __setIncrementalIndexSettledForTests,
+    __setReconciliationSettledForTests,
+    getMessageIndexQueueHeapStats,
+} from "../../features/magic-context/message-index-async";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
@@ -255,6 +260,20 @@ function countIndexedHookMessage(sessionId: string, messageId: string): number {
     return typeof row?.count === "number" ? row.count : 0;
 }
 
+async function reconcileHookSession(
+    hook: NonNullable<ReturnType<typeof createMagicContextHook>>,
+    sessionId: string,
+): Promise<void> {
+    const settled = new Promise<string>((resolve) => {
+        __setReconciliationSettledForTests((id, outcome) => {
+            if (id === sessionId) resolve(outcome);
+        });
+    });
+    await hook.event!({ event: { type: "session.updated", properties: { sessionID: sessionId } } });
+    expect(await settled).toBe("reconciled");
+    __setReconciliationSettledForTests(undefined);
+}
+
 describe("magic-context hook", () => {
     it("passes the selected OpenCode 1 model to per-model scheduling before any usage event", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-model-threshold-");
@@ -379,11 +398,26 @@ describe("magic-context hook", () => {
 
     it("indexes terminal message.updated events asynchronously", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-message-index-");
+        createOpenCodeDbForHook("ses-index", []);
+        const hook = requireHook(createMagicContextHook(createMockDeps()));
+        // Complete the empty startup scan before appending rows: only terminal
+        // events, not reconciliation of pre-existing history, can index these rows.
+        await reconcileHookSession(hook, "ses-index");
         createOpenCodeDbForHook("ses-index", [
             { id: "u-1", role: "user", text: "index user text" },
             { id: "a-1", role: "assistant", text: "index assistant text" },
         ]);
-        const hook = requireHook(createMagicContextHook(createMockDeps()));
+
+        const pending = new Set(["u-1", "a-1"]);
+        const outcomes: Record<string, unknown> = {};
+        const indexed = new Promise<void>((resolve) => {
+            __setIncrementalIndexSettledForTests((sessionId, messageId, outcome) => {
+                if (sessionId !== "ses-index") return;
+                outcomes[messageId] = outcome;
+                pending.delete(messageId);
+                if (pending.size === 0) resolve();
+            });
+        });
 
         await hook.event!({
             event: {
@@ -404,8 +438,9 @@ describe("magic-context hook", () => {
                 },
             },
         });
-        await new Promise((resolve) => setTimeout(resolve, 140));
+        await indexed;
 
+        expect(outcomes).toEqual({ "u-1": { status: "indexed" }, "a-1": { status: "indexed" } });
         expect(countIndexedHookMessage("ses-index", "u-1")).toBe(1);
         expect(countIndexedHookMessage("ses-index", "a-1")).toBe(1);
 
@@ -421,9 +456,22 @@ describe("magic-context hook", () => {
             },
         });
 
-        await new Promise((resolve) => setTimeout(resolve, 140));
-
+        // A non-terminal event must not enqueue work that could index it later.
+        expect(getMessageIndexQueueHeapStats().incrementalTimers).toBe(0);
+        expect(getMessageIndexQueueHeapStats().pendingIncremental).toBe(0);
         expect(countIndexedHookMessage("ses-index", "a-streaming")).toBe(0);
+    });
+
+    it("indexes pre-existing messages when startup reconciliation settles", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-startup-index-");
+        createOpenCodeDbForHook("ses-startup", [
+            { id: "u-1", role: "user", text: "index user text" },
+            { id: "a-1", role: "assistant", text: "index assistant text" },
+        ]);
+        const hook = requireHook(createMagicContextHook(createMockDeps()));
+        await reconcileHookSession(hook, "ses-startup");
+        expect(countIndexedHookMessage("ses-startup", "u-1")).toBe(1);
+        expect(countIndexedHookMessage("ses-startup", "a-1")).toBe(1);
     });
 
     it("returns the expected hook keys", () => {

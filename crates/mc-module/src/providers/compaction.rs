@@ -1182,23 +1182,10 @@ fn execute_host(
         })
         .transpose()?;
     state.last_produced = previous.as_ref().map(|v| v.engine.clone());
-    let pending = store
-        .load_provider_pending_drops(&work.key.store_key())
+    let targets = referenced_drop_targets(store, &work.key, lineage, codec)?;
+    store
+        .reconcile_provider_drop_targets(&work.key.store_key(), &targets)
         .map_err(transient)?;
-    let live = if pending.is_empty() {
-        Vec::new()
-    } else {
-        store
-            .load_provider_hook_answers(&work.key.store_key())
-            .map_err(transient)?
-    };
-    let targets = live
-        .iter()
-        .filter(|a| a.state == "live")
-        .flat_map(|a| &a.answer.tags)
-        .filter(|t| pending.contains(&t.number))
-        .map(|t| t.block_id.clone())
-        .collect::<Vec<_>>();
     store
         .append_pending_agent_drops(&conversation.engine_namespace, &targets, now_ms())
         .map_err(transient)?;
@@ -1564,6 +1551,50 @@ fn execute_host(
     Ok(Some((view, persisted)))
 }
 
+fn referenced_drop_targets(
+    store: &McStore,
+    key: &Key,
+    lineage: &ProviderLineage,
+    codec: Codec,
+) -> Result<Vec<String>, HandlerOutcome> {
+    let pending = store
+        .load_provider_pending_drops(&key.store_key())
+        .map_err(transient)?;
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut targets = Vec::new();
+    for stored in store
+        .load_provider_hook_answers(&key.store_key())
+        .map_err(transient)?
+    {
+        // Naming a pending tag in ctx_reduce proves receipt of that tag's
+        // message, allowing its queued drop to run on a rewrite-permitted pass.
+        // It proves nothing about other messages: leave the served watermark,
+        // protection accounting and frozen hook/retry bytes unchanged.
+        if stored.state != "live" && !(stored.state == "pending" && codec == Codec::OpencodeAiSdk) {
+            continue;
+        }
+        // An ancestor answer is carried only through the declared fork cut.
+        // Message admission already checks its ordinal, mid and exact bytes;
+        // a child message reusing the ordinal above the cut is not that answer.
+        if ancestor_cut(store, key, lineage, &stored.lineage_id)?
+            .is_none_or(|cut| stored.answer.ordinal > cut)
+        {
+            continue;
+        }
+        targets.extend(
+            stored
+                .answer
+                .tags
+                .iter()
+                .filter(|tag| pending.contains(&tag.number))
+                .map(|tag| tag.block_id.clone()),
+        );
+    }
+    Ok(targets)
+}
+
 fn status(
     params: &Value,
     record: &Record,
@@ -1646,6 +1677,49 @@ fn status(
         }
     }
     Ok(status)
+}
+
+/// Compare frame-derived decisions through the real decoder and scheduler.
+/// Omitting message rendering and history mutations keeps saved-view changes out of this comparison.
+#[cfg(test)]
+pub(super) fn oracle_input_decision(frame: &Value, now: u64, mid_tool_use: bool) -> Value {
+    let mut params = frame.clone();
+    params["session"] = json!("relay-v1");
+    params["harness"] = json!("opencode");
+    params["request_id"] = json!("input-differential");
+    params["lineage_id"] = json!("input-differential");
+    params["messages"] = json!([]);
+    params["now"] = json!(now);
+    let _: compact::status::StepStatus =
+        decode(&params).unwrap_or_else(|_| panic!("invalid frame"));
+    let parsed = status(&params, &Record::default()).unwrap_or_else(|_| panic!("invalid status"));
+    let usage = parsed.usage();
+    let percentage = usage.current_total_input_tokens as f64 * 100.0 / parsed.context_window as f64;
+    let outcome = crate::scheduler::decide(&crate::scheduler::SchedulerInputs {
+        config: crate::scheduler::SchedulerConfig::default(),
+        usage: crate::scheduler::ContextUsage {
+            percentage,
+            input_tokens: usage.current_total_input_tokens as f64,
+            hard_wall_percentage: Some(percentage),
+        },
+        // execute() sets "never" to disable time-based expiry: it does not read
+        // previous_usage.completed_at. OpenCode reports idle rebuilds separately
+        // through prefix_rebuilding, not this completion timestamp.
+        session: crate::scheduler::SessionMeta {
+            last_response_time_ms: 0,
+            cache_ttl: "never".into(),
+        },
+        now_ms: now,
+        model_key: frame["model"].as_str().map(str::to_owned),
+        context_limit: Some(parsed.context_window as f64),
+        tail_state: crate::scheduler::TailState { mid_tool_use },
+        deferred_execute: None,
+        boundary_bypass: crate::scheduler::BoundaryBypass::default(),
+        drain_latch: crate::scheduler::LatchState::default(),
+        overflow_error_text: None,
+        emergency_recovery_armed: false,
+    });
+    json!({"input_tokens":usage.current_total_input_tokens,"outcome":outcome})
 }
 
 fn execute(

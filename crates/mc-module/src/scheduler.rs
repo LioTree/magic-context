@@ -835,7 +835,7 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         .as_ref()
         .and_then(|detection| detection.reported_limit_provenance);
 
-    SchedulerOutcome {
+    let outcome = SchedulerOutcome {
         pass,
         pressure_execute,
         idle_ttl_fired,
@@ -844,8 +844,19 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         defer_reason,
         detected_limit,
         detected_limit_provenance,
+    };
+    #[cfg(test)]
+    if std::env::var_os("MC_RELAY_ORACLE").is_some() {
+        *ORACLE_OUTCOME.lock().unwrap() = Some(outcome.clone());
     }
+    outcome
 }
+
+// Only the interactive relay oracle reads this observation; production builds
+// neither capture scheduler decisions nor add them to the provider protocol.
+#[cfg(test)]
+pub(crate) static ORACLE_OUTCOME: std::sync::Mutex<Option<SchedulerOutcome>> =
+    std::sync::Mutex::new(None);
 
 /// Convert a scheduler pass decision into the selection module's pass class.
 pub fn to_selection_pass_class(pass: PassDecision) -> PassClass {

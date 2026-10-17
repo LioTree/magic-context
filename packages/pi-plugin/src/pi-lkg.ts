@@ -7,6 +7,7 @@ import {
 	clearLkgFenceProcessState,
 	lkgFenceRequiresRebuild,
 	lkgRecoveryFenceUnclean,
+	lkgRecoverySlotKey,
 	markLkgRecoveryDirty,
 	ownsLkgDirtyFence,
 } from "@magic-context/core/hooks/magic-context/lkg-recovery-fence";
@@ -14,12 +15,12 @@ import { replayLkg } from "@magic-context/core/hooks/magic-context/lkg-replay";
 import { recordServedCapture } from "@magic-context/core/hooks/magic-context/lkg-served-marker";
 import {
 	captureSlot,
-	contentSnapshotValue,
 	dropSlot,
 	exactReusablePrefix,
 	getSlot,
-	incrementalLkgContentDigests,
 	isLegacyLkgDigest,
+	LKG_ENTRY_CACHE_SESSION_BYTES,
+	LKG_ENTRY_CACHE_TOTAL_BYTES,
 	LKG_SNAPSHOT_ARRAY,
 	LKG_SNAPSHOT_BOOLEAN,
 	LKG_SNAPSHOT_KEY,
@@ -102,6 +103,12 @@ interface PiLkgSessionState {
 	syncCaptureRequired: boolean;
 	acceptedInputs: readonly PiLkgInputSnapshot[] | null;
 	acceptedSlot: LkgSlot | null;
+	acceptedRecoverySlotKey?: string;
+	memoBytes: number;
+	portableDigests?: {
+		inputs: readonly { id: string; fields: readonly LkgContentField[] }[];
+		digests: readonly string[];
+	};
 	outputSnapshot: {
 		inputs: { id: string; fields: readonly LkgContentField[] }[];
 		jsonMessages: string[];
@@ -129,6 +136,157 @@ interface PiLkgCapturePlan {
 }
 
 const piLkgSessionStates = new Map<string, PiLkgSessionState>();
+const piLkgMemoSessions = new Map<string, PiLkgSessionState>();
+const defaultMemoLimits = {
+	sessionMaxBytes: LKG_ENTRY_CACHE_SESSION_BYTES,
+	totalMaxBytes: LKG_ENTRY_CACHE_TOTAL_BYTES,
+	maxSessions: 16,
+};
+let memoLimits = defaultMemoLimits;
+let piLkgMemoBytes = 0;
+
+function inputMemoBytes(
+	inputs: readonly { id: string; fields: readonly LkgContentField[] }[],
+): number {
+	let bytes = 24;
+	for (const input of inputs) {
+		bytes += 128 + input.id.length * 2;
+		for (const field of input.fields)
+			bytes += 16 + (typeof field === "string" ? field.length * 2 : 0);
+	}
+	return bytes;
+}
+
+function stringMemoBytes(values: readonly (string | null)[]): number {
+	return (
+		24 +
+		values.reduce((bytes, value) => bytes + 16 + (value?.length ?? 0) * 2, 0)
+	);
+}
+
+function equalSlotValues(
+	left: readonly (string | null)[] | undefined,
+	right: readonly (string | null)[] | undefined,
+): boolean {
+	return (
+		left === right ||
+		(!!left &&
+			!!right &&
+			left.length === right.length &&
+			left.every((value, index) => value === right[index]))
+	);
+}
+
+function sameAcceptedContent(slot: LkgSlot, accepted: LkgSlot | null): boolean {
+	return (
+		!!accepted &&
+		slot.jsonPrefix === accepted.jsonPrefix &&
+		slot.lastInputMessageId === accepted.lastInputMessageId &&
+		slot.modelKey === accepted.modelKey &&
+		slot.providerKey === accepted.providerKey &&
+		equalSlotValues(slot.inputIdSeq, accepted.inputIdSeq) &&
+		equalSlotValues(slot.inputContentDigests, accepted.inputContentDigests) &&
+		equalSlotValues(
+			slot.inputContentSignatures,
+			accepted.inputContentSignatures,
+		) &&
+		equalSlotValues(slot.piOutputEntryIds, accepted.piOutputEntryIds)
+	);
+}
+
+function evictPiLkgMemo(
+	sessionId: string,
+	state: PiLkgSessionState,
+	retainRecoveryProof = true,
+): void {
+	piLkgMemoBytes -= state.memoBytes;
+	piLkgMemoSessions.delete(sessionId);
+	// Recovery needs only the identity of a locally accepted capture, not the
+	// optional tokens used to avoid hashing. Usage and dirty-fence evidence stay.
+	if (retainRecoveryProof && state.acceptedInputs && state.acceptedSlot)
+		state.acceptedRecoverySlotKey = lkgRecoverySlotKey(state.acceptedSlot);
+	state.acceptedInputs = null;
+	state.acceptedSlot = null;
+	state.portableDigests = undefined;
+	state.outputSnapshot = null;
+	state.memoBytes = 0;
+}
+
+function retainPiLkgMemo(sessionId: string, state: PiLkgSessionState): void {
+	piLkgMemoBytes -= state.memoBytes;
+	piLkgMemoSessions.delete(sessionId);
+	let bytes = state.acceptedInputs ? inputMemoBytes(state.acceptedInputs) : 0;
+	if (state.acceptedSlot) {
+		const slot = state.acceptedSlot;
+		bytes += 256 + slot.jsonPrefix.length * 2;
+		for (const values of [
+			slot.inputIdSeq,
+			slot.inputContentDigests,
+			slot.inputContentSignatures,
+			slot.inputMoveDigests,
+			slot.piOutputEntryIds,
+		])
+			if (values) bytes += stringMemoBytes(values);
+	}
+	if (state.portableDigests)
+		bytes +=
+			inputMemoBytes(state.portableDigests.inputs) +
+			stringMemoBytes(state.portableDigests.digests);
+	if (state.outputSnapshot)
+		bytes +=
+			inputMemoBytes(state.outputSnapshot.inputs) +
+			stringMemoBytes(state.outputSnapshot.jsonMessages) +
+			state.outputSnapshot.json.length * 2;
+	state.memoBytes = bytes;
+	piLkgMemoBytes += bytes;
+	if (bytes > memoLimits.sessionMaxBytes) {
+		evictPiLkgMemo(sessionId, state);
+		return;
+	}
+	if (bytes > 0) piLkgMemoSessions.set(sessionId, state);
+	while (
+		piLkgMemoBytes > memoLimits.totalMaxBytes ||
+		piLkgMemoSessions.size > memoLimits.maxSessions
+	) {
+		const oldest = piLkgMemoSessions.entries().next().value;
+		if (!oldest) break;
+		evictPiLkgMemo(...oldest);
+	}
+}
+
+function hasLocalCaptureProof(
+	state: PiLkgSessionState,
+	slot: LkgSlot,
+): boolean {
+	if (state.acceptedInputs && state.acceptedSlot)
+		return (
+			sameAcceptedContent(slot, state.acceptedSlot) &&
+			slot.capturedAt === state.acceptedSlot.capturedAt &&
+			slot.captureSequence === state.acceptedSlot.captureSequence &&
+			slot.rowVersion === state.acceptedSlot.rowVersion
+		);
+	return (
+		state.acceptedRecoverySlotKey !== undefined &&
+		state.acceptedRecoverySlotKey === lkgRecoverySlotKey(slot)
+	);
+}
+
+/** @internal Configurable small budgets make cold-fallback tests inexpensive. */
+export const piLkgMemoForTest = {
+	setLimits(limits: typeof defaultMemoLimits = defaultMemoLimits): void {
+		for (const [id, state] of piLkgMemoSessions) evictPiLkgMemo(id, state);
+		memoLimits = limits;
+	},
+	stats() {
+		return {
+			totalBytes: piLkgMemoBytes,
+			sessions: [...piLkgMemoSessions].map(([sessionId, state]) => ({
+				sessionId,
+				bytes: state.memoBytes,
+			})),
+		};
+	},
+};
 
 function completedProviderUsage(message: unknown):
 	| {
@@ -231,7 +389,10 @@ export function notePiLkgProviderUsage(
 
 export function clearPiLkgSessionState(sessionId: string): void {
 	const state = piLkgSessionStates.get(sessionId);
-	if (state) state.captureSequence += 1;
+	if (state) {
+		state.captureSequence += 1;
+		evictPiLkgMemo(sessionId, state, false);
+	}
 	piLkgSessionStates.delete(sessionId);
 	clearLkgFenceProcessState(sessionId);
 }
@@ -453,10 +614,7 @@ function plainJsonFields(value: unknown): LkgContentField[] | null {
 		return true;
 	};
 	if (!visit(value)) return null;
-	// The shared snapshot ignores an empty OpenCode diff summary. Native Pi
-	// messages never carry that shape, but preserve compatibility for adapters.
-	const normalized = contentSnapshotValue(value);
-	return normalized === value ? fields : lkgContentFields(normalized);
+	return fields;
 }
 
 function plainOutputFields(
@@ -654,10 +812,13 @@ export function createPiLkgCoordinator(
 				syncCaptureRequired: false,
 				acceptedInputs: null,
 				acceptedSlot: null,
+				memoBytes: 0,
 				outputSnapshot: null,
 			};
 			piLkgSessionStates.set(sessionId, state);
 		}
+		if (piLkgMemoSessions.delete(sessionId))
+			piLkgMemoSessions.set(sessionId, state);
 		return state;
 	};
 	const recoveryFor: PiLkgCoordinator["recoveryFor"] = (snapshot) => {
@@ -665,14 +826,15 @@ export function createPiLkgCoordinator(
 		const prefix = state.recoveryPrefix;
 		if (!prefix) {
 			const slot = getSlot(snapshot.sessionId);
+			const processLocalProof = !!slot && hasLocalCaptureProof(state, slot);
 			return lkgRecoveryFenceUnclean(snapshot.sessionId) ||
 				(slot &&
 					lkgFenceRequiresRebuild(
 						snapshot.sessionId,
-						state.acceptedInputs
+						processLocalProof
 							? slot
 							: (loadPersistedLkgSlot(db, snapshot.sessionId) ?? slot),
-						!!state.acceptedInputs,
+						processLocalProof,
 					))
 				? { rebuildReason: "lkg_restart_rebuild" }
 				: {};
@@ -740,7 +902,7 @@ export function createPiLkgCoordinator(
 			fenceRevision: markLkgRecoveryDirty({
 				sessionId: snapshot.sessionId,
 				slot,
-				processLocalProof: !!state.acceptedInputs,
+				processLocalProof: hasLocalCaptureProof(state, slot),
 				ownDirtyRevision: state.recoveryPrefix?.fenceRevision,
 			}),
 			modelKey: snapshot.modelKey,
@@ -907,6 +1069,7 @@ export function createPiLkgCoordinator(
 			if (snapshot.replayFailure === "lkg_invalidated_reshape") {
 				dropSlot(snapshot.sessionId, snapshot.replayFailure);
 				stateFor(snapshot.sessionId).acceptedInputs = null;
+				stateFor(snapshot.sessionId).acceptedRecoverySlotKey = undefined;
 			}
 			return { ok: false, reason: snapshot.replayFailure };
 		}
@@ -986,6 +1149,24 @@ export function createPiLkgCoordinator(
 				: {}),
 			anchorIndex: snapshot.replayAnchorInputIndex,
 		};
+		if (
+			slot &&
+			slot.inputIdSeq.length === prefixInputs.length &&
+			slot.inputIdSeq.every((id, index) => id === prefixInputs[index]?.id) &&
+			slot.inputContentDigests.some(
+				(digest, index) =>
+					digest !==
+					(isLegacyLkgDigest(digest)
+						? entry.entryLegacyContentDigests?.[index]
+						: entry.entryContentDigests[index]),
+			)
+		) {
+			// Refuse this input without destroying the accepted capture: a later
+			// call can still replay the pristine bytes that actually match it.
+			stateFor(snapshot.sessionId).acceptedInputs = null;
+			stateFor(snapshot.sessionId).acceptedRecoverySlotKey = undefined;
+			return { ok: false, reason: "lkg_content_mismatch" };
+		}
 		const result = replayLkg({
 			sessionId: snapshot.sessionId,
 			messages: [] as MessageLike[],
@@ -997,7 +1178,10 @@ export function createPiLkgCoordinator(
 			// stable-id/content fences are the applicable seam proof.
 			skipSeamValidation: true,
 		});
-		if (!result.ok) stateFor(snapshot.sessionId).acceptedInputs = null;
+		if (!result.ok) {
+			stateFor(snapshot.sessionId).acceptedInputs = null;
+			stateFor(snapshot.sessionId).acceptedRecoverySlotKey = undefined;
+		}
 		const measuredPrefix = result.ok
 			? measuredPrefixFor(snapshot, slot, parentOf)
 			: undefined;
@@ -1064,6 +1248,8 @@ export function createPiLkgCoordinator(
 			const failedState = stateFor(snapshot.sessionId);
 			failedState.syncCaptureRequired = true;
 			failedState.acceptedInputs = null;
+			failedState.acceptedRecoverySlotKey = undefined;
+			retainPiLkgMemo(snapshot.sessionId, failedState);
 			sessionLog(
 				snapshot.sessionId,
 				"LKG SNAPSHOT PREPARATION FAILED; forcing synchronous capture on the next applied pass:",
@@ -1098,13 +1284,22 @@ export function createPiLkgCoordinator(
 		state.captureSequence += 1;
 		const plan: PiLkgCapturePlan = {
 			sessionId: snapshot.sessionId,
-			inputs: snapshot.inputs,
+			inputs: snapshot.inputs.map((input) => ({
+				...input,
+				fields: [...input.fields],
+			})),
 			jsonPrefix,
 			modelKey: snapshot.modelKey,
 			providerKey: snapshot.providerKey,
 			capturedAt: Date.now(),
 			captureSequence: state.captureSequence,
 		};
+		const serializedOutput = state.outputSnapshot
+			? {
+					json: state.outputSnapshot.json,
+					jsonMessages: [...state.outputSnapshot.jsonMessages],
+				}
+			: undefined;
 		// Capturing an unmeasured retry must not erase evidence for its unchanged
 		// served prefix. A rebuild, edited row, route or envelope does erase it.
 		const noteCapturedRequest = () => {
@@ -1125,6 +1320,11 @@ export function createPiLkgCoordinator(
 		const livePrior = getSlot(snapshot.sessionId);
 		const unchanged =
 			livePrior &&
+			sameAcceptedContent(livePrior, state.acceptedSlot) &&
+			equalSlotValues(
+				livePrior.inputMoveDigests,
+				state.acceptedSlot?.inputMoveDigests,
+			) &&
 			livePrior.modelKey === plan.modelKey &&
 			livePrior.providerKey === plan.providerKey &&
 			livePrior.jsonPrefix === plan.jsonPrefix &&
@@ -1197,7 +1397,9 @@ export function createPiLkgCoordinator(
 			try {
 				const inputIdSeq = plan.inputs.map((input) => input.id);
 				const prior = getSlot(plan.sessionId);
-				const digestPrior = prior ?? state.acceptedSlot;
+				// Only the private accepted slot is tied to acceptedInputs.
+				// getSlot returns copies and may hydrate or replace the shared slot.
+				const digestPrior = state.acceptedSlot;
 				const reusePrior =
 					digestPrior?.inputContentSignatures !== undefined &&
 					digestPrior.modelKey === plan.modelKey &&
@@ -1210,18 +1412,21 @@ export function createPiLkgCoordinator(
 				const reusablePrefix = reusePrior
 					? exactReusablePrefix(plan.inputs, state.acceptedInputs)
 					: 0;
+				const portablePrior = state.portableDigests;
+				const portablePrefix = exactReusablePrefix(
+					plan.inputs,
+					portablePrior?.inputs ?? null,
+				);
 				const inputContentSignatures = [
 					...(reusePrior ? reusePrior.signatures.slice(0, reusablePrefix) : []),
 					...plan.inputs
 						.slice(reusablePrefix)
 						.map((input) => signatureForFields(input.fields)),
 				];
-				// Exact field validation above proves the prefix of our own accepted
-				// slot. A foreign/reloaded slot still needs the ordinary id/signature
-				// check, and legacy digest formats must never cross into a new slot.
+				// Exact tokens prove our own slot's prefix, not a foreign slot's
+				// self-reported signatures. Legacy digests are always recomputed.
 				const verifiedOwnPrefix =
 					reusePrior &&
-					digestPrior === state.acceptedSlot &&
 					reusePrior.slot.inputIdSeq.length === reusePrior.signatures.length &&
 					reusePrior.signatures.length ===
 						reusePrior.slot.inputContentDigests.length;
@@ -1246,31 +1451,18 @@ export function createPiLkgCoordinator(
 										.map((input) => lkgContentDigestFromFields(input.fields)),
 								],
 							}
-						: incrementalLkgContentDigests(
-								plan.inputs.map((input, index) => ({
-									id: input.id,
-									signature: inputContentSignatures[index] ?? "",
-									fields: input.fields,
-								})),
-								reusePrior
-									? {
-											ids: reusePrior.slot.inputIdSeq.slice(0, reusablePrefix),
-											signatures: reusePrior.signatures.slice(
-												0,
-												reusablePrefix,
-											),
-											digests: reusePrior.slot.inputContentDigests.slice(
-												0,
-												reusablePrefix,
-											),
-										}
-									: undefined,
-							);
+						: {
+								reusedPrefix: 0,
+								digests: plan.inputs.map((input) =>
+									lkgContentDigestFromFields(input.fields),
+								),
+							};
 				reusedPrefix = incremental.reusedPrefix;
 				if (
 					!args.publishServedNumbers &&
 					!state.syncCaptureRequired &&
 					prior &&
+					unchanged &&
 					reusedPrefix === plan.inputs.length &&
 					prior.inputIdSeq.length === plan.inputs.length &&
 					prior.servedCaptureId === plan.servedCaptureId &&
@@ -1279,6 +1471,7 @@ export function createPiLkgCoordinator(
 				) {
 					args.assertCurrentPass?.();
 					state.acceptedInputs = plan.inputs;
+					state.acceptedRecoverySlotKey = undefined;
 					return;
 				}
 				const slot = {
@@ -1294,9 +1487,14 @@ export function createPiLkgCoordinator(
 					captureSequence: plan.captureSequence,
 					servedCaptureId: plan.servedCaptureId,
 					fullCoverage: true,
-					inputMoveDigests: plan.inputs.map((input) =>
-						moveMessageDigestFromFields(input.fields),
-					),
+					// Only locally computed digests enter this memo. A
+					// hydrated or externally replaced slot cannot supply its values.
+					inputMoveDigests: plan.inputs.map((input, index) => {
+						const digest = portablePrior?.digests[index];
+						return index < portablePrefix && digest !== undefined
+							? digest
+							: moveMessageDigestFromFields(input.fields);
+					}),
 				};
 				args.assertCurrentPass?.();
 				if (args.publishServedNumbers) {
@@ -1330,6 +1528,22 @@ export function createPiLkgCoordinator(
 				}
 				state.acceptedInputs = plan.inputs;
 				state.acceptedSlot = slot;
+				state.acceptedRecoverySlotKey = undefined;
+				// Pass snapshots are caller-visible. Retain private tokens only
+				// when inputs change, so later snapshot edits cannot rewrite proof.
+				if (
+					!portablePrior ||
+					portablePrefix !== plan.inputs.length ||
+					portablePrior.inputs.length !== plan.inputs.length
+				) {
+					state.portableDigests = {
+						inputs: plan.inputs.map((input) => ({
+							id: input.id,
+							fields: [...input.fields],
+						})),
+						digests: [...slot.inputMoveDigests],
+					};
+				}
 				if (state.recoveryPrefix) {
 					state.recoveryPrefix = args.releaseRecovery
 						? undefined
@@ -1353,6 +1567,7 @@ export function createPiLkgCoordinator(
 				if (args.publishServedNumbers) {
 					state.syncCaptureRequired = true;
 					state.acceptedInputs = null;
+					state.acceptedRecoverySlotKey = undefined;
 					throw error;
 				}
 				try {
@@ -1373,12 +1588,14 @@ export function createPiLkgCoordinator(
 				);
 				state.syncCaptureRequired = true;
 				state.acceptedInputs = null;
+				state.acceptedRecoverySlotKey = undefined;
 				sessionLog(
 					plan.sessionId,
 					"LKG ASYNC CAPTURE FAILED; forcing synchronous capture on the next applied pass:",
 					error,
 				);
 			} finally {
+				retainPiLkgMemo(plan.sessionId, state);
 				try {
 					onCaptureTiming?.({
 						sessionId: plan.sessionId,
@@ -1403,6 +1620,7 @@ export function createPiLkgCoordinator(
 				);
 				state.syncCaptureRequired = true;
 				state.acceptedInputs = null;
+				state.acceptedRecoverySlotKey = undefined;
 				sessionLog(
 					plan.sessionId,
 					"LKG CAPTURE SCHEDULE FAILED; forcing synchronous capture on the next applied pass:",
@@ -1410,7 +1628,8 @@ export function createPiLkgCoordinator(
 				);
 			}
 		}
-		return state.outputSnapshot ?? undefined;
+		retainPiLkgMemo(plan.sessionId, state);
+		return serializedOutput;
 	};
 
 	return {

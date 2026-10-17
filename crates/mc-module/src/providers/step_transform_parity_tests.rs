@@ -349,6 +349,9 @@ async fn drive_overlay_corpus_with(
         };
         let mut raw = vec![baseline()];
         let mut served_native = raw.clone();
+        // Save pending numbers when each message's hook output is produced: we
+        // compare it again after newer hooks may have confirmed its delivery.
+        let mut pending_by_mid = BTreeMap::new();
         for _ in 0..2 {
             transform::transform(
                 full.store.get().unwrap(),
@@ -412,6 +415,10 @@ async fn drive_overlay_corpus_with(
             super::host_tests::response(host.dispatch_value(7,json!({"method":"state_sync","session_id":"s","provider_pass":{"pass_id":format!("{seed}-{pass}"),"lineage_id":"L","appended":entries,"physical_tail":{"mid":tail["mid"],"ordinal":tail["ordinal"]}}})).await);
             for (n, m) in appended.iter().enumerate() {
                 served_native.push(host_message(&host, m, prior + n as u64 + 1, prior).await);
+                pending_by_mid.insert(
+                    m["info"]["id"].as_str().unwrap().to_owned(),
+                    super::host_tests::pending_hint_numbers(&host),
+                );
             }
             raw.extend(appended);
             let current_request = request_for(&raw, search);
@@ -452,7 +459,23 @@ async fn drive_overlay_corpus_with(
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                assert!(actual==expected[&message.mid],"seed={seed:x} pass={pass} mid={} actual prefixes={:?} expected prefixes={:?} actual suffixes={:?} expected suffixes={:?}",message.mid,actual.iter().map(|(_,s)|s.chars().take(100).collect::<String>()).collect::<Vec<_>>(),expected[&message.mid].iter().map(|(_,s)|s.chars().take(100).collect::<String>()).collect::<Vec<_>>(),actual.iter().map(|(_,s)|s.chars().rev().take(180).collect::<String>()).collect::<Vec<_>>(),expected[&message.mid].iter().map(|(_,s)|s.chars().rev().take(180).collect::<String>()).collect::<Vec<_>>());
+                let no_pending = BTreeSet::new();
+                let pending_numbers = pending_by_mid.get(&message.mid).unwrap_or(&no_pending);
+                let without_hints = |values: &[(usize, String)]| {
+                    values
+                        .iter()
+                        .map(|(index, text)| {
+                            (
+                                *index,
+                                super::host_tests::without_delivery_dependent_hint(
+                                    text,
+                                    pending_numbers,
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert!(without_hints(&actual)==without_hints(&expected[&message.mid]),"seed={seed:x} pass={pass} mid={} actual prefixes={:?} expected prefixes={:?} actual suffixes={:?} expected suffixes={:?}",message.mid,actual.iter().map(|(_,s)|s.chars().take(100).collect::<String>()).collect::<Vec<_>>(),expected[&message.mid].iter().map(|(_,s)|s.chars().take(100).collect::<String>()).collect::<Vec<_>>(),actual.iter().map(|(_,s)|s.chars().rev().take(180).collect::<String>()).collect::<Vec<_>>(),expected[&message.mid].iter().map(|(_,s)|s.chars().rev().take(180).collect::<String>()).collect::<Vec<_>>());
                 counts.comparisons += 1;
             }
             if run.frozen_reference && !queued && !calibrated {
@@ -470,13 +493,14 @@ async fn drive_overlay_corpus_with(
 }
 
 #[tokio::test]
-async fn randomized_and_adversarial_host_overlay_bytes_equal_full_engine_and_pre_extraction_corpus()
-{
+async fn randomized_host_overlay_matches_full_engine_except_delivery_dependent_hints_and_keeps_frozen_corpus(
+) {
     drive_overlay_corpus(false, false).await;
 }
 
 #[tokio::test]
-async fn queued_tool_and_sibling_text_releases_match_full_engine_grace_and_oldest_hints() {
+async fn queued_tool_and_sibling_text_releases_match_full_engine_grace_except_delivery_dependent_hints(
+) {
     drive_overlay_corpus(true, false).await;
 }
 
@@ -1127,9 +1151,10 @@ async fn exact_hard_model_case(
     let mut reminders = 0;
     for (i, m) in appended.iter().enumerate() {
         let actual = host_message(&host, m, i as u64 + 2, 1).await;
+        let pending_numbers = super::host_tests::pending_hint_numbers(&host);
         let text = actual["parts"][0]["state"]["output"].as_str().unwrap();
         let want = &expected[m["info"]["id"].as_str().unwrap()][0].1;
-        assert!(text==want,"exact HARD {old:?}->{new:?}, tools={tools:?}, repeats={repeats}, index={i}; actual suffix {:?}, expected suffix {:?}",text.find("<system-reminder>").map(|n|&text[n..]),want.find("<system-reminder>").map(|n|&want[n..]));
+        assert!(super::host_tests::without_delivery_dependent_hint(text, &pending_numbers)==super::host_tests::without_delivery_dependent_hint(want, &pending_numbers),"exact HARD {old:?}->{new:?}, tools={tools:?}, repeats={repeats}, index={i}; actual suffix {:?}, expected suffix {:?}",text.find("<system-reminder>").map(|n|&text[n..]),want.find("<system-reminder>").map(|n|&want[n..]));
         reminders += usize::from(want.contains("<system-reminder>"));
     }
     (appended.len(), reminders)

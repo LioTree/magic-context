@@ -7,9 +7,11 @@ import {
 	readServedMarker,
 } from "@magic-context/core/hooks/magic-context/lkg-served-marker";
 import {
+	captureSlot,
 	getSlot,
 	resetLkgSlotsForTest,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import * as move from "@magic-context/core/hooks/magic-context/move-inputs";
 import {
 	moveInputs,
 	persistedMoveInputs,
@@ -20,6 +22,7 @@ import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	createPiLkgCoordinator,
 	type PiLkgCaptureTiming,
+	type PiLkgPassSnapshot,
 	resolvePiLkgOutputEntryIds,
 } from "./pi-lkg";
 import { assertPiRawFallbackFits } from "./pi-raw-fallback";
@@ -61,6 +64,100 @@ afterEach(() => {
 });
 
 describe("Pi incremental LKG capture", () => {
+	it("portable input certification ignores replacement slots", () => {
+		const harness = createHarness();
+		databases.push(harness.db);
+		const sessionId = "pi-portable-replaced";
+		const capture = (messages: Record<string, unknown>[]) => {
+			const ids = messages.map((_, index) => `entry-${index}`);
+			const snapshot = harness.coordinator.beginPass({
+				sessionId,
+				messages,
+				entryIds: ids,
+				modelKey: "test/model",
+				providerKey: "test",
+			});
+			harness.coordinator.captureAppliedPass({
+				snapshot,
+				outputMessages: messages,
+				outputEntryIds: ids,
+				cacheBusting: false,
+			});
+			harness.flushCapture();
+		};
+		const initial = [message("one"), message("two")];
+		capture(initial);
+		const saved = getSlot(sessionId);
+		if (!saved) throw new Error("capture did not install a slot");
+		// A storage reload or another coordinator can replace the shared slot.
+		// An unchanged diagnostic capture must not adopt its portable digests.
+		expect(
+			captureSlot(sessionId, {
+				...saved,
+				inputMoveDigests: ["f".repeat(64), "e".repeat(64)],
+			}),
+		).toBe(true);
+		capture(structuredClone(initial));
+		const appended = [...initial, message("three")];
+		capture(appended);
+		const final = getSlot(sessionId);
+		if (!final) throw new Error("capture did not install a slot");
+		expect(persistedMoveInputs(final)).toEqual(
+			moveInputs("pi", appended, ["entry-0", "entry-1", "entry-2"]),
+		);
+	});
+	it("portable input certification reuses only the exact accepted prefix", () => {
+		const harness = createHarness();
+		databases.push(harness.db);
+		const sessionId = "pi-portable-reuse";
+		let lastSnapshot: PiLkgPassSnapshot | undefined;
+		const capture = (messages: Record<string, unknown>[]) => {
+			const ids = messages.map((_, index) => `entry-${index}`);
+			const snapshot = harness.coordinator.beginPass({
+				sessionId,
+				messages,
+				entryIds: ids,
+				modelKey: "test/model",
+				providerKey: "test",
+			});
+			lastSnapshot = snapshot;
+			harness.coordinator.captureAppliedPass({
+				snapshot,
+				outputMessages: messages,
+				outputEntryIds: ids,
+				cacheBusting: false,
+			});
+			harness.flushCapture();
+			const saved = getSlot(sessionId);
+			if (!saved) throw new Error("capture did not install a slot");
+			return persistedMoveInputs(saved);
+		};
+		const initial = [message("one"), message("two")];
+		capture(initial);
+		// The caller owns its pass snapshot; editing it cannot alter the memo's
+		// private proof for the pristine input that was already captured.
+		if (!lastSnapshot) throw new Error("snapshot was not prepared");
+		lastSnapshot.inputs[1].fields = [];
+		const hash = spyOn(move, "moveMessageDigestFromFields");
+		try {
+			capture(structuredClone(initial));
+			expect(hash).toHaveBeenCalledTimes(0);
+			const appended = [...initial, message("three")];
+			capture(appended);
+			expect(hash).toHaveBeenCalledTimes(1);
+			const edited = structuredClone(appended);
+			edited[1].content = [{ type: "text", text: "edited α" }];
+			hash.mockClear();
+			const actual = capture(edited);
+			const calls = hash.mock.calls.length;
+			expect(actual).toEqual(
+				moveInputs("pi", edited, ["entry-0", "entry-1", "entry-2"]),
+			);
+			expect(calls).toBe(2);
+		} finally {
+			hash.mockRestore();
+		}
+	});
 	it("compactionOff capture writes no marker and is explicitly uncertified for moving", () => {
 		const harness = createHarness();
 		databases.push(harness.db);

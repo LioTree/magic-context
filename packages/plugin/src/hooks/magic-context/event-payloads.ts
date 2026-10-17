@@ -42,6 +42,7 @@ export interface MessageUpdatedAssistantInfo {
     modelID?: string;
     tokens?: {
         input?: number;
+        output?: number;
         cache?: {
             read?: number;
             write?: number;
@@ -135,6 +136,7 @@ export function getMessageUpdatedAssistantInfo(
         modelID: typeof info.modelID === "string" ? info.modelID : undefined,
         tokens: {
             input: typeof tokens?.input === "number" ? tokens.input : undefined,
+            output: typeof tokens?.output === "number" ? tokens.output : undefined,
             cache: {
                 read: typeof cache?.read === "number" ? cache.read : undefined,
                 write: typeof cache?.write === "number" ? cache.write : undefined,

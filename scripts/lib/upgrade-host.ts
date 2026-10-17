@@ -4,13 +4,14 @@ import { NOW } from "./upgrade-audit";
 import type { M0M1RenderOptions } from "../../packages/plugin/src/hooks/magic-context/inject-compartments";
 import type { Database } from "../../packages/plugin/src/shared/sqlite";
 
-const [mode, tree, root, output] = process.argv.slice(2);
+const [mode, tree, root, output, sourceFile] = process.argv.slice(2);
 process.env.HOME = join(root, "home");
 process.env.XDG_DATA_HOME = join(root, "data");
 process.env.XDG_CONFIG_HOME = join(root, "config");
 process.env.XDG_CACHE_HOME = join(root, "cache");
 process.env.XDG_STATE_HOME = join(root, "state");
 process.env.MAGIC_CONTEXT_STORAGE_DIR = root;
+process.env.MAGIC_CONTEXT_TEST_DATA_DIR = join(root, "data");
 process.env.MAGIC_CONTEXT_LOG_PATH = join(root, "host.log");
 process.env.OPENCODE_DB = join(root, "unused-opencode.db");
 process.env.NODE_ENV = mode === "refuse" ? "production" : "test";
@@ -89,9 +90,33 @@ if (mode === "refuse") {
 		const { ensureSessionMetaRow } = (await import(
 			feature("storage-meta-shared.ts")
 		)) as typeof import("../../packages/plugin/src/features/magic-context/storage-meta-shared");
+		const { recordSessionProjectIdentity } = await import(feature("session-project-storage.ts"));
+		const { armThinkingBindingRecovery } = await import(feature("storage-meta-persisted.ts"));
+		const { saveLkgSlotToDb } = await import(join(tree, "packages/plugin/src/hooks/magic-context/lkg-persist.ts"));
+		const { messageContentSnapshot, lkgContentDigestFromFields } = await import(join(tree, "packages/plugin/src/hooks/magic-context/lkg-slot.ts"));
+		db.prepare("INSERT INTO workspaces(name,created_at,updated_at) VALUES ('rehearsal',?,?)").run(NOW, NOW);
+		for (const [identity, name] of [["git:upgrade-rehearsal", "main"], ["git:upgrade-peer", "peer"]])
+			db.prepare("INSERT INTO workspace_members(workspace_id,project_path,display_name,display_path,added_at) VALUES (1,?,?,?,?)").run(identity, name, join(root, name), NOW);
 		for (let s = 0; s < 20; s++) {
 			const session = `session-${String(s).padStart(2, "0")}`;
 			ensureSessionMetaRow(db, session);
+			recordSessionProjectIdentity(db, session, "git:upgrade-rehearsal");
+			const message = {
+				info: { id: `signed-${s}`, role: "assistant" },
+				parts: [{ type: "thinking", thinking: `Preserved reasoning ${s} 東京`, signature: `fixture-signature-${s}` }],
+			};
+			const snapshot = messageContentSnapshot(message);
+			if (!saveLkgSlotToDb(db, session, {
+				jsonPrefix: JSON.stringify([message]),
+				inputIdSeq: [message.info.id],
+				inputContentDigests: [lkgContentDigestFromFields(snapshot.fields)],
+				inputContentSignatures: [snapshot.signature],
+				lastInputMessageId: message.info.id,
+				modelKey: "fixture-model",
+				providerKey: "anthropic",
+				capturedAt: NOW,
+			})) throw new Error(`Could not persist LKG for ${session}`);
+			armThinkingBindingRecovery(db, session);
 			const count = s === 0 ? 150_000 : 500;
 			for (let start = 1; start <= count; start += 1000) {
 				const sources = Array.from(
@@ -180,8 +205,46 @@ if (mode === "refuse") {
 			}
 		}).immediate();
 		console.log(
-			"Seeded 20 sessions, 159500 messages, 2414 compartments, 1000 memories/commits/384-d embeddings, 200 notes using v0.49.0 writers",
+			"Seeded 20 sessions, 159500 messages, 2414 compartments, 1000 memories/commits/384-d embeddings, 200 notes, 20 signed-thinking LKG/recovery/project records and a two-member workspace using released writers",
 		);
+	} else if (mode === "augment") {
+		const session = output;
+		const project = (db.prepare("SELECT project_path FROM session_projects WHERE session_id=?").get(session) as {project_path: string} | undefined)?.project_path;
+		if (!project) throw new Error(`Host did not record project for ${session}`);
+		const { insertMemory } = await import(feature("memory/storage-memory.ts"));
+		const { addNote } = await import(feature("storage-notes.ts"));
+		const { insertTag } = await import(feature("storage-tags.ts"));
+		const { appendCompartments } = await import(feature("compartment-storage.ts"));
+		insertMemory(db, { projectPath: project, category: "CONSTRAINTS", content: "Rehearsal memory 東京: preserve old schema rows.", sourceType: "agent", sourceSessionId: session });
+		addNote(db, "session", { sessionId: session, content: "Rehearsal follow-up 東京", anchorOrdinal: 1 });
+		let messages = db.prepare("SELECT message_id,message_ordinal AS ordinal FROM message_history_source WHERE session_id=? ORDER BY message_ordinal LIMIT 2").all(session) as {message_id: string; ordinal: number}[];
+		if (messages.length !== 2) {
+			// Short sessions need not have triggered background archival yet. Add a released-writer archive fixture explicitly.
+			const { indexSourcesAfterOrdinal } = await import(feature("message-index.ts"));
+			const sources = sourceFile
+				? JSON.parse(readFileSync(sourceFile, "utf8")) as { id: string; ordinal: number; role: string; createdAt: number; sourceVersion: string; contentHash: string; content: string }[]
+				: [1,2].map((ordinal) => ({ id: `archive-${session}-${ordinal}`, ordinal, role: ordinal === 1 ? "user" : "assistant", createdAt: NOW - 10000 + ordinal, sourceVersion: "1", contentHash: new Bun.CryptoHasher("sha256").update(`Archived planning ${ordinal}`).digest("hex"), content: `Archived planning ${ordinal}` }));
+			if (sources.length !== 2) throw new Error("Archive fixture needs two real message boundaries");
+			indexSourcesAfterOrdinal(db,session,sources,2);
+			messages = sources.map((s) => ({message_id: s.id, ordinal: s.ordinal}));
+		}
+		const maxTag = Number((db.prepare("SELECT COALESCE(MAX(tag_number),0) AS n FROM tags WHERE session_id=?").get(session) as {n:number}).n);
+		for (const [i,m] of messages.entries()) insertTag(db, session, m.message_id, "message", 750, maxTag+i+1);
+		appendCompartments(db, session, [{ sequence: 1, startMessage: messages[0].ordinal, endMessage: messages[1].ordinal, startMessageId: messages[0].message_id, endMessageId: messages[1].message_id, title: "Rehearsal design", content: "Preserve exact archival bytes 東京.", p1: "Keep rows", p2: "Keep rows", p3: "Keep rows", p4: "Keep rows", importance: 90, episodeType: "design" }]);
+		db.prepare("INSERT INTO workspaces(name,created_at,updated_at) VALUES ('live-rehearsal',?,?)").run(NOW,NOW);
+		for (const [identity,name] of [[project,"main"],["git:rehearsal-peer","peer"]]) db.prepare("INSERT INTO workspace_members(workspace_id,project_path,display_name,display_path,added_at) VALUES (1,?,?,?,?)").run(identity,name,join(root,name),NOW);
+		console.log(`Augmented real host session ${session}: memory, note, 2 tags, compartment, workspace`);
+	} else if (mode === "state") {
+		const { loadPersistedLkgSlot } = await import(join(tree, "packages/plugin/src/hooks/magic-context/lkg-persist.ts"));
+		const sessions = db.prepare("SELECT session_id,thinking_binding_recovery_target FROM session_meta ORDER BY session_id").all() as { session_id: string; thinking_binding_recovery_target: string }[];
+		if (sessions.length !== 20) throw new Error(`Expected 20 LKG/recovery fixtures, found ${sessions.length}`);
+		const slots = sessions.map(({session_id, thinking_binding_recovery_target}) => {
+			const slot = loadPersistedLkgSlot(db, session_id);
+			if (!slot || !slot.jsonPrefix.includes("fixture-signature-") || slot.inputContentSignatures?.length !== 1 || thinking_binding_recovery_target !== "all_reasoning_bearing_assistants")
+				throw new Error(`LKG/recovery fixture did not survive: ${session_id}`);
+			return { session_id, jsonPrefix: slot.jsonPrefix, inputIdSeq: slot.inputIdSeq, inputContentDigests: slot.inputContentDigests, inputContentSignatures: slot.inputContentSignatures, thinking_binding_recovery_target };
+		});
+		console.log(JSON.stringify(slots));
 	} else if (mode === "render") {
 		const { materializeM0 } = (await import(
 			join(

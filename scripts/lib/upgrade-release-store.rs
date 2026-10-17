@@ -1,4 +1,5 @@
-//! Compiled inside the v0.49.0 source tree, never against the candidate's store crate.
+//! scripts/rehearse-upgrade.ts copies this helper into the v0.49.7 archive before building it.
+//! Using that archive's McStore preserves the released schema ceiling for rollback tests.
 use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{McStore, ModuleMeta};

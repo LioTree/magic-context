@@ -1,9 +1,10 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
 import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
 import { outgoingContextRefusal } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
+import * as fences from "@magic-context/core/hooks/magic-context/lkg-recovery-fence";
 import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { persistPiPressureFromMessageEnd } from "./index";
@@ -11,6 +12,7 @@ import {
 	clearPiLkgSessionState,
 	createPiLkgCoordinator,
 	notePiLkgProviderUsage,
+	piLkgMemoForTest,
 } from "./pi-lkg";
 import { readPiLkgFitEnvelope } from "./pi-lkg-fit-envelope";
 import {
@@ -22,7 +24,11 @@ const key = "openai-codex/gpt-5.6-sol";
 const databases: Database[] = [];
 const sessions: string[] = [];
 afterEach(() => {
-	for (const session of sessions.splice(0)) clearPiLkgSessionState(session);
+	for (const session of sessions.splice(0)) {
+		fences.clearLkgRecoveryFence(session);
+		clearPiLkgSessionState(session);
+	}
+	piLkgMemoForTest.setLimits();
 	resetLkgSlotsForTest();
 	for (const db of databases.splice(0)) db.close();
 });
@@ -158,6 +164,71 @@ function harness(modelKey = key, prefixOverride?: unknown[]) {
 		recapture,
 	};
 }
+
+test("Pi memo eviction retains local recovery proof and provider usage", () => {
+	const h = harness();
+	const snapshot = h.coordinator.beginPass({
+		sessionId: h.sessionId,
+		messages: [...h.prefix, ...h.tail],
+		entryIds: ["input", "answer", "new-input"],
+		modelKey: key,
+		providerKey: "openai-codex",
+	});
+	const proof = spyOn(fences, "lkgFenceRequiresRebuild");
+	try {
+		expect(h.coordinator.recoveryFor(snapshot)).toEqual({});
+		expect(proof.mock.calls.at(-1)?.[2]).toBe(true);
+		piLkgMemoForTest.setLimits({
+			sessionMaxBytes: 0,
+			totalMaxBytes: 0,
+			maxSessions: 1,
+		});
+		expect(piLkgMemoForTest.stats().sessions).toEqual([]);
+		// The captured request survives eviction even before usage is correlated.
+		expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(
+			true,
+		);
+		const before = h.replay();
+		if (!before.ok) throw new Error(before.reason);
+		expect(before.measuredPrefix?.inputTokens).toBe(130);
+		expect(h.coordinator.recoveryFor(snapshot)).toEqual({});
+		expect(proof.mock.calls.at(-1)?.[2]).toBe(true);
+		h.recapture();
+		expect(piLkgMemoForTest.stats().sessions).toEqual([]);
+		const after = h.replay();
+		expect(after).toEqual(before);
+		expect(JSON.stringify(after.ok && after.messages)).toBe(
+			JSON.stringify([...h.prefix, ...h.tail]),
+		);
+	} finally {
+		proof.mockRestore();
+	}
+});
+
+test("Pi memo eviction retains dirty-fence recovery ownership", () => {
+	const h = harness();
+	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
+	const snapshot = h.coordinator.beginPass({
+		sessionId: h.sessionId,
+		messages: [...h.prefix, ...h.tail],
+		entryIds: ["input", "answer", "new-input"],
+		modelKey: key,
+		providerKey: "openai-codex",
+	});
+	const before = h.replay();
+	if (!before.ok) throw new Error(before.reason);
+	h.coordinator.noteRecovery(snapshot, before.messages);
+	const recovery = h.coordinator.recoveryFor(snapshot);
+	expect(recovery.prefix?.json).toBe(JSON.stringify(before.messages));
+	piLkgMemoForTest.setLimits({
+		sessionMaxBytes: 0,
+		totalMaxBytes: 0,
+		maxSessions: 1,
+	});
+	expect(piLkgMemoForTest.stats().sessions).toEqual([]);
+	expect(h.coordinator.recoveryFor(snapshot)).toEqual(recovery);
+	expect(h.replay()).toEqual(before);
+});
 
 test("Pi healthy refusal prefers correlated provider usage and prices only the new tail", () => {
 	const h = harness("anthropic/claude-fable-5-1", [

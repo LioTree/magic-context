@@ -5499,6 +5499,9 @@ pub struct SessionStatusSnapshot {
     pub loaded: LoadedState,
     pub compartment_count: usize,
     pub pending_drop_count: usize,
+    pub provider_queued_drop_count: usize,
+    pub provider_unserved_drop_count: usize,
+    pub provider_applied_drop_count: usize,
     /// Every durable `mc_tags` row for the session, regardless of coverage, compartment, or drop state.
     pub tag_count: usize,
     pub pass_trace: Option<PassTrace>,
@@ -9400,10 +9403,30 @@ impl McStore {
                 )?
                 .max(0) as usize;
             let pass_trace = read_pass_trace(&transaction, session_id)?;
+            // Provider stamps can wait before they have engine block-ID queue
+            // entries. Count their union, not the engine queue alone, and avoid
+            // double-counting stamps already forwarded to that queue.
+            let (provider_queued_drop_count, provider_unserved_drop_count, forwarded) = transaction.query_row(
+                "SELECT count(*), coalesce(sum(a.state='pending'),0), coalesce(sum(EXISTS(SELECT 1 FROM pending_agent_drops e WHERE e.session_id=?1 AND e.target_id=json_extract(t.value,'$.block_id'))),0)
+                 FROM mc_provider_conversations_v2 c
+                 JOIN mc_provider_pending_drops_v1 d ON d.conv_key=c.conv_key
+                 JOIN mc_provider_hook_answers_v1 a ON a.conv_key=d.conv_key AND a.legacy_json IS NULL
+                 JOIN json_each(a.tags_json) t ON json_extract(t.value,'$.number')=d.tag_number
+                 WHERE c.engine_namespace=?1",
+                params![session_id],
+                |row| Ok((row.get::<_, usize>(0)?, row.get::<_, usize>(1)?, row.get::<_, usize>(2)?)),
+            )?;
+            let provider_applied_drop_count = transaction.query_row(
+                "SELECT count(*) FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1",
+                params![session_id], |row| row.get(0),
+            )?;
             let snapshot = SessionStatusSnapshot {
                 loaded,
                 compartment_count: compartment_count.max(0) as usize,
-                pending_drop_count: count("pending_agent_drops")?,
+                pending_drop_count: count("pending_agent_drops")? + provider_queued_drop_count - forwarded,
+                provider_queued_drop_count,
+                provider_unserved_drop_count,
+                provider_applied_drop_count,
                 tag_count,
                 pass_trace,
             };
@@ -11676,7 +11699,15 @@ impl McStore {
                         let mut tags=tx.prepare("SELECT t.tag_number FROM pending_agent_drops d JOIN mc_tags t ON t.session_id=d.session_id AND t.block_id=d.target_id WHERE d.session_id=?1 AND d.id=?2")?;
                         numbers.extend(tags.query_map(params![session_id,drop_id],|row|row.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?);
                     }
-                    for key in keys {provider_records::consume_provider_drops_tx(tx,&key,&numbers)?;}
+                    for key in keys {
+                        let mut referenced = numbers.clone();
+                        // Bridge references authorize drops without inserting
+                        // mc_tags rows (which would change protection accounting).
+                        // Resolve those block IDs back to their queued numbers in
+                        // the same transaction that consumes the engine releases.
+                        referenced.extend(provider_records::referenced_provider_drop_numbers_tx(tx, &key, consumed_drop_ids)?);
+                        provider_records::consume_provider_drops_tx(tx,&key,&referenced)?;
+                    }
                 }
             }
             for drop_id in consumed_drop_ids {
