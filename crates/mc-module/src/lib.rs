@@ -7430,8 +7430,9 @@ impl McHandler {
         );
         let failure_started_at_ms = firing.now_ms;
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
-        // Until per-session allowlist selection is supplied, every request stays XML.
-        // Host and Broca requests must use the same decision, not a carrier default.
+        // Requests stay dormant until per-session allowlist authorization determines
+        // whether turn two is enabled. Both runners must use that session decision;
+        // the Host/Broca runner kind must not choose the output contract.
         let turn_two_enabled = false;
         if runner == HistorianRunnerKind::Host {
             // The host lane never opens a Broca route, so there is no connect step

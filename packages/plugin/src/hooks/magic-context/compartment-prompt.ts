@@ -8,7 +8,7 @@ import {
 
 export { COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT, COMPARTMENT_AGENT_SYSTEM_PROMPT };
 
-/** Both sends of an authorized session use the same combined system bytes. */
+/** Both historian turns use the same combined system when turn two is enabled. */
 export function historianSystemPrompt(turnTwoEnabled: boolean): string {
     return turnTwoEnabled
         ? COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT

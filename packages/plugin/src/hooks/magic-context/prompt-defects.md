@@ -18,9 +18,10 @@ system; the second user message contains only notices and the work items.
 | 7 | Three task prompts lack the internal-agent phrase. | No text change: friction-gate, retrospective and compress-cues keep their exact bytes and use the dreamer registration identity. The extracted README's `prompts/dreamer/_agent-registration.system.md` corresponds to `DREAMER_SYSTEM_PROMPT` in `dreamer/task-prompts.ts`, not a runtime Markdown asset. | `prompt-defects.test.ts`: `C5 row 7` pins task and registration bytes and checks the retrospective/classifier registrations. |
 | 8 | “Coding agent” is both persona and detection key. | The persona sentence remains byte-identical in both renderings and structural recomp. | `prompt-defects.test.ts`: `C5 row 8` |
 
-No tool-use prohibition is added to the historian source. The frozen OpenCode Zen blocked-read carrier
-appends this exact instruction when needed: `Summarize only the supplied conversation and memory context. Do not call tools.` Its tool bytes and instruction are owned by
-the carrier, not duplicated in either historian rendering.
+No tool-use prohibition is added to the historian source. For OpenCode Zen models
+that require a tool definition, the transport supplies a read tool but blocks every
+call, and appends this exact instruction: `Summarize only the supplied conversation and memory context. Do not call tools.` The tool definition and instruction remain
+owned by the transport, not duplicated in either historian rendering.
 
 Generate TypeScript renderings with
 `bun packages/plugin/scripts/build-historian-prompt.ts`, then vendor both exact
