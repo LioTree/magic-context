@@ -99,7 +99,7 @@ describe("Cloud Code relay", () => {
         const event = JSON.parse(streamed.split("\n").find((line) => line.startsWith("data:"))?.slice(5) ?? "{}");
         expect(event.candidates?.[0]?.content?.parts?.[0]?.text).toBe("ok");
         expect(event.response).toBeUndefined();
-        const whole = await (await send(randomGeminiBody(8), relay.hostKey, "generateContent")).json();
+        const whole = (await (await send(randomGeminiBody(8), relay.hostKey, "generateContent")).json()) as { candidates?: { finishReason?: string }[] };
         expect(whole.candidates?.[0]?.finishReason).toBe("STOP");
         expect(unwrapCloudCodeEvent(" [DONE]")).toBe(" [DONE]");
     });
@@ -114,7 +114,7 @@ describe("Cloud Code relay", () => {
         const log = JSON.stringify(relay.log);
         expect(log).not.toContain(expectations.cloudCodeToken);
         expect(log).not.toContain(relay.hostKey);
-        expect(Object.keys(relay.log[0] ?? {}).sort()).toEqual(["bytesIn", "bytesOut", "durationMs", "method", "path", "route", "status"]);
+        expect(Object.keys(relay.log[0] ?? {}).sort()).toEqual(["bytesIn", "bytesOut", "durationMs", "inputTokens", "method", "outputTokens", "path", "route", "status"]);
     });
 
     test("an upstream 401 latches the rejection and stops forwarding", async () => {

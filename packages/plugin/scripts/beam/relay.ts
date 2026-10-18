@@ -20,7 +20,8 @@
  * - each upstream `{ response: X }` event is sent back as `X`, other events unchanged;
  * - the host must present the per-run random key it was configured with; the real upstream token is
  *   held only in this process's memory and is sent only to the upstream;
- * - the log records method, path, status, duration and byte counts, never headers or bodies.
+ * - the log records method, path, status, duration, byte counts and the upstream's token counts,
+ *   never headers or bodies.
  *
  * The route table is keyed by path prefix, so a second upstream (for example the ChatGPT Codex
  * backend) can be added as another route under the same rules.
@@ -35,6 +36,9 @@ export interface RelayLogEntry {
     durationMs: number;
     bytesIn: number;
     bytesOut: number;
+    /** Token counts from the upstream's `usageMetadata` (the last one seen), for the budget. */
+    inputTokens: number;
+    outputTokens: number;
 }
 
 export interface CloudCodeRoute {
@@ -92,13 +96,33 @@ export function unwrapCloudCodeEvent(data: string): string {
     return data;
 }
 
+/** Copy the token counts out of one unwrapped Gemini reply, if it carries them. */
+function readUsage(data: string, entry: RelayLogEntry): void {
+    try {
+        const usage = (JSON.parse(data) as { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number } })
+            .usageMetadata;
+        if (usage?.promptTokenCount !== undefined) entry.inputTokens = usage.promptTokenCount;
+        if (usage?.candidatesTokenCount !== undefined) entry.outputTokens = usage.candidatesTokenCount;
+    } catch {
+        // Not JSON: nothing to count.
+    }
+}
+
 /** Rewrite an SSE stream event by event, unwrapping each `data:` line. */
-function unwrapSseStream(body: ReadableStream<Uint8Array>, count: (bytes: number) => void): ReadableStream<Uint8Array> {
+function unwrapSseStream(
+    body: ReadableStream<Uint8Array>,
+    entry: RelayLogEntry,
+): ReadableStream<Uint8Array> {
+    const count = (bytes: number) => (entry.bytesOut += bytes);
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     let buffer = "";
-    const transformLine = (line: string) =>
-        line.startsWith("data:") ? `data: ${unwrapCloudCodeEvent(line.slice(5))}` : line;
+    const transformLine = (line: string) => {
+        if (!line.startsWith("data:")) return line;
+        const data = unwrapCloudCodeEvent(line.slice(5));
+        readUsage(data, entry);
+        return `data: ${data}`;
+    };
     return body.pipeThrough(
         new TransformStream<Uint8Array, Uint8Array>({
             transform(chunk, controller) {
@@ -145,6 +169,8 @@ export function startRelay(options: RelayOptions): Relay {
                 durationMs: 0,
                 bytesIn: 0,
                 bytesOut: 0,
+                inputTokens: 0,
+                outputTokens: 0,
             };
             const finish = (response: Response) => {
                 entry.status = response.status;
@@ -185,10 +211,11 @@ export function startRelay(options: RelayOptions): Relay {
                 return finish(new Response(errorText, { status: upstream.status, headers }));
             }
             if (action === "streamGenerateContent") {
-                const stream = unwrapSseStream(upstream.body, (bytes) => (entry.bytesOut += bytes));
+                const stream = unwrapSseStream(upstream.body, entry);
                 return finish(new Response(stream, { status: upstream.status, headers }));
             }
             const unwrapped = unwrapCloudCodeEvent(await upstream.text());
+            readUsage(unwrapped, entry);
             entry.bytesOut = Buffer.byteLength(unwrapped);
             return finish(new Response(unwrapped, { status: upstream.status, headers }));
         },

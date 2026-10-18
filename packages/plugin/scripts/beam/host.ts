@@ -127,6 +127,8 @@ export interface HostModels {
     answerOutputLimit: number;
     /** Responses `reasoning.effort`; omitted when undefined. */
     answerReasoningEffort?: string;
+    /** The build agent's temperature, as the Vanilla arm sends it; omitted when undefined. */
+    answerTemperature?: number;
     /** Historian model id on Cloud Code Assist, e.g. `gemini-3.8-flash`. */
     historianModel: string;
     historianContextLimit: number;
@@ -209,9 +211,22 @@ export function writeHostConfig(paths: RootLayout, models: HostModels, wiring: H
         snapshot: false,
         compaction: { auto: false, prune: false },
         // The answer agent may use only Magic Context's two history tools.
-        tools: { "*": false, ctx_search: true, ctx_expand: true },
-        agent: { title: { disable: true }, summary: { disable: true } },
-        permission: { bash: "deny", edit: "deny", webfetch: "deny", external_directory: "deny" },
+        // OpenCode keeps `task` unless it is named explicitly.
+        tools: { "*": false, task: false, ctx_search: true, ctx_expand: true },
+        // OpenCode offers its `task` tool unless the build agent turns it off itself; the global
+        // `tools` map above does not remove it. The subagents it would launch are disabled too.
+        agent: {
+            title: { disable: true },
+            summary: { disable: true },
+            general: { disable: true },
+            explore: { disable: true },
+            build: {
+                tools: { task: false },
+                permission: { task: "deny" },
+                ...(models.answerTemperature !== undefined ? { temperature: models.answerTemperature } : {}),
+            },
+        },
+        permission: { bash: "deny", edit: "deny", webfetch: "deny", external_directory: "deny", task: "deny" },
     };
     writeFileSync(join(paths.dirs.config, "opencode.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
     const magicContext = {

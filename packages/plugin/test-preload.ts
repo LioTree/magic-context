@@ -60,6 +60,9 @@ afterAll(() => {
             const path = join(directory, entry.name);
             if (entry.isDirectory()) {
                 if (entry.name === "node_modules" || entry.name === ".git") continue;
+                // The BEAM benchmark keeps its git-ignored throwaway host roots here; their
+                // context.db files belong to benchmark runs, not to a leaking test.
+                if (path === join(packageDir, "scripts", "beam", ".runs")) continue;
                 if (entry.name === "undefined") violations.push(path);
                 scan(path);
             } else if (entry.isFile() && entry.name === "context.db") {
