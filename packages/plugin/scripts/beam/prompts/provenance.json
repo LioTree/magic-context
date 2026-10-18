@@ -11,5 +11,22 @@
     "20": "92f59d403e7a697ab2a240b74b5a30e42f0b5c929c89adb63461ca1e7e07bb2e",
     "21": "6c3588beece7006dfb7dce941c5e083942c1a7ecc4d6f5603d5eb72bded2a407",
     "44": "6dfac230619fc7f21293193d8bcb852ca4a906d03797a16bcad60b1b163633ce"
+  },
+  "released": {
+    "repo": "mohammadtavakoli78/BEAM",
+    "commit": "b2da22eac88bb0874c64665f13457eb99835774a",
+    "extraction": "runtime value of the Python string literal (escapes decoded, f-string fields kept as {name})",
+    "members": {
+      "judge": "src/prompts.py: unified_llm_judge_base_prompt",
+      "equivalence-system": "src/evaluation/compute_metrics.py: llm_equivalence system message",
+      "equivalence-user": "src/evaluation/compute_metrics.py: llm_equivalence user message f-string",
+      "long-context-question": "src/answer_probing_questions/long_term_memory_methods.py: long-context question message f-string"
+    },
+    "sha256": {
+      "judge": "593373c642a288a7b590577d8a8fc92c3f9a2b70e2f64ad6e59a040a6c56b7f5",
+      "equivalence-system": "0863c78c1b27d36c97bb7bfd2d4d6b88ef69b093e92bb4719e665527722413e2",
+      "equivalence-user": "6bf789b815decbeb1c27f5058e2416c2a6e167724c0433b1da27b0abe5cc73df",
+      "long-context-question": "4283812ce472c57c6a31fcc428bcc6af70fb0b7da998934c4b672999b8bc7bc4"
+    }
   }
 }

@@ -2,10 +2,10 @@
  * Scoring exactly as the BEAM paper describes it (§2.4) and its released code implements it
  * (github.com/mohammadtavakoli78/BEAM, src/evaluation/compute_metrics.py and report_results.py):
  *
- * - Nine abilities: the judge scores each rubric nugget 0, 0.5 or 1 with Listing 20, and the
- *   question's score is the mean over its nuggets.
+ * - Nine abilities: the judge scores each rubric nugget 0, 0.5 or 1 with the released judge prompt
+ *   (the code's version of Listing 20), and the question's score is the mean over its nuggets.
  * - Event ordering: each line of the answer is aligned to the first unused reference item the
- *   equivalence detector (Listing 21) calls the same, Kendall tau-b is computed over the ranks of
+ *   equivalence detector (the code's version of Listing 21) calls the same, Kendall tau-b is computed over the ranks of
  *   the union of both aligned lists (an item missing from a list ranks after all of its items),
  *   and the reported score is tau-b scaled to 0..1 as (tau + 1) / 2 (`tau_norm`).
  * - Headline: the mean over questions; per-ability means are reported next to it.
@@ -13,7 +13,7 @@
  * The pure parts (averaging, ranking, tau-b, alignment) take the judge as a function so they can be
  * tested on known vectors without a model.
  */
-import { prompt } from "./prompts";
+import type { PromptMessage, PromptSet } from "./prompts";
 
 export interface NuggetVerdict {
     nugget: string;
@@ -54,7 +54,7 @@ export interface QuestionScore {
 }
 
 /** One text completion from the judge model at temperature 0. */
-export type JudgeCall = (input: { system?: string; user: string }) => Promise<string>;
+export type JudgeCall = (messages: PromptMessage[]) => Promise<string>;
 
 export function mean(values: number[]): number {
     if (values.length === 0) return 0;
@@ -92,36 +92,16 @@ export function parseJudgeJson(reply: string): { score: number; reason: string; 
     };
 }
 
-/** Listing 20 with its three slots filled. */
-export async function renderNuggetPrompt(question: string, nugget: string, response: string): Promise<string> {
-    // Function replacers keep `$` sequences in model text literal.
-    return (await prompt(20))
-        .replace("<question>", () => question)
-        .replace("<rubric_item>", () => nugget)
-        .replace("<llm_response>", () => response);
-}
-
-/**
- * Listing 21 as the released code sends it: the instruction paragraph as the system message and
- * the two snippets as the user message. The listing's blank line is where that split falls.
- */
-export async function renderEquivalencePrompt(first: string, second: string): Promise<{ system: string; user: string }> {
-    const text = await prompt(21);
-    const split = text.indexOf("\n\n");
-    if (split < 0) throw new Error("Listing 21 has no blank line between instruction and snippets");
-    return {
-        system: text.slice(0, split),
-        user: text
-            .slice(split + 2)
-            .replace("{first_paragraph}", () => first)
-            .replace("{second_paragraph}", () => second),
-    };
-}
-
-export async function scoreNuggets(question: string, response: string, nuggets: string[], judge: JudgeCall): Promise<QuestionScore> {
+export async function scoreNuggets(
+    question: string,
+    response: string,
+    nuggets: string[],
+    judge: JudgeCall,
+    prompts: PromptSet,
+): Promise<QuestionScore> {
     const verdicts: NuggetVerdict[] = [];
     for (const nugget of nuggets) {
-        const raw = await judge({ user: await renderNuggetPrompt(question, nugget, response) });
+        const raw = await judge(await prompts.nuggetJudge({ question, nugget, response }));
         try {
             const parsed = parseJudgeJson(raw);
             verdicts.push({ nugget, score: parsed.score, reason: parsed.reason, raw, ...(parsed.offScale ? { offScale: true } : {}) });
@@ -231,11 +211,16 @@ export function systemItems(response: string): string[] {
     return response.split("\n");
 }
 
-export async function scoreEventOrdering(reference: string[], response: string, judge: JudgeCall): Promise<QuestionScore> {
+export async function scoreEventOrdering(
+    reference: string[],
+    response: string,
+    judge: JudgeCall,
+    prompts: PromptSet,
+): Promise<QuestionScore> {
     const system = systemItems(response);
     const checks: EquivalenceCheck[] = [];
     const aligned = await alignWithJudge(reference, system, async (referenceItem, systemItem) => {
-        const raw = await judge(await renderEquivalencePrompt(referenceItem, systemItem));
+        const raw = await judge(await prompts.equivalence({ reference: referenceItem, system: systemItem }));
         // The released code lowercases the reply and looks for "yes" anywhere in it.
         const same = raw.toLowerCase().includes("yes");
         checks.push({ reference: referenceItem, system: systemItem, same, raw });
@@ -249,9 +234,14 @@ export async function scoreQuestion(
     question: { category: string; text: string; rubric: string[] },
     response: string,
     judge: JudgeCall,
+    prompts: PromptSet,
 ): Promise<QuestionScore> {
-    if (question.category === "event_ordering") return scoreEventOrdering(question.rubric, response, judge);
-    return scoreNuggets(question.text, response, question.rubric, judge);
+    // The released code also runs the nugget judge on event-ordering questions, but its report
+    // (report_results.py) reads only `tau_norm` for them, so that extra judging is skipped here.
+    if (question.category === "event_ordering") {
+        return scoreEventOrdering(question.rubric, response, judge, prompts);
+    }
+    return scoreNuggets(question.text, response, question.rubric, judge, prompts);
 }
 
 export interface Summary {

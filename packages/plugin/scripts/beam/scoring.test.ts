@@ -1,12 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { releasedPromptSet as prompts, releasedPrompt } from "./prompts";
 import {
     alignWithJudge,
     kendallTauB,
     mean,
     orderingScore,
     parseJudgeJson,
-    renderEquivalencePrompt,
-    renderNuggetPrompt,
     scoreEventOrdering,
     scoreNuggets,
     summarize,
@@ -67,10 +66,17 @@ describe("event ordering with the equivalence judge", () => {
     });
 
     test("scores the released code's way: answer split on newlines, YES anywhere means the same", async () => {
-        const result = await scoreEventOrdering(["Core functionality", "Error handling", "Deployment"], "Deployment\nCore functionality\nError handling", async ({ user }) => {
-            const [first, second] = user.split("\n").map((line) => line.replace(/^(First|Second) snippet: /, ""));
-            return first === second ? "**YES**" : "NO";
-        });
+        const result = await scoreEventOrdering(
+            ["Core functionality", "Error handling", "Deployment"],
+            "Deployment\nCore functionality\nError handling",
+            async (messages) => {
+                const user = messages.at(-1)?.content ?? "";
+                const first = /First snippet: (.*) \n/.exec(user)?.[1];
+                const second = /Second snippet: (.*)\n/.exec(user)?.[1];
+                return first === second ? "**YES**" : "NO";
+            },
+            prompts,
+        );
         // Aligned order [Deployment, Core, Error] against [Core, Error, Deployment]: tau-b = -1/3.
         expect(result.ordering?.aligned).toEqual(["Deployment", "Core functionality", "Error handling"]);
         expect(result.score).toBeCloseTo(1 / 3, 12);
@@ -84,17 +90,28 @@ describe("nugget scoring", () => {
             second: '```json\n{"score": 0.5, "reason": "partly"}\n```',
             third: 'Here: {"score": 0, "reason": "missing"}',
         };
-        const result = await scoreNuggets("Q?", "the answer", ["first", "second", "third"], async ({ user }) => {
-            const nugget = /RUBRIC CRITERION \(what to check\): (\w+)/.exec(user)?.[1] ?? "";
-            return verdicts[nugget] ?? "";
-        });
+        const result = await scoreNuggets(
+            "Q?",
+            "the answer",
+            ["first", "second", "third"],
+            async (messages) => {
+                const user = messages[0]?.content ?? "";
+                const nugget = /RUBRIC CRITERION \(what to check\): (\w+)/.exec(user)?.[1] ?? "";
+                return verdicts[nugget] ?? "";
+            },
+            prompts,
+        );
         expect(result.nuggets?.map((verdict) => verdict.score)).toEqual([1, 0.5, 0]);
         expect(result.score).toBeCloseTo(0.5, 12);
     });
 
     test("an unparseable verdict scores 0 and records the error", async () => {
-        const result = await scoreNuggets("Q?", "A", ["one", "two"], async ({ user }) =>
-            user.includes(": one\n") ? '{"score": 1}' : "I cannot decide",
+        const result = await scoreNuggets(
+            "Q?",
+            "A",
+            ["one", "two"],
+            async (messages) => (messages[0]?.content.includes(": one\n") ? '{"score": 1}' : "I cannot decide"),
+            prompts,
         );
         expect(result.score).toBe(0.5);
         expect(result.nuggets?.[1]?.error).toContain("no JSON object");
@@ -107,19 +124,29 @@ describe("nugget scoring", () => {
     });
 });
 
-describe("prompt rendering", () => {
-    test("Listing 20 receives the question, the nugget and the response, with `$` kept literal", async () => {
-        const text = await renderNuggetPrompt("What is $HOME?", "LLM response should state: $1", "It is $& here");
-        expect(text).toContain("- QUESTION (what the user asked): What is $HOME?");
-        expect(text).toContain("- RUBRIC CRITERION (what to check): LLM response should state: $1");
-        expect(text).toContain("- RESPONSE TO EVALUATE: It is $& here");
-        expect(text).not.toMatch(/<question>|<rubric_item>|<llm_response>/);
+describe("prompt rendering (released code at the pinned commit)", () => {
+    test("the judge gets the nugget and the response as one user message, with `$` kept literal", async () => {
+        const messages = await prompts.nuggetJudge({ question: "unused", nugget: "should state: $1", response: "It is $& here" });
+        expect(messages).toHaveLength(1);
+        expect(messages[0]?.role).toBe("user");
+        expect(messages[0]?.content).toContain("- RUBRIC CRITERION (what to check): should state: $1");
+        expect(messages[0]?.content).toContain("- RESPONSE TO EVALUATE: It is $& here");
+        expect(messages[0]?.content).not.toMatch(/<rubric_item>|<llm_response>/);
     });
 
-    test("Listing 21 splits into the instruction and the two snippets", async () => {
-        const { system, user } = await renderEquivalencePrompt("one", "two");
-        expect(system.startsWith("You are a binary classifier.")).toBe(true);
-        expect(user).toBe("First snippet: one\nSecond snippet: two");
+    test("equivalence sends the released system message and the snippets with their whitespace", async () => {
+        const messages = await prompts.equivalence({ reference: "one", system: "two" });
+        expect(messages.map((message) => message.role)).toEqual(["system", "user"]);
+        expect(messages[0]?.content).toBe(await releasedPrompt("equivalence-system"));
+        expect(messages[1]?.content).toBe(
+            "First snippet: one \n\n                       Second snippet: two\n                    ",
+        );
+    });
+
+    test("the question turn is the long-context wrapper verbatim", async () => {
+        expect(await prompts.questionTurn("When?")).toBe(
+            "\n            NOTE: Only provide the answer without any explanations. \n            Question: When?",
+        );
     });
 });
 
