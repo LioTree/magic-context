@@ -6,7 +6,7 @@ It runs in several hosts and shares one implementation of the core behaviour:
 
 - **OpenCode 1.x and 2.x**, as the npm plugin `@cortexkit/opencode-magic-context` (`packages/plugin`). The 1.x and 2.x hosts have different plugin APIs; each has a thin adapter over the same core.
 - **Pi and OMP**, as `@cortexkit/pi-magic-context` (`packages/pi-plugin`), which imports the core from the OpenCode package.
-- **The Rust module `ck-mc`** (`crates/`), a module of the subconscious daemon (subc). It runs the transform and historian when a project opts into Rust transform mode, and it serves Claude Code through the Thalamus proxy.
+- **The Rust module `ck-mc`** (`crates/`), a module of the subconscious daemon (subc). It serves the provider lanes for hosts that run without an in-process plugin: Broca workers, Claude Code through the Thalamus gateway, and bridged OpenCode and Pi sessions. It runs their transform steps, compaction and historian.
 
 All hosts and all projects on a machine share one SQLite database, `~/.local/share/cortexkit/magic-context/context.db`. Session-scoped tables carry a `harness` column; project-scoped tables (memories, git commits) are shared across hosts. The Rust module keeps its own store, `store.db`, which moves in step with `context.db` (see Storage).
 
@@ -28,9 +28,9 @@ Magic Context rewrites the message array and system prompt the host is about to 
 | Layer | Where | Role |
 |---|---|---|
 | Entry | `src/index.ts` | Load config, register hooks, tools, hidden agents, RPC server and dream timer. Default-exports both host shapes (`{ id, server }` for 1.x, `setup` for 2.x). |
-| OpenCode 1 adapter | `src/plugin/` | Hook wrappers, tool registry, RPC handlers, dream-timer lifecycle, Rust-mode tool routing. |
+| OpenCode 1 adapter | `src/plugin/` | Hook wrappers, tool registry, RPC handlers, dream-timer lifecycle. |
 | OpenCode 2 adapter | `src/v2/` | Context and compaction hooks, store reader, hidden-completion executor, fold ownership, TUI seam. |
-| Runtime | `src/hooks/magic-context/` | The transform, its postprocess phase, history rendering, nudges, strip-and-replay, the Rust-mode adapter. |
+| Runtime | `src/hooks/magic-context/` | The transform, its postprocess phase, history rendering, nudges, strip-and-replay. |
 | Services | `src/features/magic-context/` | Storage and migrations, tagger, scheduler, memory, dreamer, search and indexes, overflow detection. |
 | Tools | `src/tools/` | `ctx_reduce`, `ctx_expand`, `ctx_note`, `ctx_memory`, `ctx_search`. |
 | Shared | `src/shared/`, `src/config/` | Logger, SQLite backend, RPC, config schema and loader, prompt surfaces, window geometry. |
@@ -41,9 +41,9 @@ Magic Context rewrites the message array and system prompt the host is about to 
 
 `STRUCTURE.md` has the directory map and where to add new code.
 
-## Transform modes
+## Where the transform runs
 
-The transform runs in TypeScript by default. With `transform_mode: "rust"` (experimental; OpenCode 1 only, and only when subc is configured at user level; otherwise it falls back to TypeScript), the TypeScript layer becomes a coordinator: it syncs state to the module, sends each pass over subc, and serves the module's output. If the module fails, it replays the last known good output for the session (`lkg-slot.ts`, `lkg-replay.ts`) so the cached prefix survives the fault, and refuses the turn rather than send an unmanaged prompt when it cannot.
+Inside OpenCode 1 and 2, Pi and OMP, the TypeScript transform is the only in-host transform; the old `transform_mode` setting is accepted and ignored with one warning. Hosts without an in-process plugin use ck-mc's provider lanes: Broca workers and Claude Code call its step-transform and compaction hooks directly, and the OpenCode and Pi bridges relay a session through the Thalamus harness module to the same lanes. Each session runs on exactly one path, the in-host TypeScript transform or a provider lane; when a session is bridged, the in-host plugin stands down for it.
 
 <!-- mc:protected START — hand-authored cache-stability core. The dreamer's maintain-docs task MUST NOT edit, reword, reorder, trim, or drop anything between mc:protected START and mc:protected END; carry it forward byte-for-byte on any rewrite. Only a human edits this region, deliberately. -->
 
