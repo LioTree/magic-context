@@ -194,13 +194,14 @@ it("a first render that fails after its strip committed still omits that thinkin
 		fail.mockRestore();
 	}
 	expect(failed).toBe(true);
-	// The failure came after tagging: the strip and some edits are durable.
-	expect(f.omissions()).toHaveLength(6);
+	// The failure came after tagging: some edits are durable.
 	expect(getTagsBySession(f.db, "first-render-failure").length).toBeGreaterThan(
 		0,
 	);
+	// The next pass is a valid request: the committed strip is replayed, not undone.
 	const next = await f.pass();
 	expect(f.thinking(next)).toEqual([]);
+	expect(f.omissions()).toHaveLength(6);
 	expect(f.thinking(await f.pass())).toEqual([]);
 });
 
