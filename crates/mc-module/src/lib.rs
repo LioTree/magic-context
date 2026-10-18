@@ -21566,6 +21566,8 @@ mod tests {
     mod single_store_drill;
     mod tool_catalog;
     mod tool_catalog_conformance;
+    // Mode-3 guidance against the standalone plugins' captured guidance.
+    mod standalone_guidance_parity;
     // The per-harness default runner, driven through real passes.
     mod default_runner;
     mod retrieval_parity;

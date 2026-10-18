@@ -1,0 +1,30 @@
+import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+const root = resolve(import.meta.dir, "../../../..");
+const generator = resolve(root, "crates/mc-module/gen/gen-standalone-guidance.ts");
+
+// The Rust module's mode-3 guidance must equal what this plugin and the Pi
+// plugin put into a standalone session's system prompt. The Rust test reads a
+// committed capture of that guidance; this test fails when a plugin change makes
+// the capture stale, so the capture is regenerated in the same change.
+test("standalone guidance capture for the Rust parity test is current", () => {
+    const scratch = mkdtempSync(join(tmpdir(), "mc-standalone-guidance-check-"));
+    try {
+        const result = Bun.spawnSync(["bun", generator, "--check"], {
+            cwd: root,
+            env: { ...process.env, TMPDIR: scratch },
+            stderr: "pipe",
+            stdout: "pipe",
+            windowsHide: true,
+        });
+        if (result.exitCode !== 0) {
+            throw new Error(`generator --check failed:\n${result.stderr.toString()}`);
+        }
+        expect(result.stdout.toString()).toContain("standalone guidance fixture is current");
+    } finally {
+        rmSync(scratch, { recursive: true, force: true });
+    }
+}, 120_000);

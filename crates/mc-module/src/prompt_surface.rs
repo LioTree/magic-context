@@ -125,8 +125,13 @@ pub(crate) fn without_smart_note_description(text: &str) -> String {
 }
 
 pub(crate) fn without_smart_note_guidance(text: &str) -> String {
-    let plain = text.replace(" A note with a `surface_condition` is left with an outside checker that looks the condition up periodically and returns the note only when it holds.", "")
-        .replace("; a `surface_condition` leaves the note with an outside checker that returns it when the condition holds", "");
+    // The plugin's `withoutSmartNoteGuidance` removes only the first occurrence
+    // of each smart-note sentence (a JavaScript string `replace`); a later copy
+    // stays in its line, and the line filter below then drops that whole line.
+    // Removing every occurrence here would keep the rest of such a line and
+    // serve different bytes from the standalone plugins.
+    let plain = text.replacen(" A note with a `surface_condition` is left with an outside checker that looks the condition up periodically and returns the note only when it holds.", "", 1)
+        .replacen("; a `surface_condition` leaves the note with an outside checker that returns it when the condition holds", "", 1);
     let mut smart_section_level = 0;
     plain
         .split('\n')
