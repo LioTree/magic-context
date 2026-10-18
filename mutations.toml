@@ -89,11 +89,11 @@ id = 'ts-stale-reduce-detects-only-on-bust'
 guards = 'new stale ctx_reduce strips are detected only when the prefix is eligible for editing, never on a defer or a signed-prefix hold'
 file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
 old = '''
-                detect: canEditWholePrefix,
-                protectedCount: args.protectedCount,'''
+                        detect: canEditWholePrefix,
+                        protectedCount: args.protectedCount,'''
 new = '''
-                detect: true,
-                protectedCount: args.protectedCount,'''
+                        detect: true,
+                        protectedCount: args.protectedCount,'''
 test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
 runner = 'command'
 command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
@@ -106,9 +106,10 @@ id = 'ts-image-strip-detects-only-on-bust'
 guards = 'processed images are newly stripped only when the current mode permits first application; a defer only replays the frozen ids'
 file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
 old = '''
-                detect:
-                    (holdEnabled ? isCacheBustingPass : canEditWholePrefix) && imageWatermark > 0,'''
-new = 'detect: imageWatermark > 0,'
+                    detect:
+                        (holdEnabled ? isCacheBustingPass : canEditWholePrefix) &&
+                        imageWatermark > 0,'''
+new = '                    detect: imageWatermark > 0,'
 test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
 runner = 'command'
 command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
@@ -226,8 +227,22 @@ expect_message = 'Received: "cleared"'
 id = 'ts-signed-thinking-invalidated-by-prefix-edit'
 guards = 'a busting pass whose first application edits bytes before newer signed thinking strips that thinking (the provider would reject the edited signature)'
 file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
-old = '        firstApplicationEdits.beforeNewerThinking;'
-new = '        false;'
+old = '''
+    const firstEditPrecedesThinking = (): boolean =>
+        firstApplicationEdits.beforeNewerThinking ||
+        [...firstApplicationLocations].some(([message, part]) => {
+            const index = sourceOrder.get(message);
+            return (
+                index !== undefined &&
+                !!lastThinking &&
+                (index < lastThinking.message ||
+                    (index === lastThinking.message && part <= lastThinking.part))
+            );
+        }) ||
+        droppedTokenReductions.some(
+            (reduction) => tagEditBeforeThinking.get(reduction.tagNumber) ?? true,
+        );'''
+new = '    const firstEditPrecedesThinking = (): boolean => false;'
 test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
 runner = 'command'
 command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
