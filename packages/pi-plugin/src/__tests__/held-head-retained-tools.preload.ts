@@ -1,5 +1,9 @@
 import { spyOn } from "bun:test";
+import { setHarness } from "@magic-context/core/shared/harness";
 import * as contextHandler from "../context-handler";
+
+// Match the Pi entrypoint so the final fit checks run in this child process.
+setHarness("pi");
 
 const register = contextHandler.registerPiContextHandler;
 const retainedReads = 16;

@@ -104,6 +104,7 @@ import { compareRawSessionMessageOrder, resolveHostServedBoundaryId } from "./re
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import { projectCompartmentScores, readAppliedScoreWatermark } from "./score-projection";
+import { refuseServedPrefix, replayServedPrefix, type ServedPrefix } from "./served-prefix";
 import type { MessageLike } from "./tag-messages";
 import { formatDate } from "./temporal-awareness";
 import { renderUserProfileContent } from "./user-profile-render";
@@ -1136,6 +1137,7 @@ export interface PrefixTrimSourceOrder {
 }
 
 export interface InjectM0M1Result {
+    servedPrefixRecord?: ServedPrefix<MessageLike>;
     injected: boolean;
     prependedMessageCount: number;
     m0RematerializedThisPass: boolean;
@@ -4657,6 +4659,23 @@ export function hasCompleteCachedM0M1(db: Database, sessionId: string): boolean 
 
 export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
     const prepared = options.preparedPrefix;
+    if (prepared?.servedPrefixRecord && options.messages) {
+        const record = prepared.servedPrefixRecord;
+        const problem = replayServedPrefix({
+            messages: options.messages,
+            record,
+            stableId: (message) => message.info.id,
+            isHead: isSyntheticPrefixHead,
+            isSummary: (message) => message.info.summary === true,
+            keepIdless: isHostRenderedSystemMessage,
+        });
+        if (problem) refuseServedPrefix(problem, options.sessionId);
+        return {
+            ...prepared,
+            prependedMessageCount: record.head.length,
+            prefixTrimStatus: "applied",
+        };
+    }
     if (prepared?.preparedMessages) {
         const head = prepared.preparedMessages;
         let prefixTrimStatus: PrefixTrimStatus = "not-attempted";

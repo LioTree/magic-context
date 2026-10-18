@@ -13,6 +13,7 @@ const source =
 // Each phase loads the real implementation in a new process over one owned
 // store. Failed handler construction must not let its caller dispatch raw input.
 const childCode = `
+const { spyOn } = await import('bun:test');
 const { join } = await import('node:path');
 const { pathToFileURL } = await import('node:url');
 const root = process.env.MC_UNCAPTURED_SOURCE;
@@ -22,7 +23,22 @@ const { registerPiContextHandler } = await load('packages/pi-plugin/src/context-
 const { createDbLkgPersistence, loadPersistedLkgSlot } = await load('packages/plugin/src/hooks/magic-context/lkg-persist.ts');
 const { getInMemorySlot, registerLkgPersistence } = await load('packages/plugin/src/hooks/magic-context/lkg-slot.ts');
 const { lkgRecoveryFenceUnclean } = await load('packages/plugin/src/hooks/magic-context/lkg-recovery-fence.ts');
-const { createPiLkgCoordinator } = await load('packages/pi-plugin/src/pi-lkg.ts');
+const coordinatorModule = await load('packages/pi-plugin/src/pi-lkg.ts');
+const { createPiLkgCoordinator, PiLkgUncapturable } = coordinatorModule;
+let uncaptured = false;
+let publicationFailures = 0;
+spyOn(coordinatorModule, 'createPiLkgCoordinator').mockImplementation((...args) => {
+  const coordinator = createPiLkgCoordinator(...args);
+  const capture = coordinator.captureAppliedPass;
+  coordinator.captureAppliedPass = (request) => {
+    if (uncaptured) {
+      publicationFailures++;
+      throw new PiLkgUncapturable('output_identity_unresolved', 'Fixture output cannot be captured');
+    }
+    return capture(request);
+  };
+  return coordinator;
+});
 const dbPath = join(process.env.MC_UNCAPTURED_ROOT, 'context.db');
 const db = u.createTestDb(dbPath);
 registerLkgPersistence(createDbLkgPersistence(db));
@@ -42,7 +58,11 @@ const pass = async (messages, mapped) => {
     model:{provider:'anthropic',id:'claude-opus-5-5',api:'anthropic-messages',contextWindow:100000},
     getContextUsage:()=>({tokens:20000,percent:20,contextWindow:100000}),
   };
-  if (!mapped) ctx.sessionManager.getBranch = () => { throw new Error('branch temporarily unavailable'); };
+   if (!mapped) ctx.sessionManager.getBranch = () => {
+     if (mode === 'seed-empty') throw new Error('branch temporarily unavailable');
+     // User requests are persisted; the new signed assistant may still have no entry id.
+     return input.flatMap((message,i)=>message.role==='user' ? [{type:'message',id:'entry-'+i,message}] : []);
+   };
   return handler({messages:input},ctx);
 };
 const mode = process.env.MC_UNCAPTURED_MODE;
@@ -95,6 +115,9 @@ if (mode === 'restart-replay') {
       provider:'anthropic',model:'claude-opus-5-5',api:'anthropic-messages',
       content:[{type:'thinking',thinking:'kept reasoning',thinkingSignature:'opaque-signature'},{type:'text',text:'continue'}],
     });
+    // Keep the persisted user's prefix identity; inject the independent
+    // uncapturable-output publication failure this fixture is testing.
+    uncaptured = mode === 'seed-older' || mode === 'wider';
     const output = await pass([...raw,tail],false);
     result = {older:!!older,dirty:lkgRecoveryFenceUnclean(session),
       saved:!!loadPersistedLkgSlot(db,session),inMemory:!!getInMemorySlot(session),
@@ -110,6 +133,7 @@ if (mode === 'restart-replay') {
     }
   }
 }
+result.publicationFailures = publicationFailures;
 console.log('UNCAPTURED_PROOF='+JSON.stringify(result));
 db.close();
 process.exit(0);
@@ -172,7 +196,12 @@ test("numbers-only publication with an older LKG fences its restart replay", () 
 	const root = fixture();
 	try {
 		const published = child(root, "seed-older");
-		expect(published).toMatchObject({ older: true, saved: true, dirty: true });
+		expect(published).toMatchObject({
+			older: true,
+			saved: true,
+			dirty: true,
+			publicationFailures: 1,
+		});
 		expect(published.output).not.toBe(published.raw);
 		expect(child(root, "restart-replay")).toMatchObject({ replay: false });
 		const restarted = child(root, "restart");
@@ -211,6 +240,7 @@ test("an older LKG with unresolved signed entry IDs still refuses the required p
 			older: true,
 			dirty: true,
 			refused: true,
+			publicationFailures: 1,
 		});
 		expect(published.reasons).toContain(
 			"Cannot persist thinking omission without a stable entry id",

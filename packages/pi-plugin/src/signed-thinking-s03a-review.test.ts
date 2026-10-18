@@ -20,6 +20,7 @@ import {
 } from "@magic-context/core/hooks/magic-context/edit-admission";
 import { protectNewTagMutations } from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
 import * as noteNudger from "@magic-context/core/hooks/magic-context/note-nudger";
+import { readServedPrefix } from "@magic-context/core/hooks/magic-context/served-prefix";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
 import {
 	type Block,
@@ -576,23 +577,31 @@ async function historyFixture(
 }
 
 describe("signed-thinking s03a review: Pi stable-id migration", () => {
-	test("handler stable-id migration preserves a sent placeholder under thinking", async () => {
+	test("handler refuses unproven stable-id migration under thinking without losing the placeholder", async () => {
 		const f = await historyFixture("s03a-handler-cutover", true, "off");
 		try {
 			const before = await f.pass();
+			const record = readServedPrefix(f.db, f.sessionId);
 			expect(f.mock.check(requestWire(before.messages))).toBeNull();
-			f.resolveEntryIds();
-			const after = await f.pass();
 			expect(JSON.stringify(requestWire(before.messages))).toContain(
 				"[dropped §998§]",
 			);
-			expect(JSON.stringify(requestWire(after.messages))).toContain(
-				"[dropped §998§]",
+			f.resolveEntryIds();
+			let failure: unknown;
+			try {
+				await f.pass();
+			} catch (error) {
+				failure = error;
+			}
+			expect(String(((failure as Error)?.cause as Error)?.cause)).toContain(
+				"served prefix cannot be reproduced",
 			);
-			console.log(
-				`HANDLER-CUTOVER-REJECTION ${f.mock.check(requestWire(after.messages))}`,
-			);
-			expect(f.mock.check(requestWire(after.messages))).toBeNull();
+			expect(readServedPrefix(f.db, f.sessionId)).toEqual(record);
+			expect(JSON.stringify(f.raw)).toContain("[dropped §998§]");
+			f.userTurn();
+			const recovered = await f.pass();
+			expect(f.mock.check(requestWire(recovered.messages))).toBeNull();
+			expect(readServedPrefix(f.db, f.sessionId)?.turn).toBe("next-user");
 		} finally {
 			f.close();
 		}

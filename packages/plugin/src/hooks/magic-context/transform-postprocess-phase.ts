@@ -24,6 +24,7 @@ import {
     getMaxDroppedTagNumber,
     getMaxM0MutationId,
     getNoteNudgeAnchors,
+    getOrCreateSessionMeta,
     getPendingCompactionMarkerState,
     getPendingOps,
     getPendingOpsCount,
@@ -139,6 +140,7 @@ import {
     type InjectM0M1Result,
     injectM0M1,
     type M0HardSignals,
+    type M0M1RenderOptions,
     type M0M1State,
     MaterializeContentionError,
     type MaterializeDecision,
@@ -180,6 +182,16 @@ import {
     modelAcceptsEmptyContent,
     replaySentinelByMessageIds,
 } from "./sentinel";
+import {
+    type PrefixProvenance,
+    prefixRecordProblem,
+    prefixTurn,
+    readServedPrefix,
+    refuseServedPrefix,
+    type ServedPrefix,
+    validateServedPrefix,
+    writeServedPrefix,
+} from "./served-prefix";
 import { servedPrefixMatches } from "./strict-thinking-prefix";
 import {
     applyFrozenTrailingBlankDecisions,
@@ -1858,6 +1870,8 @@ interface RunPostTransformPhaseArgs {
 }
 
 export interface PostTransformPhaseResult {
+    finalizeServedPrefix?: (publish?: boolean) => boolean;
+    prefixRecordWritable?: boolean;
     thinkingReleasedForFit?: boolean;
     explicitMaterializedSuccessfully: boolean;
     deferredMaterializedSuccessfully: boolean;
@@ -2312,6 +2326,37 @@ export async function runPostTransformPhase(
                 ),
         });
     let editAdmission = makeEditAdmission();
+    const prefixProvenance: PrefixProvenance = {
+        host: args.opencode2 ? "opencode-v2" : "opencode-v1",
+        id_space: args.opencode2 ? "opencode-v2-message" : "opencode-v1-message",
+        generation: args.opencode2 ? "v2" : "v1",
+        projection: "messages",
+    };
+    const prefixSourceIds = new Set(
+        (
+            args.prefixTrimSourceOrder?.messageIds ??
+            args.messages.map((message) => message.info.id)
+        ).filter((id): id is string => !!id),
+    );
+    const recordTurn = prefixTurn(args.messages, (message) => message.info.id);
+    const prefixRecordEnabled =
+        m0M1EnabledForFold && args.thinkingBindingRecoveryEnabledForModel === true;
+    let prefixRecord: ServedPrefix<MessageLike> | null = null;
+    if (prefixRecordEnabled) {
+        try {
+            prefixRecord = readServedPrefix(args.db, args.sessionId);
+        } catch (error) {
+            if (!compactionOff) throw degradedPassError("served-prefix-read", error);
+        }
+    }
+    let replayedPrefixRecord = false;
+    let offPrefixFallback: (() => MessageLike[] | undefined) | undefined;
+    const prefixUnverified = (reason: string): void => {
+        sessionLog(
+            args.sessionId,
+            `edit admission: served_prefix_unverified reason=${reason} held_edits=1`,
+        );
+    };
     const heldWholeMessages = new Map<string, string[]>();
     const admitWholeMessage =
         (lane: string) =>
@@ -3889,16 +3934,85 @@ export async function runPostTransformPhase(
     // Same gate computed once at the top for the known-bust fold decision.
     const m0M1Enabled = m0M1EnabledForFold;
     if (m0M1Enabled && args.m0M1) {
-        // Serve the persisted pair and its trim boundary as they are. Marking
-        // the replay contention-exhausted keeps this pass from counting as
-        // consumed history, so deferred refreshes stay pending.
+        // Replay saved history/knowledge messages and resume raw host history
+        // at its saved first-kept message. Reusing the saved head summarizes no
+        // new history: leave the host's compaction-marker update and the pending
+        // history/knowledge refresh queued until signed thinking no longer
+        // binds the current turn's prefix.
+        if (prefixRecordEnabled) {
+            let recordProblem = prefixRecordProblem(
+                prefixRecord,
+                prefixProvenance,
+                recordTurn,
+                activeThinkingPrefixHold,
+            );
+            if (compactionOff && prefixRecord) {
+                const firstRawId = args.messages.find((message) => !!message.info.id)?.info.id;
+                recordProblem ??=
+                    prefixRecord.summary !== null || prefixRecord.first_kept?.id !== firstRawId
+                        ? "off-mode record does not describe the full raw window"
+                        : validateServedPrefix(
+                              prefixRecord,
+                              args.messages,
+                              (message) => message.info.id,
+                          );
+            }
+            const candidateHead = !activeThinkingPrefixHold
+                ? prepareCachedM0M1Replay(args.db, args.sessionId)?.preparedMessages
+                : undefined;
+            const unchangedHead =
+                !!candidateHead &&
+                JSON.stringify(candidateHead) === JSON.stringify(prefixRecord?.head);
+            const wantsRecord =
+                activeThinkingPrefixHold ||
+                (unchangedHead &&
+                    !foldBustsServedPrefixThisPass &&
+                    !thinkingReleasedForFit &&
+                    !firstRenderBust);
+            const firstKeptPresent = prefixRecord?.first_kept
+                ? args.messages.some((message) => message.info.id === prefixRecord?.first_kept?.id)
+                : !args.messages.some(
+                      (message) => !!message.info.id && message.info.summary !== true,
+                  );
+            if (!activeThinkingPrefixHold && !compactionOff && (recordProblem || !firstKeptPresent))
+                persistCompanion();
+            if (wantsRecord && !recordProblem && firstKeptPresent && prefixRecord) {
+                preparedPrefix = {
+                    injected: true,
+                    prependedMessageCount: 0,
+                    m0RematerializedThisPass: false,
+                    materializationContentionRetryExhausted: true,
+                    decision: { value: false, reason: "cache_hit" },
+                    servedPrefixRecord: prefixRecord,
+                    preparedTrimBoundaryId: prefixRecord.cut_mode.id,
+                    m0Bytes: Buffer.from(
+                        prefixRecord.head[0]?.parts
+                            .map((part) =>
+                                isRecord(part) && typeof part.text === "string" ? part.text : "",
+                            )
+                            .join("") ?? "",
+                    ),
+                    m1Text:
+                        prefixRecord.head[1]?.parts
+                            .map((part) =>
+                                isRecord(part) && typeof part.text === "string" ? part.text : "",
+                            )
+                            .join("") ?? "",
+                };
+                replayedPrefixRecord = true;
+            } else if (activeThinkingPrefixHold) {
+                const reason = recordProblem ?? "first kept id missing";
+                if (!compactionOff) refuseServedPrefix(reason, args.sessionId);
+                prefixUnverified(reason);
+            } else if (wantsRecord && !compactionOff) persistCompanion();
+        }
         if (freezeM0M1 && !preparedPrefix) {
             preparedPrefix = prepareCachedM0M1Replay(args.db, args.sessionId);
         }
         const tInjectM0M1 = performance.now();
         try {
             const messagesBeforeInjection = args.messages.slice();
-            const result = injectM0M1({
+            const injectionOptions: M0M1RenderOptions = {
                 db: args.db,
                 sessionId: args.sessionId,
                 messages: args.messages,
@@ -3936,7 +4050,17 @@ export async function runPostTransformPhase(
                             persistCompanion();
                     };
                 },
-            });
+            };
+            const result = injectM0M1(injectionOptions);
+            if (compactionOff)
+                offPrefixFallback = () =>
+                    prepareCachedM0M1Replay(args.db, args.sessionId)?.preparedMessages ??
+                    injectM0M1({
+                        ...injectionOptions,
+                        messages: undefined,
+                        preparedPrefix: undefined,
+                        state: getOrCreateSessionMeta(args.db, args.sessionId) as M0M1State,
+                    }).preparedMessages;
             deliveredPrefix = result;
             if (result.prefixTrimStatus === "applied") {
                 // Preparation can summarize history without removing messages from
@@ -4194,6 +4318,7 @@ export async function runPostTransformPhase(
         explicitMaterializedSuccessfully ||
         deferredMaterializedSuccessfully;
     const historyWasConsumedThisPass =
+        !replayedPrefixRecord &&
         (!m0M1Enabled ||
             (deliveredPrefix?.injected === true &&
                 !deliveredPrefix.materializationContentionRetryExhausted)) &&
@@ -4324,21 +4449,44 @@ export async function runPostTransformPhase(
         }
     }
 
-    // A busting pass retires a cleared marker that defer passes kept serving,
-    // which takes its summary out of the served history.
-    const deferredClearedMarkerRetires =
-        !compactionOff &&
-        isCacheBustingPass &&
-        persistedCompactionMarkerState === null &&
-        getDeferredClearedCompactionMarkerState(args.db, args.sessionId) !== null;
-
     // Compaction-off: the marker reconciler and the deferred marker drain are
     // compaction machinery — gated off. The off-transition deletes the MC
     // marker rows and clears the persisted/pending marker state, so nothing
     // here has state to replay; leaving it live would re-insert a synthetic
     // summary into the wire of a mode that must stay additive-only.
-    if (!compactionOff) {
+    if (
+        !compactionOff &&
+        !(replayedPrefixRecord && (activeThinkingPrefixHold || !isCacheBustingPass))
+    ) {
         const tMarkerWire = performance.now();
+        const markerWire = (
+            summary: MessageLike | null | undefined = args.messages.find(
+                (message) => message.info.summary === true,
+            ),
+        ): string | null => {
+            return summary
+                ? stableStringify([
+                      summary.info.role,
+                      summary.parts
+                          .filter((part) => !isPartDroppedBeforeWire(part, args.resolvedProviderID))
+                          .map(providerVisiblePart),
+                  ])
+                : null;
+        };
+        const hasPreviousPrefix =
+            prefixRecordEnabled &&
+            prefixRecord !== null &&
+            prefixRecordProblem(prefixRecord, prefixProvenance, recordTurn, false) === null;
+        // Raw host history need not contain the synthetic summary served last time.
+        // Prefer that authoritative record over the current rebuilt array.
+        const markerBefore = prefixRecordEnabled
+            ? markerWire(hasPreviousPrefix ? prefixRecord?.summary : undefined)
+            : null;
+        const legacyMarkerRetires =
+            !hasPreviousPrefix &&
+            isCacheBustingPass &&
+            persistedCompactionMarkerState === null &&
+            getDeferredClearedCompactionMarkerState(args.db, args.sessionId) !== null;
         pair(
             () =>
                 (args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy).reconcile(
@@ -4352,8 +4500,12 @@ export async function runPostTransformPhase(
                         isCacheBustingPass,
                     },
                 ),
-            () => deferredClearedMarkerRetires,
+            () => (hasPreviousPrefix ? markerWire() !== markerBefore : legacyMarkerRetires),
         );
+        // Applying, replacing or retiring a visible summary changes the prefix.
+        // Retiring bookkeeping for a summary never served changes no bytes.
+        if (prefixRecordEnabled && markerWire() !== markerBefore)
+            recordFirstApplicationWireEdit(true);
         logTransformTiming(args.sessionId, "pp.markerWireReconcile", tMarkerWire);
     }
 
@@ -5306,9 +5458,109 @@ export async function runPostTransformPhase(
                 `edit admission: release reason=${parkedReleaseReasons.join(",")}`,
             );
         }
+        const finalizeServedPrefix = (publish = true): boolean => {
+            let lateStrip = false;
+            if (prefixRecordEnabled && m0M1InjectedThisPass) {
+                const problem =
+                    replayedPrefixRecord && prefixRecord
+                        ? validateServedPrefix(
+                              prefixRecord,
+                              args.messages,
+                              (message) => message.info.id,
+                          )
+                        : null;
+                if (activeThinkingPrefixHold) {
+                    if (problem && !compactionOff) refuseServedPrefix(problem, args.sessionId);
+                    if (problem) {
+                        prefixUnverified(problem);
+                        try {
+                            const head = offPrefixFallback?.();
+                            if (head) {
+                                let end = 0;
+                                while (
+                                    end < args.messages.length &&
+                                    isSyntheticHeadMessage(args.messages[end])
+                                )
+                                    end++;
+                                args.messages.splice(0, end, ...structuredClone(head));
+                            }
+                        } catch (error) {
+                            prefixUnverified(`fallback failed: ${getErrorMessage(error)}`);
+                        }
+                    }
+                } else {
+                    if (problem && !compactionOff) {
+                        const priorCompanionCount = companionIds.size;
+                        persistCompanion();
+                        lateStrip = companionIds.size > priorCompanionCount;
+                        // Thinking removed after tail accounting changes part positions.
+                        // Discard that advisory baseline rather than reuse stale coordinates.
+                        if (lateStrip) args.channel1StateBySession?.delete(args.sessionId);
+                        finalizeMessageRepresentation(args.messages, args.resolvedProviderID, {
+                            frozenThinkingBindingMessageIds: new Set([
+                                ...savedBindings,
+                                ...companionIds,
+                            ]),
+                            skipTrailingWhitespaceStrip: true,
+                        });
+                    }
+                    if (!publish) return lateStrip;
+                    let headEnd = 0;
+                    while (
+                        headEnd < args.messages.length &&
+                        isSyntheticHeadMessage(args.messages[headEnd])
+                    )
+                        headEnd++;
+                    const head = args.messages.slice(0, headEnd);
+                    const summary = compactionOff
+                        ? null
+                        : (args.messages.find((message) => message.info.summary === true) ?? null);
+                    const firstKept = args.messages.find(
+                        (message) =>
+                            message.info.summary !== true &&
+                            !!message.info.id &&
+                            prefixSourceIds.has(message.info.id),
+                    );
+                    try {
+                        writeServedPrefix({
+                            db: args.db,
+                            sessionId: args.sessionId,
+                            head,
+                            summary,
+                            firstKept,
+                            firstKeptId: firstKept?.info.id,
+                            turn: recordTurn,
+                            provenance: prefixProvenance,
+                            cut: replayedPrefixRecord
+                                ? prefixRecord?.cut_mode
+                                : deliveredPrefix?.preparedTrimBoundaryId &&
+                                    deliveredPrefix.prefixTrimStatus === "applied"
+                                  ? {
+                                        mode:
+                                            firstKept?.info.id ===
+                                            deliveredPrefix.preparedTrimBoundaryId
+                                                ? "partial"
+                                                : "inclusive",
+                                        id: deliveredPrefix.preparedTrimBoundaryId,
+                                    }
+                                  : {
+                                        mode: "none",
+                                        id: deliveredPrefix?.preparedTrimBoundaryId ?? null,
+                                    },
+                        });
+                    } catch (error) {
+                        if (!compactionOff) throw degradedPassError("served-prefix-write", error);
+                        prefixUnverified(`write failed: ${getErrorMessage(error)}`);
+                    }
+                }
+            }
+            return lateStrip;
+        };
         parkedTriggers?.persist(args.db, args.sessionId);
         if (!parkedTriggers?.pending) parkedBustTriggersBySession.delete(args.sessionId);
         return {
+            finalizeServedPrefix: prefixRecordEnabled ? finalizeServedPrefix : undefined,
+            prefixRecordWritable: prefixRecordEnabled && !activeThinkingPrefixHold,
             explicitMaterializedSuccessfully,
             deferredMaterializedSuccessfully,
             materialized,

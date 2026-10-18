@@ -5119,8 +5119,8 @@ for (const { modelID, prefixBound } of [
             getTagsBySession(db, sessionId).find((t) => t.tagNumber === tag)?.status;
         const logs = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
         try {
-            // Cache m[0]/m[1] before signed thinking enters the tool loop.
-            await transform({}, { messages: structuredClone(raw.slice(0, 1)) });
+            // Publish the current user request before simulating its signed tool reply.
+            await transform({}, { messages: structuredClone(raw.slice(0, 4)) });
             const baseline = await pass();
             expect(getOrCreateSessionMeta(db, sessionId).cachedM0Bytes).not.toBeNull();
             const tools = getTagsBySession(db, sessionId)
@@ -5357,6 +5357,7 @@ it("a flush in a held signed turn is parked through execute and defer passes and
                 ],
             },
         );
+        await transform({}, { messages: structuredClone(source.slice(0, -1)) });
         const baseline = JSON.stringify(await serve());
         const old = getTagsBySession(db, sessionId).filter(
             (tag) =>
@@ -5507,6 +5508,30 @@ for (const trigger of ["wall", "final fit"] as const)
                 });
                 await serve();
                 const tag = getTagsBySession(db, sessionId).find((tag) => tag.type === "tool")!;
+                // Establish the active turn while its mandatory user text fits
+                // a larger advertised window, then shrink the window before
+                // testing emergency reclaim. The signed request bytes stay fixed.
+                source.push({
+                    info: { id: "active-user", role: "user", sessionID: sessionId },
+                    parts: [
+                        {
+                            type: "text",
+                            text: outcome === "fits" ? "continue" : "MANDATORY_USER ".repeat(90000),
+                        },
+                    ],
+                });
+                usage.set(sessionId, {
+                    usage: { percentage: 20, inputTokens: 2_000_000 },
+                    updatedAt: Date.now(),
+                    hasUsageTokens: true,
+                });
+                await serve();
+                source.pop();
+                usage.set(sessionId, {
+                    usage: { percentage: 20, inputTokens: 20_000 },
+                    updatedAt: Date.now(),
+                    hasUsageTokens: true,
+                });
                 (source[1].parts[0] as ToolPart).state.output = "RECLAIMABLE ".repeat(60000);
                 source.push(
                     {

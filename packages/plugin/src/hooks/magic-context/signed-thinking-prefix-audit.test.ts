@@ -17,6 +17,7 @@
  * Findings: .cortexkit/internal-docs/investigations/reports/signed-thinking-prefix-edits-audit.md. Run with
  * MC_AUDIT_STRICT=1 to make every exposed lane fail on its strict-binding 400.
  */
+
 import { describe, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import {
@@ -49,6 +50,7 @@ import {
     GOLDEN,
     GoldenCapture,
 } from "./__tests__/golden-capture.test";
+import { servedMessageDigest } from "./__tests__/served-prefix-evidence";
 import {
     type Block,
     beforeLastThinking,
@@ -61,10 +63,19 @@ import {
 } from "./__tests__/strict-binding-mock";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { clearInjectionCache } from "./inject-compartments";
+import { readServedPrefix } from "./served-prefix";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import type { MessageLike } from "./tag-messages";
 import { clearMessageTokensCache, createTransform, type TransformDeps } from "./transform";
 import { hasParkedBustTrigger, resetDegradedCacheCount } from "./transform-postprocess-phase";
+
+function storedPrefixValidates(db: Database, sessionId: string, messages: MessageLike[]): boolean {
+    const record = readServedPrefix<MessageLike>(db, sessionId);
+    const first = messages.find((message) => message.info.id === record?.first_kept?.id);
+    return (
+        !!record?.first_kept && !!first && servedMessageDigest(first) === record.first_kept.digest
+    );
+}
 
 const MODEL = { providerID: "anthropic", modelID: process.env.MC_AUDIT_MODEL ?? "claude-opus-5-5" };
 // Postponing a content edit to preserve a current-turn signature must leave
@@ -148,7 +159,7 @@ type Lane =
  * Lanes whose mid-loop bust changes the request before a signed thinking block the
  * request still carries, which a strict-binding provider rejects.
  */
-const EXPOSED = new Set<Lane>(["m[0]/m[1] re-render after a recomp clears the cached pair"]);
+const EXPOSED = new Set<Lane>();
 
 const PRIMARY_LANES: Lane[] = [
     "ctx_reduce drop (full removal)",
@@ -360,11 +371,18 @@ async function fixture(
                 messages,
                 isPrefixBoundThinkingModel(MODEL.providerID, MODEL.modelID),
             );
+        const prefixRecord = readServedPrefix<MessageLike>(db, sessionId);
+        const firstKept = messages.find(
+            (message) => message.info.id === prefixRecord?.first_kept?.id,
+        );
         capture.write(
             wire(messages),
             bustedThisPass,
             mock.hasCurrentTurnThinking(wire(messages)),
             hasParkedBustTrigger(sessionId),
+            !!prefixRecord?.first_kept &&
+                !!firstKept &&
+                servedMessageDigest(firstKept) === prefixRecord.first_kept.digest,
         );
         return { messages, bustedThisPass };
     };
@@ -850,6 +868,7 @@ for (const generation of ["v1", "v2"] as const) {
                 busted,
                 mock.hasCurrentTurnThinking(request),
                 hasParkedBustTrigger(sessionId),
+                storedPrefixValidates(db, sessionId, messages),
             );
             return request;
         };
@@ -955,6 +974,7 @@ for (const generation of ["v1", "v2"] as const) {
                     busted,
                     mock.hasCurrentTurnThinking(request),
                     hasParkedBustTrigger(sessionId),
+                    storedPrefixValidates(db, sessionId, messages),
                 );
                 return request;
             };
@@ -1004,6 +1024,17 @@ for (const generation of ["v1", "v2"] as const) {
             async (f) => {
                 await toolLoop(f, 4);
                 const before = wire(f.served);
+                const storedBefore = readServedPrefix<MessageLike>(f.db, f.sessionId);
+                const checkStored = (served: MessageLike[]) => {
+                    if (GOLDEN) return;
+                    const record = readServedPrefix<MessageLike>(f.db, f.sessionId);
+                    const actual = served.find(
+                        (message) => message.info.id === record?.first_kept?.id,
+                    );
+                    expect(!!record?.first_kept && !!actual).toBe(true);
+                    expect(record?.first_kept?.digest).toBe(servedMessageDigest(actual));
+                };
+                checkStored(f.served);
                 const firstKept = before.findIndex((message) =>
                     message.content.some((block) => block.type === "thinking"),
                 );
@@ -1020,13 +1051,20 @@ for (const generation of ["v1", "v2"] as const) {
                     expect(wire(held.messages)).toEqual(before);
                     expect(digest(wire(held.messages))).toBe(heldDigest);
                     expect(getReasoningRemovalState(f.db, f.sessionId)).toEqual(removalState);
+                    checkStored(held.messages);
+                    expect(readServedPrefix(f.db, f.sessionId)).toEqual(storedBefore);
                 }
                 await nextUserTurn(f, "digest-release");
                 const rebuilt = wire(f.served);
                 expect(f.mock.check(rebuilt)).toBeNull();
                 expect(thinkingBlocks(rebuilt)).toBe("[]");
                 expect(digest(rebuilt)).not.toBe(heldDigest);
-                expect(wire((await f.pass()).messages)).toEqual(rebuilt);
+                checkStored(f.served);
+                expect(readServedPrefix(f.db, f.sessionId)?.turn).toBe("digest-release");
+                const warm = (await f.pass()).messages;
+                checkStored(warm);
+                expect(f.mock.check(wire(warm))).toBeNull();
+                expect(wire(warm)).toEqual(rebuilt);
             },
             "reasoning-digest",
         ),
@@ -1315,11 +1353,6 @@ for (const generation of ["v1", "v2"] as const) {
                         console.log(
                             `AUDIT-CUT ${host} | mid tool loop: ${error ?? "accepted"}; cutMoved=${moved}`,
                         );
-                        if (!GOLDEN && !STRICT_AUDIT) {
-                            expect(moved).toBe(true);
-                            expect(error).toBe(PREFIX_ERROR);
-                            return;
-                        }
                         expect(error).toBeNull();
                         expect(moved).toBe(false);
                         expect(withoutThinking(after)).toBe(withoutThinking(before));
@@ -1355,11 +1388,6 @@ for (const generation of ["v1", "v2"] as const) {
                         );
                         // No current-turn thinking yet, but the previous turn's signed blocks are
                         // still sent, and a defer pass strips none of them.
-                        if (!GOLDEN && !STRICT_AUDIT) {
-                            expect(moved).toBe(true);
-                            expect(error).toBe(PREFIX_ERROR);
-                            return;
-                        }
                         expect(error).toBeNull();
                         expect(moved).toBe(false);
                         expect(withoutThinking(after)).toBe(withoutThinking(before));
@@ -1405,7 +1433,11 @@ for (const generation of ["v1", "v2"] as const) {
                         const before = wire(f.served);
                         expect(f.mock.check(before)).toBeNull();
                         expect(landed(f, MARKER_LANE, before)).toBe(false);
-                        // Offer a bust whose own work is all before the kept thinking.
+                        // Reaching 95% usage permits a cache bust independently of
+                        // the held flush, so this pass exercises summary-retirement
+                        // admission rather than merely lacking permission to bust.
+                        if (isPrefixBoundThinkingModel(MODEL.providerID, MODEL.modelID))
+                            f.setUsage(95);
                         f.pendingMaterialization.add(f.sessionId);
                         const afterMessages = (await f.pass()).messages;
                         const after = wire(afterMessages);
@@ -1417,7 +1449,8 @@ for (const generation of ["v1", "v2"] as const) {
                         );
                         expect(error).toBeNull();
                         expect(retired).toBe(false);
-                        expect(withoutThinking(after)).toBe(withoutThinking(before));
+                        expect(beforeLastThinking(after)).toBe(beforeLastThinking(before));
+                        expect(thinkingBlocks(after)).toBe(thinkingBlocks(before));
                         expect(wire((await f.pass()).messages)).toEqual(after);
                         f.served = afterMessages;
                         await toolLoop(f, 2);

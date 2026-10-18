@@ -126,8 +126,8 @@ import {
     finalizeMessageRepresentation,
     reconcileMarkerRepresentation,
     replayRustModeBindingMismatchStrips,
-    runPostTransformPhase,
     runRustModePostprocess,
+    runPostTransformPhase as runUnfinalizedPostTransformPhase,
 } from "./transform-postprocess-phase";
 
 const SESSION_ID = "ses-postprocess-drift";
@@ -292,6 +292,40 @@ function makeDropTarget(message: MessageLike): TagTarget {
         inputStringBytes: () => 0,
         canDrop: () => message.parts.some((part) => (part as { type?: string }).type === "tool"),
     };
+}
+
+import { prepareCachedM0M1Replay } from "./inject-compartments";
+import { prefixTurn, readServedPrefix, writeServedPrefix } from "./served-prefix";
+
+async function runPostTransformPhase(args: Parameters<typeof runUnfinalizedPostTransformPhase>[0]) {
+    const result = await runUnfinalizedPostTransformPhase(args);
+    // A completed request includes final record publication, which production
+    // performs after restoring any recovery prefix.
+    if (result.finalizeServedPrefix?.()) result.bustedThisPass = true;
+    return result;
+}
+
+function seedHeldServedPrefix(
+    db: Database,
+    sessionId: string,
+    messages: MessageLike[],
+    head?: MessageLike[],
+): void {
+    writeServedPrefix({
+        db,
+        sessionId,
+        head: head ?? prepareCachedM0M1Replay(db, sessionId)!.preparedMessages!,
+        summary: null,
+        firstKept: messages[0],
+        firstKeptId: messages[0]?.info.id,
+        turn: prefixTurn(messages, (message) => message.info.id),
+        provenance: {
+            host: "opencode-v1",
+            id_space: "opencode-v1-message",
+            generation: "v1",
+            projection: "messages",
+        },
+    });
 }
 
 type PostTransformArgs = Parameters<typeof runPostTransformPhase>[0];
@@ -13256,6 +13290,8 @@ describe("signed-prefix riders on unavoidable busts", () => {
                     };
                     const targets = new Map([[1, target]]);
                     const replayed = applyFlushedStatuses(sessionId, db, targets);
+                    if (cold && cause === "idle expiry")
+                        seedHeldServedPrefix(db, sessionId, source);
                     const result = await runPostTransformPhase(
                         basePostTransformArgs(db, sessionId, source, {
                             activeThinkingTurn: true,
@@ -13356,6 +13392,7 @@ it("an already-cold held pass runs safe routine cleanup without stripping thinki
         mutationParts: [{ message: old, part: old.parts[1] }],
         dropReasoningParts: [],
     };
+    seedHeldServedPrefix(db, sessionId, messages);
     const cleanup = spyOn(heuristicCleanup, "applyHeuristicCleanup");
     try {
         const result = await runPostTransformPhase(
@@ -13400,7 +13437,7 @@ it("an already-cold held pass runs safe routine cleanup without stripping thinki
     }
 });
 
-it("a first render reproducing the served pair keeps all signed thinking", async () => {
+it("a cleared cache replays the served record and keeps all signed thinking", async () => {
     db = new Database(":memory:");
     initializeDatabase(db);
     const sessionId = "first-render-same-binding-prefix";
@@ -13432,6 +13469,7 @@ it("a first render reproducing the served pair keeps all signed thinking", async
             parts: [{ type: "reasoning", text: "active signed" }],
         },
     ];
+    seedHeldServedPrefix(db, sessionId, messages, heads);
     const result = await runPostTransformPhase(
         basePostTransformArgs(db, sessionId, messages, {
             activeThinkingTurn: true,
@@ -14023,3 +14061,287 @@ describe("independent image cache safety through both host projections", () => {
         });
     }
 });
+
+it("served prefix replay keeps the summary and does not consume a pending marker", async () => {
+    db = new Database(":memory:");
+    initializeDatabase(db);
+    const sessionId = "record-marker-replay";
+    const injection = {
+        projectPath: "git:record-marker",
+        projectDirectory: "/nonexistent",
+        memoryEnabled: false,
+        injectDocs: false,
+    };
+    injectM0M1({
+        db,
+        sessionId,
+        state: getOrCreateSessionMeta(db, sessionId),
+        ...injection,
+        isCacheBustingPass: true,
+    });
+    const head = prepareCachedM0M1Replay(db, sessionId)!.preparedMessages!;
+    const first: MessageLike = {
+        info: { id: "turn", role: "user" },
+        parts: [{ type: "text", text: "Continue" }],
+    };
+    const summary: MessageLike = {
+        info: { id: "old-summary", role: "assistant", summary: true },
+        parts: [{ type: "text", text: "Frozen summary" }],
+    };
+    const marker = {
+        boundaryMessageId: "covered",
+        summaryMessageId: "old-summary",
+        compactionPartId: "old-compaction",
+        summaryPartId: "old-summary-part",
+        boundaryOrdinal: 1,
+        targetEndMessageId: "covered",
+    };
+    setPersistedCompactionMarkerState(db, sessionId, marker);
+    const pending = { ordinal: 1, endMessageId: "covered", publishedAt: 1 };
+    setPendingCompactionMarkerState(db, sessionId, pending);
+    const record = writeServedPrefix({
+        db,
+        sessionId,
+        head,
+        summary,
+        firstKept: first,
+        firstKeptId: "turn",
+        turn: "turn",
+        provenance: {
+            host: "opencode-v1",
+            id_space: "opencode-v1-message",
+            generation: "v1",
+            projection: "messages",
+        },
+        cut: { mode: "inclusive", id: "covered" },
+    });
+    setPersistedCompactionMarkerState(db, sessionId, null);
+    let drains = 0;
+    const deferred = new Set([sessionId]);
+    const messages: MessageLike[] = [
+        { info: { id: "covered", role: "user" }, parts: [{ type: "text", text: "Earlier work" }] },
+        structuredClone(first),
+        {
+            info: { id: "thinking", role: "assistant" },
+            parts: [
+                {
+                    type: "reasoning",
+                    text: "Current thought",
+                    metadata: { anthropic: { signature: "signed" } },
+                },
+            ],
+        },
+    ];
+    const result = await runPostTransformPhase(
+        basePostTransformArgs(db, sessionId, messages, {
+            m0M1: {
+                ...injection,
+                hardSignals: {
+                    cacheExpired: true,
+                    systemHash: "",
+                    modelKey: "",
+                    lastResponseTime: 1,
+                },
+            },
+            activeThinkingTurn: true,
+            activeThinkingPrefixHold: true,
+            freezeM0M1: true,
+            signedThinkingHold: "on",
+            resolvedProviderID: "anthropic",
+            resolvedModelID: "claude-opus-5-5",
+            thinkingBindingRecoveryEnabledForModel: true,
+            historyRebuiltThisPass: true,
+            canConsumeDeferredLate: true,
+            deferredHistoryWasPendingAtPassStart: true,
+            deferredHistoryRefreshSessions: deferred,
+            prefixTrimSourceOrder: capturePrefixTrimSourceOrder(messages),
+            pendingCompartmentInjection: {
+                block: "",
+                compartmentEndMessage: 1,
+                compartmentEndMessageId: "covered",
+                compartmentCount: 1,
+                skippedVisibleMessages: 0,
+                factCount: 0,
+                memoryCount: 0,
+                rebuiltFromDb: true,
+            },
+            compactionMarkerStrategy: {
+                reconcile: reconcileMarkerRepresentation,
+                applyDeferred: () => {
+                    drains++;
+                    setPersistedCompactionMarkerState(db!, sessionId, {
+                        ...marker,
+                        summaryMessageId: "moved-summary",
+                    });
+                    return { kind: "applied", markerOrdinal: 1 };
+                },
+            },
+        }),
+    );
+    expect(drains).toBe(0);
+    expect(result.historianFoldMaterializedThisPass).toBe(false);
+    expect(deferred.has(sessionId)).toBe(true);
+    expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+    expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+    expect(getDeferredClearedCompactionMarkerState(db, sessionId)).toEqual(marker);
+    expect(messages.find((message) => message.info.summary === true)).toEqual(summary);
+    expect(readServedPrefix(db, sessionId)).toEqual(record);
+});
+
+it("compaction-off late digest failure serves the complete cached head, not raw input", async () => {
+    db = new Database(":memory:");
+    initializeDatabase(db);
+    const sessionId = "late-off-record";
+    const injection = {
+        projectPath: "git:off-record",
+        projectDirectory: "/nonexistent",
+        memoryEnabled: false,
+        injectDocs: false,
+    };
+    const first: MessageLike = {
+        info: { id: "turn", role: "user" },
+        parts: [{ type: "text", text: "Task" }],
+    };
+    const base = () =>
+        basePostTransformArgs(db!, sessionId, [structuredClone(first)], {
+            compactionOff: true,
+            m0M1: injection,
+            resolvedProviderID: "anthropic",
+            resolvedModelID: "claude-opus-5-5",
+            thinkingBindingRecoveryEnabledForModel: true,
+        });
+    await runPostTransformPhase(base());
+    const record = readServedPrefix(db, sessionId);
+    const args = base();
+    args.messages.push({
+        info: { id: "current", role: "assistant" },
+        parts: [
+            {
+                type: "reasoning",
+                text: "Active thought",
+                metadata: { anthropic: { signature: "active" } },
+            },
+        ],
+    });
+    args.activeThinkingTurn = true;
+    args.activeThinkingPrefixHold = true;
+    const result = await runUnfinalizedPostTransformPhase(args);
+    const raw = args.messages.find((message) => message.info.id === "turn")!;
+    (raw.parts[0] as { text: string }).text = "Changed after replay";
+    updateSessionMeta(db, sessionId, {
+        cachedM0Bytes: Buffer.from("<session-history>cached fallback</session-history>"),
+    });
+    expect(() => result.finalizeServedPrefix?.()).not.toThrow();
+    expect(args.messages[0].parts[0]).toMatchObject({
+        text: "<session-history>cached fallback</session-history>",
+    });
+    expect(args.messages).toContain(raw);
+    expect(readServedPrefix(db, sessionId)).toEqual(record);
+});
+
+for (const visible of [true, false])
+    it(
+        visible
+            ? "applying a marker alone pairs its new prefix with older-thinking omissions"
+            : "retiring an unserved marker does not strip thinking or originate a bust",
+        async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = "record-marker-first-apply";
+            const injection = {
+                projectPath: "git:record-marker-apply",
+                projectDirectory: "/nonexistent",
+                memoryEnabled: false,
+                injectDocs: false,
+                hardSignals: {
+                    systemHash: "stable-system",
+                    modelKey: "anthropic/claude-opus-5-5",
+                    cacheExpired: false,
+                    lastResponseTime: Date.now(),
+                },
+            };
+            injectM0M1({
+                db,
+                sessionId,
+                state: getOrCreateSessionMeta(db, sessionId),
+                ...injection,
+                isCacheBustingPass: true,
+            });
+            const head = prepareCachedM0M1Replay(db, sessionId)!.preparedMessages!;
+            const first: MessageLike = {
+                info: { id: "old-user", role: "user" },
+                parts: [{ type: "text", text: "Earlier task" }],
+            };
+            writeServedPrefix({
+                db,
+                sessionId,
+                head,
+                summary: null,
+                firstKept: first,
+                firstKeptId: "old-user",
+                turn: "current-user",
+                provenance: {
+                    host: "opencode-v1",
+                    id_space: "opencode-v1-message",
+                    generation: "v1",
+                    projection: "messages",
+                },
+            });
+            setPersistedCompactionMarkerState(db, sessionId, {
+                boundaryMessageId: "old-user",
+                summaryMessageId: "new-summary",
+                compactionPartId: "compaction",
+                summaryPartId: "summary-part",
+                boundaryOrdinal: 1,
+                targetEndMessageId: null,
+            });
+            if (!visible) setPersistedCompactionMarkerState(db, sessionId, null);
+            const messages: MessageLike[] = [
+                structuredClone(first),
+                {
+                    info: { id: "old-thinking", role: "assistant" },
+                    parts: [
+                        {
+                            type: "reasoning",
+                            text: "Older signed thought",
+                            metadata: { anthropic: { signature: "old-signature" } },
+                        },
+                        { type: "text", text: "Earlier answer" },
+                    ],
+                },
+                {
+                    info: { id: "current-user", role: "user" },
+                    parts: [{ type: "text", text: "Next task" }],
+                },
+            ];
+            const result = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    m0M1: injection,
+                    signedThinkingHold: "on",
+                    resolvedProviderID: "anthropic",
+                    resolvedModelID: "claude-opus-5-5",
+                    thinkingBindingRecoveryEnabledForModel: true,
+                    pendingMaterializationSessions: new Set([sessionId]),
+                }),
+            );
+            expect(messages.slice(0, head.length)).toEqual(head);
+            expect(messages.some((message) => message.info.summary === true)).toBe(visible);
+            expect(
+                messages
+                    .flatMap((message) => message.parts)
+                    .some((part) => (part as { type?: string }).type === "reasoning"),
+            ).toBe(!visible);
+            if (visible)
+                expect(getMergedReasoningStrippedIds(db, sessionId)).toContain(
+                    "binding_mismatch:old-thinking",
+                );
+            else
+                expect(getMergedReasoningStrippedIds(db, sessionId)).not.toContain(
+                    "binding_mismatch:old-thinking",
+                );
+            expect(result.bustedThisPass).toBe(visible);
+            expect(readServedPrefix(db, sessionId)?.summary).toEqual(
+                messages.find((message) => message.info.summary === true) ?? null,
+            );
+        },
+    );
