@@ -3993,6 +3993,10 @@ export async function runPostTransformPhase(
             const wantsRecord =
                 activeThinkingPrefixHold ||
                 (unchangedHead &&
+                    // An admitted explicit refresh also releases the frozen system date.
+                    // Replaying the old record would incorrectly report unconsumed history.
+                    !explicitMaterializedSuccessfully &&
+                    !deferredMaterializedSuccessfully &&
                     !foldBustsServedPrefixThisPass &&
                     !thinkingReleasedForFit &&
                     !firstRenderBust);

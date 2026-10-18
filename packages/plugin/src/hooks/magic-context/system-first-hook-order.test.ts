@@ -238,7 +238,37 @@ function fixture(order: "private" | "stock" = "private") {
             "user_flush",
         );
     }
-    return { serve, appendDelta, flush, db, sessionId };
+    function refresh() {
+        liveSessionState.deferredHistoryRefreshSessions.add(sessionId);
+        flush();
+    }
+    function appendThinking() {
+        source.push({
+            info: {
+                id: "msg_0004",
+                sessionID: sessionId,
+                role: "assistant",
+                ...route,
+            },
+            parts: [
+                {
+                    type: "reasoning",
+                    text: "signed thought",
+                    metadata: { anthropic: { signature: "held-signature" } },
+                },
+            ],
+        });
+    }
+    return {
+        serve,
+        appendDelta,
+        flush,
+        refresh,
+        appendThinking,
+        historyPending: () => liveSessionState.deferredHistoryRefreshSessions.has(sessionId),
+        db,
+        sessionId,
+    };
 }
 
 describe("standalone real hooks under private system-first dispatch", () => {
@@ -285,6 +315,40 @@ describe("standalone real hooks under private system-first dispatch", () => {
         const next = await f.serve("base instructions", "2026-10-15");
         expect(changed.system).toContain("Date: 2026-10-15");
         expect([next.system, next.m0, next.m1]).toEqual([changed.system, changed.m0, changed.m1]);
+    });
+
+    it("an explicit history refresh consumes published history and advances the date only without a signed hold", async () => {
+        for (const held of [false, true]) {
+            const f = fixture();
+            f.appendDelta();
+            await f.serve();
+            if (held) f.appendThinking();
+            const before = await f.serve();
+            expect(before.m0).toContain("DELTA_TO_FOLD");
+            now = Date.UTC(2026, 9, 15, 0, 1);
+            const midnight = await f.serve("base instructions", "2026-10-15", false);
+            expect(midnight.system).toBe(before.system);
+            f.refresh();
+            expect(f.historyPending()).toBe(true);
+            const refreshed = await f.serve("base instructions", "2026-10-15", false);
+            expect({
+                held,
+                date: /Date: (\d{4}-\d{2}-\d{2})/.exec(refreshed.system)?.[1],
+                historyPending: f.historyPending(),
+            }).toEqual({
+                held,
+                date: held ? "2026-10-14" : "2026-10-15",
+                historyPending: held,
+            });
+            expect([refreshed.m0, refreshed.m1]).toEqual([before.m0, before.m1]);
+            if (held) expect(refreshed.messages).toEqual(midnight.messages);
+            const next = await f.serve("base instructions", "2026-10-15", false);
+            expect([next.system, next.m0, next.m1]).toEqual([
+                refreshed.system,
+                refreshed.m0,
+                refreshed.m1,
+            ]);
+        }
     });
 
     it("keeps stock messages-first bytes frozen through a system edit and the following request", async () => {
