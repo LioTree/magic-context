@@ -1,0 +1,70 @@
+/**
+ * Computes how many trailing messages Magic Context's protected tail would keep raw for the answer
+ * model, using the production boundary code on the conversation's own stores.
+ *
+ * Run it as a child process whose environment points every store at a SCRATCH COPY of the root
+ * (see `rootEnv` in host.ts): resolving the boundary seeds per-session metadata in context.db, and
+ * that write must not reach the snapshot the questions are answered from.
+ *
+ * It resolves the boundary in `trigger` mode, the mode the transform uses before a historian run,
+ * with the usage the first question turn would report: every raw message, tokenized by the same
+ * index the boundary walks, over the answer model's context limit. Output is one JSON line.
+ *
+ *   bun boundary-probe.ts <sessionId> <contextLimit> <executeThresholdPercentage>
+ */
+import { openDatabase } from "../../src/features/magic-context/storage-db";
+import { resolveOpenCodeProtectedTailBoundary } from "../../src/hooks/magic-context/protected-tail-boundary";
+import { readRawSessionMessages } from "../../src/hooks/magic-context/read-session-chunk";
+import { buildTrueRawTokenIndex } from "../../src/hooks/magic-context/read-session-true-raw-tokens";
+
+export interface BoundaryProbeResult {
+    rawMessageCount: number;
+    sessionTokens: number;
+    usagePercentage: number;
+    protectedTailStart: number;
+    /** Trailing messages kept raw: the `/ctx-wrapup` argument. */
+    messagesToKeep: number;
+    tailTokens: number;
+    tailTargetTokens: number;
+    boundaryReason: string;
+}
+
+if (import.meta.main) {
+    const [sessionId, limitText, thresholdText] = process.argv.slice(2);
+    if (!sessionId || !limitText || !thresholdText) {
+        console.error("usage: boundary-probe.ts <sessionId> <contextLimit> <executeThresholdPercentage>");
+        process.exit(2);
+    }
+    const contextLimit = Number(limitText);
+    const executeThresholdPercentage = Number(thresholdText);
+    const db = openDatabase();
+    if (!db) throw new Error("could not open the scratch context database");
+    const messages = readRawSessionMessages(sessionId);
+    const index = buildTrueRawTokenIndex(sessionId, messages, {
+        providerShapeVersion: "opencode-v1",
+        cacheNamespace: `opencode:${sessionId}`,
+    });
+    const sessionTokens = index.rangeTokens(1, index.rawMessageCount + 1);
+    const usagePercentage = (sessionTokens / contextLimit) * 100;
+    const snapshot = resolveOpenCodeProtectedTailBoundary({
+        db,
+        sessionId,
+        mode: "trigger",
+        contextLimit,
+        executeThresholdPercentage,
+        usage: { percentage: usagePercentage, inputTokens: sessionTokens },
+        usageSource: "live",
+    });
+    const result: BoundaryProbeResult = {
+        rawMessageCount: snapshot.rawMessageCountAtTrigger,
+        sessionTokens,
+        usagePercentage,
+        protectedTailStart: snapshot.protectedTailStart,
+        messagesToKeep: snapshot.rawMessageCountAtTrigger - snapshot.protectedTailStart + 1,
+        tailTokens: index.rangeTokens(snapshot.protectedTailStart, index.rawMessageCount + 1),
+        tailTargetTokens: snapshot.N,
+        boundaryReason: snapshot.boundaryReason,
+    };
+    console.log(JSON.stringify(result));
+    db.close();
+}
