@@ -52,8 +52,9 @@ import {
     providerRevertsToRaw,
 } from "./opencode-adapter";
 
-/** The frozen messages of one returned view: admitted host messages, not heads or
- * still-running passthrough rows, whose bytes the host may already have sent. */
+/** The frozen messages of one returned view, keyed by message id: admitted host
+ * messages only, not heads or still-running passthrough rows. The host may already
+ * have sent these bytes to the provider. */
 export interface ServedView {
     lineageId: string;
     viewVersion?: number;
