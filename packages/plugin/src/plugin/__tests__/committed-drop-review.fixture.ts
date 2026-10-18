@@ -64,7 +64,7 @@ if (lane === "pi") {
                 injectDocs: false,
             }),
         },
-                onLkgReplay: () => {
+        onLkgReplay: () => {
             recoveryCount = (recoveryCount ?? 0) + 1;
         },
     });

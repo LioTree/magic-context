@@ -41,7 +41,7 @@ for (const lane of ["oc1", "oc2"] as const) {
                             directory: process.cwd(),
                         }),
                     },
-                                        onLkgReplay: () => {
+                    onLkgReplay: () => {
                         replays++;
                     },
                 });
@@ -211,7 +211,7 @@ for (const lane of ["oc1", "oc2"] as const) {
                         throw new Error("text drop failed pass");
                     },
                 },
-                                onLkgReplay: () => {
+                onLkgReplay: () => {
                     replays++;
                 },
             });

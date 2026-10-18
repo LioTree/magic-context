@@ -1198,11 +1198,7 @@ describe("magic-context hook", () => {
                             "SELECT next_due_at, last_status FROM task_schedule_state WHERE project_path = ? AND task = 'classify-memories'",
                         )
                         .get(projectPath) as { next_due_at: number; last_status: string | null };
-                for (
-                    let attempt = 0;
-                    attempt < 400 && row().last_status === null;
-                    attempt += 1
-                ) {
+                for (let attempt = 0; attempt < 400 && row().last_status === null; attempt += 1) {
                     await new Promise((resolve) => setTimeout(resolve, 5));
                 }
                 expect(row().last_status).not.toBeNull();

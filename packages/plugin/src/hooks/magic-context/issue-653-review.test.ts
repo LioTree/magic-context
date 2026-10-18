@@ -173,7 +173,7 @@ function busyHandler(onRefusal?: () => void) {
                 throw Object.assign(new Error("lock after acquisition"), { code: "SQLITE_BUSY" });
             },
         },
-            });
+    });
 }
 
 afterEach(() => {
@@ -258,7 +258,7 @@ describe("issue 653 independent upgrade review", () => {
                     ).toBe(true);
                 },
             },
-                    });
+        });
         await handler({}, output as never);
         // The healthy pass wrote the slot in the current format.
         const upgraded = getSlot(SESSION)!;

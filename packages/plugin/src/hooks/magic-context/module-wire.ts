@@ -36,7 +36,6 @@ function yieldToEventLoop(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-
 function getMessageId(message: MessageLike): string | null {
     return typeof message.info.id === "string" && message.info.id.length > 0
         ? message.info.id
@@ -414,7 +413,6 @@ export function moduleWireBodyBytes(payload: {
 }): number {
     return Buffer.byteLength(JSON.stringify(toFlatModuleWireBody(payload)));
 }
-
 
 export interface ModuleRawBlockMapping {
     blockIndex: number;

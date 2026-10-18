@@ -26,13 +26,12 @@ import type { SessionContext } from "../../../v2/hooks/types";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
 import { clearLkgRecoveryFence } from "../lkg-recovery-fence";
 import { captureSlot, lkgContentDigest, resetLkgSlotsForTest } from "../lkg-slot";
+import { createModuleSessionKernel } from "../module-session-kernel";
 import { setRawMessageProvider } from "../read-session-chunk";
-import type { createModuleSessionKernel } from "../module-session-kernel";
 import { StorageBusyRefusalError } from "../storage-busy-refusal";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
 import { applyProviderOps, createOpenCodeProviderTransform } from "./opencode-adapter";
-import { createModuleSessionKernel } from "../module-session-kernel";
 import type { HookAnswer } from "./record";
 
 // The package preload redirects both XDG homes and all implicit context DB opens.

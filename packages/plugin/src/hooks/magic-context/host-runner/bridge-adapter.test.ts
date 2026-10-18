@@ -29,9 +29,9 @@ import {
 import { Database } from "../../../shared/sqlite";
 import { createTestTempDir } from "../../../shared/test-temp-dir";
 import * as markerManager from "../compaction-marker-manager";
+import { createModuleSessionKernel } from "../module-session-kernel";
 import { SubcModuleTransport } from "../module-transport";
 import { setRawMessageProvider } from "../read-session-chunk";
-import { createModuleSessionKernel } from "../module-session-kernel";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
 import { defaultCompactionMarkerStrategy } from "../transform-postprocess-phase";

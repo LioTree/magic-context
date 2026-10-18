@@ -17,7 +17,15 @@ import { setRawMessageProvider } from "./read-session-chunk";
 import type { MessageLike } from "./transform-operations";
 
 it("pins shared state-sync frame budgets to the module fixture", () => {
-    const limits = JSON.parse(readFileSync(join(import.meta.dir, "../../../../../crates/mc-module/testdata/subc-frame-limits.json"), "utf8"));
+    const limits = JSON.parse(
+        readFileSync(
+            join(
+                import.meta.dir,
+                "../../../../../crates/mc-module/testdata/subc-frame-limits.json",
+            ),
+            "utf8",
+        ),
+    );
     expect(SUBC_MAX_FRAME_BODY_BYTES).toBe(limits.max_frame_body_bytes);
     expect(MODULE_PAGE_MAX_BYTES).toBe(limits.application_body_bytes);
 });

@@ -5,11 +5,11 @@ import type { ContextDatabase } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { Database } from "../../shared/sqlite";
+import { createOpenCodeProviderTransform } from "./host-runner/opencode-adapter";
 import { resetLkgSlotsForTest } from "./lkg-slot";
+import { createModuleSessionKernel } from "./module-session-kernel";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
-import { createModuleSessionKernel } from "./module-session-kernel";
-import { createOpenCodeProviderTransform } from "./host-runner/opencode-adapter";
 import type { TransformDeps } from "./transform";
 import type { MessageLike } from "./transform-operations";
 
@@ -61,7 +61,9 @@ function createFixture(
             methods.push(method);
             bodies.push({ method, body });
             if (method === "historian.pending") return { ok: true, runs: [] };
-            const params = (body instanceof Uint8Array ? JSON.parse(new TextDecoder().decode(body)) : body).params;
+            const params = (
+                body instanceof Uint8Array ? JSON.parse(new TextDecoder().decode(body)) : body
+            ).params;
             if (method === "transform.declare") return { subscriptions: [] };
             const view = {
                 compaction_id: "wiring",

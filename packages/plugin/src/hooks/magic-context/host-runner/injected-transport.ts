@@ -4,9 +4,9 @@ import {
 } from "../../../features/magic-context/provider-meters";
 import { sessionLog } from "../../../shared/logger";
 import { isRecord } from "../../../shared/record-type-guard";
+import type { ModuleSessionClient } from "../module-session-kernel";
 import { moduleRequestBody, type SubcModuleTransport } from "../module-transport";
 import { assembleReplyPages } from "../reply-pages";
-import type { ModuleSessionClient } from "../module-session-kernel";
 import { singleStoreMigrationRequiredFailure } from "../single-store-refusal";
 import { storeAheadOfBinaryFailure } from "../store-ahead-refusal";
 import type { BridgeTransport, BridgeTransportError } from "./bridge-types";

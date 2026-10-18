@@ -154,6 +154,7 @@ import {
     type LkgSlot,
     releaseWithheldServedCapture,
 } from "./lkg-slot";
+import type { ModuleSessionClient } from "./module-session-kernel";
 import { onNoteTrigger } from "./note-nudger";
 import {
     createPassOutcome,
@@ -178,7 +179,6 @@ import {
     resolveKeepReasoningTokens,
 } from "./reasoning-budget";
 import { createM0RenderOptions } from "./render-options";
-import type { ModuleSessionClient } from "./module-session-kernel";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
 import {

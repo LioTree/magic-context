@@ -20,8 +20,8 @@ import {
 	getAutoSearchHintDecisions,
 	getCompartments,
 	getOrCreateSessionMeta,
-	queueMemoryMutation,
 	queueM0Mutation,
+	queueMemoryMutation,
 	setProjectState,
 } from "@magic-context/core/features/magic-context/storage";
 import {

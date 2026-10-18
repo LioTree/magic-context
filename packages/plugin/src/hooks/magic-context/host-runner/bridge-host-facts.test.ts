@@ -17,8 +17,8 @@ import {
 import { Database } from "../../../shared/sqlite";
 import { cleanupTestTempDir, createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import { createEventHandler } from "../event-handler";
-import { setRawMessageProvider } from "../read-session-chunk";
 import { createModuleSessionKernel } from "../module-session-kernel";
+import { setRawMessageProvider } from "../read-session-chunk";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
 import { startOracle } from "./conformance/oracle";

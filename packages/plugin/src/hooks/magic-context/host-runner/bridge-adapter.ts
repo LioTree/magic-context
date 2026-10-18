@@ -20,9 +20,9 @@ import {
     markerEnvelopeKey,
     qualifyingMarkerEnvelopeUpper,
 } from "../marker-envelope";
+import { createModuleSessionKernel } from "../module-session-kernel";
 import { SubcModuleTransport } from "../module-transport";
 import { hasRawMessageProvider } from "../read-session-chunk";
-import { createModuleSessionKernel } from "../module-session-kernel";
 import type { TransformDeps } from "../transform";
 import { createBridgeDeps } from "./bridge-deps";
 import { createBridgeHostFacts } from "./bridge-host-facts";

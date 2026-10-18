@@ -1,8 +1,6 @@
 /// <reference types="bun-types" />
 import { expect, test } from "bun:test";
-import {
-    encodeOpenCodeMessagesToCk,
-} from "./module-wire";
+import { encodeOpenCodeMessagesToCk } from "./module-wire";
 
 test("attachment review: attachment-free error/completed and empty-list aliases keep old bytes", () => {
     for (const status of ["completed", "error"]) {

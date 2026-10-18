@@ -888,10 +888,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             tasks: runtimeConfigs,
             executor,
             projectMemoryEnabled: deps.config.memory?.enabled !== false,
-        })
-            .catch((error: unknown) => {
-                log("[dreamer] scheduled task run failed:", error);
-            });
+        }).catch((error: unknown) => {
+            log("[dreamer] scheduled task run failed:", error);
+        });
     };
 
     const sendCommandNotification = async (

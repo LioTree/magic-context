@@ -270,7 +270,6 @@ async function fixture(mode: "ts" = "ts", generation: "v1" | "v2" = "v1") {
 
 const head = (messages: unknown[]) => JSON.stringify(messages.slice(0, 2));
 
-
 for (const mode of ["ts"] as const) {
     const test = it;
     for (const finish of ["aborted", "error", "unaccepted"]) {
@@ -286,9 +285,9 @@ for (const mode of ["ts"] as const) {
                 expect(getOrCreateSessionMeta(f.db, f.sessionId).cachedM0SystemHash).toBe(before);
                 f.source.push(f.user("wake", "continue"));
                 const wake = await f.serve("changed instruction");
-                    expect(getOrCreateSessionMeta(f.db, f.sessionId).cachedM0SystemHash).not.toBe(
-                        before,
-                    );
+                expect(getOrCreateSessionMeta(f.db, f.sessionId).cachedM0SystemHash).not.toBe(
+                    before,
+                );
             } finally {
                 f.close();
             }
@@ -317,9 +316,9 @@ for (const mode of ["ts"] as const) {
         try {
             const before = await f.serve();
             before.accept("stop");
-                expect(getOrCreateSessionMeta(f.db, f.sessionId).cachedM0SystemHash).toBe(
-                    getOrCreateSessionMeta(f.db, f.sessionId).systemPromptHash,
-                );
+            expect(getOrCreateSessionMeta(f.db, f.sessionId).cachedM0SystemHash).toBe(
+                getOrCreateSessionMeta(f.db, f.sessionId).systemPromptHash,
+            );
         } finally {
             f.close();
         }
@@ -361,7 +360,6 @@ it("TypeScript: already_delivered_system_change_does_not_hard_after_signed_head_
     }
 }, 120_000);
 
-
 for (const [input, patch] of [
     ["model", { cachedM0ModelKey: "anthropic/claude-opus-5-4" }],
     ["renderer", { cachedM0UpgradeState: "previous-renderer" }],
@@ -402,7 +400,7 @@ for (const mode of ["ts"] as const) {
             f.hold();
             const before = await f.serve();
             before.accept();
-{
+            {
                 const target = getTagsBySession(f.db, f.sessionId).find(
                     (tag) => tag.type === "tool" && tag.messageId === "read-old",
                 );
@@ -479,9 +477,7 @@ for (const mode of ["ts"] as const) {
             expect(getOrCreateSessionMeta(f.db, f.sessionId).cachedM0SystemHash).toBe(before);
             f.source.push(f.user("wake", "continue"));
             const wake = await f.serve("changed instruction");
-                expect(getOrCreateSessionMeta(f.db, f.sessionId).cachedM0SystemHash).not.toBe(
-                    before,
-                );
+            expect(getOrCreateSessionMeta(f.db, f.sessionId).cachedM0SystemHash).not.toBe(before);
         } finally {
             f.close();
         }

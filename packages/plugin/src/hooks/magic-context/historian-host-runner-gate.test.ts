@@ -15,11 +15,11 @@ import {
     HistorianHostRunner,
     type HistorianHostRunnerDeps,
 } from "./historian-host-runner";
+import { createOpenCodeProviderTransform } from "./host-runner/opencode-adapter";
 import { resetLkgSlotsForTest } from "./lkg-slot";
+import { createModuleSessionKernel } from "./module-session-kernel";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
-import { createModuleSessionKernel } from "./module-session-kernel";
-import { createOpenCodeProviderTransform } from "./host-runner/opencode-adapter";
 import type { TransformDeps } from "./transform";
 import type { MessageLike } from "./transform-operations";
 
@@ -545,7 +545,9 @@ describe("host runner project binding at the transform seam", () => {
                     void body;
                     return { ok: false, refusal: "already_claimed" };
                 }
-                const params = (body instanceof Uint8Array ? JSON.parse(new TextDecoder().decode(body)) : body).params;
+                const params = (
+                    body instanceof Uint8Array ? JSON.parse(new TextDecoder().decode(body)) : body
+                ).params;
                 if (method === "transform.declare") return { subscriptions: [] };
                 const view = {
                     compaction_id: "gate",

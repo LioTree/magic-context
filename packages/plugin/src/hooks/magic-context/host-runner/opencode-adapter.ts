@@ -27,6 +27,7 @@ import type { SessionMeta } from "../../../features/magic-context/types";
 import { sessionLog } from "../../../shared/logger";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
 import { createHistorianHostRunner } from "../historian-host-runner";
+import type { createModuleSessionKernel, HistorianHostRunnerSeam } from "../module-session-kernel";
 import {
     type ModuleStateSyncState,
     readAuthoritySeqMismatch,
@@ -36,7 +37,6 @@ import { resolveOrdinalsForModule } from "../module-wire";
 import { providerNativeMessage } from "../provider-visible-parts";
 import { hasRawSessionMessageById } from "../read-session-chunk";
 import { isRawCompactionSummaryInfo } from "../read-session-raw";
-import type { createModuleSessionKernel, HistorianHostRunnerSeam } from "../module-session-kernel";
 import { storeAheadOfBinaryFailure } from "../store-ahead-refusal";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
@@ -101,7 +101,9 @@ export class TransformRouteRetiredError extends EmergencyFailClosedError {
     readonly code = "transform_route_retired";
 
     constructor() {
-        super("transform_route_retired: the full-request transform is retired; use the step contract");
+        super(
+            "transform_route_retired: the full-request transform is retired; use the step contract",
+        );
         this.name = "TransformRouteRetiredError";
     }
 }

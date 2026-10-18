@@ -255,7 +255,6 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
         await expect(handler({}, output)).rejects.toBeInstanceOf(DegradedPassRefusalError);
     });
 
-
     it("refuses an uncut over-window request when no last good request can stand in", async () => {
         // Unlike an ordinary transform error, this one must not fall through to
         // the input messages: they are the same uncut, over-window

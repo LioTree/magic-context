@@ -1,5 +1,5 @@
-import { getDefaultSubcConnectionFile, SubcModuleTransport } from "./module-transport";
 import type { ModuleSessionClient } from "./module-session-kernel";
+import { getDefaultSubcConnectionFile, SubcModuleTransport } from "./module-transport";
 
 /**
  * Build the subc-backed module client every host lane uses to reach `ck-mc`.
