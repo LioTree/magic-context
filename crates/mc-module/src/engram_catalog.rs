@@ -35,10 +35,8 @@ const CATALOG_MODULE_ID: &str = "magic-context";
 /// The one descriptor schema version Engram currently accepts.
 const CATALOG_SCHEMA_VERSION: u32 = 1;
 
-/// The portable directory of remembered project identities. Engram refuses a
-/// whole backup when a portable source is absent, and this directory only appears
-/// after the first git probe, so ck-mc creates it (empty) before publishing the
-/// catalog.
+/// The portable directory of remembered project identities. It is created when
+/// the first identity pin is written, not when the catalog is published.
 const PROJECT_IDENTITIES_DIR: &str = "project-identities";
 
 /// Why maintainer-only paths are listed at all: no released build writes them,
@@ -299,9 +297,6 @@ pub enum CatalogWrite {
 /// runs as the same user and nobody else needs it. An existing byte-identical
 /// file is not rewritten.
 pub fn write_catalog(data_dir: &Path) -> io::Result<CatalogWrite> {
-    // A portable path that does not exist makes Engram refuse the whole backup,
-    // so the identity directory has to exist before the catalog names it.
-    mc_store::private_permissions::ensure_directory(&data_dir.join(PROJECT_IDENTITIES_DIR), true)?;
     let path = data_dir.join(CATALOG_FILE_NAME);
     let bytes = catalog_bytes();
     if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
@@ -393,6 +388,7 @@ mod tests {
             .iter()
             .find(|entry| entry["path"] == PROJECT_IDENTITIES_DIR)
             .expect("project-identities must be declared");
+        assert_eq!(identities["entry_id"], "magic-context/project-identities");
         assert_eq!(identities["class"], "portable");
         assert_eq!(identities["mechanism"], "filetree");
     }
@@ -452,15 +448,27 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_data_folder_gets_the_catalog_and_the_identity_directory() {
+    fn startup_writes_catalog_without_creating_the_identity_directory() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("magic-context");
-        assert_eq!(write_catalog(&data_dir).unwrap(), CatalogWrite::Written);
+        assert_eq!(
+            write_catalog_at_startup(&data_dir).unwrap(),
+            CatalogWrite::Written
+        );
         assert_eq!(
             std::fs::read(data_dir.join(CATALOG_FILE_NAME)).unwrap(),
             catalog_bytes()
         );
-        assert!(data_dir.join(PROJECT_IDENTITIES_DIR).is_dir());
+        assert!(
+            !data_dir.join(PROJECT_IDENTITIES_DIR).exists(),
+            "startup must leave the project identities directory for the pin writer"
+        );
+        let identities = entries()
+            .into_iter()
+            .find(|entry| entry["entry_id"] == "magic-context/project-identities")
+            .expect("the catalog must still declare project identities");
+        assert_eq!(identities["class"], "portable");
+        assert_eq!(identities["path"], "project-identities");
         let mut names: Vec<String> = std::fs::read_dir(&data_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -468,7 +476,7 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            [CATALOG_FILE_NAME, PROJECT_IDENTITIES_DIR],
+            [CATALOG_FILE_NAME],
             "no temporary file may be left behind"
         );
     }
