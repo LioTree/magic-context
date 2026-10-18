@@ -2005,8 +2005,7 @@ export async function registerContext(context: V2Context) {
                 // This host builds no Rust adapter. Answering null, rather than
                 // omitting the option, keeps the wrapper from consulting the
                 // process-wide adapter registry.
-                rustReplayParticipant: () => null,
-            })(
+                            })(
                 {},
                 mapped as unknown as Parameters<
                     ReturnType<typeof createMessagesTransformHandler>
@@ -2087,8 +2086,7 @@ export async function registerContext(context: V2Context) {
                         await createMessagesTransformHandler({
                             replayFits,
                             onLkgReplay: restoreLkgSystem,
-                            rustReplayParticipant: () => null,
-                            magicContext: {
+                                                        magicContext: {
                                 "experimental.chat.messages.transform": async () => {
                                     throw error;
                                 },

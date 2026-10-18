@@ -41,8 +41,7 @@ for (const lane of ["oc1", "oc2"] as const) {
                             directory: process.cwd(),
                         }),
                     },
-                    rustReplayParticipant: () => null,
-                    onLkgReplay: () => {
+                                        onLkgReplay: () => {
                         replays++;
                     },
                 });
@@ -212,8 +211,7 @@ for (const lane of ["oc1", "oc2"] as const) {
                         throw new Error("text drop failed pass");
                     },
                 },
-                rustReplayParticipant: () => null,
-                onLkgReplay: () => {
+                                onLkgReplay: () => {
                     replays++;
                 },
             });

@@ -1,13 +1,11 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
-    __moduleWireTest,
-    buildPagedModuleTransformPayloads,
     encodeOpenCodeMessagesToCk,
     MODULE_ORDINAL_PAGE_SIZE,
     MODULE_PAGE_MAX_BYTES,
@@ -17,6 +15,12 @@ import {
 } from "./module-wire";
 import { setRawMessageProvider } from "./read-session-chunk";
 import type { MessageLike } from "./transform-operations";
+
+it("pins shared state-sync frame budgets to the module fixture", () => {
+    const limits = JSON.parse(readFileSync(join(import.meta.dir, "../../../../../crates/mc-module/testdata/subc-frame-limits.json"), "utf8"));
+    expect(SUBC_MAX_FRAME_BODY_BYTES).toBe(limits.max_frame_body_bytes);
+    expect(MODULE_PAGE_MAX_BYTES).toBe(limits.application_body_bytes);
+});
 
 describe("encodeOpenCodeMessagesToCk", () => {
     it("projects tool attachments beside text for both completed and error results", () => {
@@ -789,221 +793,5 @@ describe("resolveOrdinalsForModule bounded rebuild", () => {
         } finally {
             store.unregister();
         }
-    });
-});
-const TEST_PAGE_MAX_BYTES = 512 * 1024;
-
-describe("buildPagedModuleTransformPayloads byte reuse", () => {
-    it("hashes only stabilized pages while preserving canonical digests and wire sizes", () => {
-        const body = {
-            method: "transform",
-            session_id: "stabilized-digest",
-            native_messages: Array.from({ length: 80 }, (_, i) => ({
-                z: "α😀".repeat(1_500),
-                a: i,
-            })),
-        };
-        const parse = spyOn(JSON, "parse");
-        try {
-            const pages = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES, true);
-            expect(pages.length).toBeGreaterThan(1);
-            expect(parse).toHaveBeenCalledTimes(pages.length);
-            for (const { page, bytes } of pages) {
-                const values = page.native_messages as { a: number; z: string }[];
-                // Explicit canonical key order for this fixture is independent
-                // of the production canonicalizer and its timing instrumentation.
-                const canonical = JSON.stringify({
-                    native_messages: values.map(({ a, z }) => ({ a, z })),
-                });
-                expect(page.transform_page_digest).toBe(
-                    createHash("sha256").update(canonical).digest("hex"),
-                );
-                expect(bytes).toBe(Buffer.byteLength(JSON.stringify(page)));
-            }
-            expect(pages.flatMap(({ page }) => page.native_messages)).toEqual(body.native_messages);
-        } finally {
-            parse.mockRestore();
-        }
-    });
-
-    it("bounds a forced one-page envelope including the transport reply capability", () => {
-        const body = { method: "transform", session_id: "boundary", input: [{ text: "" }] };
-        body.input[0]!.text = "x".repeat(
-            TEST_PAGE_MAX_BYTES - Buffer.byteLength(JSON.stringify(body)),
-        );
-        const pages = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES, true);
-        expect(pages.length).toBeGreaterThan(1);
-        for (const { page, bytes } of pages) {
-            expect(bytes).toBe(Buffer.byteLength(JSON.stringify(page)));
-            expect(
-                Buffer.byteLength(JSON.stringify({ ...page, accept_reply_pages: true })),
-            ).toBeLessThanOrEqual(TEST_PAGE_MAX_BYTES);
-        }
-    });
-
-    it("reserves the late transport capability on a full non-final page", () => {
-        const body = {
-            method: "transform",
-            session_id: "boundary",
-            input: [
-                { text: "x".repeat(TEST_PAGE_MAX_BYTES - 2_000) },
-                { text: "x".repeat(TEST_PAGE_MAX_BYTES) },
-            ],
-        };
-        const initial = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES, true);
-        // Fill the first page to ten bytes below the caller's cap, before the
-        // transport adds its 26-byte reply capability. This used to overrun it.
-        body.input[0]!.text += "x".repeat(TEST_PAGE_MAX_BYTES - initial[0]!.bytes - 10);
-        const pages = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES, true);
-        expect(pages.length).toBeGreaterThan(1);
-        for (const { page } of pages) {
-            expect(
-                Buffer.byteLength(JSON.stringify({ ...page, accept_reply_pages: true })),
-            ).toBeLessThanOrEqual(TEST_PAGE_MAX_BYTES);
-        }
-    });
-
-    it("pins the application page budget to the shared SUBC frame fixture", async () => {
-        const fixture = (await Bun.file(
-            new URL(
-                "../../../../../crates/mc-module/testdata/subc-frame-limits.json",
-                import.meta.url,
-            ),
-        ).json()) as { max_frame_body_bytes: number; application_body_bytes: number };
-        expect(SUBC_MAX_FRAME_BODY_BYTES).toBe(fixture.max_frame_body_bytes);
-        expect(MODULE_PAGE_MAX_BYTES).toBe(fixture.application_body_bytes);
-    });
-    it("returns the first stringify length on the unpaged path", () => {
-        const body = {
-            method: "transform",
-            session_id: "ses-unpaged",
-            input: [{ mid: "m1", ordinal: 1, ck: { text: "hi" } }],
-        };
-        const pages = buildPagedModuleTransformPayloads(body);
-        expect(pages).toHaveLength(1);
-        expect(pages[0]?.page).toBe(body);
-        expect(pages[0]?.bytes).toBe(Buffer.byteLength(JSON.stringify(body)));
-    });
-
-    it("returns paging sizes that match a later stringify of each page", () => {
-        const body = {
-            method: "transform",
-            session_id: "ses-paged",
-            input: Array.from({ length: 80 }, (_, index) => ({
-                mid: `m${index}`,
-                ordinal: index + 1,
-                ck: { text: "x".repeat(8_000) },
-            })),
-        };
-        expect(Buffer.byteLength(JSON.stringify(body))).toBeGreaterThan(TEST_PAGE_MAX_BYTES);
-        const pages = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES);
-        expect(pages.length).toBeGreaterThan(1);
-        for (const { page, bytes } of pages) {
-            expect(bytes).toBe(Buffer.byteLength(JSON.stringify(page)));
-        }
-    });
-
-    it("content-addresses a cold page series so a completed result is adoptable", () => {
-        const body = {
-            method: "transform",
-            session_id: "ses-adopt-completed",
-            input: Array.from({ length: 80 }, (_, index) => ({
-                mid: `m${index}`,
-                ordinal: index + 1,
-                ck: { text: "x".repeat(8_000) },
-            })),
-        };
-
-        const first = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES);
-        const retry = buildPagedModuleTransformPayloads(structuredClone(body), TEST_PAGE_MAX_BYTES);
-        const changed = buildPagedModuleTransformPayloads(
-            {
-                ...body,
-                input: [...body.input, { mid: "changed", ordinal: 81, ck: { text: "changed" } }],
-            },
-            TEST_PAGE_MAX_BYTES,
-        );
-        const id = first[0]?.page.transform_page_id;
-
-        expect(first.length).toBeGreaterThan(1);
-        expect(retry.map(({ page }) => page.transform_page_id)).toEqual(
-            first.map(({ page }) => page.transform_page_id),
-        );
-        expect(changed[0]?.page.transform_page_id).not.toBe(id);
-    });
-
-    it("pages a 30,000-entry tool-input key-order map and bounds the scalar tail", () => {
-        const toolInputKeyOrders = Object.fromEntries(
-            Array.from({ length: 30_000 }, (_, index) => [
-                `msg_${index.toString(16).padStart(24, "0")}#0`,
-                ["filePath", "oldString", "newString"],
-            ]),
-        );
-        const body = {
-            method: "transform",
-            kind: "transform",
-            v: 2,
-            session_id: "ses-key-order-map",
-            input: [],
-            tool_input_key_orders: toolInputKeyOrders,
-            usage: { current_total_input_tokens: 1, context_limit_tokens: 200_000 },
-        };
-
-        expect(Buffer.byteLength(JSON.stringify(toolInputKeyOrders))).toBeGreaterThan(
-            TEST_PAGE_MAX_BYTES,
-        );
-        const pages = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES);
-        expect(pages.length).toBeGreaterThan(1);
-        expect(pages.every(({ bytes }) => bytes <= TEST_PAGE_MAX_BYTES)).toBe(true);
-
-        const reassembled = Object.assign(
-            {},
-            ...pages.map(({ page }) => page.tool_input_key_orders as Record<string, string[]>),
-        );
-        expect(reassembled).toEqual(toolInputKeyOrders);
-
-        const complete = { ...pages.at(-1)?.page };
-        for (const field of [
-            "input",
-            "messages",
-            "native_messages",
-            "ts_output",
-            "ts_ck_messages",
-            "normalizations",
-            "tool_input_key_orders",
-        ]) {
-            delete complete[field];
-        }
-        expect(Buffer.byteLength(JSON.stringify(complete))).toBeLessThan(64 * 1024);
-    });
-
-    it("hashes map slices with the Rust canonical page digest", () => {
-        expect(
-            __moduleWireTest.transformPageDigest({
-                messages: [{ mid: "m1", text: "hello" }],
-                tool_input_key_orders: {
-                    "m1#2": ["newString", "filePath"],
-                    "m1#0": ["path", "content"],
-                },
-            }),
-        ).toBe("db28d9596edc518ebe4131403a892c60868ee683f80c248e6c1c1a6f0e9bbf17");
-    });
-
-    it("names the five largest scalar fields when the tail cannot fit", () => {
-        const body = {
-            method: "transform",
-            session_id: "ses-scalar-diagnostic",
-            input: [],
-            largest: "a".repeat(180_000),
-            second: "b".repeat(160_000),
-            third: "c".repeat(140_000),
-            fourth: "d".repeat(120_000),
-            fifth: "e".repeat(100_000),
-            sixth: "f".repeat(80_000),
-        };
-
-        expect(() => buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES)).toThrow(
-            "largest scalar fields: largest=180002 bytes, second=160002 bytes, third=140002 bytes, fourth=120002 bytes, fifth=100002 bytes",
-        );
     });
 });

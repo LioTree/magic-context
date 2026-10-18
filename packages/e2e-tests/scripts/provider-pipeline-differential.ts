@@ -45,7 +45,7 @@ import {
     OPENCODE_PROVIDER_BOOTSTRAP_BUDGET_MS,
     type OpenCodeProviderOptions,
 } from "../../plugin/src/hooks/magic-context/host-runner/opencode-adapter";
-import type { createRustModeTransform } from "../../plugin/src/hooks/magic-context/rust-mode-transform";
+import type { createModuleSessionKernel } from "../../plugin/src/hooks/magic-context/module-session-kernel";
 import {
     createTransform,
     type TransformDeps,
@@ -1016,7 +1016,7 @@ export async function fixture(driver: Driver, host: Host, directory?: string, pr
         ordinalContinuationBase: 0,
     };
     const legacy = { getState: () => state } as unknown as ReturnType<
-        typeof createRustModeTransform
+        typeof createModuleSessionKernel
     >;
     const options: OpenCodeProviderOptions = {
         now: () => now,

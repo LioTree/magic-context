@@ -18,7 +18,7 @@ import { Database } from "../../../shared/sqlite";
 import { cleanupTestTempDir, createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import { createEventHandler } from "../event-handler";
 import { setRawMessageProvider } from "../read-session-chunk";
-import { createRustModeTransform } from "../rust-mode-transform";
+import { createModuleSessionKernel } from "../module-session-kernel";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
 import { startOracle } from "./conformance/oracle";
@@ -195,7 +195,7 @@ test("bridge usage reaches scheduler bands and frame parity", async () => {
                             lastHeuristicsTurnId: new Map(),
                             historianRunnable: false,
                         };
-                        const legacy = createRustModeTransform(deps, {
+                        const legacy = createModuleSessionKernel({
                             moduleClient: transport,
                             projectRoot: f.dir,
                         });

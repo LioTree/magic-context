@@ -18,20 +18,6 @@
  * assert the shipped mechanism (re-adopt, no permanent park) by default.
  */
 
-import {
-    RUST_EMERGENCY_WALL_PCT,
-    RUST_FAILURE_PARK_THRESHOLD,
-    RUST_PARK_PROBE_PRESSURE_BYPASS_PCT,
-    RUST_PARK_RETRY_INTERVAL,
-} from "../../plugin/src/hooks/magic-context/rust-mode-transform";
-import { RustTestHarness } from "./rust-harness";
-
-export {
-    RUST_EMERGENCY_WALL_PCT,
-    RUST_FAILURE_PARK_THRESHOLD,
-    RUST_PARK_PROBE_PRESSURE_BYPASS_PCT,
-    RUST_PARK_RETRY_INTERVAL,
-};
 
 export const rustPrereqs = RustTestHarness.detectPrereqs();
 

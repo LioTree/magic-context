@@ -22,7 +22,7 @@ import {
 import { adaptPayload } from "../../../v2/hooks/payload";
 import type { SessionContext } from "../../../v2/hooks/types";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
-import type { createRustModeTransform } from "../rust-mode-transform";
+import type { createModuleSessionKernel } from "../module-session-kernel";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
 import { applyProviderOps, createOpenCodeProviderTransform } from "./opencode-adapter";
@@ -187,7 +187,7 @@ function fixture(host: Host, covered = false) {
         ordinalMemoCheckpoints: [],
     };
     const legacy = { getState: () => legacyState } as unknown as ReturnType<
-        typeof createRustModeTransform
+        typeof createModuleSessionKernel
     >;
     const seams = {
         now: () => clock,

@@ -31,13 +31,7 @@ import {
     getSlot,
     noteEntry,
 } from "../hooks/magic-context/lkg-slot";
-import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import { replayCommittedDrops } from "../hooks/magic-context/replay-committed-drops";
-import {
-    noteExternalLkgReplay,
-    type RustLkgReplayParticipant,
-    resolveRustLkgReplayParticipant,
-} from "../hooks/magic-context/rust-lkg-freeze-registry";
 import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-refusal";
 import { retirePendingSystemPromptDelivery } from "../hooks/magic-context/system-prompt-delivery";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
@@ -241,14 +235,13 @@ export function tryMessagesTransformLkgReplay(args: {
     output: MessagesTransformOutput;
     sessionId: string;
     error: unknown;
-    rust?: RustLkgReplayParticipant;
     agent?: string;
     onLkgReplay?: () => void;
     entry?: ReturnType<typeof noteEntry> | null;
     /** Host-owned envelope validation, before adopting any saved messages. */
     replayFits?: (messages: MessageLike[]) => boolean;
 }): boolean {
-    const { output, sessionId, error, agent } = args;
+    const { output, sessionId, agent } = args;
     const slotAtEntry = getSlot(sessionId);
     let entry = args.entry;
     if (entry === undefined && slotAtEntry) {
@@ -262,30 +255,12 @@ export function tryMessagesTransformLkgReplay(args: {
         dropSlot(sessionId, "lkg_invalidated_reshape");
         sessionLog(sessionId, "lkg_invalidated_reshape");
     } else if (sessionId && entry) {
-        if (
-            !args.rust &&
-            lkgRecoveryEntryUnproven(sessionId, entry, output.messages as MessageLike[])
-        )
+        if (lkgRecoveryEntryUnproven(sessionId, entry, output.messages as MessageLike[]))
             return false;
         let replayBlocked = false;
         try {
             const db = openDatabase();
-            // In Rust mode the adapter tracks whether the session is serving a frozen
-            // replay, and it only replays when the replay fits the context limit.
-            // A replay served here must update that tracking and pass the same check.
-            const rust = args.rust;
             if (
-                (error instanceof StorageBusyRefusalError &&
-                    error.stage === "rust-mode-emergency") ||
-                rust?.emergencyFailClosed(sessionId, output.messages as MessageLike[])
-            ) {
-                // The adapter refused while failing closed (usage at or above 95%
-                // of the model's limit, or a proven provider overflow); there it
-                // admits no last-known-good replay, so serving one here would
-                // bypass its refusal.
-                replayBlocked = true;
-                sessionLog(sessionId, "lkg_emergency_band_refused");
-            } else if (
                 !db ||
                 isEmergencyRecoveryArmed(sessionId) ||
                 getOverflowState(db, sessionId).needsEmergencyRecovery
@@ -302,31 +277,27 @@ export function tryMessagesTransformLkgReplay(args: {
                     providerKey: keys.providerKey,
                     entry,
                     prepareReplay: (messages) =>
-                        rust
-                            ? rust.stripPersistedReasoning(sessionId, messages, inputMessages)
-                            : replayRustModeBindingMismatchStrips({
-                                  db,
-                                  sessionId,
-                                  messages,
-                                  resolvedProviderID: keys.providerKey ?? undefined,
-                              }),
+                        replayRustModeBindingMismatchStrips({
+                            db,
+                            sessionId,
+                            messages,
+                            resolvedProviderID: keys.providerKey ?? undefined,
+                        }),
                 });
-                if (replay.ok && !rust && lkgRecoveryReplayUnproven(sessionId)) {
+                if (replay.ok && lkgRecoveryReplayUnproven(sessionId)) {
                     sessionLog(sessionId, "lkg_restart_rebuild_required");
                     return false;
                 }
                 // A failed batch may already have committed earlier drops. The
                 // fallback must serve that subset before a later defer replays it.
-                if (replay.ok && !rust && !replayCommittedDrops(db, sessionId, replay.messages)) {
+                if (replay.ok && !replayCommittedDrops(db, sessionId, replay.messages)) {
                     sessionLog(sessionId, "lkg_reasoning_prefix_changed");
                     return false;
                 }
-                // TypeScript mode has no Rust result to check, but replaying
-                // the saved request for a known model still has to pass the
-                // same fit check as Rust mode: measured size of the saved
-                // request plus an estimate for the messages added since.
+                // Saved requests must fit the current model, including messages
+                // appended since the request was captured.
                 let tsFit = true;
-                if (replay.ok && !rust && keys.providerKey && keys.modelKey) {
+                if (replay.ok && keys.providerKey && keys.modelKey) {
                     const model = {
                         providerID: keys.providerKey,
                         modelID: keys.modelKey.slice(keys.providerKey.length + 1),
@@ -353,12 +324,7 @@ export function tryMessagesTransformLkgReplay(args: {
                         if (!fit.fits && fit.detail) sessionLog(sessionId, fit.detail);
                     }
                 }
-                if (
-                    replay.ok &&
-                    (!tsFit ||
-                        args.replayFits?.(replay.messages) === false ||
-                        (rust && !rust.replayFits(sessionId, replay.messages, inputMessages)))
-                ) {
+                if (replay.ok && (!tsFit || args.replayFits?.(replay.messages) === false)) {
                     replayBlocked = true;
                     sessionLog(sessionId, "lkg_replay_does_not_fit");
                 } else if (replay.ok) {
@@ -372,7 +338,6 @@ export function tryMessagesTransformLkgReplay(args: {
                     });
                     rememberLkgDirtyRevision(sessionId, revision);
                     if (
-                        !rust &&
                         !noteLkgRecoveryPrefix({
                             sessionId,
                             entry,
@@ -383,9 +348,6 @@ export function tryMessagesTransformLkgReplay(args: {
                         return false;
                     retirePendingSystemPromptDelivery(sessionId);
                     args.onLkgReplay?.();
-                    // Record raw-part visibility before installing bytes that a later
-                    // healthy Rust pass must preserve, even if the module has already tagged them.
-                    noteExternalLkgReplay(rust, sessionId, inputMessages, replay.messages);
                     replaceMessagesInPlace(
                         output,
                         replay.messages as unknown as MessageWithParts[],
@@ -415,7 +377,7 @@ export function tryMessagesTransformLkgReplay(args: {
  *
  * Error handling is tiered:
  *
- * - **FailClosedBlockingError / EmergencyFailClosedError / RawFallbackContextLimitError /
+ * - **FailClosedBlockingError / EmergencyFailClosedError /
  *   AssistantTerminalRetryError**: Intentional loud aborts. Rethrown so the terminal UI surfaces the
  *   message and the turn does not silently fall through to native compaction or a
  *   provider-rejected raw prompt.
@@ -468,17 +430,7 @@ export function createMessagesTransformHandler(args: {
     onLkgReplay?: () => void;
     internalChildSessions?: Set<string>;
     tryReopenStorage?: () => boolean | Promise<boolean>;
-    /**
-     * The Rust adapter of this wrapper's own plugin instance, or null when the
-     * instance runs in TypeScript mode. When omitted, the process-wide replay
-     * registry picks the adapter (the one that most recently ran the session).
-     */
-    rustReplayParticipant?: () => RustLkgReplayParticipant | null | undefined;
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
-    const resolveRust = (sessionId: string): RustLkgReplayParticipant | undefined =>
-        args.rustReplayParticipant
-            ? (args.rustReplayParticipant() ?? undefined)
-            : resolveRustLkgReplayParticipant(sessionId);
     const run = async (input: Record<string, never>, output: MessagesTransformOutput) => {
         const sessionId = resolveSessionId(output);
         const agent = resolveAgentNameFromMessages(output.messages);
@@ -570,7 +522,6 @@ export function createMessagesTransformHandler(args: {
                                         sessionId,
                                         error,
                                         entry,
-                                        rust: resolveRust(sessionId),
                                         agent,
                                         replayFits: args.replayFits,
                                         onLkgReplay: args.onLkgReplay,
@@ -630,10 +581,7 @@ export function createMessagesTransformHandler(args: {
                     cause: error,
                 });
             }
-            if (
-                error instanceof RawFallbackContextLimitError ||
-                error instanceof AssistantTerminalRetryError
-            ) {
+            if (error instanceof AssistantTerminalRetryError) {
                 throw error;
             }
             if (error instanceof EmergencyFailClosedError || isFailClosedBlockingError(error)) {
@@ -669,7 +617,6 @@ export function createMessagesTransformHandler(args: {
                     sessionId,
                     error,
                     entry,
-                    rust: resolveRust(sessionId),
                     agent,
                     replayFits: args.replayFits,
                     onLkgReplay: args.onLkgReplay,

@@ -3,7 +3,6 @@ import { openDatabase } from "../features/magic-context/storage-db";
 import { getOrCreateSessionMeta, updateSessionMeta } from "../features/magic-context/storage-meta";
 import { captureLkgSlot, replayLkg } from "../hooks/magic-context/lkg-replay";
 import { resetLkgSlotsForTest } from "../hooks/magic-context/lkg-slot";
-import type { RustLkgReplayParticipant } from "../hooks/magic-context/rust-lkg-freeze-registry";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
 import { createMessagesTransformHandler } from "../plugin/messages-transform";
 
@@ -34,13 +33,6 @@ for (const change of ["content", "reorder", "interior deletion"] as const) {
         let fits = 0;
         let callbacks = 0;
         let changed: MessageLike[] | undefined;
-        const participant: RustLkgReplayParticipant = {
-            lastPassStamp: () => 1,
-            enterFreezeFromExternalServe: () => {},
-            emergencyFailClosed: () => false,
-            stripPersistedReasoning: () => {},
-            replayFits: () => ++fits > 1,
-        };
         const exec = db.exec.bind(db);
         let attempts = 0;
         const spy = spyOn(db, "exec").mockImplementation((sql) => {
@@ -64,7 +56,7 @@ for (const change of ["content", "reorder", "interior deletion"] as const) {
         });
         try {
             const handler = createMessagesTransformHandler({
-                rustReplayParticipant: () => participant,
+                replayFits: () => ++fits > 1,
                 magicContext: {
                     "experimental.chat.messages.transform": async () => {
                         callbacks++;

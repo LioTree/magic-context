@@ -177,7 +177,7 @@ import {
     resolveKeepReasoningTokens,
 } from "./reasoning-budget";
 import { createM0RenderOptions } from "./render-options";
-import type { RustModeModuleClient } from "./rust-mode-transform";
+import type { ModuleSessionClient } from "./module-session-kernel";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
 import {
@@ -679,7 +679,7 @@ export interface TransformDeps {
     /** Resolves trusted USER guidance files before crossing the module boundary. */
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     /** Module transport injected by the hook; tests use a deterministic mock. */
-    rustModeModuleClient?: RustModeModuleClient;
+    rustModeModuleClient?: ModuleSessionClient;
     rustModeProjectRoot?: string;
     onRustEngineReconnectRefusal?: (args: {
         sessionId: string;

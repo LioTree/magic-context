@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import type { RustModeModuleClient } from "../rust-mode-transform";
+import type { ModuleSessionClient } from "../module-session-kernel";
 import { StoreAheadOfBinaryError } from "../store-ahead-refusal";
 import {
     decodeProviderRequest,
@@ -89,7 +89,7 @@ const tool = {
     blocks: ["result"],
     is_error: false,
 };
-type Call = Parameters<RustModeModuleClient["call"]>[0];
+type Call = Parameters<ModuleSessionClient["call"]>[0];
 type Wire = { method: ProviderMethod; params: Record<string, unknown> };
 function harness(
     reply: (wire: Wire, call: Call) => unknown | Promise<unknown>,
