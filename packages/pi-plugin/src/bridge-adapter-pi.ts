@@ -387,6 +387,29 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 				listeners.delete(listener);
 			};
 		},
+		/** Drop only the module's provider state; normal session deletion owns host data. */
+		async onSessionDeleted(id: string): Promise<void> {
+			assertOpen();
+			const pending = transport.call({
+				sessionId: id,
+				projectRoot: options.projectRoot,
+				method: "compaction.delete",
+				body: {
+					method: "compaction.delete",
+					params: { session: id, harness: "pi" },
+				},
+			});
+			work.add(pending);
+			try {
+				await pending;
+				manifests.delete(id);
+				currentWindows.delete(id);
+				rawReaders.get(id)?.();
+				rawReaders.delete(id);
+			} finally {
+				work.delete(pending);
+			}
+		},
 		dispose(): Promise<void> {
 			if (disposal) return disposal;
 			disposed = true;

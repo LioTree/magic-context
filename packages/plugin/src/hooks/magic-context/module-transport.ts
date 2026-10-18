@@ -466,6 +466,7 @@ export class SubcModuleTransport {
         method:
             | "state_sync"
             | "transform"
+            | "compaction.delete"
             | "session.status"
             | "session.delete"
             | "session.flush"

@@ -27,6 +27,7 @@ test("Pi relay vectors regenerate byte-identically through the real adapter and 
 		"native-cut-applied-and-recovered",
 		"tree-branch-switch",
 		"forked-session",
+		"session-delete-idempotent-and-terminal-step",
 	]);
 	// Steps and exchanges use relay-v1's field names, in relay-v1's key order.
 	for (const vector of parsed.cases) {
@@ -53,6 +54,7 @@ test("Pi relay vectors regenerate byte-identically through the real adapter and 
 			"state_sync",
 			"compaction.step",
 			"transform.hook",
+			"compaction.delete",
 		]),
 	);
 	const frozen = exchangesOf(parsed, "hook-timeout-fallback-freeze");
@@ -68,7 +70,7 @@ test("recorded Pi exchanges replay against a fresh McHandler with byte-identical
 	const recorded = vectors.cases.flatMap((vector) =>
 		vector.steps.flatMap((step) => step.exchanges),
 	).length;
-	expect(recorded).toBe(17);
+	expect(recorded).toBe(25);
 	expect(await replayPiExchangesAgainstMc(vectors)).toBe(recorded);
 }, 300_000);
 

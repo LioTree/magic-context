@@ -182,6 +182,14 @@ impl ResidentHooks {
         Some(messages)
     }
 
+    pub(crate) fn remove(&self, instance: u64, key: &Key) {
+        // Removing a building reservation also prevents its lease from publishing.
+        self.entries
+            .lock()
+            .expect("resident lock")
+            .remove(&(instance, key.store_key().conversation_key()));
+    }
+
     pub(crate) fn begin(
         &self,
         instance: u64,

@@ -15412,6 +15412,7 @@ impl McHandler {
                 "role.describe" => providers::describe(),
                 "compaction.setup"
                 | "compaction.step"
+                | "compaction.delete"
                 | "compaction.view.read"
                 | "transform.declare"
                 | "transform.hook" => {

@@ -15,6 +15,8 @@ export type PiEntry = {
 
 export type Action =
     | { kind: "bootstrap" }
+    | { kind: "delete" }
+    | { kind: "step_deleted" }
     | {
           kind: "serve";
           messages: MessageLike[];
@@ -30,7 +32,7 @@ export type Action =
     | ({ kind: "delivery" } & BridgeRequestCompletion);
 
 export interface Exchange {
-    method: ProviderMethod;
+    method: ProviderMethod | "compaction.delete";
     /** Exact UTF-8 JSON, not a JSON object to be reserialized by the consumer. */
     request_bytes: string;
     answer_bytes: string;

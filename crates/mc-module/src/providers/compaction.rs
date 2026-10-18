@@ -2815,10 +2815,15 @@ impl McHandler {
             let work = self.provider_work(&store, binding, key)?;
             return self.host_step(&store, &work, conversation, params, request);
         }
-        if let Some(conversation) = store
+        let conversation = store
             .load_provider_conversation(&key.store_key())
-            .map_err(transient)?
+            .map_err(transient)?;
+        if matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi")
+            && conversation.is_none()
         {
+            return Err(super::session_delete::conversation_missing());
+        }
+        if let Some(conversation) = conversation {
             let frozen: Value =
                 serde_json::from_str(&conversation.params_json).map_err(transient)?;
             if host_plan(&binding, &request.session, &request.harness, &frozen)? {

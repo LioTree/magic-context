@@ -41,6 +41,7 @@ mod resident_bytes;
 pub(crate) mod resident_hooks;
 mod resident_view;
 mod runner_resident;
+mod session_delete;
 mod step_transform;
 #[cfg(test)]
 mod tests;
@@ -340,6 +341,14 @@ impl McHandler {
         // Harness strings select a codec, not authorization. OpenCode and Pi check the
         // bound principal and scope; Claude Code still requires reserved:thalamus.
         let host = host_binding(&binding);
+        if method == "compaction.delete"
+            && !matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi")
+        {
+            return error(
+                "host_lane_requires_harness_module",
+                "Deletion requires the authenticated host bridge",
+            );
+        }
         if !host && binding.harness != session_resolver::RUNNER_BIND_HARNESS {
             return error(
                 "route_unbound",
@@ -385,6 +394,14 @@ impl McHandler {
                         "provider call does not match its bound conversation",
                     );
                 }
+            }
+            // Deletion needs route attestation, not a surviving frozen plan:
+            // a retry must still succeed after the first call removed that plan.
+            if method == "compaction.delete" {
+                return match self.provider_delete(&binding, params).await {
+                    Ok(bytes) => HandlerOutcome::Response(bytes),
+                    Err(error) => error,
+                };
             }
             if method == "transform.hook" && self.provider_resident.is_enabled() {
                 if let (Some(store), Some(session), Some(harness)) = (
