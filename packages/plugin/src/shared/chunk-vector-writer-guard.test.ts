@@ -19,6 +19,19 @@ function vectorUpdates(source: string): number[] {
         .map((match) => sql.slice(0, match.index).split("\n").length);
 }
 
+function isRustIntegrationTest(path: string): boolean {
+    return /^crates\/[^/]+\/tests\/.+\.rs$/.test(path);
+}
+
+test("writer guard excludes only Rust integration test paths", () => {
+    expect(isRustIntegrationTest("crates/mc-store/tests/retrieval_vectors.rs")).toBe(true);
+    expect(isRustIntegrationTest("crates/mc-store/tests/support/fixture.rs")).toBe(true);
+    expect(isRustIntegrationTest("crates/mc-store/src/retrieval_vectors.rs")).toBe(false);
+    expect(isRustIntegrationTest("crates/mc-store/tests/production.sql")).toBe(false);
+    expect(isRustIntegrationTest("packages/plugin/src/tests/writer.ts")).toBe(false);
+    expect(isRustIntegrationTest("scripts/tests/writer.py")).toBe(false);
+});
+
 test("writer guard recognizes vector/dims updates without rejecting metadata repairs", () => {
     expect(
         vectorUpdates("UPDATE compartment_chunk_embeddings SET vector = ? WHERE id = ?"),
@@ -59,7 +72,8 @@ test("production chunk vectors and dimensions are immutable at their rowid", () 
                     scan(path);
             } else if (
                 /\.(?:tsx?|rs|py|sql|[cm]?js)$/.test(entry.name) &&
-                !/(?:\.test|\.spec|_tests?|\.fixture|\.test-support)\./.test(entry.name)
+                !/(?:\.test|\.spec|_tests?|\.fixture|\.test-support)\./.test(entry.name) &&
+                !isRustIntegrationTest(relative(root, path))
             ) {
                 for (const line of vectorUpdates(readFileSync(path, "utf8"))) {
                     violations.push(`${relative(root, path)}:${line}`);
