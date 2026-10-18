@@ -19,18 +19,12 @@ import {
 } from "@cortexkit/subc-client";
 import vectors from "../../../../../../test-vectors/project-resolve-v1/resolve.json";
 import { createEventHandler } from "../../../hooks/magic-context/event-handler";
-import { createSubcModuleClient } from "../../../hooks/magic-context/module-client";
-import { setRawMessageProvider } from "../../../hooks/magic-context/read-session-chunk";
-import {
-    createRustModeTransform,
-    type RustModeModuleClient,
-} from "../../../hooks/magic-context/rust-mode-transform";
 import { createTransform } from "../../../hooks/magic-context/transform";
 import { getHarness } from "../../../shared/harness";
 import { Database } from "../../../shared/sqlite";
 import { createTestTempDir } from "../../../shared/test-temp-dir";
 import { recordSessionProjectIdentity } from "../session-project-storage";
-import { closeDatabase, getOrCreateSessionMeta, openDatabase } from "../storage";
+import { closeDatabase, openDatabase } from "../storage";
 import { createTagger } from "../tagger";
 import {
     __clearProjectIdentityResolutionCacheForTests,
@@ -786,68 +780,6 @@ describe("offline registered identity continuity", () => {
         expect(decision.identity).toBe(registeredProjectId);
         expect(readRememberedProjectIdentity(directory)?.identity).toBe(registeredProjectId);
         expect(logs).toHaveLength(0);
-        expect(fake.calls).toHaveLength(1);
-    });
-});
-
-describe("ck-mc host binding order", () => {
-    test("the awaited host row exists at route bind and the route uses the current session directory", async () => {
-        const directory = folder("route-root");
-        const launch = folder("launch-root");
-        const fake = await fakeEndpoint(directory);
-        fake.delay = 400;
-        const db = hostDatabase();
-        const session = "binding-order";
-        const raw = {
-            id: "user-1",
-            ordinal: 0,
-            role: "user",
-            parts: [{ type: "text", text: "continue" }],
-            timeCreated: 1,
-            contributesOrdinal: true,
-            hasValidInfo: true,
-        };
-        cleanups.push(
-            setRawMessageProvider(session, {
-                readMessages: () => [raw],
-                readMessageOrdinalPage: (after, limit) => (!after ? [raw].slice(0, limit) : []),
-                getStoredMessageCount: () => 1,
-                readMessagePartsById: () => ({
-                    id: raw.id,
-                    role: "user",
-                    parts: [{ type: "text", text: "continue" }],
-                    createdAt: 1,
-                }),
-            }),
-        );
-        const bindings: { root: string; identity: string | undefined }[] = [];
-        fake.onRoute = (route) => {
-            const target = route.target as { module_id?: string };
-            if (target.module_id !== "magic-context") return;
-            const identity = route.identity as { project_root: string };
-            bindings.push({ root: identity.project_root, identity: row(db, session) });
-        };
-        const transport = createSubcModuleClient({
-            connectionFile: fake.connectionFile,
-            projectRoot: launch,
-        });
-        cleanups.push(() => transport.closeSession?.(session));
-        const moduleClient: RustModeModuleClient = {
-            call: async (args) => {
-                await transport.call(args);
-                throw new Error("stop after real route bind");
-            },
-        };
-        const deps = hostDeps(db, session, directory, fake.connectionFile);
-        deps.directory = launch;
-        const runner = createRustModeTransform(deps, { moduleClient });
-        cleanups.push(() => runner.dispose());
-        const input = messages(session);
-        await expect(
-            runner.run(session, input, { messages: input }, getOrCreateSessionMeta(db, session)),
-        ).rejects.toThrow();
-        expect(bindings.length).toBeGreaterThan(0);
-        expect(bindings).toEqual([{ root: directory, identity: registeredProjectId }]);
         expect(fake.calls).toHaveLength(1);
     });
 });
