@@ -581,11 +581,18 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         // reconcile step compares the fact with existing memory instead.
         const turnOneLane = resolveTurnOneLane(deps.memoryLifecycleLane);
         const anchoredFacts = turnOneLane === "enabled" && deps.memoryEnabled !== false;
-        const memories = anchoredFacts
-            ? []
-            : getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+        // Every attempt in the chain (configured fallbacks, then the session
+        // model as the last resort) sends this same prompt, so size it for each
+        // of their windows too, resolved as their pre-send check resolves them.
+        const fallbackWindows = [
+            ...(deps.fallbackModels ?? []).map((entry) => toModelEntry(entry)?.model),
+            deps.fallbackModelId,
+        ]
+            .filter((key): key is string => typeof key === "string" && key !== producerModel)
+            .map((key) => resolveHistorianProducerWindow(key, deps.historianMaxOutputTokens));
         const promptFit = fitHistorianPrompt({
             window: producerWindow,
+            fallbackWindows,
             systemPrompt: withContentLanguageDirective(
                 COMPARTMENT_AGENT_SYSTEM_PROMPT,
                 deps.language,
@@ -599,7 +606,8 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 sessionId,
                 priorCompartments,
             ),
-            memories,
+            memories: () =>
+                anchoredFacts ? [] : getMemoriesByProject(db, projectPath, ["active", "permanent"]),
             memoryEnabled: deps.memoryEnabled !== false,
             anchoredFacts,
         });
@@ -877,8 +885,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             retainChild: anchoredFacts,
         });
         retainedChild = validatedPass.ok ? validatedPass.retainedChild : undefined;
-        // A window refusal here comes from a fallback model (the primary was fitted
-        // above). Treat it like any other failed pass: count it, notify, and keep
+        // A window refusal here comes from a fallback too small to hold even a
+        // minimal prompt (every other chain model was fitted above). Treat it like
+        // any other failed pass: count it, notify, and keep
         // the reserved drain budget spent so the next trigger does not retry at once.
         if (!validatedPass.ok) {
             // Always track historian failures regardless of usage percentage.

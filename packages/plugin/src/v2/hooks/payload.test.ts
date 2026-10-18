@@ -90,6 +90,64 @@ function callsAndResults(messages: V2Message[]) {
 }
 
 describe("adaptPayload", () => {
+    it("render review: 400 timestamp observations preserve exact provider-visible bytes", () => {
+        let seed = 4910;
+        const next = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0);
+        for (let pass = 0; pass < 400; pass++) {
+            const messages: V2Message[] = [
+                {
+                    id: `u${pass}`,
+                    role: "user",
+                    content: [
+                        { type: "text", text: `Question ${next()}`, cache: { type: "ephemeral" } },
+                    ],
+                },
+                ...toolTurn(`a${pass}`, `call${pass}`, "read", `Contents ${next()}`),
+                {
+                    id: `tail${pass}`,
+                    role: "user",
+                    content: [{ type: "text", text: `Follow-up ${next()}` }],
+                },
+            ];
+            const untimed = draft(structuredClone(messages));
+            const timed = draft(structuredClone(messages));
+            const times = new Map(
+                messages
+                    .filter((m) => m.id)
+                    .map((m) => [m.id!, { created: next(), completed: next() }]),
+            );
+            const plain = adaptPayload(untimed);
+            const observed = adaptPayload(timed, new Set(), times);
+            expect(observed.messages[0].info.time).toEqual(times.get(`u${pass}`));
+            if (next() % 2) {
+                plain.messages[0].parts[0].text += " Edited by the pipeline.";
+                observed.messages[0].parts[0].text += " Edited by the pipeline.";
+            }
+            for (const message of observed.messages)
+                message.info.time = { created: next(), completed: next() };
+            plain.commit();
+            observed.commit();
+            expect(JSON.stringify(timed), `timestamp pass ${pass}`).toBe(JSON.stringify(untimed));
+            expect(timed.messages.some((m) => "info" in m)).toBe(false);
+        }
+    });
+
+    it("observes store timestamps internally without serializing info to the host draft", () => {
+        const context = draft([
+            { id: "timed", role: "user", content: [{ type: "text", text: "hello" }] },
+            { role: "assistant", content: [{ type: "text", text: "world" }] },
+        ]);
+        const before = JSON.stringify(context);
+        const time = { created: 1700000000000, completed: 1700000001000 };
+        const payload = adaptPayload(context, new Set(), new Map([["timed", time]]));
+        expect(payload.messages[0].info.time).toEqual(time);
+        expect(payload.messages[1].info.time).toBeUndefined();
+        payload.messages[0].info.time = { created: 42, completed: 43 };
+        payload.commit();
+        expect(JSON.stringify(context)).toBe(before);
+        expect(context.messages.every((message) => !("info" in message))).toBe(true);
+    });
+
     it("preserves restored and normalized tool errors as errors with identical tagged text", () => {
         const failure = {
             error: { type: "tool.execution", message: "File not found: missing.txt" },

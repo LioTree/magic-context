@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { buildMagicContextSection } from "../../agents/magic-context-prompt";
 import { computeHardCacheExpired } from "../../features/magic-context/scheduler";
 import {
@@ -6,6 +5,7 @@ import {
     getOrCreateSessionMeta,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import { noteSystemPromptHashChange } from "../../features/magic-context/transform-decision-log";
 import type { PluginContext } from "../../plugin/types";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { log, sessionLog } from "../../shared/logger";
@@ -14,7 +14,7 @@ import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import {
     createPromptSurfaceGuidanceEpochCache,
     createPromptSurfaceRuntime,
-    promptSurfaceHashMaterial,
+    systemPromptFingerprint,
 } from "../../shared/prompt-surface-runtime";
 import {
     ctxReduceSpawnPermissionReadNeeded,
@@ -485,9 +485,7 @@ export function createSystemPromptHashHandler(deps: {
         const dates = systemPromptDates(liveSystemContent, stickyDate);
         const currentDate = dates.live;
         const stableCandidate = dates.stable;
-        const stableCandidateHash = createHash("md5")
-            .update(promptSurfaceHashMaterial(stableCandidate, promptSurface.preset))
-            .digest("hex");
+        const stableCandidateHash = systemPromptFingerprint(stableCandidate, promptSurface.preset);
         const contentOrPresetChanged = hasPersistedHash && stableCandidateHash !== previousHash;
         const rewritePermission = systemDateRefreshPermission(
             deps.historyRefreshSessions,
@@ -518,9 +516,7 @@ export function createSystemPromptHashHandler(deps: {
                     }
                     try {
                         const content = liveElements.join("\n");
-                        const hash = createHash("md5")
-                            .update(promptSurfaceHashMaterial(content, promptSurface.preset))
-                            .digest("hex");
+                        const hash = systemPromptFingerprint(content, promptSurface.preset);
                         updateSessionMeta(deps.db, sessionId, {
                             systemPromptHash: hash,
                             cachedM0SystemHash: hash,
@@ -593,9 +589,7 @@ export function createSystemPromptHashHandler(deps: {
         // causing precision loss on read-back and infinite hash-change flushes.
         // node:crypto MD5 produces identical digests to Bun.CryptoHasher("md5"),
         // so persisted hashes remain stable across the Bun→Node runtime swap.
-        const currentHash = createHash("md5")
-            .update(promptSurfaceHashMaterial(systemContent, promptSurface.preset))
-            .digest("hex");
+        const currentHash = systemPromptFingerprint(systemContent, promptSurface.preset);
         recordMarkerSystem(sessionId, modelKey, currentHash, output.system);
 
         recordSystemPromptForRequest(
@@ -623,6 +617,10 @@ export function createSystemPromptHashHandler(deps: {
                 sessionId,
                 `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), ${idleCacheExpired ? "adopting on idle-expired request" : requestMessagesFinal ? "adopting on the request whose messages are already final" : "triggering flush"}`,
             );
+            // This request carries the new prompt, so the provider rewrites its
+            // cache from the system block onward whatever the messages pass did.
+            // Its transform decision names the change, in every branch below.
+            noteSystemPromptHashChange(sessionId);
             // When the following messages transform can still fold into this
             // request, signal all three independent refresh lifetimes. The semantic
             // prompt epoch changed on this turn, so history rebuild, adjunct refresh,

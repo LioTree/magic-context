@@ -56,6 +56,7 @@ import { observeTemporalDecisions } from "../../features/magic-context/temporal-
 import {
     clearOpenCodePendingTransformDecision,
     normalizeMaterializeReason,
+    noteOpenCodeUnbustedPass,
     recordPendingTransformDecision,
 } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
@@ -99,7 +100,6 @@ import { deriveTriggerBudget } from "./derive-budgets";
 import { contextRefusalError, EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
-    historyBudgetPolicyIdentity,
     resolveContextWindowGeometry,
     resolveExecuteThreshold,
     resolveExecuteThresholdDetail,
@@ -176,6 +176,7 @@ import {
     projectOpencodeReasoningBudgetCutoff,
     resolveKeepReasoningTokens,
 } from "./reasoning-budget";
+import { createM0RenderOptions } from "./render-options";
 import type { RustModeModuleClient } from "./rust-mode-transform";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
@@ -830,7 +831,7 @@ export function createTransform(deps: TransformDeps) {
                 : { ...params, toastDurationMs: historianRun.toastDurationMs };
         };
         beginLkgPass(sessionId);
-        clearOpenCodePendingTransformDecision(sessionId);
+        clearOpenCodePendingTransformDecision(sessionId, messages);
 
         const db = deps.db;
 
@@ -1718,12 +1719,6 @@ export function createTransform(deps: TransformDeps) {
         const boundaryUsageForProtectedTail = persistedUsageFreshForBoundary ?? contextUsageEarly;
         const boundaryUsageSource = persistedUsageFreshForBoundary ? "persisted" : "live";
 
-        const historyPolicyIdentity = historyBudgetPolicyIdentity(
-            deps.historyBudgetPercentage,
-            deps.executeThresholdPercentage,
-            currentModelKeyForBoundary,
-            deps.executeThresholdTokens,
-        );
         // A cold-pass usage reset must not hide the last matched usable window.
         // For catalog-absent models, rendering against the 60K default here would
         // manufacture a larger baseline, then force a shrink on the next pass.
@@ -1737,14 +1732,17 @@ export function createTransform(deps: TransformDeps) {
             persistedUsageBeforeResets.lastUsageContextLimit > 0
                 ? persistedUsageBeforeResets.lastUsageContextLimit
                 : undefined);
-        const historyBudgetTokens = resolveHistoryBudgetTokens(
-            deps.historyBudgetPercentage,
+        const memoryProjectDirectory = compartmentDirectory || process.cwd();
+        const renderOptions = createM0RenderOptions(
+            deps,
             contextUsageEarly,
-            deps.executeThresholdPercentage,
-            deps.getModelKey?.(sessionId),
-            deps.executeThresholdTokens,
+            currentModelKeyForBoundary,
             historyContextLimit,
+            deps.memoryConfig?.enabled
+                ? resolveProjectIdentityForSession(memoryProjectDirectory, deps.allowHomeProject)
+                : undefined,
         );
+        const { historyBudgetTokens, projectPath: projectIdentity } = renderOptions;
         // Ceiling for the tiered emergency drop = contextLimit × executeThreshold%
         // (the usable working ceiling, NOT scaled by history_budget_percentage).
         // Resolve the limit the same way resolveHistoryBudgetTokens does: prefer
@@ -2006,16 +2004,6 @@ export function createTransform(deps: TransformDeps) {
 
         logTransformTiming(sessionId, "emergencyRecoveryBlock", tFirstPass);
 
-        // Resolve project identity ONCE per transform pass. Used by both
-        // prepareCompartmentInjection (memory filtering by project) and
-        // runCompartmentPhase (historian memory resolution). Computing it
-        // twice per turn is wasteful — resolveProjectIdentity caches by
-        // directory but still does a cache lookup on each call, and the
-        // first call per directory in a new process spawns `git rev-list`.
-        const memoryProjectDirectory = compartmentDirectory || process.cwd();
-        const projectIdentity = deps.memoryConfig?.enabled
-            ? resolveProjectIdentityForSession(memoryProjectDirectory, deps.allowHomeProject)
-            : undefined;
         if (deps.memoryConfig?.enabled) {
             maybeSendProjectIdentityWarning(
                 deps,
@@ -2705,14 +2693,8 @@ export function createTransform(deps: TransformDeps) {
                 db,
                 sessionId,
                 state: sessionMeta,
-                projectPath: projectIdentity,
                 projectDirectory: sessionDirectory,
-                injectDocs: deps.injectDocs,
-                memoryEnabled: deps.memoryConfig?.enabled,
-                muralEnabled: deps.muralEnabled,
-                memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
-                historyBudgetTokens,
-                historyBudgetPolicyIdentity: historyPolicyIdentity,
+                ...renderOptions,
                 hardSignals: m0HardSignals,
             }).value;
         const protectionCacheBustingPass =
@@ -2935,23 +2917,9 @@ export function createTransform(deps: TransformDeps) {
             passOutcome,
             historyRefreshSessions: deps.historyRefreshSessions,
             m0M1: {
-                // Memory identity ONLY (drives <project-memory> selection in
-                // materializeM0). Must stay undefined when memory.enabled=false —
-                // falling back to deps.projectPath here re-enabled memory injection
-                // despite the config being off (materializeM0 renders memory purely
-                // on projectPath presence). projectDirectory below independently
-                // drives docs/key-files/history, so dropping the fallback does not
-                // disable those.
-                projectPath: projectIdentity,
                 projectDirectory: sessionDirectory,
-                injectDocs: deps.injectDocs,
-                memoryEnabled: deps.memoryConfig?.enabled,
-                memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
-                historyBudgetTokens,
-                historyBudgetPolicyIdentity: historyPolicyIdentity,
-                temporalAwareness: deps.experimentalTemporalAwareness,
+                ...renderOptions,
                 hardSignals: m0HardSignals,
-                muralEnabled: deps.muralEnabled,
             },
         });
         if (recovery.prefix && !recoveryNormalized) {
@@ -3468,6 +3436,32 @@ export function createTransform(deps: TransformDeps) {
                 bustedThisPass: true,
                 lkgFrozenReleaseReason: recoveryReleaseReason,
             });
+        } else {
+            // A pass that changed no message bytes stages no decision row. Keep its
+            // decision in memory anyway: if the system prompt hook detects a changed
+            // prompt on the same request, that request still rewrites the provider's
+            // prompt cache and its row is built from this decision.
+            noteOpenCodeUnbustedPass(sessionId, {
+                tsMs: Date.now(),
+                decision: schedulerDecision,
+                materialized: postTransformResult.materialized,
+                materializeReason: normalizeMaterializeReason(
+                    "opencode",
+                    postTransformResult.materializeReason,
+                    postTransformResult.materialized,
+                ),
+                systemHashPrev: postTransformResult.systemHashPrev,
+                systemHashNew: postTransformResult.systemHashNew,
+                m0ToolSetHashPrev: postTransformResult.m0ToolSetHashPrev,
+                m0ToolSetHashNew: postTransformResult.m0ToolSetHashNew,
+                m0ModelKeyPrev: postTransformResult.m0ModelKeyPrev,
+                m0ModelKeyNew: postTransformResult.m0ModelKeyNew,
+                emergency: postTransformResult.emergency,
+                droppedTokens: postTransformResult.droppedTokens,
+                droppedCount: postTransformResult.droppedCount,
+                inputTokens: contextUsage.inputTokens,
+                bustedThisPass: false,
+            });
         }
         logTransformTiming(sessionId, "postTransformPhase", tPostProcess);
 
@@ -3670,54 +3664,7 @@ export function createTransform(deps: TransformDeps) {
     return Object.assign(transform, { clearSessionLogState });
 }
 
-export function resolveHistoryBudgetTokens(
-    historyBudgetPercentage: number | undefined,
-    contextUsage: ContextUsage,
-    executeThresholdPercentage:
-        | number
-        | { default: number; [modelKey: string]: number }
-        | undefined,
-    modelKey: string | undefined,
-    executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined },
-    resolvedContextLimit?: number,
-): number | undefined {
-    if (!historyBudgetPercentage) {
-        return undefined;
-    }
-
-    // Derive the budget from the model's STABLE context limit, resolved
-    // directly (models.dev + any detected-overflow override). The previous
-    // design back-derived the limit from live usage as inputTokens/percentage,
-    // which collapses to 0/0 on the FIRST transform pass after a restart
-    // (percentage=0, inputTokens=0). When a re-materialize was forced on that
-    // very pass (e.g. the m[1] cache was cleared by a migration), the budget
-    // fell through to the hard-coded 60K default — far below a large model's
-    // real history budget — and the decay renderer archived the oldest
-    // compartments to fit 60K, then stuck there via cache_hit replay. The
-    // resolved limit is available even at percentage=0 (recovered from the
-    // OpenCode DB), so it removes the hole. The live-usage back-derivation is
-    // kept only as a last-resort fallback if a limit couldn't be resolved.
-    let contextLimit = resolvedContextLimit && resolvedContextLimit > 0 ? resolvedContextLimit : 0;
-    if (contextLimit <= 0) {
-        if (contextUsage.percentage <= 0) {
-            return undefined;
-        }
-        contextLimit = contextUsage.inputTokens / (contextUsage.percentage / 100);
-    }
-    if (!Number.isFinite(contextLimit) || contextLimit <= 0) {
-        return undefined;
-    }
-
-    return Math.floor(
-        contextLimit *
-            (resolveExecuteThreshold(executeThresholdPercentage ?? 65, modelKey, 65, {
-                tokensConfig: executeThresholdTokens,
-                contextLimit,
-            }) /
-                100) *
-            historyBudgetPercentage,
-    );
-}
+export { resolveHistoryBudgetTokens } from "./render-options";
 
 import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
 import { resolveDecisionCalibration } from "./decision-calibration";

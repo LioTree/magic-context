@@ -56,7 +56,7 @@ export function registerV2DreamScheduleTimer(args: {
     directory: string;
     projectIdentity: string;
     config: MagicContextPluginConfig;
-    dreamer: DreamerConfig;
+    dreamer: DreamerConfig | undefined;
     /** The live configuration, re-read before each timer pass. */
     liveConfig: () => MagicContextPluginConfig;
     executor: HiddenCompletionExecutor;
@@ -77,7 +77,11 @@ export function registerV2DreamScheduleTimer(args: {
         dreamerConfig: dreamer,
         sampleDreamRun: () => {
             const current = dreamerRunConfig(config, args.liveConfig());
-            return { dreamerConfig: current.dreamer ?? dreamer, mural: current.mural };
+            return {
+                dreamerConfig: current.dreamer ?? dreamer,
+                mural: current.mural,
+                gitCommitIndexing: current.memory.git_commit_indexing,
+            };
         },
         // Scheduled and manual runs share one capability filter, so a host
         // without a tool loop never records tasks it cannot run as failed.
