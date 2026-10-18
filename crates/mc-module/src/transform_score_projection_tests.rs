@@ -7,7 +7,7 @@
 // - The applied watermark (`ModuleMeta::score_selection_watermark`, "W" in test
 //   names and messages) is the highest score selection rendered into m0.
 // - A marker HARD is a rebuild requested because content may have changed (here
-//   a pending project-memory epoch, set by `mark_epoch`), not because the
+//   a structural history marker, set by `mark_history`), not because the
 //   provider's cache was lost. It must re-render at W and keep the prefix.
 // - Each fixture compartment N stores tier text `detail-P<tier>-N;` for tiers
 //   P1 (fullest) to P4 (shortest), so the tier the decay curve picked shows up
@@ -44,11 +44,8 @@ fn scored_fixture() -> (tempfile::TempDir, McStore, TransformRequest) {
     (dir, s, request)
 }
 
-fn mark_epoch(s: &McStore) {
-    let mut loaded = s.load("ses").unwrap();
-    loaded.meta.project_memory_epoch_pending = true;
-    s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
-        .unwrap();
+fn mark_history(s: &McStore) {
+    regate_mark_history_pending(s, "ses");
 }
 
 fn assert_applied(s: &McStore, watermark: i64, first_tier: u8) {
@@ -73,7 +70,7 @@ fn assert_applied(s: &McStore, watermark: i64, first_tier: u8) {
 }
 
 #[test]
-fn publication_and_two_epoch_marker_hards_keep_watermark_and_prefix() {
+fn publication_and_two_history_marker_hards_keep_watermark_and_prefix() {
     let (_dir, s, request) = scored_fixture();
     let ctx = pctx("git:proj", "/nonexistent-docs", 0);
     transform(&s, &request, &ctx).unwrap();
@@ -92,7 +89,7 @@ fn publication_and_two_epoch_marker_hards_keep_watermark_and_prefix() {
     assert_ne!(pending.action, "SOFT");
     assert_eq!(pending.messages(), baseline.messages());
     for _ in 0..2 {
-        mark_epoch(&s);
+        mark_history(&s);
         let hard = transform(&s, &request, &ctx).unwrap();
         assert_eq!(hard.action, "HARD");
         assert!(!hard.prefix_bust_permitted);
@@ -154,7 +151,7 @@ fn ttl_and_model_cache_loss_adopt_latest_even_when_w_render_matches() {
         // requests a rebuild. An expired cache TTL or a different model means the
         // provider no longer holds the cached prefix, so keeping the old bytes saves
         // nothing and the rebuild must adopt the pending score.
-        mark_epoch(&s);
+        mark_history(&s);
         if ttl {
             ctx.now_ms = 600_000;
             ctx.observed_last_response_at_ms = Some(1);
@@ -186,7 +183,7 @@ fn first_fold_and_content_busting_marker_adopt_latest() {
         Ok(())
     })
     .unwrap();
-    mark_epoch(&s);
+    mark_history(&s);
     let hard = transform(&s, &request, &ctx).unwrap();
     assert_eq!(hard.action, "HARD");
     assert!(hard.prefix_bust_permitted);
@@ -208,7 +205,7 @@ fn undo_pending_across_restart_keeps_applied_view_until_cache_loss() {
     }).unwrap();
     drop(s);
     let s = store(dir.path());
-    mark_epoch(&s);
+    mark_history(&s);
     let marker = transform(&s, &request, &ctx).unwrap();
     assert_eq!(marker.action, "HARD");
     assert!(!marker.prefix_bust_permitted);
@@ -384,7 +381,7 @@ fn review_marker_publication_between_probe_and_cas_keeps_exact_applied_render() 
     transform(&s, &request, &ctx).unwrap();
     let baseline = transform(&s, &request, &ctx).unwrap();
     assert_applied(&s, 1, 2);
-    mark_epoch(&s);
+    mark_history(&s);
     let publisher = std::sync::Arc::clone(&s);
     s.after_score_snapshot_for_test(move || {
         publisher.publish_score_for_test("ses", 2, 1).unwrap();
@@ -414,7 +411,7 @@ fn review_score_cas_retry_recomposes_bytes_and_watermark_together() {
     let competitor = std::sync::Arc::clone(&s);
     s.after_score_snapshot_for_test(move || {
         competitor.publish_score_for_test("ses", 2, 1).unwrap();
-        mark_epoch(&competitor);
+        mark_history(&competitor);
     });
     request.model_key = Some("provider/model-b".into());
     let hard = transform(&s, &request, &ctx).unwrap();
@@ -558,7 +555,7 @@ fn review_downgrade_meta_rewrite_must_not_adopt_unserved_scores_on_marker_hard()
     let replay = transform(&reopened, &request, &ctx).unwrap();
     assert_ne!(replay.action, "HARD");
     assert_eq!(replay.messages(), baseline.messages());
-    mark_epoch(&reopened);
+    mark_history(&reopened);
     let marker = transform(&reopened, &request, &ctx).unwrap();
     assert_eq!(marker.action, "HARD");
     assert!(!marker.prefix_bust_permitted);

@@ -972,7 +972,9 @@ fn reset_store_caches(options: &RepairOptions, work: &Work) -> Result<(), Engine
                 _ => json!({}),
             };
             let object = value.as_object_mut().expect("checked above");
-            object.insert("project_memory_epoch_pending".into(), true.into());
+            // Restored history invalidates the frozen baseline independently of
+            // any dashboard memory change counter.
+            object.insert("bootstrap_seed_fold_pending".into(), true.into());
             conn.execute(
                 "UPDATE mc_cache_state SET meta = ?2, row_version = row_version + 1 WHERE session_id = ?1",
                 params![session, value.to_string()],

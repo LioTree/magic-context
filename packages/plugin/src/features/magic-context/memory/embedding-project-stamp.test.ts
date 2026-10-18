@@ -310,3 +310,39 @@ test("embedding project epoch lookup uses the project primary-key index and repo
         f.close();
     }
 });
+
+test("embedding epoch invalidates after dashboard delta admission without clearing served prefix bytes", () => {
+    const f = fixture();
+    try {
+        f.reader
+            .prepare(
+                "INSERT INTO session_meta(session_id,cached_m0_bytes,cached_m1_bytes) VALUES ('held-dashboard',?,?)",
+            )
+            .run(Buffer.from("frozen m0"), Buffer.from("frozen m1"));
+        const warm = getProjectEmbeddings(f.reader, f.projectPath, "stamp:model");
+        const receipt = applyDashboardMemoryEdit(f.writer, {
+            projectPath: f.projectPath,
+            operationId: "delta-and-search",
+            expectedRevisions: [{ memoryId: f.first.id, revision: 1 }],
+            changes: [{ memoryId: f.first.id, content: "Dashboard correction." }],
+        });
+        expect(receipt.state).toBe("applied");
+        expect(
+            f.reader
+                .prepare(
+                    "SELECT new_content FROM memory_mutation_log WHERE operation_id LIKE 'dashboard:%'",
+                )
+                .all(),
+        ).toEqual([{ new_content: "Dashboard correction." }]);
+        expect(getProjectEmbeddings(f.reader, f.projectPath, "stamp:model")).not.toBe(warm);
+        const cache = f.reader
+            .prepare(
+                "SELECT cached_m0_bytes,cached_m1_bytes FROM session_meta WHERE session_id='held-dashboard'",
+            )
+            .get() as { cached_m0_bytes: Uint8Array; cached_m1_bytes: Uint8Array };
+        expect(Buffer.from(cache.cached_m0_bytes).toString()).toBe("frozen m0");
+        expect(Buffer.from(cache.cached_m1_bytes).toString()).toBe("frozen m1");
+    } finally {
+        f.close();
+    }
+});

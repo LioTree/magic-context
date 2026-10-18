@@ -5574,7 +5574,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         expect(advSha(shared)).toBe(advSha(exec.messages));
     });
 
-    it("ADV: a project_memory_epoch HARD fold with byte-identical m[0] does not convert legacy markers", async () => {
+    it("ADV: a project_memory_epoch bump with byte-identical m[0] does not convert legacy markers", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-adv-epoch-identical";
@@ -5609,7 +5609,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 firstDiff,
             }),
         );
-        expect(hard.result.materialized).toBe(true);
+        expect(hard.result.materialized).toBe(false);
         // The fold re-rendered m[0]/m[1] byte-identically, so the prefix stays
         // cached. The conversion only rides a bust that already rewrites the
         // prefix: here it must not happen, and the served bytes stay identical.
@@ -6284,11 +6284,14 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         const statusOf = (sessionId: string, tag: number) =>
             getTagsBySession(db, sessionId).find((row) => row.tagNumber === tag)?.status;
 
-        const bumpEpoch = async () => {
-            const { bumpEpochsForWorkspaceMembers } = await import(
-                "../../features/magic-context/workspaces"
-            );
-            bumpEpochsForWorkspaceMembers(db, FOLD_PROJECT);
+        const bumpStructuralMutation = async () => {
+            for (const row of db.prepare("SELECT session_id FROM session_meta").all() as Array<{
+                session_id: string;
+            }>)
+                queueM0Mutation(db, {
+                    sessionId: row.session_id,
+                    mutationType: "compartment_delete",
+                });
         };
         const setCachedUpgradeState = (sessionId: string, from: string, to: string) => {
             db.prepare(
@@ -6304,14 +6307,6 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             arm: (sessionId: string) => Promise<M0HardSignals | undefined>;
             identical: boolean;
         }> = [
-            {
-                reason: "project_memory_epoch",
-                arm: async () => {
-                    await bumpEpoch();
-                    return undefined;
-                },
-                identical: true,
-            },
             {
                 reason: "upgrade_state",
                 arm: async (sessionId) => {
@@ -6416,7 +6411,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             expect(head(exec.messages)).not.toBe(head(defer.messages));
         });
 
-        it("holds a queued ctx_reduce drop on an identical-bytes project_memory_epoch HARD; the served bytes stay identical", async () => {
+        it("holds a queued ctx_reduce drop on an identical-bytes max_mutation_id HARD; the served bytes stay identical", async () => {
             db = new Database(":memory:");
             initializeDatabase(db);
             const sessionId = "ses-identical-epoch-drain";
@@ -6428,7 +6423,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             const held = await pass(sessionId);
             expect(sha(held.messages)).toBe(sha(defer.messages));
 
-            await bumpEpoch();
+            await bumpStructuralMutation();
             const hard = await pass(sessionId, { turn: "turn-epoch" });
             expect(hard.result.materialized).toBe(true);
             expect(head(hard.messages)).toBe(head(defer.messages));
@@ -6486,7 +6481,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             expect(sha(after.messages.slice(0, hard.messages.length))).toBe(sha(hard.messages));
         });
 
-        it("still drains on a project_memory_epoch HARD that changes m[0]", async () => {
+        it("still drains on a max_mutation_id HARD that changes m[0]", async () => {
             db = new Database(":memory:");
             initializeDatabase(db);
             const sessionId = "ses-changed-epoch-drain";
@@ -6503,10 +6498,10 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 content: "EPOCH_CONTENT_CHANGE: new rule.",
                 importance: 50,
             });
-            await bumpEpoch();
+            await bumpStructuralMutation();
             const hard = await pass(sessionId, { turn: "turn-epoch-changed" });
             expect(hard.result.materialized).toBe(true);
-            expect(hard.result.materializeReason).toBe("project_memory_epoch");
+            expect(hard.result.materializeReason).toBe("max_mutation_id");
             expect(head(hard.messages)).not.toBe(head(defer.messages));
             expect(statusOf(sessionId, target)).toBe("dropped");
 
@@ -6606,7 +6601,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             return { messages, result };
         }
 
-        // Re-gate: an identical-bytes epoch HARD on a session that serves a mural
+        // Re-gate: an identical-bytes structural HARD on a session that serves a mural
         // image. The fold re-renders the same text and the same image, so the
         // queued drop must stay held. The lean variant starts the pass from a
         // state whose mural field was never loaded (undefined rather than null):
@@ -6614,7 +6609,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         // the missing field as "no image served" and the unchanged image counts
         // as a change.
         for (const lean of [false, true]) {
-            it(`REGATE mural unchanged (${lean ? "lean" : "hydrated"} state): an identical-bytes epoch HARD holds the drop`, async () => {
+            it(`REGATE mural unchanged (${lean ? "lean" : "hydrated"} state): an identical-bytes structural HARD holds the drop`, async () => {
                 const xdg = createTestTempDirFromPath(join(tmpdir(), "mc-regate-oc-mural-"));
                 tempDirs.push(xdg);
                 process.env.XDG_DATA_HOME = xdg;
@@ -6663,13 +6658,13 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                             "UPDATE memories SET mural_cue = ?, mural_cue_hash = ? WHERE id = ?",
                         ).run(`cue-${i}`, cues.computeCueContentHash(content), memory.id);
                     }
-                    await bumpEpoch();
+                    await bumpStructuralMutation();
                     await pass(sessionId, { mural: true });
                     const defer = await pass(sessionId, { mural: true });
                     const muralA = getOrCreateSessionMeta(db, sessionId).cachedM0MuralDataUrl;
                     const target = toolTag(sessionId, "c-mid", "m-mid");
                     queuePendingOp(db, sessionId, target, "drop");
-                    await bumpEpoch();
+                    await bumpStructuralMutation();
                     const hard = await pass(sessionId, { mural: true, leanMural: lean });
                     const muralB = getOrCreateSessionMeta(db, sessionId).cachedM0MuralDataUrl;
                     const after = await pass(sessionId, { mural: true });
@@ -6753,7 +6748,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                     });
                     setCue(memory.id, `cue-a-${i}`, cues.computeCueContentHash(content));
                 }
-                await bumpEpoch();
+                await bumpStructuralMutation();
                 await pass(sessionId, { mural: true });
                 const withMural = await pass(sessionId, { mural: true });
                 const muralA = getOrCreateSessionMeta(db, sessionId).cachedM0MuralDataUrl;
@@ -6781,14 +6776,17 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 modelsDev.clearModelsDevCache();
             }
         });
-        const bumpEpoch = async () => {
-            const { bumpEpochsForWorkspaceMembers } = await import(
-                "../../features/magic-context/workspaces"
-            );
-            bumpEpochsForWorkspaceMembers(db, FOLD_PROJECT);
+        const bumpStructuralMutation = async () => {
+            for (const row of db.prepare("SELECT session_id FROM session_meta").all() as Array<{
+                session_id: string;
+            }>)
+                queueM0Mutation(db, {
+                    sessionId: row.session_id,
+                    mutationType: "compartment_delete",
+                });
         };
 
-        // Baseline, then a queued drop, then an identical-bytes epoch HARD that
+        // Baseline, then a queued drop, then an identical-bytes structural HARD that
         // must hold the drop. Returns the pre-HARD defer bytes and the target.
         async function heldAfterIdenticalHard(sessionId: string) {
             db = new Database(":memory:");
@@ -6797,10 +6795,10 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             const defer = await pass(sessionId);
             const target = toolTag(sessionId, "c-mid", "m-mid");
             queuePendingOp(db, sessionId, target, "drop");
-            await bumpEpoch();
+            await bumpStructuralMutation();
             const hard = await pass(sessionId, { turn: "t-hard" });
             expect(hard.result.materialized).toBe(true);
-            expect(hard.result.materializeReason).toBe("project_memory_epoch");
+            expect(hard.result.materializeReason).toBe("max_mutation_id");
             expect(head(hard.messages)).toBe(head(defer.messages));
             expect(statusOf(sessionId, target)).toBe("active");
             expect(sha(hard.messages)).toBe(sha(defer.messages));
@@ -6896,7 +6894,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 await pass(sessionId);
                 const target = toolTag(sessionId, "c-mid", "m-mid");
                 queuePendingOp(db, sessionId, target, "drop");
-                await bumpEpoch();
+                await bumpStructuralMutation();
                 const hard = await pass(sessionId, { pct });
                 expect(hard.result.materialized).toBe(true);
                 expect(statusOf(sessionId, target)).toBe("dropped");

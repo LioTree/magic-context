@@ -21,6 +21,7 @@ import {
 	getCompartments,
 	getOrCreateSessionMeta,
 	queueMemoryMutation,
+	queueM0Mutation,
 	setProjectState,
 } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -2236,7 +2237,10 @@ describe("injectM0M1Pi", () => {
 				newContent: "Reconciled content.",
 				queuedAt: 10,
 			});
-			setProjectState(db, state.projectIdentity, { projectMemoryEpoch: 1 });
+			queueM0Mutation(db, {
+				sessionId: state.sessionId,
+				mutationType: "compartment_delete",
+			});
 
 			const bust = [userMessage("bust", 11)];
 			const result = injectM0M1Pi(state, db, bust as never, undefined, true);

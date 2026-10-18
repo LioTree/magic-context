@@ -201,6 +201,7 @@ fn signed_prefix_hold_keeps_a_marker_hard_pending() {
     let session = "signed-hold-marker";
     let baseline = signed_hold_baseline(&s, session, 66_000);
     signed_hold_edit_meta(&s, session, |meta| meta.project_memory_epoch_pending = true);
+    regate_mark_history_pending(&s, session);
     let mut request = signed_hold_request(session, 66_000);
     let held = transform(&s, &request, &ctx).unwrap();
     assert_signed_hold_deferred(&held, &baseline, &s, session, 0);
@@ -250,7 +251,7 @@ fn signed_hold_head(response: &TransformResponse) -> Vec<Vec<u8>> {
 /// Context-pressure relief inside the open turn, with both drops from
 /// `signed_hold_queue_both` queued. The late drop (after the kept signed thinking) is applied
 /// and the serve shrinks; the early drop, before it, stays withheld. The m0/m1 head replays byte
-/// for byte while that signed thinking is still served, so a pending project-memory marker
+/// for byte while that signed thinking is still served, so a pending structural history marker
 /// (a HARD fold trigger) waits for the next user turn, which then takes it.
 fn check_signed_hold_relief(session: &str, used: u64, recovery_armed: bool) {
     let dir = tempfile::tempdir().unwrap();
@@ -259,6 +260,7 @@ fn check_signed_hold_relief(session: &str, used: u64, recovery_armed: bool) {
     let baseline = signed_hold_baseline(&s, session, 20_000);
     signed_hold_queue_both(&s, session);
     signed_hold_edit_meta(&s, session, |meta| meta.project_memory_epoch_pending = true);
+    regate_mark_history_pending(&s, session);
     let mut request = signed_hold_request(session, used);
     request.emergency_recovery_armed = recovery_armed;
     let relieved = transform(&s, &request, &ctx).unwrap();

@@ -2473,8 +2473,7 @@ pub mod compaction {
             ctx.now_ms,
         )?;
         let first_fold = core.boundary_id.is_empty() && store.has_compartments(namespace)?;
-        let external =
-            meta.m1_external_revision != 0 && meta.m1_external_revision != signal.external_revision;
+        let external = meta.m1_history_revision != signal.history_revision;
         let protection = meta
             .protected_tokens_effective
             .is_some_and(|n| n != ctx.protected_tokens_floor)
@@ -2492,7 +2491,7 @@ pub mod compaction {
             cached_m1_missing: cached_m1_missing(&core),
             render_config_changed: meta.last_model_key != model
                 || metadata_render_epochs_changed(store, namespace, ctx, model, &meta)?,
-            hard_fold_requested: first_fold || external || protection || meta.project_memory_epoch_pending || meta.bootstrap_seed_fold_pending || meta.pending_rewrite.is_some()
+            hard_fold_requested: first_fold || external || protection || meta.bootstrap_seed_fold_pending || meta.pending_rewrite.is_some()
                 // Replay treatments can need content-dependent repair. Without
                 // decoding content a preflight cannot prove them safe to skip.
                 || core.frozen_units.iter().any(|u| !matches!(u.key.as_str(), "m0" | "m1" | "m0-mural"))
@@ -3965,10 +3964,10 @@ fn apply_additive_only(
         Some(&mut m1_revision_read_timings),
     )?;
     let applied_m1_revision = m1_signal.equivalent_applied_revision(loaded.meta.m1_revision);
-    let external_revision_changed = loaded.meta.initialized
-        && loaded.meta.m1_external_revision != 0
-        && m1_signal.external_revision != loaded.meta.m1_external_revision;
-    let project_memory_epoch_hard_due = loaded.meta.project_memory_epoch_pending;
+    let external_revision_changed =
+        loaded.meta.initialized && m1_signal.history_revision != loaded.meta.m1_history_revision;
+    // Legacy pending-epoch flags are consumed at the next natural HARD, never
+    // used to manufacture one. Structural history revisions remain HARD inputs.
 
     let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
     let context_limit_tokens =
@@ -4046,8 +4045,7 @@ fn apply_additive_only(
         scheduler_outcome.idle_ttl_fired,
     );
     let render_config_changed = render_config_changed && !system_identity_adopted;
-    let hard_fold_requested =
-        idle_fold_due || external_revision_changed || project_memory_epoch_hard_due;
+    let hard_fold_requested = idle_fold_due || external_revision_changed;
     let ordinary_historian_veto = ctx.historian_active
         && m1_signal.revision == applied_m1_revision
         && scheduler_outcome.pass == scheduler::PassDecision::Execute
@@ -4174,8 +4172,7 @@ fn apply_additive_only(
                 let source = MarkerMemorySource {
                     store,
                     projection: loaded.meta.memory_projection.as_ref(),
-                    allow_external_repair: external_revision_changed
-                        || project_memory_epoch_hard_due,
+                    allow_external_repair: external_revision_changed,
                 };
                 let mut frozen_request = req.clone();
                 frozen_request.mural = loaded
@@ -4515,7 +4512,7 @@ fn apply_additive_only(
                 && loaded.meta.m1_history_revision != m1_signal.history_revision
             {
                 "compartment_history_revision"
-            } else if external_revision_changed || project_memory_epoch_hard_due {
+            } else if external_revision_changed {
                 "project_memory_epoch"
             } else if cached_m1_missing(&loaded.core) {
                 "cached_m1_missing"
@@ -5565,10 +5562,10 @@ fn apply_once(
     let compartment_seq_changed_since_meta = loaded.meta.initialized
         && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
     *boundary_divergence_detected = boundary_divergence_recut.is_some();
-    let external_revision_changed = loaded.meta.initialized
-        && loaded.meta.m1_external_revision != 0
-        && m1_signal.external_revision != loaded.meta.m1_external_revision;
-    let project_memory_epoch_hard_due = loaded.meta.project_memory_epoch_pending;
+    let external_revision_changed =
+        loaded.meta.initialized && m1_signal.history_revision != loaded.meta.m1_history_revision;
+    // Legacy pending-epoch flags are consumed at the next natural HARD, never
+    // used to manufacture one. Structural history revisions remain HARD inputs.
     let emergency_no_head_escape =
         req.emergency_recovery_armed && req.emergency_recovery_no_head_escape;
     if emergency_no_head_escape {
@@ -5853,9 +5850,9 @@ fn apply_once(
                 .or_else(|| req.usage.as_ref().map(|usage| usage.context_limit_tokens))
                 .unwrap_or(200_000),
         );
-    // Every trigger below asks for a HARD. Whether that HARD may also price automatic
-    // reductions and the other bust-only lanes depends on whether it can re-render the
-    // served prefix byte-identically:
+    // Every trigger below asks to rebuild the frozen baseline (HARD). Automatic
+    // reductions and other cache-changing work may run alongside that rebuild
+    // only if it loses the provider cache or changes the bytes already served.
     // - first_fold_due: folds the session's first compartment and mints the first
     //   boundary, so m0 and the coverage anchor change by construction. It keeps pricing.
     // - boundary_divergence_recut: re-cuts compartments to a new boundary, so coverage and
@@ -5863,10 +5860,9 @@ fn apply_once(
     // - system_absorb_hard_due: fires only when new compartment coverage absorbs system
     //   messages, so m0 grows and coverage moves. It keeps pricing.
     // - idle TTL: the provider cache is already gone (hard_fold_loses_provider_cache).
-    // - pre_snapshot_inputs_changed, external_revision_changed and
-    //   project_memory_epoch_hard_due: none of them is an m0 compose input by itself, so the
-    //   fold CAN reproduce the frozen pair exactly. They go through
-    //   hard_fold_busts_served_prefix below (marker_hard_keeps_provider_cache).
+    // - pre_snapshot_inputs_changed and structural history revisions are markers,
+    //   not compose inputs, so a rebuild can reproduce the frozen pair exactly.
+    //   hard_fold_busts_served_prefix checks those bytes before allowing reductions.
     // Reconcile (the boundary left the live array after a revert) and lineage descent (a new
     // host conversation epoch) are separate HARD inputs below; both serve a different
     // message array than the cached one, so they keep pricing too.
@@ -5879,8 +5875,7 @@ fn apply_once(
             || boundary_divergence_recut.is_some()
             || idle_fold_due
             || system_absorb_hard_due
-            || external_revision_changed
-            || project_memory_epoch_hard_due);
+            || external_revision_changed);
     // Historian activity is not a second gate: only independently priced work
     // below can authorize new provider-visible mutations.
     // Subagents execute a reductions-only branch, not the prefix plan. Inherited
@@ -5937,9 +5932,7 @@ fn apply_once(
     // byte-identical marker HARD into a prefix bust; when the probe keeps the
     // prefix, the HARD branch commits this same composition below.
     let marker_hard_candidate = prefix_materialization_enabled
-        && (external_revision_changed
-            || project_memory_epoch_hard_due
-            || pre_snapshot_inputs_changed)
+        && (external_revision_changed || pre_snapshot_inputs_changed)
         && !(first_fold_due
             || boundary_divergence_recut.is_some()
             || system_absorb_hard_due
@@ -5962,7 +5955,7 @@ fn apply_once(
             incremental_history,
             &mut timings.compose,
             &loaded,
-            external_revision_changed || project_memory_epoch_hard_due,
+            external_revision_changed,
         )
         .filter(|comp| {
             !hard_fold_busts_served_prefix(
@@ -6512,7 +6505,7 @@ fn apply_once(
         legacy_baseline: is_legacy_baseline(&loaded.core),
         render_config_changed,
         profile_transition,
-        project_memory_epoch_due: external_revision_changed || project_memory_epoch_hard_due,
+        project_memory_epoch_due: external_revision_changed,
         history_revision_due: external_revision_changed
             && loaded.meta.m1_history_revision != m1_signal.history_revision,
         first_fold_due,
@@ -9754,12 +9747,34 @@ fn m0_content_epoch_for_pass(
     })
 }
 
+// Membership changes are held content, not a provider-cache eviction. Ignore only
+// the parsed workspace field; opaque provider identities must still compare exactly.
+fn without_workspace_epoch(config: &str) -> String {
+    let Some(fields) = versioned_render_epochs(config) else {
+        return config.into();
+    };
+    let Some(value) = fields.get("ws") else {
+        return config.into();
+    };
+    let Some((base, suffix)) = config.rsplit_once("|m0epoch[") else {
+        return config.into();
+    };
+    format!(
+        "{base}|m0epoch[{}",
+        suffix.replacen(&format!("ws:{}:{value}", value.len()), "ws:0:", 1)
+    )
+}
+
 fn render_config_change(
     meta: &ModuleMeta,
     req: &TransformRequest,
     effective_render_config: &str,
     transition_due: bool,
 ) -> (bool, bool, bool) {
+    let held_current = without_workspace_epoch(effective_render_config);
+    let effective_render_config = held_current.as_str();
+    let held_previous = without_workspace_epoch(&meta.last_render_config);
+    let last_render_config = held_previous.as_str();
     let identity_observed = !meta.last_provider_id.is_empty()
         || !meta.last_model_key.is_empty()
         || !meta.last_system_prompt_hash.is_empty()
@@ -9772,14 +9787,14 @@ fn render_config_change(
         || !req.upgrade_state.is_empty();
     let changed = meta.initialized
         && if transition_due || identity_observed || !coordinator_identity {
-            effective_render_config != meta.last_render_config
-        } else if meta.last_render_config.is_empty() {
+            effective_render_config != last_render_config
+        } else if last_render_config.is_empty() {
             false
-        } else if render_config_base(&meta.last_render_config).is_empty() {
+        } else if render_config_base(last_render_config).is_empty() {
             render_epoch_suffix(effective_render_config, true)
-                != render_epoch_suffix(&meta.last_render_config, true)
+                != render_epoch_suffix(last_render_config, true)
         } else {
-            effective_render_config != meta.last_render_config
+            effective_render_config != last_render_config
         };
     // Switching transports must replay the existing identity and frozen head,
     // not fold an m1 delta merely to adopt provider-plan serialization. Explicit
@@ -9791,7 +9806,7 @@ fn render_config_change(
             && meta.last_provider_id == req.provider_id.as_deref().unwrap_or("")
             && meta.last_system_prompt_hash == req.system_prompt_hash
             && meta.last_upgrade_state == req.upgrade_state
-            && versioned_render_epochs(&meta.last_render_config).is_some_and(|old| {
+            && versioned_render_epochs(last_render_config).is_some_and(|old| {
                 versioned_render_epochs(effective_render_config).as_ref() == Some(&old)
             }));
     #[cfg(feature = "drive-fault")]
@@ -9893,7 +9908,7 @@ fn metadata_render_epochs_changed(
     if !meta.initialized {
         return Ok(false);
     }
-    let Some(old) = versioned_render_epochs(&meta.last_render_config) else {
+    let Some(mut old) = versioned_render_epochs(&meta.last_render_config) else {
         return Ok(true);
     };
     let request: TransformRequest = serde_json::from_value(serde_json::json!({
@@ -9924,6 +9939,8 @@ fn metadata_render_epochs_changed(
     if let Some(mural) = old.get("mur") {
         current.insert("mur".into(), mural.clone());
     }
+    old.remove("ws");
+    current.remove("ws");
     Ok(old != current)
 }
 
@@ -20349,11 +20366,7 @@ pub(crate) mod tests {
                     .unwrap()
                     .answer,
             );
-            let mut loaded = store.load("ses").unwrap();
-            loaded.meta.project_memory_epoch_pending = true;
-            store
-                .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
-                .unwrap();
+            regate_mark_history_pending(&store, "ses");
             let pass = adapter::step(&store, &request, &context(), &st, &mut state).unwrap();
             assert_eq!(pass.engine.response.action, "HARD");
             assert!(pass.engine.response.committed);
@@ -26512,7 +26525,7 @@ pub(crate) mod tests {
     /// pending todo must not ride that HARD: the provider cache survives it, so a
     /// changed synthetic pair would be the pass's only bust.
     #[test]
-    fn adv_identical_bytes_epoch_hard_holds_pending_synthetic_todo() {
+    fn adv_identical_bytes_history_hard_holds_pending_synthetic_todo() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -26547,10 +26560,7 @@ pub(crate) mod tests {
             "a pending todo alone never busts"
         );
 
-        let mut loaded = s.load("ses").unwrap();
-        loaded.meta.project_memory_epoch_pending = true;
-        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
-            .unwrap();
+        regate_mark_history_pending(&s, "ses");
         let hard = transform(&s, &newer, &ctx).unwrap();
         let hard_pair = synthetic_todo_pair_bytes(&hard);
         let replay = transform(&s, &newer, &ctx).unwrap();
@@ -26575,7 +26585,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn identical_bytes_epoch_hard_holds_pending_drop_and_serves_identical_bytes() {
+    fn identical_bytes_history_hard_holds_pending_drop_and_serves_identical_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -26598,11 +26608,8 @@ pub(crate) mod tests {
         let held = transform(&s, &request, &ctx).unwrap();
         assert_eq!(held.messages(), baseline.messages());
 
-        // A project-memory epoch change that alters no rendered content.
-        let mut loaded = s.load("ses").unwrap();
-        loaded.meta.project_memory_epoch_pending = true;
-        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
-            .unwrap();
+        // A structural history marker that alters no rendered content.
+        regate_mark_history_pending(&s, "ses");
         let hard = transform(&s, &request, &ctx).unwrap();
         assert_eq!(hard.action, "HARD");
         assert!(!hard.prefix_bust_permitted);
@@ -26767,7 +26774,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn regate_mark_epoch_pending(s: &McStore, session: &str) {
+    fn regate_mark_history_pending(s: &McStore, session: &str) {
+        s.with_context_conn_for_test(|conn| conn.execute("INSERT INTO m0_mutation_log(session_id,mutation_type,queued_at) VALUES(?1,'compartment_delete',1)", [session])).unwrap();
         let mut loaded = s.load(session).unwrap();
         loaded.meta.project_memory_epoch_pending = true;
         s.commit(session, loaded.row_version, &loaded.core, &loaded.meta)
@@ -26823,17 +26831,17 @@ pub(crate) mod tests {
         assert!(frozen_red_payload(&s.load(session).unwrap().core, "res-1#0").is_some());
 
         // The marker HARD comes on the very next pass.
-        regate_mark_epoch_pending(&s, session);
+        regate_mark_history_pending(&s, session);
         let hard = run(&s, &armed, &reductions);
         let keys_after_hard = regate_unit_keys(&s, session);
         let replay = run(&s, &armed, &reductions);
         // A second marker HARD after a plain defer.
-        regate_mark_epoch_pending(&s, session);
+        regate_mark_history_pending(&s, session);
         let hard2 = run(&s, &armed, &reductions);
         // A third marker HARD from a freshly opened store, as after a process restart.
         drop(s);
         let s = store(dir.path());
-        regate_mark_epoch_pending(&s, session);
+        regate_mark_history_pending(&s, session);
         let hard3 = run(&s, &armed, &reductions);
         eprintln!(
             "REGATE_RUST_RICH hard_action={} hard2_action={} hard3_action={} hard3_identical={} reason={:?} wire_identical={} m0_identical={} replay_identical={} hard2_identical={} units_soft={:?} units_hard={:?}",
@@ -26897,7 +26905,7 @@ pub(crate) mod tests {
             // Undo: the last three messages leave the array.
             let undone = req(session, "cfg", messages[..2].to_vec());
             if marker_hard {
-                regate_mark_epoch_pending(&s, session);
+                regate_mark_history_pending(&s, session);
             }
             let undo_pass = run(&s, &undone, &[]);
             let red_after_undo =
@@ -26960,7 +26968,7 @@ pub(crate) mod tests {
         assert_eq!(defer.messages(), baseline.messages());
         let floor_after_defer = s.load(session).unwrap().meta.protected_tokens_effective;
 
-        regate_mark_epoch_pending(&s, session);
+        regate_mark_history_pending(&s, session);
         let hard = transform(&s, &request, &ctx).unwrap();
         let floor_after_hard = s.load(session).unwrap().meta.protected_tokens_effective;
         let drops_after_hard = s.load_pending_agent_drops(session).unwrap().len();
@@ -27050,7 +27058,7 @@ pub(crate) mod tests {
             if genuine {
                 request.system_prompt_hash = "sys-b".to_string();
             } else {
-                regate_mark_epoch_pending(&s, session);
+                regate_mark_history_pending(&s, session);
             }
             let hard = transform(&s, &request, &ctx).unwrap();
             let loaded = s.load(session).unwrap();
@@ -28932,10 +28940,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn project_memory_epoch_in_context_db_is_an_eager_hard_input() {
-        // An identity or workspace writer bumps project_state.project_memory_epoch in
-        // context.db. The next pass must rebuild m0 (a HARD naming the epoch), and the pass
-        // after it must not repeat the HARD.
+    fn project_memory_epoch_in_context_db_is_held_until_a_natural_hard() {
+        // Epoch changes invalidate search caches, not the served prompt prefix.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -28946,11 +28952,8 @@ pub(crate) mod tests {
 
         s.set_project_memory_epoch_for_test("git:proj", 7).unwrap();
         let after_epoch = run(&s, &request, &spine());
-        assert_eq!(after_epoch.action, "HARD");
-        assert_eq!(
-            after_epoch.materialize_reason.as_deref(),
-            Some("project_memory_epoch")
-        );
+        assert_ne!(after_epoch.action, "HARD");
+        assert_eq!(after_epoch.materialize_reason.as_deref(), None);
         assert_ne!(run(&s, &request, &spine()).action, "HARD");
     }
 
@@ -28999,7 +29002,6 @@ pub(crate) mod tests {
         let first = run(&s, &request, &spine());
         assert!(m0_bytes(&first).contains("SUMMARY"));
         assert_ne!(run(&s, &request, &spine()).action, "HARD");
-        let before = s.load("ses").unwrap();
         let writer = rusqlite::Connection::open(dir.path().join("context.db")).unwrap();
         let head: i64 = writer
             .query_row(
@@ -29030,48 +29032,6 @@ pub(crate) mod tests {
         assert_eq!(
             repaired.materialize_reason.as_deref(),
             Some("compartment_history_revision")
-        );
-        let after = s.load("ses").unwrap();
-        let mut alternative_meta = before.meta;
-        // Reproduce the old generic label while keeping the same stale aggregate
-        // revision and input snapshot. Only diagnostic history tracking differs.
-        alternative_meta.m1_history_revision = after.meta.m1_history_revision;
-
-        s.commit_transform(
-            "ses",
-            TransformCommit {
-                expected: after.row_version,
-                core: &before.core,
-                meta: &alternative_meta,
-                sections: mc_store::SectionsCommit::default(),
-                consumed_drop_ids: &[],
-                first_applied_command_ids: &[],
-                memory_revision: None,
-                compartment_max_seq: None,
-                project_root: None,
-                first_divergence: None,
-                scheduler_observation: None,
-                scheduler_request_observed_at_ms: None,
-                scheduler_full_array_fingerprint: None,
-                scheduler_eligible_supersession_count: None,
-                scheduler_withheld_by_tag_window: None,
-                scheduler_withheld_by_exempt_message: None,
-                scheduler_applied_supersession_count: None,
-                scheduler_applied_reductions: false,
-                overlays: TransformOverlayBatch::default(),
-            },
-        )
-        .unwrap();
-        let generic = run(&s, &request, &spine());
-        assert_eq!(generic.action, "HARD");
-        assert_eq!(
-            generic.materialize_reason.as_deref(),
-            Some("project_memory_epoch")
-        );
-        assert_eq!(
-            serde_json::to_vec(repaired.messages()).unwrap(),
-            serde_json::to_vec(generic.messages()).unwrap(),
-            "reason labels must not change served bytes"
         );
         assert_ne!(run(&s, &request, &spine()).action, "HARD");
     }
@@ -37080,8 +37040,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn soft_reads_no_mutation_log_rows_or_watermark() {
-        soft_pass_runs_without_table(true, "memory_mutation_log");
+    fn soft_reads_no_canonical_memory_rows_for_dashboard_deltas() {
+        soft_pass_runs_without_table(true, "memories");
     }
 
     #[test]
@@ -37708,34 +37668,54 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn workspace_membership_change_is_a_render_config_hard() {
+    fn workspace_membership_change_is_held_until_a_natural_hard() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
             .unwrap();
-        run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        // a steady defer (no change)
-        let defer = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(defer.action, "SOFT+");
-
-        // joining a workspace changes the deterministic workspace_fingerprint → the folded
-        // render_config changes → a HARD (m0 is now composed over a different project set).
         s.seed_workspace_member("ws1", "git:proj", "[\"CONSTRAINTS\"]")
             .unwrap();
-        let r = run(
+        s.seed_memory(5, "git:joined", "CONSTRAINTS", "joined workspace rule", 70)
+            .unwrap();
+        s.with_context_conn_for_test(|conn| {
+            conn.execute(
+                "UPDATE memories SET shareable = 1, scope = 'project' WHERE id = 5",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let request = req("ses", "cfg0", vec![item("m1msg", 1, "raw")]);
+        let before = run(&s, &request, &spine());
+        assert_eq!(before.action, "HARD");
+        let served_pair = (m0_bytes(&before).to_owned(), m1_bytes(&before).to_owned());
+        assert!(!served_pair.0.contains("joined workspace rule"));
+        assert!(!served_pair.1.contains("joined workspace rule"));
+
+        s.seed_workspace_member("ws1", "git:joined", "[\"CONSTRAINTS\"]")
+            .unwrap();
+        let after_membership = run(&s, &request, &spine());
+        assert_ne!(
+            after_membership.action, "HARD",
+            "joining a workspace holds the served pair until an independently authorized HARD"
+        );
+        assert_eq!(
+            (m0_bytes(&after_membership), m1_bytes(&after_membership)),
+            (served_pair.0.as_str(), served_pair.1.as_str()),
+            "workspace membership alone must preserve both served heads byte-for-byte"
+        );
+
+        let natural_hard = run(
             &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &req("ses", "cfg1", vec![item("m1msg", 1, "raw")]),
             &spine(),
         );
-        assert_eq!(r.action, "HARD", "a membership change re-materializes m0");
+        assert_eq!(natural_hard.action, "HARD");
+        let rebuilt_pair = format!("{}{}", m0_bytes(&natural_hard), m1_bytes(&natural_hard));
+        assert!(
+            rebuilt_pair.contains("joined workspace rule"),
+            "an independently authorized HARD includes the joined member's content: {rebuilt_pair}"
+        );
     }
 
     #[test]

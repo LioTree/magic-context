@@ -535,15 +535,17 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             try {
                 moduleStore.exec("PRAGMA busy_timeout=30000");
                 moduleStore.query("INSERT INTO pending_agent_drops(session_id,target_id,queued_at) VALUES (?,?,1)").run(sessionId,`${raw[16999]!.id}#0`);
-                const stagedEpoch = moduleStore.query("UPDATE mc_cache_state SET meta=json_set(meta,'$.project_memory_epoch_pending',json('true')),row_version=row_version+1 WHERE session_id=? RETURNING row_version,json_extract(meta,'$.project_memory_epoch_pending') AS pending").get(sessionId) as { row_version: number; pending: number };
-                expect(stagedEpoch.pending).toBe(1);
+                // A structural history marker authorizes this byte-preserving HARD; the legacy epoch flag alone does not.
+                moduleStore.query("INSERT INTO m0_mutation_log(session_id,mutation_type,queued_at) VALUES(?,'compartment_delete',1)").run(sessionId);
+                const stagedHistory = moduleStore.query("UPDATE mc_cache_state SET meta=json_set(meta,'$.project_memory_epoch_pending',json('true')),row_version=row_version+1 WHERE session_id=? RETURNING row_version,json_extract(meta,'$.project_memory_epoch_pending') AS pending").get(sessionId) as { row_version: number; pending: number };
+                expect(stagedHistory.pending).toBe(1);
                 const before = h.readRustPasses().length;
                 await h.sendPrompt(sessionId,probe,{messageID:probeId});
                 const pass = (await h.waitForRustPasses(before+1)).at(-1)!;
                 expect(pass.decision).toBe("HARD");
                 expect(pass.raw).toContain("prefix_bust_permitted=false");
-                expect(pass.raw).toContain("reason=project_memory_epoch");
-                expect(pass.rowVersion).toBeGreaterThan(stagedEpoch.row_version);
+                expect(pass.raw).toContain("reason=compartment_history_revision");
+                expect(pass.rowVersion).toBeGreaterThan(stagedHistory.row_version);
                 expect(pass.applied).toBe(true);
                 expect(state()).toEqual(held);
                 expect(markerRows()).toEqual(rows);
