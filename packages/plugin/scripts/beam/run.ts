@@ -290,7 +290,6 @@ async function openUpstreams(settings: Settings): Promise<Upstreams> {
                   chatgptCredential: flags["chatgpt-credential"] as string | undefined,
                   antigravityCredential: flags["antigravity-credential"] as string,
                   voyageKeyFile: flags["voyage-key-file"] as string,
-                  minTtlMs: 3_600_000,
               });
     const stub =
         settings.mode === "stub"
@@ -309,8 +308,8 @@ async function openUpstreams(settings: Settings): Promise<Upstreams> {
                 kind: "cloud-code",
                 prefix: "/gemini/v1beta",
                 upstream: stub ? stub.origin : UPSTREAMS.cloudCode,
-                token: () => credentials.cloudCode.token,
-                project: credentials.cloudCode.project,
+                token: async () => (await credentials.cloudCode()).token,
+                project: (await credentials.cloudCode()).project,
             },
         ],
     });
@@ -326,8 +325,7 @@ async function openUpstreams(settings: Settings): Promise<Upstreams> {
         },
         codex: (s) => ({
             baseURL: codexBase,
-            token: credentials.codex.token,
-            accountId: credentials.codex.accountId,
+            credentials: credentials.codex,
             model: s.answerModel,
             reasoningEffort: s.reasoningEffort,
             temperature: s.temperature,
@@ -335,15 +333,17 @@ async function openUpstreams(settings: Settings): Promise<Upstreams> {
         stop() {
             relay.stop();
             stub?.stop();
+            credentials.close();
         },
     };
 }
 
 /** The child environment that carries the secrets the host configs reference by name. */
-function hostSecrets(upstreams: Upstreams): Record<string, string> {
+async function hostSecrets(upstreams: Upstreams): Promise<Record<string, string>> {
+    const codex = await upstreams.credentials.codex();
     return {
-        [SECRET_ENV.codexToken]: upstreams.credentials.codex.token,
-        [SECRET_ENV.codexAccount]: upstreams.credentials.codex.accountId,
+        [SECRET_ENV.codexToken]: codex.token,
+        [SECRET_ENV.codexAccount]: codex.accountId,
         [SECRET_ENV.relayKey]: upstreams.relay.hostKey,
         [SECRET_ENV.voyageKey]: upstreams.credentials.voyageKey,
     };
@@ -364,6 +364,7 @@ function hostModels(settings: Settings): HostModels {
 
 /** Stop conditions shared by both arms: a rejected credential ends the run without retrying. */
 function checkUpstreams(upstreams: Upstreams): void {
+    if (upstreams.relay.credentialError) throw upstreams.relay.credentialError;
     if (upstreams.relay.authRejected) {
         throw new StopRun(
             `Cloud Code Assist rejected the credential (HTTP ${upstreams.relay.authRejected.status}); stopping without retry`,
@@ -608,7 +609,7 @@ async function withHost<T>(
     work: (host: Host) => Promise<T>,
 ): Promise<{ value: T; isolation: string[][] }> {
     killStaleHost(settings);
-    const host = await startHost(paths, opencodeBinary(), hostSecrets(upstreams));
+    const host = await startHost(paths, opencodeBinary(), await hostSecrets(upstreams));
     writeFileSync(pidFile(settings), String(host.pid));
     const isolation: string[][] = [];
     const sample = (when: string) => {
@@ -629,6 +630,7 @@ async function withHost<T>(
         rmSync(pidFile(settings), { force: true });
         const mcLog = scrub(readIfExists(paths.mcLog), upstreams.credentials.secrets());
         writeFileSync(join(runDir(settings), "mc", "logs", `${label}.mc.log`), mcLog);
+        checkUpstreams(upstreams);
     }
     // Checked once the host has stopped: no login or credential row may reach its store.
     const credentials = credentialRowCounts(paths.opencodeDb);
@@ -1126,6 +1128,7 @@ async function smokeTransport(settings: Settings, upstreams: Upstreams): Promise
             `codex direct: ok model=${settings.answerModel} input=${result.usage.input} output=${result.usage.output} reasoning=${result.usage.reasoning}`,
         );
     } catch (error) {
+        if (error instanceof CredentialError || error instanceof AuthRejectedError) throw error;
         failures++;
         console.log(
             `codex direct: FAILED ${scrub(String((error as Error).message), upstreams.credentials.secrets()).slice(0, 400)}`,
@@ -1145,6 +1148,7 @@ async function smokeTransport(settings: Settings, upstreams: Upstreams): Promise
         },
     );
     const text = await response.text();
+    checkUpstreams(upstreams);
     let usage = "";
     try {
         const parsed = JSON.parse(text) as {

@@ -50,7 +50,7 @@ Real runs read credentials only at run time, on the Mac that holds the vault:
 
 - **ChatGPT (answer and judge)**: `chatgpt:openai*` through the `mc-e2e` enrollment
   (`~/.config/cortexkit/mc-e2e/enrollment.json`, or `MC_E2E_ENROLLMENT_PATH`), `getScoped` with a
-  one-hour minimum lifetime. With more than one granted ChatGPT row, choose one with
+  15-minute minimum lifetime. With more than one granted ChatGPT row, choose one with
   `--chatgpt-credential` (`list-credentials` prints the non-secret inventory).
 - **Antigravity (historian)**: `antigravity:google`; the token plus its `project_id`.
 - **Voyage (embeddings)**: the key file `~/.config/voyage.key` (`--voyage-key-file`).
@@ -58,6 +58,21 @@ Real runs read credentials only at run time, on the Mac that holds the vault:
 No token is written to disk. The host configs reference them as `{env:NAME}` and the values travel
 only in the host's environment. `report_auth_failure` is never called; a 401 or 403 from any
 upstream stops the run without retrying, and a 429 stops it too (resume later).
+
+Each subscription credential has its own refresh getter. It reuses a token only while its
+expiry is more than 10 minutes away, or for less than 30 minutes when the vault gives no expiry.
+Concurrent callers share one vault read; every read requests the same 15-minute minimum lifetime.
+A refresh refusal stops the run with exit 3 and the vault's reason, without falling back to the old
+token or retrying the read. All token versions remain in the in-memory log scrubber until exit.
+Direct answer and judge requests resolve credentials on each request (including transport retries),
+the historian relay resolves them on each forwarded request, and each host spawn resolves a fresh
+Codex environment. The vault client stays connected until the run ends.
+
+The long `/ctx-wrapup` command uses only the configured Gemini historian through the relay:
+the production command hook ends it with a sentinel before OpenCode can forward it to the answer
+model. Its host can therefore hold an unused Codex environment for more than 30 minutes. Question
+hosts restart from the snapshot for each question and have a 30-minute answer request timeout;
+their Codex environment is fixed for that host's lifetime, not updated in-place.
 
 How the throwaway host reaches each upstream without any OpenCode auth plugin or stored login:
 

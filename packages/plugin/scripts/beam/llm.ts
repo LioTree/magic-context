@@ -28,8 +28,7 @@ export interface Usage {
 
 export interface CodexSettings {
     baseURL: string;
-    token: string;
-    accountId: string;
+    credentials(): Promise<{ token: string; accountId: string }>;
     model: string;
     /** `reasoning.effort`; omitted when undefined. */
     reasoningEffort?: string;
@@ -139,6 +138,8 @@ export async function codexComplete(
     const body = JSON.stringify(codexRequestBody(settings, messages));
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
+        // Resolve outside the transport retry handler: a vault refusal must stop the run.
+        const credential = await settings.credentials();
         let response: Response;
         try {
             response = await fetch(`${settings.baseURL}/responses`, {
@@ -146,8 +147,8 @@ export async function codexComplete(
                 headers: {
                     "content-type": "application/json",
                     accept: "text/event-stream",
-                    authorization: `Bearer ${settings.token}`,
-                    "chatgpt-account-id": settings.accountId,
+                    authorization: `Bearer ${credential.token}`,
+                    "chatgpt-account-id": credential.accountId,
                 },
                 body,
                 signal: AbortSignal.timeout(timeoutMs),

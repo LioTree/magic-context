@@ -27,6 +27,7 @@
  * backend) can be added as another route under the same rules.
  */
 import { randomBytes, randomUUID } from "node:crypto";
+import { CredentialError } from "./credentials";
 
 export interface RelayLogEntry {
     route: string;
@@ -48,7 +49,7 @@ export interface CloudCodeRoute {
     /** Upstream origin, e.g. `https://cloudcode-pa.googleapis.com`. */
     upstream: string;
     /** Returns the current upstream bearer; called per request so the token never sits in config. */
-    token: () => string;
+    token: () => string | Promise<string>;
     project: string;
 }
 
@@ -66,6 +67,8 @@ export interface Relay {
     log: RelayLogEntry[];
     /** Set once an upstream answered 401 or 403; the harness stops the run on it. */
     authRejected: { route: string; status: number } | null;
+    /** A vault refusal is terminal, even if the host retries its HTTP request. */
+    credentialError: CredentialError | null;
     stop(): void;
 }
 
@@ -167,6 +170,7 @@ export function startRelay(options: RelayOptions): Relay {
         hostKey,
         log,
         authRejected: null,
+        credentialError: null,
         stop: () => server.stop(true),
     };
 
@@ -206,6 +210,8 @@ export function startRelay(options: RelayOptions): Relay {
                 return finish(
                     new Response("upstream credential rejected earlier", { status: 403 }),
                 );
+            if (relay.credentialError)
+                return finish(new Response("credential refresh refused", { status: 403 }));
 
             const method = GEMINI_METHOD.exec(url.pathname.slice(route.prefix.length));
             if (request.method !== "POST" || !method)
@@ -215,11 +221,19 @@ export function startRelay(options: RelayOptions): Relay {
             entry.bytesIn = Buffer.byteLength(text);
             const hostBody = JSON.parse(text) as unknown;
             const upstreamUrl = `${route.upstream}/v1internal:${action}${action === "streamGenerateContent" ? "?alt=sse" : ""}`;
+            let token: string;
+            try {
+                token = await route.token();
+            } catch (error) {
+                if (!(error instanceof CredentialError)) throw error;
+                relay.credentialError = error;
+                return finish(new Response("credential refresh refused", { status: 403 }));
+            }
             const upstream = await fetch(upstreamUrl, {
                 method: "POST",
                 headers: {
                     "content-type": "application/json",
-                    authorization: `Bearer ${route.token()}`,
+                    authorization: `Bearer ${token}`,
                     ...(action === "streamGenerateContent" ? { accept: "text/event-stream" } : {}),
                 },
                 body: JSON.stringify(wrapCloudCodeRequest(model, route.project, hostBody)),

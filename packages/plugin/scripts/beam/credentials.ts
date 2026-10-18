@@ -26,13 +26,71 @@ export interface ScopedRow {
     refreshAdapter?: string;
 }
 
+export interface CodexCredential {
+    token: string;
+    accountId: string;
+    credentialId: string;
+    expiresAtMs: number | null;
+}
+
+export interface CloudCodeCredential {
+    token: string;
+    project: string;
+    credentialId: string;
+    expiresAtMs: number | null;
+}
+
 export interface Credentials {
     mode: "vault" | "stub";
-    codex: { token: string; accountId: string; credentialId: string; expiresAtMs: number | null };
-    cloudCode: { token: string; project: string; credentialId: string; expiresAtMs: number | null };
+    codex(): Promise<CodexCredential>;
+    cloudCode(): Promise<CloudCodeCredential>;
     voyageKey: string;
     /** Every secret value, for scrubbing captured logs before they are written anywhere. */
     secrets(): string[];
+    close(): void;
+}
+
+export const SCOPED_MIN_TTL_MS = 900_000;
+const REFRESH_BEFORE_MS = 600_000;
+const UNKNOWN_EXPIRY_CACHE_MS = 1_800_000;
+
+/** Share refreshes between callers; a refused read is terminal for this run, not a retry loop. */
+export function credentialGetter<T extends { expiresAtMs: number | null }>(
+    read: () => Promise<T>,
+    now: () => number = Date.now,
+): () => Promise<T> {
+    let cached: T | undefined;
+    let fetchedAt = 0;
+    let inFlight: Promise<T> | undefined;
+    let failure: unknown;
+    let failed = false;
+    return async () => {
+        if (failed) throw failure;
+        if (inFlight) return inFlight;
+        if (
+            cached &&
+            (cached.expiresAtMs === null
+                ? now() - fetchedAt < UNKNOWN_EXPIRY_CACHE_MS
+                : cached.expiresAtMs - now() > REFRESH_BEFORE_MS)
+        )
+            return cached;
+        inFlight = (async () => {
+            try {
+                cached = await read();
+                fetchedAt = now();
+                return cached;
+            } catch (error) {
+                failed = true;
+                failure = error;
+                throw error;
+            }
+        })();
+        try {
+            return await inFlight;
+        } finally {
+            inFlight = undefined;
+        }
+    };
 }
 
 export const STUB_CREDENTIALS = {
@@ -46,20 +104,21 @@ export const STUB_CREDENTIALS = {
 export function stubCredentials(): Credentials {
     const value: Credentials = {
         mode: "stub",
-        codex: {
+        codex: async () => ({
             token: STUB_CREDENTIALS.codexToken,
             accountId: STUB_CREDENTIALS.codexAccountId,
             credentialId: "stub",
             expiresAtMs: null,
-        },
-        cloudCode: {
+        }),
+        cloudCode: async () => ({
             token: STUB_CREDENTIALS.cloudCodeToken,
             project: STUB_CREDENTIALS.cloudCodeProject,
             credentialId: "stub",
             expiresAtMs: null,
-        },
+        }),
         voyageKey: STUB_CREDENTIALS.voyageKey,
         secrets: () => Object.values(STUB_CREDENTIALS),
+        close() {},
     };
     return value;
 }
@@ -69,8 +128,6 @@ export interface VaultOptions {
     chatgptCredential?: string;
     antigravityCredential: string;
     voyageKeyFile: string;
-    /** Minimum remaining lifetime demanded of each served token. */
-    minTtlMs: number;
 }
 
 export const ENROLLMENT_PATH =
@@ -82,7 +139,7 @@ const CLIENT_PATH = resolve(
     "../../../e2e-tests/node_modules/@cortexkit/claustrum-client/dist/index.js",
 );
 
-interface ClaustrumClientLike {
+export interface ClaustrumClientLike {
     listScoped(token: string): Promise<{ rows: readonly ScopedRow[] }>;
     getScoped(input: {
         credentialId: string;
@@ -90,7 +147,7 @@ interface ClaustrumClientLike {
         minTtlMs?: number;
     }): Promise<{
         material: string;
-        expiresAtMs: number | null;
+        expiresAtMs?: number | null;
         accountId?: string;
         projectId?: string;
     }>;
@@ -175,6 +232,21 @@ export async function vaultCredentials(options: VaultOptions): Promise<Credentia
     const voyageKey = readKeyFile(options.voyageKeyFile, "Voyage");
     const enrollment = readEnrollmentToken();
     const client = await connect();
+    return scopedCredentials(options, { client, enrollment, voyageKey });
+}
+
+/** Build the same refreshable credentials with a fake vault and clock in credential-free tests. */
+export async function scopedCredentials(
+    options: VaultOptions,
+    source: {
+        client: ClaustrumClientLike;
+        enrollment: string;
+        voyageKey: string;
+        now?: () => number;
+    },
+): Promise<Credentials> {
+    const { client, enrollment, voyageKey, now } = source;
+    const secrets = new Set([enrollment, voyageKey]);
     try {
         const rows = (await client.listScoped(enrollment)).rows;
         const chatgpt = rows.filter((row) => row.id.startsWith("chatgpt:openai"));
@@ -197,47 +269,59 @@ export async function vaultCredentials(options: VaultOptions): Promise<Credentia
         }
         const fetch = async (credentialId: string) => {
             try {
-                return await client.getScoped({
+                const served = await client.getScoped({
                     credentialId,
                     enrollmentToken: enrollment,
-                    minTtlMs: options.minTtlMs,
+                    minTtlMs: SCOPED_MIN_TTL_MS,
                 });
+                secrets.add(served.material);
+                return served;
             } catch (error) {
                 throw new CredentialError(
-                    `the vault refused ${credentialId} (${(error as Error).message.slice(0, 200)})`,
+                    `the vault refused ${credentialId} (${scrub((error as Error).message, [...secrets]).slice(0, 200)})`,
                 );
             }
         };
-        const codex = await fetch(chatgptId);
-        if (!codex.accountId)
-            throw new CredentialError(
-                `${chatgptId} was served without an account id; the Codex backend needs it`,
-            );
-        const cloud = await fetch(options.antigravityCredential);
-        if (!cloud.projectId)
-            throw new CredentialError(
-                `${options.antigravityCredential} was served without a project id`,
-            );
-        const secrets = [codex.material, cloud.material, voyageKey];
+        const codexId = chatgptId;
+        const codex = credentialGetter(async () => {
+            const served = await fetch(codexId);
+            if (!served.accountId)
+                throw new CredentialError(
+                    `${codexId} was served without an account id; the Codex backend needs it`,
+                );
+            return {
+                token: served.material,
+                accountId: served.accountId,
+                credentialId: codexId,
+                expiresAtMs: served.expiresAtMs ?? null,
+            };
+        }, now);
+        const cloudCode = credentialGetter(async () => {
+            const served = await fetch(options.antigravityCredential);
+            if (!served.projectId)
+                throw new CredentialError(
+                    `${options.antigravityCredential} was served without a project id`,
+                );
+            return {
+                token: served.material,
+                project: served.projectId,
+                credentialId: options.antigravityCredential,
+                expiresAtMs: served.expiresAtMs ?? null,
+            };
+        }, now);
+        await codex();
+        await cloudCode();
         return {
             mode: "vault",
-            codex: {
-                token: codex.material,
-                accountId: codex.accountId,
-                credentialId: chatgptId,
-                expiresAtMs: codex.expiresAtMs,
-            },
-            cloudCode: {
-                token: cloud.material,
-                project: cloud.projectId,
-                credentialId: options.antigravityCredential,
-                expiresAtMs: cloud.expiresAtMs,
-            },
+            codex,
+            cloudCode,
             voyageKey,
-            secrets: () => secrets,
+            secrets: () => [...secrets],
+            close: () => client.close(),
         };
-    } finally {
+    } catch (error) {
         client.close();
+        throw error;
     }
 }
 
