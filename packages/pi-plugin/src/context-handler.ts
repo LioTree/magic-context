@@ -446,9 +446,11 @@ import { loadPiToolWireSchema } from "./pi-tool-wire-schema";
 import {
 	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
+	assertPiOldestThinkingRun,
 	assertPiThinkingEntryIds,
 	frozenBindingEntryIds,
 	piMessageHasThinking,
+	planPiProactiveThinkingStrip,
 	resolvePiBindingStripOrder,
 } from "./provider-error-recovery-pi";
 import {
@@ -8466,6 +8468,93 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
 		return result;
 	}
+	// First render only: strip may commit before its edit; failure costs at most
+	// one rewrite. The session's first render tags every message, an edit before
+	// all of its kept thinking, so its strip is certain; pairing them would hold
+	// the write lock for the whole first pipeline run over the session. The strip
+	// of every older-turn block commits first in a short transaction, then the
+	// pipeline runs unpaired as before. If the pipeline then fails, the next pass
+	// still replays the committed omissions: a valid request, one wasted rewrite.
+	if (piSessionFirstRender(args)) {
+		const entryIds = args.messages.map((message, index) =>
+			resolvePiStableId(
+				message,
+				index,
+				args.entryIds,
+				args.entryIdByRef ?? undefined,
+			),
+		);
+		const plan = planPiProactiveThinkingStrip({
+			db: args.db,
+			sessionId: args.sessionId,
+			messages: args.messages as unknown[],
+			entryIds,
+		});
+		if (!plan)
+			throw new DegradedPassRefusalError("pi-first-render-strip-identity", {
+				cause: new Error(
+					"Cannot persist thinking omission without a stable entry id",
+				),
+			});
+		assertPiOldestThinkingRun(
+			args.messages as unknown[],
+			entryIds,
+			new Set([
+				...frozenBindingEntryIds(args.db, args.sessionId),
+				...plan.entryIds,
+			]),
+		);
+		if (plan.entryIds.length > 0) {
+			let heldFrom = 0;
+			args.db
+				.transaction(() => {
+					heldFrom = performance.now();
+					applyPiProactiveThinkingStrip({
+						db: args.db,
+						sessionId: args.sessionId,
+						messages: args.messages as unknown[],
+						entryIds,
+						provider: args.resolvedProviderID,
+						model: args.resolvedModelID,
+						cacheBustingPass: true,
+						persistOnly: true,
+						requirePersistence: true,
+					});
+				})
+				.immediate();
+			logSlowWriteTransaction("pi_first_render_strip", heldFrom);
+		}
+		const result = runSynchronousPipeline(args, rollbackObservations, () => {
+			throw new DegradedPassRefusalError(UNPAIRED_PREFIX_REWRITE_SITE, {
+				cause: new Error("A first render reached a signed-prefix rewrite"),
+			});
+		});
+		// The early strip covered every thinking block this pass could need to
+		// omit; one it did not cover must not be served with the edit.
+		if (needsCompanion(result)) {
+			const missed = planPiProactiveThinkingStrip({
+				db: args.db,
+				sessionId: args.sessionId,
+				messages: result.messages as unknown[],
+				entryIds: resolvePiLkgOutputEntryIds(
+					result.messages,
+					result.syntheticLeadingCount,
+					(message) =>
+						result.lkgEntryIdByRef.get(message) ??
+						result.postCommitEntryIdByRef.get(message),
+				).map((id) => id ?? undefined),
+			});
+			if (!missed || missed.entryIds.length > 0)
+				throw new DegradedPassRefusalError("pi-first-render-strip-incomplete", {
+					cause: new Error(
+						"A first render needed thinking omissions its early strip did not record",
+					),
+				});
+		}
+		if (!result.strictThinkingKept)
+			clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
+		return result;
+	}
 	const result = pairedThinkingEdit({
 		db: args.db,
 		messages: args.messages as unknown[],
@@ -8500,6 +8589,31 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (!result.strictThinkingKept)
 		clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
 	return result;
+}
+
+/**
+ * Whether this pass is the session's first render with thinking to omit: no
+ * message has a tag and no cached head exists yet, the injection that grants a
+ * first render its full-prefix rebuild is configured, and no current-turn
+ * thinking is kept (a pass that keeps it holds every edit instead).
+ */
+function piSessionFirstRender(args: RunPipelineArgs): boolean {
+	if (!args.injection) return false;
+	if (args.recoveryRebuildReason || args.forceSignedRebuildForFit) return false;
+	if (!(args.messages as unknown[]).some(piMessageHasThinking)) return false;
+	if (
+		hasActiveAnthropicThinkingTurn(
+			args.messages,
+			args.resolvedProviderID,
+			args.resolvedModelID,
+		)
+	)
+		return false;
+	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
+	if (meta.cachedM0Bytes || meta.cachedM1Bytes) return false;
+	return !args.db
+		.prepare("SELECT 1 FROM tags WHERE session_id = ? LIMIT 1")
+		.get(args.sessionId);
 }
 
 /** The refusal of a pass outside the companion transaction that reached a rewrite. */
@@ -8642,14 +8756,25 @@ function runSynchronousPipeline(
 	)
 		stripForPrefixRewrite();
 	// Outside the companion transaction, only a pass that keeps its current-turn
-	// signed thinking (every edit before it is held) or carries no thinking at all
-	// may continue; anything else needs its edits paired with their strip.
-	if (
-		requirePairing &&
-		!protectedSignedPrefix &&
-		(args.messages as unknown[]).some(piMessageHasThinking)
-	)
-		requirePairing();
+	// signed thinking (every edit before it is held) or has no thinking left to
+	// omit (none at all, or all of it already omitted) may continue; anything
+	// else needs its edits paired with their strip.
+	if (requirePairing && !protectedSignedPrefix) {
+		const plan = planPiProactiveThinkingStrip({
+			db: args.db,
+			sessionId: args.sessionId,
+			messages: args.messages as unknown[],
+			entryIds: args.messages.map((message, index) =>
+				resolvePiStableId(
+					message,
+					index,
+					args.entryIds,
+					args.entryIdByRef ?? undefined,
+				),
+			),
+		});
+		if (!plan || plan.entryIds.length > 0) requirePairing();
+	}
 	// Messages without a real entry id get a position-independent fallback id
 	// computed once from this pass's input, before any stage edits content.
 	// Every stage below resolves by the index it was given into this same array

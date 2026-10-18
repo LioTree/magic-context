@@ -15,6 +15,7 @@ import {
 	thinkingBindingEntryOrderId,
 	thinkingBindingRecoveryFrozenId,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { DegradedPassRefusalError } from "@magic-context/core/hooks/magic-context/degraded-pass-refusal";
 import { latestAssistantTurnMessages } from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
 import {
 	armBindingRecoverySafely,
@@ -402,6 +403,56 @@ export function applyPiProactiveThinkingStrip(args: {
 		`proactive thinking strip: busting pass froze thinking of ${entryIds.length} entr${entryIds.length === 1 ? "y" : "ies"} [${entryIds.join(",")}]`,
 	);
 	return { entryIds };
+}
+
+/**
+ * The entries whose thinking a companion strip would newly omit on this array:
+ * every thinking-bearing message outside the latest assistant turn that the
+ * session has not already omitted. `null` when such a message has no stable
+ * entry id, so the omission could not be recorded.
+ */
+export function planPiProactiveThinkingStrip(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	messages: unknown[];
+	entryIds: readonly (string | undefined)[];
+}): { entryIds: string[] } | null {
+	const protectedMessages = latestAssistantTurnMessages(args.messages);
+	const existingIds = frozenBindingEntryIds(args.db, args.sessionId);
+	const entryIds: string[] = [];
+	for (let index = 0; index < args.messages.length; index += 1) {
+		const message = args.messages[index];
+		if (protectedMessages.has(message) || !hasThinkingPart(message)) continue;
+		const entryId = args.entryIds[index];
+		if (!entryId) return null;
+		if (!existingIds.has(entryId)) entryIds.push(entryId);
+	}
+	return { entryIds };
+}
+
+/**
+ * Refuse an omission set that would leave a kept thinking block before an
+ * omitted one. On its own the provider accepts removing thinking only from the
+ * start of the history (or all of it), never from the middle.
+ */
+export function assertPiOldestThinkingRun(
+	messages: readonly unknown[],
+	entryIds: readonly (string | undefined)[],
+	omitted: ReadonlySet<string>,
+): void {
+	let keptBefore = false;
+	for (let index = 0; index < messages.length; index += 1) {
+		if (!hasThinkingPart(messages[index])) continue;
+		const entryId = entryIds[index];
+		if (entryId && omitted.has(entryId)) {
+			if (keptBefore)
+				throw new DegradedPassRefusalError("pi-thinking-strip-middle-gap", {
+					cause: new Error(
+						`Omitting thinking of ${entryId} would leave earlier thinking kept`,
+					),
+				});
+		} else keptBefore = true;
+	}
 }
 
 export function piThinkingOmissionOrderId(
