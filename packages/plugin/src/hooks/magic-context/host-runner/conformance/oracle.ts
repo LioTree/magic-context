@@ -1,3 +1,4 @@
+import { accessSync, constants } from "node:fs";
 import { resolve } from "node:path";
 
 export const ORACLE_TEST = "providers::relay_conformance::oracle";
@@ -13,9 +14,27 @@ export const ORACLE_COMMAND = [
     "--nocapture",
 ];
 
+export function oracleCommand(test = ORACLE_TEST, env: NodeJS.ProcessEnv = process.env) {
+    const binary = env.MC_CONFORMANCE_ORACLE_BINARY;
+    if (binary) {
+        try {
+            accessSync(binary, constants.X_OK);
+        } catch {
+            throw new Error(`MC_CONFORMANCE_ORACLE_BINARY_UNUSABLE: not executable: ${binary}`);
+        }
+        return [binary, test, "--exact", "--nocapture"];
+    }
+    if (env.CI) {
+        throw new Error(
+            "MC_CONFORMANCE_ORACLE_BINARY_REQUIRED: CI must restore the prebuilt mc-module lib test binary",
+        );
+    }
+    return ORACLE_COMMAND.map((part) => (part === ORACLE_TEST ? test : part));
+}
+
 /** Each case owns a disposable Magic Context store, reused only for module restarts. */
 export function startOracle(options: { contextRoot?: string } = {}) {
-    const child = Bun.spawn(ORACLE_COMMAND, {
+    const child = Bun.spawn(oracleCommand(), {
         windowsHide: true,
         cwd: resolve(import.meta.dir, "../../../../../../.."),
         env: {
@@ -52,7 +71,7 @@ export function startOracle(options: { contextRoot?: string } = {}) {
         async close() {
             await child.stdin.end();
             for await (const _ of lines) {
-                // Consume cargo's test-result footer so a full stdout pipe cannot block process exit.
+                // Consume libtest's footer so a full stdout pipe cannot block process exit.
             }
             if ((await child.exited) !== 0) throw new Error("MC oracle failed");
         },

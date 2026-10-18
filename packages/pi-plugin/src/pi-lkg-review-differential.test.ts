@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,9 +27,27 @@ import {
 	userMessage,
 } from "./test-utils.test";
 
-// Compare complete handler outputs rather than token estimates.
-test("REVIEW differential: 480 complete Pi requests with recovery and restart", async () => {
-	let state = 0xa6319b27;
+const allRecords: unknown[] = [];
+afterAll(() => {
+	if (process.env.MC_PI_REVIEW_RECORD)
+		writeFileSync(process.env.MC_PI_REVIEW_RECORD, JSON.stringify(allRecords));
+});
+
+// Compare complete handler outputs rather than token estimates. The second seed
+// resumes the original 40-trial PRNG stream after trial 19, even when run alone.
+test.each([
+	{ first: 0, last: 19, seed: 0xa6319b27 },
+	{ first: 20, last: 39, seed: 0x5055a80c },
+])("REVIEW differential: 240 complete Pi requests with recovery and restart (trials $first-$last)", async ({
+	first,
+	last,
+	seed,
+}) => {
+	await runTrials(first, last, seed);
+});
+
+async function runTrials(first: number, last: number, seed: number) {
+	let state = seed;
 	const random = () => {
 		state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
 		return state / 0x100000000;
@@ -37,7 +55,7 @@ test("REVIEW differential: 480 complete Pi requests with recovery and restart", 
 	const records: unknown[] = [];
 	const root = join(tmpdir(), "magic-context/pi-lkg-review/differential");
 	mkdirSync(root, { recursive: true });
-	for (let trial = 0; trial < 40; trial++) {
+	for (let trial = first; trial <= last; trial++) {
 		const path = join(root, `trial-${trial}.db`);
 		rmSync(path, { force: true });
 		const db = createTestDb(path);
@@ -233,7 +251,6 @@ test("REVIEW differential: 480 complete Pi requests with recovery and restart", 
 			db.close();
 		}
 	}
-	expect(records).toHaveLength(480);
-	if (process.env.MC_PI_REVIEW_RECORD)
-		writeFileSync(process.env.MC_PI_REVIEW_RECORD, JSON.stringify(records));
-});
+	expect(records).toHaveLength(240);
+	allRecords.push(...records);
+}
