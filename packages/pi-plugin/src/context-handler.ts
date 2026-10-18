@@ -374,6 +374,8 @@ import {
 	clearPiLkgSessionState,
 	createPiLkgCoordinator,
 	isTransientPiStorageError,
+	type PiLkgCoordinator,
+	type PiLkgDispatchTicket,
 	type PiLkgPassSnapshot,
 	type PiLkgSerializedOutput,
 	PiLkgUncapturable,
@@ -4194,6 +4196,23 @@ function loadPiHistorianStateSnapshot(
 }
 
 /**
+ * The dispatch wrapper's certificate for one pass. It is built here, outside the
+ * context handler, because a closure created inside the handler keeps the
+ * handler's whole scope alive, including that pass's snapshot and inputs. The
+ * pass budget that holds this certificate can outlive the pass (a detached async
+ * resource may keep it), so it must hold only the pass's ticket.
+ */
+function dispatchCertificateFor(
+	coordinator: PiLkgCoordinator,
+	ticket: PiLkgDispatchTicket,
+): { confirm(): void; refuse(): void } {
+	return {
+		confirm: () => coordinator.certifyDispatchTicket(ticket),
+		refuse: () => coordinator.refuseDispatchTicket(ticket),
+	};
+}
+
+/**
  * Register the Pi `context` event handler.
  *
  * The Tagger is created once per session boot — same lifecycle as the
@@ -6808,11 +6827,12 @@ export function registerPiContextHandler(
 			// wrapper certifies the saved copy of this request only once it actually
 			// hands the request on for sending, and records a refusal otherwise.
 			if (lkgPassSnapshot) {
-				const dispatchedSnapshot = lkgPassSnapshot;
-				budget.dispatchCertificate = {
-					confirm: () => lkgCoordinator.certifyDispatched(dispatchedSnapshot),
-					refuse: () => lkgCoordinator.refuseDispatch(dispatchedSnapshot),
-				};
+				const ticket = lkgCoordinator.dispatchTicket(lkgPassSnapshot);
+				if (ticket)
+					budget.dispatchCertificate = dispatchCertificateFor(
+						lkgCoordinator,
+						ticket,
+					);
 			}
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;

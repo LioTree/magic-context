@@ -131,7 +131,13 @@ interface PiLkgSessionState {
 	 * to Pi; a pass refused after publishing leaves it uncertified.
 	 */
 	pendingDispatch?: {
-		snapshot: PiLkgPassSnapshot;
+		/**
+		 * Names the pass that published. It holds no reference to that pass's
+		 * snapshot or inputs: whoever confirms or refuses the dispatch may outlive
+		 * the pass, and the conversation must stay collectable once a newer pass
+		 * supersedes it.
+		 */
+		ticket: PiLkgDispatchTicket;
 		servedCaptureId?: number;
 		/** The capture this pass installed in memory. */
 		capture: Pick<LkgSlot, "capturedAt" | "jsonPrefix">;
@@ -153,6 +159,11 @@ interface PiLkgCapturePlan {
 }
 
 const piLkgSessionStates = new Map<string, PiLkgSessionState>();
+/**
+ * The dispatch ticket of each pass that published, keyed weakly by its snapshot
+ * so the ticket never keeps the pass alive.
+ */
+const dispatchTickets = new WeakMap<PiLkgPassSnapshot, PiLkgDispatchTicket>();
 const piLkgMemoSessions = new Map<string, PiLkgSessionState>();
 const defaultMemoLimits = {
 	sessionMaxBytes: LKG_ENTRY_CACHE_SESSION_BYTES,
@@ -472,6 +483,25 @@ export interface PiLkgCoordinator {
 	 * restart. Never throws.
 	 */
 	refuseDispatch(snapshot: PiLkgPassSnapshot): void;
+	/**
+	 * The ticket naming this pass's publication that awaits dispatch, or
+	 * undefined when the pass published nothing to certify. Holders that may
+	 * outlive the pass (the dispatch wrapper's certificate) keep the ticket
+	 * instead of the snapshot.
+	 */
+	dispatchTicket(snapshot: PiLkgPassSnapshot): PiLkgDispatchTicket | undefined;
+	/** `certifyDispatched` for a pass named by its ticket. Never throws. */
+	certifyDispatchTicket(ticket: PiLkgDispatchTicket): void;
+	/** `refuseDispatch` for a pass named by its ticket. Never throws. */
+	refuseDispatchTicket(ticket: PiLkgDispatchTicket): void;
+}
+
+/**
+ * Names one pass's publication awaiting dispatch, by identity, without holding
+ * the pass's snapshot or inputs.
+ */
+export interface PiLkgDispatchTicket {
+	readonly sessionId: string;
 }
 
 /** A request that cannot be saved for replay can still be served with its admitted tag numbers recorded. */
@@ -1228,6 +1258,52 @@ export function createPiLkgCoordinator(
 		return result.ok && measuredPrefix ? { ...result, measuredPrefix } : result;
 	};
 
+	const certifyDispatchTicket = (ticket: PiLkgDispatchTicket): void => {
+		try {
+			const state = piLkgSessionStates.get(ticket.sessionId);
+			const pending = state?.pendingDispatch;
+			if (!state || pending?.ticket !== ticket) return;
+			state.pendingDispatch = undefined;
+			if (pending.servedCaptureId !== undefined)
+				certifyDispatchedLkgSlot(db, ticket.sessionId, pending.servedCaptureId);
+		} catch (error) {
+			// Certification is optional; a dispatched request stays servable.
+			sessionLog(
+				ticket.sessionId,
+				"LKG dispatch certification skipped:",
+				error,
+			);
+		}
+	};
+
+	const refuseDispatchTicket = (ticket: PiLkgDispatchTicket): void => {
+		try {
+			const state = piLkgSessionStates.get(ticket.sessionId);
+			const pending = state?.pendingDispatch;
+			if (!state || pending?.ticket !== ticket) return;
+			state.pendingDispatch = undefined;
+			// The refused request was never sent: replay and the next pass must
+			// work from the last request that was, so undo this pass's in-memory
+			// capture and the replay state it advanced.
+			if (
+				restoreRefusedCapture(ticket.sessionId, pending.capture, pending.prior)
+			) {
+				state.acceptedInputs = null;
+				state.acceptedSlot = null;
+				state.acceptedRecoverySlotKey = undefined;
+				state.recoveryPrefix = pending.priorRecoveryPrefix;
+			}
+			if (pending.servedCaptureId !== undefined)
+				refuseUndispatchedLkgSlot(
+					db,
+					ticket.sessionId,
+					pending.servedCaptureId,
+				);
+		} catch (error) {
+			sessionLog(ticket.sessionId, "LKG dispatch refusal not recorded:", error);
+		}
+	};
+
 	const captureAppliedPass: PiLkgCoordinator["captureAppliedPass"] = (args) => {
 		args.assertCurrentPass?.();
 		const { snapshot } = args;
@@ -1575,8 +1651,12 @@ export function createPiLkgCoordinator(
 					// otherwise. A refusal also puts back the in-memory capture served
 					// before this one. A cache-busting pass already dropped that capture as
 					// stale, so it has none to put back.
+					const ticket: PiLkgDispatchTicket = {
+						sessionId: snapshot.sessionId,
+					};
+					dispatchTickets.set(snapshot, ticket);
 					state.pendingDispatch = {
-						snapshot,
+						ticket,
 						servedCaptureId: plan.servedCaptureId,
 						capture: slot,
 						prior: args.cacheBusting && !unchanged ? undefined : livePrior,
@@ -1737,61 +1817,24 @@ export function createPiLkgCoordinator(
 		},
 		captureAppliedPass,
 		certifyDispatched(snapshot) {
-			try {
-				const state = piLkgSessionStates.get(snapshot.sessionId);
-				const pending = state?.pendingDispatch;
-				if (!state || pending?.snapshot !== snapshot) return;
-				state.pendingDispatch = undefined;
-				if (pending.servedCaptureId !== undefined)
-					certifyDispatchedLkgSlot(
-						db,
-						snapshot.sessionId,
-						pending.servedCaptureId,
-					);
-			} catch (error) {
-				// Certification is optional; a dispatched request stays servable.
-				sessionLog(
-					snapshot.sessionId,
-					"LKG dispatch certification skipped:",
-					error,
-				);
-			}
+			const ticket = dispatchTickets.get(snapshot);
+			if (ticket) certifyDispatchTicket(ticket);
 		},
 		refuseDispatch(snapshot) {
-			try {
-				const state = piLkgSessionStates.get(snapshot.sessionId);
-				const pending = state?.pendingDispatch;
-				if (!state || pending?.snapshot !== snapshot) return;
-				state.pendingDispatch = undefined;
-				// The refused request was never sent: replay and the next pass must
-				// work from the last request that was, so undo this pass's in-memory
-				// capture and the replay state it advanced.
-				if (
-					restoreRefusedCapture(
-						snapshot.sessionId,
-						pending.capture,
-						pending.prior,
-					)
-				) {
-					state.acceptedInputs = null;
-					state.acceptedSlot = null;
-					state.acceptedRecoverySlotKey = undefined;
-					state.recoveryPrefix = pending.priorRecoveryPrefix;
-				}
-				if (pending.servedCaptureId !== undefined)
-					refuseUndispatchedLkgSlot(
-						db,
-						snapshot.sessionId,
-						pending.servedCaptureId,
-					);
-			} catch (error) {
-				sessionLog(
-					snapshot.sessionId,
-					"LKG dispatch refusal not recorded:",
-					error,
-				);
-			}
+			const ticket = dispatchTickets.get(snapshot);
+			if (ticket) refuseDispatchTicket(ticket);
 		},
+		dispatchTicket(snapshot) {
+			const ticket = dispatchTickets.get(snapshot);
+			// Only the publication still awaiting dispatch has a ticket to hand out.
+			return ticket &&
+				piLkgSessionStates.get(snapshot.sessionId)?.pendingDispatch?.ticket ===
+					ticket
+				? ticket
+				: undefined;
+		},
+		certifyDispatchTicket,
+		refuseDispatchTicket,
 		measureOutgoingPrefix(snapshot, messages, parentOf) {
 			try {
 				const slot = getSlot(snapshot.sessionId);
