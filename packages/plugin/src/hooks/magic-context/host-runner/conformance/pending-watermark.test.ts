@@ -11,32 +11,30 @@ import type { MessageLike } from "../../transform-operations";
 import { createBridgeAdapter } from "../bridge-adapter";
 import { BridgeRefusalError } from "../bridge-types";
 import { ProviderClient } from "../provider-client";
+import { oracleCommand } from "./oracle";
 
 const SESSION = "relay-v1";
 const ORACLE = "providers::relay_conformance::pending_watermark_oracle";
 const base = join(tmpdir(), "magic-context/bridge-tag-reference");
 
 function startOracle(root: string) {
-    const child = Bun.spawn(
-        ["cargo", "test", "-p", "mc-module", "--lib", ORACLE, "--", "--exact", "--nocapture"],
-        {
-            windowsHide: true,
-            cwd: resolve(import.meta.dir, "../../../../../../.."),
-            env: {
-                ...process.env,
-                MC_PENDING_WATERMARK_ROOT: root,
-                RUSTC_WRAPPER: "",
-                CARGO_BUILD_RUSTC_WRAPPER: "",
-                // The policy replay checker compares incremental and fully rebuilt
-                // inputs. After a drop is applied, their baseline_generation values
-                // disagree. Disable that test-only assertion, not the policy.
-                MC_POLICY_SUMMARY_SKIP_FULL_CHECK: "1",
-            },
-            stdin: "pipe",
-            stdout: "pipe",
-            stderr: "inherit",
+    const child = Bun.spawn(oracleCommand(ORACLE), {
+        windowsHide: true,
+        cwd: resolve(import.meta.dir, "../../../../../../.."),
+        env: {
+            ...process.env,
+            MC_PENDING_WATERMARK_ROOT: root,
+            RUSTC_WRAPPER: "",
+            CARGO_BUILD_RUSTC_WRAPPER: "",
+            // The policy replay checker compares incremental and fully rebuilt
+            // inputs. After a drop is applied, their baseline_generation values
+            // disagree. Disable that test-only assertion, not the policy.
+            MC_POLICY_SUMMARY_SKIP_FULL_CHECK: "1",
         },
-    );
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "inherit",
+    });
     const lines = (async function* () {
         let pending = "";
         const decoder = new TextDecoder();
@@ -59,7 +57,7 @@ function startOracle(root: string) {
         async close() {
             await child.stdin.end();
             for await (const _ of lines) {
-                /* Drain the cargo test footer before awaiting exit. */
+                /* Drain the libtest footer before awaiting exit. */
             }
             expect(await child.exited).toBe(0);
         },

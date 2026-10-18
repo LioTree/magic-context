@@ -168,6 +168,48 @@ test("unit matrices preserve both modes, package wrappers and Pi assertion isola
     expect(pi).toContain("MAGIC_CONTEXT_DEBUG_ASSERTIONS=1 bun run --cwd packages/pi-plugin test --parallel=1 --timeout=60000");
 });
 
+test("Bun oracle consumers restore one same-attempt Rust test binary before running tests", async () => {
+    const producer = workflow.jobs["rust-lib-archive"]!;
+    const build = producer.steps.find((step) => step.name === "Package conformance oracle test binary")!;
+    expect(build.run).toContain("cargo test --locked -p mc-module --lib --profile ci-test --no-run --no-fail-fast --message-format=json");
+    expect(build.run).toContain('cp "$binary" ci-conformance-oracle/mc-module-lib-test');
+    expect(build.run).toContain('printf \'%s\\n\' "$GITHUB_SHA" > ci-conformance-oracle/commit.txt');
+    expect(build.run).toContain("sha256sum ci-conformance-oracle/mc-module-lib-test");
+    const uploads = Object.values(workflow.jobs).flatMap((job) => job.steps).filter(
+        (step) => step.uses === "actions/upload-artifact@v4" && step.with?.name === "conformance-oracle-${{ github.sha }}-${{ github.run_attempt }}",
+    );
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0]!.with!.path).toBe("ci-conformance-oracle/");
+    expect(uploads[0]!.with!["if-no-files-found"]).toBe("error");
+    for (const id of ["unit-plugin", "unit-pi-plugin", "rust-mc-module-integration"]) {
+        const job = workflow.jobs[id]!;
+        const restores = job.steps.filter((step) => step.uses === "./.github/actions/restore-conformance-oracle");
+        expect(restores).toHaveLength(1);
+        const restore = job.steps.indexOf(restores[0]!);
+        expect(job["timeout-minutes"]).toBe(90);
+        for (const [index, step] of job.steps.entries()) {
+            if (step.run && /bun (test |run --cwd .*? test\b)/.test(step.run)) expect(index).toBeGreaterThan(restore);
+            expect(step.run ?? "").not.toMatch(/cargo test .*--lib/);
+        }
+    }
+    const integration = workflow.jobs["rust-mc-module-integration"]!.steps.find(
+        (step) => step.name === "Run system-prompt-delivery integration test",
+    )!;
+    expect(integration.run).toContain('MC_SYSTEM_DELIVERY_FIXTURE_BINARY="$MC_CONFORMANCE_ORACLE_BINARY"');
+    const actionText = await Bun.file(resolve(root, ".github/actions/restore-conformance-oracle/action.yml")).text();
+    const action = Bun.YAML.parse(actionText) as { runs: { steps: Step[] } };
+    const wait = action.runs.steps.find((step) => step.uses === "./.github/actions/wait-ci-artifact")!;
+    expect(wait.with!.artifact).toBe("conformance-oracle-${{ github.sha }}");
+    expect(wait.with!.producer).toBe(producer.name);
+    expect(Number(wait.with!["timeout-minutes"])).toBe(producer["timeout-minutes"]!);
+    const download = action.runs.steps.find((step) => step.uses === "actions/download-artifact@v4")!;
+    expect(download.with!["artifact-ids"]).toBe("${{ steps.oracle.outputs.artifact-id }}");
+    expect(actionText).toContain('test "$(cat ci-conformance-oracle/commit.txt)" = "$GITHUB_SHA"');
+    expect(actionText).toContain("sha256sum --check ci-conformance-oracle/oracle.sha256");
+    expect(actionText).toContain('test -x "$binary"');
+    expect(actionText).toContain('echo "MC_CONFORMANCE_ORACLE_BINARY=$binary" >> "$GITHUB_ENV"');
+});
+
 test("remaining Rust crates retain Bun migration oracles and hermetic archives retain executable variants", () => {
     const remaining = workflow.jobs["rust-workspace-crates"]!.steps;
     expect(remaining.some((step) => step.uses === "oven-sh/setup-bun@v2")).toBe(true);
