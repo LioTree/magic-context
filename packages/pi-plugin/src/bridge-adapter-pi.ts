@@ -34,13 +34,13 @@ import {
 	deriveMarkerEnvelopeReading,
 	type MarkerEnvelope,
 } from "@magic-context/core/hooks/magic-context/marker-envelope";
+import { createModuleSessionKernel } from "@magic-context/core/hooks/magic-context/module-session-kernel";
 import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
 import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import {
 	estimateTokens,
 	preloadTokenizer,
 } from "@magic-context/core/hooks/magic-context/read-session-formatting";
-import { createModuleSessionKernel } from "@magic-context/core/hooks/magic-context/module-session-kernel";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import {
 	createPromptSurfaceGuidanceEpochCache,

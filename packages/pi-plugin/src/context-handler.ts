@@ -11806,18 +11806,18 @@ function runSynchronousPipeline(
 			const wireInjectionResult =
 				recordedInjection ??
 				injectPrefix(() =>
-				injectM0M1PiForRun(
-					piM0State,
-					args.db,
-					args.messages as Parameters<typeof injectM0M1Pi>[2],
-					args.entryIds,
-					// History-only refreshes can change m[1] without executing cleanup or
-					// materializing m[0]. Refresh the delta on every cache-busting pass;
-					// replay-only passes must keep the cached m[1] bytes unchanged.
-					isCacheBustingPass,
-					injectionPassSnapshot,
-				),
-			);
+					injectM0M1PiForRun(
+						piM0State,
+						args.db,
+						args.messages as Parameters<typeof injectM0M1Pi>[2],
+						args.entryIds,
+						// History-only refreshes can change m[1] without executing cleanup or
+						// materializing m[0]. Refresh the delta on every cache-busting pass;
+						// replay-only passes must keep the cached m[1] bytes unchanged.
+						isCacheBustingPass,
+						injectionPassSnapshot,
+					),
+				);
 			injectionResult = preFoldInjectionResult?.m0Materialized
 				? {
 						...wireInjectionResult,

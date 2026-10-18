@@ -2028,10 +2028,7 @@ export async function registerContext(context: V2Context) {
                 compactionOff,
                 replayFits,
                 onLkgReplay: restoreLkgSystem,
-                // This host builds no Rust adapter. Answering null, rather than
-                // omitting the option, keeps the wrapper from consulting the
-                // process-wide adapter registry.
-                            })(
+            })(
                 {},
                 mapped as unknown as Parameters<
                     ReturnType<typeof createMessagesTransformHandler>
@@ -2112,7 +2109,7 @@ export async function registerContext(context: V2Context) {
                         await createMessagesTransformHandler({
                             replayFits,
                             onLkgReplay: restoreLkgSystem,
-                                                        magicContext: {
+                            magicContext: {
                                 "experimental.chat.messages.transform": async () => {
                                     throw error;
                                 },
