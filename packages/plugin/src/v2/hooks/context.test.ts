@@ -413,10 +413,15 @@ test("v2 observed move supersedes an initial pending decision", async () => {
         connectionFile: fake.connectionFile,
     });
     await called;
-    await host.context(draft(session));
-    expect(host.row(session)).toBe("pj-DESTINATION");
-    fake.release();
+    // Release the old reply when the move is recorded, not after the full
+    // transform: cold rendering may outlast the independent 500ms RPC deadline.
+    spyOn(logger, "log").mockImplementation((message) => {
+        if (message.includes("directory moved")) fake.release();
+    });
+    const moved = host.context(draft(session));
     expect(await pending).toEqual({ directory, identity: "pj-DESTINATION" });
+    await moved;
+    expect(host.row(session)).toBe("pj-DESTINATION");
     expect(readRememberedProjectIdentity(before)?.identity).toBe(projectId);
     await host.context(draft(session));
     expect(host.row(session)).toBe("pj-DESTINATION");

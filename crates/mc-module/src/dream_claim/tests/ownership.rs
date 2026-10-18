@@ -159,6 +159,40 @@ async fn attested_claimant_publishes_for_its_project_and_plugin_routes_read_it()
 }
 
 #[tokio::test]
+async fn ownership_and_run_task_keep_the_served_project_on_the_bound_channel() {
+    let r = route("opencode2", "fenceless", true, Some(every_hosted_task()));
+    let store = r.handler.store.get().unwrap();
+    store.with_context_conn_for_test(|db| {
+        db.execute_batch("INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES ('parent', 'opencode2', 'pj-original', 1), ('harness-session', 'opencode2', 'pj-original', 1)")
+    }).unwrap();
+    assert!(!published(&declare(&r.handler, "fenceless").await).is_empty());
+    let original = read(&r.handler).await;
+    assert!(!published(&original).is_empty());
+
+    // A host-row update cannot move an already-served channel into a different
+    // project's scheduler. A fresh channel may adopt the newly recorded key.
+    store
+        .with_context_conn_for_test(|db| {
+            db.execute(
+                "UPDATE session_projects SET project_path='pj-next' WHERE session_id='parent'",
+                [],
+            )
+        })
+        .unwrap();
+    r.handler
+        .bind_route(8, r.handler.facade_binding(PLUGIN).unwrap());
+    assert_eq!(published(&read(&r.handler).await), published(&original));
+    let fresh = call(&r.handler, 8, json!({"v":1,"method":"dream.ownership"})).await;
+    assert!(published(&fresh).is_empty());
+    let curate = json!({"v":1,"method":"dreamer.run_task","session_id":"parent","task":"curate"});
+    assert_eq!(
+        call(&r.handler, PLUGIN, curate.clone()).await["error"],
+        "rust_scheduler_owns_task"
+    );
+    assert_eq!(call(&r.handler, 8, curate).await["error"], "invalid_params");
+}
+
+#[tokio::test]
 async fn a_plugin_route_cannot_declare_a_claimant_and_keeps_every_task() {
     let r = route("opencode2", "fenceless", true, Some(every_hosted_task()));
     for claimant in [vector()["claimants"]["fenceless"].clone(), Value::Null] {

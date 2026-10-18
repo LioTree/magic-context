@@ -1,5 +1,5 @@
 import { test } from "bun:test";
-import { dashboardCacheProof } from "../../plugin/src/hooks/magic-context/dashboard-cache-proof";
+import { dashboardCacheProof } from "../../plugin/src/hooks/magic-context/dashboard-cache-proof.test";
 import { _resetHarnessForTesting } from "../../plugin/src/shared/harness";
 import { injectM0M1Pi } from "./inject-compartments-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";

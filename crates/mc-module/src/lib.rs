@@ -142,8 +142,8 @@ pub mod decay_render;
 pub mod decision_calibration;
 mod digest;
 pub mod divergence;
-pub mod entorhinal_resolve;
 mod dream_runner;
+pub mod entorhinal_resolve;
 /// Explicit background entries. None is called by a served transform or tool.
 /// Config resolution and all adapter work happen on the worker, not its caller.
 pub mod background {
@@ -8827,7 +8827,7 @@ impl McHandler {
                 message: "mc.retrieval requires a store".into(),
             };
         };
-        let project = match self.route_project_identity(store, &binding) {
+        let project = match self.route_project_identity(channel, store, &binding) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
@@ -9423,7 +9423,7 @@ impl McHandler {
         }
         if non_served_contract::PROJECT_METHODS.contains(&method) {
             if let Some(store) = store {
-                if let Err(outcome) = self.route_project_identity(store, &binding) {
+                if let Err(outcome) = self.route_project_identity(channel, store, &binding) {
                     return outcome;
                 }
             }
@@ -13804,7 +13804,7 @@ impl McHandler {
         // A plugin route still runs every task Rust has not published, exactly as
         // with the switch off; only a published task belongs to the Rust scheduler.
         if activated && dream_claim::plugin_lane(&binding) {
-            if canonical.is_some_and(|name| self.dream_task_published(&binding, name)) {
+            if canonical.is_some_and(|name| self.dream_task_published(channel, &binding, name)) {
                 return HandlerOutcome::Error {
                     code: "rust_scheduler_owns_task".into(),
                     message: format!("Rust scheduler owns dreamer task {task:?}"),
@@ -13828,7 +13828,7 @@ impl McHandler {
             }
             // Ownership comes only from the published list; request fields and
             // config alone cannot claim a task for Rust.
-            if canonical.is_some_and(|name| self.dream_task_published(&binding, name)) {
+            if canonical.is_some_and(|name| self.dream_task_published(channel, &binding, name)) {
                 return HandlerOutcome::Error {
                     code: "rust_scheduler_owns_task".into(),
                     message: format!("Rust scheduler owns dreamer task {task:?}"),

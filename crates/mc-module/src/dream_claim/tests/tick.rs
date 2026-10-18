@@ -144,7 +144,7 @@ impl Project {
         );
         handler.bind_route(PLUGIN, plugin.clone());
         let project = handler
-            .historian_lane_project(&plugin, handler.store.get().unwrap())
+            .historian_lane_project(PLUGIN, &plugin, handler.store.get().unwrap())
             .unwrap();
         Self {
             _owned: owned,

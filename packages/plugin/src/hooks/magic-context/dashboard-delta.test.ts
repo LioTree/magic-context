@@ -4,7 +4,7 @@ import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
-import { dashboardCacheProof } from "./dashboard-cache-proof";
+import { dashboardCacheProof } from "./dashboard-cache-proof.test";
 import { clearInjectionCache, injectM0M1 } from "./inject-compartments";
 
 for (const host of ["opencode", "opencode2"] as const) {

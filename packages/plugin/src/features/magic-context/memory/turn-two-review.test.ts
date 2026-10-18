@@ -951,6 +951,7 @@ describe("S6 review probes: projection (passed at dafaede1)", () => {
             f.gate.blocking = true;
             try {
                 for (const busting of [true, false, true, false]) {
+                    f.gate.allowDashboardPayloads = busting;
                     const served = pass(busting);
                     expect(served.m0).toBe(before.m0);
                     expect(served.m1).toBe(before.m1);
@@ -958,6 +959,7 @@ describe("S6 review probes: projection (passed at dafaede1)", () => {
                 }
             } finally {
                 f.gate.blocking = false;
+                f.gate.allowDashboardPayloads = false;
             }
             expect(f.gate.blocked).toEqual([]);
             // A genuine HARD trigger (provider cache expiry) shows the edit.

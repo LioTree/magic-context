@@ -231,6 +231,7 @@ fn capabilities() -> Value {
 impl McHandler {
     fn ops_binding_project(
         &self,
+        channel: u16,
         store: &mc_store::McStore,
         binding: &crate::SessionBinding,
     ) -> Result<String, HandlerOutcome> {
@@ -254,7 +255,7 @@ impl McHandler {
             code: e.code().into(),
             message: e.to_string(),
         })?;
-        let recorded = self.route_project_identity(store, binding)?;
+        let recorded = self.route_project_identity(channel, store, binding)?;
         if root != recorded {
             return Err(error("project_scope_mismatch"));
         }
@@ -283,7 +284,7 @@ impl McHandler {
                 non_served_route_refusal(method)
             };
         };
-        let project = match self.ops_binding_project(store, &binding) {
+        let project = match self.ops_binding_project(channel, store, &binding) {
             Ok(project) => Some(project),
             Err(HandlerOutcome::Error { code, .. })
                 if code == "store_load_failed"

@@ -1261,7 +1261,7 @@ fn dashboard_delta_holds_admits_freezes_and_folds_across_240_randomized_passes()
         if kind == 0 { dashboard(step); }
         else if kind == 1 { edit(&s, "ses", agent, &format!("Agent correction {step}."), &format!("proof-agent:{step}")).unwrap(); }
         let natural = step % 19 == 18;
-        let bust = natural || (rng >> 8) % 3 == 0;
+        let bust = natural || (rng >> 8).is_multiple_of(3);
         if natural { request.render_config = format!("cfg-natural:{step}"); }
         else if bust { s.arm_soft_refresh("ses").unwrap(); }
         let current = transform(&s, &request, &ctx).unwrap();
@@ -1486,7 +1486,7 @@ fn independent_dashboard_archive_membership_restore_mix_480_passes() {
         let idle = step % 29 == 28;
         let flush = step % 67 == 66;
         ctx.observed_last_response_at_ms = idle.then_some(ctx.now_ms - 300_001);
-        let bust = idle || flush || (rng >> 8) % 4 == 0;
+        let bust = idle || flush || (rng >> 8).is_multiple_of(4);
         if bust && !idle {
             s.arm_soft_refresh("ses").unwrap();
         }

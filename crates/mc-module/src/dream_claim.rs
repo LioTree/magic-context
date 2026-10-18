@@ -62,7 +62,7 @@ impl McHandler {
         let Some(store) = self.store.get() else {
             return Err(self.store_refusal());
         };
-        let project = self.historian_lane_project(&binding, store)?;
+        let project = self.historian_lane_project(channel, &binding, store)?;
         Ok((binding, project))
     }
 
@@ -247,11 +247,16 @@ impl McHandler {
     }
 
     /// Whether Rust publishes `task` for this route; used by `dreamer.run_task`.
-    pub(crate) fn dream_task_published(&self, binding: &SessionBinding, task: TaskName) -> bool {
+    pub(crate) fn dream_task_published(
+        &self,
+        channel: u16,
+        binding: &SessionBinding,
+        task: TaskName,
+    ) -> bool {
         let Some(store) = self.store.get() else {
             return false;
         };
-        let Ok(project) = self.historian_lane_project(binding, store) else {
+        let Ok(project) = self.historian_lane_project(channel, binding, store) else {
             return false;
         };
         self.dream_ownership(binding, &project).owns(task)
