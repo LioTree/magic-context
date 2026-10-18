@@ -101,7 +101,7 @@ fn enable_hint_memory(h: &McHandler) -> String {
     binding.config.auto_search.score_threshold = 0.0;
     h.bind_route(7, binding.clone());
     let store = h.store.get().unwrap();
-    let project = h.route_project(store, &binding).unwrap().key;
+    let project = h.route_project(7, store, &binding).unwrap().key;
     store
         .seed_memory(
             1,

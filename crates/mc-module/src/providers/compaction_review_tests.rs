@@ -65,6 +65,7 @@ fn fixture(
             ..Default::default()
         },
     };
+    handler.bind_route(7, binding.clone());
     let key = Key::new(&binding, "s", "opencode").unwrap();
     (handler, binding, store, key, runner)
 }
@@ -195,14 +196,14 @@ fn full_engine(store: &McStore, work: &Work, tokens: u64) -> transform::Transfor
 async fn final_history_gap_refuses_before_promote_and_burn() {
     let dir = tempfile::tempdir().unwrap();
     let (h, b, s, k, runner) = fixture(dir.path());
-    response(h.provider_setup(b.clone(), &setup_request()).await);
+    response(h.provider_setup(7, b.clone(), &setup_request()).await);
     pending_hook(&s, &k, 1);
     pending_hook(&s, &k, 3);
     let before = s.load_provider_hook_answers(&k.store_key()).unwrap();
     let mut gap = step("gap", vec![], 3);
     gap["served_through_ordinal"] = json!(3);
     gap["unserved_subjects"] = json!([{"subject_mid":"m1","hook":"pre_user"}]);
-    let answer = response(h.provider_step(b, &gap).await);
+    let answer = response(h.provider_step(7, b, &gap).await);
     assert_eq!(answer["code"], "history_unreadable");
     assert_eq!(answer["detail"]["history_gap_from"], 2);
     assert_eq!(runner.0.load(Ordering::SeqCst), 0);
@@ -223,18 +224,18 @@ async fn final_history_gap_refuses_before_promote_and_burn() {
 async fn first_historian_publication_matches_the_real_full_request_engine() {
     let dir = tempfile::tempdir().unwrap();
     let (h, b, s, k, _) = fixture(dir.path());
-    let work = h.provider_work(&s, b.clone(), k).unwrap();
+    let work = h.provider_work(7, &s, b.clone(), k).unwrap();
     assert_eq!(full_engine(&s, &work, 1000).response.action, "HARD");
     assert_eq!(full_engine(&s, &work, 1000).response.action, "SOFT+");
-    response(h.provider_setup(b.clone(), &setup_request()).await);
+    response(h.provider_setup(7, b.clone(), &setup_request()).await);
     // Complete bootstrap, then acknowledge its view before the publication.
     let mut boot = step("boot", vec![message(1), message(2), message(3)], 3);
     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-    let view = response(h.provider_step(b.clone(), &boot).await);
+    let view = response(h.provider_step(7, b.clone(), &boot).await);
     let mut settled = step("settled", vec![], 3);
     settled["last_applied"] = view["compaction"].clone();
     assert_eq!(
-        response(h.provider_step(b.clone(), &settled).await)["answer"],
+        response(h.provider_step(7, b.clone(), &settled).await)["answer"],
         "noop"
     );
     publication(&s, 0, 1, "FIRST-PUBLISHED-HISTORY");
@@ -243,14 +244,17 @@ async fn first_historian_publication_matches_the_real_full_request_engine() {
     let oracle_dir = tempfile::tempdir().unwrap();
     let (oracle_h, oracle_b, oracle_s, oracle_k, _) = fixture(oracle_dir.path());
     let oracle_work = oracle_h
-        .provider_work(&oracle_s, oracle_b, oracle_k)
+        .provider_work(7, &oracle_s, oracle_b, oracle_k)
         .unwrap();
     full_engine(&oracle_s, &oracle_work, 1000);
     publication(&oracle_s, 0, 1, "FIRST-PUBLISHED-HISTORY");
     let expected = full_engine(&oracle_s, &oracle_work, 1000);
     assert_eq!(expected.response.action, "HARD");
     assert!(expected.response.prefix_bust_permitted);
-    let actual = response(h.provider_step(b, &step("after-publish", vec![], 3)).await);
+    let actual = response(
+        h.provider_step(7, b, &step("after-publish", vec![], 3))
+            .await,
+    );
     assert_eq!(
         actual["answer"], "compaction_message",
         "full-request engine HARD-folded its first publication, but host returned {actual}"
@@ -261,7 +265,7 @@ async fn first_historian_publication_matches_the_real_full_request_engine() {
 async fn soft_plus_pipeline_switch_preserves_the_full_request_head_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let (h, b, s, k, _) = fixture(dir.path());
-    let work = h.provider_work(&s, b.clone(), k).unwrap();
+    let work = h.provider_work(7, &s, b.clone(), k).unwrap();
     publication(&s, 0, 1, "BASELINE-HISTORY");
     assert_eq!(full_engine(&s, &work, 1000).response.action, "HARD");
     publication(&s, 1, 2, "DELTA-HISTORY");
@@ -299,10 +303,10 @@ async fn soft_plus_pipeline_switch_preserves_the_full_request_head_bytes() {
             &super::super::codec_opencode::NativeRenderContext::from(&old),
         )
         .unwrap();
-    response(h.provider_setup(b.clone(), &setup_request()).await);
+    response(h.provider_setup(7, b.clone(), &setup_request()).await);
     let mut switch = step("switch", vec![message(1), message(2), message(3)], 3);
     switch["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-    let actual = response(h.provider_step(b, &switch).await);
+    let actual = response(h.provider_step(7, b, &switch).await);
     assert_eq!(actual["answer"], "compaction_message");
     assert_eq!(
         actual["compaction"]["replacement"],
@@ -314,17 +318,17 @@ async fn soft_plus_pipeline_switch_preserves_the_full_request_head_bytes() {
 async fn retry_after_independent_rebuild(pipeline_switch: bool) {
     let dir = tempfile::tempdir().unwrap();
     let (h, b, s, k, _) = fixture(dir.path());
-    response(h.provider_setup(b.clone(), &setup_request()).await);
+    response(h.provider_setup(7, b.clone(), &setup_request()).await);
     publication(&s, 0, 1, "BASELINE-HISTORY");
     pending_hook(&s, &k, 4);
     let mut boot = step("boot", vec![message(1), message(2), message(3)], 4);
     boot["served_through_ordinal"] = json!(4);
     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-    let initial = response(h.provider_step(b.clone(), &boot).await)["compaction"].clone();
+    let initial = response(h.provider_step(7, b.clone(), &boot).await)["compaction"].clone();
     let mut ack = step("ack", vec![], 4);
     ack["last_applied"] = initial.clone();
     assert_eq!(
-        response(h.provider_step(b.clone(), &ack).await)["answer"],
+        response(h.provider_step(7, b.clone(), &ack).await)["answer"],
         "noop"
     );
 
@@ -332,7 +336,7 @@ async fn retry_after_independent_rebuild(pipeline_switch: bool) {
     let mut cold = step("cold", vec![], 4);
     cold["last_applied"] = initial.clone();
     cold["prefix_rebuilding"] = json!({"reason":"expired_cache"});
-    let lost = response(h.provider_step(b.clone(), &cold).await)["compaction"].clone();
+    let lost = response(h.provider_step(7, b.clone(), &cold).await)["compaction"].clone();
     assert!(lost.to_string().contains("SECOND-HISTORY"));
     assert!(lost.to_string().contains("raw 4"));
 
@@ -348,7 +352,7 @@ async fn retry_after_independent_rebuild(pipeline_switch: bool) {
     if pipeline_switch {
         next["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
     }
-    let actual = response(h.provider_step(b.clone(), &next).await);
+    let actual = response(h.provider_step(7, b.clone(), &next).await);
     assert_eq!(actual["answer"], "compaction_message");
     assert!(actual["compaction"]["version"].as_u64().unwrap() > lost["version"].as_u64().unwrap());
     assert!(s
@@ -369,7 +373,7 @@ async fn retry_after_independent_rebuild(pipeline_switch: bool) {
     replay["model"] = json!("new-model");
     replay["last_applied"] = actual["compaction"].clone();
     assert_eq!(
-        response(h.provider_step(b, &replay).await)["answer"],
+        response(h.provider_step(7, b, &replay).await)["answer"],
         "noop"
     );
     assert!(actual["compaction"]["replacement"].to_string().contains("NEWEST-HISTORY"),
@@ -393,14 +397,14 @@ async fn r73_late_view_without_pipeline_switch_cannot_hide_independent_model_reb
 async fn structural_rejected_view_cannot_be_acknowledged_on_a_later_pass() {
     let dir = tempfile::tempdir().unwrap();
     let (h, b, s, k, _) = fixture(dir.path());
-    response(h.provider_setup(b.clone(), &setup_request()).await);
+    response(h.provider_setup(7, b.clone(), &setup_request()).await);
     let mut boot = step("boot", vec![message(1)], 1);
     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-    let view = response(h.provider_step(b.clone(), &boot).await);
+    let view = response(h.provider_step(7, b.clone(), &boot).await);
     let version = view["compaction"]["version"].as_u64().unwrap();
     let mut rejected = step("rejected", vec![], 1);
     rejected["last_not_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":version,"reason":"structural"});
-    response(h.provider_step(b.clone(), &rejected).await);
+    response(h.provider_step(7, b.clone(), &rejected).await);
     let row = s
         .resolve_provider_view_catalog(&k.store_key(), version)
         .unwrap()
@@ -409,7 +413,7 @@ async fn structural_rejected_view_cannot_be_acknowledged_on_a_later_pass() {
     let mut late_ack = step("late-ack", vec![], 1);
     late_ack["last_applied"] =
         json!({"compaction_id":view["compaction"]["compaction_id"],"version":version});
-    let _result = h.provider_step(b, &late_ack).await;
+    let _result = h.provider_step(7, b, &late_ack).await;
     let later = s
         .resolve_provider_view_catalog(&k.store_key(), version)
         .unwrap()
@@ -423,14 +427,14 @@ async fn structural_rejected_view_cannot_be_acknowledged_on_a_later_pass() {
 async fn acknowledgement_with_a_foreign_compaction_id_cannot_apply_a_view() {
     let dir = tempfile::tempdir().unwrap();
     let (h, b, s, k, _) = fixture(dir.path());
-    response(h.provider_setup(b.clone(), &setup_request()).await);
+    response(h.provider_setup(7, b.clone(), &setup_request()).await);
     let mut boot = step("boot", vec![message(1)], 1);
     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-    let view = response(h.provider_step(b.clone(), &boot).await);
+    let view = response(h.provider_step(7, b.clone(), &boot).await);
     let version = view["compaction"]["version"].as_u64().unwrap();
     let mut ack = step("foreign-ack", vec![], 1);
     ack["last_applied"] = json!({"compaction_id":"foreign-conversation","version":version});
-    let _result = h.provider_step(b, &ack).await;
+    let _result = h.provider_step(7, b, &ack).await;
     let row = s
         .resolve_provider_view_catalog(&k.store_key(), version)
         .unwrap()
@@ -446,16 +450,16 @@ async fn acknowledgement_with_a_foreign_compaction_id_cannot_apply_a_view() {
 async fn missing_cached_m1_repair_cannot_be_skipped() {
     let dir = tempfile::tempdir().unwrap();
     let (h, b, s, k, _) = fixture(dir.path());
-    response(h.provider_setup(b.clone(), &setup_request()).await);
+    response(h.provider_setup(7, b.clone(), &setup_request()).await);
     publication(&s, 0, 1, "BASELINE");
     pending_hook(&s, &k, 2);
     let mut boot = step("boot", vec![message(1), message(3)], 3);
     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
     boot["served_through_ordinal"] = json!(3);
-    let view = response(h.provider_step(b.clone(), &boot).await);
+    let view = response(h.provider_step(7, b.clone(), &boot).await);
     let mut settled = step("settled", vec![], 3);
     settled["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
-    response(h.provider_step(b.clone(), &settled).await);
+    response(h.provider_step(7, b.clone(), &settled).await);
     // The full engine explicitly supports repairing this legacy cached-head
     // shape. It is not an uninitialized namespace or forced-work meta flag.
     let mut legacy = s.load("s").unwrap();
@@ -465,7 +469,7 @@ async fn missing_cached_m1_repair_cannot_be_skipped() {
         .unwrap();
     s.queue_provider_drops(&k.store_key(), &[1]).unwrap();
     let params = step("repair", vec![], 3);
-    let actual = response(h.provider_step(b.clone(), &params).await);
+    let actual = response(h.provider_step(7, b.clone(), &params).await);
     let c = s
         .load_provider_conversation(&k.store_key())
         .unwrap()
@@ -479,7 +483,7 @@ async fn missing_cached_m1_repair_cannot_be_skipped() {
         },
     )
     .unwrap();
-    let work = h.provider_work(&s, b, k.clone()).unwrap();
+    let work = h.provider_work(7, &s, b, k.clone()).unwrap();
     let lineage = s
         .load_provider_lineage(&k.store_key(), "L")
         .unwrap()
@@ -526,7 +530,7 @@ async fn pressure_flush_model_and_cold_match_the_real_engine_with_queued_drops_a
                 for (handler, binding, store, key) in [(&h, &b, &s, &k), (&oh, &ob, &os, &ok)] {
                     response(
                         handler
-                            .provider_setup(binding.clone(), &setup_request())
+                            .provider_setup(7, binding.clone(), &setup_request())
                             .await,
                     );
                     publication(store, 0, 1, "BASELINE");
@@ -534,10 +538,10 @@ async fn pressure_flush_model_and_cold_match_the_real_engine_with_queued_drops_a
                     let mut boot = step("boot", vec![message(1), message(3)], 3);
                     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
                     boot["served_through_ordinal"] = json!(3);
-                    let view = response(handler.provider_step(binding.clone(), &boot).await);
+                    let view = response(handler.provider_step(7, binding.clone(), &boot).await);
                     let mut settled = step("settled", vec![], 3);
                     settled["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
-                    response(handler.provider_step(binding.clone(), &settled).await);
+                    response(handler.provider_step(7, binding.clone(), &settled).await);
                     publication(store, 1, 2, "PUBLISHED-DELTA");
                     store.queue_provider_drops(&key.store_key(), &[1]).unwrap();
                     if event == "flush" {
@@ -559,7 +563,7 @@ async fn pressure_flush_model_and_cold_match_the_real_engine_with_queued_drops_a
                 if event == "model" {
                     params["model"] = json!("new-model");
                 }
-                let actual = response(h.provider_step(b, &params).await);
+                let actual = response(h.provider_step(7, b, &params).await);
                 let c = os
                     .load_provider_conversation(&ok.store_key())
                     .unwrap()
@@ -575,7 +579,7 @@ async fn pressure_flush_model_and_cold_match_the_real_engine_with_queued_drops_a
                 )
                 .unwrap();
                 setup.setup.request.model = params["model"].as_str().unwrap().into();
-                let work = oh.provider_work(&os, ob, ok.clone()).unwrap();
+                let work = oh.provider_work(7, &os, ob, ok.clone()).unwrap();
                 let lineage = os
                     .load_provider_lineage(&ok.store_key(), "L")
                     .unwrap()
@@ -621,10 +625,10 @@ async fn pressure_flush_model_and_cold_match_the_real_engine_with_queued_drops_a
 async fn module_ahead_descent_after_restart_burns_stranded_tags_without_rewriting_the_view() {
     let dir = tempfile::tempdir().unwrap();
     let (h, b, s, k, _) = fixture(dir.path());
-    response(h.provider_setup(b.clone(), &setup_request()).await);
+    response(h.provider_setup(7, b.clone(), &setup_request()).await);
     let mut boot = step("boot", vec![message(1)], 1);
     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-    let view = response(h.provider_step(b.clone(), &boot).await);
+    let view = response(h.provider_step(7, b.clone(), &boot).await);
     let version = view["compaction"]["version"].as_u64().unwrap();
     let frozen = serde_json::to_string(
         &super::super::view_recipe::load(&s, &k, version)
@@ -645,7 +649,7 @@ async fn module_ahead_descent_after_restart_burns_stranded_tags_without_rewritin
     let mut conflict = step("conflict", vec![replacement.clone()], 2);
     conflict["served_through_ordinal"] = json!(1);
     conflict["unserved_subjects"] = json!([{"subject_mid":"m2","hook":"pre_user"}]);
-    assert!(matches!(h.provider_step(b.clone(), &conflict).await,
+    assert!(matches!(h.provider_step(7, b.clone(), &conflict).await,
         Err(HandlerOutcome::ErrorWithDetail { code, detail, .. }) if code == "invalid_params" && detail["field"] == "messages"));
     assert_eq!(
         s.load_provider_hook_answers(&k.store_key()).unwrap()[0].state,
@@ -659,7 +663,7 @@ async fn module_ahead_descent_after_restart_burns_stranded_tags_without_rewritin
     descent["last_applied"] =
         json!({"compaction_id":view["compaction"]["compaction_id"],"version":version});
     assert_eq!(
-        response(h.provider_step(b.clone(), &descent).await)["answer"],
+        response(h.provider_step(7, b.clone(), &descent).await)["answer"],
         "noop"
     );
     assert_eq!(
@@ -680,7 +684,7 @@ async fn module_ahead_descent_after_restart_burns_stranded_tags_without_rewritin
     cold["lineage_id"] = json!("child");
     cold["served_through_ordinal"] = json!(2);
     cold["prefix_rebuilding"] = json!({"reason":"expired_cache"});
-    let rebuilt = response(h.provider_step(b, &cold).await);
+    let rebuilt = response(h.provider_step(7, b, &cold).await);
     assert_eq!(rebuilt["answer"], "compaction_message");
     let raw = rebuilt["compaction"]["replacement"].as_array().unwrap();
     assert!(raw
@@ -697,7 +701,7 @@ async fn module_ahead_descent_after_restart_burns_stranded_tags_without_rewritin
 async fn r3_nonfinal_bootstrap_with_hook_complete_history_waits_without_engine() {
     let dir = tempfile::tempdir().unwrap();
     let (h, b, s, k, _) = fixture(dir.path());
-    response(h.provider_setup(b.clone(), &setup_request()).await);
+    response(h.provider_setup(7, b.clone(), &setup_request()).await);
     for ordinal in 1..=3 {
         pending_hook(&s, &k, ordinal);
     }
@@ -705,7 +709,7 @@ async fn r3_nonfinal_bootstrap_with_hook_complete_history_waits_without_engine()
     let mut page = step("more-but-covered", vec![], 3);
     page["more"] = json!(true);
     page["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-    let actual = response(h.provider_step(b, &page).await);
+    let actual = response(h.provider_step(7, b, &page).await);
     assert_eq!(
         actual["answer"], "wait",
         "non-final bootstrap may not render a view: {actual}"
@@ -723,7 +727,7 @@ async fn r3_upgrade_identity_change_is_not_transport_adoption() {
     for host in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let (h, b, s, k, _) = fixture(dir.path());
-        let w = h.provider_work(&s, b, k).unwrap();
+        let w = h.provider_work(7, &s, b, k).unwrap();
         publication(&s, 0, 1, "BASE");
         let mut req = engine_request(1000);
         req.upgrade_state = "old-release".into();
@@ -757,7 +761,7 @@ async fn r3_upgrade_identity_change_is_not_transport_adoption() {
 fn r3_recomp_reset_summary_agrees_with_full_core() {
     let dir = tempfile::tempdir().unwrap();
     let (h, b, s, k, _) = fixture(dir.path());
-    let w = h.provider_work(&s, b, k).unwrap();
+    let w = h.provider_work(7, &s, b, k).unwrap();
     full_engine(&s, &w, 1000);
     let before = s.load("s").unwrap();
     assert!(!s
@@ -827,8 +831,8 @@ async fn r3_old_render_epoch_comparison(pipeline_switch: bool) {
     let od = tempfile::tempdir().unwrap();
     let (h, b, s, k, _) = fixture(ad.path());
     let (oh, ob, os, ok, _) = fixture(od.path());
-    let w = h.provider_work(&s, b.clone(), k.clone()).unwrap();
-    let ow = oh.provider_work(&os, ob, ok).unwrap();
+    let w = h.provider_work(7, &s, b.clone(), k.clone()).unwrap();
+    let ow = oh.provider_work(7, &os, ob, ok).unwrap();
     let mut old = Value::Null;
     for (ss, ww) in [(&s, &w), (&os, &ow)] {
         publication(ss, 0, 1, "BASE");
@@ -837,15 +841,15 @@ async fn r3_old_render_epoch_comparison(pipeline_switch: bool) {
         assert_eq!(full_engine(ss, ww, 75000).response.action, "SOFT");
         old = r3_native(&full_engine(ss, ww, 1000), &engine_request(1000), 3);
     }
-    response(h.provider_setup(b.clone(), &setup_request()).await);
+    response(h.provider_setup(7, b.clone(), &setup_request()).await);
     let mut boot = step("boot", vec![message(1), message(2), message(3)], 3);
     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-    let v = response(h.provider_step(b.clone(), &boot).await);
+    let v = response(h.provider_step(7, b.clone(), &boot).await);
     assert_eq!(v["compaction"]["replacement"], old);
     let mut settled = step("settled", vec![], 3);
     settled["last_applied"] = v["compaction"].clone();
     assert_eq!(
-        response(h.provider_step(b.clone(), &settled).await)["answer"],
+        response(h.provider_step(7, b.clone(), &settled).await)["answer"],
         "noop"
     );
     for ss in [&s, &os] {
@@ -870,7 +874,7 @@ async fn r3_old_render_epoch_comparison(pipeline_switch: bool) {
     if pipeline_switch {
         pass["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
     }
-    let actual = response(h.provider_step(b, &pass).await);
+    let actual = response(h.provider_step(7, b, &pass).await);
     let served = if actual["answer"] == "compaction_message" {
         actual["compaction"]["replacement"].clone()
     } else {
@@ -984,8 +988,8 @@ async fn r3_randomized_host_full_engine_240_passes() {
         let (oh, mut ob, os, ok, _) = fixture(od.path());
         b.config.memory_enabled = true;
         ob.config.memory_enabled = true;
-        let w = h.provider_work(&s, b.clone(), k.clone()).unwrap();
-        let ow = oh.provider_work(&os, ob.clone(), ok.clone()).unwrap();
+        let w = h.provider_work(7, &s, b.clone(), k.clone()).unwrap();
+        let ow = oh.provider_work(7, &os, ob.clone(), ok.clone()).unwrap();
         let n = 4 + draw() % 7;
         let mut time = 1000_i64;
         let mut entries = Vec::new();
@@ -1003,7 +1007,7 @@ async fn r3_randomized_host_full_engine_240_passes() {
             entries.push(entry);
         }
         for (hh, bb, ss, kk) in [(&h, &b, &s, &k), (&oh, &ob, &os, &ok)] {
-            response(hh.provider_setup(bb.clone(), &setup_request()).await);
+            response(hh.provider_setup(7, bb.clone(), &setup_request()).await);
             publication(ss, 0, 1, "BASE");
             for entry in &entries {
                 r3_hook_entry(ss, kk, entry);
@@ -1012,7 +1016,7 @@ async fn r3_randomized_host_full_engine_240_passes() {
         let mut boot = step("boot", vec![], n);
         boot["served_through_ordinal"] = json!(n);
         boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let initial = response(h.provider_step(b.clone(), &boot).await);
+        let initial = response(h.provider_step(7, b.clone(), &boot).await);
         os.commit_provider_status_page(
             &ok.store_key(),
             mc_store::provider_records::ProviderStatusPage {
@@ -1144,7 +1148,7 @@ async fn r3_randomized_host_full_engine_240_passes() {
             req.usage.as_mut().unwrap().current_total_input_tokens = tokens;
             let expected = transform::transform_with_projection(&os, &req, &ctx).unwrap();
             ctx.observed_last_response_at_ms = Some(ctx.now_ms);
-            let actual = response(h.provider_step(b.clone(), &params).await);
+            let actual = response(h.provider_step(7, b.clone(), &params).await);
             if actual["answer"] == "compaction_message" {
                 applied = actual["compaction"].clone();
             }
@@ -1178,10 +1182,10 @@ async fn hookcost_review_durable_wire_fragment_is_not_response_wire_fragment() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (h, binding, store, key, _) = fixture(dir.path());
-    response(h.provider_setup(binding.clone(), &setup_request()).await);
+    response(h.provider_setup(7, binding.clone(), &setup_request()).await);
     let mut boot = step("boot", vec![message(1), message(2)], 2);
     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-    let answer_bytes = h.provider_step(binding, &boot).await.unwrap();
+    let answer_bytes = h.provider_step(7, binding, &boot).await.unwrap();
     let answer: Value = serde_json::from_slice(&answer_bytes).unwrap();
     assert_eq!(answer["answer"], "compaction_message");
     let version = answer["compaction"]["version"].as_u64().unwrap();
@@ -1417,11 +1421,11 @@ fn bridge_reference_lineage_excludes_sibling_pending_but_allows_identical_carrie
 async fn bridge_reference_exact_retry_keeps_frozen_bytes_and_version() {
     let dir = tempfile::tempdir().unwrap();
     let (h, binding, store, key, _) = fixture(dir.path());
-    response(h.provider_setup(binding.clone(), &setup_request()).await);
+    response(h.provider_setup(7, binding.clone(), &setup_request()).await);
     pending_hook(&store, &key, 1);
     let mut boot = step("frozen", vec![], 1);
     boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-    let frozen = h.provider_step(binding.clone(), &boot).await.unwrap();
+    let frozen = h.provider_step(7, binding.clone(), &boot).await.unwrap();
     let frozen = response(Ok(frozen))["compaction"].clone();
     let version = frozen["version"].as_u64().unwrap();
     let before = serde_json::to_vec(
@@ -1440,7 +1444,7 @@ async fn bridge_reference_exact_retry_keeps_frozen_bytes_and_version() {
     let mut ordinary = step("ordinary", vec![], 1);
     ordinary["last_applied"] = frozen;
     assert_eq!(
-        response(h.provider_step(binding, &ordinary).await)["answer"],
+        response(h.provider_step(7, binding, &ordinary).await)["answer"],
         "noop"
     );
     assert_eq!(

@@ -100,7 +100,8 @@ function decodeReply(body: unknown, options: EntorhinalResolveOptions): Entorhin
     if (result.via === "worktree" && typeof result.worktreeOf !== "string") {
         return decodeFailure({ worktreeOf: result.worktreeOf }, options);
     }
-    // An implicit id must never escape as a durable project identity, even on a malformed root reply.
+    // Implicit IDs describe unregistered directories, not registered projects.
+    // Never persist one, even if a malformed reply labels it as a registered root.
     if (result.via === "implicit") return { status: "implicit" };
     if (result.projectId.startsWith("pj-implicit1-")) {
         return decodeFailure({ projectId: result.projectId }, options);

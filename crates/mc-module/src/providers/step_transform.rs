@@ -833,6 +833,7 @@ impl McHandler {
     }
     async fn provider_host_hook(
         &self,
+        channel: u16,
         binding: SessionBinding,
         key: Key,
         call: &hooks::hook::HookCall,
@@ -1112,6 +1113,7 @@ impl McHandler {
             });
         let hint = if hook == Hook::PreUser && eligible_hint {
             self.host_user_hint(
+                channel,
                 &store,
                 &binding,
                 &c.engine_namespace,
@@ -1335,6 +1337,7 @@ impl McHandler {
     #[allow(clippy::too_many_arguments)]
     fn host_user_hint(
         &self,
+        channel: u16,
         store: &McStore,
         binding: &SessionBinding,
         namespace: &str,
@@ -1350,7 +1353,7 @@ impl McHandler {
             return Ok(None);
         }
         let directory = binding.project_root.to_string_lossy();
-        let project = self.route_project(store, binding)?.key;
+        let project = self.route_project(channel, store, binding)?.key;
         let mut request: TransformRequest = decode(
             &json!({"v":2,"kind":"transform.hook","session_id":namespace,"serializer_profile":if binding.harness == "pi" { "pi" } else { "opencode-aisdk" },"render_config":"host-hook","messages":messages}),
         )?;
@@ -1487,6 +1490,7 @@ impl McHandler {
 
     pub(super) async fn provider_hook(
         &self,
+        channel: u16,
         binding: SessionBinding,
         params: &Value,
     ) -> Result<Vec<u8>, HandlerOutcome> {
@@ -1512,7 +1516,9 @@ impl McHandler {
                 .await;
         }
         if matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi") {
-            return self.provider_host_hook(binding, key, &call, params).await;
+            return self
+                .provider_host_hook(channel, binding, key, &call, params)
+                .await;
         }
         if call.lineage_id.is_none() && call.subject.hook() != Hook::PreUser {
             return Err(invalid("lineage_id is required after the first pre_user"));
@@ -2860,7 +2866,7 @@ mod overlay_parity_tests {
         let mut params = json!({"serializer_profile":"opencode-aisdk","observation":"answer","auto_search_min_prompt_chars":0,"auto_search_score_threshold":0.0});
         response(dispatch(&h, 7, "transform.declare", json!({"params":params})).await);
         let store = h.store.get().unwrap();
-        let project = h.route_project(store, &binding).unwrap().key;
+        let project = h.route_project(7, store, &binding).unwrap().key;
         for n in 1..=30 {
             store
                 .seed_memory(

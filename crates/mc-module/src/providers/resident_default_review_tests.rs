@@ -21,10 +21,10 @@ async fn review_default_config_transcript() {
         binding.harness = harness.into();
         let key = Key::new(&binding, "s", harness).unwrap();
         let mut start = setup(); start["harness"] = json!(harness);
-        transcript.push(answer(h.provider_setup(binding.clone(), &start).await));
+        transcript.push(answer(h.provider_setup(7, binding.clone(), &start).await));
         let mut boot = step("default-initial", (1..=30).map(message).collect(), 30);
         boot["harness"] = json!(harness);
-        let mut view = answer(h.provider_step(binding.clone(), &boot).await);
+        let mut view = answer(h.provider_step(7, binding.clone(), &boot).await);
         transcript.push(view.clone());
         let mut newest = 30;
         for pass in 0..24 {
@@ -52,7 +52,7 @@ async fn review_default_config_transcript() {
                 request["model"] = json!("different-model");
                 request["prefix_rebuilding"] = json!({"reason":"model_switch"});
             }
-            let response = answer(h.provider_step(binding.clone(), &request).await);
+            let response = answer(h.provider_step(7, binding.clone(), &request).await);
             if response["answer"] == "compaction_message" { view = response.clone(); }
             transcript.push(response);
             // The persisted hygiene baseline is part of the default transcript;

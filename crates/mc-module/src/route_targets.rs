@@ -303,7 +303,18 @@ mod tests {
         );
         assert!(RegisteredRoute::EntorhinalResolve.self_signals().is_empty());
         let manifest = crate::manifest_with_route_targets(crate::DEFAULT_MODULE_ID, &config);
-        assert!(manifest.capabilities.is_none());
+        let capabilities = manifest
+            .capabilities
+            .expect("provider roles remain declared");
+        assert_eq!(
+            capabilities.provides,
+            vec![
+                cortexkit_role_compaction_provider::PROVIDES.to_string(),
+                cortexkit_role_step_transform_provider::PROVIDES.to_string(),
+            ]
+        );
+        assert!(capabilities.requires.is_empty());
+        assert!(capabilities.must_never_reach.is_empty());
         assert!(manifest.consumes.iter().any(|role| matches!(role,
             subc_protocol::manifest::ConsumerRole::ServiceClient { of } if of.iter().any(|module| module == "entorhinal")
         )));

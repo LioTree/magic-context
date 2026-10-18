@@ -555,7 +555,8 @@ function pinForUsableDirectory(canonical: string, directory: string): string | u
         assertDirectoryUsable(canonical, directory);
         accessSync(canonical, constants.R_OK | constants.X_OK);
     } catch {
-        // Preserve legacy fallback handling for missing paths, but never use their pins.
+        // Missing or inaccessible directories keep the legacy Git/path fallback;
+        // a remembered pin must not bypass the directory usability check.
         return undefined;
     }
     const pinned = readRememberedProjectIdentity(canonical)?.identity;

@@ -33,16 +33,16 @@ async fn run_sequence(harness: &str, random_seed: u64) {
     for (h, binding, store) in [(&ha, &ba, &sa), (&hb, &bb, &sb)] {
         let mut start = setup();
         start["harness"] = json!(harness);
-        answer(h.provider_setup(binding.clone(), &start).await);
+        answer(h.provider_setup(7, binding.clone(), &start).await);
         let mut boot = step("initial", (1..=newest).map(message).collect(), newest);
         boot["harness"] = json!(harness);
-        let initial = answer(h.provider_step(binding.clone(), &boot).await);
+        let initial = answer(h.provider_step(7, binding.clone(), &boot).await);
         store.replace_compartments("s", &compartments()).unwrap();
         store.arm_soft_refresh("s").unwrap();
         let mut fold = step("first", vec![], newest);
         fold["harness"] = json!(harness);
         acknowledge(&mut fold, &initial);
-        views.push(answer(h.provider_step(binding.clone(), &fold).await));
+        views.push(answer(h.provider_step(7, binding.clone(), &fold).await));
     }
     let mut rng = random_seed;
     let mut choices = [0usize; 8];
@@ -106,7 +106,7 @@ async fn run_sequence(harness: &str, random_seed: u64) {
                 request["prefix_rebuilding"] = json!({"reason":"model_switch"});
             }
             acknowledge(&mut request, &views[index]);
-            answers.push(answer(h.provider_step(binding.clone(), &request).await));
+            answers.push(answer(h.provider_step(7, binding.clone(), &request).await));
         }
         assert_eq!(normalized_receipt(answers[0].clone()), normalized_receipt(answers[1].clone()),
             "{harness}, seed {random_seed}, pass {pass}, choice {choice}: served receipt bytes");
@@ -143,7 +143,7 @@ async fn review_over_cap_policy_index_falls_back_without_refusal() {
         store.arm_soft_refresh("s").unwrap();
         let mut request = step("over-cap", vec![], 30);
         acknowledge(&mut request, &view);
-        let result = h.provider_step(binding, &request).await;
+        let result = h.provider_step(7, binding, &request).await;
         assert!(result.is_ok(), "resident={enabled}: over-cap derived index must fall back, not refuse: {result:?}");
         results.push(normalized_receipt(serde_json::from_slice(&result.unwrap()).unwrap()));
     }
@@ -162,7 +162,7 @@ async fn review_external_native_edit_invalidates_cached_tail() {
         store.arm_soft_refresh("s").unwrap();
         let mut request = step("prime-edit", vec![], 30);
         acknowledge(&mut request, &view);
-        let primed = answer(h.provider_step(binding.clone(), &request).await);
+        let primed = answer(h.provider_step(7, binding.clone(), &request).await);
         if primed["answer"] == "compaction_message" { view = primed; }
         let external = rusqlite::Connection::open(dir.join("store.db")).unwrap();
         let changed = external.execute("UPDATE mc_provider_messages_v1 SET message_bytes=CAST(json_set(CAST(message_bytes AS TEXT),'$.parts[0].text','externally changed café 🦀') AS BLOB) WHERE ordinal=25", []).unwrap();
@@ -174,7 +174,7 @@ async fn review_external_native_edit_invalidates_cached_tail() {
         store.arm_soft_refresh("s").unwrap();
         request["request_id"] = json!("external-edit");
         acknowledge(&mut request, &view);
-        answers.push(answer(h.provider_step(binding, &request).await));
+        answers.push(answer(h.provider_step(7, binding, &request).await));
     }
     assert_eq!(normalized_receipt(answers[0].clone()), normalized_receipt(answers[1].clone()));
     assert!(serde_json::to_string(&answers[0]).unwrap().contains("externally changed café"));
@@ -207,7 +207,7 @@ async fn review_coverage_advance_matches_fresh_prefix_authority() {
         store.arm_soft_refresh("s").unwrap();
         let mut request = step(&format!("advance-{through}"), vec![], 30);
         acknowledge(&mut request, &view);
-        let response = answer(h.provider_step(binding.clone(), &request).await);
+        let response = answer(h.provider_step(7, binding.clone(), &request).await);
         if response["answer"] == "compaction_message" { view = response; }
         let fresh = store.read_provider_resident_policy(&key.store_key(), |index, counters| {
             Ok(crate::providers::fold_prefix::FoldPrefix::build(&index.all_parts()?, &counters["engine_policy"]).unwrap())
@@ -234,7 +234,7 @@ async fn review_late_hook_answer_invalidates_same_ordinal_tail() {
         store.arm_soft_refresh("s").unwrap();
         let mut request = step("prime-hook", vec![], 30);
         acknowledge(&mut request, &view);
-        let primed = answer(h.provider_step(binding.clone(), &request).await);
+        let primed = answer(h.provider_step(7, binding.clone(), &request).await);
         if primed["answer"] == "compaction_message" { view = primed; }
         let lineage = ProviderLineage { lineage_id: "L".into(), first_ordinal: 1, descends_from: None, through_ordinal: None };
         hook_answer(&store, &key, &lineage, &message(25), "pre_user",
@@ -246,7 +246,7 @@ async fn review_late_hook_answer_invalidates_same_ordinal_tail() {
         request["request_id"] = json!("late-hook");
         request["served_through_ordinal"] = json!(30);
         acknowledge(&mut request, &view);
-        answers.push(answer(h.provider_step(binding, &request).await));
+        answers.push(answer(h.provider_step(7, binding, &request).await));
     }
     assert_eq!(normalized_receipt(answers[0].clone()), normalized_receipt(answers[1].clone()));
     assert!(serde_json::to_string(&answers[0]).unwrap().contains("late hook café"));
@@ -280,7 +280,7 @@ async fn review_appended_compartments_preserve_replay_identity() {
             store.arm_soft_refresh("s").unwrap();
             let mut request = step(&format!("append-compartment-{through}"), vec![], 30);
             acknowledge(&mut request, &views[index]);
-            answers.push(answer(h.provider_step(binding.clone(), &request).await));
+            answers.push(answer(h.provider_step(7, binding.clone(), &request).await));
         }
         assert_eq!(normalized_receipt(answers[0].clone()), normalized_receipt(answers[1].clone()), "served receipt at coverage {through}");
         assert_eq!(normalized_measurement(&sa)["content_signature"], normalized_measurement(&sb)["content_signature"], "baseline content signature at coverage {through}");
@@ -304,7 +304,7 @@ async fn review_concurrent_two_session_hooks_match_replay() {
             let mut binding = if std::ptr::eq(h, &ha) { ba.clone() } else { bb.clone() };
             binding.session = session.into();
             let mut start = setup(); start["session"] = json!(session);
-            answer(h.provider_setup(binding, &start).await);
+            answer(h.provider_setup(7, binding, &start).await);
         }
     }
     for ordinal in 1..=12 {
@@ -319,7 +319,8 @@ async fn review_concurrent_two_session_hooks_match_replay() {
             };
             let p = make_hook("s"); let q = make_hook("sibling");
             let mut sibling = binding.clone(); sibling.session = "sibling".into();
-            let (left, right) = tokio::join!(h.provider_hook(binding.clone(), &p), h.provider_hook(sibling, &q));
+            h.bind_route(8, sibling.clone());
+            let (left, right) = tokio::join!(h.provider_hook(7, binding.clone(), &p), h.provider_hook(8, sibling, &q));
             replies.push((left.unwrap(), right.unwrap()));
         }
         assert_eq!(replies[0], replies[1], "two concurrent session hooks at ordinal {ordinal}");
@@ -341,7 +342,7 @@ async fn review_memory_epoch_and_lane_rebuild_match_replay() {
         let mut answers = Vec::new();
         for (index, (h, binding, store)) in [(&ha, &ba, &sa), (&hb, &bb, &sb)].into_iter().enumerate() {
             let key = Key::new(binding, "s", "opencode").unwrap();
-            let work = h.provider_work(store, binding.clone(), key).unwrap();
+            let work = h.provider_work(7, store, binding.clone(), key).unwrap();
             match pass {
                 0 => { store.insert_memory(mc_store::InsertMemoryInput {
                     project_path: &work.project_path, route_project_root: None, category: "architecture",
@@ -358,7 +359,7 @@ async fn review_memory_epoch_and_lane_rebuild_match_replay() {
             acknowledge(&mut request, &views[index]);
             if pass == 3 { request["prefix_rebuilding"] = json!({"reason":"pipeline_switch"}); }
             if pass == 4 { request["model"] = json!("changed-model"); request["prefix_rebuilding"] = json!({"reason":"model_switch"}); }
-            answers.push(answer(h.provider_step(binding.clone(), &request).await));
+            answers.push(answer(h.provider_step(7, binding.clone(), &request).await));
         }
         assert_eq!(normalized_receipt(answers[0].clone()), normalized_receipt(answers[1].clone()), "memory/epoch/recomp pass {pass}");
         assert_eq!(normalized_measurement(&sa), normalized_measurement(&sb));
@@ -401,7 +402,7 @@ async fn review_fold_crash_child() {
         std::io::stdout().flush().unwrap();
         loop { std::thread::park(); }
     });
-    let _ = h.provider_step(binding, &request).await;
+    let _ = h.provider_step(7, binding, &request).await;
     panic!("the parent must kill the child during the fold attempt");
 }
 
@@ -438,11 +439,11 @@ async fn review_kill_during_fold_reopens_with_full_replay_bytes() {
     let ha = ha.with_startup_provider_resident_enabled(true);
     let mut request: Value = serde_json::from_slice(&std::fs::read(a.path().join("pending.json")).unwrap()).unwrap();
     request["request_id"] = json!("after-crash");
-    let actual = answer(ha.provider_step(ba, &request).await);
+    let actual = answer(ha.provider_step(7, ba, &request).await);
     let (hb, mut bb, sb, _) = handler(b.path(), Arc::new(NoReads::default()));
     let hb = hb.with_startup_provider_resident_enabled(false);
     bb.project_root = a.path().into();
-    let expected = answer(hb.provider_step(bb, &request).await);
+    let expected = answer(hb.provider_step(7, bb, &request).await);
     assert_eq!(normalized_receipt(actual), normalized_receipt(expected));
     assert_eq!(normalized_measurement(&sa), normalized_measurement(&sb));
 }
@@ -499,7 +500,7 @@ async fn review_tail_descent_and_config_changes_match_replay() {
                 request["descends_from"] = json!({"lineage_id":parent,"through_ordinal":through});
             }
             acknowledge(&mut request, &views[index]);
-            answers.push(h.provider_step(binding.clone(), &request).await);
+            answers.push(h.provider_step(7, binding.clone(), &request).await);
         }
         let render = |answer: &Result<Vec<u8>, HandlerOutcome>| match answer {
             Ok(bytes) => normalized_receipt(serde_json::from_slice(bytes).unwrap()),
@@ -564,7 +565,7 @@ async fn review_summaries_covering_the_newest_message_match_replay() {
             store.arm_soft_refresh("s").unwrap();
             let mut request = step(&format!("covered-{pass}"), appended.clone(), newest);
             acknowledge(&mut request, &views[index]);
-            answers.push(h.provider_step(binding.clone(), &request).await);
+            answers.push(h.provider_step(7, binding.clone(), &request).await);
         }
         let render = |answer: &Result<Vec<u8>, HandlerOutcome>| match answer {
             Ok(bytes) => String::from_utf8_lossy(&normalized_receipt(serde_json::from_slice(bytes).unwrap())).into_owned(),

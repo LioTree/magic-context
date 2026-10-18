@@ -2,6 +2,7 @@
 
 #![cfg(unix)]
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -77,7 +78,12 @@ fn fixture(directory: &Path, scenario: &str) -> Option<String> {
 // Compile the source files themselves, not a reimplementation of their algorithms. The
 // harness expires a failed git probe's cached result before retrying, avoiding its normal
 // five-minute cooldown without changing how either resolver computes the identity.
-fn compile_host(repo: &Path, scratch: &Path, revision: Option<&str>) -> PathBuf {
+fn compile_host(
+    repo: &Path,
+    scratch: &Path,
+    revision: Option<&str>,
+    libraries: &HashMap<String, PathBuf>,
+) -> PathBuf {
     std::fs::create_dir_all(scratch).unwrap();
     for name in [
         "project_identity",
@@ -116,7 +122,7 @@ fn compile_host(repo: &Path, scratch: &Path, revision: Option<&str>) -> PathBuf 
     let source = format!(
         r#"
 #![allow(dead_code)]
-pub use mc_module::{{host_store, decision_calibration, historian_runner}};
+pub use mc_module::{{agent_data, host_store, decision_calibration, historian_runner}};
 mod config {{
     pub use mc_module::config::{{private_storage_permissions_enabled, ConfiguredRunners}};
     pub fn user_home_dir() -> Option<std::path::PathBuf> {{ std::env::var_os("HOME").map(Into::into) }}
@@ -169,11 +175,7 @@ async fn main() {{
         },
     );
     std::fs::write(scratch.join("host.rs"), source).unwrap();
-    let deps = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let deps = libraries["subc_client_rs"].parent().unwrap().to_path_buf();
     let mut command = Command::new("rustc");
     command
         .args(["--edition=2021", "-L"])
@@ -195,28 +197,87 @@ async fn main() {{
         "tracing",
         "rusqlite",
     ] {
-        let prefix = format!("lib{name}-");
-        let library = std::fs::read_dir(&deps)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with(&prefix)
-                    && path
-                        .extension()
-                        .is_some_and(|extension| extension == "rlib")
-            })
-            .max_by_key(|path| path.metadata().unwrap().modified().unwrap())
-            .unwrap_or_else(|| panic!("missing {name} in {}", deps.display()));
+        let library = libraries
+            .get(name)
+            .unwrap_or_else(|| panic!("missing linked dependency {name}"));
         command
             .arg("--extern")
             .arg(format!("{name}={}", library.display()));
     }
     checked(&mut command);
     scratch.join("host")
+}
+
+// The target directory can contain several versions of the same crate. Ask Cargo
+// for this package's direct dependency graph and build artifacts rather than
+// linking whichever rlib happens to have the newest filesystem timestamp.
+fn host_libraries(repo: &Path) -> HashMap<String, PathBuf> {
+    let metadata: Value = serde_json::from_slice(&checked(
+        Command::new("cargo")
+            .args(["metadata", "--locked", "--format-version=1"])
+            .current_dir(repo)
+            .env("RUSTC_WRAPPER", "")
+            .env("CARGO_BUILD_RUSTC_WRAPPER", ""),
+    ))
+    .unwrap();
+    let package_id = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "mc-module")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let node = metadata["resolve"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == package_id)
+        .unwrap();
+    let mut names: HashMap<&str, &str> = node["deps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|dep| (dep["pkg"].as_str().unwrap(), dep["name"].as_str().unwrap()))
+        .collect();
+    names.insert(package_id, "mc_module");
+    let artifacts = checked(
+        Command::new("cargo")
+            .args([
+                "build",
+                "--locked",
+                "-p",
+                "mc-module",
+                "--lib",
+                "--message-format=json",
+            ])
+            .current_dir(repo)
+            .env("RUSTC_WRAPPER", "")
+            .env("CARGO_BUILD_RUSTC_WRAPPER", ""),
+    );
+    let mut libraries = HashMap::new();
+    for line in artifacts
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let artifact: Value = serde_json::from_slice(line).unwrap();
+        if artifact["reason"] != "compiler-artifact" {
+            continue;
+        }
+        let Some(name) = artifact["package_id"].as_str().and_then(|id| names.get(id)) else {
+            continue;
+        };
+        for file in artifact["filenames"].as_array().unwrap() {
+            let path = PathBuf::from(file.as_str().unwrap());
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "rlib")
+            {
+                libraries.insert((*name).to_owned(), path);
+            }
+        }
+    }
+    libraries
 }
 
 struct Host {
@@ -510,8 +571,9 @@ async fn standalone_identity_and_prefix_bytes_match_the_pre_campaign_base() {
         .prefix("standalone-")
         .tempdir_in(temporary_root)
         .unwrap();
-    let base = compile_host(&repo, &scratch.path().join("base"), Some(base));
-    let head = compile_host(&repo, &scratch.path().join("head"), None);
+    let libraries = host_libraries(&repo);
+    let base = compile_host(&repo, &scratch.path().join("base"), Some(base), &libraries);
+    let head = compile_host(&repo, &scratch.path().join("head"), None, &libraries);
     for mode in ["no-connection", "daemon-down", "module-absent"] {
         let root = scratch.path().join(mode);
         std::fs::create_dir_all(&root).unwrap();

@@ -1353,7 +1353,11 @@ export async function registerContext(context: V2Context) {
         return materializeM0({
             ...createM0RenderOptions(
                 {
-                    ...createV2TransformFeatureDeps(config, compactionOff, sessionProjectDirectory(draft.sessionID)),
+                    ...createV2TransformFeatureDeps(
+                        config,
+                        compactionOff,
+                        sessionProjectDirectory(draft.sessionID),
+                    ),
                     ...createV2ThresholdDeps(config),
                 },
                 usage.get(draft.sessionID)?.usage ?? { percentage: 0, inputTokens: 0 },

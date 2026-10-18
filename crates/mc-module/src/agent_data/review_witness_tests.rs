@@ -100,13 +100,14 @@ fn manifest_before_participant(
     if !smart_notes {
         crate::prompt_surface::disable_smart_notes_in_tools(&mut tools, PromptSurfacePreset::Full);
     }
-    // Reproduce the pre-agent-data manifest, which registered only the model
-    // tools and provider roles (source revision 47486760). Pin its route list
-    // independently so an extra disabled route cannot change both manifests.
+    // Reproduce the pre-agent-data model tools and provider roles, plus the
+    // optional project lookup used without agent-data. Pin routes independently
+    // so a disabled participant route cannot change both manifests.
     let mut targets = vec!["thalamus".to_string()];
     for id in [
         config.runner_module_id(),
         Some(config.provider_runner_module_id()),
+        Some("entorhinal"),
     ]
     .into_iter()
     .flatten()
@@ -734,7 +735,7 @@ async fn review_feature_off_normal_dispatch_preserves_business_write_footprints(
             .commit(SESSION, loaded.row_version, &loaded.core, &meta)
             .unwrap();
         let binding = h.facade_binding(1).unwrap();
-        let project = h.historian_lane_project(&binding, store).unwrap();
+        let project = h.historian_lane_project(1, &binding, store).unwrap();
         store
             .publish_pending_historian_run(&mc_store::NewHistorianPendingRun {
                 run_id: "review-run".into(),

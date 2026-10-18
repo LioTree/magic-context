@@ -62,7 +62,7 @@ fn fixture(dir: &Path, memory_budget: f64, temporal: bool) -> (McHandler, String
     binding.config.auto_search.score_threshold = 0.0;
     h.bind_route(7, binding.clone());
     let store = h.store.get().unwrap();
-    let project = h.route_project(store, &binding).unwrap().key;
+    let project = h.route_project(7, store, &binding).unwrap().key;
     for (id, text) in [
         (1, "rust ownership borrowing durable context"),
         (2, "separate archive subject"),

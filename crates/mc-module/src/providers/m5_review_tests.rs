@@ -753,7 +753,7 @@ async fn review_m5_provider_crash_claim_report_publish_matrix() {
             } else {
                 let store = restarted.store.get().unwrap();
                 let project = restarted
-                    .route_project(store, &binding(&restarted))
+                    .route_project(7, store, &binding(&restarted))
                     .unwrap()
                     .key;
                 let takeover = store

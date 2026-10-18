@@ -425,7 +425,7 @@ describe("shared project identity parity table", () => {
 
     test("a walk answer pins the checkout root only for an equal canonicalRoot spelling", () => {
         // A registered subfolder must not pin its parent merely because via is walk:
-        // the pin-writing bullet in intent section 2 requires canonicalRoot to equal the checkout root.
+        // pinning requires canonicalRoot to equal the checkout root.
         for (const name of [
             "walk-subfolder-canonical-root-equals-checkout",
             "walk-subfolder-canonical-root-differs-from-checkout",

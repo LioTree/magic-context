@@ -2606,11 +2606,12 @@ impl McHandler {
 
     fn provider_work(
         &self,
+        channel: u16,
         store: &McStore,
         binding: SessionBinding,
         key: Key,
     ) -> Result<Work, HandlerOutcome> {
-        let route = self.route_project(store, &binding)?;
+        let route = self.route_project(channel, store, &binding)?;
         Ok(Work {
             resident_folds: self.provider_resident.is_enabled(),
             resident: self.provider_resident.clone(),
@@ -2624,6 +2625,7 @@ impl McHandler {
 
     pub(super) async fn provider_setup(
         &self,
+        channel: u16,
         binding: SessionBinding,
         params: &Value,
     ) -> Result<Vec<u8>, HandlerOutcome> {
@@ -2653,7 +2655,7 @@ impl McHandler {
                 ..binding.clone()
             })?;
         }
-        let work = self.provider_work(&store, binding, key.clone())?;
+        let work = self.provider_work(channel, &store, binding, key.clone())?;
         if record.setup.is_none() {
             if !work.binding.config.compaction_enabled {
                 return bytes(&compact::setup::SetupAnswer::Refuse {
@@ -2768,6 +2770,7 @@ impl McHandler {
 
     pub(super) async fn provider_step(
         &self,
+        channel: u16,
         binding: SessionBinding,
         params: &Value,
     ) -> Result<Vec<u8>, HandlerOutcome> {
@@ -2812,7 +2815,7 @@ impl McHandler {
             if !host_plan(&binding, &request.session, &request.harness, &frozen)? {
                 return Err(invalid_field("params"));
             }
-            let work = self.provider_work(&store, binding, key)?;
+            let work = self.provider_work(channel, &store, binding, key)?;
             return self.host_step(&store, &work, conversation, params, request);
         }
         let conversation = store
@@ -2827,7 +2830,7 @@ impl McHandler {
             let frozen: Value =
                 serde_json::from_str(&conversation.params_json).map_err(transient)?;
             if host_plan(&binding, &request.session, &request.harness, &frozen)? {
-                let work = self.provider_work(&store, binding, key)?;
+                let work = self.provider_work(channel, &store, binding, key)?;
                 return self.host_step(&store, &work, conversation, params, request);
             }
         }
@@ -2838,7 +2841,7 @@ impl McHandler {
                 "compaction.step requires a Setup record for this project and session",
             ));
         }
-        let work = self.provider_work(&store, binding, key.clone())?;
+        let work = self.provider_work(channel, &store, binding, key.clone())?;
         ingest(&mut record, &request.lineage_id, &request.messages)?;
         record.save(&self.provider_store, &key)?;
         fault("MessagesIngested");
@@ -3054,9 +3057,10 @@ mod host_tests {
         let hb = hb.with_startup_provider_resident_enabled(false);
         let mut views = Vec::new();
         for (h, binding, store) in [(&ha, &ba, &sa), (&hb, &bb, &sb)] {
-            answer(h.provider_setup(binding.clone(), &setup()).await);
+            answer(h.provider_setup(7, binding.clone(), &setup()).await);
             let initial = answer(
                 h.provider_step(
+                    7,
                     binding.clone(),
                     &step("initial", (1..=30).map(source).collect(), 30),
                 )
@@ -3081,7 +3085,7 @@ mod host_tests {
             let mut request = step("first-fold", vec![], 30);
             request["last_applied"] = json!({"compaction_id":initial["compaction"]["compaction_id"],"version":initial["compaction"]["version"]});
             store.arm_soft_refresh("s").unwrap();
-            views.push(answer(h.provider_step(binding.clone(), &request).await));
+            views.push(answer(h.provider_step(7, binding.clone(), &request).await));
         }
         for sample in 0..3 {
             let mut answers = Vec::new();
@@ -3095,7 +3099,7 @@ mod host_tests {
                 store.arm_soft_refresh("s").unwrap();
                 let mut request = step(&format!("fold-{sample}"), vec![], 30);
                 request["last_applied"] = json!({"compaction_id":views[at]["compaction"]["compaction_id"],"version":views[at]["compaction"]["version"]});
-                answers.push(answer(h.provider_step(binding.clone(), &request).await));
+                answers.push(answer(h.provider_step(7, binding.clone(), &request).await));
             }
             assert_eq!(
                 answers[0]["compaction"]["replacement"],
@@ -3159,7 +3163,7 @@ mod host_tests {
             .prepare_request(&mut request, &entries)
             .unwrap();
         let key = Key::new(binding, "s", "opencode").unwrap();
-        let work = h.provider_work(store, binding.clone(), key).unwrap();
+        let work = h.provider_work(7, store, binding.clone(), key).unwrap();
         let mut context = producer_context(&work, model, 100000, false);
         context.temporal_awareness = false;
         context.cache_ttl = "never".into();
@@ -3194,16 +3198,16 @@ mod host_tests {
                 full_request_native(&oh, &ob, &os, &native, "fixture").0
             );
         }
-        answer(h.provider_setup(binding.clone(), &setup()).await);
+        answer(h.provider_setup(7, binding.clone(), &setup()).await);
         let mut boot = step("boot-model", vec![message(1), message(2)], 2);
         boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(binding.clone(), &boot).await);
+        let view = answer(h.provider_step(7, binding.clone(), &boot).await);
         let mut switched = step("model-switch", vec![], 2);
         switched["model"] = json!("next-model");
         switched["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
         switched["prefix_rebuilding"] = json!({"reason":"model_switch"});
         let previous_core_version = store.load("s").unwrap().core.version;
-        let actual = answer(h.provider_step(binding, &switched).await);
+        let actual = answer(h.provider_step(7, binding, &switched).await);
         let (expected, decision) = full_request_native(&oh, &ob, &os, &native, "next-model");
         assert_eq!(decision, "HARD");
         let served = if actual["answer"] == "noop" {
@@ -3257,10 +3261,10 @@ mod host_tests {
                 expected
             );
         }
-        answer(h.provider_setup(binding.clone(), &setup()).await);
+        answer(h.provider_setup(7, binding.clone(), &setup()).await);
         let mut boot = step("published-switch", vec![message(2), message(3)], 3);
         boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(binding.clone(), &boot).await);
+        let view = answer(h.provider_step(7, binding.clone(), &boot).await);
         assert_eq!(view["answer"], "compaction_message");
         assert_eq!(view["compaction"]["replacement"], expected);
         let published = mc_store::StoredCompartment {
@@ -3281,7 +3285,7 @@ mod host_tests {
         let mut ordinary = step("after-publication", vec![], 3);
         ordinary["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
         assert_eq!(
-            answer(h.provider_step(binding.clone(), &ordinary).await)["answer"],
+            answer(h.provider_step(7, binding.clone(), &ordinary).await)["answer"],
             "noop"
         );
         assert_eq!(
@@ -3292,7 +3296,7 @@ mod host_tests {
         flush["request_id"] = json!("published-flush");
         flush["prefix_rebuilding"] = json!({"reason":"flush"});
         os.arm_soft_refresh("s").unwrap();
-        let actual = answer(h.provider_step(binding, &flush).await);
+        let actual = answer(h.provider_step(7, binding, &flush).await);
         assert_eq!(actual["answer"], "compaction_message");
         assert_eq!(
             actual["compaction"]["replacement"],
@@ -3378,7 +3382,7 @@ mod host_tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(NoReads::default());
         let (h, b, s, k) = handler(dir.path(), runner.clone());
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         let l = ProviderLineage {
             lineage_id: "L".into(),
             first_ordinal: 4000,
@@ -3430,7 +3434,7 @@ mod host_tests {
         let mut page = step("rebuild", vec![], 4001);
         page["served_through_ordinal"] = json!(4001);
         page["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let output = answer(h.provider_step(b.clone(), &page).await);
+        let output = answer(h.provider_step(7, b.clone(), &page).await);
         assert_eq!(output["answer"], "compaction_message");
         let replacement = output["compaction"]["replacement"].as_array().unwrap();
         let rendered_user = replacement
@@ -3474,17 +3478,20 @@ mod host_tests {
         let mut settled = step("settled", vec![], 4001);
         settled["last_applied"] = json!({"compaction_id":output["compaction"]["compaction_id"],"version":output["compaction"]["version"]});
         settled["served_through_ordinal"] = json!(4001);
-        assert_eq!(answer(h.provider_step(b, &settled).await)["answer"], "noop");
+        assert_eq!(
+            answer(h.provider_step(7, b, &settled).await)["answer"],
+            "noop"
+        );
     }
 
     #[tokio::test]
     async fn fast_noop_does_not_read_rebuild_payloads_or_commit_frozen_state() {
         let dir = tempfile::tempdir().unwrap();
         let (h, b, s, k) = handler(dir.path(), Arc::new(NoReads::default()));
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         let mut first = step("first", vec![message(1)], 1);
         first["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(b.clone(), &first).await);
+        let view = answer(h.provider_step(7, b.clone(), &first).await);
         let l = s
             .load_provider_lineage(&k.store_key(), "L")
             .unwrap()
@@ -3503,7 +3510,7 @@ mod host_tests {
         let mut noop = step("noop", vec![], 2);
         noop["served_through_ordinal"] = json!(2);
         noop["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
-        assert_eq!(answer(h.provider_step(b, &noop).await)["answer"], "noop");
+        assert_eq!(answer(h.provider_step(7, b, &noop).await)["answer"], "noop");
         assert_eq!(s.load_meta("s").unwrap().row_version, before);
     }
 
@@ -3524,7 +3531,7 @@ mod host_tests {
             )
             .unwrap()[0]
             .tag_number;
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         let l = ProviderLineage {
             lineage_id: "L".into(),
             first_ordinal: 1,
@@ -3535,7 +3542,7 @@ mod host_tests {
         let mut page = step("switch", vec![message(1), message(3)], 3);
         page["served_through_ordinal"] = json!(3);
         page["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(b, &page).await);
+        let view = answer(h.provider_step(7, b, &page).await);
         let raw = view["compaction"]["replacement"].as_array().unwrap();
         for (mid, text) in [
             ("m1", format!("§{old}§ raw 1")),
@@ -3556,24 +3563,27 @@ mod host_tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(NoReads::default());
         let (h, b, s, k) = handler(dir.path(), runner.clone());
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         let mut first = step("page1", vec![message(4000)], 4001);
         first["more"] = json!(true);
-        assert_eq!(answer(h.provider_step(b, &first).await)["answer"], "wait");
+        assert_eq!(
+            answer(h.provider_step(7, b, &first).await)["answer"],
+            "wait"
+        );
         assert_eq!(s.provider_frontier(&k.store_key(), "L").unwrap(), 4001);
         drop(h);
         drop(s);
         let (h, b, _, _) = handler(dir.path(), runner.clone());
         let mut last = step("page2", vec![message(4001)], 4001);
         last["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(b.clone(), &last).await);
+        let view = answer(h.provider_step(7, b.clone(), &last).await);
         let mut observe = step("observed", vec![], 4001);
         observe["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
         assert_eq!(
-            answer(h.provider_step(b.clone(), &observe).await)["answer"],
+            answer(h.provider_step(7, b.clone(), &observe).await)["answer"],
             "noop"
         );
-        let ready = answer(h.provider_setup(b, &setup()).await);
+        let ready = answer(h.provider_setup(7, b, &setup()).await);
         assert_eq!(ready["initial"]["range"], view["compaction"]["range"]);
         assert_eq!(
             ready["initial"]["replacement"],
@@ -3586,7 +3596,7 @@ mod host_tests {
     async fn coverage_names_the_published_boundary_only_on_a_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let (h, b, s, _) = handler(dir.path(), Arc::new(NoReads::default()));
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         s.replace_compartments(
             "s",
             &[mc_store::StoredCompartment {
@@ -3604,12 +3614,12 @@ mod host_tests {
         .unwrap();
         let mut page = step("rebuild", vec![message(4000), message(4001)], 4001);
         page["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(b.clone(), &page).await);
+        let view = answer(h.provider_step(7, b.clone(), &page).await);
         assert_eq!(view["answer"], "compaction_message");
         assert_eq!(view["coverage"], json!({"end_mid":"m4000","ordinal":4000}));
         let mut next = step("noop", vec![], 4001);
         next["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
-        let noop = answer(h.provider_step(b, &next).await);
+        let noop = answer(h.provider_step(7, b, &next).await);
         assert_eq!(noop["answer"], "noop");
         assert!(noop.get("coverage").is_none());
     }
@@ -3618,7 +3628,7 @@ mod host_tests {
     async fn executed_host_drops_leave_the_provider_queue_and_do_not_reapply() {
         let dir = tempfile::tempdir().unwrap();
         let (h, b, s, k) = handler(dir.path(), Arc::new(NoReads::default()));
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         let l = ProviderLineage {
             lineage_id: "L".into(),
             first_ordinal: 1,
@@ -3637,7 +3647,7 @@ mod host_tests {
         let mut bootstrap = step("bootstrap", vec![message(1), message(6)], 6);
         bootstrap["served_through_ordinal"] = json!(6);
         bootstrap["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(b.clone(), &bootstrap).await);
+        let view = answer(h.provider_step(7, b.clone(), &bootstrap).await);
         s.replace_compartments(
             "s",
             &[mc_store::StoredCompartment {
@@ -3658,7 +3668,7 @@ mod host_tests {
         execute["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
         execute["estimate"]["request_tokens"] = json!(66000);
         execute["prefix_rebuilding"] = json!({"reason":"flush"});
-        let dropped = answer(h.provider_step(b.clone(), &execute).await);
+        let dropped = answer(h.provider_step(7, b.clone(), &execute).await);
         assert_eq!(dropped["answer"], "compaction_message");
         assert!(!dropped["compaction"]["replacement"]
             .to_string()
@@ -3671,7 +3681,7 @@ mod host_tests {
         let mut again = step("again", vec![], 6);
         again["last_applied"] = json!({"compaction_id":dropped["compaction"]["compaction_id"],"version":dropped["compaction"]["version"]});
         again["prefix_rebuilding"] = json!({"reason":"flush"});
-        let _ = answer(h.provider_step(b, &again).await);
+        let _ = answer(h.provider_step(7, b, &again).await);
         assert!(s.load_pending_agent_drops("s").unwrap().is_empty());
         assert!(s
             .load_provider_pending_drops(&k.store_key())
@@ -3843,7 +3853,7 @@ mod host_tests {
     fn real_state_trigger_comparison(cause: &str, expected_action: &str) {
         let dir = tempfile::tempdir().unwrap();
         let (h, b, s, k) = handler(dir.path(), Arc::new(NoReads::default()));
-        let mut work = h.provider_work(&s, b, k).unwrap();
+        let mut work = h.provider_work(7, &s, b, k).unwrap();
         let baseline = mc_store::StoredCompartment {
             sequence: 0,
             start_message: 1,
@@ -4169,10 +4179,10 @@ mod host_tests {
                     for flush in [false, true] {
                         let dir = tempfile::tempdir().unwrap();
                         let (h, b, s, k) = handler(dir.path(), Arc::new(NoReads::default()));
-                        answer(h.provider_setup(b.clone(), &setup()).await);
+                        answer(h.provider_setup(7, b.clone(), &setup()).await);
                         let mut boot = step("boot", vec![message(1), message(2)], 2);
                         boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-                        answer(h.provider_step(b.clone(), &boot).await);
+                        answer(h.provider_step(7, b.clone(), &boot).await);
                         let compartment = mc_store::StoredCompartment {
                             sequence: 0,
                             start_message: 1,
@@ -4189,7 +4199,7 @@ mod host_tests {
                         if flush {
                             s.arm_soft_refresh("s").unwrap();
                         }
-                        let work = h.provider_work(&s, b.clone(), k).unwrap();
+                        let work = h.provider_work(7, &s, b.clone(), k).unwrap();
                         let context = producer_context(&work, "fixture", 100000, false);
                         let facts =
                             transform::compaction::skip_facts(&s, "s", &context, "fixture", 100000)
@@ -4212,7 +4222,7 @@ mod host_tests {
                         let oracle_dir = tempfile::tempdir().unwrap();
                         let (oh, ob, os, ok) =
                             handler(oracle_dir.path(), Arc::new(NoReads::default()));
-                        let ow = oh.provider_work(&os, ob, ok).unwrap();
+                        let ow = oh.provider_work(7, &os, ob, ok).unwrap();
                         let mut req: TransformRequest = decode(&json!({"v":2,"kind":"transform","session_id":"s","serializer_profile":"opencode-aisdk","render_config":"full-request-oracle","model_key":"fixture","messages":[],"tool_present":false,"auto_search_enabled":false,"usage":{"current_total_input_tokens":1000,"context_limit_tokens":100000}})).unwrap();
                         let entries = [message(1), message(2)]
                             .into_iter()
@@ -4252,7 +4262,7 @@ mod host_tests {
         s.commit("s", seeded.row_version, &seeded.core, &seeded.meta)
             .unwrap();
         let before = s.load_meta("s").unwrap();
-        let ready = answer(h.provider_setup(b.clone(), &setup()).await);
+        let ready = answer(h.provider_setup(7, b.clone(), &setup()).await);
         assert_eq!(ready["initial"]["range"], json!({"from":0,"to":0}));
         assert_eq!(ready["initial"]["replacement"].as_array().unwrap().len(), 2);
         assert_eq!(s.load_meta("s").unwrap().row_version, before.row_version);
@@ -4262,7 +4272,7 @@ mod host_tests {
             .unwrap()
             .unwrap();
         assert_eq!(c.engine_namespace, "s");
-        let repeat = answer(h.provider_setup(b, &setup()).await);
+        let repeat = answer(h.provider_setup(7, b, &setup()).await);
         assert!(
             repeat["initial"]["version"].as_u64().unwrap()
                 > ready["initial"]["version"].as_u64().unwrap()
@@ -4289,11 +4299,11 @@ mod host_tests {
             },
         )
         .unwrap();
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         let mut page = step("bootstrap", vec![message(1)], 1);
         page["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
         assert_eq!(
-            answer(h.provider_step(b.clone(), &page).await)["answer"],
+            answer(h.provider_step(7, b.clone(), &page).await)["answer"],
             "compaction_message"
         );
         let meta = s.load_meta(&b.session).unwrap();
@@ -4314,7 +4324,7 @@ mod host_tests {
     async fn pipeline_switch_keeps_observed_provider_and_system_identity() {
         let dir = tempfile::tempdir().unwrap();
         let (h, b, s, k) = handler(dir.path(), Arc::new(NoReads::default()));
-        let work = h.provider_work(&s, b.clone(), k.clone()).unwrap();
+        let work = h.provider_work(7, &s, b.clone(), k.clone()).unwrap();
         let mut req: TransformRequest = decode(&json!({"v":2,"kind":"transform","session_id":"s","serializer_profile":"opencode-aisdk","render_config":"old-full-request","model_key":"fixture","provider_id":"provider","system_prompt_hash":"system","upgrade_state":"upgrade","messages":[],"tool_present":false,"auto_search_enabled":false,"usage":{"current_total_input_tokens":1000,"context_limit_tokens":100000}})).unwrap();
         let entries = [message(1), message(2)]
             .into_iter()
@@ -4351,10 +4361,10 @@ mod host_tests {
                 &super::super::codec_opencode::NativeRenderContext::from(&old),
             )
             .unwrap();
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         let mut page = step("switch", vec![message(1), message(2)], 2);
         page["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let actual = answer(h.provider_step(b, &page).await);
+        let actual = answer(h.provider_step(7, b, &page).await);
         assert_eq!(
             actual["compaction"]["replacement"],
             json!(expected.replacement)
@@ -4381,7 +4391,7 @@ mod host_tests {
             let (h, b, s, k) = handler(dir.path(), Arc::new(NoReads::default()));
             let oracle_dir = tempfile::tempdir().unwrap();
             let (oh, ob, os, ok) = handler(oracle_dir.path(), Arc::new(NoReads::default()));
-            let ow = oh.provider_work(&os, ob, ok).unwrap();
+            let ow = oh.provider_work(7, &os, ob, ok).unwrap();
             let timed = |ordinal: u64, role: &str, created: i64, completed: Option<i64>| {
                 let mut entry = message(ordinal);
                 entry["message"]["info"]["role"] = json!(role);
@@ -4425,7 +4435,7 @@ mod host_tests {
                     .replace_compartments("s", std::slice::from_ref(&baseline))
                     .unwrap();
             }
-            answer(h.provider_setup(b.clone(), &setup()).await);
+            answer(h.provider_setup(7, b.clone(), &setup()).await);
             let l = ProviderLineage {
                 lineage_id: "L".into(),
                 first_ordinal: 1,
@@ -4443,7 +4453,7 @@ mod host_tests {
             let mut boot = step("boot", vec![], 2);
             boot["served_through_ordinal"] = json!(2);
             boot["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-            let first = answer(h.provider_step(b.clone(), &boot).await);
+            let first = answer(h.provider_step(7, b.clone(), &boot).await);
             let mut req: TransformRequest = decode(&json!({"v":2,"kind":"transform","session_id":"s","serializer_profile":"opencode-aisdk","render_config":"temporal-oracle","model_key":"fixture","messages":[],"tool_present":true,"auto_search_enabled":false,"usage":{"current_total_input_tokens":1000,"context_limit_tokens":100000}})).unwrap();
             let decode_entries = |entries: &[Value]| {
                 entries
@@ -4476,7 +4486,7 @@ mod host_tests {
             defer["served_through_ordinal"] = json!(5);
             defer["last_applied"] = first["compaction"].clone();
             assert_eq!(
-                answer(h.provider_step(b.clone(), &defer).await)["answer"],
+                answer(h.provider_step(7, b.clone(), &defer).await)["answer"],
                 "noop"
             );
             Codec::OpencodeAiSdk
@@ -4541,7 +4551,7 @@ mod host_tests {
                     &super::super::codec_opencode::NativeRenderContext::from(&old),
                 )
                 .unwrap();
-            let actual = answer(h.provider_step(b, &rebuild).await);
+            let actual = answer(h.provider_step(7, b, &rebuild).await);
             assert_eq!(actual["answer"], "compaction_message");
             assert_eq!(actual["compaction"]["range"]["to"], 6);
             assert_eq!(
@@ -4568,10 +4578,10 @@ mod host_tests {
         b.config.cache_ttl = "10m".into();
         let mut request = setup();
         request["params"]["cache_ttl"] = json!("10m");
-        answer(h.provider_setup(b.clone(), &request).await);
+        answer(h.provider_setup(7, b.clone(), &request).await);
         let mut bootstrap = step("bootstrap", vec![message(1), message(2)], 2);
         bootstrap["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(b.clone(), &bootstrap).await);
+        let view = answer(h.provider_step(7, b.clone(), &bootstrap).await);
         s.replace_compartments(
             "s",
             &[mc_store::StoredCompartment {
@@ -4590,7 +4600,7 @@ mod host_tests {
         let mut cold = step("cold", vec![], 2);
         cold["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
         cold["prefix_rebuilding"] = json!({"reason":"expired_cache"});
-        let folded = answer(h.provider_step(b.clone(), &cold).await);
+        let folded = answer(h.provider_step(7, b.clone(), &cold).await);
         assert_eq!(folded["answer"], "compaction_message");
         assert!(folded["compaction"]["replacement"]
             .to_string()
@@ -4606,7 +4616,7 @@ mod host_tests {
         )
         .unwrap();
         assert_eq!(saved.setup.request.params["cache_ttl"], "10m");
-        let work = h.provider_work(&s, b, k).unwrap();
+        let work = h.provider_work(7, &s, b, k).unwrap();
         // Transport-specific execution overrides internal TTL scheduling, not
         // the configured policy returned by the common context builder.
         assert_eq!(
@@ -4622,7 +4632,7 @@ mod host_tests {
         let mut b = host_binding.clone();
         b.harness = "runner".into();
         assert_eq!(
-            field(h.provider_setup(b.clone(), &setup()).await),
+            field(h.provider_setup(7, b.clone(), &setup()).await),
             "params.observation"
         );
         let mut profile = setup();
@@ -4631,17 +4641,17 @@ mod host_tests {
             .unwrap()
             .remove("observation");
         assert_eq!(
-            field(h.provider_setup(b, &profile).await),
+            field(h.provider_setup(7, b, &profile).await),
             "params.serializer_profile"
         );
         let b = host_binding;
         assert_eq!(
-            field(h.provider_setup(b.clone(), &profile).await),
+            field(h.provider_setup(7, b.clone(), &profile).await),
             "params.observation"
         );
         let mut foreign = setup();
         foreign["session"] = json!("other");
-        assert_eq!(field(h.provider_setup(b, &foreign).await), "session");
+        assert_eq!(field(h.provider_setup(7, b, &foreign).await), "session");
     }
 
     #[tokio::test]
@@ -4649,18 +4659,18 @@ mod host_tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(NoReads::default());
         let (h, b, s, k) = handler(dir.path(), runner.clone());
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         let mut page = step("page1", vec![message(4000)], 4002);
         page["more"] = json!(true);
         assert_eq!(
-            answer(h.provider_step(b.clone(), &page).await)["answer"],
+            answer(h.provider_step(7, b.clone(), &page).await)["answer"],
             "wait"
         );
         tokio::task::yield_now().await;
         let final_gap = step("page2", vec![message(4002)], 4002);
         let refused = tokio::time::timeout(
             Duration::from_millis(250),
-            h.provider_step(b.clone(), &final_gap),
+            h.provider_step(7, b.clone(), &final_gap),
         )
         .await
         .expect("next host page must not wait for background scan lock");
@@ -4669,7 +4679,7 @@ mod host_tests {
         assert_eq!(refused["detail"], json!({"history_gap_from":4001}));
         let mut final_page = step("page3", vec![message(4001), message(4002)], 4002);
         final_page["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(b, &final_page).await);
+        let view = answer(h.provider_step(7, b, &final_page).await);
         assert_eq!(view["answer"], "compaction_message");
         assert_eq!(view["compaction"]["range"], json!({"from":4000,"to":4003}));
         assert_eq!(s.provider_frontier(&k.store_key(), "L").unwrap(), 4003);
@@ -4686,24 +4696,24 @@ mod host_tests {
     async fn step_gaps_use_held_history_not_the_claimed_status_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let (h, b, _, _) = handler(dir.path(), Arc::new(NoReads::default()));
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         // Only an intermediate page admits a partial transcript. The refused
         // final page below must not be used as a source of held bytes.
         let mut partial = step("partial", vec![message(10), message(12)], 12);
         partial["more"] = json!(true);
         assert_eq!(
-            answer(h.provider_step(b.clone(), &partial).await)["answer"],
+            answer(h.provider_step(7, b.clone(), &partial).await)["answer"],
             "wait"
         );
         let page = step("first", vec![message(10), message(12)], 12);
         assert_eq!(
-            answer(h.provider_step(b.clone(), &page).await)["detail"]["history_gap_from"],
+            answer(h.provider_step(7, b.clone(), &page).await)["detail"]["history_gap_from"],
             11
         );
         let mut empty = step("empty", vec![], 12);
         empty["after_ordinal"] = json!(12);
         assert_eq!(
-            answer(h.provider_step(b, &empty).await)["detail"]["history_gap_from"],
+            answer(h.provider_step(7, b, &empty).await)["detail"]["history_gap_from"],
             11
         );
     }
@@ -4712,7 +4722,7 @@ mod host_tests {
     async fn conflicting_status_refuses_messages_before_promotion_or_burn() {
         let dir = tempfile::tempdir().unwrap();
         let (h, b, s, k) = handler(dir.path(), Arc::new(NoReads::default()));
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         let l = ProviderLineage {
             lineage_id: "L".into(),
             first_ordinal: 1,
@@ -4760,7 +4770,7 @@ mod host_tests {
         conflict["messages"][0]["message"]["parts"][0]["text"] = json!("changed");
         conflict["served_through_ordinal"] = json!(1);
         conflict["unserved_subjects"] = json!([{"subject_mid":"m1","hook":"pre_user"}]);
-        assert_eq!(field(h.provider_step(b, &conflict).await), "messages");
+        assert_eq!(field(h.provider_step(7, b, &conflict).await), "messages");
         assert_eq!(
             s.load_provider_hook_answers(&k.store_key()).unwrap()[0].state,
             "pending"
@@ -4771,10 +4781,10 @@ mod host_tests {
     async fn descent_keeps_view_at_boundary_and_rebuilds_when_cut_inside() {
         let dir = tempfile::tempdir().unwrap();
         let (h, b, _, _) = handler(dir.path(), Arc::new(NoReads::default()));
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
         let mut first = step("first", vec![message(1), message(2), message(3)], 3);
         first["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(b.clone(), &first).await);
+        let view = answer(h.provider_step(7, b.clone(), &first).await);
         let version = view["compaction"]["version"].clone();
         let mut descend = step("descend", vec![message(4)], 4);
         descend["lineage_id"] = json!("child");
@@ -4782,13 +4792,13 @@ mod host_tests {
         descend["last_applied"] =
             json!({"compaction_id":view["compaction"]["compaction_id"],"version":version});
         assert_eq!(
-            answer(h.provider_step(b.clone(), &descend).await)["answer"],
+            answer(h.provider_step(7, b.clone(), &descend).await)["answer"],
             "noop"
         );
         let mut inside = step("inside", vec![], 2);
         inside["lineage_id"] = json!("grandchild");
         inside["descends_from"] = json!({"lineage_id":"child","through_ordinal":2});
-        let rebuilt = answer(h.provider_step(b.clone(), &inside).await);
+        let rebuilt = answer(h.provider_step(7, b.clone(), &inside).await);
         assert_eq!(rebuilt["answer"], "compaction_message");
         assert_eq!(rebuilt["compaction"]["range"]["to"], 3);
         assert!(!rebuilt["compaction"]["replacement"]
@@ -4799,12 +4809,12 @@ mod host_tests {
         let mut foreign = step("foreign", vec![], 2);
         foreign["lineage_id"] = json!("foreign");
         assert_eq!(
-            field(h.provider_step(b.clone(), &foreign).await),
+            field(h.provider_step(7, b.clone(), &foreign).await),
             "lineage_id"
         );
         foreign["descends_from"] = json!({"lineage_id":"grandchild","through_ordinal":8});
         assert_eq!(
-            answer(h.provider_step(b, &foreign).await)["detail"]["history_gap_from"],
+            answer(h.provider_step(7, b, &foreign).await)["detail"]["history_gap_from"],
             3
         );
     }
@@ -4813,11 +4823,11 @@ mod host_tests {
     async fn stepping_original_branch_after_fork_returns_lineage_not_head() {
         let dir = tempfile::tempdir().unwrap();
         let (h, b, _, _) = handler(dir.path(), Arc::new(NoReads::default()));
-        answer(h.provider_setup(b.clone(), &setup()).await);
+        answer(h.provider_setup(7, b.clone(), &setup()).await);
 
         let mut first = step("first", vec![message(1), message(2), message(3)], 3);
         first["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let view = answer(h.provider_step(b.clone(), &first).await);
+        let view = answer(h.provider_step(7, b.clone(), &first).await);
         assert_eq!(view["answer"], "compaction_message");
 
         let mut fork = step("fork", vec![message(4)], 4);
@@ -4825,12 +4835,12 @@ mod host_tests {
         fork["descends_from"] = json!({"lineage_id":"L","through_ordinal":3});
         fork["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
         assert_eq!(
-            answer(h.provider_step(b.clone(), &fork).await)["answer"],
+            answer(h.provider_step(7, b.clone(), &fork).await)["answer"],
             "noop"
         );
 
         let original = step("original", vec![], 3);
-        let result = h.provider_step(b, &original).await;
+        let result = h.provider_step(7, b, &original).await;
         let HandlerOutcome::ErrorWithDetail { code, detail, .. } = result.unwrap_err() else {
             panic!("expected named lineage refusal")
         };

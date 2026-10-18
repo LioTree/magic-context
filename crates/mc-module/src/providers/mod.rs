@@ -456,12 +456,12 @@ impl McHandler {
             }
         }
         let result = match method {
-            "compaction.setup" => self.provider_setup(binding, params).await,
-            "compaction.step" => self.provider_step(binding, params).await,
+            "compaction.setup" => self.provider_setup(channel, binding, params).await,
+            "compaction.step" => self.provider_step(channel, binding, params).await,
             "compaction.view.read" if attested_claude_code(&binding) => {
                 self.provider_native_view_read(binding, params).await
             }
-            "transform.hook" => self.provider_hook(binding, params).await,
+            "transform.hook" => self.provider_hook(channel, binding, params).await,
             _ => Err(invalid("unknown provider method")),
         };
         if resident_wal {

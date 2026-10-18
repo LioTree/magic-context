@@ -13909,7 +13909,7 @@ impl McHandler {
         // External editors have no served session. The authenticated connection fixes
         // their project directory and identity; the write transaction checks again
         // whether this process may still change that project's memories.
-        let route = match self.route_project(&store, &binding) {
+        let route = match self.route_project(channel, &store, &binding) {
             Ok(route) => route,
             Err(outcome) => return outcome,
         };

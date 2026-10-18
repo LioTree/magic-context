@@ -148,6 +148,7 @@ export interface MagicContextDeps {
         protectedTokenTierOverrides?: ProtectedTokensTierOverrides;
         /** User-level setting that lets a session started exactly in the canonical home directory use it as the project. */
         allow_home_project?: boolean;
+        subc?: MagicContextConfig["subc"];
         language?: string;
         smart_drops?: unknown;
         protected_tools?: Readonly<Record<string, number>>;

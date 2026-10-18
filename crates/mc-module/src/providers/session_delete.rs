@@ -143,7 +143,7 @@ mod tests {
             let held = h.provider_serial.lock_for(&key).await;
             let params = json!({"session":"s","harness":"opencode"});
             let step_params = step("opencode");
-            let mut stepping = Box::pin(h.provider_step(binding.clone(), &step_params));
+            let mut stepping = Box::pin(h.provider_step(7, binding.clone(), &step_params));
             let mut deleting = Box::pin(h.provider_delete(&binding, &params));
             // Poll each real operation into the mutex queue in a known order.
             poll_fn(|cx| {

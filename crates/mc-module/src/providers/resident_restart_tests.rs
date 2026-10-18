@@ -13,13 +13,13 @@ fn compartments() -> Vec<mc_store::StoredCompartment> {
 }
 
 async fn seed(h:&McHandler,binding:&SessionBinding,store:&McStore) -> Value {
-    answer(h.provider_setup(binding.clone(),&setup()).await);
-    let first=answer(h.provider_step(binding.clone(),&step("initial",(1..=30).map(message).collect(),30)).await);
+    answer(h.provider_setup(7, binding.clone(), &setup()).await);
+    let first=answer(h.provider_step(7, binding.clone(), &step("initial",(1..=30).map(message).collect(),30)).await);
     store.replace_compartments("s",&compartments()).unwrap();
     store.arm_soft_refresh("s").unwrap();
     let mut request=step("first-fold",vec![],30);
     request["last_applied"]=json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
-    answer(h.provider_step(binding.clone(),&request).await)
+    answer(h.provider_step(7, binding.clone(), &request).await)
 }
 
 #[tokio::test]
@@ -34,7 +34,7 @@ async fn unchanged_reopen_primes_an_intact_cut_without_full_replay() {
     store.arm_soft_refresh("s").unwrap();
     let mut request=step("reopened",vec![],30);
     request["last_applied"]=json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
-    answer(h.provider_step(binding,&request).await);
+    answer(h.provider_step(7, binding, &request).await);
     let lease=h.provider_resident.begin(store.tag_cache_namespace(),&key).unwrap().unwrap();
     assert_eq!(lease.state.fold_tail_passes,1,"an ordinary reopen must not replay native history");
     lease.publish();
@@ -50,7 +50,7 @@ async fn hot_interior_structure_change_cannot_reuse_an_intact_cut_digest() {
     store.replace_compartments("s",&rows).unwrap();store.arm_soft_refresh("s").unwrap();
     let mut request=step("hot-edit",vec![],30);
     request["last_applied"]=json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
-    answer(h.provider_step(binding,&request).await);
+    answer(h.provider_step(7, binding, &request).await);
     let lease=h.provider_resident.begin(store.tag_cache_namespace(),&key).unwrap().unwrap();
     assert_eq!(lease.state.fold_tail_passes,0,"a cached terminal boundary is not a proof of the unchanged interior");
     lease.publish();
@@ -64,13 +64,13 @@ async fn compartment_writer_after_capture_forces_full_replay_on_the_next_fold() 
     let session="resident-race-capture";
     binding.session=session.into();
     let mut start=setup();start["session"]=json!(session);
-    answer(h.provider_setup(binding.clone(),&start).await);
+    answer(h.provider_setup(7, binding.clone(), &start).await);
     let mut request=step("initial",(1..=30).map(message).collect(),30);request["session"]=json!(session);
-    let first=answer(h.provider_step(binding.clone(),&request).await);
+    let first=answer(h.provider_step(7, binding.clone(), &request).await);
     store.replace_compartments(session,&compartments()).unwrap();store.arm_soft_refresh(session).unwrap();
     request=step("first",vec![],30);request["session"]=json!(session);
     request["last_applied"]=json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
-    let view=answer(h.provider_step(binding.clone(),&request).await);
+    let view=answer(h.provider_step(7, binding.clone(), &request).await);
     let writer=store.clone();
     crate::transform::install_transform_attempt_hook(session,move|| {
         let mut rows=writer.load_compartments(session).unwrap();rows[0].p1=Some("writer changed content after source capture".into());
@@ -78,13 +78,13 @@ async fn compartment_writer_after_capture_forces_full_replay_on_the_next_fold() 
     });
     store.arm_soft_refresh(session).unwrap();request["request_id"]=json!("race");
     request["last_applied"]=json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
-    let raced=answer(h.provider_step(binding.clone(),&request).await);
+    let raced=answer(h.provider_step(7, binding.clone(), &request).await);
     let key=Key::new(&binding,session,"opencode").unwrap();
     let lease=h.provider_resident.begin(store.tag_cache_namespace(),&key).unwrap().unwrap();
     assert!(lease.state.fold_source_raced,"the current source version must differ from the pre-read binding");lease.publish();
     store.arm_soft_refresh(session).unwrap();request["request_id"]=json!("after-race");
     if raced["answer"]=="compaction_message" {request["last_applied"]=json!({"compaction_id":raced["compaction"]["compaction_id"],"version":raced["compaction"]["version"]});}
-    answer(h.provider_step(binding,&request).await);
+    answer(h.provider_step(7, binding, &request).await);
     let lease=h.provider_resident.begin(store.tag_cache_namespace(),&key).unwrap().unwrap();
     assert_eq!(lease.state.fold_tail_passes,0,"the following fold must perform full validation");lease.publish();
 }
@@ -109,7 +109,7 @@ async fn interior_edit_with_equal_terminal_coverage_after_reopen_requires_full_r
         store.arm_soft_refresh("s").unwrap();
         let mut request=step("interior-edit",vec![],30);
         request["last_applied"]=json!({"compaction_id":views[index]["compaction"]["compaction_id"],"version":views[index]["compaction"]["version"]});
-        answers.push(answer(h.provider_step(binding,&request).await));
+        answers.push(answer(h.provider_step(7, binding, &request).await));
         if resident {
             let lease=h.provider_resident.begin(store.tag_cache_namespace(),&key).unwrap().unwrap();
             assert_eq!(lease.state.fold_tail_passes,0,"an equal terminal endpoint does not authorize an edited interior");
@@ -139,7 +139,7 @@ async fn delete_merge_and_recomp_while_down_match_the_full_replay_provider() {
             }
             store.replace_compartments("s",&rows).unwrap();store.arm_soft_refresh("s").unwrap();
             let mut request=step(mutation,vec![],30);request["last_applied"]=json!({"compaction_id":views[index]["compaction"]["compaction_id"],"version":views[index]["compaction"]["version"]});
-            answers.push(answer(h.provider_step(binding,&request).await));
+            answers.push(answer(h.provider_step(7, binding, &request).await));
             if resident {let lease=h.provider_resident.begin(store.tag_cache_namespace(),&key).unwrap().unwrap();assert_eq!(lease.state.fold_tail_passes,0,"{mutation} cannot be trusted after reopen");lease.publish();}
         }
         assert_eq!(answers[0]["answer"],answers[1]["answer"]);
@@ -159,7 +159,7 @@ async fn appended_tail_invalidates_the_resident_source_and_hygiene_descriptors()
         store.arm_soft_refresh("s").unwrap();
         let mut request=step("prime",vec![],30);
         request["last_applied"]=json!({"compaction_id":views[index]["compaction"]["compaction_id"],"version":views[index]["compaction"]["version"]});
-        let primed=answer(h.provider_step(binding.clone(),&request).await);
+        let primed=answer(h.provider_step(7, binding.clone(), &request).await);
         if primed["answer"]=="compaction_message" {views[index]=primed;}
     }
     let mut answers=Vec::new();
@@ -168,7 +168,7 @@ async fn appended_tail_invalidates_the_resident_source_and_hygiene_descriptors()
         store.replace_compartments("s",&rows).unwrap();store.arm_soft_refresh("s").unwrap();
         let mut request=step("append",vec![message(31)],31);
         request["last_applied"]=json!({"compaction_id":views[index]["compaction"]["compaction_id"],"version":views[index]["compaction"]["version"]});
-        answers.push(answer(h.provider_step(binding.clone(),&request).await));
+        answers.push(answer(h.provider_step(7, binding.clone(), &request).await));
     }
     assert_eq!(answers[0]["compaction"]["replacement"],answers[1]["compaction"]["replacement"]);
     let mut actual=serde_json::to_value(sa.load("s").unwrap().meta.tail_hygiene_baseline).unwrap();
@@ -185,15 +185,15 @@ async fn changed_tail_recipe_reconstruction_matches_the_served_treatment_bytes()
     let dir=tempfile::tempdir().unwrap();
     let (h,binding,store,key)=handler(dir.path(),Arc::new(NoReads::default()));
     let h=h.with_startup_provider_resident_enabled(true);
-    answer(h.provider_setup(binding.clone(),&setup()).await);
+    answer(h.provider_setup(7, binding.clone(), &setup()).await);
     let mut messages=(1..=30).map(message).collect::<Vec<_>>();
     messages[24]=json!({"ordinal":25,"mid":"m25","message":{"info":{"id":"m25","role":"assistant"},"parts":[
         {"id":"tool-part","type":"tool","tool":"bash","callID":"call-25","state":{"status":"completed","input":{"command":"inspect"},"output":"large spent tool output ".repeat(100)}}]}});
-    let first=answer(h.provider_step(binding.clone(),&step("initial",messages,30)).await);
+    let first=answer(h.provider_step(7, binding.clone(), &step("initial",messages,30)).await);
     store.replace_compartments("s",&compartments()).unwrap();store.arm_soft_refresh("s").unwrap();
     let mut request=step("first-fold",vec![],30);
     request["last_applied"]=json!({"compaction_id":first["compaction"]["compaction_id"],"version":first["compaction"]["version"]});
-    let answer=answer(h.provider_step(binding,&request).await);
+    let answer=answer(h.provider_step(7, binding, &request).await);
     let version=answer["compaction"]["version"].as_u64().unwrap();
     let mut view=crate::providers::view_recipe::load(&store,&key,version).unwrap().unwrap();
     let mut arena=crate::providers::resident_bytes::ByteArena::default();

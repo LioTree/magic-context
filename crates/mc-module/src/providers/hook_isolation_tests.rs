@@ -9,18 +9,19 @@ async fn transport_hook_completes_while_other_session_fold_is_blocked() {
     let handler = Arc::new(handler.with_startup_provider_resident_enabled(true));
     let session = "isolation-fold";
     fold_binding.session = session.into();
+    handler.bind_route(7, fold_binding.clone());
     let mut start = setup();
     start["session"] = json!(session);
-    answer(handler.provider_setup(fold_binding.clone(), &start).await);
+    answer(handler.provider_setup(7, fold_binding.clone(), &start).await);
     let mut initial = step("initial", (1..=30).map(message).collect(), 30);
     initial["session"] = json!(session);
-    let initial = answer(handler.provider_step(fold_binding.clone(), &initial).await);
+    let initial = answer(handler.provider_step(7, fold_binding.clone(), &initial).await);
     store.replace_compartments(session, &compartments()).unwrap();
     store.arm_soft_refresh(session).unwrap();
     let mut request = step("prime", vec![], 30);
     request["session"] = json!(session);
     request["last_applied"] = json!({"compaction_id":initial["compaction"]["compaction_id"],"version":initial["compaction"]["version"]});
-    let view = answer(handler.provider_step(fold_binding.clone(), &request).await);
+    let view = answer(handler.provider_step(7, fold_binding.clone(), &request).await);
     let fold_session = fold_binding.session.clone();
     fold_binding.principal = Some(subc_protocol::Principal::Reserved {
         module_id: "thalamus-harness".into(),
@@ -31,7 +32,8 @@ async fn transport_hook_completes_while_other_session_fold_is_blocked() {
     let hook_key = Key::new(&hook_binding, &hook_binding.session, "opencode").unwrap();
     let mut start = setup();
     start["session"] = json!(hook_binding.session);
-    answer(handler.provider_setup(hook_binding.clone(), &start).await);
+    handler.bind_route(8, hook_binding.clone());
+    answer(handler.provider_setup(8, hook_binding.clone(), &start).await);
     let hook = json!({"method":"transform.hook","params":{
         "session":hook_binding.session,"harness":"opencode","params":setup()["params"],
         "lineage_id":"L","subject_mid":"m1","subject_ordinal":1,

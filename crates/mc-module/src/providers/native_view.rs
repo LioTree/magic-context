@@ -320,10 +320,10 @@ mod tests {
             .unwrap();
         let binding = h.facade_binding(7).unwrap();
         let setup = json!({"session":"cc","harness":"claude-code","request_id":"setup","preset":"head","params":declare["params"],"composition":{},"claude_code":declare["claude_code"],"model":"fixture","context_window":100000,"lineage_id":"L","now":1});
-        h.provider_setup(binding.clone(), &setup).await.unwrap();
+        h.provider_setup(7, binding.clone(), &setup).await.unwrap();
         let mut status = cc::step(r#"{ "role":"user","content":"not folded" }"#);
         status["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-        let response = h.provider_step(binding, &status).await.unwrap();
+        let response = h.provider_step(7, binding, &status).await.unwrap();
         let answer: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(answer["answer"], "refuse");
         assert_eq!(answer["provider_code"], "native_endpoint_missing");
