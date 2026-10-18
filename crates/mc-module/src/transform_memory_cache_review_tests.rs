@@ -1361,3 +1361,264 @@ fn single_store_id_reset_hard_precedes_dashboard_delta_refresh() {
         assert_eq!(serde_json::to_vec(replay.messages()).unwrap(), serde_json::to_vec(first.messages()).unwrap());
     }
 }
+
+#[test]
+fn independent_dashboard_archive_membership_restore_mix_480_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+        .unwrap();
+    let own = s
+        .insert_memory(memory_input("git:proj", "CONSTRAINTS", "OWN_BASE", 0))
+        .unwrap();
+    let agent = s
+        .insert_memory(memory_input("git:proj", "CONSTRAINTS", "AGENT_BASE", 0))
+        .unwrap();
+    let foreign = s
+        .insert_memory(memory_input("git:other", "CONSTRAINTS", "FOREIGN_BASE", 0))
+        .unwrap();
+    s.with_context_conn_for_test(|conn| {
+        conn.execute_batch("INSERT INTO workspaces(id,name,share_categories,created_at,updated_at) VALUES(919,'review','[\"CONSTRAINTS\"]',1,1); INSERT INTO workspace_members(workspace_id,project_path,display_name,display_path,added_at) VALUES(919,'git:proj','Own','/own',1)")?;
+        conn.execute("UPDATE memories SET shareable=1,scope='project' WHERE id=?1", [foreign])
+    }).unwrap();
+    let mut request = req(
+        "ses",
+        "cfg",
+        vec![item("a", 1, "raw"), item("tail", 2, "tail")],
+    );
+    request.auto_search_enabled = false;
+    let mut ctx = pctx("git:proj", "/nonexistent-docs", 1);
+    ctx.memory_budget_tokens = 100000.0;
+    ctx.history_budget_tokens = 100000.0;
+    ctx.cache_ttl = "5m".into();
+    let bytes = |r: &TransformResponse| (m0_bytes(r).to_string(), m1_bytes(r).to_string());
+    let mut previous = bytes(&transform(&s, &request, &ctx).unwrap());
+    let mut rng = 0x93801acu32;
+    let mut joined = false;
+    let mut decision: Option<String> = None;
+    let mut counts = [0; 10];
+    let mut changes = Vec::new();
+    for step in 0..480 {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        let kind = (rng % 10) as usize;
+        counts[kind] += 1;
+        let revision = |id: i64| {
+            s.with_context_conn_for_test(|conn| {
+                conn.query_row("SELECT revision FROM memories WHERE id=?1", [id], |r| {
+                    r.get::<_, i64>(0)
+                })
+            })
+            .unwrap()
+        };
+        if [0, 1, 8].contains(&kind) {
+            let id = if kind == 8 { foreign } else { own };
+            let project = if kind == 8 { "git:other" } else { "git:proj" };
+            let change = if kind == 1 {
+                let status = s
+                    .with_context_conn_for_test(|conn| {
+                        conn.query_row("SELECT status FROM memories WHERE id=?1", [own], |r| {
+                            r.get::<_, String>(0)
+                        })
+                    })
+                    .unwrap();
+                json!({"memoryId":own,"status":if status == "archived" { "active" } else { "archived" }})
+            } else {
+                json!({"memoryId":id,"content":format!("DASH_{id}_{step}"),"status":"active"})
+            };
+            let receipt = s.memory_history_rpc("memory.edit", &json!({"projectPath":project,"operationId":format!("review-{step}"),"expectedRevisions":[{"memoryId":id,"revision":revision(id)}],"changes":[change]}), step as i64 + 2).unwrap();
+            assert_eq!(receipt["state"], "applied");
+            if id == own {
+                decision = receipt["decisionKey"].as_str().map(str::to_string);
+            } else {
+                s.with_context_conn_for_test(|conn| {
+                    conn.execute(
+                        "UPDATE memories SET shareable=1,scope='project' WHERE id=?1",
+                        [foreign],
+                    )
+                })
+                .unwrap();
+            }
+        } else if kind == 2 {
+            if let Some(key) = decision.take() {
+                let preview = s
+                    .memory_history_rpc(
+                        "memory.restore.preview",
+                        &json!({"projectPath":"git:proj","decisionKey":key}),
+                        step as i64 + 2,
+                    )
+                    .unwrap();
+                let receipt = s.memory_history_rpc("memory.restore", &json!({"projectPath":"git:proj","decisionKey":key,"operationId":format!("restore-{step}"),"expectedRevisions":preview["expectedRevisions"]}), step as i64 + 2).unwrap();
+                assert_eq!(receipt["state"], "applied", "{receipt}");
+            }
+        } else if kind == 3 && !joined {
+            s.with_context_conn_for_test(|conn| conn.execute("INSERT INTO workspace_members(workspace_id,project_path,display_name,display_path,added_at) VALUES(919,'git:other','Other','/other',1)", [])).unwrap();
+            joined = true;
+        } else if kind == 4 {
+            s.with_context_conn_for_test(|conn| {
+                conn.execute(
+                    "DELETE FROM workspace_members WHERE project_path='git:other'",
+                    [],
+                )
+            })
+            .unwrap();
+            joined = false;
+        } else if kind == 5 || kind == 7 {
+            edit(
+                &s,
+                if kind == 5 { "ses" } else { "other" },
+                agent,
+                &format!("AGENT_{step}"),
+                &format!("review-agent-{step}"),
+            )
+            .unwrap();
+        } else if kind == 6 {
+            s.with_context_conn_for_test(|conn| {
+                conn.execute(
+                    "UPDATE memories SET content=?1,revision=revision+1 WHERE id=?2",
+                    rusqlite::params![format!("DREAM_{step}"), agent],
+                )
+            })
+            .unwrap();
+        }
+        ctx.now_ms = (step as i64 + 2) * 1_000_000;
+        let idle = step % 29 == 28;
+        let flush = step % 67 == 66;
+        ctx.observed_last_response_at_ms = idle.then_some(ctx.now_ms - 300_001);
+        let bust = idle || flush || (rng >> 8) % 4 == 0;
+        if bust && !idle {
+            s.arm_soft_refresh("ses").unwrap();
+        }
+        let response = transform(&s, &request, &ctx).unwrap();
+        let current = bytes(&response);
+        let m0_changed = current.0 != previous.0;
+        let m1_changed = current.1 != previous.1;
+        if m0_changed || m1_changed {
+            changes.push(json!({"step":step,"kind":kind,"bust":bust,"idle":idle,"flush":flush,"action":response.action,"m0Changed":m0_changed,"m1Changed":m1_changed}));
+        }
+        assert_eq!(
+            response.action == "HARD",
+            idle,
+            "step {step} kind {kind}: {:?}",
+            response.materialize_reason
+        );
+        if !bust {
+            assert_eq!(current, previous, "held step {step} kind {kind}");
+        }
+        if !idle {
+            assert_eq!(current.0, previous.0, "m0 step {step}");
+            if kind == 6 || kind == 7 {
+                assert!(
+                    !current.1.contains(&format!(
+                        "{}_{step}",
+                        if kind == 6 { "DREAM" } else { "AGENT" }
+                    )),
+                    "foreign leak step {step}"
+                );
+            }
+        } else {
+            let active = s.with_context_conn_for_test(|conn| {
+                let mut q = conn.prepare("SELECT content FROM memories WHERE project_path='git:proj' AND status IN ('active','permanent') ORDER BY id")?;
+                let rows = q.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }).unwrap();
+            for text in active {
+                assert_eq!(
+                    current.0.matches(&text).count(),
+                    1,
+                    "fold once {step}: {text}"
+                );
+                assert!(!current.1.contains(&text));
+            }
+        }
+        previous = current;
+    }
+    println!(
+        "INDEPENDENT_RUST_MIX {}",
+        json!({"passes":480,"counts":counts,
+            "m0Changes":changes.iter().filter(|c| c["m0Changed"] == true).map(|c| &c["step"]).collect::<Vec<_>>(),
+            "m1Changes":changes.iter().filter(|c| c["m1Changed"] == true).map(|c| &c["step"]).collect::<Vec<_>>(),
+            "unpermittedChanges":changes.iter().filter(|c| c["bust"] == false).collect::<Vec<_>>()})
+    );
+}
+
+#[test]
+#[ignore = "run from two separately built revisions with an isolated MC_INDEPENDENT_STORE"]
+fn independent_base_store_upgrade_probe() {
+    let path = std::path::PathBuf::from(std::env::var("MC_INDEPENDENT_STORE").unwrap());
+    let s = store(&path);
+    let request = req("upgrade", "unchanged", vec![item("tail", 1, "tail")]);
+    let ctx = pctx("git:proj", "/nonexistent-docs", 1);
+    let capture = path.join("served.json");
+    if std::env::var("MC_INDEPENDENT_PHASE").as_deref() == Ok("base") {
+        s.insert_memory(memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "Independent upgrade memory.",
+            0,
+        ))
+        .unwrap();
+        let first = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(first.action, "HARD");
+        std::fs::write(capture, serde_json::to_vec(first.messages()).unwrap()).unwrap();
+        println!("independent base 1f78949d: created real persisted module store");
+    } else {
+        let baseline = std::fs::read(capture).unwrap();
+        for pass in 0..5 {
+            if pass % 2 == 0 {
+                s.arm_soft_refresh("upgrade").unwrap();
+            }
+            let current = transform(&s, &request, &ctx).unwrap();
+            assert_ne!(current.action, "HARD", "upgrade pass {pass}");
+            assert_eq!(
+                serde_json::to_vec(current.messages()).unwrap(),
+                baseline,
+                "upgrade bytes pass {pass}"
+            );
+        }
+        println!("independent Rust base -> tip: 5 passes, 0 extra rebuilds, identical prefix");
+    }
+}
+
+#[test]
+fn independent_legacy_dashboard_epoch_hard_receipt_is_still_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let id = s
+        .insert_memory(memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "Legacy receipt memory.",
+            0,
+        ))
+        .unwrap();
+    let edit = s.memory_history_rpc("memory.edit", &json!({"projectPath":"git:proj","operationId":"archive-for-receipt","expectedRevisions":[{"memoryId":id,"revision":1}],"changes":[{"memoryId":id,"status":"archived"}]}), 1).unwrap();
+    let preview = s
+        .memory_history_rpc(
+            "memory.restore.preview",
+            &json!({"projectPath":"git:proj","decisionKey":edit["decisionKey"]}),
+            2,
+        )
+        .unwrap();
+    let request = json!({"projectPath":"git:proj","operationId":"restore-for-receipt","decisionKey":edit["decisionKey"],"expectedRevisions":preview["expectedRevisions"]});
+    let mut receipt = s.memory_history_rpc("memory.restore", &request, 3).unwrap();
+    assert_eq!(receipt["state"], "applied");
+    assert!(mc_store::memory_history::valid_receipt(
+        "memory.restore",
+        &request,
+        &receipt
+    ));
+    receipt["adoption"] = json!("dashboard_epoch_hard");
+    assert!(mc_store::memory_history::valid_receipt(
+        "memory.restore",
+        &request,
+        &receipt
+    ));
+    receipt["adoption"] = json!("not-a-real-receipt");
+    assert!(!mc_store::memory_history::valid_receipt(
+        "memory.restore",
+        &request,
+        &receipt
+    ));
+}

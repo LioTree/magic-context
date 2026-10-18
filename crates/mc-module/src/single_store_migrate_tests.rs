@@ -2085,3 +2085,58 @@ fn issue682_combined_dry_run_then_real_run_preserves_two_rust_projects() {
         assert_eq!(check, "ok");
     }
 }
+
+#[test]
+fn independent_first_transform_after_real_migration_rebuilds_complete_old_pair() {
+    use crate::transform::{
+        tests::{item, memory_input, pctx, req, store},
+        transform,
+    };
+    let fixture = Fixture::new(Extras::default());
+    // Start with a complete, already-served pair so missing cache bytes cannot
+    // explain the first rebuild after migration.
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = store(source_dir.path());
+    source
+        .insert_memory(memory_input(
+            STORE_PROJECT,
+            "CONSTRAINTS",
+            "OLD_RESET_SENTINEL",
+            0,
+        ))
+        .unwrap();
+    let request = req(SESSION, "unchanged", vec![item("tail", 100, "tail")]);
+    let mut ctx = pctx(STORE_PROJECT, "/nonexistent-docs", NOW);
+    ctx.compaction_enabled = false;
+    transform(&source, &request, &ctx).unwrap();
+    let before = source.load(SESSION).unwrap();
+    fixture
+        .store()
+        .execute(
+            "UPDATE mc_cache_state SET core_state=?1,meta=?2 WHERE session_id=?3",
+            params![
+                serde_json::to_string(&before.core).unwrap(),
+                serde_json::to_string(&before.meta).unwrap(),
+                SESSION
+            ],
+        )
+        .unwrap();
+    fixture.migrate();
+    let migrated = store(&fixture.root);
+    let reset = migrated.load(SESSION).unwrap();
+    assert_eq!(reset.meta.max_memory_id, 0);
+    assert!(reset.meta.bootstrap_seed_fold_pending);
+    let first = transform(&migrated, &request, &ctx).unwrap();
+    assert_eq!(first.action, "HARD", "{:?}", first.materialize_reason);
+    assert!(!serde_json::to_string(first.messages())
+        .unwrap()
+        .contains("OLD_RESET_SENTINEL"));
+    assert!(
+        !migrated
+            .load(SESSION)
+            .unwrap()
+            .meta
+            .bootstrap_seed_fold_pending
+    );
+    assert_ne!(transform(&migrated, &request, &ctx).unwrap().action, "HARD");
+}
