@@ -71,7 +71,10 @@ export interface Question {
     /** Position within its category, from 0. */
     index: number;
     text: string;
-    /** The nuggets the judge scores, or for event ordering, the reference order. */
+    /**
+     * The question's `rubric` list: for nine abilities, the nuggets the judge scores; for event
+     * ordering, the reference events in their correct order.
+     */
     rubric: string[];
 }
 

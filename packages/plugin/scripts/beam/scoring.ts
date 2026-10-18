@@ -61,7 +61,10 @@ export function mean(values: number[]): number {
     return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
-/** The scale Listing 20 asks for. Other values in 0..1 are kept, as the released code adds any float, but flagged. */
+/**
+ * The scale the judge prompt asks for (0, 0.5 or 1). Any other value in 0..1 is kept, because the
+ * released BEAM code (`compute_metrics.py`) adds whatever float the judge returns, but it is flagged.
+ */
 export const NUGGET_SCORES = [0, 0.5, 1] as const;
 
 /**

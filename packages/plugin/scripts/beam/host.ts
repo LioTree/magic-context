@@ -453,7 +453,10 @@ export async function startHost(
     return { url, pid: child.pid as number, paths, log: () => logs, api, checkIsolation, stop };
 }
 
-/** The parts of a root that hold state: the OpenCode and Magic Context stores and the project repo. */
+/**
+ * The parts of a root that hold state: `data/` (the OpenCode store `data/opencode/opencode.db` and
+ * the Magic Context store under `data/cortexkit/magic-context/`) and `work/` (the project's git repo).
+ */
 const SNAPSHOT_DIRS: RootDir[] = ["data", "work"];
 
 /** Copy a stopped root's state into `target` (which must not exist). */
