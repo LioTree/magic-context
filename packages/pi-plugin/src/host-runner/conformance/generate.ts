@@ -33,6 +33,13 @@ type PiFitAction = {
 /** One host-visible operation on the Pi adapter, or a control call to the MC oracle. */
 export type PiAction =
 	| { kind: "bind"; harness: "pi"; session: string }
+	| {
+			kind: "system_prompt";
+			session: string;
+			systemPrompt: string;
+			model: { provider: string; id: string };
+	  }
+	| { kind: "check_system_prompt"; session: string; systemPrompt: string }
 	| { kind: "delete" | "step_deleted"; session: string }
 	| {
 			kind: "run";
@@ -589,6 +596,49 @@ export async function generatePiVectors(): Promise<PiVectorFile> {
 		snapshot("session-delete-idempotent-and-terminal-step", {
 			answer: "deleted",
 			subsequent_step_error: "provider_conversation_missing",
+		});
+		const promptInput = {
+			sessionId: "relay-pi-first-prompt",
+			systemPrompt: "Pi conformance system.\nToday's date: 2026-10-12",
+			model: host.model,
+		};
+		assert.equal(adapter.receipt(promptInput.sessionId), undefined);
+		const compose = () =>
+			step(
+				{
+					kind: "system_prompt",
+					session: promptInput.sessionId,
+					systemPrompt: promptInput.systemPrompt,
+					model: promptInput.model,
+				},
+				() => adapter.systemPrompt(promptInput),
+			);
+		const firstPrompt = await compose();
+		assert.ok(firstPrompt.systemPrompt.includes("## Magic Context"));
+		assert.deepEqual(await compose(), firstPrompt);
+		assert.equal(adapter.receipt(promptInput.sessionId), undefined);
+		const check = (systemPrompt: string) =>
+			step(
+				{
+					kind: "check_system_prompt",
+					session: promptInput.sessionId,
+					systemPrompt,
+				},
+				() =>
+					adapter.checkSystemPrompt({
+						sessionId: promptInput.sessionId,
+						systemPrompt,
+					}),
+			);
+		const managed = await check(firstPrompt.systemPrompt);
+		const unmanaged = await check(promptInput.systemPrompt);
+		assert.equal(managed.managed, true);
+		assert.equal(unmanaged.managed, false);
+		snapshot("system-prompt-first-turn", {
+			receipt: null,
+			...firstPrompt,
+			managed,
+			unmanaged,
 		});
 		return {
 			schema: "mc-relay-pi/v1",

@@ -28,6 +28,7 @@ test("Pi relay vectors regenerate byte-identically through the real adapter and 
 		"tree-branch-switch",
 		"forked-session",
 		"session-delete-idempotent-and-terminal-step",
+		"system-prompt-first-turn",
 	]);
 	// Steps and exchanges use relay-v1's field names, in relay-v1's key order.
 	for (const vector of parsed.cases) {

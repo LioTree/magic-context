@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, join } from "node:path";
 import { loadPluginConfigDetailed } from "@magic-context/core/config";
+import {
+	isCompactionEnabled,
+	isDreamerRunnable,
+} from "@magic-context/core/config/agent-disable";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { recordSessionProjectIdentity } from "@magic-context/core/features/magic-context/session-project-storage";
 import { openBridgeDatabase } from "@magic-context/core/features/magic-context/storage-db";
@@ -32,8 +36,15 @@ import {
 } from "@magic-context/core/hooks/magic-context/marker-envelope";
 import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
 import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
-import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import {
+	estimateTokens,
+	preloadTokenizer,
+} from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { createRustModeTransform } from "@magic-context/core/hooks/magic-context/rust-mode-transform";
+import {
+	createPromptSurfaceGuidanceEpochCache,
+	createPromptSurfaceRuntime,
+} from "@magic-context/core/shared/prompt-surface-runtime";
 import {
 	nativePiEntry,
 	piProviderCodec,
@@ -45,8 +56,10 @@ import type {
 	PiBridgeAdapterOptions,
 	PiBridgeFallbackInputs,
 	PiBridgeRunInput,
+	PiBridgeSystemPromptInput,
 	PiBridgeView,
 } from "./bridge-types-pi";
+import { composePiSystemPrompt } from "./compose-system-prompt-pi";
 import {
 	convertEntriesToRawMessages,
 	locatePiRawOrdinals,
@@ -81,6 +94,12 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 		{ db, directory: options.projectRoot, rustModeModuleClient: transport },
 		"pi",
 	);
+	const promptRuntime = createPromptSurfaceRuntime({
+		harness: "pi",
+		directory: options.projectRoot,
+		warn: console.warn,
+	});
+	deps.promptSurfaceRuntime = promptRuntime;
 	const manifests = new Map<string, string>();
 	const currentWindows = new Map<string, Map<string, number>>();
 	const listeners = new Set<BridgeOutcomeListener>();
@@ -149,6 +168,17 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 		),
 	);
 	const facts = createBridgeHostFacts(deps, config);
+	const stickyDates = new Map<string, string>();
+	const systemRefresh = new Set<string>();
+	const managedSystems = new Map<string, string>();
+	const systemDigest = (system: string) =>
+		createHash("sha256").update(system, "utf8").digest("hex");
+	const clearSystemPrompt = (id: string) => {
+		managedSystems.delete(id);
+		stickyDates.delete(id);
+		systemRefresh.delete(id);
+		createPromptSurfaceGuidanceEpochCache(promptRuntime).clear(id);
+	};
 	const normalized = (inputs: PiBridgeFallbackInputs) => ({
 		...inputs,
 		messages: inputs.messages
@@ -156,6 +186,67 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 			.map((m) => projectPiEntry(m)),
 	});
 	return {
+		/** Install guidance before the first context pass; no delivery receipt exists yet. */
+		async systemPrompt(input: PiBridgeSystemPromptInput) {
+			idle(input.sessionId);
+			if (!input.sessionId || !input.model.provider || !input.model.id)
+				throw new Error("Pi systemPrompt requires a session and model");
+			if (input.systemPromptOptions?.sections && !input.renderSystemPrompt)
+				throw new Error(
+					"Pi sections require renderSystemPrompt: () => event.systemPrompt",
+				);
+			await preloadTokenizer();
+			idle(input.sessionId);
+			getOrCreateSessionMeta(db, input.sessionId, "pi");
+			const result = composePiSystemPrompt({
+				...input,
+				db,
+				cwd: options.projectRoot,
+				config,
+				registrationEnabled: config.enabled,
+				runtime: promptRuntime,
+				ctxReduceCallable: isCompactionEnabled(config),
+				dreamerEnabled: isDreamerRunnable(config),
+				smartNotesEnabled: config.smart_notes.enabled,
+				stickyDates,
+				hasSystemPromptRefresh: (id) => systemRefresh.has(id),
+				clearSystemPromptRefresh: (id) => {
+					systemRefresh.delete(id);
+				},
+				signalHashChange: (id) => {
+					systemRefresh.add(id);
+					deps.historyRefreshSessions?.add(id);
+					deps.pendingMaterializationSessions?.add(id);
+					deps.lastHeuristicsTurnId?.delete(id);
+				},
+			});
+			const digest = systemDigest(result.systemPrompt);
+			managedSystems.set(input.sessionId, digest);
+			return { ...result, digest };
+		},
+		/** Compare actual host-built bytes; the caller owns request-refusal policy. */
+		checkSystemPrompt(input: { sessionId: string; systemPrompt: string }) {
+			assertOpen();
+			const expectedDigest = managedSystems.get(input.sessionId);
+			const actualDigest = systemDigest(input.systemPrompt);
+			return {
+				managed:
+					expectedDigest !== undefined && expectedDigest === actualDigest,
+				reason:
+					expectedDigest === undefined
+						? ("system_prompt_not_prepared" as const)
+						: expectedDigest !== actualDigest
+							? ("system_prompt_mismatch" as const)
+							: undefined,
+				expectedDigest,
+				actualDigest,
+			};
+		},
+		/** Mirror standalone's outgoing-session cleanup on a confirmed host switch. */
+		clearSystemPrompt(id: string) {
+			idle(id);
+			clearSystemPrompt(id);
+		},
 		async run(input: PiBridgeRunInput): Promise<PiBridgeView> {
 			const started = performance.now(),
 				id = input.sessionId;
@@ -196,7 +287,16 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 			});
 			getOrCreateSessionMeta(db, id, "pi");
 			updateSessionMeta(db, id, {
-				systemPromptHash: createHash("md5").update(host.system).digest("hex"),
+				// composePiSystemPrompt already stored the standalone fingerprint of the
+				// base prompt plus guidance and selected preset. Hashing the host's XML
+				// section rendering here would make the next turn detect a false change.
+				...(!managedSystems.has(id)
+					? {
+							systemPromptHash: createHash("md5")
+								.update(host.system)
+								.digest("hex"),
+						}
+					: {}),
 				systemPromptTokens: estimateTokens(host.system),
 				lastUsageContextLimit: host.contextWindow,
 			});
@@ -274,6 +374,11 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 		},
 		async recordHostFact(fact: BridgeHostFact) {
 			idle(fact.sessionId);
+			if (fact.kind === "system_prompt")
+				return {
+					accepted: false,
+					reason: "use_system_prompt_before_agent_start" as const,
+				};
 			const receipt = owner(fact.sessionId).current();
 			if (
 				!receipt ||
@@ -404,6 +509,7 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 				await pending;
 				manifests.delete(id);
 				currentWindows.delete(id);
+				clearSystemPrompt(id);
 				rawReaders.get(id)?.();
 				rawReaders.delete(id);
 			} finally {
@@ -421,6 +527,11 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 				} finally {
 					listeners.clear();
 					published.clear();
+					for (const id of managedSystems.keys())
+						createPromptSurfaceGuidanceEpochCache(promptRuntime).clear(id);
+					managedSystems.clear();
+					stickyDates.clear();
+					systemRefresh.clear();
 					for (const unregister of rawReaders.values()) unregister();
 					rawReaders.clear();
 					transport.close();

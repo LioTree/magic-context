@@ -276,7 +276,13 @@ describe("source contract: peek-then-drain in runPipeline (pending materializati
 });
 
 describe("source contract: peek-then-drain in before_agent_start (system prompt)", () => {
-	const code = stripComments(INDEX_SRC);
+	const code =
+		stripComments(
+			readFileSync(
+				join(import.meta.dir, "compose-system-prompt-pi.ts"),
+				"utf-8",
+			),
+		) + stripComments(INDEX_SRC);
 
 	test("uses hasSystemPromptRefresh peek, not the old draining helper", () => {
 		// The old code called consumeSystemPromptRefresh(sessionId) at the
@@ -312,20 +318,17 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 		// only when the host has no sections API, because an unconditional
 		// sections assignment throws on Oh My Pi and the handler's catch
 		// would then drop our guidance block entirely.
-		expect(code).toContain("= event.systemPromptOptions;");
-		expect(code).toContain("const hostSections = promptOptions?.sections;");
-		expect(code).toContain("hostSections.magic_context = block");
-		// Exactly two forced fallbacks exist, each on its explicit
-		// no-sections guard: an unguarded forced return adds a third match
-		// or breaks the guard patterns (hiding later Pi sections), and
-		// deleting a fallback drops the count (breaking Oh My Pi).
-		const forcedReturns = [...code.matchAll(/return\s*\{\s*systemPrompt\b/g)];
-		expect(forcedReturns).toHaveLength(2);
-		expect(code).toMatch(
-			/if\s*\(\s*block\s*&&\s*!hostSections\s*\)\s*return\s*\{\s*systemPrompt\b/,
+		const index = stripComments(INDEX_SRC);
+		expect(index).toContain("composePiSystemPrompt({");
+		expect(index).toContain("systemPromptOptions: event.systemPromptOptions");
+		expect(code).toContain(
+			"const hostSections = input.systemPromptOptions?.sections;",
 		);
-		expect(code).toMatch(
-			/if\s*\(\s*hostSections\s*\)\s*\{\s*return;?\s*\}\s*return\s*\{\s*systemPrompt\b/,
+		expect(code).toContain("hostSections.magic_context = block");
+		expect(code).toContain("force: !!block && !hostSections");
+		expect(code).toContain("force: !hostSections");
+		expect(index).toMatch(
+			/if\s*\(result\.force\)\s*return\s*\{\s*systemPrompt:/,
 		);
 	});
 
@@ -339,7 +342,8 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 		expect(code).toContain(
 			"effectiveConfig.system_prompt_injection?.skip_signatures",
 		);
-		expect(code).toContain("existingSystemPrompt: event.systemPrompt");
+		expect(code).toContain("existingSystemPrompt: systemPrompt");
+		expect(stripComments(INDEX_SRC)).toContain("config: effectiveConfig");
 	});
 
 	test("message_end indexes the ended assistant by deferred id lookup", () => {
@@ -379,7 +383,7 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 		expect(idx).toBeGreaterThan(0);
 		const segment = code.slice(idx, idx + 500);
 		expect(segment).toContain(
-			"signalPiSystemHashChange(sessionId, result.currentHash)",
+			"input.signalHashChange(sessionId, result.currentHash)",
 		);
 		const contextCode = stripComments(CONTEXT_HANDLER_SRC);
 		const start = contextCode.indexOf(

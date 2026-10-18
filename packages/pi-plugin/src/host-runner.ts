@@ -18,6 +18,7 @@ export type {
 	PiBridgeFallbackInputs,
 	PiBridgeHostSnapshot,
 	PiBridgeRunInput,
+	PiBridgeSystemPromptInput,
 	PiBridgeView,
 } from "./bridge-types-pi";
 export type PiBridgeAdapter = Awaited<ReturnType<typeof createPiBridgeAdapter>>;

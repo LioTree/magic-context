@@ -31,7 +31,7 @@ const MAGIC_CONTEXT_MARKER = "## Magic Context";
  * Sticky date cache. Module-scoped so clearPiSystemPromptSession can release
  * entries when Pi shuts down or switches sessions.
  */
-const stickyDateBySession = new Map<string, string>();
+const stickyDateBySessionDefault = new Map<string, string>();
 
 export interface BuildMagicContextBlockOptions {
 	db: ContextDatabase;
@@ -126,8 +126,11 @@ export function processSystemPromptForCache(args: {
 	/** When true, the caller has already determined this turn is busting cache. */
 	isCacheBusting: boolean;
 	promptSurfacePreset?: PromptSurfacePreset;
+	/** Bridge instances own their date state rather than sharing standalone sessions. */
+	stickyDates?: Map<string, string>;
 }): SystemPromptHashResult {
 	const { db, sessionId, systemPrompt, isCacheBusting } = args;
+	const stickyDateBySession = args.stickyDates ?? stickyDateBySessionDefault;
 
 	// Step 1: hash detection vs persisted value.
 	let sessionMeta:
@@ -239,7 +242,7 @@ export function processSystemPromptForCache(args: {
  */
 export function clearPiSystemPromptSession(sessionId: string): void {
 	clearPiSystemPromptDelivery(sessionId);
-	stickyDateBySession.delete(sessionId);
+	stickyDateBySessionDefault.delete(sessionId);
 }
 
 /** Test-only markers for system-prompt parity assertions. */
