@@ -2405,8 +2405,17 @@ impl McHandler {
                 applied.range.lineage_id = lineage.lineage_id.clone();
             }
             if applied.range.lineage_id != lineage.lineage_id {
+                // Forks are one-way: the gateway never steps the original branch again
+                // before a conversation reset. This guard is a safety net, not a liveness loss.
                 let cut = ancestor_cut(store, &work.key, &lineage, &applied.range.lineage_id)?
-                    .ok_or_else(|| invalid_field("lineage_id"))?;
+                    .ok_or_else(|| HandlerOutcome::ErrorWithDetail {
+                        code: "lineage_not_head".into(),
+                        message: "provider lineage is not the current conversation head".into(),
+                        detail: json!({
+                            "requested_lineage_id": lineage.lineage_id.clone(),
+                            "head_lineage_id": applied.range.lineage_id.clone(),
+                        }),
+                    })?;
                 if applied.range.to > 0 && cut < applied.range.to - 1 {
                     setup.invalidated = true;
                     store
@@ -4793,6 +4802,36 @@ mod host_tests {
             answer(h.provider_step(b, &foreign).await)["detail"]["history_gap_from"],
             3
         );
+    }
+
+    #[tokio::test]
+    async fn stepping_original_branch_after_fork_returns_lineage_not_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, b, _, _) = handler(dir.path(), Arc::new(NoReads::default()));
+        answer(h.provider_setup(b.clone(), &setup()).await);
+
+        let mut first = step("first", vec![message(1), message(2), message(3)], 3);
+        first["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
+        let view = answer(h.provider_step(b.clone(), &first).await);
+        assert_eq!(view["answer"], "compaction_message");
+
+        let mut fork = step("fork", vec![message(4)], 4);
+        fork["lineage_id"] = json!("child");
+        fork["descends_from"] = json!({"lineage_id":"L","through_ordinal":3});
+        fork["last_applied"] = json!({"compaction_id":view["compaction"]["compaction_id"],"version":view["compaction"]["version"]});
+        assert_eq!(
+            answer(h.provider_step(b.clone(), &fork).await)["answer"],
+            "noop"
+        );
+
+        let original = step("original", vec![], 3);
+        let result = h.provider_step(b, &original).await;
+        let HandlerOutcome::ErrorWithDetail { code, detail, .. } = result.unwrap_err() else {
+            panic!("expected named lineage refusal")
+        };
+        assert_eq!(code, "lineage_not_head");
+        assert_eq!(detail["requested_lineage_id"], "L");
+        assert_eq!(detail["head_lineage_id"], "child");
     }
 }
 

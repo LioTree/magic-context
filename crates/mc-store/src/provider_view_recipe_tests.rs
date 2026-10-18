@@ -100,11 +100,11 @@ fn seed_conversation(store: &McStore, key: &ProviderSessionKey) {
 /// Every reference that can still replay a view keeps that view and the
 /// native source it streams: the host Setup's acknowledged and produced views
 /// (the produced one is replayed when the host reports it not applied), the
-/// step receipt a retried request answers from, the two newest applied views
-/// (the host's last-known-good request), last-known-good versions in the hook
-/// counters, the runner record's waiting view, and every ancestor of those.
+/// step receipt a retried request answers from, the two newest applied views,
+/// the runner record's waiting view, and every ancestor of those. A stale
+/// last-known-good counter is not a runtime view reference.
 #[test]
-fn v2_recipe_keeps_ack_lkg_receipt_source_roots() {
+fn v2_recipe_keeps_ack_receipt_source_roots() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
     let key = key("roots", "claude-code");
@@ -137,19 +137,18 @@ fn v2_recipe_keeps_ack_lkg_receipt_source_roots() {
         })
         .unwrap();
     let roots = store.provider_view_source_roots(&key).unwrap();
-    assert_eq!(roots.versions, BTreeSet::from([2, 3, 5, 6, 7, 8]));
+    assert_eq!(roots.versions, BTreeSet::from([2, 3, 5, 6, 7]));
     assert_eq!(roots.sources, BTreeSet::from([("L".to_string(), 0, 1)]));
     assert_eq!(
         store.prune_provider_views_from_conversation(&key).unwrap(),
-        2
+        4
     );
     assert_eq!(
         store.load_provider_view_recipe_versions(&key).unwrap(),
-        vec![2, 3, 4, 5, 6, 7, 8],
-        "ancestor 4 of the last-known-good view 8 stays; only 1 and 9 go"
+        vec![2, 3, 5, 6, 7],
+        "stale last-known-good counter versions do not prevent pruning"
     );
-    // A delayed acknowledgement, receipt replay or last-known-good request
-    // still resolves its view, native source included.
+    // Every live root still resolves after pruning, with its native source.
     for version in roots.versions {
         let resolved = store.resolve_provider_view(&key, version).unwrap().unwrap();
         assert_eq!(resolved.messages.len(), 1, "view {version} lost its source");

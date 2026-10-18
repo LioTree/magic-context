@@ -696,9 +696,8 @@ pub(crate) fn prune_tx(
 /// - the view each still-held lineage was named in its newest step answer
 ///   (`LINEAGE_ANSWERED_VIEWS`), which the receipt alone loses once a sibling
 ///   lineage of the same conversation steps;
-/// - last-known-good request versions, including the two newest applied rows,
-///   because the host keeps the previous applied request until it saves the
-///   newly acknowledged one;
+/// - the two newest applied rows, because the host keeps the previous applied
+///   request until it saves the newly acknowledged one;
 /// - the runner record's produced, applied and waiting views.
 pub(crate) fn view_roots_tx(
     conn: &rusqlite::Connection,
@@ -735,9 +734,6 @@ pub(crate) fn view_roots_tx(
         &["/produced_version", "/applied_version", "/wait_version"],
     )?;
     let counters: Value = serde_json::from_str(&counters).map_err(invalid)?;
-    if let Some(lkg) = counters.get("lkg_view_versions").and_then(Value::as_array) {
-        roots.extend(lkg.iter().filter_map(Value::as_u64));
-    }
     roots.extend(lineage_answered_views_tx(conn, conv, &counters)?.into_values());
     let mut q = conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 AND state='applied' ORDER BY version DESC LIMIT 2")?;
     for version in q.query_map([conv], |r| r.get::<_, u64>(0))? {
