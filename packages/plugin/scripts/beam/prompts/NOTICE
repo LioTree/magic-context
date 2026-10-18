@@ -1,16 +1,26 @@
-Listings 20, 21, and 44 from:
-Beyond a Million Tokens: Benchmarking and Enhancing Long-Term Memory in LLMs
-https://arxiv.org/abs/2510.27246 (version 2)
+Prompts vendored for the BEAM benchmark harness.
 
-Copyright the paper's authors. Paper material is reproduced under CC BY 4.0:
-https://creativecommons.org/licenses/by/4.0/
+1. prompts/listing-20.txt, listing-21.txt, listing-44.txt
+   Listings 20, 21 and 44 from:
+   Beyond a Million Tokens: Benchmarking and Enhancing Long-Term Memory in LLMs
+   https://arxiv.org/abs/2510.27246 (version 2)
+   Copyright the paper's authors. Paper material is reproduced under CC BY 4.0:
+   https://creativecommons.org/licenses/by/4.0/
+   The prompts are verbatim UTF-8 text from the arXiv v2 TeX source archive. The v2 HTML
+   contains empty figures for these three listings, so the TeX source is authoritative.
 
-The prompts are verbatim UTF-8 text from the arXiv v2 TeX source archive.
-The v2 HTML currently contains empty figures for these three listings, so the
-TeX source is authoritative for this extraction. See provenance.json for the
-source URL, source member paths, and SHA-256 of each unmodified prompt.
-Only runtime placeholder substitution is performed; see ../README.md.
+2. prompts/released/*.txt
+   The runtime values of the corresponding strings in the authors' released code,
+   https://github.com/mohammadtavakoli78/BEAM at commit
+   b2da22eac88bb0874c64665f13457eb99835774a (src/prompts.py,
+   src/evaluation/compute_metrics.py, src/answer_probing_questions/long_term_memory_methods.py).
+   Copyright (c) 2025 Mohammad Tavakoli, MIT License.
+   These are the strings the harness sends.
+
+provenance.json records each file's source and SHA-256. `run.ts --verify-prompts` re-downloads
+both sources and compares every file byte for byte. Only runtime placeholder substitution is
+performed; see ../README.md.
 
 Dataset licensing is separate: Mohammadta/BEAM is CC BY-SA 4.0.
-The pastdotdev/benchmarks dataset parser was consulted as an MIT-licensed
-reference. No ExaBase prompts are included or used.
+The pastdotdev/benchmarks dataset parser was consulted as an MIT-licensed reference.
+No ExaBase prompts are included or used.
