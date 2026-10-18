@@ -39,7 +39,7 @@ export type PiAction =
 			systemPrompt: string;
 			model: { provider: string; id: string };
 	  }
-	| { kind: "check_system_prompt"; session: string; systemPrompt: string }
+	| { kind: "check_system_prompt"; session: string; systemBlocks: string[] }
 	| { kind: "delete" | "step_deleted"; session: string }
 	| {
 			kind: "run";
@@ -617,21 +617,24 @@ export async function generatePiVectors(): Promise<PiVectorFile> {
 		assert.ok(firstPrompt.systemPrompt.includes("## Magic Context"));
 		assert.deepEqual(await compose(), firstPrompt);
 		assert.equal(adapter.receipt(promptInput.sessionId), undefined);
-		const check = (systemPrompt: string) =>
+		const check = (systemBlocks: string[]) =>
 			step(
 				{
 					kind: "check_system_prompt",
 					session: promptInput.sessionId,
-					systemPrompt,
+					systemBlocks,
 				},
 				() =>
 					adapter.checkSystemPrompt({
 						sessionId: promptInput.sessionId,
-						systemPrompt,
+						systemBlocks,
 					}),
 			);
-		const managed = await check(firstPrompt.systemPrompt);
-		const unmanaged = await check(promptInput.systemPrompt);
+		const managed = await check([
+			"You are Claude Code, Anthropic's official CLI for Claude.",
+			firstPrompt.systemPrompt,
+		]);
+		const unmanaged = await check([promptInput.systemPrompt]);
 		assert.equal(managed.managed, true);
 		assert.equal(unmanaged.managed, false);
 		snapshot("system-prompt-first-turn", {
