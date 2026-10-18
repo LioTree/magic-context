@@ -8398,7 +8398,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (
 		!isPrefixBoundThinkingModel(args.resolvedProviderID, args.resolvedModelID)
 	)
-		return runSynchronousPipeline(args);
+		return runSynchronousPipeline(args, undefined, undefined, false);
 	// A host system-prompt change rewrote the bytes before every kept thinking
 	// block. The first prefix-bound pass without a current-turn boundary strips
 	// older thinking with it. Other passes keep the record: thinking signed
@@ -8445,13 +8445,18 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// any other pass is a defect: the pipeline refuses the pass at that point,
 	// before writing the omissions.
 	if (piPassMayNeedNoCompanion(args) && !piPassMayRewritePrefix(args)) {
-		const result = runSynchronousPipeline(args, rollbackObservations, () => {
-			throw new DegradedPassRefusalError(UNPAIRED_PREFIX_REWRITE_SITE, {
-				cause: new Error(
-					"A pass with no rewrite cause reached a signed-prefix rewrite",
-				),
-			});
-		});
+		const result = runSynchronousPipeline(
+			args,
+			rollbackObservations,
+			() => {
+				throw new DegradedPassRefusalError(UNPAIRED_PREFIX_REWRITE_SITE, {
+					cause: new Error(
+						"A pass with no rewrite cause reached a signed-prefix rewrite",
+					),
+				});
+			},
+			false,
+		);
 		// Unreachable when the pipeline's checks hold; refusing here keeps an edit
 		// from being served without the strip its thinking needs.
 		if (
@@ -8653,22 +8658,29 @@ function runSynchronousPipeline(
 	args: RunPipelineArgs,
 	rollbackObservations?: (() => void)[],
 	requirePairing?: () => never,
+	/**
+	 * Whether this pass can need a companion strip. The scans that locate edits
+	 * relative to kept thinking only decide that, so a pass that cannot need one
+	 * (a model whose thinking is not prefix-bound, or a pass the caller runs
+	 * outside the companion transaction, where any path to needing one refuses)
+	 * skips them.
+	 */
+	companionPossible = true,
 ): RunPipelineResult {
 	args.assertCurrentPass?.();
-	const prefixTagStart = isPrefixBoundThinkingModel(
-		args.resolvedProviderID,
-		args.resolvedModelID,
-	)
-		? Number(
-				(
-					args.db
-						.prepare(
-							"SELECT COALESCE(MAX(tag_number), 0) AS value FROM tags WHERE session_id = ?",
-						)
-						.get(args.sessionId) as { value: number }
-				).value,
-			)
-		: Number.MAX_SAFE_INTEGER;
+	const prefixTagStart =
+		companionPossible &&
+		isPrefixBoundThinkingModel(args.resolvedProviderID, args.resolvedModelID)
+			? Number(
+					(
+						args.db
+							.prepare(
+								"SELECT COALESCE(MAX(tag_number), 0) AS value FROM tags WHERE session_id = ?",
+							)
+							.get(args.sessionId) as { value: number }
+					).value,
+				)
+			: Number.MAX_SAFE_INTEGER;
 	const thinkingRecovery = prepareLatestThinkingRecovery({
 		db: args.db,
 		sessionId: args.sessionId,
@@ -9730,100 +9742,107 @@ function runSynchronousPipeline(
 				),
 		});
 	let editAdmission = makeEditAdmission();
-	// Record original part positions before removing tool calls or results, so
-	// an edit after kept thinking is not mistaken for an earlier edit.
-	const sourceParts = new Map<unknown, { message: number; part: number }>();
-	let lastThinking: { message: number; part: number } | undefined;
-	const goneThinking = new Set(frozenBindingEntryIds(args.db, args.sessionId));
-	try {
-		for (const id of getNativeReplayState(args.db, args.sessionId).reasoningIds)
-			goneThinking.add(id);
-	} catch {
-		// Unreadable native state is handled by the native lanes below. Here it
-		// only means fewer omissions are known, so more thinking counts as kept
-		// and an edit is more likely to require its companion strip.
-	}
-	const redacted = new Map<string, Set<number>>();
-	for (const [index, raw] of workingMessages.entries()) {
-		const id = stableIdResolver(raw, index);
-		if (
-			!id ||
-			goneThinking.has(id) ||
-			raw.role !== "assistant" ||
-			!Array.isArray(raw.content)
-		)
-			continue;
-		for (const [partIndex, part] of raw.content.entries())
-			if (
-				part &&
-				typeof part === "object" &&
-				["redactedThinking", "redacted_thinking"].includes(
-					String((part as { type?: string }).type),
-				)
-			) {
-				const indices = redacted.get(id) ?? new Set<number>();
-				indices.add(partIndex);
-				redacted.set(id, indices);
-			}
-	}
-	for (const [index, message] of mutationView.entries()) {
-		for (const [partIndex, part] of message.parts.entries()) {
-			const location = { message: index, part: partIndex };
-			sourceParts.set(part, location);
-			if (
-				message.info.role === "assistant" &&
-				!goneThinking.has(message.info.id ?? "") &&
-				((part.kind === "thinking" &&
-					part.getText() !== "" &&
-					part.getText() !== "[cleared]") ||
-					redacted.get(message.info.id ?? "")?.has(partIndex))
-			)
-				lastThinking = location;
-		}
-	}
+	// Where each tag's edit lies relative to the last kept thinking block; read
+	// only to decide whether this pass needs a companion strip.
 	const tagEditBeforeThinking = new Map<number, boolean>();
-	for (const [tag, target] of targets) {
-		const parts =
-			target.mutationParts?.map(({ part }) => part) ??
-			target.message?.parts ??
-			[];
-		tagEditBeforeThinking.set(
-			tag,
-			parts.length === 0 ||
-				parts.some((part) => {
-					const location = sourceParts.get(part);
-					return (
-						!location ||
-						(!!lastThinking &&
-							(location.message < lastThinking.message ||
-								(location.message === lastThinking.message &&
-									location.part <= lastThinking.part)))
-					);
-				}),
+	if (companionPossible) {
+		// Record original part positions before removing tool calls or results, so
+		// an edit after kept thinking is not mistaken for an earlier edit.
+		const sourceParts = new Map<unknown, { message: number; part: number }>();
+		let lastThinking: { message: number; part: number } | undefined;
+		const goneThinking = new Set(
+			frozenBindingEntryIds(args.db, args.sessionId),
 		);
-	}
-	// Reapplying a saved tag to raw history is replay. Only newly allocated
-	// prefixes that actually changed text before kept thinking require a strip.
-	for (const [tag, target] of targets) {
-		if (tag <= prefixTagStart) continue;
-		if (
-			target.mutationParts?.some(({ part }) => {
-				const location = sourceParts.get(part);
-				const text = (
-					part as { getText?: () => string | undefined }
-				).getText?.();
-				return (
-					prefixTexts.has(part) &&
-					prefixTexts.get(part) !== text &&
-					location &&
-					lastThinking &&
-					(location.message < lastThinking.message ||
-						(location.message === lastThinking.message &&
-							location.part <= lastThinking.part))
-				);
-			})
-		)
-			recordFirstApplicationWireEdit(true);
+		try {
+			for (const id of getNativeReplayState(args.db, args.sessionId)
+				.reasoningIds)
+				goneThinking.add(id);
+		} catch {
+			// Unreadable native state is handled by the native lanes below. Here it
+			// only means fewer omissions are known, so more thinking counts as kept
+			// and an edit is more likely to require its companion strip.
+		}
+		const redacted = new Map<string, Set<number>>();
+		for (const [index, raw] of workingMessages.entries()) {
+			const id = stableIdResolver(raw, index);
+			if (
+				!id ||
+				goneThinking.has(id) ||
+				raw.role !== "assistant" ||
+				!Array.isArray(raw.content)
+			)
+				continue;
+			for (const [partIndex, part] of raw.content.entries())
+				if (
+					part &&
+					typeof part === "object" &&
+					["redactedThinking", "redacted_thinking"].includes(
+						String((part as { type?: string }).type),
+					)
+				) {
+					const indices = redacted.get(id) ?? new Set<number>();
+					indices.add(partIndex);
+					redacted.set(id, indices);
+				}
+		}
+		for (const [index, message] of mutationView.entries()) {
+			for (const [partIndex, part] of message.parts.entries()) {
+				const location = { message: index, part: partIndex };
+				sourceParts.set(part, location);
+				if (
+					message.info.role === "assistant" &&
+					!goneThinking.has(message.info.id ?? "") &&
+					((part.kind === "thinking" &&
+						part.getText() !== "" &&
+						part.getText() !== "[cleared]") ||
+						redacted.get(message.info.id ?? "")?.has(partIndex))
+				)
+					lastThinking = location;
+			}
+		}
+		for (const [tag, target] of targets) {
+			const parts =
+				target.mutationParts?.map(({ part }) => part) ??
+				target.message?.parts ??
+				[];
+			tagEditBeforeThinking.set(
+				tag,
+				parts.length === 0 ||
+					parts.some((part) => {
+						const location = sourceParts.get(part);
+						return (
+							!location ||
+							(!!lastThinking &&
+								(location.message < lastThinking.message ||
+									(location.message === lastThinking.message &&
+										location.part <= lastThinking.part)))
+						);
+					}),
+			);
+		}
+		// Reapplying a saved tag to raw history is replay. Only newly allocated
+		// prefixes that actually changed text before kept thinking require a strip.
+		for (const [tag, target] of targets) {
+			if (tag <= prefixTagStart) continue;
+			if (
+				target.mutationParts?.some(({ part }) => {
+					const location = sourceParts.get(part);
+					const text = (
+						part as { getText?: () => string | undefined }
+					).getText?.();
+					return (
+						prefixTexts.has(part) &&
+						prefixTexts.get(part) !== text &&
+						location &&
+						lastThinking &&
+						(location.message < lastThinking.message ||
+							(location.message === lastThinking.message &&
+								location.part <= lastThinking.part))
+					);
+				})
+			)
+				recordFirstApplicationWireEdit(true);
+		}
 	}
 	if (materializationHeld && rideSignals.explicitFlush)
 		sessionLog(
@@ -11498,6 +11517,7 @@ function runSynchronousPipeline(
 			tagEditBeforeThinking.get(reduction.tagNumber) ?? true,
 		);
 	if (
+		companionPossible &&
 		args.reasoningClearing?.prefixBound &&
 		firstEditSourceOrder &&
 		firstEditParts.size > 0 &&

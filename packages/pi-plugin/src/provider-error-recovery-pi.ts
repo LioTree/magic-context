@@ -234,21 +234,21 @@ export function applyPiThinkingBindingRecovery(args: {
 	/** The second replay phase must not create another removal decision from the same recovery request. */
 	freezeRecovery?: boolean;
 }): PiThinkingBindingApplication | null {
+	const before = readPiOmissionLedger(args.db, args.sessionId);
+	const flagTargetCandidate =
+		args.freezeRecovery !== false &&
+		isPrefixBoundThinkingModel(args.provider, args.model)
+			? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
+			: null;
+	const flagTarget = flagTargetCandidate?.startsWith(LATEST_THINKING_RESTORE)
+		? null
+		: flagTargetCandidate;
+	// A phase with no recovery to freeze and no recorded omission replayed in it
+	// leaves the array as it is; skip its walks over the session.
+	if (!flagTarget && args.replayOrder && !before.phases[args.replayOrder])
+		return null;
 	const protectedMessages = latestAssistantTurnMessages(args.messages);
-	const frozenEntryIds = frozenBindingEntryIds(args.db, args.sessionId);
-	let omissionLedger = getMergedReasoningStrippedIds(args.db, args.sessionId);
-
-	const flagTargetCandidate = isPrefixBoundThinkingModel(
-		args.provider,
-		args.model,
-	)
-		? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
-		: null;
-	const flagTarget =
-		args.freezeRecovery === false ||
-		flagTargetCandidate?.startsWith(LATEST_THINKING_RESTORE)
-			? null
-			: flagTargetCandidate;
+	const frozenEntryIds = new Set(before.frozen);
 	let applied: PiThinkingBindingApplication | null = null;
 	if (flagTarget) {
 		const entryIds = new Set<string>();
@@ -288,7 +288,8 @@ export function applyPiThinkingBindingRecovery(args: {
 		messages: args.messages,
 		id: (message, index) => resolvePiStableId(message, index, args.entryIds),
 	});
-	omissionLedger = getMergedReasoningStrippedIds(args.db, args.sessionId);
+	// Re-read after the recovery above may have recorded omissions.
+	const ledger = readPiOmissionLedger(args.db, args.sessionId);
 	for (let index = 0; index < args.messages.length; index += 1) {
 		if (restoringActiveTurn && protectedMessages.has(args.messages[index]))
 			continue;
@@ -296,7 +297,7 @@ export function applyPiThinkingBindingRecovery(args: {
 		if (
 			entryId &&
 			args.replayOrder &&
-			omissionOrderFromLedger(omissionLedger, entryId) !== args.replayOrder
+			ledger.order(entryId) !== args.replayOrder
 		)
 			continue;
 		if (entryId && frozenEntryIds.has(entryId))
@@ -474,6 +475,63 @@ export function piThinkingOmissionOrder(
 	);
 }
 
+/** One parse of a session's omission ledger, with each frozen entry's replay phase. */
+interface PiOmissionLedger {
+	readonly raw: string | null;
+	readonly ids: ReadonlySet<string>;
+	readonly frozen: ReadonlySet<string>;
+	/** Whether any frozen entry replays in that phase. */
+	readonly phases: { readonly start: boolean; readonly end: boolean };
+	order(id: string): "start" | "end";
+}
+
+const omissionLedgers = new WeakMap<
+	ContextDatabase,
+	Map<string, PiOmissionLedger>
+>();
+
+/**
+ * The session's omission ledger, parsed once per stored value. The stored
+ * column text is read on every call, so any write to the ledger (a recovery,
+ * a companion strip, a rewrite) yields a fresh view.
+ */
+function readPiOmissionLedger(
+	db: ContextDatabase,
+	sessionId: string,
+): PiOmissionLedger {
+	const row = db
+		.prepare(
+			"SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?",
+		)
+		.get(sessionId) as { merged_reasoning_stripped_ids?: string | null } | null;
+	const raw = row?.merged_reasoning_stripped_ids ?? null;
+	let views = omissionLedgers.get(db);
+	if (!views) {
+		views = new Map();
+		omissionLedgers.set(db, views);
+	}
+	const cached = views.get(sessionId);
+	if (cached && cached.raw === raw) return cached;
+	const ids: ReadonlySet<string> = getMergedReasoningStrippedIds(db, sessionId);
+	const frozen = new Set<string>();
+	for (const entry of ids) {
+		if (!entry.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
+		const entryId = entry.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+		if (entryId.length > 0) frozen.add(entryId);
+	}
+	const phases = { start: false, end: false };
+	for (const id of frozen) phases[omissionOrderFromLedger(ids, id)] = true;
+	const view: PiOmissionLedger = {
+		raw,
+		ids,
+		frozen,
+		phases,
+		order: (id) => omissionOrderFromLedger(ids, id),
+	};
+	views.set(sessionId, view);
+	return view;
+}
+
 function omissionOrderFromLedger(
 	ledger: ReadonlySet<string>,
 	id: string,
@@ -522,10 +580,11 @@ export function resolvePiBindingStripOrder(args: {
 	/** Known before any stage runs: this pass is allowed to change served bytes. */
 	bustPermittedAtStart: boolean;
 }): "start" | "end" {
-	const ledger = getMergedReasoningStrippedIds(args.db, args.sessionId);
+	const view = readPiOmissionLedger(args.db, args.sessionId);
+	const ledger = view.ids;
 	if (ledger.has(THINKING_BINDING_STRIP_ORDER_END_MARKER)) return "end";
 	const frozen = new Set(
-		[...frozenBindingEntryIds(args.db, args.sessionId)].filter(
+		[...view.frozen].filter(
 			(id) =>
 				!ledger.has(piThinkingOmissionOrderId(id, "start")) &&
 				!ledger.has(piThinkingOmissionOrderId(id, "end")),
