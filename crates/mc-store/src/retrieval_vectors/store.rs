@@ -126,6 +126,8 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 /// The shared memory/commit vector schema has no input-hash column. Their text
 /// writers must invalidate old vectors on text changes; this operation checks the
 /// source's current hash against the embedded text to reject delayed provider replies.
+/// Memory status is rechecked too: archiving leaves the hash unchanged but must
+/// still prevent an in-flight reply from restoring a vector removed by the writer.
 pub fn save_if_current(
     db: &Transaction<'_>,
     chunks: &dyn ChunkCatalog,
@@ -150,6 +152,7 @@ pub fn save_if_current(
         Source::Memory { id } => db.execute(
             "INSERT INTO memory_embeddings(memory_id,embedding,model_id)
              SELECT id,?1,?2 FROM memories WHERE id=?3 AND project_path=?4 AND normalized_hash=?5
+             AND status IN ('active','permanent')
              ON CONFLICT(memory_id,model_id) DO UPDATE SET embedding=excluded.embedding",
             params![blob, model_id, id, passage.project, passage.content_hash],
         )?,
@@ -220,6 +223,11 @@ pub trait ChunkCatalog {
     fn current(&self, db: &Connection, passage: &Passage) -> rusqlite::Result<bool>;
 }
 
+/// Rust backfill includes permanent memories as well as active ones. TypeScript's
+/// primary backfill selects active rows only (project-embedding-registry.ts at
+/// 282d9c08bce4); its per-write attempt usually embeds permanent rows. This is a
+/// deliberate superset: permanent memories are live retrieval inputs too, and
+/// selection only fills missing vectors without removing any existing vector.
 pub fn pending(
     db: &Connection,
     chunks: &dyn ChunkCatalog,

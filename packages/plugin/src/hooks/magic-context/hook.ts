@@ -194,6 +194,8 @@ export interface MagicContextDeps {
             min_chars: number;
         };
         signed_thinking_hold?: "off" | "on";
+        /** Live-sampled: lets ck-mc run the dream tasks it publishes as its own. */
+        rust_background_enabled?: boolean;
         /** Compaction-off mode gate (issue #266). Resolved ONCE here at the
          *  session-hook construction boundary via isCompactionEnabled; the
          *  resolved boolean is threaded to the transform phases. */
@@ -886,9 +888,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             tasks: runtimeConfigs,
             executor,
             projectMemoryEnabled: deps.config.memory?.enabled !== false,
-        }).catch((error: unknown) => {
-            log("[dreamer] scheduled task run failed:", error);
-        });
+        })
+            .catch((error: unknown) => {
+                log("[dreamer] scheduled task run failed:", error);
+            });
     };
 
     const sendCommandNotification = async (
@@ -992,7 +995,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   // Manual /ctx-dream → Dreamer v2 per-task scheduler. Runs in this
                   // hook's own checkout (not a stale sibling worktree from the
                   // shared git:<sha> identity map).
-                  runManual: (task) => {
+                  runManual: async (task) => {
                       const sampledDream = deps.sampleDreamConfig?.() ?? deps.config;
                       const currentDreamer = sampledDream.dreamer ?? dreamerConfig;
                       return runManualDream({

@@ -137,7 +137,7 @@ export interface MemoryRestorePreview {
     before: MemoryHistorySnapshot;
     after: MemoryHistorySnapshot;
   }>;
-  adoption: "next_natural_hard";
+  adoption: "next_allowed_bust" | "dashboard_epoch_hard";
 }
 
 export interface MemoryRestoreRequest {
@@ -159,7 +159,7 @@ export interface MemoryRestoreReceipt {
   restoredDecisionKey: string | null;
   revisions: MemoryRevisionRef[];
   conflicts: MemoryRevisionConflict[];
-  adoption: "next_natural_hard";
+  adoption: "next_allowed_bust" | "dashboard_epoch_hard";
 }
 
 /** Reply of every dashboard memory setter (status, category, content,

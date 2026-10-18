@@ -14,6 +14,10 @@ import {
     OpenCodeRetrospectiveRawProvider,
     type RetrospectiveRawProvider,
 } from "../features/magic-context/dreamer/retrospective-raw-provider";
+import {
+    type DreamModuleClient,
+    readRustOwnedDreamTasks,
+} from "../features/magic-context/dreamer/rust-ownership";
 import { deleteTaskScheduleRowsForProject } from "../features/magic-context/dreamer/storage-task-schedule";
 import {
     buildDreamTaskRuntimeConfigs,
@@ -119,7 +123,11 @@ interface ProjectRegistration {
     sampleDreamRun?: () => Partial<
         Pick<
             ProjectRegistration,
-            "dreamerConfig" | "mural" | "historianChildSweep" | "gitCommitIndexing"
+            | "dreamerConfig"
+            | "mural"
+            | "historianChildSweep"
+            | "gitCommitIndexing"
+            | "rustBackgroundEnabled"
         >
     >;
     language?: string;
@@ -159,6 +167,14 @@ interface ProjectRegistration {
     primerRawProviderFactory?: (
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
+    /**
+     * The live `rust_background_enabled`. With it on and `moduleClient` present
+     * (this host is attached to ck-mc), the tasks ck-mc publishes as its own are
+     * skipped here; without ck-mc nothing is skipped.
+     */
+    rustBackgroundEnabled?: boolean;
+    /** Optional transport for dream routes only; standalone registrations omit it. */
+    moduleClient?: DreamModuleClient;
     onDreamerProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
     sessionCleanupModuleClient?: {
         deleteSession(sessionId: string, projectRoot: string): Promise<void>;
@@ -682,12 +698,19 @@ async function sweepProject(
             onProgress: (progress, completedTask) =>
                 reg.onDreamerProgress?.(progress, completedTask),
         });
+        const rustOwnedTasks = await readRustOwnedDreamTasks({
+            rustBackgroundEnabled: reg.rustBackgroundEnabled,
+            moduleClient: reg.moduleClient,
+            projectIdentity: reg.projectIdentity,
+            projectRoot: reg.directory,
+        });
         const ran = await runDueTasksForProject({
             db,
             projectIdentity: reg.projectIdentity,
             tasks: runtimeConfigs,
             executor,
             projectMemoryEnabled: reg.memoryEnabled !== false,
+            rustOwnedTasks,
         });
         if (ran > 0) {
             log(`[dreamer] timer tick (${origin}) ${reg.projectIdentity} — ran ${ran} task(s)`);

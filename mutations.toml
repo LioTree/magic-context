@@ -26,6 +26,20 @@
 # Never `git checkout` a file while a replay runs: it removes the mutation and
 # fakes a survivor.
 
+# --- audited memory: curate edits remain undoable across runtimes ---
+[[control]]
+id = 'rust-curate-history-is-required-for-audited-undo'
+guards = 'curate update, merge and archive retain immutable audited snapshots so the real memory.restore path restores the same rows and pending embeddings as a TypeScript edit'
+file = 'crates/mc-module/src/memory_actions.rs'
+old = 'mc_store::memory_history::record_decision(tx, &decision).map_err(history_error)?;'
+new = '// Deliberately skip the history write.'
+test_file = 'crates/mc-module/src/dream_dispatch/curate_host/tests/undo.rs'
+runner = 'command'
+command = ['cargo', 'test', '-p', 'mc-module', '--lib', '{test}', '--', '--exact']
+test_count_pattern = 'running {count} test'
+expect_red = ['dream_dispatch::curate_host::tests::undo::rust_curate_undo_matches_typescript_edit_rows_history_and_embedding_queue']
+expect_message = 'history_not_found'
+
 # --- cache stability: one bust permission, byte-identical defers ---
 # ARCHITECTURE.md, load-bearing invariants 2-4: a defer (SOFT+) pass replays the
 # served prefix byte for byte, and every mutation lane consults the one per-pass

@@ -74,7 +74,7 @@ fn marker_probe_and_commit_ignore_pending_lifecycle() {
         request.mural.as_mut().unwrap().data_url = Some("data:image/png;base64,pending".into());
         request.mural.as_mut().unwrap().content_hash = Some("pending-image".into());
         ctx.now_ms = 100;
-        regate_mark_epoch_pending(&s, "ses");
+        regate_mark_history_pending(&s, "ses");
         drop(s);
         let restarted = store(dir.path());
         let marker = transform(&restarted, &request, &ctx).unwrap();
@@ -96,13 +96,13 @@ fn marker_probe_and_commit_ignore_pending_lifecycle() {
 }
 
 #[test]
-fn external_repair_still_recuts() {
+fn external_repair_waits_for_natural_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path());
     let id = s
         .insert_memory(memory_input("git:proj", "CONSTRAINTS", "external old", 0))
         .unwrap();
-    let request = req("ses", "cfg0", vec![item("tail", 1, "tail")]);
+    let mut request = req("ses", "cfg0", vec![item("tail", 1, "tail")]);
     let ctx = pctx("git:proj", "/nonexistent-docs", 0);
     let before = transform(&s, &request, &ctx).unwrap();
     s.with_context_conn_for_test(|conn| {
@@ -112,7 +112,9 @@ fn external_repair_still_recuts() {
         )
     })
     .unwrap();
-    regate_mark_epoch_pending(&s, "ses");
+    let held = transform(&s, &request, &ctx).unwrap();
+    assert_ne!(held.action, "HARD");
+    request.render_config = "cfg-natural-hard".into();
     let after = transform(&s, &request, &ctx).unwrap();
     assert_eq!(after.action, "HARD");
     assert!(after.prefix_bust_permitted);
@@ -121,7 +123,7 @@ fn external_repair_still_recuts() {
 }
 
 #[test]
-fn privacy_revocation_still_invalidates() {
+fn archiving_holds_admitted_text_until_natural_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path());
     let id = s
@@ -132,14 +134,16 @@ fn privacy_revocation_still_invalidates() {
             0,
         ))
         .unwrap();
-    let request = req("ses", "cfg0", vec![item("tail", 1, "tail")]);
+    let mut request = req("ses", "cfg0", vec![item("tail", 1, "tail")]);
     let ctx = pctx("git:proj", "/nonexistent-docs", 0);
     transform(&s, &request, &ctx).unwrap();
     s.with_context_conn_for_test(|conn| {
         conn.execute("UPDATE memories SET status='archived' WHERE id=?1", [id])
     })
     .unwrap();
-    regate_mark_epoch_pending(&s, "ses");
+    let held = transform(&s, &request, &ctx).unwrap();
+    assert_ne!(held.action, "HARD");
+    request.render_config = "cfg-natural-hard".into();
     let after = transform(&s, &request, &ctx).unwrap();
     assert_eq!(after.action, "HARD");
     assert!(after.prefix_bust_permitted);

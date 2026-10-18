@@ -189,6 +189,7 @@ describe("MagicContextConfigSchema", () => {
                 rust_pipeline: "full_request",
                 signed_thinking_hold: "off",
                 rust_provider_preparation: false,
+                rust_background_enabled: false,
                 protected_tools: { todowrite: 1, ctx_reduce: 3 },
             });
         });
@@ -829,6 +830,16 @@ describe("MagicContextConfigSchema", () => {
             ).toThrow();
         });
     });
+});
+
+it("Rust background dream ownership is opt-in and boolean", () => {
+    expect(MagicContextConfigSchema.parse({}).rust_background_enabled).toBe(false);
+    expect(
+        MagicContextConfigSchema.parse({ rust_background_enabled: true }).rust_background_enabled,
+    ).toBe(true);
+    expect(MagicContextConfigSchema.safeParse({ rust_background_enabled: "true" }).success).toBe(
+        false,
+    );
 });
 
 it("provider policy preparation consumption is opt-in", () => {

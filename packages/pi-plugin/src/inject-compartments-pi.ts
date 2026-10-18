@@ -1362,31 +1362,7 @@ export function mustMaterializePi(
 			current.upgradeState,
 		);
 	}
-	if (
-		current.workspaceFingerprint !== null ||
-		(meta.cachedM0WorkspaceFingerprint ?? null) !== null
-	) {
-		if (
-			current.workspaceFingerprint !==
-			(meta.cachedM0WorkspaceFingerprint ?? null)
-		) {
-			return piMaterializeMismatch(
-				"project_memory_change",
-				"workspaceFingerprint",
-				meta.cachedM0WorkspaceFingerprint ?? null,
-				current.workspaceFingerprint,
-			);
-		}
-	} else if (
-		current.projectMemoryEpoch !== (meta.cachedM0ProjectMemoryEpoch ?? 0)
-	) {
-		return piMaterializeMismatch(
-			"project_memory_change",
-			"projectMemoryEpoch",
-			meta.cachedM0ProjectMemoryEpoch ?? 0,
-			current.projectMemoryEpoch,
-		);
-	}
+	// External memory and workspace changes do not request a baseline rebuild.
 	// Use !== (not >), matching OpenCode mustMaterialize: a max-id that DECREASES
 	// (revert / message.removed shrinking the compartment or mutation set) must
 	// still invalidate m[0]. A '>' comparison would miss a decrease and serve a
@@ -2326,11 +2302,10 @@ function renderNewUserProfileSectionPi(
 }
 
 /**
- * The m[1] of a busting SOFT pass. It reads no memory rows and no mutation log:
- * new compartments and the user profile render as usual, the HARD fold's memory
- * blocks replay byte for byte, and this session's newer agent fragments are
- * appended (composeSoftMemoryUpdates, shared with OpenCode). Memory changes by
- * anyone else, and by automated writers, reach the prompt at the next HARD fold.
+ * An authorized delta refresh replays frozen memory blocks and corrections.
+ * Only this session's agent fragments and dashboard log payloads can append
+ * corrections (composeSoftMemoryUpdates, shared with OpenCode); automated
+ * writers and other agents still wait for a baseline rebuild.
  */
 function renderSoftM1Pi(
 	state: PiM0M1State,
@@ -2339,6 +2314,7 @@ function renderSoftM1Pi(
 	projection: AppliedProjection,
 	m0Text: string,
 	compartments: readonly PiCompartment[],
+	renderedMemoryIds: readonly number[],
 ): { result: RenderM1PiResult; projection: AppliedProjection } {
 	const compartmentsSection = renderNewCompartmentsSectionPi(
 		state,
@@ -2369,6 +2345,10 @@ function renderSoftM1Pi(
 			: composeSoftMemoryUpdates({
 					db,
 					sessionId: state.sessionId,
+					projectPath: memoryProjectPath(state),
+					dashboardAfterId: markers.maxMemoryMutationId,
+					baselineMemoryIds: renderedMemoryIds,
+					maxMemoryId: markers.maxMemoryId,
 					projection,
 					memoryBudgetTokens:
 						state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
@@ -2880,6 +2860,7 @@ function softRefreshCachedM1Pi(args: {
 			projection,
 			m0Text,
 			compartments,
+			renderedM0Ids,
 		);
 		const rendered = soft.result;
 		const m1Bytes = Buffer.from(rendered.text, "utf8");

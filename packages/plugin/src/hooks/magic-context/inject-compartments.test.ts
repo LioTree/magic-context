@@ -2118,7 +2118,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(render(true)).toBe(render(false));
     });
 
-    it("mustMaterialize detects project_memory_epoch decreases after DB restore", () => {
+    it("mustMaterialize holds project_memory_epoch decreases after DB restore", () => {
         db = makeDb();
         setProjectState(db, PROJECT_PATH, { projectMemoryEpoch: 4 });
         const state = {
@@ -2148,16 +2148,11 @@ describe("m[0]/m[1] materialization", () => {
                 projectPath: PROJECT_PATH,
                 projectDirectory: makeProjectDir(),
             }).reason,
-        ).toBe("project_memory_epoch");
+        ).toBeNull();
     });
 
-    it("mustMaterialize folds when a cached WORKSPACED m[0] becomes single-project", () => {
-        // Transition guard: a cached union m[0] carries a non-null workspace
-        // fingerprint; if the session then LEAVES its workspace, the current pass
-        // is single-project (fingerprint null). Keying the HARD gate only on the
-        // current `isWorkspaced` would fall through to the integer-epoch compare
-        // and keep rendering the stale union if a membership bump were missed.
-        // The fix compares fingerprints whenever EITHER side is non-null.
+    it("mustMaterialize holds a cached WORKSPACED m[0] when it becomes single-project", () => {
+        // Workspace membership changes are held until a natural baseline rebuild.
         db = makeDb();
         const projectDirectory = makeProjectDir();
         materializeM0({
@@ -2183,8 +2178,8 @@ describe("m[0]/m[1] materialization", () => {
             projectDirectory,
         });
 
-        expect(decision.value).toBe(true);
-        expect(decision.reason).toBe("project_memory_epoch");
+        expect(decision.value).toBe(false);
+        expect(decision.reason).toBeNull();
     });
 
     it("mustMaterialize does NOT materialize m[0] on a new compartment (it rides m[1])", () => {
@@ -4555,7 +4550,7 @@ describe("m[0]/m[1] materialization", () => {
             newContent: "Reconciled content.",
             queuedAt: 10,
         });
-        setProjectState(db, PROJECT_PATH, { projectMemoryEpoch: 1 });
+        queueM0Mutation(db, { sessionId: SESSION_ID, mutationType: "compartment_delete" });
 
         const bust = [userMessage("m2", "bust")];
         const result = injectM0M1({

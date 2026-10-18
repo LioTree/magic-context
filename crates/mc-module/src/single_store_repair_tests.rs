@@ -487,7 +487,7 @@ fn apply_restores_the_backup_history_with_its_ids_and_dependents() {
         )
         .unwrap();
     assert!(
-        meta.contains("\"project_memory_epoch_pending\":true"),
+        meta.contains("\"bootstrap_seed_fold_pending\":true"),
         "{meta}"
     );
     assert_eq!(
@@ -635,7 +635,7 @@ fn repair_discards_typescript_memory_ids_with_the_cached_pair() {
         )
         .unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(&meta).unwrap()["project_memory_epoch_pending"],
+        serde_json::from_str::<Value>(&meta).unwrap()["bootstrap_seed_fold_pending"],
         true
     );
 }
@@ -727,4 +727,63 @@ fn rust_module_keeps_typescript_upgrade_metadata_out_of_render_identity() {
             "SESSION_META_RESETS".to_string()
         )]
     );
+}
+
+#[test]
+fn independent_first_transform_after_real_repair_rebuilds_complete_old_pair() {
+    use crate::transform::{
+        tests::{item, memory_input, pctx, req, store},
+        transform,
+    };
+    let fixture = Fixture::new();
+    // Reuse real frozen bytes rather than the fixture's empty core, which would
+    // request a first render even if repair failed to mark the cache stale.
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = store(source_dir.path());
+    source
+        .insert_memory(memory_input(
+            PROJECT,
+            "CONSTRAINTS",
+            "OLD_REPAIR_SENTINEL",
+            0,
+        ))
+        .unwrap();
+    let request = req(SESSION, "unchanged", vec![item("tail", 100, "tail")]);
+    let mut ctx = pctx(PROJECT, "/nonexistent-docs", NOW);
+    ctx.compaction_enabled = false;
+    transform(&source, &request, &ctx).unwrap();
+    let before = source.load(SESSION).unwrap();
+    open_rw(&fixture.live_store)
+        .execute(
+            "UPDATE mc_cache_state SET core_state=?1,meta=?2 WHERE session_id=?3",
+            params![
+                serde_json::to_string(&before.core).unwrap(),
+                serde_json::to_string(&before.meta).unwrap(),
+                SESSION
+            ],
+        )
+        .unwrap();
+    // The repair fixture retains old mirror tables for its SQL assertions. A
+    // runnable migrated store has already dropped those populated tables.
+    open_rw(&fixture.live_store)
+        .execute_batch(mc_store::single_store_schema::MIGRATION_61_DROP_SQL)
+        .unwrap();
+    fixture.apply();
+    let repaired = store(&fixture.root);
+    let reset = repaired.load(SESSION).unwrap();
+    assert_eq!(reset.meta.max_memory_id, before.meta.max_memory_id);
+    assert!(reset.meta.bootstrap_seed_fold_pending);
+    let first = transform(&repaired, &request, &ctx).unwrap();
+    assert_eq!(first.action, "HARD", "{:?}", first.materialize_reason);
+    assert!(!serde_json::to_string(first.messages())
+        .unwrap()
+        .contains("OLD_REPAIR_SENTINEL"));
+    assert!(
+        !repaired
+            .load(SESSION)
+            .unwrap()
+            .meta
+            .bootstrap_seed_fold_pending
+    );
+    assert_ne!(transform(&repaired, &request, &ctx).unwrap().action, "HARD");
 }

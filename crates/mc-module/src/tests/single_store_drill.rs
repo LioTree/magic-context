@@ -89,7 +89,7 @@ async fn single_store_drill_post_migration_passes() {
         hard["rendered_memory_ids"].as_array().map_or(0, Vec::len)
     );
     assert_eq!(hard["decision"], "HARD", "{hard}");
-    assert_eq!(hard["materialize_reason"], "project_memory_epoch");
+    assert_eq!(hard["materialize_reason"], "first_render");
 
     // Only a completed provider reply advances the idle clock; preparing the HARD does not.
     let completed_at_ms = now_ms();

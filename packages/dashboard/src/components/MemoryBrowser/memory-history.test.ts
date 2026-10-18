@@ -212,7 +212,7 @@ function preview(patch: Partial<MemoryRestorePreview> = {}): MemoryRestorePrevie
         after: snap(7, { revision: 5, content: "Use bun for tests" }),
       },
     ],
-    adoption: "next_natural_hard",
+    adoption: "next_allowed_bust",
     ...patch,
   };
 }
@@ -228,7 +228,7 @@ function receipt(patch: Partial<MemoryRestoreReceipt> = {}): MemoryRestoreReceip
     restoredDecisionKey: "restore-1",
     revisions: [{ memoryId: 7, revision: 5 }],
     conflicts: [],
-    adoption: "next_natural_hard",
+    adoption: "next_allowed_bust",
     ...patch,
   };
 }

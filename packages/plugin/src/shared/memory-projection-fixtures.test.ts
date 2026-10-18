@@ -36,9 +36,9 @@ import { createTestTempDirFromPath } from "./test-temp-dir";
  * Shared regressions for the memory projection of one session's prompt. OpenCode
  * and Pi register them with their own drivers, so both renderers are held to the
  * same contract:
- *   - a HARD fold is the only pass that reads memory rows or the mutation log;
+ *   - only a HARD fold reads canonical memory rows or unscoped mutation logs;
  *   - a busting SOFT pass replays the fold's memory bytes and appends only this
- *     session's own agent fragments; a defer pass replays stored bytes;
+ *     session's own agent fragments and dashboard payloads; a defer replays stored bytes;
  *   - automated writers and other sessions reach the prompt at its next HARD fold.
  */
 
@@ -51,12 +51,18 @@ import {
 } from "../features/magic-context/memory/history-applier";
 
 /**
- * Whether a statement reads memories or the mutation log at all, including aggregate
- * heads such as MAX(id). Nothing that renders the memory pair on a SOFT or defer pass
- * may read either table; automatic and explicit search are the named exceptions and
- * are not part of these passes.
+ * The gate blocks canonical memory rows and log heads, including MAX(id). Only
+ * the exact immutable dashboard payload query is allowed during an authorized
+ * SOFT; a defer permits neither table. Search is tested separately.
  */
 export const MEMORY_LOADER_BLOCKED = "memory loader called on a gated pass";
+export function isDashboardPayloadRead(sql: string): boolean {
+    return (
+        sql.replace(/\s+/g, " ").trim().toLowerCase() ===
+        "select id, project_path, target_memory_id, mutation_type, superseded_by_id, category, new_content, operation_id from memory_mutation_log where id > ? and operation_id like 'dashboard:%' and (project_path = ? or target_memory_id in (select value from json_each(?))) order by id"
+    );
+}
+
 function readsMemoryTables(sql: string): boolean {
     return /\b(?:FROM|JOIN)\s+(?:memories|memory_mutation_log)\b/i.test(sql);
 }
@@ -67,8 +73,8 @@ export interface ProjectionFixture {
     projectPath: string;
     /** Two sessions of the same project. */
     sessions: readonly [string, string];
-    /** While `blocking` is true, any memory-row or mutation-log load throws. */
-    gate: { blocking: boolean; blocked: string[] };
+    /** A SOFT may read dashboard payloads, but never canonical rows or log heads. */
+    gate: { blocking: boolean; allowDashboardPayloads: boolean; blocked: string[] };
     close: () => void;
 }
 
@@ -92,7 +98,10 @@ function installLoaderGate(db: Database, gate: ProjectionFixture["gate"]): void 
                 Object.defineProperty(statement, method, {
                     configurable: true,
                     value: (...args: unknown[]) => {
-                        if (gate.blocking) {
+                        if (
+                            gate.blocking &&
+                            !(gate.allowDashboardPayloads && isDashboardPayloadRead(sql))
+                        ) {
                             gate.blocked.push(sql);
                             throw new Error(`${MEMORY_LOADER_BLOCKED}: ${sql}`);
                         }
@@ -116,7 +125,7 @@ export function createProjectionFixture(
         initializeDatabase(db);
         runMigrations(db);
     }
-    const gate = { blocking: false, blocked: [] as string[] };
+    const gate = { blocking: false, allowDashboardPayloads: false, blocked: [] as string[] };
     installLoaderGate(db, gate);
     const sessions = [`${label}-a`, `${label}-b`] as const;
     for (const session of sessions) getOrCreateSessionMeta(db, session);
@@ -217,13 +226,15 @@ function automatedEdit(f: ProjectionFixture, id: number, content: string): void 
     recordAutomatedMemoryEdit(f.db, { writer: "verify", before, reason: "verify_update" });
 }
 
-/** Run `body` with every memory-row and mutation-log load throwing. */
-function gated<T>(f: ProjectionFixture, body: () => T): T {
+/** Block row/head reads; callers testing a permitted delta refresh opt in with `allowDashboardPayloads`. */
+function gated<T>(f: ProjectionFixture, body: () => T, allowDashboardPayloads = false): T {
     f.gate.blocking = true;
+    f.gate.allowDashboardPayloads = allowDashboardPayloads;
     try {
         return body();
     } finally {
         f.gate.blocking = false;
+        f.gate.allowDashboardPayloads = false;
     }
 }
 
@@ -481,13 +492,17 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
                 expect(getMemoryById(f.db, target.id)?.content).toBe(target.content);
                 expect(getMemoryById(f.db, target.id)?.status).toBe("active");
                 if (second) expect(getMemoryById(f.db, second.id)?.status).toBe("active");
-                // Unlike automation, an external editor explicitly signals that sessions should rebuild.
-                const epochHard = driver.pass(f, session, false);
-                expect(epochHard.materialized).toBe(true);
-                expect(epochHard.m0 + epochHard.m1).toContain(target.content);
-                const afterEpoch = driver.pass(f, session, true);
-                expect(afterEpoch.materialized).toBe(false);
-                expect(afterEpoch.m0).toBe(epochHard.m0);
+                // Audited undo queues a dashboard correction, not a baseline rebuild.
+                const held = driver.pass(f, session, false);
+                expect(held).toEqual({ ...hard, materialized: false });
+                const admitted = driver.pass(f, session, true);
+                expect(admitted.materialized).toBe(false);
+                expect(admitted.m0).toBe(hard.m0);
+                expect(admitted.m1).toContain(target.content);
+                expect(driver.pass(f, session, false)).toEqual(admitted);
+                const restoredHard = driver.pass(f, session, true, { cacheExpired: true });
+                expect(restoredHard.materialized).toBe(true);
+                expect(restoredHard.m0).toContain(target.content);
                 const epoch = f.db
                     .prepare(
                         "SELECT project_memory_epoch n FROM project_state WHERE project_path=?",
@@ -517,9 +532,9 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
     const create = (label: string) =>
         createProjectionFixture(`${driver.host}-${label}`, driver.open);
 
-    // The acceptance gate: busting SOFT and defer passes never load memory rows or
-    // the mutation log. The positive control proves the gate catches a HARD fold.
-    test(`${driver.host} SOFT and defer passes read no memory rows, mutation log or their heads`, () => {
+    // SOFT permits only immutable dashboard payloads; defer reads no memory/log
+    // rows. The positive control proves that canonical HARD reads are blocked.
+    test(`${driver.host} SOFT reads only dashboard payloads and defer reads no memory rows or log heads`, () => {
         const f = create("gate");
         try {
             const [a] = f.sessions;
@@ -532,7 +547,7 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
                 mutationType: "archive",
                 targetMemoryId: baseline.id,
             });
-            const soft = gated(f, () => driver.pass(f, a, true));
+            const soft = gated(f, () => driver.pass(f, a, true), true);
             expect(soft.materialized).toBe(false);
             expect(soft.m1).toContain(
                 `<added id="${saved}" category="ARCHITECTURE">Agent save shown on the next busting pass.</added>`,
@@ -732,14 +747,15 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
         }
     });
 
-    // B1 safety peer: an external content repair still bumps the project epoch
-    // and still recuts the head; lifecycle writes cannot borrow that path.
-    test(`${driver.host} external_repair_still_recuts`, () => {
+    // An external content repair bumps the epoch for storage coherence, but its
+    // canonical text is held until an independently authorized baseline rebuild.
+    test(`${driver.host} external repair waits for natural HARD`, () => {
         const f = create("external-repair");
         try {
             const [a] = f.sessions;
             const target = memory(f, "Repaired claim before repair.");
             driver.hard(f, a);
+            const before = driver.pass(f, a, false);
             updateMemoryContent(
                 f.db,
                 target.id,
@@ -747,7 +763,8 @@ export function registerMemoryProjectionRegressions(driver: ProjectionDriver): v
                 computeNormalizedHash("Repaired claim after repair."),
             );
             bumpProjectMemoryEpoch(f.db, f.projectPath);
-            const repaired = driver.pass(f, a, true);
+            expect(driver.pass(f, a, true)).toEqual(before);
+            const repaired = driver.pass(f, a, true, { cacheExpired: true });
             expect(repaired.materialized).toBe(true);
             expect(repaired.m0).toContain("Repaired claim after repair.");
         } finally {

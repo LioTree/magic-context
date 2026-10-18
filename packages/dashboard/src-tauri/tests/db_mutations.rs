@@ -93,7 +93,8 @@ fn create_schema(conn: &Connection) {
             superseded_by_id INTEGER,
             category TEXT,
             new_content TEXT,
-            queued_at INTEGER NOT NULL
+            queued_at INTEGER NOT NULL,
+            operation_id TEXT
         );
         CREATE TABLE memory_history (id INTEGER PRIMARY KEY AUTOINCREMENT,memory_id INTEGER NOT NULL,revision INTEGER NOT NULL,previous_text TEXT NOT NULL,after_text TEXT,before_json TEXT,after_json TEXT,applied_at INTEGER NOT NULL,reason TEXT NOT NULL,evidence_json TEXT NOT NULL,source_ids_json TEXT NOT NULL,decision_key TEXT NOT NULL,UNIQUE(memory_id,revision));
         CREATE TABLE memory_journal(id INTEGER PRIMARY KEY AUTOINCREMENT,project_path TEXT NOT NULL,decision_key TEXT NOT NULL UNIQUE,operation TEXT NOT NULL,receipt_json TEXT NOT NULL,applied_at INTEGER NOT NULL,before_json TEXT,after_json TEXT);
@@ -234,7 +235,7 @@ fn seed_project_state(conn: &Connection, project_path: &str, memory_epoch: i64, 
 }
 
 #[test]
-fn archive_memory_status_is_audited_and_bumps_epoch_without_delta() {
+fn archive_memory_status_is_audited_and_bumps_epoch_with_delta() {
     let mut conn = make_db();
     let id = insert_memory(&conn, "git:project-a", "active");
     seed_project_state(&conn, "git:project-a", 9, 0);
@@ -243,7 +244,7 @@ fn archive_memory_status_is_audited_and_bumps_epoch_without_delta() {
     assert_eq!(receipt["state"], "applied");
     assert_eq!(memory_epoch(&conn, "git:project-a"), 10);
     assert_eq!(memory_epoch(&conn, "git:other"), 5);
-    assert!(mutation_log_rows(&conn).is_empty());
+    assert_eq!(mutation_log_rows(&conn).len(), 1);
     assert_eq!(
         conn.query_row(
             "SELECT COUNT(*) FROM memory_history WHERE memory_id=?1",
@@ -256,7 +257,7 @@ fn archive_memory_status_is_audited_and_bumps_epoch_without_delta() {
 }
 
 #[test]
-fn restore_memory_status_keeps_epoch_bump_without_mutation_log() {
+fn restore_memory_status_keeps_epoch_bump_with_mutation_log() {
     let mut conn = make_db();
     let id = insert_memory(&conn, "git:project-a", "archived");
     seed_project_state(&conn, "git:project-a", 9, 0);
@@ -264,15 +265,13 @@ fn restore_memory_status_keeps_epoch_bump_without_mutation_log() {
     audited_edit(&mut conn, &[id], "status", "active").expect("restore status");
 
     assert_eq!(memory_epoch(&conn, "git:project-a"), 10);
-    assert!(mutation_log_rows(&conn).is_empty());
+    assert_eq!(mutation_log_rows(&conn).len(), 1);
 }
 
 #[test]
-fn pin_active_to_permanent_bumps_epoch_without_mutation_log() {
-    // active -> permanent reorders the m[0] baseline (selection is
-    // permanent-first under budget pressure), so it must bump the epoch to
-    // invalidate cached m[0]. The old code gated restore on archived-origin
-    // only, so this transition silently invalidated nothing.
+fn pin_active_to_permanent_bumps_epoch_with_mutation_log() {
+    // Pinning updates search-cache state and queues a held prompt delta;
+    // selection order changes only at the next natural baseline rebuild.
     let mut conn = make_db();
     let id = insert_memory(&conn, "git:project-a", "active");
     seed_project_state(&conn, "git:project-a", 9, 0);
@@ -280,11 +279,11 @@ fn pin_active_to_permanent_bumps_epoch_without_mutation_log() {
     audited_edit(&mut conn, &[id], "status", "permanent").expect("pin status");
 
     assert_eq!(memory_epoch(&conn, "git:project-a"), 10);
-    assert!(mutation_log_rows(&conn).is_empty());
+    assert_eq!(mutation_log_rows(&conn).len(), 1);
 }
 
 #[test]
-fn unpin_permanent_to_active_bumps_epoch_without_mutation_log() {
+fn unpin_permanent_to_active_bumps_epoch_with_mutation_log() {
     let mut conn = make_db();
     let id = insert_memory(&conn, "git:project-a", "permanent");
     seed_project_state(&conn, "git:project-a", 9, 0);
@@ -292,7 +291,7 @@ fn unpin_permanent_to_active_bumps_epoch_without_mutation_log() {
     audited_edit(&mut conn, &[id], "status", "active").expect("unpin status");
 
     assert_eq!(memory_epoch(&conn, "git:project-a"), 10);
-    assert!(mutation_log_rows(&conn).is_empty());
+    assert_eq!(mutation_log_rows(&conn).len(), 1);
 }
 
 #[test]
@@ -321,7 +320,7 @@ fn bulk_archive_status_has_one_audited_decision_and_one_epoch() {
     assert_eq!(receipt["revisions"].as_array().unwrap().len(), 2);
     assert_eq!(memory_epoch(&conn, "git:project-a"), 10);
     assert_eq!(memory_epoch(&conn, "git:other"), 5);
-    assert!(mutation_log_rows(&conn).is_empty());
+    assert_eq!(mutation_log_rows(&conn).len(), 2);
     assert_eq!(
         conn.query_row(
             "SELECT COUNT(DISTINCT decision_key) FROM memory_history",
@@ -366,7 +365,7 @@ fn bulk_delete_archives_rows_in_one_undoable_decision() {
     assert_eq!(receipt["state"], "applied");
     assert_eq!(memory_epoch(&conn, "git:project-a"), 1);
     assert_eq!(memory_epoch(&conn, "git:other"), 0);
-    assert!(mutation_log_rows(&conn).is_empty());
+    assert_eq!(mutation_log_rows(&conn).len(), 2);
     for id in ids {
         assert_eq!(
             conn.query_row("SELECT status FROM memories WHERE id=?1", [id], |row| {
@@ -391,6 +390,19 @@ fn bulk_delete_archives_rows_in_one_undoable_decision() {
     )
     .unwrap();
     assert_eq!(restored["state"], "applied");
+    // Replaying an old durable receipt must remain valid after the render policy changes.
+    let mut legacy_receipt = restored.clone();
+    legacy_receipt["adoption"] = serde_json::json!("dashboard_epoch_hard");
+    assert!(mc_store::memory_history::valid_receipt("memory.restore", &undo, &legacy_receipt));
+    let deltas = mutation_log_rows(&conn);
+    assert_eq!(deltas.len(), 4);
+    assert_eq!(deltas[0].1, "archive");
+    assert_eq!(deltas[1].1, "archive");
+    assert_eq!(deltas[2].1, "update");
+    assert_eq!(deltas[3].1, "update");
+    assert_eq!(deltas[2].4, Some(format!("memory {} for git:project-a", ids[0])));
+    assert_eq!(deltas[3].4, Some(format!("memory {} for git:project-a", ids[1])));
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM memory_mutation_log WHERE operation_id LIKE 'dashboard:%'", [], |row| row.get::<_, i64>(0)).unwrap(), 4);
     for id in ids {
         assert_eq!(
             conn.query_row("SELECT status FROM memories WHERE id=?1", [id], |row| {
@@ -604,14 +616,14 @@ fn bulk_update_refuses_invalid_status_without_sql_side_effects() {
 }
 
 #[test]
-fn update_memory_content_has_history_and_epoch_without_delta() {
+fn update_memory_content_has_history_and_epoch_with_delta() {
     let mut conn = make_db();
     let id = insert_memory(&conn, "git:project-a", "active");
     seed_project_state(&conn, "git:project-a", 11, 0);
     let receipt = audited_edit(&mut conn, &[id], "content", "new dashboard content").unwrap();
     assert_eq!(receipt["state"], "applied");
     assert_eq!(memory_epoch(&conn, "git:project-a"), 12);
-    assert!(mutation_log_rows(&conn).is_empty());
+    assert_eq!(mutation_log_rows(&conn).len(), 1);
     assert_eq!(
         conn.query_row("SELECT revision FROM memories WHERE id=?1", [id], |row| row
             .get::<_, i64>(0))
@@ -717,7 +729,7 @@ fn test_update_memory_category_success() {
     // project change counter asks sessions to rebuild. Dashboard edits never add
     // agent-only prompt update lines or mutation-log rows.
     assert_eq!(memory_epoch(&conn, "git:project-a"), 12);
-    assert_eq!(mutation_log_rows(&conn), vec![]);
+    assert_eq!(mutation_log_rows(&conn).len(), 1);
 }
 
 #[test]

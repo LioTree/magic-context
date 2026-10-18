@@ -70,7 +70,7 @@ export interface MemoryEditReceipt {
 export interface MemoryRestoreReceipt extends Omit<MemoryEditReceipt, "decisionKey"> {
     decisionKey: string;
     restoredDecisionKey: string | null;
-    adoption: "dashboard_epoch_hard";
+    adoption: "next_allowed_bust" | "dashboard_epoch_hard";
 }
 export interface MemoryRestorePreview {
     version: 1;
@@ -85,7 +85,7 @@ export interface MemoryRestorePreview {
         before: MemoryHistorySnapshot;
         after: MemoryHistorySnapshot;
     }>;
-    adoption: "dashboard_epoch_hard";
+    adoption: "next_allowed_bust" | "dashboard_epoch_hard";
 }
 export interface MemoryHistoryRequest {
     projectPath: string;

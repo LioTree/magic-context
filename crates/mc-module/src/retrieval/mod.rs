@@ -7,6 +7,7 @@
 pub use crate::memory_tool::{compartments, hybrid};
 
 pub mod embedding_provider;
+pub mod note_ranking;
 
 use crate::parity_contract::*;
 

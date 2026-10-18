@@ -714,6 +714,25 @@ function applyPlannedWrite(
             : [],
     });
     recordMemoryHistoryDecision(db, decision);
+    // Keep dashboard deltas atomic with the audited canonical edit.
+    for (const target of plan.after) {
+        db.prepare(`INSERT INTO memory_mutation_log
+            (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at, operation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+            projectPath,
+            target.supersededByMemoryId !== null
+                ? "superseded"
+                : target.status === "archived"
+                  ? "archive"
+                  : "update",
+            target.id,
+            target.supersededByMemoryId,
+            target.category,
+            target.content,
+            now,
+            `dashboard:${key}`,
+        );
+    }
     const epochProject =
         projectPath.startsWith("git:") || projectPath.startsWith("dir:")
             ? projectPath
@@ -754,7 +773,7 @@ function write(
                   restoredDecisionKey: key,
                   revisions,
                   conflicts,
-                  adoption: "dashboard_epoch_hard",
+                  adoption: "next_allowed_bust",
               }
             : {
                   version: 1,
@@ -905,7 +924,7 @@ export function previewMemoryRestore(
                     before: plan.before[index]!,
                     after,
                 })),
-                adoption: "dashboard_epoch_hard",
+                adoption: "next_allowed_bust",
             } as MemoryRestorePreview;
         })
         .deferred();

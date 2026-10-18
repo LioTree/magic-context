@@ -131,6 +131,7 @@ pub fn compose(
             if (used_full + cost) as f64 <= full_budget && full_lines + fragment.lines.len() <= 40 {
                 committed.push(CommittedFragment {
                     id: fragment.id,
+                    dashboard_log_id: fragment.dashboard_log_id,
                     form: "full".into(),
                     overflow_ids: Vec::new(),
                     overflow_count: None,
@@ -157,6 +158,7 @@ pub fn compose(
             if used_markers + cost <= reserve {
                 committed.push(CommittedFragment {
                     id: fragment.id,
+                    dashboard_log_id: fragment.dashboard_log_id,
                     form: "marker".into(),
                     overflow_ids: Vec::new(),
                     overflow_count: None,
@@ -168,6 +170,7 @@ pub fn compose(
             }
             overflow = Some(CommittedFragment {
                 id: fragment.id,
+                dashboard_log_id: fragment.dashboard_log_id,
                 form: "overflow".into(),
                 overflow_ids: Vec::new(),
                 overflow_count: Some(0),
@@ -176,7 +179,10 @@ pub fn compose(
             });
         }
         let entry = overflow.as_mut().unwrap();
-        entry.id = fragment.id;
+        entry.id = entry.id.max(fragment.id);
+        if fragment.dashboard_log_id.is_some() {
+            entry.dashboard_log_id = fragment.dashboard_log_id;
+        }
         entry.overflow_ids.extend(&fragment.memory_ids);
         entry.overflow_count = Some(entry.overflow_count.unwrap_or(0) + 1);
     }

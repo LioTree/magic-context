@@ -13,6 +13,7 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import {
     loadAgentFragmentsAfter,
+    loadDashboardFragmentsAfter,
     maxAgentFragmentId,
     renderStaleFragmentMarker,
 } from "../../features/magic-context/memory/agent-fragments";
@@ -1993,28 +1994,14 @@ export function mustMaterialize(args: {
         }
     }
 
-    // Compare the workspace fingerprint whenever EITHER the cached baseline or
-    // the current pass is workspaced — keying only on current `isWorkspaced`
-    // would miss the workspace→single transition: a cached union m[0] whose
-    // session just left its workspace would fall through to the integer-epoch
-    // compare and keep rendering the stale union if a membership bump were
-    // missed. Mirrors renderM1's soft-refresh gate and Pi's mustMaterializePi.
-    if (
-        current.workspaceFingerprint !== null ||
-        (args.state.cachedM0WorkspaceFingerprint ?? null) !== null
-    ) {
-        if ((args.state.cachedM0WorkspaceFingerprint ?? null) !== current.workspaceFingerprint) {
-            return withToolSetHashComparison({ value: true, reason: "project_memory_epoch" });
-        }
-    } else if (args.state.cachedM0ProjectMemoryEpoch !== current.projectMemoryEpoch) {
-        return { value: true, reason: "project_memory_epoch" };
-    }
+    // External memory and workspace changes never request a baseline rebuild
+    // (HARD). Dashboard log payloads join the delta only when a refresh (SOFT)
+    // is already authorized, then remain frozen until that baseline rebuild.
     // NOTE: project_user_profile_version is deliberately NOT a trigger. Additive
     // user-profile promotions surface in m[1] via renderM1's <new-user-profile>
     // delta (version-watermark), exactly like new compartments and memories. A
     // version change must not fold m[0]; the delta reconciles into m[0] on the
-    // next HARD fold. Destructive profile edits route through the same delta plus
-    // the project_memory_epoch path for external (dashboard) mutations.
+    // next HARD fold. Destructive profile edits use the same held delta.
     //
     // NOTE: max_compartment_seq is deliberately NOT a trigger. New compartments
     // are the canonical m[1] delta (renderM1 -> readNewCompartments WHERE
@@ -3132,17 +3119,17 @@ function renderNewUserProfileBlock(options: M0M1RenderOptions, markers: M0Snapsh
 }
 
 /**
- * The m[1] of a busting SOFT pass. It reads no memory rows and no mutation log:
- * new compartments and the user profile render as usual, the HARD fold's memory
- * blocks replay byte for byte, and this session's newer agent fragments are
- * appended (see composeSoftMemoryUpdates). Memory changes by anyone else, and
- * by automated writers, reach the prompt only at the next HARD fold.
+ * The m[1] of an authorized delta refresh (SOFT). Frozen memory blocks and
+ * admitted corrections replay byte for byte. New corrections come only from
+ * this session's agent fragments and dashboard-tagged mutation-log payloads;
+ * automated writers and other agents still wait for a baseline rebuild (HARD).
  */
 function renderSoftM1(
     options: M0M1RenderOptions,
     markers: M0SnapshotMarkers,
     projection: AppliedProjection,
     m0Text: string,
+    renderedMemoryIds: readonly number[],
 ): { result: RenderM1Result; projection: AppliedProjection } {
     if (!markers || markers.maxCompartmentSeq === undefined) {
         throw new RenderM1InvalidMarkersError(options.sessionId);
@@ -3173,6 +3160,10 @@ function renderSoftM1(
             : composeSoftMemoryUpdates({
                   db: options.db,
                   sessionId: options.sessionId,
+                  projectPath: options.projectPath,
+                  dashboardAfterId: markers.maxMemoryMutationId,
+                  baselineMemoryIds: renderedMemoryIds,
+                  maxMemoryId: markers.maxMemoryId,
                   projection,
                   memoryBudgetTokens:
                       options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
@@ -3440,6 +3431,10 @@ export function renderMemoryEditOverflowLine(memoryIds: readonly number[], count
 export function composeSoftMemoryUpdates(args: {
     db: Database;
     sessionId: string;
+    projectPath?: string;
+    dashboardAfterId?: number;
+    baselineMemoryIds?: readonly number[];
+    maxMemoryId?: number;
     projection: AppliedProjection;
     memoryBudgetTokens: number;
     historyBudgetTokens: number;
@@ -3456,6 +3451,7 @@ export function composeSoftMemoryUpdates(args: {
               id: overflowEntry.id,
               memoryIds: [...(overflowEntry.overflowIds ?? [])],
               count: overflowEntry.overflowCount ?? 0,
+              dashboardLogId: overflowEntry.dashboardLogId,
           }
         : null;
     const processedThrough = Math.max(
@@ -3463,6 +3459,20 @@ export function composeSoftMemoryUpdates(args: {
         ...args.projection.committed.map((fragment) => fragment.id),
     );
     const pending = loadAgentFragmentsAfter(args.db, args.sessionId, processedThrough);
+    if (args.projectPath) {
+        pending.push(
+            ...loadDashboardFragmentsAfter(
+                args.db,
+                args.projectPath,
+                Math.max(
+                    args.dashboardAfterId ?? 0,
+                    ...args.projection.committed.map((f) => f.dashboardLogId ?? 0),
+                ),
+                args.baselineMemoryIds ?? [],
+                args.maxMemoryId ?? 0,
+            ),
+        );
+    }
     if (pending.length > 0) {
         const headerTokens = estimateTokens(
             `<memory-updates>\n${MEMORY_UPDATES_HEADER}\n</memory-updates>\n`,
@@ -3502,6 +3512,9 @@ export function composeSoftMemoryUpdates(args: {
                 ) {
                     committed.push({
                         id: fragment.id,
+                        ...(fragment.dashboardLogId === undefined
+                            ? {}
+                            : { dashboardLogId: fragment.dashboardLogId }),
                         form: "full",
                         lines: fragment.lines,
                         visibleTexts: fragment.visibleTexts,
@@ -3515,6 +3528,9 @@ export function composeSoftMemoryUpdates(args: {
                 if (usedMarkers + markerCost <= markerReserve) {
                     committed.push({
                         id: fragment.id,
+                        ...(fragment.dashboardLogId === undefined
+                            ? {}
+                            : { dashboardLogId: fragment.dashboardLogId }),
                         form: "marker",
                         lines: [marker],
                         visibleTexts: [],
@@ -3522,9 +3538,16 @@ export function composeSoftMemoryUpdates(args: {
                     usedMarkers += markerCost;
                     continue;
                 }
-                overflow = { id: fragment.id, memoryIds: [], count: 0 };
+                overflow = {
+                    id: fragment.id,
+                    memoryIds: [],
+                    count: 0,
+                    dashboardLogId: undefined as number | undefined,
+                };
             }
-            overflow.id = fragment.id;
+            overflow.id = Math.max(overflow.id, fragment.id);
+            if (fragment.dashboardLogId !== undefined)
+                overflow.dashboardLogId = fragment.dashboardLogId;
             overflow.memoryIds.push(...fragment.memoryIds);
             overflow.count += 1;
         }
@@ -3533,6 +3556,9 @@ export function composeSoftMemoryUpdates(args: {
     if (overflow)
         nextCommitted.push({
             id: overflow.id,
+            ...(overflow.dashboardLogId === undefined
+                ? {}
+                : { dashboardLogId: overflow.dashboardLogId }),
             form: "overflow",
             lines: [renderMemoryEditOverflowLine(overflow.memoryIds, overflow.count)],
             visibleTexts: [],
@@ -3849,6 +3875,7 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             readAppliedProjection(options.db, options.sessionId, options.projectPath, m0Text) ??
                 legacyProjection(options.db, options.sessionId, options.projectPath, row),
             m0Text,
+            renderedM0Ids,
         );
         const rendered = soft.result;
         // Ids shown in full: the served manifest, plus agent fragments shown in full.

@@ -100,8 +100,8 @@ fn manifest_before_participant(
     if !smart_notes {
         crate::prompt_surface::disable_smart_notes_in_tools(&mut tools, PromptSurfacePreset::Full);
     }
-    // Reproduce the pre-agent-data model tools and provider roles, plus the
-    // optional project lookup used without agent-data. Pin routes independently
+    // Without agent-data, model tools and provider roles still use optional
+    // project lookup and non-served Synapse retrieval. Pin routes independently
     // so a disabled participant route cannot change both manifests.
     let mut targets = vec!["thalamus".to_string()];
     for id in [
@@ -116,6 +116,7 @@ fn manifest_before_participant(
             targets.push(id.to_string());
         }
     }
+    targets.push("synapse".into());
     ModuleManifest::builder(
         DEFAULT_MODULE_ID.to_string(),
         env!("CARGO_PKG_VERSION").to_string(),

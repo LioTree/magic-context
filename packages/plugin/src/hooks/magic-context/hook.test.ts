@@ -1138,6 +1138,80 @@ describe("magic-context hook", () => {
         }
     });
 
+    // This hook has no module client. The background switch alone cannot exclude
+    // TS tasks; the shared dream-domain lease still arbitrates with a Rust host.
+    for (const enabled of [true, false]) {
+        it(`scheduled dreaming runs classify without a module client when Rust background is ${enabled ? "on" : "off"}`, async () => {
+            process.env.XDG_DATA_HOME = makeTempDir("hook-classify-ownership-scheduled-");
+            const promptMocks = createPromptMocks();
+            const deps = createMockDeps(promptMocks);
+            deps.directory = "/repo/ownership";
+            deps.config = {
+                ...deps.config,
+                rust_background_enabled: enabled,
+                dreamer: {
+                    tasks: {
+                        "classify-memories": { schedule: "0 3 * * *", timeout_minutes: 10 },
+                    },
+                },
+            } as never;
+            const originalDateNow = Date.now;
+            Date.now = () => originalDateNow() + 2 * 60 * 60 * 1000;
+            try {
+                const hook = requireHook(createMagicContextHook(deps));
+                const db = openDatabase();
+                const projectPath = resolveProjectIdentity("/repo/ownership");
+                const due = Date.now() - 1000;
+                insertMemory(db, {
+                    projectPath,
+                    category: "ARCHITECTURE",
+                    content: "Ownership scheduled memory.",
+                });
+                writeTaskScheduleState(db, {
+                    projectPath,
+                    task: "classify-memories",
+                    lastRunAt: null,
+                    nextDueAt: due,
+                    schedule: "0 3 * * *",
+                    lastStatus: null,
+                    lastError: null,
+                    retryCount: 0,
+                });
+                await hook.event!({
+                    event: {
+                        type: "message.updated",
+                        properties: {
+                            info: {
+                                role: "assistant",
+                                finish: "stop",
+                                sessionID: "ses-ownership-schedule",
+                                providerID: "openai",
+                                modelID: "gpt-4o",
+                                tokens: { input: 10, output: 10, cache: { read: 0, write: 0 } },
+                            },
+                        },
+                    },
+                });
+                const row = () =>
+                    db
+                        .prepare(
+                            "SELECT next_due_at, last_status FROM task_schedule_state WHERE project_path = ? AND task = 'classify-memories'",
+                        )
+                        .get(projectPath) as { next_due_at: number; last_status: string | null };
+                for (
+                    let attempt = 0;
+                    attempt < 400 && row().last_status === null;
+                    attempt += 1
+                ) {
+                    await new Promise((resolve) => setTimeout(resolve, 5));
+                }
+                expect(row().last_status).not.toBeNull();
+            } finally {
+                Date.now = originalDateNow;
+            }
+        });
+    }
+
     it("clears the reasoning watermark when message.updated reports a model change", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-model-change-watermark-");
         const hook = requireHook(createMagicContextHook(createMockDeps()));

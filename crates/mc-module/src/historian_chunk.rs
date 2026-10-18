@@ -794,6 +794,7 @@ impl AssembledHistorianFiring {
         content_language: Option<&'a str>,
     ) -> HistorianFireRequest<'a> {
         HistorianFireRequest {
+            rust_background_enabled: false,
             store,
             session_id,
             project_path,
