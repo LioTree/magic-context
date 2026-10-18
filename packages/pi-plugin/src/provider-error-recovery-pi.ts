@@ -30,7 +30,7 @@ import { getHarness } from "@magic-context/core/shared/harness";
 import { log } from "@magic-context/core/shared/logger";
 import { resetPiUpperEstimateReclaim } from "./pi-fit-reclaim";
 import { clearPiLkgSessionState } from "./pi-lkg";
-import { resolvePiStableId } from "./read-session-pi";
+import { piContentFallbackIds, resolvePiStableId } from "./read-session-pi";
 
 function reportBindingRecovery(
 	sessionId: string,
@@ -199,6 +199,34 @@ function stripThinkingParts(message: unknown): number {
 	return before - strippedContent.length;
 }
 
+/** Completed turns can use the transcript's content identities; an active turn still needs its host entry. */
+function completedThinkingEntryIds(
+	messages: readonly unknown[],
+	entryIds: readonly (string | undefined | null)[],
+): (string | undefined)[] {
+	const protectedMessages = latestAssistantTurnMessages(messages);
+	if (
+		!messages.some(
+			(message, index) =>
+				!entryIds[index] &&
+				!protectedMessages.has(message) &&
+				hasThinkingPart(message),
+		)
+	)
+		return entryIds.map((id) => id ?? undefined);
+	const fallback = piContentFallbackIds(
+		messages,
+		(_message, index) => entryIds[index] ?? undefined,
+	);
+	return messages.map(
+		(message, index) =>
+			entryIds[index] ??
+			(!protectedMessages.has(message) && hasThinkingPart(message)
+				? fallback[index]
+				: undefined),
+	);
+}
+
 export interface PiThinkingBindingApplication {
 	/** The flag value read, so the caller clears only that value. */
 	flagTarget: string;
@@ -260,13 +288,17 @@ export function applyPiThinkingBindingRecovery(args: {
 	if (!flagTarget && args.replayOrder && !before.phases[args.replayOrder])
 		return null;
 	const protectedMessages = latestAssistantTurnMessages(args.messages);
+	const resolvedEntryIds = completedThinkingEntryIds(
+		args.messages,
+		args.entryIds,
+	);
 	const frozenEntryIds = new Set(before.frozen);
 	let applied: PiThinkingBindingApplication | null = null;
 	if (flagTarget) {
 		const entryIds = new Set<string>();
 		for (let index = 0; index < args.messages.length; index += 1) {
 			if (!hasThinkingPart(args.messages[index])) continue;
-			const entryId = args.entryIds[index];
+			const entryId = resolvedEntryIds[index];
 			if (!entryId) throw new PiThinkingBindingRecoveryRefusal();
 			entryIds.add(entryId);
 		}
@@ -305,7 +337,7 @@ export function applyPiThinkingBindingRecovery(args: {
 	for (let index = 0; index < args.messages.length; index += 1) {
 		if (restoringActiveTurn && protectedMessages.has(args.messages[index]))
 			continue;
-		const entryId = args.entryIds[index];
+		const entryId = resolvedEntryIds[index];
 		if (
 			entryId &&
 			args.replayOrder &&
@@ -332,10 +364,11 @@ export function hasUnfrozenPiThinking(args: {
 	provider?: string;
 	model?: string;
 }): boolean {
+	const entryIds = completedThinkingEntryIds(args.messages, args.entryIds);
 	return (
 		isPrefixBoundThinkingModel(args.provider, args.model) &&
 		args.messages.some((message, index) => {
-			const entryId = args.entryIds[index];
+			const entryId = entryIds[index];
 			return (
 				hasThinkingPart(message) && (!entryId || !args.frozen.has(entryId))
 			);
@@ -356,12 +389,14 @@ export function hasUnfrozenPiThinking(args: {
  * omissions after transcript commit, so raw history cannot restore a removed
  * block or change the rendered drop shape. `persistOnly` records this decision
  * before the pipeline edits the transcript; otherwise `messages` is its final
- * output. Entries without stable IDs and failed writes leave all thinking
- * intact. Callers serving a companion edit require persistence and withhold
- * that edit if planning or writing the omissions fails.
+ * output. Completed turns without host IDs use the same content identities as
+ * transcript tagging. Missing active-turn IDs and failed writes leave thinking
+ * intact. A caller changing earlier prompt bytes must require persistence and
+ * withhold that prompt edit if planning or writing the omissions fails.
  *
- * Callers pair this write with its landed edit in one synchronous transaction.
- * Permission alone, idle expiry and scheduler labels are not landed edits.
+ * Callers commit the prompt edit and its required omissions in one synchronous
+ * transaction. Permission to edit, idle expiry, or a scheduler's decision to run
+ * work is not proof that the prompt actually changed.
  */
 export function applyPiProactiveThinkingStrip(args: {
 	db: ContextDatabase;
@@ -384,12 +419,16 @@ export function applyPiProactiveThinkingStrip(args: {
 	const protectedMessages = args.stripActiveTurn
 		? new Set()
 		: latestAssistantTurnMessages(args.messages);
+	const resolvedEntryIds = completedThinkingEntryIds(
+		args.messages,
+		args.entryIds,
+	);
 	const entryIds: string[] = [];
 	const indices: number[] = [];
 	const existingIds = frozenBindingEntryIds(args.db, args.sessionId);
 	for (let index = 0; index < args.messages.length; index += 1) {
 		if (protectedMessages.has(args.messages[index])) continue;
-		const entryId = args.entryIds[index];
+		const entryId = resolvedEntryIds[index];
 		if (!hasThinkingPart(args.messages[index])) continue;
 		if (!entryId) {
 			if (args.requirePersistence)
@@ -438,10 +477,11 @@ export function applyPiProactiveThinkingStrip(args: {
 }
 
 /**
- * The entries whose thinking a companion strip would newly omit on this array:
- * every thinking-bearing message outside the latest assistant turn that the
- * session has not already omitted. `null` when such a message has no stable
- * entry id, so the omission could not be recorded.
+ * Plan which entries in `args.messages` need their thinking removed when the
+ * caller changes earlier prompt bytes. Include every thinking-bearing message
+ * outside the latest assistant turn that the session has not already omitted.
+ * Completed turns without a SessionEntry ID use the transcript tagger's content
+ * hash and duplicate counter, so moving a message does not change its identity.
  */
 export function planPiProactiveThinkingStrip(args: {
 	db: ContextDatabase;
@@ -451,11 +491,15 @@ export function planPiProactiveThinkingStrip(args: {
 }): { entryIds: string[] } | null {
 	const protectedMessages = latestAssistantTurnMessages(args.messages);
 	const existingIds = frozenBindingEntryIds(args.db, args.sessionId);
+	const resolvedEntryIds = completedThinkingEntryIds(
+		args.messages,
+		args.entryIds,
+	);
 	const entryIds: string[] = [];
 	for (let index = 0; index < args.messages.length; index += 1) {
 		const message = args.messages[index];
 		if (protectedMessages.has(message) || !hasThinkingPart(message)) continue;
-		const entryId = args.entryIds[index];
+		const entryId = resolvedEntryIds[index];
 		if (!entryId) return null;
 		if (!existingIds.has(entryId)) entryIds.push(entryId);
 	}
@@ -473,9 +517,10 @@ export function assertPiOldestThinkingRun(
 	omitted: ReadonlySet<string>,
 ): void {
 	let keptBefore = false;
+	const resolvedEntryIds = completedThinkingEntryIds(messages, entryIds);
 	for (let index = 0; index < messages.length; index += 1) {
 		if (!hasThinkingPart(messages[index])) continue;
-		const entryId = entryIds[index];
+		const entryId = resolvedEntryIds[index];
 		if (entryId && omitted.has(entryId)) {
 			if (keptBefore)
 				throw new DegradedPassRefusalError("pi-thinking-strip-middle-gap", {
@@ -661,13 +706,18 @@ export function shouldRunPiProactiveThinkingStrip(args: {
 	return !args.compactionOff && args.bindingStripOrder === "end";
 }
 
-/** A mandatory prefix rebuild cannot hide an incoming signed message with no durable identity. */
+/** A mandatory prefix rebuild cannot omit active-turn thinking without its host identity. */
 export function assertPiThinkingEntryIds(
 	messages: readonly unknown[],
 	entryIds: readonly (string | undefined | null)[],
 ): void {
+	const protectedMessages = latestAssistantTurnMessages(messages);
 	for (let index = 0; index < messages.length; index++) {
-		if (hasThinkingPart(messages[index]) && !entryIds[index])
+		if (
+			protectedMessages.has(messages[index]) &&
+			hasThinkingPart(messages[index]) &&
+			!entryIds[index]
+		)
 			throw new Error(
 				"Cannot persist thinking omission without a stable entry id",
 			);

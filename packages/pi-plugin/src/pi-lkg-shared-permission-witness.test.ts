@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { __test as decisions } from "@magic-context/core/features/magic-context/transform-decision-log";
 import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
@@ -267,6 +268,18 @@ test("WITNESS: frozen unresolved thinking must not price cleanup on unchanged re
 		updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
 		await pass([raw[0]]);
 		await pass();
+		appendCompartments(db, sessionId, [
+			{
+				sequence: 0,
+				startMessage: 1,
+				endMessage: 1,
+				startMessageId: "entry-1",
+				endMessageId: "entry-1",
+				title: "Published head",
+				content: "U: head",
+				p1: "U: head",
+			},
+		]);
 		signalPiPendingMaterialization(sessionId);
 		const frozen = await pass();
 		expect(JSON.stringify(frozen)).not.toContain("unresolved bound thought");
