@@ -600,11 +600,23 @@ fn native_certificate_crosses_frozen_baseline_length_and_validates_its_cut() {
     );
     prefix.through -= 1;
     prefix.parts += 1;
-    store.inner.with_conn(|conn| {
-        conn.execute("UPDATE mc_cache_state SET meta=json_set(meta,'$.tail_hygiene_baseline.prefix_count',?2) WHERE session_id=?1",
-            params![namespace, prefix.parts])?;
-        Ok(())
-    }).unwrap();
+    store
+        .inner
+        .with_conn(|conn| {
+            let raw: String = conn.query_row(
+                "SELECT meta FROM mc_cache_state WHERE session_id=?1",
+                [namespace],
+                |row| row.get(0),
+            )?;
+            let mut meta: Value = serde_json::from_str(&raw).unwrap();
+            meta["tail_hygiene_baseline"]["prefix_count"] = json!(prefix.parts);
+            conn.execute(
+                "UPDATE mc_cache_state SET meta=?2 WHERE session_id=?1",
+                params![namespace, meta.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     assert!(
         matches!(
             store.load_native_transform_snapshot(namespace, &prefix, &[]),
