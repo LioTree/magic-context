@@ -11,6 +11,7 @@
  * Findings: .cortexkit/internal-docs/investigations/reports/signed-thinking-prefix-edits-audit.md. Run with
  * MC_AUDIT_STRICT=1 to make every exposed lane fail on its strict-binding 400.
  */
+
 import { describe, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import {
@@ -28,6 +29,7 @@ import {
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
 import { getMergedReasoningStrippedIds } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { readServedPrefix } from "@magic-context/core/hooks/magic-context/served-prefix";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import * as writeTiming from "@magic-context/core/shared/write-transaction-timing";
 import { assertAdmissionParity } from "../../plugin/src/hooks/magic-context/__tests__/admission-parity.test";
@@ -37,6 +39,7 @@ import {
 	GOLDEN,
 	GoldenCapture,
 } from "../../plugin/src/hooks/magic-context/__tests__/golden-capture.test";
+import { servedMessageDigest } from "../../plugin/src/hooks/magic-context/__tests__/served-prefix-evidence";
 import {
 	type Block,
 	beforeLastThinking,
@@ -169,9 +172,7 @@ type Lane =
  * Lanes whose mid-loop bust changes the request before a signed thinking block the
  * request still carries, which a strict-binding provider rejects.
  */
-const EXPOSED = new Set<Lane>([
-	"m[0]/m[1] re-render after a recomp clears the cached pair",
-]);
+const EXPOSED = new Set<Lane>();
 
 const PRIMARY_LANES: Lane[] = [
 	"ctx_reduce drop (full removal)",
@@ -339,11 +340,16 @@ async function fixture(
 			(await handler({ messages: source }, ctx as never))?.messages ?? source;
 		if (bustedThisPass === undefined)
 			throw new Error("audit pass did not reach postprocess");
+		const prefixRecord = readServedPrefix(db, sessionId);
+		const firstKept = prefixRecord && output[prefixRecord.head.length];
 		capture.write(
 			wire(output),
 			bustedThisPass,
 			mock.hasCurrentTurnThinking(wire(output)),
 			hasPiParkedBustTrigger(sessionId),
+			!!prefixRecord?.first_kept &&
+				!!firstKept &&
+				servedMessageDigest(firstKept) === prefixRecord.first_kept.digest,
 		);
 		return { messages: output, bustedThisPass };
 	};
@@ -959,6 +965,15 @@ it(
 		async (f) => {
 			await toolLoop(f, 4);
 			const before = wire(f.served);
+			const storedBefore = readServedPrefix(f.db, f.sessionId);
+			const checkStored = (served: unknown[]) => {
+				if (GOLDEN) return;
+				const record = readServedPrefix(f.db, f.sessionId);
+				const actual = record && served[record.head.length];
+				expect(!!record?.first_kept && !!actual).toBe(true);
+				expect(record?.first_kept?.digest).toBe(servedMessageDigest(actual));
+			};
+			checkStored(f.served);
 			const firstKept = before.findIndex((message) =>
 				message.content.some((block) => block.type === "thinking"),
 			);
@@ -975,13 +990,20 @@ it(
 				expect(held.bustedThisPass).toBe(false);
 				expect(wire(held.messages)).toEqual(before);
 				expect(digest(wire(held.messages))).toBe(heldDigest);
+				checkStored(held.messages);
+				expect(readServedPrefix(f.db, f.sessionId)).toEqual(storedBefore);
 			}
 			await nextUserTurn(f, "digest-release");
 			const rebuilt = wire(f.served);
 			expect(f.mock.check(rebuilt)).toBeNull();
 			expect(thinkingBlocks(rebuilt)).toBe("[]");
 			expect(digest(rebuilt)).not.toBe(heldDigest);
-			expect(wire((await f.pass()).messages)).toEqual(rebuilt);
+			checkStored(f.served);
+			expect(readServedPrefix(f.db, f.sessionId)?.turn).toBe("digest-release");
+			const warm = (await f.pass()).messages;
+			checkStored(warm);
+			expect(f.mock.check(wire(warm))).toBeNull();
+			expect(wire(warm)).toEqual(rebuilt);
 		},
 		"reasoning-digest",
 	),
@@ -1316,11 +1338,6 @@ for (const subagent of [false, true]) {
 					console.log(
 						`AUDIT-CUT Pi/OMP | mid tool loop: ${error ?? "accepted"}; cutMoved=${moved}`,
 					);
-					if (!GOLDEN && !STRICT_AUDIT) {
-						expect(moved).toBe(true);
-						expect(error).toBe(PREFIX_ERROR);
-						return;
-					}
 					expect(error).toBeNull();
 					expect(moved).toBe(false);
 					expect(withoutThinking(after)).toBe(withoutThinking(before));
@@ -1355,11 +1372,6 @@ for (const subagent of [false, true]) {
 					);
 					// No current-turn thinking yet, but the previous turn's signed blocks are
 					// still sent, and a defer pass strips none of them.
-					if (!GOLDEN && !STRICT_AUDIT) {
-						expect(moved).toBe(true);
-						expect(error).toBe(PREFIX_ERROR);
-						return;
-					}
 					expect(error).toBeNull();
 					expect(moved).toBe(false);
 					expect(withoutThinking(after)).toBe(withoutThinking(before));

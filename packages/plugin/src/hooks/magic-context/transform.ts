@@ -2934,6 +2934,8 @@ export function createTransform(deps: TransformDeps) {
             );
             messages.splice(0, messages.length, ...JSON.parse(recovery.prefix.json), ...suffix);
         }
+        if (postTransformResult.finalizeServedPrefix?.(false))
+            postTransformResult.bustedThisPass = true;
         const recoveryReleaseReason =
             recovery.rebuildReason ?? (recoveryNormalized ? "recovery_tail_normalized" : undefined);
         if (recoveryReleaseReason) postTransformResult.bustedThisPass = true;
@@ -3652,9 +3654,27 @@ export function createTransform(deps: TransformDeps) {
         deps.onPostprocess?.({ bustedThisPass: postTransformResult.bustedThisPass });
         // The pass is about to return its request to the host, so the capture of that
         // request was really served: give it its served-capture id now.
+        // Publish the prefix before releasing its saved-request capture. A
+        // failed prefix write must leave the old record and certificate intact.
+        const publishServed = () => {
+            if (postTransformResult.finalizeServedPrefix?.())
+                postTransformResult.bustedThisPass = true;
+            return servedAtReturn
+                ? recordServedCapture(
+                      db,
+                      sessionId,
+                      servedAtReturn.fullCoverage,
+                      servedAtReturn.slot,
+                      servedAtReturn.prior,
+                  )
+                : undefined;
+        };
+        const servedCaptureId =
+            postTransformResult.prefixRecordWritable && !compactionOff
+                ? db.transaction(publishServed).immediate()
+                : publishServed();
         if (servedAtReturn) {
-            const { slot, fullCoverage, prior } = servedAtReturn;
-            const servedCaptureId = recordServedCapture(db, sessionId, fullCoverage, slot, prior);
+            const { slot } = servedAtReturn;
             releaseWithheldServedCapture(sessionId, slot, servedCaptureId);
             if (savedAtReturn) {
                 savedAtReturn.servedCaptureId = servedCaptureId;

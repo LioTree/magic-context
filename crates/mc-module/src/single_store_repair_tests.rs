@@ -184,6 +184,14 @@ impl Fixture {
             params![SESSION],
         )
         .unwrap();
+        live.execute(
+            "UPDATE session_meta SET served_prefix = ?1, held_release = ?2 WHERE session_id = ?3",
+            params![
+                r#"{"version":1,"head":[{"info":{"role":"user"},"parts":[{"type":"text","text":"frozen head"}]}],"summary":null,"first_kept":{"id":"m26","digest":"frozen-digest"},"cut_mode":{"mode":"inclusive","id":"m25"},"turn":"m1","provenance":{"host":"opencode-v1","id_space":"opencode-v1-message","generation":"v1","projection":"messages","pass":1}}"#,
+                r#"{"version":1,"materialization":"user_flush"}"#,
+                SESSION
+            ],
+        ).unwrap();
         drop(live);
         let store = open_rw(&live_store);
         store
@@ -200,7 +208,7 @@ impl Fixture {
         store
             .execute(
                 "INSERT INTO mc_cache_state(session_id, row_version, core_state, meta, last_activity_at)
-                 VALUES (?1, 1, '{}', '{\"initialized\":true}', 1)",
+                 VALUES (?1, 1, '{}', '{\"initialized\":true,\"held_release\":{\"reason\":\"flush\",\"obligations\":[{\"lane\":\"flush\",\"pending\":true}]}}', 1)",
                 params![SESSION],
             )
             .unwrap();
@@ -376,6 +384,14 @@ fn the_preview_names_the_truncated_session_and_writes_nothing() {
 #[test]
 fn apply_restores_the_backup_history_with_its_ids_and_dependents() {
     let fixture = Fixture::new();
+    let held_before: (String, String) = fixture
+        .live()
+        .query_row(
+            "SELECT served_prefix, held_release FROM session_meta WHERE session_id = ?1",
+            params![SESSION],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
     let report = fixture.apply();
     assert_eq!(report.status, "repaired");
     let live = fixture.live();
@@ -432,6 +448,21 @@ fn apply_restores_the_backup_history_with_its_ids_and_dependents() {
         ),
         "cached m[0] and the pending marker move are cleared; the host's marker state is kept"
     );
+    let held: (String, String) = open_rw(&fixture.live_context)
+        .query_row(
+            "SELECT served_prefix, held_release FROM session_meta WHERE session_id = ?1",
+            params![SESSION],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        held, held_before,
+        "repair must not replace the served unit or a parked release"
+    );
+    let prefix: serde_json::Value = serde_json::from_str(&held.0).unwrap();
+    assert_eq!(prefix["head"][0]["parts"][0]["text"], "frozen head");
+    assert_eq!(prefix["first_kept"]["id"], "m26");
+    assert_eq!(held.1, r#"{"version":1,"materialization":"user_flush"}"#);
     assert_eq!(
         fixture
             .ids("SELECT COUNT(*) FROM m0_mutation_log WHERE mutation_type = 'compartment_delete'"),
@@ -458,6 +489,10 @@ fn apply_restores_the_backup_history_with_its_ids_and_dependents() {
     assert!(
         meta.contains("\"project_memory_epoch_pending\":true"),
         "{meta}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&meta).unwrap()["held_release"],
+        serde_json::json!({"reason":"flush","obligations":[{"lane":"flush","pending":true}]})
     );
     assert!(fixture.root.join("repair-backup/MANIFEST.tsv").exists());
     // A second preview has nothing left to do.

@@ -42,7 +42,8 @@ export class GoldenCapture {
         wire: Wire,
         bustedThisPass: boolean,
         hasBoundary: boolean,
-        hasParkedTrigger = false,
+        hasParkedTrigger: boolean,
+        validatingRecord: boolean,
     ): void {
         if (!GOLDEN) return;
         const dir = join(GOLDEN, this.name);
@@ -51,9 +52,7 @@ export class GoldenCapture {
             defer: !bustedThisPass,
             noBoundary: !hasBoundary,
             noParkedTrigger: !hasParkedTrigger,
-            // Records of previously sent message prefixes are not implemented yet,
-            // so record validation cannot exclude captures from the identity comparison.
-            validatingRecord: true,
+            validatingRecord,
         };
         const file = `pass-${String(++this.passNumber).padStart(4, "0")}.${STRICT_AUDIT ? "strict" : "default"}.json`;
         writeFileSync(

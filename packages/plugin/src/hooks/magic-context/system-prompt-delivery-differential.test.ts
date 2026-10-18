@@ -510,8 +510,13 @@ async function pi(signed: boolean, seed: number, active = false) {
                 if (e.edit) instruction = `genuine instructions ${e.pass}`;
                 if (e.flush) piContext.signalPiPendingMaterialization(sessionId, "user_flush");
                 if (e.history) piContext.signalPiHistoryRefresh(sessionId);
-                if (e.model)
+                if (e.model) {
                     model = model === "claude-opus-5-5" ? "claude-sonnet-4-6" : "claude-opus-5-5";
+                    // Turns served by the other model have no protected-prefix
+                    // record. Start a real user request before simulating a new
+                    // signed reply on the protected model again.
+                    if (active && model === "claude-opus-5-5") user();
+                }
                 if (e.drop) {
                     const target = getTagsBySession(db, sessionId).find(
                         (tag) => tag.type === "tool" && tag.status === "active",
@@ -618,7 +623,13 @@ async function pi(signed: boolean, seed: number, active = false) {
                     if (ackAt < 0) ackAt = e.pass;
                 }
             } catch (error) {
-                errors.push(`${e.pass}:${String(error)}`);
+                const causes: string[] = [];
+                let cause: unknown = error;
+                for (let depth = 0; cause && depth < 8; depth++) {
+                    causes.push(String(cause));
+                    cause = cause instanceof Error ? cause.cause : undefined;
+                }
+                errors.push(`${e.pass}:${causes.join(" caused by ")}`);
                 bodies.push(`ERROR:${String(error)}`);
             }
         }

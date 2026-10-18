@@ -253,6 +253,7 @@ import {
 	modelAcceptsEmptyContent,
 	variantChangeBustsProviderCache,
 } from "@magic-context/core/hooks/magic-context/sentinel";
+import { prefixRecordProblem } from "@magic-context/core/hooks/magic-context/served-prefix";
 import { servedPrefixMatches } from "@magic-context/core/hooks/magic-context/strict-thinking-prefix";
 import {
 	buildEditSupersessionReclaim,
@@ -489,6 +490,7 @@ import {
 	getPiServedTagNumbers,
 	PiServedIdentityError,
 } from "./served-array-ledger";
+import { PiPrefixPass } from "./served-prefix-pi";
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import {
@@ -6041,6 +6043,10 @@ export function registerPiContextHandler(
 					if (id) recoveredEntryIds.set(message, id);
 				});
 				result.postCommitEntryIdByRef = recoveredEntryIds;
+				result.prefixStableIds = new Map([
+					...(result.prefixStableIds ?? []),
+					...recoveredEntryIds,
+				]);
 				outputMessages = [...prefix, ...suffix];
 				result.syntheticLeadingCount = recovery.prefix.outputEntryIds.findIndex(
 					(id) => id !== null,
@@ -6632,6 +6638,58 @@ export function registerPiContextHandler(
 				)
 					throw new PiDegradedPassError("outgoing-over-window");
 			}
+			const prefixStableId = (message: unknown): string | undefined =>
+				result.prefixStableIds?.get(message as object) ??
+				result.postCommitEntryIdByRef.get(message as object) ??
+				result.lkgEntryIdByRef.get(message as object);
+			const finishPrefix = (publish = true) =>
+				result.prefixPass?.finish(
+					outputMessages,
+					result.syntheticLeadingCount,
+					prefixStableId,
+					result.injectionResult?.renderedBoundary.endMessageId,
+					publish,
+				);
+			const prefixRepairNeeded =
+				result.prefixPass?.needsRepair(outputMessages, prefixStableId) === true;
+			const prefixRepairPlan = prefixRepairNeeded
+				? planPiProactiveThinkingStrip({
+						db: options.db,
+						sessionId,
+						messages: outputMessages,
+						entryIds: outputMessages.map(prefixStableId),
+					})
+				: undefined;
+			if (
+				prefixRepairNeeded &&
+				(!prefixRepairPlan || prefixRepairPlan.entryIds.length > 0)
+			) {
+				const lateStrip = pairedThinkingEdit({
+					db: options.db,
+					messages: outputMessages,
+					edit: () => {
+						const strip = applyPiProactiveThinkingStrip({
+							db: options.db,
+							sessionId,
+							messages: outputMessages,
+							entryIds: outputMessages.map(prefixStableId),
+							provider: ctx.model?.provider,
+							model: ctx.model?.id,
+							cacheBustingPass: true,
+							stripActiveTurn: false,
+							requirePersistence: true,
+						});
+						finishPrefix(false);
+						return strip;
+					},
+					needsCompanion: () => false,
+					persistCompanion: () => {},
+				});
+				if (lateStrip?.entryIds.length) {
+					result.bustedThisPass = true;
+					clearPiChannel1State(sessionId);
+				}
+			} else finishPrefix(false);
 			let serializedOutput: PiLkgSerializedOutput | undefined;
 			let numbersCommitted = false;
 			budget.stage = "LKG/served publication";
@@ -6822,6 +6880,7 @@ export function registerPiContextHandler(
 						ticket,
 					);
 			}
+			finishPrefix();
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;
 			};
@@ -8272,6 +8331,8 @@ interface PiChannelBaselineSnapshot {
 }
 
 interface RunPipelineResult {
+	prefixPass?: PiPrefixPass;
+	prefixStableIds?: ReadonlyMap<object, string>;
 	recoveryNormalized?: boolean;
 	lkgFrozenReleaseReason?: string;
 	/** Shared permission for first applications in the pipeline and host-side lanes. */
@@ -8419,29 +8480,91 @@ function captureReasoningMutationRollback(
 async function runCompactionOffPipeline(
 	args: RunPipelineArgs,
 ): Promise<RunPipelineResult> {
+	const offStableIds = new Map<object, string>();
+	for (const [index, message] of args.messages.entries()) {
+		if (message && typeof message === "object") {
+			const id = resolvePiRealStableId(
+				message,
+				index,
+				args.entryIds,
+				args.entryIdByRef ?? undefined,
+			);
+			if (id) offStableIds.set(message, id);
+		}
+	}
+	const stableId = (message: unknown) =>
+		message && typeof message === "object"
+			? offStableIds.get(message)
+			: undefined;
+	const boundary = hasActiveAnthropicThinkingTurn(
+		args.messages,
+		args.resolvedProviderID,
+		args.resolvedModelID,
+	);
+	const prefixPass =
+		args.injection &&
+		isPrefixBoundThinkingModel(args.resolvedProviderID, args.resolvedModelID)
+			? new PiPrefixPass(
+					args.db,
+					args.sessionId,
+					args.messages,
+					stableId,
+					boundary,
+					true,
+				)
+			: undefined;
 	let injectionResult: PiInjectionResult | null = null;
 	if (args.injection) {
-		injectionResult = injectM0M1Pi(
-			{
-				sessionId: args.sessionId,
-				projectIdentity: args.projectIdentity,
-				projectDirectory: args.projectDirectory,
-				memoryEnabled: args.injection.memoryEnabled,
-				injectDocs: args.injection.injectDocs,
-				injectionBudgetTokens: args.injection.injectionBudgetTokens,
-				historyBudgetTokens: args.injection.historyBudgetTokens,
-				historyBudgetPolicyIdentity: args.injection.historyBudgetPolicyIdentity,
-				muralEnabled: args.injection.muralEnabled === true,
-				compactionOff: true,
-			},
-			args.db,
-			args.messages as Parameters<typeof injectM0M1Pi>[2],
-			args.entryIds,
-			false,
-			args.injectionPassSnapshot,
-		);
+		const state: PiM0M1State = {
+			sessionId: args.sessionId,
+			projectIdentity: args.projectIdentity,
+			projectDirectory: args.projectDirectory,
+			memoryEnabled: args.injection.memoryEnabled,
+			injectDocs: args.injection.injectDocs,
+			injectionBudgetTokens: args.injection.injectionBudgetTokens,
+			historyBudgetTokens: args.injection.historyBudgetTokens,
+			historyBudgetPolicyIdentity: args.injection.historyBudgetPolicyIdentity,
+			muralEnabled: args.injection.muralEnabled === true,
+			compactionOff: true,
+		};
+		const recorded =
+			boundary && prefixPass
+				? prefixPass.replay(args.messages, stableId)
+				: null;
+		if (boundary && prefixPass && !recorded)
+			state.preparedPrefix = prepareCachedM0M1PiReplay(
+				state,
+				args.db,
+				args.injectionPassSnapshot?.cachedRow,
+			);
+		if (prefixPass)
+			prefixPass.compactionOffFallback = (messages, headCount) => {
+				const shadow = messages
+					.slice(0, headCount)
+					.filter(
+						(message) => (message as { role?: string }).role === "system",
+					) as Parameters<typeof injectM0M1Pi>[2];
+				const fallbackState = {
+					...state,
+					preparedPrefix: prepareCachedM0M1PiReplay(state, args.db),
+				};
+				injectM0M1Pi(fallbackState, args.db, shadow);
+				messages.splice(0, headCount, ...shadow);
+			};
+		injectionResult =
+			recorded ??
+			injectM0M1Pi(
+				state,
+				args.db,
+				args.messages as Parameters<typeof injectM0M1Pi>[2],
+				args.entryIds,
+				false,
+				args.injectionPassSnapshot,
+			);
 	}
 	return {
+		prefixPass,
+		prefixStableIds: offStableIds,
 		messages: args.messages as unknown[],
 		prefixBustPermitted: false,
 		prefixMutationAllowed: false,
@@ -8922,6 +9045,47 @@ function runSynchronousPipeline(
 		realStableId(msg, index) ??
 		passFallbackIds[index] ??
 		resolvePiStableId(msg, index);
+	const prefixPass =
+		args.injection && args.reasoningClearing?.prefixBound === true
+			? new PiPrefixPass(
+					args.db,
+					args.sessionId,
+					args.messages,
+					stableIdResolver,
+					protectedSignedPrefix,
+					false,
+				)
+			: undefined;
+	if (prefixPass && !protectedSignedPrefix) {
+		const record = prefixPass.record;
+		const problem = prefixRecordProblem(
+			record,
+			{
+				host: "pi",
+				id_space: "pi-entry",
+				generation: "pi",
+				projection: "messages",
+			},
+			prefixPass.turn,
+			false,
+		);
+		if (
+			problem ||
+			!record?.first_kept ||
+			!args.messages.some(
+				(message, index) =>
+					stableIdResolver(message, index) === record.first_kept?.id,
+			)
+		) {
+			const plan = planPiProactiveThinkingStrip({
+				db: args.db,
+				sessionId: args.sessionId,
+				messages: args.messages as unknown[],
+				entryIds: args.messages.map(stableIdResolver),
+			});
+			if (!plan || plan.entryIds.length > 0) stripForPrefixRewrite();
+		}
+	}
 	let foldingSystemState: PiEffectiveSystemState | null = null;
 	try {
 		// Capture the provider-visible system state before transforming the served
@@ -11215,21 +11379,50 @@ function runSynchronousPipeline(
 			if (!piM0State) {
 				throw new Error("Pi m[0] state must exist before wire injection");
 			}
-			const wireInjectionResult = injectM0M1PiForRun(
-				piM0State,
-				args.db,
-				args.messages as Parameters<typeof injectM0M1Pi>[2],
-				args.entryIds,
-				// recomputeM1ThisPass: recompute m[1] (vs byte-identical replay) on any
-				// cache-busting pass — history refresh (new compartment published),
-				// deferred history refresh, OR executed work (drops/heuristics). A
-				// history-refresh-only pass has executedWorkThisPass=false but MUST
-				// re-render m[1] so the new compartment surfaces; gating on work alone
-				// (the prior behavior, masked by the now-removed cache clear) would
-				// replay stale m[1]. Mirrors OpenCode's isCacheBustingPass gate.
-				isCacheBustingPass,
-				injectionPassSnapshot,
-			);
+			if (prefixPass) prefixPass.boundary = protectedSignedPrefix;
+			const candidatePrefix =
+				prefixPass && !protectedSignedPrefix
+					? getOrCreateSessionMeta(args.db, args.sessionId)
+					: null;
+			const unchangedRecordedHead =
+				candidatePrefix &&
+				prefixPass?.record &&
+				servedPrefixMatches({
+					messages: prefixPass.record.head.filter(
+						(message) => (message as { role?: string }).role !== "system",
+					),
+					m0Text: candidatePrefix.cachedM0Bytes?.toString(),
+					m1Text: candidatePrefix.cachedM1Bytes?.toString(),
+					muralDataUrl: candidatePrefix.cachedM0MuralDataUrl,
+				});
+			const recordedInjection =
+				prefixPass &&
+				(protectedSignedPrefix ||
+					(unchangedRecordedHead &&
+						!foldBustsServedPrefixThisPass &&
+						!rewritingSignedPrefix &&
+						!firstRenderBust))
+					? prefixPass.replay(args.messages, (message) =>
+							postCommitStableIdByRef.get(message as object),
+						)
+					: null;
+			const wireInjectionResult =
+				recordedInjection ??
+				injectM0M1PiForRun(
+					piM0State,
+					args.db,
+					args.messages as Parameters<typeof injectM0M1Pi>[2],
+					args.entryIds,
+					// recomputeM1ThisPass: recompute m[1] (vs byte-identical replay) on any
+					// cache-busting pass — history refresh (new compartment published),
+					// deferred history refresh, OR executed work (drops/heuristics). A
+					// history-refresh-only pass has executedWorkThisPass=false but MUST
+					// re-render m[1] so the new compartment surfaces; gating on work alone
+					// (the prior behavior, masked by the now-removed cache clear) would
+					// replay stale m[1]. Mirrors OpenCode's isCacheBustingPass gate.
+					isCacheBustingPass,
+					injectionPassSnapshot,
+				);
 			injectionResult = preFoldInjectionResult?.m0Materialized
 				? {
 						...wireInjectionResult,
@@ -11283,6 +11476,11 @@ function runSynchronousPipeline(
 			);
 			logTransformTiming(args.sessionId, "compartmentPhase", tInjection);
 		} catch (err) {
+			if (
+				err instanceof DegradedPassRefusalError &&
+				err.site === "served-prefix"
+			)
+				throw err;
 			sessionLog(
 				args.sessionId,
 				`compartment injection failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
@@ -11290,6 +11488,7 @@ function runSynchronousPipeline(
 		}
 	}
 
+	if (prefixPass?.replayed) historyWasConsumedThisPass = false;
 	transcript.finalizeToolRemovals();
 	const tDroppedPlaceholders = performance.now();
 	const heldPlaceholderIds: string[] = [];
@@ -11821,7 +12020,10 @@ function runSynchronousPipeline(
 	parkedTriggers?.persist(args.db, args.sessionId);
 	if (!parkedTriggers?.pending)
 		parkedBustTriggersBySession.delete(args.sessionId);
+	if (prefixPass) prefixPass.boundary = protectedSignedPrefix;
 	return {
+		prefixPass,
+		prefixStableIds: postCommitStableIdByRef,
 		messages: outputMessages,
 		recoveryNormalized,
 		lkgFrozenReleaseReason:

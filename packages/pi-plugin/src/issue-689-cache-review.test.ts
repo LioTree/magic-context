@@ -302,10 +302,12 @@ it("review 689: upper-only pressure keeps an unfinished signed-thinking turn bel
 		const initial = [userMessage("initial", 1), assistantMessage("done", 2)];
 		await f.pass(initial);
 		f.settle();
+		const notice = metadataNotice(3);
 		const source = [
 			...initial,
-			metadataNotice(3),
+			{ ...notice, content: notice.content.slice(0, 1) },
 			userMessage("next", 4),
+			{ ...notice, timestamp: 4.5, content: notice.content.slice(1) },
 			assistantMessage("", 5, {
 				provider: "anthropic",
 				model: "claude-opus-5-5",
@@ -326,6 +328,10 @@ it("review 689: upper-only pressure keeps an unfinished signed-thinking turn bel
 			}),
 			toolResultMessage("call-1", "small result", 6),
 		];
+		// Publish the user before its signed response. The large invisible
+		// metadata arrives afterward, outside the already measured prefix.
+		await f.pass(source.slice(0, 4));
+		f.settle();
 		logs.lines.length = 0;
 		const first = await f.pass(source);
 		f.settle();
@@ -334,9 +340,7 @@ it("review 689: upper-only pressure keeps an unfinished signed-thinking turn bel
 		expect(JSON.stringify(second.messages)).toBe(
 			JSON.stringify(first.messages),
 		);
-		expect(
-			logs.lines.some((line) => line.includes("reclaim held by signed prefix")),
-		).toBe(true);
+		expect(logs.lines.join("\n")).toContain("reclaim held by signed prefix");
 		expect(
 			logs.lines.filter((line) =>
 				line.includes("attempting emergency reclaim"),

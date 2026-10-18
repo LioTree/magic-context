@@ -368,15 +368,11 @@ for (const lane of [
 			"active-two",
 		];
 		let tokens = 20_000;
-		const pass = async (warm = false) => {
-			const messages = structuredClone(warm ? source.slice(0, 1) : source);
+		const pass = async (warm: boolean | "active" = false) => {
+			const count = warm === true ? 1 : warm === "active" ? 3 : source.length;
+			const messages = structuredClone(source.slice(0, count));
 			const ctx = {
-				...fakeContext(
-					sessionId,
-					process.cwd(),
-					warm ? ids.slice(0, 1) : ids,
-					messages,
-				),
+				...fakeContext(sessionId, process.cwd(), ids.slice(0, count), messages),
 				model: {
 					provider: "anthropic",
 					id: "claude-opus-5-5",
@@ -393,9 +389,10 @@ for (const lane of [
 				.messages;
 		};
 		try {
-			// Cache m[0]/m[1] before thinking starts, so these are warm-cache holds
-			// rather than the first-render exception that permits cleanup.
+			// Publish both real user requests before simulating their signed
+			// replies, so the saved prefix belongs to the active turn.
 			await pass(true);
+			await pass("active");
 			await pass();
 			const baseline = JSON.stringify(await pass());
 			search.mockClear();
@@ -552,13 +549,14 @@ for (const cause of ["first render", "idle expiry"] as const) {
 				"active-thought",
 				"late-answer",
 			];
-			const pass = async (warm = false) => {
-				const messages = structuredClone(warm ? source.slice(0, 1) : source);
+			const pass = async (warm: boolean | "active" = false) => {
+				const count = warm === true ? 1 : warm === "active" ? 3 : source.length;
+				const messages = structuredClone(source.slice(0, count));
 				const ctx = {
 					...fakeContext(
 						sessionId,
 						process.cwd(),
-						warm ? ids.slice(0, 1) : ids,
+						ids.slice(0, count),
 						messages,
 					),
 					model: {
@@ -580,7 +578,10 @@ for (const cause of ["first render", "idle expiry"] as const) {
 				).messages;
 			};
 			try {
-				if (cause === "idle expiry") await pass(true);
+				if (cause === "idle expiry") {
+					await pass(true);
+					await pass("active");
+				}
 				await pass();
 				const late = getTagsBySession(db, sessionId)
 					.filter((tag) => tag.type === "message")
@@ -827,15 +828,11 @@ test("Pi already-cold held pass keeps every signed block when no binding bytes c
 		thought(4),
 	];
 	const ids = ["old-user", "old-answer", "active-user", "active-thought"];
-	const pass = async (warm = false) => {
-		const messages = structuredClone(warm ? source.slice(0, 1) : source);
+	const pass = async (warm: boolean | "active" = false) => {
+		const count = warm === true ? 1 : warm === "active" ? 3 : source.length;
+		const messages = structuredClone(source.slice(0, count));
 		const ctx = {
-			...fakeContext(
-				sessionId,
-				process.cwd(),
-				warm ? ids.slice(0, 1) : ids,
-				messages,
-			),
+			...fakeContext(sessionId, process.cwd(), ids.slice(0, count), messages),
 			model: {
 				provider: "anthropic",
 				id: "claude-opus-5-5",
@@ -856,6 +853,7 @@ test("Pi already-cold held pass keeps every signed block when no binding bytes c
 	};
 	try {
 		await pass(true);
+		await pass("active");
 		const before = JSON.stringify(await pass());
 		expect(before).toContain('"thinkingSignature":"sig-2"');
 		updateSessionMeta(db, sessionId, {
@@ -936,6 +934,7 @@ for (const trigger of ["wall", "final fit"] as const)
 			];
 			const ids = ["u0", "old-tool", "old-result"];
 			let percent = 20;
+			let contextWindow = 100000;
 			const serve = async () => {
 				const messages = structuredClone(source);
 				const ctx = {
@@ -945,12 +944,12 @@ for (const trigger of ["wall", "final fit"] as const)
 						provider: "anthropic",
 						id: "claude-opus-5-5",
 						api: "anthropic-messages",
-						contextWindow: 100000,
+						contextWindow,
 					},
 					getContextUsage: () => ({
-						tokens: percent * 1000,
+						tokens: (percent * contextWindow) / 100,
 						percent,
-						contextWindow: 100000,
+						contextWindow,
 					}),
 				};
 				return (
@@ -964,6 +963,20 @@ for (const trigger of ["wall", "final fit"] as const)
 				const tag = getTagsBySession(db, sessionId).find(
 					(tag) => tag.type === "tool",
 				)!;
+				// Establish the signed turn with its real user bytes while a
+				// larger window fits them, then test a smaller window's guard.
+				source.push(
+					userMessage(
+						outcome === "fits" ? "continue" : "MANDATORY_USER ".repeat(90000),
+						4,
+					),
+				);
+				ids.push("active-user");
+				contextWindow = 1_000_000;
+				await serve();
+				source.pop();
+				ids.pop();
+				contextWindow = 100000;
 				(source[2].content as { text: string }[])[0].text =
 					"RECLAIMABLE ".repeat(60000);
 				source.push(
