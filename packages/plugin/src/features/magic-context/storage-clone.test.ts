@@ -213,6 +213,9 @@ describe("copySessionStateForClone", () => {
             encodePiContentDecision("reminder-strip", "msg_a:p0"),
             "binding_mismatch:msg_a",
             "binding_mismatch:msg_gone",
+            "binding_mismatch_entry_order:end:msg_gone",
+            "binding_mismatch:new_entry",
+            "binding_mismatch_entry_order:end:new_entry",
         ];
         db.prepare(
             "UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
@@ -248,6 +251,8 @@ describe("copySessionStateForClone", () => {
             `${MERGED_REASONING_PARTS_PREFIX}${JSON.stringify(["msg_a_clone", ["prt_1_clone", 2]])}`,
             encodePiContentDecision("reminder-strip", "msg_a_clone:p0"),
             "binding_mismatch:msg_a_clone",
+            "binding_mismatch:new_entry_clone",
+            "binding_mismatch_entry_order:end:new_entry_clone",
         ]);
         expect(getTemporalDecisions(db, DESTINATION)).toEqual(
             new Map([["msg_a_clone", "<!-- +5m -->\n"]]),

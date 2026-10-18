@@ -171,3 +171,30 @@ it("runs the proactive strip for subagents as for primaries, never under compact
 		).toBe(false);
 	}
 });
+
+it("withholds the whole companion plan when an older entry lacks an id", () => {
+	const db = new Database(":memory:");
+	initializeDatabase(db);
+	try {
+		const messages = input();
+		const before = structuredClone(messages);
+		const args = {
+			db,
+			sessionId: "companion-missing-id",
+			messages,
+			entryIds: ["assistant-1", "result-1", undefined, "next-user"],
+			provider: "anthropic",
+			model: "claude-opus-5-5",
+			cacheBustingPass: true,
+		};
+		expect(applyPiProactiveThinkingStrip(args)).toBeNull();
+		expect(messages).toEqual(before);
+		expect(getMergedReasoningStrippedIds(db, args.sessionId).size).toBe(0);
+		expect(() =>
+			applyPiProactiveThinkingStrip({ ...args, requirePersistence: true }),
+		).toThrow("Cannot persist thinking omission without a stable entry id");
+		expect(messages).toEqual(before);
+	} finally {
+		db.close();
+	}
+});

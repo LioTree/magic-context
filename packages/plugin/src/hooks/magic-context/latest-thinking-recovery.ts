@@ -3,6 +3,7 @@ import { detectLatestTurnThinkingMismatch } from "../../features/magic-context/o
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     armThinkingBindingRecovery,
+    decodeThinkingBindingEntryOrder,
     getMergedReasoningStrippedIds,
     getThinkingBindingRecoveryTarget,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -165,7 +166,11 @@ export function prepareLatestThinkingRecovery(args: {
         throw contextRefusalError(LATEST_THINKING_UNSAFE + " [missing-thinking-original]");
     const ids = new Map(args.messages.map((message, index) => [args.id(message, index), index]));
     for (const decision of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
-        if (decision === "binding_mismatch_order:end" || decision === TOOL_SWEEP_SCOPED_MARKER)
+        if (
+            decodeThinkingBindingEntryOrder(decision) ||
+            decision === "binding_mismatch_order:end" ||
+            decision === TOOL_SWEEP_SCOPED_MARKER
+        )
             continue;
         const id =
             decodeMergedReasoningParts(decision)?.[0] ??

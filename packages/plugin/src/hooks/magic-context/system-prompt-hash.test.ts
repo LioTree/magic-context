@@ -53,6 +53,7 @@ import {
     clearCtxReduceAvailability,
     resolveCtxReduceAvailabilityFromMessages,
 } from "./ctx-reduce-availability";
+import { clearSystemPromptEdit, hasSystemPromptEdit } from "./pending-materialization";
 import { createSystemPromptHashHandler, isMagicContextInternalAgent } from "./system-prompt-hash";
 
 const tempDirs: string[] = [];
@@ -362,6 +363,25 @@ describe("system-prompt-hash drain semantics (Oracle review 2026-04-26 Finding A
         // captured value (false in this case), so the just-added flag
         // must SURVIVE for the next pass to consume.
         expect(systemPromptRefreshSessions.has(sessionId)).toBe(true);
+    });
+
+    it("records a changed host system prompt as an edit that owes the thinking strip", async () => {
+        useTempDataHome("sph-system-edit-record-");
+        const sessionId = "ses-system-edit-record";
+        const pendingMaterializationSessions = new Set<string>();
+        const { handler } = buildHandler({ pendingMaterializationSessions });
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+        updateSessionMeta(db, sessionId, { systemPromptHash: "stalehash" });
+
+        await handler({ sessionID: sessionId }, { system: ["Changed instructions"] });
+        expect(hasSystemPromptEdit(pendingMaterializationSessions, sessionId)).toBe(true);
+
+        // The record belongs to the transform pass that strips; an unchanged
+        // prompt on a later request neither adds nor removes it.
+        clearSystemPromptEdit(pendingMaterializationSessions, sessionId);
+        await handler({ sessionID: sessionId }, { system: ["Changed instructions"] });
+        expect(hasSystemPromptEdit(pendingMaterializationSessions, sessionId)).toBe(false);
     });
 
     it("does NOT drain if handler short-circuits before the drain (early return)", async () => {

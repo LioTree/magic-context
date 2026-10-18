@@ -23,7 +23,7 @@ import {
     spawnAgentFromOpenCodeDb,
 } from "./ctx-reduce-availability";
 import { currentLkgRequestIdentity } from "./lkg-measured-request";
-import { requestPendingMaterialization } from "./pending-materialization";
+import { recordSystemPromptEdit, requestPendingMaterialization } from "./pending-materialization";
 import { estimateTokens } from "./read-session-formatting";
 import { clearMarkerSystem, recordMarkerSystem } from "./standalone-marker-envelope";
 import { systemPromptDates } from "./system-prompt-dates";
@@ -541,8 +541,12 @@ export function createSystemPromptHashHandler(deps: {
                 },
             );
         }
+        // Idle expiry frees the provider cache, not a signature: when this
+        // request's messages already went out keeping signed thinking, a
+        // date-only change would invalidate that thinking and waits instead.
         const dateMayAdvance =
-            idleCacheExpired ||
+            (idleCacheExpired &&
+                systemDateThinkingHeld(deps.historyRefreshSessions, dateRequest) !== true) ||
             contentOrPresetChanged ||
             (isCacheBusting &&
                 !deferredDateRefresh &&
@@ -621,6 +625,9 @@ export function createSystemPromptHashHandler(deps: {
             // cache from the system block onward whatever the messages pass did.
             // Its transform decision names the change, in every branch below.
             noteSystemPromptHashChange(sessionId);
+            // The new system bytes are served even when the change is adopted
+            // without a flush, so kept signed thinking needs its companion strip.
+            recordSystemPromptEdit(deps.pendingMaterializationSessions, sessionId);
             // When the following messages transform can still fold into this
             // request, signal all three independent refresh lifetimes. The semantic
             // prompt epoch changed on this turn, so history rebuild, adjunct refresh,
@@ -757,5 +764,6 @@ import {
     type SystemDateRequestIdentity,
     systemDateRefreshPermission,
     systemDateRequestForOutput,
+    systemDateThinkingHeld,
     waitForSystemDateRefresh,
 } from "./system-date-refresh";

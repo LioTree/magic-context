@@ -221,6 +221,18 @@ export function foldBustsServedPrefix(
     return CACHE_LOSING_FOLD_REASONS.has(reason ?? "") || foldChangesServedPrefix(before, after);
 }
 
+/** Expiry grants rewrite permission but is not itself an edit to signed context. */
+export function foldInvalidatesThinking(
+    reason: string | null | undefined,
+    before: ServedPrefixBytes,
+    after: ServedPrefixBytes,
+): boolean {
+    return (
+        (reason !== "ttl_idle" && CACHE_LOSING_FOLD_REASONS.has(reason ?? "")) ||
+        foldChangesServedPrefix(before, after)
+    );
+}
+
 /**
  * Convert every dropped tool call that still serves the legacy
  * `{"dropped": "[dropped §N§]"}` argument marker to the real-or-absent rule,

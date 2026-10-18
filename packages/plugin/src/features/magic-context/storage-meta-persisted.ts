@@ -2679,6 +2679,23 @@ export const THINKING_BINDING_RECOVERY_FROZEN_PREFIX = "binding_mismatch:";
  * writes this entry.
  */
 export const THINKING_BINDING_STRIP_ORDER_END_MARKER = "binding_mismatch_order:end";
+export const THINKING_BINDING_ENTRY_ORDER_PREFIX = "binding_mismatch_entry_order:";
+
+export function thinkingBindingEntryOrderId(id: string, order: "start" | "end"): string {
+    return `${THINKING_BINDING_ENTRY_ORDER_PREFIX}${order}:${id}`;
+}
+
+export function decodeThinkingBindingEntryOrder(
+    entry: string,
+): { id: string; order: "start" | "end" } | null {
+    if (!entry.startsWith(THINKING_BINDING_ENTRY_ORDER_PREFIX)) return null;
+    const rest = entry.slice(THINKING_BINDING_ENTRY_ORDER_PREFIX.length);
+    for (const order of ["start", "end"] as const) {
+        if (rest.startsWith(`${order}:`) && rest.length > order.length + 1)
+            return { id: rest.slice(order.length + 1), order };
+    }
+    return null;
+}
 
 export function thinkingBindingRecoveryFrozenId(messageId: string): string {
     return `${THINKING_BINDING_RECOVERY_FROZEN_PREFIX}${messageId}`;

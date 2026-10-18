@@ -5104,7 +5104,14 @@ export function createRustModeTransform(
                 throw error;
             }
             const bookkeepingStartedAt = performance.now();
-            finishSystemDateRefresh(deps.historyRefreshSessions, dateRequest, moduleDecisionBusts);
+            finishSystemDateRefresh(
+                deps.historyRefreshSessions,
+                dateRequest,
+                moduleDecisionBusts,
+                isPrefixBoundThinkingModel(model?.providerID, model?.modelID)
+                    ? hasKeptSignedThinking(output.messages)
+                    : undefined,
+            );
             if (shouldAdoptModuleAfterFreeze(moduleDecisionBusts, frozenReplayReleased)) {
                 if (frozenReleaseReason) {
                     sessionLog(
@@ -5813,6 +5820,7 @@ import {
     beginSystemDateRequest,
     bindSystemDateRequest,
     finishSystemDateRefresh,
+    hasKeptSignedThinking,
     systemDateRequestForOutput,
     systemDateRequestIdentity,
     systemDateTurnId,

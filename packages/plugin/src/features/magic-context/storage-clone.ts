@@ -8,6 +8,7 @@ import {
 } from "./merged-reasoning-decisions";
 import { decodePiContentDecision, encodePiContentDecision } from "./pi-content-decisions";
 import {
+    decodeThinkingBindingEntryOrder,
     getPendingPiCompactionMarkerState,
     logPiCompactionMarkerClear,
     type PendingPiCompactionMarker,
@@ -16,6 +17,7 @@ import {
     serializeProcessedImageMarkers,
     serializeStrippedPlaceholderState,
     THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
+    thinkingBindingEntryOrderId,
 } from "./storage-meta-persisted";
 import { getNativeReplayState } from "./storage-native-replay";
 import {
@@ -161,6 +163,17 @@ function clonePiContentDecisions(
         if (typeof entry !== "string") continue;
         if (isReservedLedgerControlEntry(entry)) {
             copied.push(entry);
+            continue;
+        }
+        const order = decodeThinkingBindingEntryOrder(entry);
+        if (order) {
+            if (filter.includeMessageId(order.id))
+                copied.push(
+                    thinkingBindingEntryOrderId(
+                        mapMessageId(filter, order.id) ?? order.id,
+                        order.order,
+                    ),
+                );
             continue;
         }
         const decision = decodePiContentDecision(entry);

@@ -453,7 +453,9 @@ describe("Pi proactive strip of thinking on busting passes", () => {
 				"binding_mismatch:a1",
 				"binding_mismatch:a2",
 				"binding_mismatch:a3",
-				"binding_mismatch_order:end",
+				"binding_mismatch_entry_order:end:a1",
+				"binding_mismatch_entry_order:end:a2",
+				"binding_mismatch_entry_order:end:a3",
 			]),
 		);
 

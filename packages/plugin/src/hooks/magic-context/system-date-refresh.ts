@@ -1,4 +1,5 @@
 import { activeAnthropicTurnStart } from "./active-anthropic-turn";
+import { thinkingAnchor } from "./edit-admission";
 
 export type SystemDateRequestIdentity = object | string;
 export interface SystemDateRequest {
@@ -12,6 +13,7 @@ interface RequestState extends SystemDateRequest {
     systemDone: boolean;
     messagesSeen: boolean;
     permitted: boolean | undefined;
+    keptSignedThinking?: boolean;
     ambiguous: boolean;
     waiting?: (permitted: boolean) => void;
 }
@@ -20,6 +22,71 @@ const channels = new WeakMap<Set<string>, Channel>();
 const outputUpdates = new WeakMap<string[], () => void>();
 const outputIdentities = new WeakMap<object, SystemDateRequestIdentity>();
 const outputRequests = new WeakMap<object, SystemDateRequest>();
+
+/** Inspect the returned render, not raw history whose saved omissions still need replay. */
+export function hasKeptSignedThinking(messages: readonly unknown[]): boolean {
+    for (const raw of messages) {
+        if (!raw || typeof raw !== "object") continue;
+        const message = raw as {
+            role?: string;
+            info?: { role?: string };
+            parts?: unknown;
+            content?: unknown;
+            providerPayload?: { items?: unknown[] };
+        };
+        if ((message.info?.role ?? message.role) !== "assistant") continue;
+        const parts = message.parts ?? message.content;
+        if (
+            Array.isArray(parts) &&
+            parts.some((part) => {
+                if (!part || typeof part !== "object") return false;
+                const block = part as {
+                    type?: string;
+                    kind?: string;
+                    metadata?: object;
+                    data?: unknown;
+                };
+                if (
+                    ![
+                        "reasoning",
+                        "thinking",
+                        "redacted_thinking",
+                        "redactedThinking",
+                        "redacted_reasoning",
+                    ].includes(String(block.type ?? block.kind))
+                )
+                    return false;
+                return (
+                    thinkingAnchor(part) !== undefined ||
+                    (typeof block.data === "string" && block.data.length > 0) ||
+                    (!!block.metadata && Object.keys(block.metadata).length > 0)
+                );
+            })
+        )
+            return true;
+        if (
+            message.providerPayload?.items?.some(
+                (item) =>
+                    !!item &&
+                    typeof item === "object" &&
+                    (item as { type?: string }).type === "reasoning",
+            )
+        )
+            return true;
+    }
+    return false;
+}
+
+/** Whether the request's served messages kept a signed thinking block. A date
+ * refresh is a system-prompt edit, so it is withheld while such a block is
+ * served; `undefined` means the messages hook has not reported for this request
+ * or the model's thinking is not bound to the bytes before it. */
+export function systemDateThinkingHeld(
+    history: Set<string>,
+    request: SystemDateRequest | undefined,
+): boolean | undefined {
+    return state(history, request)?.keptSignedThinking;
+}
 
 /** Use the last real-user message ID that anchors thinking recovery, including
  * its exclusions for synthetic messages and tool-result carriers. */
@@ -180,10 +247,15 @@ export function finishSystemDateRefresh(
     history: Set<string>,
     request: SystemDateRequest | undefined,
     permitted: boolean,
+    keptSignedThinking?: boolean,
 ): void {
     const current = state(history, request);
     if (!current) return;
-    current.permitted = current.ambiguous ? false : permitted;
+    current.keptSignedThinking = keptSignedThinking;
+    // A changed date line rewrites the system prompt, which every kept signed
+    // thinking block is bound to. It waits for a pass that serves none: a pass
+    // whose landed edit also removed the older thinking, or a later one.
+    current.permitted = current.ambiguous || keptSignedThinking === true ? false : permitted;
     const apply = current.waiting;
     current.waiting = undefined;
     apply?.(current.permitted);

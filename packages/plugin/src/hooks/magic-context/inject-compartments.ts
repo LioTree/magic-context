@@ -1008,6 +1008,8 @@ export interface M0M1State {
 }
 
 export interface M0M1RenderOptions {
+    /** Called inside the cache write transaction, only when the served M1 or cut changes. */
+    onM1Commit?: () => void;
     db: Database;
     sessionId: string;
     messages?: MessageLike[];
@@ -3887,6 +3889,11 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             projection: soft.projection,
         });
         steps.mark("sessionMeta");
+        if (
+            !bufferEqualsNullable(row.cached_m1_bytes, m1Bytes) ||
+            row.cached_m0_last_baseline_end_message_id !== baselineEndMessageId
+        )
+            options.onM1Commit?.();
         options.db.exec("COMMIT");
         steps.mark("commit");
         logSlowWriteTransaction(
