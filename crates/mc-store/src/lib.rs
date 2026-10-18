@@ -6152,6 +6152,7 @@ pub enum ModuleStateSyncError {
 #[derive(Debug)]
 pub enum McStoreError {
     Store(StoreError),
+    NativeSnapshotUnavailable(cache_codec::NativeSnapshotRejection),
     /// A durable move fence or staged import owns this session.
     SessionMoving,
     /// The on-disk row_version moved under us (a concurrent writer committed first).
@@ -6278,6 +6279,7 @@ impl std::fmt::Display for McStoreError {
         match self {
             McStoreError::SessionMoving => write!(f, "session_moving"),
             McStoreError::Store(e) => write!(f, "store: {e}"),
+            McStoreError::NativeSnapshotUnavailable(reason) => f.write_str(reason.reason()),
             McStoreError::CasConflict { expected, found } => {
                 write!(f, "cas conflict: expected {expected:?}, found {found}")
             }
@@ -7653,6 +7655,7 @@ pub struct McStore {
     inner: Arc<SqliteStore>,
     move_path: Option<std::path::PathBuf>,
     provider_wal: Mutex<Option<provider_wal::ProviderWal>>,
+    native_snapshot_fallbacks: Mutex<HashMap<String, cache_codec::NativeSnapshotRejection>>,
     // Distinguishes independent stores in the process-local tag baseline cache. Production
     // opens one store for the module lifetime; tests and embedded callers may open several.
     tag_cache_namespace: Arc<std::sync::atomic::AtomicU64>,
@@ -8317,6 +8320,7 @@ impl McStore {
                 _ => None,
             },
             provider_wal: Mutex::new(None),
+            native_snapshot_fallbacks: Mutex::new(HashMap::new()),
             tag_cache_namespace: Arc::new(std::sync::atomic::AtomicU64::new(
                 NEXT_TAG_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             )),
@@ -9222,7 +9226,34 @@ impl McStore {
         prefix: &provider_log::ProviderNativePrefix,
         mids: &[&str],
     ) -> Result<TransformSnapshot, McStoreError> {
-        self.load_transform_snapshot_scoped(session_id, Some((prefix, mids)), || {})
+        let result = self.load_transform_snapshot_scoped(session_id, Some((prefix, mids)), || {});
+        if let Err(McStoreError::NativeSnapshotUnavailable(reason)) = &result {
+            let mut logged = self
+                .native_snapshot_fallbacks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !logged.contains_key(session_id) {
+                logged.insert(session_id.to_owned(), *reason);
+                tracing::warn!(
+                    session_id,
+                    reason = reason.reason(),
+                    "native fold cache inadmissible; using the full rebuild"
+                );
+            }
+        }
+        result
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn native_snapshot_fallback_for_test(
+        &self,
+        session_id: &str,
+    ) -> Option<cache_codec::NativeSnapshotRejection> {
+        self.native_snapshot_fallbacks
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .copied()
     }
 
     fn load_transform_snapshot_with_hook(
@@ -9243,7 +9274,11 @@ impl McStore {
             let transaction = conn.unchecked_transaction()?;
             let cache_state_started_at = Instant::now();
             let decoded = match native {
-                Some((prefix, _)) => cache_codec::read_native_decoded(&transaction, session_id, prefix)?,
+                Some((prefix, _)) => match cache_codec::read_native_decoded(&transaction, session_id, prefix) {
+                    Ok(decoded) => decoded,
+                    Err(cache_codec::NativeSnapshotError::Unavailable(reason)) => return Ok(Err(reason)),
+                    Err(cache_codec::NativeSnapshotError::Sqlite(error)) => return Err(error),
+                },
                 None => cache_codec::read_decoded(&transaction, session_id)?,
             };
             let loaded = match decoded {
@@ -9348,7 +9383,7 @@ impl McStore {
                 .map(|ordinal| ordinal.max(0) as u64);
             let overlay_frontier_ms = overlay_frontier_started_at.elapsed().as_secs_f64() * 1_000.0;
             transaction.commit()?;
-            Ok(TransformSnapshot {
+            Ok(Ok(TransformSnapshot {
                 loaded,
                 temporal_marks,
                 user_hints,
@@ -9361,9 +9396,9 @@ impl McStore {
                     channel1_ms,
                     overlay_frontier_ms,
                 },
-            })
+            }))
         })?;
-        Ok(snapshot)
+        snapshot.map_err(McStoreError::NativeSnapshotUnavailable)
     }
 
     /// Load the durable fields used by session.status: the cache fields from one `store.db`
@@ -11362,7 +11397,8 @@ impl McStore {
             // Refuse before the diff runs rather than treating an unhydrated meta as a
             // request to delete the session's identity history.
             if let Some(prefix) = native_prefix {
-                let decoded = cache_codec::read_native_decoded(tx, session_id, prefix)?
+                let decoded = cache_codec::read_native_decoded(tx, session_id, prefix)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
                     .ok_or(rusqlite::Error::InvalidQuery)?;
                 if !native_requested || meta.coverage_ordinal.is_none_or(|through| through < prefix.through)
                     || decoded.sections.any_discarded() {

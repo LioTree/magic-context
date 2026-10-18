@@ -202,6 +202,146 @@ fn cc_message(ordinal: u64, text: &str) -> Value {
     json!({"ordinal":ordinal,"mid":format!("m{ordinal}"),"message":serde_json::from_str::<Value>(&raw).unwrap(),"raw_message":raw})
 }
 
+async fn certificate_boundary_matches_full_rebuild(harness: &str) {
+    let root = synthetic();
+    let a = root.path().join("on");
+    let b = root.path().join("off");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let project = root.path().join("project");
+    let cc = harness == "claude-code";
+    let (on, off) = if cc {
+        (claude(&a, &project, true), claude(&b, &project, false))
+    } else {
+        (runner(&a, &project, true), runner(&b, &project, false))
+    };
+    let session = if cc { "cc" } else { "s" };
+    if cc {
+        assert_eq!(
+            super::super::claude_code_tests::setup(&on).await,
+            super::super::claude_code_tests::setup(&off).await
+        );
+    } else {
+        let request = setup(session, "head");
+        assert_eq!(
+            invoke(&on, "compaction.setup", &request).await,
+            invoke(&off, "compaction.setup", &request).await
+        );
+    }
+    let store = on.store.get().unwrap();
+    let key = key(&on, session, harness);
+    let namespace = key.engine_key();
+    let mut applied = Value::Null;
+    for ordinal in 1..=5 {
+        for h in [&on, &off] {
+            let store = h.store.get().unwrap();
+            store
+                .replace_compartments(&namespace, &compartments(ordinal, 1))
+                .unwrap();
+            store.arm_soft_refresh(&namespace).unwrap();
+        }
+        // The first fold summarizes its only message. Hygiene excludes the
+        // newest message from the frozen baseline, so one covered part cannot
+        // receive a native certificate until a newer message arrives.
+        let message = if cc {
+            cc_message(ordinal, "café 🦀")
+        } else {
+            user(ordinal, "café 🦀")
+        };
+        let mut request = step(session, vec![message], Some(ordinal));
+        request["harness"] = json!(harness);
+        request["request_id"] = json!(format!("certificate-{ordinal}"));
+        // Hold time constant while the frozen baseline crosses eligibility.
+        request["now"] = json!(1000);
+        if cc {
+            request["served_through_ordinal"] = json!(ordinal);
+        }
+        if !applied.is_null() {
+            request["last_applied"] = applied.clone();
+        }
+        let served = invoke(&on, "compaction.step", &request).await;
+        assert_eq!(
+            served,
+            invoke(&off, "compaction.step", &request).await,
+            "{harness} fold {ordinal}"
+        );
+        let served: Value = serde_json::from_slice(&served).unwrap();
+        assert_eq!(served["answer"], "compaction_message", "{served}");
+        applied = json!({"compaction_id":served["compaction"]["compaction_id"],"version":served["compaction"]["version"]});
+
+        let mut lease = on
+            .provider_resident
+            .begin(store.tag_cache_namespace(), &key)
+            .unwrap()
+            .unwrap();
+        let prefix = lease.state.fold_prefix.as_ref().unwrap().reference();
+        if ordinal == 1 {
+            assert!(store
+                .load(&namespace)
+                .unwrap()
+                .meta
+                .tail_hygiene_baseline
+                .unwrap()
+                .baseline_parts
+                .is_empty());
+            assert_eq!(prefix.parts, 1);
+            assert!(matches!(
+                store.load_native_transform_snapshot(&namespace, &prefix, &[]),
+                Err(mc_store::McStoreError::NativeSnapshotUnavailable(
+                    mc_store::cache_codec::NativeSnapshotRejection::MissingReference
+                ))
+            ));
+            assert_eq!(lease.state.fold_tail_passes, 0);
+        } else {
+            assert!(
+                store
+                    .load_native_transform_snapshot(&namespace, &prefix, &[])
+                    .is_ok(),
+                "eligible row must carry a matching certificate"
+            );
+            if ordinal == 3 {
+                assert!(
+                    lease.state.fold_tail_passes > 0,
+                    "eligible certificate must admit the fast path"
+                );
+                // A stale resident prefix must not authorize a different row.
+                lease.state.fold_prefix.as_mut().unwrap().parts += 1;
+                let stale = lease.state.fold_prefix.as_ref().unwrap().reference();
+                assert!(matches!(
+                    store.load_native_transform_snapshot(&namespace, &stale, &[]),
+                    Err(mc_store::McStoreError::NativeSnapshotUnavailable(
+                        mc_store::cache_codec::NativeSnapshotRejection::ReferenceMismatch
+                    ))
+                ));
+            }
+            if ordinal == 4 {
+                assert_eq!(
+                    lease.state.fold_tail_passes, 0,
+                    "stale certificate must force full rebuild"
+                );
+            }
+            if ordinal == 5 {
+                assert!(lease.state.fold_tail_passes > 0, "next fold must recover");
+            }
+        }
+        lease.publish();
+    }
+    assert_eq!(
+        store.native_snapshot_fallback_for_test(&namespace),
+        Some(mc_store::cache_codec::NativeSnapshotRejection::MissingReference)
+    );
+}
+
+#[tokio::test]
+async fn broca_native_certificate_boundary_matches_full_rebuild() {
+    certificate_boundary_matches_full_rebuild("broca").await;
+}
+
+#[tokio::test]
+async fn claude_native_certificate_boundary_matches_full_rebuild() {
+    certificate_boundary_matches_full_rebuild("claude-code").await;
+}
+
 #[tokio::test]
 async fn claude_resident_randomized_48_passes_are_byte_identical() {
     let root = synthetic();

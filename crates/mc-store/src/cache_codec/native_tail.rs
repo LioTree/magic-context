@@ -13,6 +13,36 @@ pub(super) struct NativeReference {
     pub(super) prefix_count: usize,
 }
 
+impl NativeReference {
+    // A certificate is issued only for measurements that can be recovered from
+    // immutable message facts. The reader requires this certificate rather than
+    // guessing eligibility from the conversation's coverage alone.
+    fn build(
+        cut_id: u64,
+        live_prefix_count: usize,
+        retained_prefix_count: usize,
+        baseline: &TailHygieneBaseline,
+    ) -> Option<Self> {
+        let covered = baseline.baseline_parts.get(..live_prefix_count)?;
+        if covered.iter().any(|part| {
+            part.kind != crate::TailHygienePartKind::Excluded
+                || part.tokens != 0
+                || part.u_tokens != 0
+                || part.tag_number.is_some()
+                || part.tag_status.is_some()
+                || part.protected
+                || part.queued_for_drop
+        }) {
+            return None;
+        }
+        Some(Self {
+            format: FORMAT.into(),
+            cut_id,
+            prefix_count: live_prefix_count + retained_prefix_count,
+        })
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct NativeBody {
     reference: NativeReference,
@@ -36,9 +66,7 @@ impl TailBody {
             (Self::Native(body), Some(reference)) if &body.reference == reference => {
                 Ok(body.baseline)
             }
-            _ => Err(CodecError::Serde(
-                "native tail section and small-row marker disagree".into(),
-            )),
+            _ => Err(CodecError::NativeReferenceMismatch),
         }
     }
 }
@@ -117,35 +145,16 @@ pub(crate) fn encode_native_row(
         })
         .filter(|part| part.kind != "header")
         .count();
-    if live_prefix_count > baseline.baseline_parts.len() {
-        return Ok(None);
-    }
-    // coverage_ordinal is the last message summarized by the cached history.
-    // The hygiene walk gives every covered part zero tokens and no tag, protection
-    // or drop state. Only its key/hash remain; any other measurement values require
-    // storing the complete baseline vector rather than replacing its prefix with facts.
-    if baseline.baseline_parts[..live_prefix_count]
-        .iter()
-        .any(|part| {
-            part.kind != crate::TailHygienePartKind::Excluded
-                || part.tokens != 0
-                || part.u_tokens != 0
-                || part.tag_number.is_some()
-                || part.tag_status.is_some()
-                || part.protected
-                || part.queued_for_drop
-        })
-    {
-        return Ok(None);
-    }
-    let reference = NativeReference {
-        format: FORMAT.into(),
+    let Some(reference) = NativeReference::build(
         cut_id,
-        prefix_count: live_prefix_count
-            + policy
-                .native_prefix
-                .as_ref()
-                .map_or(0, |prefix| prefix.parts),
+        live_prefix_count,
+        policy
+            .native_prefix
+            .as_ref()
+            .map_or(0, |prefix| prefix.parts),
+        baseline,
+    ) else {
+        return Ok(None);
     };
     #[derive(Serialize)]
     struct Body<'a> {
