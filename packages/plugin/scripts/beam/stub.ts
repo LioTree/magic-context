@@ -49,7 +49,10 @@ export interface Stub {
     stop(): void;
 }
 
-function credentialHeader(actual: string | null, expected: string): "present-matches" | "present-differs" | undefined {
+function credentialHeader(
+    actual: string | null,
+    expected: string,
+): "present-matches" | "present-differs" | undefined {
     if (actual === null) return undefined;
     return actual === expected ? "present-matches" : "present-differs";
 }
@@ -58,7 +61,8 @@ function credentialHeader(actual: string | null, expected: string): "present-mat
 function strings(value: unknown, out: string[] = []): string[] {
     if (typeof value === "string") out.push(value);
     else if (Array.isArray(value)) for (const item of value) strings(item, out);
-    else if (value && typeof value === "object") for (const item of Object.values(value)) strings(item, out);
+    else if (value && typeof value === "object")
+        for (const item of Object.values(value)) strings(item, out);
     return out;
 }
 
@@ -84,7 +88,11 @@ export function historianRange(texts: string[]): { start: number; end: number } 
 }
 
 function escapeXml(text: string): string {
-    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
 }
 
 /** A valid v2 historian output for one range, with one fact so promotion to memory can be observed. */
@@ -117,7 +125,11 @@ function sse(events: Record<string, unknown>[]): Response {
 }
 
 /** A complete Responses stream with one output item (a message or a function call). */
-export function responsesStream(model: string, item: Record<string, unknown>, usage: { input: number; output: number }): Response {
+export function responsesStream(
+    model: string,
+    item: Record<string, unknown>,
+    usage: { input: number; output: number },
+): Response {
     const response = {
         id: `resp_${createHash("sha1").update(JSON.stringify(item)).digest("hex").slice(0, 12)}`,
         object: "response",
@@ -134,30 +146,85 @@ export function responsesStream(model: string, item: Record<string, unknown>, us
         },
     };
     const events: Record<string, unknown>[] = [
-        { type: "response.created", sequence_number: 0, response: { ...response, status: "in_progress", output: [], usage: null } },
+        {
+            type: "response.created",
+            sequence_number: 0,
+            response: { ...response, status: "in_progress", output: [], usage: null },
+        },
         {
             type: "response.output_item.added",
             sequence_number: 1,
             output_index: 0,
-            item: { ...item, ...(item.type === "function_call" ? { arguments: "" } : { content: [] }), status: "in_progress" },
+            item: {
+                ...item,
+                ...(item.type === "function_call" ? { arguments: "" } : { content: [] }),
+                status: "in_progress",
+            },
         },
     ];
     if (item.type === "message") {
         const text = ((item.content as { text: string }[])[0] as { text: string }).text;
         events.push(
-            { type: "response.content_part.added", sequence_number: 2, item_id: item.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
-            { type: "response.output_text.delta", sequence_number: 3, item_id: item.id, output_index: 0, content_index: 0, delta: text, logprobs: [] },
-            { type: "response.output_text.done", sequence_number: 4, item_id: item.id, output_index: 0, content_index: 0, text, logprobs: [] },
-            { type: "response.content_part.done", sequence_number: 5, item_id: item.id, output_index: 0, content_index: 0, part: { type: "output_text", text, annotations: [] } },
+            {
+                type: "response.content_part.added",
+                sequence_number: 2,
+                item_id: item.id,
+                output_index: 0,
+                content_index: 0,
+                part: { type: "output_text", text: "", annotations: [] },
+            },
+            {
+                type: "response.output_text.delta",
+                sequence_number: 3,
+                item_id: item.id,
+                output_index: 0,
+                content_index: 0,
+                delta: text,
+                logprobs: [],
+            },
+            {
+                type: "response.output_text.done",
+                sequence_number: 4,
+                item_id: item.id,
+                output_index: 0,
+                content_index: 0,
+                text,
+                logprobs: [],
+            },
+            {
+                type: "response.content_part.done",
+                sequence_number: 5,
+                item_id: item.id,
+                output_index: 0,
+                content_index: 0,
+                part: { type: "output_text", text, annotations: [] },
+            },
         );
     } else {
         events.push(
-            { type: "response.function_call_arguments.delta", sequence_number: 2, item_id: item.id, output_index: 0, delta: item.arguments },
-            { type: "response.function_call_arguments.done", sequence_number: 3, item_id: item.id, output_index: 0, arguments: item.arguments },
+            {
+                type: "response.function_call_arguments.delta",
+                sequence_number: 2,
+                item_id: item.id,
+                output_index: 0,
+                delta: item.arguments,
+            },
+            {
+                type: "response.function_call_arguments.done",
+                sequence_number: 3,
+                item_id: item.id,
+                output_index: 0,
+                arguments: item.arguments,
+            },
         );
     }
     events.push(
-        { type: "response.output_item.done", sequence_number: 6, output_index: 0, item: { ...item, status: "completed" } },
+        {
+            type: "response.output_item.done",
+            sequence_number: 6,
+            output_index: 0,
+            item: { ...item, status: "completed" },
+        },
         { type: "response.completed", sequence_number: 7, response },
     );
     return sse(events);
@@ -247,7 +314,10 @@ export function startStub(expect: StubExpectations): Stub {
             if (url.pathname === "/backend-api/codex/responses") {
                 record.route = "codex";
                 const bearer = credentialHeader(auth, `Bearer ${expect.codexToken}`);
-                const account = credentialHeader(request.headers.get("chatgpt-account-id"), expect.codexAccountId);
+                const account = credentialHeader(
+                    request.headers.get("chatgpt-account-id"),
+                    expect.codexAccountId,
+                );
                 if (bearer) record.credentialHeaders.authorization = bearer;
                 if (account) record.credentialHeaders["chatgpt-account-id"] = account;
                 record.bodyFacts = {
@@ -258,18 +328,31 @@ export function startStub(expect: StubExpectations): Stub {
                     temperature: body.temperature,
                     reasoning: body.reasoning,
                     maxOutputTokens: body.max_output_tokens,
-                    tools: ((body.tools as { name?: string }[] | undefined) ?? []).map((tool) => tool.name),
+                    tools: ((body.tools as { name?: string }[] | undefined) ?? []).map(
+                        (tool) => tool.name,
+                    ),
                 };
-                if (stub.rejectCodex) return reply(new Response('{"detail":"stub rejection"}', { status: 401 }));
+                if (stub.rejectCodex)
+                    return reply(new Response('{"detail":"stub rejection"}', { status: 401 }));
                 if (bearer !== "present-matches" || account !== "present-matches") {
-                    return reply(new Response('{"detail":"stub: wrong credential shape"}', { status: 401 }));
+                    return reply(
+                        new Response('{"detail":"stub: wrong credential shape"}', { status: 401 }),
+                    );
                 }
                 const answer = codexAnswer(body);
-                const input = strings(body.input).join("").length + String(body.instructions ?? "").length;
-                return reply(responsesStream(String(body.model), answer, { input: Math.ceil(input / 4), output: 20 }));
+                const input =
+                    strings(body.input).join("").length + String(body.instructions ?? "").length;
+                return reply(
+                    responsesStream(String(body.model), answer, {
+                        input: Math.ceil(input / 4),
+                        output: 20,
+                    }),
+                );
             }
 
-            const cloud = /^\/v1internal:(streamGenerateContent|generateContent)$/.exec(url.pathname);
+            const cloud = /^\/v1internal:(streamGenerateContent|generateContent)$/.exec(
+                url.pathname,
+            );
             if (cloud) {
                 record.route = "cloud-code";
                 const bearer = credentialHeader(auth, `Bearer ${expect.cloudCodeToken}`);
@@ -277,11 +360,18 @@ export function startStub(expect: StubExpectations): Stub {
                 record.bodyFacts = {
                     model: body.model,
                     projectMatches: body.project === expect.cloudCodeProject,
-                    requestKeys: Object.keys((body.request as Record<string, unknown> | undefined) ?? {}),
+                    requestKeys: Object.keys(
+                        (body.request as Record<string, unknown> | undefined) ?? {},
+                    ),
                     alt: url.searchParams.get("alt"),
                 };
                 if (bearer !== "present-matches" || body.project !== expect.cloudCodeProject) {
-                    return reply(new Response('{"error":{"code":401,"message":"stub: wrong credential shape"}}', { status: 401 }));
+                    return reply(
+                        new Response(
+                            '{"error":{"code":401,"message":"stub: wrong credential shape"}}',
+                            { status: 401 },
+                        ),
+                    );
                 }
                 const texts = strings(body.request);
                 const draft = texts.find((value) => value.includes("<draft>"));
@@ -293,27 +383,59 @@ export function startStub(expect: StubExpectations): Stub {
                       : "ok";
                 const inputTokens = Math.ceil(texts.join("").length / 4);
                 const response = {
-                    candidates: [{ content: { role: "model", parts: [{ text: answer }] }, finishReason: "STOP", index: 0 }],
-                    usageMetadata: { promptTokenCount: inputTokens, candidatesTokenCount: Math.ceil(answer.length / 4), totalTokenCount: inputTokens + Math.ceil(answer.length / 4) },
+                    candidates: [
+                        {
+                            content: { role: "model", parts: [{ text: answer }] },
+                            finishReason: "STOP",
+                            index: 0,
+                        },
+                    ],
+                    usageMetadata: {
+                        promptTokenCount: inputTokens,
+                        candidatesTokenCount: Math.ceil(answer.length / 4),
+                        totalTokenCount: inputTokens + Math.ceil(answer.length / 4),
+                    },
                     modelVersion: String(body.model),
                 };
                 if (cloud[1] === "generateContent") return reply(Response.json({ response }));
-                return reply(new Response(`data: ${JSON.stringify({ response })}\r\n\r\n`, { status: 200, headers: { "content-type": "text/event-stream" } }));
+                return reply(
+                    new Response(`data: ${JSON.stringify({ response })}\r\n\r\n`, {
+                        status: 200,
+                        headers: { "content-type": "text/event-stream" },
+                    }),
+                );
             }
 
             if (url.pathname === "/v1/embeddings") {
                 record.route = "voyage";
                 const bearer = credentialHeader(auth, `Bearer ${expect.voyageKey}`);
                 if (bearer) record.credentialHeaders.authorization = bearer;
-                const inputs = Array.isArray(body.input) ? (body.input as string[]) : [String(body.input ?? "")];
-                record.bodyFacts = { model: body.model, input_type: body.input_type, inputs: inputs.length };
-                if (bearer !== "present-matches") return reply(new Response('{"detail":"stub: wrong key"}', { status: 401 }));
+                const inputs = Array.isArray(body.input)
+                    ? (body.input as string[])
+                    : [String(body.input ?? "")];
+                record.bodyFacts = {
+                    model: body.model,
+                    input_type: body.input_type,
+                    inputs: inputs.length,
+                };
+                if (bearer !== "present-matches")
+                    return reply(new Response('{"detail":"stub: wrong key"}', { status: 401 }));
                 const data = inputs.map((input, index) => {
                     const digest = createHash("sha256").update(input).digest();
-                    const vector = Array.from({ length: 64 }, (_, i) => ((digest[i % digest.length] as number) - 128) / 128);
+                    const vector = Array.from(
+                        { length: 64 },
+                        (_, i) => ((digest[i % digest.length] as number) - 128) / 128,
+                    );
                     return { object: "embedding", index, embedding: vector };
                 });
-                return reply(Response.json({ object: "list", data, model: body.model, usage: { total_tokens: inputs.join(" ").length } }));
+                return reply(
+                    Response.json({
+                        object: "list",
+                        data,
+                        model: body.model,
+                        usage: { total_tokens: inputs.join(" ").length },
+                    }),
+                );
             }
 
             return reply(new Response("stub: no such route", { status: 404 }));

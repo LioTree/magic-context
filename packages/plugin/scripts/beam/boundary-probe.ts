@@ -32,7 +32,9 @@ export interface BoundaryProbeResult {
 if (import.meta.main) {
     const [sessionId, limitText, thresholdText] = process.argv.slice(2);
     if (!sessionId || !limitText || !thresholdText) {
-        console.error("usage: boundary-probe.ts <sessionId> <contextLimit> <executeThresholdPercentage>");
+        console.error(
+            "usage: boundary-probe.ts <sessionId> <contextLimit> <executeThresholdPercentage>",
+        );
         process.exit(2);
     }
     const contextLimit = Number(limitText);

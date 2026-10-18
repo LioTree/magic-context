@@ -59,10 +59,13 @@ export function writeSessionTurns(options: WriteSessionOptions): WrittenSession 
     try {
         const session = db.query("SELECT id FROM session WHERE id = ?").get(options.sessionId);
         if (!session) throw new Error(`session ${options.sessionId} is not in ${options.dbPath}`);
-        const existing = db.query("SELECT COUNT(*) AS count FROM message WHERE session_id = ?").get(options.sessionId) as {
+        const existing = db
+            .query("SELECT COUNT(*) AS count FROM message WHERE session_id = ?")
+            .get(options.sessionId) as {
             count: number;
         };
-        if (existing.count > 0) throw new Error(`session ${options.sessionId} already has ${existing.count} messages`);
+        if (existing.count > 0)
+            throw new Error(`session ${options.sessionId} already has ${existing.count} messages`);
 
         // Leave a margin below "now" so every id here sorts before ids the host mints later.
         const base = (options.clock ?? Date.now()) - options.turns.length - 10_000;
@@ -94,23 +97,49 @@ export function writeSessionTurns(options: WriteSessionOptions): WrittenSession 
                               agent: "build",
                               path: { cwd: options.directory, root: options.directory },
                               cost: 0,
-                              tokens: { total: 0, input: 0, output: 0, reasoning: 0, cache: { write: 0, read: 0 } },
+                              tokens: {
+                                  total: 0,
+                                  input: 0,
+                                  output: 0,
+                                  reasoning: 0,
+                                  cache: { write: 0, read: 0 },
+                              },
                               modelID: options.modelID,
                               providerID: options.providerID,
                               time: { created, completed: created },
                               finish: "stop",
                           };
-                insertMessage.run(messageId, options.sessionId, created, created, JSON.stringify(data));
+                insertMessage.run(
+                    messageId,
+                    options.sessionId,
+                    created,
+                    created,
+                    JSON.stringify(data),
+                );
                 const part =
                     turn.role === "user"
                         ? { type: "text", text: turn.content }
-                        : { type: "text", text: turn.content, time: { start: created, end: created } };
-                insertPart.run(partId, messageId, options.sessionId, created, created, JSON.stringify(part));
+                        : {
+                              type: "text",
+                              text: turn.content,
+                              time: { start: created, end: created },
+                          };
+                insertPart.run(
+                    partId,
+                    messageId,
+                    options.sessionId,
+                    created,
+                    created,
+                    JSON.stringify(part),
+                );
                 if (turn.role === "user") lastUserId = messageId;
                 messageIds.push(messageId);
             });
             const last = options.turns.at(-1)?.timestampMs ?? 0;
-            db.prepare("UPDATE session SET time_updated = ? WHERE id = ?").run(Math.max(last, Date.now()), options.sessionId);
+            db.prepare("UPDATE session SET time_updated = ? WHERE id = ?").run(
+                Math.max(last, Date.now()),
+                options.sessionId,
+            );
         })();
         db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
         return { messageIds, lastMessageId: messageIds.at(-1) ?? "" };
@@ -123,13 +152,17 @@ export function writeSessionTurns(options: WriteSessionOptions): WrittenSession 
 export function credentialRowCounts(dbPath: string): Record<string, number> {
     const db = new Database(dbPath, { readonly: true });
     try {
-        const tables = (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map(
-            (row) => row.name,
-        );
+        const tables = (
+            db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as {
+                name: string;
+            }[]
+        ).map((row) => row.name);
         const counts: Record<string, number> = {};
         for (const table of ["credential", "account", "account_state", "control_account"]) {
             if (!tables.includes(table)) continue;
-            counts[table] = (db.query(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
+            counts[table] = (
+                db.query(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
+            ).count;
         }
         return counts;
     } finally {

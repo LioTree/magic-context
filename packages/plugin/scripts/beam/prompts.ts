@@ -16,8 +16,9 @@
  * A prompt set is the unit a second protocol would replace (see `PromptSet`); only the paper's
  * released protocol is implemented.
  */
-import { createHash } from "node:crypto";
+
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -43,28 +44,29 @@ export const RELEASED_PROMPTS = [
 export type ReleasedPrompt = (typeof RELEASED_PROMPTS)[number];
 
 /** Where each released prompt lives: the source file and how to find the literal in it. */
-const RELEASED_SOURCES: Record<ReleasedPrompt, { file: string; anchor: string; literal: RegExp }> = {
-    judge: {
-        file: "src/prompts.py",
-        anchor: "unified_llm_judge_base_prompt = ",
-        literal: /^unified_llm_judge_base_prompt = """([\s\S]*?)"""/,
-    },
-    "equivalence-system": {
-        file: "src/evaluation/compute_metrics.py",
-        anchor: "def llm_equivalence(",
-        literal: /"role": "system",\s*"content": """([\s\S]*?)"""/,
-    },
-    "equivalence-user": {
-        file: "src/evaluation/compute_metrics.py",
-        anchor: "def llm_equivalence(",
-        literal: /"role": "user",\s*"content": f"""([\s\S]*?)"""/,
-    },
-    "long-context-question": {
-        file: "src/answer_probing_questions/long_term_memory_methods.py",
-        anchor: 'if evaluation_type == "long-context":',
-        literal: /messages\.append\(\{\s*"role": "user",\s*"content": f"""([\s\S]*?)"""/,
-    },
-};
+const RELEASED_SOURCES: Record<ReleasedPrompt, { file: string; anchor: string; literal: RegExp }> =
+    {
+        judge: {
+            file: "src/prompts.py",
+            anchor: "unified_llm_judge_base_prompt = ",
+            literal: /^unified_llm_judge_base_prompt = """([\s\S]*?)"""/,
+        },
+        "equivalence-system": {
+            file: "src/evaluation/compute_metrics.py",
+            anchor: "def llm_equivalence(",
+            literal: /"role": "system",\s*"content": """([\s\S]*?)"""/,
+        },
+        "equivalence-user": {
+            file: "src/evaluation/compute_metrics.py",
+            anchor: "def llm_equivalence(",
+            literal: /"role": "user",\s*"content": f"""([\s\S]*?)"""/,
+        },
+        "long-context-question": {
+            file: "src/answer_probing_questions/long_term_memory_methods.py",
+            anchor: 'if evaluation_type == "long-context":',
+            literal: /messages\.append\(\{\s*"role": "user",\s*"content": f"""([\s\S]*?)"""/,
+        },
+    };
 
 export function sha256(text: string): string {
     return createHash("sha256").update(text).digest("hex");
@@ -83,7 +85,14 @@ export async function releasedPrompt(name: ReleasedPrompt): Promise<string> {
  * f-strings used here, `{name}` fields stay as written (none of them contain `{{`).
  */
 export function decodePythonLiteral(body: string): string {
-    const simple: Record<string, string> = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"' };
+    const simple: Record<string, string> = {
+        n: "\n",
+        t: "\t",
+        r: "\r",
+        "\\": "\\",
+        "'": "'",
+        '"': '"',
+    };
     let out = "";
     for (let i = 0; i < body.length; i++) {
         const char = body[i] as string;
@@ -111,7 +120,8 @@ export function extractReleasedPrompt(name: ReleasedPrompt, source: string): str
     const start = source.indexOf(spec.anchor);
     if (start < 0) throw new Error(`${name}: anchor not found in ${spec.file}`);
     const match = spec.literal.exec(source.slice(start));
-    if (!match?.[1] && match?.[1] !== "") throw new Error(`${name}: literal not found in ${spec.file}`);
+    if (!match?.[1] && match?.[1] !== "")
+        throw new Error(`${name}: literal not found in ${spec.file}`);
     return decodePythonLiteral(match[1]);
 }
 
@@ -120,7 +130,8 @@ export function extractSourceListing(archive: string, number: number): string {
         encoding: "utf8",
         windowsHide: true,
     });
-    if (result.status !== 0) throw new Error(`Could not extract Listing ${number}: ${result.stderr}`);
+    if (result.status !== 0)
+        throw new Error(`Could not extract Listing ${number}: ${result.stderr}`);
     return result.stdout;
 }
 
@@ -137,7 +148,8 @@ export async function provenance(): Promise<Provenance> {
 /** Every vendored prompt's SHA-256, as recorded for run results. */
 export async function promptHashes(): Promise<Record<string, string>> {
     const record: Record<string, string> = {};
-    for (const name of RELEASED_PROMPTS) record[`released/${name}`] = sha256(await releasedPrompt(name));
+    for (const name of RELEASED_PROMPTS)
+        record[`released/${name}`] = sha256(await releasedPrompt(name));
     for (const number of LISTINGS) record[`listing-${number}`] = sha256(await prompt(number));
     return record;
 }
@@ -146,7 +158,8 @@ export async function promptHashes(): Promise<Record<string, string>> {
 export async function verifyPrompts(dataDir: string): Promise<string[]> {
     const lines: string[] = [];
     const manifest = await provenance();
-    if (manifest.source !== SOURCE_URL) throw new Error("Unexpected listing source in provenance.json");
+    if (manifest.source !== SOURCE_URL)
+        throw new Error("Unexpected listing source in provenance.json");
     if (manifest.released.commit !== RELEASED_COMMIT || manifest.released.repo !== RELEASED_REPO) {
         throw new Error("Unexpected released-code pin in provenance.json");
     }
@@ -200,7 +213,11 @@ export interface PromptSet {
     /** The text of turn |T|+1, appended after the conversation. */
     questionTurn(question: string): Promise<string>;
     /** The nugget judge's messages for one rubric item. */
-    nuggetJudge(input: { question: string; nugget: string; response: string }): Promise<PromptMessage[]>;
+    nuggetJudge(input: {
+        question: string;
+        nugget: string;
+        response: string;
+    }): Promise<PromptMessage[]>;
     /** The equivalence detector's messages for one reference / answer item pair. */
     equivalence(input: { reference: string; system: string }): Promise<PromptMessage[]>;
 }

@@ -68,7 +68,11 @@ export const NUGGET_SCORES = [0, 0.5, 1] as const;
  * Read the judge's JSON reply. Like the released code's `parse_json_response`, a fenced block or
  * the first `{...}` span is accepted.
  */
-export function parseJudgeJson(reply: string): { score: number; reason: string; offScale: boolean } {
+export function parseJudgeJson(reply: string): {
+    score: number;
+    reason: string;
+    offScale: boolean;
+} {
     let text = reply.trim();
     const fenced = /```(?:json)?\s*(\{[\s\S]*\})\s*```/.exec(text);
     if (fenced?.[1]) text = fenced[1];
@@ -83,7 +87,9 @@ export function parseJudgeJson(reply: string): { score: number; reason: string; 
     const record = value as { score?: unknown; reason?: unknown };
     const score = typeof record.score === "string" ? Number(record.score) : record.score;
     if (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > 1) {
-        throw new Error(`judge score ${JSON.stringify(record.score)} is not a number between 0 and 1`);
+        throw new Error(
+            `judge score ${JSON.stringify(record.score)} is not a number between 0 and 1`,
+        );
     }
     return {
         score,
@@ -104,12 +110,22 @@ export async function scoreNuggets(
         const raw = await judge(await prompts.nuggetJudge({ question, nugget, response }));
         try {
             const parsed = parseJudgeJson(raw);
-            verdicts.push({ nugget, score: parsed.score, reason: parsed.reason, raw, ...(parsed.offScale ? { offScale: true } : {}) });
+            verdicts.push({
+                nugget,
+                score: parsed.score,
+                reason: parsed.reason,
+                raw,
+                ...(parsed.offScale ? { offScale: true } : {}),
+            });
         } catch (error) {
             verdicts.push({ nugget, score: 0, reason: "", raw, error: String(error) });
         }
     }
-    return { method: "nuggets", score: mean(verdicts.map((verdict) => verdict.score)), nuggets: verdicts };
+    return {
+        method: "nuggets",
+        score: mean(verdicts.map((verdict) => verdict.score)),
+        nuggets: verdicts,
+    };
 }
 
 /**
@@ -146,12 +162,15 @@ export async function alignWithJudge(
  * items by position from 1 (a repeated item keeps its last position), and an item the list does
  * not contain ranks `union.length + 1`.
  */
-export function unionRanks(reference: string[], system: string[]): { union: string[]; referenceRanks: number[]; systemRanks: number[] } {
+export function unionRanks(
+    reference: string[],
+    system: string[],
+): { union: string[]; referenceRanks: number[]; systemRanks: number[] } {
     const union = [...new Set([...reference, ...system])];
     const tie = union.length + 1;
     const ranks = (sequence: string[]) => {
         const position = new Map<string, number>();
-        sequence.forEach((item, index) => position.set(item, index + 1));
+        for (const [index, item] of sequence.entries()) position.set(item, index + 1);
         return union.map((item) => position.get(item) ?? tie);
     };
     return { union, referenceRanks: ranks(reference), systemRanks: ranks(system) };
@@ -191,7 +210,10 @@ export function kendallTauB(x: number[], y: number[]): number {
  * `tau_norm = (tau_b + 1) / 2`; it also computes precision, recall and F1, kept here for the
  * record but not part of the reported score. An undefined tau-b (NaN) scores 0.
  */
-export function orderingScore(reference: string[], aligned: string[]): Omit<OrderingDetail, "system" | "checks"> {
+export function orderingScore(
+    reference: string[],
+    aligned: string[],
+): Omit<OrderingDetail, "system" | "checks"> {
     const { referenceRanks, systemRanks } = unionRanks(reference, aligned);
     const tauB = kendallTauB(referenceRanks, systemRanks);
     const tauNorm = Number.isNaN(tauB) ? 0 : (tauB + 1) / 2;
@@ -200,8 +222,10 @@ export function orderingScore(reference: string[], aligned: string[]): Omit<Orde
     const truePositives = [...referenceSet].filter((item) => alignedSet.has(item)).length;
     const falsePositives = aligned.filter((item) => !referenceSet.has(item)).length;
     const falseNegatives = reference.filter((item) => !alignedSet.has(item)).length;
-    const precision = truePositives + falsePositives ? truePositives / (truePositives + falsePositives) : 0;
-    const recall = truePositives + falseNegatives ? truePositives / (truePositives + falseNegatives) : 0;
+    const precision =
+        truePositives + falsePositives ? truePositives / (truePositives + falsePositives) : 0;
+    const recall =
+        truePositives + falseNegatives ? truePositives / (truePositives + falseNegatives) : 0;
     const f1 = precision + recall ? (2 * precision * recall) / (precision + recall) : 0;
     return { reference, aligned, tauB, tauNorm, precision, recall, f1 };
 }
@@ -220,14 +244,20 @@ export async function scoreEventOrdering(
     const system = systemItems(response);
     const checks: EquivalenceCheck[] = [];
     const aligned = await alignWithJudge(reference, system, async (referenceItem, systemItem) => {
-        const raw = await judge(await prompts.equivalence({ reference: referenceItem, system: systemItem }));
+        const raw = await judge(
+            await prompts.equivalence({ reference: referenceItem, system: systemItem }),
+        );
         // The released code lowercases the reply and looks for "yes" anywhere in it.
         const same = raw.toLowerCase().includes("yes");
         checks.push({ reference: referenceItem, system: systemItem, same, raw });
         return same;
     });
     const detail = orderingScore(reference, aligned);
-    return { method: "event_ordering", score: detail.tauNorm, ordering: { ...detail, system, checks } };
+    return {
+        method: "event_ordering",
+        score: detail.tauNorm,
+        ordering: { ...detail, system, checks },
+    };
 }
 
 export async function scoreQuestion(
@@ -252,7 +282,8 @@ export interface Summary {
 
 export function summarize(rows: { category: string; score: number }[]): Summary {
     const groups = new Map<string, number[]>();
-    for (const row of rows) groups.set(row.category, [...(groups.get(row.category) ?? []), row.score]);
+    for (const row of rows)
+        groups.set(row.category, [...(groups.get(row.category) ?? []), row.score]);
     const byCategory: Summary["byCategory"] = {};
     for (const [category, scores] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
         byCategory[category] = { questions: scores.length, mean: mean(scores) };

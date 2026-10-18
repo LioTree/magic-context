@@ -11,8 +11,17 @@
  * whose metadata is derived from the conversation id. OpenCode and Magic Context both derive the
  * project from the repository's root commit, so conversations never share a project or a store.
  */
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import {
+    chmodSync,
+    cpSync,
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    realpathSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -28,10 +37,20 @@ export function dataDir(): string {
 /** Refuse any root outside the data directory, so a bad argument can never point at a live store. */
 export function assertInsideDataDir(path: string): void {
     const base = dataDir();
-    if (!resolve(path).startsWith(`${base}${sep}`)) throw new Error(`refusing a root outside ${base}: ${path}`);
+    if (!resolve(path).startsWith(`${base}${sep}`))
+        throw new Error(`refusing a root outside ${base}: ${path}`);
 }
 
-export const ROOT_DIRS = ["home", "config", "data", "cache", "state", "runtime", "work", "tmp"] as const;
+export const ROOT_DIRS = [
+    "home",
+    "config",
+    "data",
+    "cache",
+    "state",
+    "runtime",
+    "work",
+    "tmp",
+] as const;
 export type RootDir = (typeof ROOT_DIRS)[number];
 
 export interface RootLayout {
@@ -44,7 +63,10 @@ export interface RootLayout {
 }
 
 export function layout(root: string): RootLayout {
-    const dirs = Object.fromEntries(ROOT_DIRS.map((key) => [key, join(root, key)])) as Record<RootDir, string>;
+    const dirs = Object.fromEntries(ROOT_DIRS.map((key) => [key, join(root, key)])) as Record<
+        RootDir,
+        string
+    >;
     const storageDir = join(dirs.data, "cortexkit", "magic-context");
     return {
         root,
@@ -57,7 +79,10 @@ export function layout(root: string): RootLayout {
 }
 
 /** The environment every process touching a root runs with; nothing inherits the operator's HOME. */
-export function rootEnv(paths: RootLayout, extra: Record<string, string> = {}): Record<string, string> {
+export function rootEnv(
+    paths: RootLayout,
+    extra: Record<string, string> = {},
+): Record<string, string> {
     return {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: paths.dirs.home,
@@ -111,7 +136,12 @@ export function initProjectRepo(paths: RootLayout, conversationId: string): stri
         GIT_COMMITTER_DATE: "2024-01-01T00:00:00Z",
     };
     const git = (args: string[]) => {
-        const result = spawnSync("git", args, { cwd: paths.dirs.work, env, encoding: "utf8", windowsHide: true });
+        const result = spawnSync("git", args, {
+            cwd: paths.dirs.work,
+            env,
+            encoding: "utf8",
+            windowsHide: true,
+        });
         if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
         return result.stdout.trim();
     };
@@ -162,7 +192,12 @@ export const HISTORIAN_PROVIDER = "google";
  * OpenCode's ChatGPT login plugin stays inactive. The historian is OpenCode's `google` provider
  * pointed at the loopback relay.
  */
-export function writeHostConfig(paths: RootLayout, models: HostModels, wiring: HostWiring, options: { dreamer: boolean }): void {
+export function writeHostConfig(
+    paths: RootLayout,
+    models: HostModels,
+    wiring: HostWiring,
+    options: { dreamer: boolean },
+): void {
     const answer = `${ANSWER_PROVIDER}/${models.answerModel}`;
     const historian = `${HISTORIAN_PROVIDER}/${models.historianModel}`;
     const answerOptions: Record<string, unknown> = {};
@@ -184,7 +219,10 @@ export function writeHostConfig(paths: RootLayout, models: HostModels, wiring: H
                         tool_call: true,
                         attachment: false,
                         temperature: true,
-                        limit: { context: models.answerContextLimit, output: models.answerOutputLimit },
+                        limit: {
+                            context: models.answerContextLimit,
+                            output: models.answerOutputLimit,
+                        },
                         options: answerOptions,
                     },
                 },
@@ -198,7 +236,10 @@ export function writeHostConfig(paths: RootLayout, models: HostModels, wiring: H
                         tool_call: true,
                         attachment: false,
                         temperature: true,
-                        limit: { context: models.historianContextLimit, output: models.historianOutputLimit },
+                        limit: {
+                            context: models.historianContextLimit,
+                            output: models.historianOutputLimit,
+                        },
                     },
                 },
             },
@@ -223,12 +264,24 @@ export function writeHostConfig(paths: RootLayout, models: HostModels, wiring: H
             build: {
                 tools: { task: false },
                 permission: { task: "deny" },
-                ...(models.answerTemperature !== undefined ? { temperature: models.answerTemperature } : {}),
+                ...(models.answerTemperature !== undefined
+                    ? { temperature: models.answerTemperature }
+                    : {}),
             },
         },
-        permission: { bash: "deny", edit: "deny", webfetch: "deny", external_directory: "deny", task: "deny" },
+        permission: {
+            bash: "deny",
+            edit: "deny",
+            webfetch: "deny",
+            external_directory: "deny",
+            task: "deny",
+        },
     };
-    writeFileSync(join(paths.dirs.config, "opencode.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(
+        join(paths.dirs.config, "opencode.json"),
+        `${JSON.stringify(config, null, 2)}\n`,
+        { mode: 0o600 },
+    );
     const magicContext = {
         historian: { opencode: { model: historian } },
         dreamer: { disable: !options.dreamer },
@@ -243,20 +296,31 @@ export function writeHostConfig(paths: RootLayout, models: HostModels, wiring: H
         },
     };
     mkdirSync(join(paths.dirs.config, "cortexkit"), { recursive: true, mode: 0o700 });
-    writeFileSync(join(paths.dirs.config, "cortexkit", "magic-context.jsonc"), `${JSON.stringify(magicContext, null, 2)}\n`, {
-        mode: 0o600,
-    });
+    writeFileSync(
+        join(paths.dirs.config, "cortexkit", "magic-context.jsonc"),
+        `${JSON.stringify(magicContext, null, 2)}\n`,
+        {
+            mode: 0o600,
+        },
+    );
 }
 
 /** Database files `lsof` reports open for a process, each checked to be inside the root. */
 export function databaseFilesFromLsof(out: string, root: string): string[] {
     const canonical = realpathSync(root);
-    const rows = out.split("\n").filter((line) => /\sREG\s/.test(line) && /\.db(?:-wal|-shm|-journal)?\s*$/.test(line));
+    const rows = out
+        .split("\n")
+        .filter((line) => /\sREG\s/.test(line) && /\.db(?:-wal|-shm|-journal)?\s*$/.test(line));
     const paths = rows.map((line) => line.split(/\s+/).slice(8).join(" "));
     if (paths.length === 0) throw new Error("isolation unproven: lsof showed no open database");
-    const outside = paths.filter((path) => !path.startsWith(`${canonical}/`) && !path.startsWith(`${root}/`));
-    if (outside.length > 0) throw new Error(`isolation failed: database open outside the root: ${outside.join(", ")}`);
-    return [...new Set(paths.map((path) => path.replace(canonical, "<root>").replace(root, "<root>")))].sort();
+    const outside = paths.filter(
+        (path) => !path.startsWith(`${canonical}/`) && !path.startsWith(`${root}/`),
+    );
+    if (outside.length > 0)
+        throw new Error(`isolation failed: database open outside the root: ${outside.join(", ")}`);
+    return [
+        ...new Set(paths.map((path) => path.replace(canonical, "<root>").replace(root, "<root>"))),
+    ].sort();
 }
 
 export interface Host {
@@ -264,7 +328,11 @@ export interface Host {
     pid: number;
     paths: RootLayout;
     log(): string;
-    api(path: string, body?: unknown, timeoutMs?: number): Promise<{ status: number; value: unknown }>;
+    api(
+        path: string,
+        body?: unknown,
+        timeoutMs?: number,
+    ): Promise<{ status: number; value: unknown }>;
     /** Sample `lsof` for the host and its children; throws unless every open database is inside the root. */
     checkIsolation(): string[];
     stop(): Promise<void>;
@@ -279,16 +347,39 @@ function childPids(pid: number): number[] {
     return direct.flatMap((child) => [child, ...childPids(child)]);
 }
 
-export async function startHost(paths: RootLayout, binary: string, secrets: Record<string, string>): Promise<Host> {
-    const version = spawnSync(binary, ["--version"], { env: rootEnv(paths), encoding: "utf8", windowsHide: true }).stdout.trim();
-    if (version !== EXPECTED_HOST_VERSION) throw new Error(`expected OpenCode ${EXPECTED_HOST_VERSION}, got ${version || "nothing"}`);
-    const port = 24000 + Math.floor(Math.random() * 20000);
-    const child: ChildProcess = spawn("nice", ["-n", "10", binary, "serve", "--hostname", "127.0.0.1", "--port", String(port), "--print-logs"], {
-        cwd: paths.dirs.work,
-        env: rootEnv(paths, secrets),
-        stdio: ["ignore", "pipe", "pipe"],
+export async function startHost(
+    paths: RootLayout,
+    binary: string,
+    secrets: Record<string, string>,
+): Promise<Host> {
+    const version = spawnSync(binary, ["--version"], {
+        env: rootEnv(paths),
+        encoding: "utf8",
         windowsHide: true,
-    });
+    }).stdout.trim();
+    if (version !== EXPECTED_HOST_VERSION)
+        throw new Error(`expected OpenCode ${EXPECTED_HOST_VERSION}, got ${version || "nothing"}`);
+    const port = 24000 + Math.floor(Math.random() * 20000);
+    const child: ChildProcess = spawn(
+        "nice",
+        [
+            "-n",
+            "10",
+            binary,
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            String(port),
+            "--print-logs",
+        ],
+        {
+            cwd: paths.dirs.work,
+            env: rootEnv(paths, secrets),
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
+        },
+    );
     let logs = "";
     child.stdout?.on("data", (chunk) => (logs += chunk));
     child.stderr?.on("data", (chunk) => (logs += chunk));
@@ -297,12 +388,15 @@ export async function startHost(paths: RootLayout, binary: string, secrets: Reco
 
     const api = async (path: string, body?: unknown, timeoutMs = 120_000) => {
         const separator = path.includes("?") ? "&" : "?";
-        const response = await fetch(`${url}${path}${separator}directory=${encodeURIComponent(paths.dirs.work)}`, {
-            method: body === undefined ? "GET" : "POST",
-            headers: { "content-type": "application/json" },
-            body: body === undefined ? undefined : JSON.stringify(body),
-            signal: AbortSignal.timeout(timeoutMs),
-        });
+        const response = await fetch(
+            `${url}${path}${separator}directory=${encodeURIComponent(paths.dirs.work)}`,
+            {
+                method: body === undefined ? "GET" : "POST",
+                headers: { "content-type": "application/json" },
+                body: body === undefined ? undefined : JSON.stringify(body),
+                signal: AbortSignal.timeout(timeoutMs),
+            },
+        );
         const text = await response.text();
         let value: unknown = text;
         try {
@@ -315,15 +409,22 @@ export async function startHost(paths: RootLayout, binary: string, secrets: Reco
 
     const checkIsolation = () => {
         const pids = [child.pid as number, ...childPids(child.pid as number)];
-        const sample = spawnSync("lsof", ["-p", pids.join(",")], { encoding: "utf8", windowsHide: true });
-        if (sample.status !== 0 && !sample.stdout) throw new Error("lsof failed; isolation unproven");
+        const sample = spawnSync("lsof", ["-p", pids.join(",")], {
+            encoding: "utf8",
+            windowsHide: true,
+        });
+        if (sample.status !== 0 && !sample.stdout)
+            throw new Error("lsof failed; isolation unproven");
         return databaseFilesFromLsof(sample.stdout, paths.root);
     };
 
     const stop = async () => {
         if (child.exitCode === null && child.signalCode === null) {
             child.kill("SIGTERM");
-            const done = await Promise.race([exited.then(() => true), Bun.sleep(15_000).then(() => false)]);
+            const done = await Promise.race([
+                exited.then(() => true),
+                Bun.sleep(15_000).then(() => false),
+            ]);
             if (!done) {
                 child.kill("SIGKILL");
                 await exited;
@@ -335,7 +436,11 @@ export async function startHost(paths: RootLayout, binary: string, secrets: Reco
     for (let attempt = 0; attempt < 120 && !ready; attempt++) {
         if (child.exitCode !== null) break;
         try {
-            ready = (await fetch(`${url}/session?directory=${encodeURIComponent(paths.dirs.work)}`, { signal: AbortSignal.timeout(1000) })).ok;
+            ready = (
+                await fetch(`${url}/session?directory=${encodeURIComponent(paths.dirs.work)}`, {
+                    signal: AbortSignal.timeout(1000),
+                })
+            ).ok;
         } catch {
             // Not listening yet.
         }
@@ -356,7 +461,8 @@ export function snapshotRoot(paths: RootLayout, target: string): void {
     assertInsideDataDir(target);
     if (existsSync(target)) throw new Error(`snapshot already exists: ${target}`);
     mkdirSync(target, { recursive: true, mode: 0o700 });
-    for (const dir of SNAPSHOT_DIRS) cpSync(paths.dirs[dir], join(target, dir), { recursive: true });
+    for (const dir of SNAPSHOT_DIRS)
+        cpSync(paths.dirs[dir], join(target, dir), { recursive: true });
 }
 
 /** Recreate a root from a snapshot at exactly `root`, so stored absolute paths stay valid. */

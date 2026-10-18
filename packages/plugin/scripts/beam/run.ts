@@ -10,9 +10,27 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    renameSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import type { BoundaryProbeResult } from "./boundary-probe";
+import {
+    CredentialError,
+    type Credentials,
+    listGranted,
+    STUB_CREDENTIALS,
+    scrub,
+    stubCredentials,
+    vaultCredentials,
+} from "./credentials";
 import { buildConversation, type Conversation, loadRows, type Question } from "./dataset";
 import {
     ANSWER_PROVIDER,
@@ -24,19 +42,19 @@ import {
     type HostWiring,
     initProjectRepo,
     PLUGIN_ENTRY,
+    type RootLayout,
+    readIfExists,
     removeRoot,
     restoreRoot,
-    type RootLayout,
     rootEnv,
     SECRET_ENV,
     snapshotRoot,
     startHost,
     writeHostConfig,
-    readIfExists,
 } from "./host";
 import {
-    addUsage,
     AuthRejectedError,
+    addUsage,
     type ChatMessage,
     type CodexSettings,
     codexComplete,
@@ -49,8 +67,6 @@ import { type Relay, type RelayLogEntry, startRelay } from "./relay";
 import { type JudgeCall, type QuestionScore, scoreQuestion, summarize } from "./scoring";
 import { credentialRowCounts, writeSessionTurns } from "./store-writer";
 import { type Stub, startStub } from "./stub";
-import { CredentialError, type Credentials, listGranted, scrub, STUB_CREDENTIALS, stubCredentials, vaultCredentials } from "./credentials";
-import type { BoundaryProbeResult } from "./boundary-probe";
 
 /** The dataset revision every result is pinned to (Hugging Face `Mohammadta/BEAM`). */
 export const DATASET = "Mohammadta/BEAM";
@@ -156,7 +172,10 @@ const { values: flags, positionals } = parseArgs({
         "max-input-tokens": { type: "string", default: "30000000" },
         "chatgpt-credential": { type: "string" },
         "antigravity-credential": { type: "string", default: "antigravity:google" },
-        "voyage-key-file": { type: "string", default: join(process.env.HOME ?? "", ".config", "voyage.key") },
+        "voyage-key-file": {
+            type: "string",
+            default: join(process.env.HOME ?? "", ".config", "voyage.key"),
+        },
         questions: { type: "string" },
         "stop-after": { type: "string" },
         "reject-codex-after": { type: "string" },
@@ -170,9 +189,13 @@ function numberFlag(name: keyof typeof flags): number {
 }
 
 function opencodeBinary(): string {
-    const binary = (flags.opencode as string | undefined) ?? join(dataDir(), "host", `opencode-${EXPECTED_HOST_VERSION}`);
+    const binary =
+        (flags.opencode as string | undefined) ??
+        join(dataDir(), "host", `opencode-${EXPECTED_HOST_VERSION}`);
     if (!existsSync(binary)) {
-        throw new Error(`OpenCode ${EXPECTED_HOST_VERSION} not found at ${binary}; copy the stock binary there or pass --opencode`);
+        throw new Error(
+            `OpenCode ${EXPECTED_HOST_VERSION} not found at ${binary}; copy the stock binary there or pass --opencode`,
+        );
     }
     return binary;
 }
@@ -183,7 +206,8 @@ function datasetFile(split: string): string {
 
 async function loadConversations(split: string, ids: string[]): Promise<Conversation[]> {
     const file = datasetFile(split);
-    if (!existsSync(file)) throw new Error(`dataset not prepared: ${file}; run the prepare command`);
+    if (!existsSync(file))
+        throw new Error(`dataset not prepared: ${file}; run the prepare command`);
     const rows = await loadRows(file);
     return ids.map((id) => {
         const row = rows.find((candidate) => candidate.conversation_id === id);
@@ -200,14 +224,18 @@ function runDir(settings: { run: string }): string {
 
 async function buildSettings(): Promise<Settings> {
     const run = flags.run as string | undefined;
-    if (!run || !/^[\w.-]+$/.test(run)) throw new Error("--run <name> is required (letters, digits, . _ -)");
+    if (!run || !/^[\w.-]+$/.test(run))
+        throw new Error("--run <name> is required (letters, digits, . _ -)");
     const temperatureText = flags.temperature as string;
     return {
         run,
         mode: flags.stub ? "stub" : "vault",
         split: flags.split as string,
         datasetRevision: DATASET_REVISION,
-        conversations: (flags.conversations as string).split(",").map((id) => id.trim()).filter(Boolean),
+        conversations: (flags.conversations as string)
+            .split(",")
+            .map((id) => id.trim())
+            .filter(Boolean),
         answerModel: flags["answer-model"] as string,
         historianModel: flags["historian-model"] as string,
         reasoningEffort: (flags["reasoning-effort"] as string) || undefined,
@@ -239,7 +267,9 @@ function pinSettings(settings: Settings): void {
         (key) => JSON.stringify(saved[key]) !== JSON.stringify(settings[key]),
     );
     if (differing.length > 0) {
-        throw new Error(`run ${settings.run} was started with different settings (${differing.join(", ")}); use a new --run`);
+        throw new Error(
+            `run ${settings.run} was started with different settings (${differing.join(", ")}); use a new --run`,
+        );
     }
 }
 
@@ -335,11 +365,18 @@ function hostModels(settings: Settings): HostModels {
 /** Stop conditions shared by both arms: a rejected credential ends the run without retrying. */
 function checkUpstreams(upstreams: Upstreams): void {
     if (upstreams.relay.authRejected) {
-        throw new StopRun(`Cloud Code Assist rejected the credential (HTTP ${upstreams.relay.authRejected.status}); stopping without retry`);
+        throw new StopRun(
+            `Cloud Code Assist rejected the credential (HTTP ${upstreams.relay.authRejected.status}); stopping without retry`,
+        );
     }
 }
 
-function judgeFor(upstreams: Upstreams, settings: Settings, usage: Usage, counter: { calls: number }): JudgeCall {
+function judgeFor(
+    upstreams: Upstreams,
+    settings: Settings,
+    usage: Usage,
+    counter: { calls: number },
+): JudgeCall {
     return async (messages) => {
         const result = await codexComplete(upstreams.codex(settings), messages as ChatMessage[]);
         addUsage(usage, result.usage);
@@ -353,22 +390,36 @@ function armInputTokens(states: QuestionState[], extra = 0): number {
     return (
         extra +
         states.reduce(
-            (sum, state) => sum + (state.answerUsage?.input ?? 0) + (state.judgeUsage?.input ?? 0) + (state.historianUsage?.input ?? 0),
+            (sum, state) =>
+                sum +
+                (state.answerUsage?.input ?? 0) +
+                (state.judgeUsage?.input ?? 0) +
+                (state.historianUsage?.input ?? 0),
             0,
         )
     );
 }
 
-function enforceBudget(settings: Settings, arm: string, states: QuestionState[], total: number, extra = 0): void {
+function enforceBudget(
+    settings: Settings,
+    arm: string,
+    states: QuestionState[],
+    total: number,
+    extra = 0,
+): void {
     const spent = armInputTokens(states, extra);
     const done = states.filter((state) => state.scoring).length;
     if (spent > settings.maxInputTokensPerArm) {
-        throw new StopRun(`${arm}: ${spent} input tokens spent, over the ${settings.maxInputTokensPerArm} limit`);
+        throw new StopRun(
+            `${arm}: ${spent} input tokens spent, over the ${settings.maxInputTokensPerArm} limit`,
+        );
     }
     if (done >= 3) {
         const projected = extra + ((spent - extra) / done) * total;
         if (projected > settings.maxInputTokensPerArm) {
-            throw new StopRun(`${arm}: projected ${Math.round(projected)} input tokens for ${total} questions, over the ${settings.maxInputTokensPerArm} limit`);
+            throw new StopRun(
+                `${arm}: projected ${Math.round(projected)} input tokens for ${total} questions, over the ${settings.maxInputTokensPerArm} limit`,
+            );
         }
     }
 }
@@ -387,7 +438,9 @@ function loadStates(settings: Settings, arm: string): QuestionState[] {
 
 function selectedQuestions(conversation: Conversation): Question[] {
     const only = (flags.questions as string | undefined)?.split(",").map((id) => id.trim());
-    return only ? conversation.questions.filter((question) => only.includes(question.id)) : conversation.questions;
+    return only
+        ? conversation.questions.filter((question) => only.includes(question.id))
+        : conversation.questions;
 }
 
 let processedThisInvocation = 0;
@@ -396,18 +449,28 @@ function maybeStopAfter(): void {
     processedThisInvocation++;
     const limit = flags["stop-after"] ? Number(flags["stop-after"]) : Number.POSITIVE_INFINITY;
     if (processedThisInvocation >= limit) {
-        log(`--stop-after ${limit}: killing this process now (SIGKILL) to leave a half-finished run`);
+        log(
+            `--stop-after ${limit}: killing this process now (SIGKILL) to leave a half-finished run`,
+        );
         process.kill(process.pid, "SIGKILL");
     }
 }
 
 /** `--reject-codex-after N` makes the stub answer 401 after N questions, to prove stop-on-rejection. */
 function maybeRejectCodex(upstreams: Upstreams): void {
-    const after = flags["reject-codex-after"] ? Number(flags["reject-codex-after"]) : Number.POSITIVE_INFINITY;
+    const after = flags["reject-codex-after"]
+        ? Number(flags["reject-codex-after"])
+        : Number.POSITIVE_INFINITY;
     if (upstreams.stub && processedThisInvocation >= after) upstreams.stub.rejectCodex = true;
 }
 
-async function scoreState(state: QuestionState, question: Question, judge: JudgeCall, judgeUsage: Usage, counter: { calls: number }): Promise<void> {
+async function scoreState(
+    state: QuestionState,
+    question: Question,
+    judge: JudgeCall,
+    judgeUsage: Usage,
+    counter: { calls: number },
+): Promise<void> {
     const scoring = await scoreQuestion(question, state.answer ?? "", judge, releasedPromptSet);
     state.scoring = scoring;
     state.score = scoring.score;
@@ -421,11 +484,21 @@ async function scoreState(state: QuestionState, question: Question, judge: Judge
  * The released code's long-context baseline: every turn as a chat message with its role and
  * content, then the question wrapper as one more user message, and no system message.
  */
-async function runVanilla(settings: Settings, upstreams: Upstreams, conversations: Conversation[]): Promise<void> {
+async function runVanilla(
+    settings: Settings,
+    upstreams: Upstreams,
+    conversations: Conversation[],
+): Promise<void> {
     const arm = "vanilla";
-    const total = conversations.reduce((sum, conversation) => sum + selectedQuestions(conversation).length, 0);
+    const total = conversations.reduce(
+        (sum, conversation) => sum + selectedQuestions(conversation).length,
+        0,
+    );
     for (const conversation of conversations) {
-        const history: ChatMessage[] = conversation.turns.map((turn) => ({ role: turn.role, content: turn.content }));
+        const history: ChatMessage[] = conversation.turns.map((turn) => ({
+            role: turn.role,
+            content: turn.content,
+        }));
         for (const question of selectedQuestions(conversation)) {
             const path = questionFile(settings, arm, question.id);
             const state: QuestionState = readJson<QuestionState>(path) ?? {
@@ -439,7 +512,10 @@ async function runVanilla(settings: Settings, upstreams: Upstreams, conversation
             enforceBudget(settings, arm, loadStates(settings, arm), total);
             maybeRejectCodex(upstreams);
             if (state.answer === undefined) {
-                const result = await codexComplete(upstreams.codex(settings), [...history, { role: "user", content: state.questionTurn }]);
+                const result = await codexComplete(upstreams.codex(settings), [
+                    ...history,
+                    { role: "user", content: state.questionTurn },
+                ]);
                 state.answer = result.text;
                 state.answerUsage = result.usage;
                 state.toolCalls = [];
@@ -447,7 +523,13 @@ async function runVanilla(settings: Settings, upstreams: Upstreams, conversation
             }
             const judgeUsage = emptyUsage();
             const counter = { calls: 0 };
-            await scoreState(state, question, judgeFor(upstreams, settings, judgeUsage, counter), judgeUsage, counter);
+            await scoreState(
+                state,
+                question,
+                judgeFor(upstreams, settings, judgeUsage, counter),
+                judgeUsage,
+                counter,
+            );
             writeJsonAtomic(path, state);
             log(`vanilla ${question.id}: score ${state.score?.toFixed(3)}`);
             maybeStopAfter();
@@ -493,7 +575,10 @@ function killStaleHost(settings: Settings): void {
     const pid = Number(readIfExists(pidFile(settings)).trim());
     if (!pid) return;
     // `ps` is not available inside the macOS sandbox; `pgrep` is.
-    const running = spawnSync("pgrep", ["-f", "opencode-.* serve"], { encoding: "utf8", windowsHide: true }).stdout;
+    const running = spawnSync("pgrep", ["-f", "opencode-.* serve"], {
+        encoding: "utf8",
+        windowsHide: true,
+    }).stdout;
     if (running.split("\n").some((line) => Number(line.trim()) === pid)) {
         log(`stopping a host left by an earlier run (pid ${pid})`);
         try {
@@ -508,7 +593,11 @@ function killStaleHost(settings: Settings): void {
 function appendIsolation(settings: Settings, label: string, files: string[]): void {
     const path = join(runDir(settings), "mc", "isolation.jsonl");
     mkdirSync(join(path, ".."), { recursive: true });
-    writeFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), label, databases: files })}\n`, { flag: "a" });
+    writeFileSync(
+        path,
+        `${JSON.stringify({ at: new Date().toISOString(), label, databases: files })}\n`,
+        { flag: "a" },
+    );
 }
 
 async function withHost<T>(
@@ -527,11 +616,12 @@ async function withHost<T>(
         appendIsolation(settings, `${label} ${when} pid=${host.pid}`, files);
         isolation.push(files);
     };
+    let result: { value: T; isolation: string[][] };
     try {
         sample("start");
         const value = await work(host);
         sample("end");
-        return { value, isolation };
+        result = { value, isolation };
     } finally {
         const hostLog = scrub(host.log(), upstreams.credentials.secrets());
         writeFileSync(join(runDir(settings), "mc", "logs", `${label}.host.log`), hostLog);
@@ -539,14 +629,23 @@ async function withHost<T>(
         rmSync(pidFile(settings), { force: true });
         const mcLog = scrub(readIfExists(paths.mcLog), upstreams.credentials.secrets());
         writeFileSync(join(runDir(settings), "mc", "logs", `${label}.mc.log`), mcLog);
-        const credentials = credentialRowCounts(paths.opencodeDb);
-        if (Object.values(credentials).some((count) => count > 0)) {
-            throw new StopRun(`the throwaway OpenCode store holds credential rows ${JSON.stringify(credentials)}`);
-        }
     }
+    // Checked once the host has stopped: no login or credential row may reach its store.
+    const credentials = credentialRowCounts(paths.opencodeDb);
+    if (Object.values(credentials).some((count) => count > 0)) {
+        throw new StopRun(
+            `the throwaway OpenCode store holds credential rows ${JSON.stringify(credentials)}`,
+        );
+    }
+    return result;
 }
 
-function relayUsage(entries: RelayLogEntry[]): { calls: number; input: number; output: number; failedCalls: number } {
+function relayUsage(entries: RelayLogEntry[]): {
+    calls: number;
+    input: number;
+    output: number;
+    failedCalls: number;
+} {
     return {
         calls: entries.length,
         input: entries.reduce((sum, entry) => sum + entry.inputTokens, 0),
@@ -555,18 +654,35 @@ function relayUsage(entries: RelayLogEntry[]): { calls: number; input: number; o
     };
 }
 
-function runBoundaryProbe(paths: RootLayout, sessionId: string, settings: Settings): BoundaryProbeResult {
+function runBoundaryProbe(
+    paths: RootLayout,
+    sessionId: string,
+    settings: Settings,
+): BoundaryProbeResult {
     const scratchRoot = `${paths.root}-probe`;
     const scratch = restoreRoot(paths.root, scratchRoot);
     try {
         const result = spawnSync(
             process.execPath,
-            [join(import.meta.dir, "boundary-probe.ts"), sessionId, String(settings.answerContextLimit), String(settings.executeThresholdPercentage)],
-            { cwd: scratch.dirs.work, env: rootEnv(scratch), encoding: "utf8", windowsHide: true, timeout: 300_000 },
+            [
+                join(import.meta.dir, "boundary-probe.ts"),
+                sessionId,
+                String(settings.answerContextLimit),
+                String(settings.executeThresholdPercentage),
+            ],
+            {
+                cwd: scratch.dirs.work,
+                env: rootEnv(scratch),
+                encoding: "utf8",
+                windowsHide: true,
+                timeout: 300_000,
+            },
         );
         const line = result.stdout.trim().split("\n").at(-1) ?? "";
         if (result.status !== 0 || !line.startsWith("{")) {
-            throw new Error(`boundary probe failed (${result.status}): ${result.stderr.slice(-1500)}`);
+            throw new Error(
+                `boundary probe failed (${result.status}): ${result.stderr.slice(-1500)}`,
+            );
         }
         return JSON.parse(line) as BoundaryProbeResult;
     } finally {
@@ -582,14 +698,30 @@ function ingestStats(paths: RootLayout, sessionId: string): IngestStats {
         const one = (db: InstanceType<typeof Database>, sql: string, ...args: string[]) =>
             Number((db.query(sql).get(...args) as { n: number | null } | null)?.n ?? 0);
         return {
-            compartments: one(context, "SELECT COUNT(*) AS n FROM compartments WHERE session_id = ?", sessionId),
-            compartmentP1Chars: one(context, "SELECT SUM(LENGTH(COALESCE(p1, content))) AS n FROM compartments WHERE session_id = ?", sessionId),
-            coveredThroughOrdinal: one(context, "SELECT MAX(end_message) AS n FROM compartments WHERE session_id = ?", sessionId),
+            compartments: one(
+                context,
+                "SELECT COUNT(*) AS n FROM compartments WHERE session_id = ?",
+                sessionId,
+            ),
+            compartmentP1Chars: one(
+                context,
+                "SELECT SUM(LENGTH(COALESCE(p1, content))) AS n FROM compartments WHERE session_id = ?",
+                sessionId,
+            ),
+            coveredThroughOrdinal: one(
+                context,
+                "SELECT MAX(end_message) AS n FROM compartments WHERE session_id = ?",
+                sessionId,
+            ),
             memories: one(context, "SELECT COUNT(*) AS n FROM memories WHERE status = 'active'"),
             userMemories: one(context, "SELECT COUNT(*) AS n FROM user_memories"),
             sessionFacts: one(context, "SELECT COUNT(*) AS n FROM session_facts"),
             memoryEmbeddings: one(context, "SELECT COUNT(*) AS n FROM memory_embeddings"),
-            opencodeMessages: one(opencode, "SELECT COUNT(*) AS n FROM message WHERE session_id = ?", sessionId),
+            opencodeMessages: one(
+                opencode,
+                "SELECT COUNT(*) AS n FROM message WHERE session_id = ?",
+                sessionId,
+            ),
         };
     } finally {
         context.close();
@@ -610,7 +742,11 @@ function snapshotDir(settings: Settings, conversation: Conversation): string {
  * written while it is stopped, the production protected-tail boundary sizes the raw tail, and the
  * real host runs `/ctx-wrapup N` (the incremental historian with fact extraction) over the rest.
  */
-async function ingestConversation(settings: Settings, upstreams: Upstreams, conversation: Conversation): Promise<IngestRecord> {
+async function ingestConversation(
+    settings: Settings,
+    upstreams: Upstreams,
+    conversation: Conversation,
+): Promise<IngestRecord> {
     const path = join(runDir(settings), "mc", "ingest", `c${conversation.id}.json`);
     const saved = readJson<IngestRecord>(path);
     if (saved?.done && existsSync(snapshotDir(settings, conversation))) return saved;
@@ -623,13 +759,25 @@ async function ingestConversation(settings: Settings, upstreams: Upstreams, conv
     writeHostConfig(paths, hostModels(settings), upstreams.wiring, { dreamer: settings.dreamer });
     const isolation: string[][] = [];
 
-    const created = await withHost(settings, upstreams, paths, `c${conversation.id}-create`, async (host) => {
-        const response = await host.api("/session", { title: `BEAM ${settings.split} conversation ${conversation.id}` });
-        if (response.status !== 200) throw new Error(`session create failed: HTTP ${response.status}`);
-        return response.value as { id: string; projectID: string };
-    });
+    const created = await withHost(
+        settings,
+        upstreams,
+        paths,
+        `c${conversation.id}-create`,
+        async (host) => {
+            const response = await host.api("/session", {
+                title: `BEAM ${settings.split} conversation ${conversation.id}`,
+            });
+            if (response.status !== 200)
+                throw new Error(`session create failed: HTTP ${response.status}`);
+            return response.value as { id: string; projectID: string };
+        },
+    );
     isolation.push(...created.isolation);
-    if (created.value.projectID !== projectId) throw new Error(`host project ${created.value.projectID} is not the repo root commit ${projectId}`);
+    if (created.value.projectID !== projectId)
+        throw new Error(
+            `host project ${created.value.projectID} is not the repo root commit ${projectId}`,
+        );
     const sessionId = created.value.id;
 
     const written = writeSessionTurns({
@@ -641,23 +789,33 @@ async function ingestConversation(settings: Settings, upstreams: Upstreams, conv
         turns: conversation.turns,
     });
     const probe = runBoundaryProbe(paths, sessionId, settings);
-    log(`c${conversation.id}: ${conversation.turns.length} turns, ${probe.sessionTokens} tokens; protected tail keeps ${probe.messagesToKeep} messages (${probe.tailTokens} tokens)`);
+    log(
+        `c${conversation.id}: ${conversation.turns.length} turns, ${probe.sessionTokens} tokens; protected tail keeps ${probe.messagesToKeep} messages (${probe.tailTokens} tokens)`,
+    );
 
     const ingestCommand = `/ctx-wrapup ${probe.messagesToKeep}`;
     const relayStart = upstreams.relay.log.length;
-    const wrapup = await withHost(settings, upstreams, paths, `c${conversation.id}-wrapup`, async (host) => {
-        const response = await host.api(
-            `/session/${sessionId}/command`,
-            { command: "ctx-wrapup", arguments: String(probe.messagesToKeep) },
-            4 * 60 * 60_000,
-        );
-        return response.status;
-    });
+    const wrapup = await withHost(
+        settings,
+        upstreams,
+        paths,
+        `c${conversation.id}-wrapup`,
+        async (host) => {
+            const response = await host.api(
+                `/session/${sessionId}/command`,
+                { command: "ctx-wrapup", arguments: String(probe.messagesToKeep) },
+                4 * 60 * 60_000,
+            );
+            return response.status;
+        },
+    );
     isolation.push(...wrapup.isolation);
     checkUpstreams(upstreams);
     const stats = ingestStats(paths, sessionId);
     if (stats.compartments === 0) {
-        throw new StopRun(`c${conversation.id}: ${ingestCommand} produced no compartments (HTTP ${wrapup.value}); see mc/logs/c${conversation.id}-wrapup.mc.log`);
+        throw new StopRun(
+            `c${conversation.id}: ${ingestCommand} produced no compartments (HTTP ${wrapup.value}); see mc/logs/c${conversation.id}-wrapup.mc.log`,
+        );
     }
     snapshotRoot(paths, snapshotDir(settings, conversation));
     const record: IngestRecord = {
@@ -676,23 +834,47 @@ async function ingestConversation(settings: Settings, upstreams: Upstreams, conv
         credentialRows: credentialRowCounts(paths.opencodeDb),
     };
     writeJsonAtomic(path, record);
-    log(`c${conversation.id}: ${stats.compartments} compartments, ${stats.memories} memories, historian ${record.historian.calls} calls`);
+    log(
+        `c${conversation.id}: ${stats.compartments} compartments, ${stats.memories} memories, historian ${record.historian.calls} calls`,
+    );
     return record;
 }
 
 interface ApiMessage {
-    info: { id: string; role: string; error?: unknown; tokens?: { input?: number; output?: number; reasoning?: number; cache?: { read?: number } } };
-    parts: { type: string; text?: string; tool?: string; synthetic?: boolean; ignored?: boolean; state?: { status?: string; input?: unknown; output?: unknown } }[];
+    info: {
+        id: string;
+        role: string;
+        error?: unknown;
+        tokens?: { input?: number; output?: number; reasoning?: number; cache?: { read?: number } };
+    };
+    parts: {
+        type: string;
+        text?: string;
+        tool?: string;
+        synthetic?: boolean;
+        ignored?: boolean;
+        state?: { status?: string; input?: unknown; output?: unknown };
+    }[];
 }
 
 /** What the host did after the question: the final answer, every tool call and the usage. */
 export function readAnswer(
     messages: ApiMessage[],
     questionTurn: string,
-): { answer: string; toolCalls: ToolCallRecord[]; usage: Usage; requestInputTokens: number; error?: string } {
+): {
+    answer: string;
+    toolCalls: ToolCallRecord[];
+    usage: Usage;
+    requestInputTokens: number;
+    error?: string;
+} {
     let start = -1;
     messages.forEach((message, index) => {
-        if (message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === questionTurn)) start = index;
+        if (
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.text === questionTurn)
+        )
+            start = index;
     });
     if (start < 0) throw new Error("the question message is not in the session");
     const after = messages.slice(start + 1).filter((message) => message.info.role === "assistant");
@@ -700,14 +882,32 @@ export function readAnswer(
     const usage = emptyUsage();
     for (const message of after) {
         const tokens = message.info.tokens ?? {};
-        addUsage(usage, { input: (tokens.input ?? 0) + (tokens.cache?.read ?? 0), cachedInput: tokens.cache?.read ?? 0, output: tokens.output ?? 0, reasoning: tokens.reasoning ?? 0 });
+        addUsage(usage, {
+            input: (tokens.input ?? 0) + (tokens.cache?.read ?? 0),
+            cachedInput: tokens.cache?.read ?? 0,
+            output: tokens.output ?? 0,
+            reasoning: tokens.reasoning ?? 0,
+        });
         for (const part of message.parts) {
             if (part.type !== "tool") continue;
-            const output = typeof part.state?.output === "string" ? part.state.output : JSON.stringify(part.state?.output ?? "");
-            toolCalls.push({ tool: part.tool ?? "", input: part.state?.input, status: part.state?.status ?? "", outputChars: output.length, outputTokensApprox: Math.ceil(output.length / 4) });
+            const output =
+                typeof part.state?.output === "string"
+                    ? part.state.output
+                    : JSON.stringify(part.state?.output ?? "");
+            toolCalls.push({
+                tool: part.tool ?? "",
+                input: part.state?.input,
+                status: part.state?.status ?? "",
+                outputChars: output.length,
+                outputTokensApprox: Math.ceil(output.length / 4),
+            });
         }
     }
-    const final = [...after].reverse().find((message) => message.parts.some((part) => part.type === "text" && !part.synthetic && !part.ignored));
+    const final = [...after]
+        .reverse()
+        .find((message) =>
+            message.parts.some((part) => part.type === "text" && !part.synthetic && !part.ignored),
+        );
     const answer = (final?.parts ?? [])
         .filter((part) => part.type === "text" && !part.synthetic && !part.ignored)
         .map((part) => part.text ?? "")
@@ -723,10 +923,17 @@ export function readAnswer(
     };
 }
 
-async function runMagicContext(settings: Settings, upstreams: Upstreams, conversations: Conversation[]): Promise<void> {
+async function runMagicContext(
+    settings: Settings,
+    upstreams: Upstreams,
+    conversations: Conversation[],
+): Promise<void> {
     const arm = "mc";
     mkdirSync(join(runDir(settings), "mc", "logs"), { recursive: true });
-    const total = conversations.reduce((sum, conversation) => sum + selectedQuestions(conversation).length, 0);
+    const total = conversations.reduce(
+        (sum, conversation) => sum + selectedQuestions(conversation).length,
+        0,
+    );
     const ingests: IngestRecord[] = [];
     const ingestTokens = () => ingests.reduce((sum, record) => sum + record.historian.input, 0);
     for (const conversation of conversations) {
@@ -748,28 +955,52 @@ async function runMagicContext(settings: Settings, upstreams: Upstreams, convers
             if (state.answer === undefined) {
                 killStaleHost(settings);
                 // Every question starts from its own fresh copy of the post-ingest stores.
-                const paths = restoreRoot(snapshotDir(settings, conversation), liveRoot(settings, conversation));
-                writeHostConfig(paths, hostModels(settings), upstreams.wiring, { dreamer: settings.dreamer });
-                const relayStart = upstreams.relay.log.length;
-                const asked = await withHost(settings, upstreams, paths, `c${conversation.id}-${question.id}`, async (host) => {
-                    const response = await host.api(
-                        `/session/${ingest.sessionId}/message`,
-                        { model: { providerID: ANSWER_PROVIDER, modelID: settings.answerModel }, agent: "build", parts: [{ type: "text", text: state.questionTurn }] },
-                        30 * 60_000,
-                    );
-                    if (response.status !== 200) {
-                        throw new Error(`question failed: HTTP ${response.status} ${scrub(JSON.stringify(response.value), upstreams.credentials.secrets()).slice(0, 500)}`);
-                    }
-                    const messages = await host.api(`/session/${ingest.sessionId}/message`);
-                    return readAnswer(messages.value as ApiMessage[], state.questionTurn);
+                const paths = restoreRoot(
+                    snapshotDir(settings, conversation),
+                    liveRoot(settings, conversation),
+                );
+                writeHostConfig(paths, hostModels(settings), upstreams.wiring, {
+                    dreamer: settings.dreamer,
                 });
+                const relayStart = upstreams.relay.log.length;
+                const asked = await withHost(
+                    settings,
+                    upstreams,
+                    paths,
+                    `c${conversation.id}-${question.id}`,
+                    async (host) => {
+                        const response = await host.api(
+                            `/session/${ingest.sessionId}/message`,
+                            {
+                                model: {
+                                    providerID: ANSWER_PROVIDER,
+                                    modelID: settings.answerModel,
+                                },
+                                agent: "build",
+                                parts: [{ type: "text", text: state.questionTurn }],
+                            },
+                            30 * 60_000,
+                        );
+                        if (response.status !== 200) {
+                            throw new Error(
+                                `question failed: HTTP ${response.status} ${scrub(JSON.stringify(response.value), upstreams.credentials.secrets()).slice(0, 500)}`,
+                            );
+                        }
+                        const messages = await host.api(`/session/${ingest.sessionId}/message`);
+                        return readAnswer(messages.value as ApiMessage[], state.questionTurn);
+                    },
+                );
                 checkUpstreams(upstreams);
                 const info = asked.value;
                 if (info.error) {
                     if (/\b(401|403)\b|unauthori[sz]ed|forbidden/i.test(info.error)) {
-                        throw new StopRun(`Codex backend rejected the credential during ${question.id}; stopping without retry`);
+                        throw new StopRun(
+                            `Codex backend rejected the credential during ${question.id}; stopping without retry`,
+                        );
                     }
-                    throw new Error(`the host's answer model failed on ${question.id}: ${scrub(info.error, upstreams.credentials.secrets()).slice(0, 500)}`);
+                    throw new Error(
+                        `the host's answer model failed on ${question.id}: ${scrub(info.error, upstreams.credentials.secrets()).slice(0, 500)}`,
+                    );
                 }
                 state.answer = info.answer;
                 state.toolCalls = info.toolCalls;
@@ -781,9 +1012,17 @@ async function runMagicContext(settings: Settings, upstreams: Upstreams, convers
             }
             const judgeUsage = emptyUsage();
             const counter = { calls: 0 };
-            await scoreState(state, question, judgeFor(upstreams, settings, judgeUsage, counter), judgeUsage, counter);
+            await scoreState(
+                state,
+                question,
+                judgeFor(upstreams, settings, judgeUsage, counter),
+                judgeUsage,
+                counter,
+            );
             writeJsonAtomic(path, state);
-            log(`mc ${question.id}: score ${state.score?.toFixed(3)}, ${state.toolCalls?.length ?? 0} tool calls`);
+            log(
+                `mc ${question.id}: score ${state.score?.toFixed(3)}, ${state.toolCalls?.length ?? 0} tool calls`,
+            );
             maybeStopAfter();
         }
     }
@@ -800,7 +1039,11 @@ function summarizeRun(settings: Settings): Record<string, unknown> {
     for (const arm of ["vanilla", "mc"]) {
         const states = loadStates(settings, arm).filter((state) => state.scoring);
         if (states.length === 0) continue;
-        const usage = { answer: emptyUsage(), judge: emptyUsage(), historian: { calls: 0, input: 0, output: 0 } };
+        const usage = {
+            answer: emptyUsage(),
+            judge: emptyUsage(),
+            historian: { calls: 0, input: 0, output: 0 },
+        };
         for (const state of states) {
             addUsage(usage.answer, state.answerUsage ?? emptyUsage());
             addUsage(usage.judge, state.judgeUsage ?? emptyUsage());
@@ -811,7 +1054,11 @@ function summarizeRun(settings: Settings): Record<string, unknown> {
         const ingest =
             arm === "mc"
                 ? settings.conversations
-                      .map((id) => readJson<IngestRecord>(join(runDir(settings), "mc", "ingest", `c${id}.json`)))
+                      .map((id) =>
+                          readJson<IngestRecord>(
+                              join(runDir(settings), "mc", "ingest", `c${id}.json`),
+                          ),
+                      )
                       .filter((record): record is IngestRecord => record !== null)
                 : [];
         for (const record of ingest) {
@@ -820,7 +1067,9 @@ function summarizeRun(settings: Settings): Record<string, unknown> {
             usage.historian.output += record.historian.output;
         }
         out[arm] = {
-            ...summarize(states.map((state) => ({ category: state.category, score: state.score ?? 0 }))),
+            ...summarize(
+                states.map((state) => ({ category: state.category, score: state.score ?? 0 })),
+            ),
             usage,
             totalInputTokens: usage.answer.input + usage.judge.input + usage.historian.input,
             totalOutputTokens: usage.answer.output + usage.judge.output + usage.historian.output,
@@ -845,11 +1094,22 @@ let upstreamsForSummary: Upstreams | null = null;
 
 function printSummary(summary: Record<string, unknown>): void {
     for (const arm of ["vanilla", "mc"]) {
-        const value = summary[arm] as (ReturnType<typeof summarize> & { totalInputTokens: number; totalOutputTokens: number; toolCalls: number }) | undefined;
+        const value = summary[arm] as
+            | (ReturnType<typeof summarize> & {
+                  totalInputTokens: number;
+                  totalOutputTokens: number;
+                  toolCalls: number;
+              })
+            | undefined;
         if (!value) continue;
-        console.log(`\n${arm}: ${value.questions} questions, mean ${value.mean.toFixed(3)}  (paper GPT-4.1-nano 100K: Vanilla ${PAPER_TABLE1_NANO_100K.vanilla}, RAG ${PAPER_TABLE1_NANO_100K.rag}, LIGHT ${PAPER_TABLE1_NANO_100K.light})`);
-        for (const [category, row] of Object.entries(value.byCategory)) console.log(`  ${category.padEnd(26)} ${row.mean.toFixed(3)}  (n=${row.questions})`);
-        console.log(`  input tokens ${value.totalInputTokens}, output tokens ${value.totalOutputTokens}, tool calls ${value.toolCalls}`);
+        console.log(
+            `\n${arm}: ${value.questions} questions, mean ${value.mean.toFixed(3)}  (paper GPT-4.1-nano 100K: Vanilla ${PAPER_TABLE1_NANO_100K.vanilla}, RAG ${PAPER_TABLE1_NANO_100K.rag}, LIGHT ${PAPER_TABLE1_NANO_100K.light})`,
+        );
+        for (const [category, row] of Object.entries(value.byCategory))
+            console.log(`  ${category.padEnd(26)} ${row.mean.toFixed(3)}  (n=${row.questions})`);
+        console.log(
+            `  input tokens ${value.totalInputTokens}, output tokens ${value.totalOutputTokens}, tool calls ${value.toolCalls}`,
+        );
     }
 }
 
@@ -857,31 +1117,59 @@ function printSummary(summary: Record<string, unknown>): void {
 async function smokeTransport(settings: Settings, upstreams: Upstreams): Promise<number> {
     let failures = 0;
     try {
-        const result = await codexComplete(upstreams.codex(settings), [{ role: "user", content: "Reply with the single word: ok" }], 120_000);
-        console.log(`codex direct: ok model=${settings.answerModel} input=${result.usage.input} output=${result.usage.output} reasoning=${result.usage.reasoning}`);
+        const result = await codexComplete(
+            upstreams.codex(settings),
+            [{ role: "user", content: "Reply with the single word: ok" }],
+            120_000,
+        );
+        console.log(
+            `codex direct: ok model=${settings.answerModel} input=${result.usage.input} output=${result.usage.output} reasoning=${result.usage.reasoning}`,
+        );
     } catch (error) {
         failures++;
-        console.log(`codex direct: FAILED ${scrub(String((error as Error).message), upstreams.credentials.secrets()).slice(0, 400)}`);
+        console.log(
+            `codex direct: FAILED ${scrub(String((error as Error).message), upstreams.credentials.secrets()).slice(0, 400)}`,
+        );
     }
-    const response = await fetch(`${upstreams.wiring.geminiBaseURL}/models/${settings.historianModel}:generateContent`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-goog-api-key": upstreams.relay.hostKey },
-        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Reply with the single word: ok" }] }] }),
-    });
+    const response = await fetch(
+        `${upstreams.wiring.geminiBaseURL}/models/${settings.historianModel}:generateContent`,
+        {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-goog-api-key": upstreams.relay.hostKey,
+            },
+            body: JSON.stringify({
+                contents: [{ role: "user", parts: [{ text: "Reply with the single word: ok" }] }],
+            }),
+        },
+    );
     const text = await response.text();
     let usage = "";
     try {
-        const parsed = JSON.parse(text) as { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number }; modelVersion?: string };
+        const parsed = JSON.parse(text) as {
+            usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+            modelVersion?: string;
+        };
         usage = `model=${parsed.modelVersion ?? settings.historianModel} input=${parsed.usageMetadata?.promptTokenCount} output=${parsed.usageMetadata?.candidatesTokenCount}`;
     } catch {
         usage = scrub(text, upstreams.credentials.secrets()).slice(0, 400);
     }
     if (!response.ok) failures++;
-    console.log(`gemini via relay: ${response.ok ? "ok" : `FAILED HTTP ${response.status}`} ${usage}`);
+    console.log(
+        `gemini via relay: ${response.ok ? "ok" : `FAILED HTTP ${response.status}`} ${usage}`,
+    );
     const voyage = await fetch(`${upstreams.wiring.embeddingEndpoint}/embeddings`, {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${upstreams.credentials.voyageKey}` },
-        body: JSON.stringify({ model: settings.embeddingModel, input: ["ok"], input_type: "query" }),
+        headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${upstreams.credentials.voyageKey}`,
+        },
+        body: JSON.stringify({
+            model: settings.embeddingModel,
+            input: ["ok"],
+            input_type: "query",
+        }),
     });
     if (!voyage.ok) failures++;
     console.log(`voyage embeddings: ${voyage.ok ? "ok" : `FAILED HTTP ${voyage.status}`}`);
@@ -906,7 +1194,8 @@ async function prepare(split: string): Promise<void> {
         if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} failed`);
     };
     if (!existsSync(python)) run("python3", ["-m", "venv", venv]);
-    if (spawnSync(python, ["-c", "import pyarrow"], { windowsHide: true }).status !== 0) run(python, ["-m", "pip", "install", "-q", "pyarrow"]);
+    if (spawnSync(python, ["-c", "import pyarrow"], { windowsHide: true }).status !== 0)
+        run(python, ["-m", "pip", "install", "-q", "pyarrow"]);
     run(python, [join(import.meta.dir, "parquet_to_jsonl.py"), parquet, datasetFile(split)]);
 }
 
@@ -921,11 +1210,16 @@ async function main(): Promise<number> {
         return 0;
     }
     if (command === "list-credentials") {
-        for (const row of await listGranted()) console.log(`${row.id}  state=${row.state}  categories=${row.categories.join(",")}  adapter=${row.refreshAdapter ?? "-"}`);
+        for (const row of await listGranted())
+            console.log(
+                `${row.id}  state=${row.state}  categories=${row.categories.join(",")}  adapter=${row.refreshAdapter ?? "-"}`,
+            );
         return 0;
     }
     if (!["smoke-transport", "vanilla", "mc", "summary"].includes(command ?? "")) {
-        console.error("usage: run.ts prepare|verify-prompts|list-credentials|smoke-transport|vanilla|mc|summary --run <name> [--stub] [flags]");
+        console.error(
+            "usage: run.ts prepare|verify-prompts|list-credentials|smoke-transport|vanilla|mc|summary --run <name> [--stub] [flags]",
+        );
         return 2;
     }
     const settings = await buildSettings();
@@ -943,7 +1237,8 @@ async function main(): Promise<number> {
     process.once("SIGINT", stopSignal);
     process.once("SIGTERM", stopSignal);
     try {
-        if (command === "smoke-transport") return (await smokeTransport(settings, upstreams)) === 0 ? 0 : 1;
+        if (command === "smoke-transport")
+            return (await smokeTransport(settings, upstreams)) === 0 ? 0 : 1;
         const conversations = await loadConversations(settings.split, settings.conversations);
         if (command === "vanilla") await runVanilla(settings, upstreams, conversations);
         else await runMagicContext(settings, upstreams, conversations);
@@ -951,9 +1246,17 @@ async function main(): Promise<number> {
         printSummary(summary);
         return 0;
     } catch (error) {
-        if (error instanceof StopRun || error instanceof AuthRejectedError || error instanceof RateLimitedError || error instanceof CredentialError) {
+        if (
+            error instanceof StopRun ||
+            error instanceof AuthRejectedError ||
+            error instanceof RateLimitedError ||
+            error instanceof CredentialError
+        ) {
             const reason = scrub((error as Error).message, upstreams.credentials.secrets());
-            writeJsonAtomic(join(runDir(settings), `stopped-${command}.json`), { at: new Date().toISOString(), reason });
+            writeJsonAtomic(join(runDir(settings), `stopped-${command}.json`), {
+                at: new Date().toISOString(),
+                reason,
+            });
             console.error(`stopped: ${reason}`);
             return 3;
         }
@@ -961,9 +1264,15 @@ async function main(): Promise<number> {
     } finally {
         if (upstreams.stub) {
             // Stub records hold fake credentials only as match flags, never values.
-            writeJsonAtomic(join(runDir(settings), `stub-records-${command}-${process.pid}.json`), upstreams.stub.records);
+            writeJsonAtomic(
+                join(runDir(settings), `stub-records-${command}-${process.pid}.json`),
+                upstreams.stub.records,
+            );
         }
-        writeJsonAtomic(join(runDir(settings), `relay-log-${command}-${process.pid}.json`), upstreams.relay.log);
+        writeJsonAtomic(
+            join(runDir(settings), `relay-log-${command}-${process.pid}.json`),
+            upstreams.relay.log,
+        );
         upstreams.stop();
     }
 }
@@ -980,4 +1289,3 @@ if (import.meta.main) {
             process.exit(1);
         });
 }
-

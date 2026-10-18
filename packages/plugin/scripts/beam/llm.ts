@@ -49,8 +49,13 @@ export function addUsage(into: Usage, more: Usage): Usage {
     return into;
 }
 
-export function codexRequestBody(settings: CodexSettings, messages: ChatMessage[]): Record<string, unknown> {
-    const system = messages.filter((message) => message.role === "system").map((message) => message.content);
+export function codexRequestBody(
+    settings: CodexSettings,
+    messages: ChatMessage[],
+): Record<string, unknown> {
+    const system = messages
+        .filter((message) => message.role === "system")
+        .map((message) => message.content);
     const body: Record<string, unknown> = {
         model: settings.model,
         ...(system.length > 0 ? { instructions: system.join("\n") } : {}),
@@ -58,7 +63,12 @@ export function codexRequestBody(settings: CodexSettings, messages: ChatMessage[
             .filter((message) => message.role !== "system")
             .map((message) => ({
                 role: message.role,
-                content: [{ type: message.role === "assistant" ? "output_text" : "input_text", text: message.content }],
+                content: [
+                    {
+                        type: message.role === "assistant" ? "output_text" : "input_text",
+                        text: message.content,
+                    },
+                ],
             })),
         store: false,
         stream: true,
@@ -84,17 +94,28 @@ export function parseResponsesStream(text: string): { text: string; usage: Usage
         } catch {
             continue;
         }
-        if (event.type === "response.output_text.delta" && typeof event.delta === "string") output += event.delta;
-        if (event.type === "response.completed" || event.type === "response.incomplete" || event.type === "response.failed") {
+        if (event.type === "response.output_text.delta" && typeof event.delta === "string")
+            output += event.delta;
+        if (
+            event.type === "response.completed" ||
+            event.type === "response.incomplete" ||
+            event.type === "response.failed"
+        ) {
             const response = event.response as Record<string, unknown> | undefined;
             status = String(response?.status ?? event.type);
             const raw = response?.usage as Record<string, unknown> | undefined;
             if (raw) {
                 usage = {
                     input: Number(raw.input_tokens ?? 0),
-                    cachedInput: Number((raw.input_tokens_details as Record<string, unknown> | undefined)?.cached_tokens ?? 0),
+                    cachedInput: Number(
+                        (raw.input_tokens_details as Record<string, unknown> | undefined)
+                            ?.cached_tokens ?? 0,
+                    ),
                     output: Number(raw.output_tokens ?? 0),
-                    reasoning: Number((raw.output_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens ?? 0),
+                    reasoning: Number(
+                        (raw.output_tokens_details as Record<string, unknown> | undefined)
+                            ?.reasoning_tokens ?? 0,
+                    ),
                 };
             }
             const items = (response?.output as Record<string, unknown>[] | undefined) ?? [];
@@ -110,7 +131,11 @@ export function parseResponsesStream(text: string): { text: string; usage: Usage
     return { text: completedText ?? output, usage, status };
 }
 
-export async function codexComplete(settings: CodexSettings, messages: ChatMessage[], timeoutMs = 600_000): Promise<{ text: string; usage: Usage }> {
+export async function codexComplete(
+    settings: CodexSettings,
+    messages: ChatMessage[],
+    timeoutMs = 600_000,
+): Promise<{ text: string; usage: Usage }> {
     const body = JSON.stringify(codexRequestBody(settings, messages));
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -133,18 +158,27 @@ export async function codexComplete(settings: CodexSettings, messages: ChatMessa
             continue;
         }
         if (response.status === 401 || response.status === 403) {
-            throw new AuthRejectedError(`Codex backend rejected the credential (HTTP ${response.status}): ${(await response.text()).slice(0, 300)}`);
+            throw new AuthRejectedError(
+                `Codex backend rejected the credential (HTTP ${response.status}): ${(await response.text()).slice(0, 300)}`,
+            );
         }
-        if (response.status === 429) throw new RateLimitedError(`Codex backend: HTTP 429 ${(await response.text()).slice(0, 300)}`);
+        if (response.status === 429)
+            throw new RateLimitedError(
+                `Codex backend: HTTP 429 ${(await response.text()).slice(0, 300)}`,
+            );
         if (response.status >= 500) {
             lastError = new Error(`Codex backend: HTTP ${response.status}`);
             await Bun.sleep(2000 * attempt);
             continue;
         }
         const text = await response.text();
-        if (!response.ok) throw new Error(`Codex backend refused the request (HTTP ${response.status}): ${text.slice(0, 500)}`);
+        if (!response.ok)
+            throw new Error(
+                `Codex backend refused the request (HTTP ${response.status}): ${text.slice(0, 500)}`,
+            );
         const parsed = parseResponsesStream(text);
-        if (parsed.status !== "completed") throw new Error(`Codex response ended with status ${parsed.status}`);
+        if (parsed.status !== "completed")
+            throw new Error(`Codex response ended with status ${parsed.status}`);
         return { text: parsed.text, usage: parsed.usage };
     }
     throw new Error(`Codex backend unreachable after 3 attempts: ${String(lastError)}`);

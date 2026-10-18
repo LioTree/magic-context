@@ -72,7 +72,11 @@ export interface Relay {
 const GEMINI_METHOD = /\/models\/([^/:]+):(streamGenerateContent|generateContent)$/;
 
 /** The Cloud Code Assist envelope around one Gemini request. */
-export function wrapCloudCodeRequest(model: string, project: string, request: unknown): Record<string, unknown> {
+export function wrapCloudCodeRequest(
+    model: string,
+    project: string,
+    request: unknown,
+): Record<string, unknown> {
     return {
         model,
         project,
@@ -89,7 +93,8 @@ export function unwrapCloudCodeEvent(data: string): string {
     if (!trimmed || trimmed === "[DONE]") return data;
     try {
         const parsed = JSON.parse(trimmed) as { response?: unknown };
-        if (parsed && typeof parsed === "object" && "response" in parsed) return JSON.stringify(parsed.response);
+        if (parsed && typeof parsed === "object" && "response" in parsed)
+            return JSON.stringify(parsed.response);
     } catch {
         // Not JSON: pass it through untouched.
     }
@@ -99,10 +104,14 @@ export function unwrapCloudCodeEvent(data: string): string {
 /** Copy the token counts out of one unwrapped Gemini reply, if it carries them. */
 function readUsage(data: string, entry: RelayLogEntry): void {
     try {
-        const usage = (JSON.parse(data) as { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number } })
-            .usageMetadata;
+        const usage = (
+            JSON.parse(data) as {
+                usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+            }
+        ).usageMetadata;
         if (usage?.promptTokenCount !== undefined) entry.inputTokens = usage.promptTokenCount;
-        if (usage?.candidatesTokenCount !== undefined) entry.outputTokens = usage.candidatesTokenCount;
+        if (usage?.candidatesTokenCount !== undefined)
+            entry.outputTokens = usage.candidatesTokenCount;
     } catch {
         // Not JSON: nothing to count.
     }
@@ -129,7 +138,9 @@ function unwrapSseStream(
                 buffer += decoder.decode(chunk, { stream: true });
                 const lines = buffer.split("\n");
                 buffer = lines.pop() ?? "";
-                const out = lines.map((line) => `${transformLine(line.replace(/\r$/, ""))}\n`).join("");
+                const out = lines
+                    .map((line) => `${transformLine(line.replace(/\r$/, ""))}\n`)
+                    .join("");
                 if (out) {
                     const bytes = encoder.encode(out);
                     count(bytes.byteLength);
@@ -151,7 +162,13 @@ function unwrapSseStream(
 export function startRelay(options: RelayOptions): Relay {
     const hostKey = randomBytes(32).toString("hex");
     const log: RelayLogEntry[] = [];
-    const relay: Relay = { origin: "", hostKey, log, authRejected: null, stop: () => server.stop(true) };
+    const relay: Relay = {
+        origin: "",
+        hostKey,
+        log,
+        authRejected: null,
+        stop: () => server.stop(true),
+    };
 
     const server = Bun.serve({
         hostname: "127.0.0.1",
@@ -160,7 +177,9 @@ export function startRelay(options: RelayOptions): Relay {
         async fetch(request) {
             const started = Date.now();
             const url = new URL(request.url);
-            const route = options.routes.find((candidate) => url.pathname.startsWith(candidate.prefix));
+            const route = options.routes.find((candidate) =>
+                url.pathname.startsWith(candidate.prefix),
+            );
             const entry: RelayLogEntry = {
                 route: route?.kind ?? "none",
                 method: request.method,
@@ -179,12 +198,18 @@ export function startRelay(options: RelayOptions): Relay {
                 return response;
             };
             if (!route) return finish(new Response("no route", { status: 404 }));
-            const presented = request.headers.get("x-goog-api-key") ?? request.headers.get("authorization")?.replace(/^Bearer /, "");
+            const presented =
+                request.headers.get("x-goog-api-key") ??
+                request.headers.get("authorization")?.replace(/^Bearer /, "");
             if (presented !== hostKey) return finish(new Response("unauthorized", { status: 401 }));
-            if (relay.authRejected) return finish(new Response("upstream credential rejected earlier", { status: 403 }));
+            if (relay.authRejected)
+                return finish(
+                    new Response("upstream credential rejected earlier", { status: 403 }),
+                );
 
             const method = GEMINI_METHOD.exec(url.pathname.slice(route.prefix.length));
-            if (request.method !== "POST" || !method) return finish(new Response("unsupported", { status: 404 }));
+            if (request.method !== "POST" || !method)
+                return finish(new Response("unsupported", { status: 404 }));
             const [, model, action] = method as unknown as [string, string, string];
             const text = await request.text();
             entry.bytesIn = Buffer.byteLength(text);
@@ -204,7 +229,9 @@ export function startRelay(options: RelayOptions): Relay {
                 relay.authRejected = { route: route.kind, status: upstream.status };
                 options.onAuthRejected?.(route.kind, upstream.status);
             }
-            const headers = { "content-type": upstream.headers.get("content-type") ?? "application/json" };
+            const headers = {
+                "content-type": upstream.headers.get("content-type") ?? "application/json",
+            };
             if (!upstream.ok || !upstream.body) {
                 const errorText = await upstream.text();
                 entry.bytesOut = Buffer.byteLength(errorText);

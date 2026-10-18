@@ -37,7 +37,10 @@ function random(seed: number) {
     };
     const text = () => {
         const alphabet = ["a", "Z", " ", "\n", '"', "\\", "<", "é", "日", "😀", "$&", "{x}"];
-        return Array.from({ length: 1 + Math.floor(next() * 12) }, () => alphabet[Math.floor(next() * alphabet.length)]).join("");
+        return Array.from(
+            { length: 1 + Math.floor(next() * 12) },
+            () => alphabet[Math.floor(next() * alphabet.length)],
+        ).join("");
     };
     const value = (depth: number): unknown => {
         const pick = next();
@@ -45,8 +48,14 @@ function random(seed: number) {
         if (pick < 0.4) return Math.round(next() * 1e6) / 1e3;
         if (pick < 0.45) return next() < 0.5;
         if (pick < 0.5) return null;
-        if (pick < 0.75) return Array.from({ length: Math.floor(next() * 4) }, () => value(depth + 1));
-        return Object.fromEntries(Array.from({ length: Math.floor(next() * 4) }, (_, i) => [`k${i}${text()}`, value(depth + 1)]));
+        if (pick < 0.75)
+            return Array.from({ length: Math.floor(next() * 4) }, () => value(depth + 1));
+        return Object.fromEntries(
+            Array.from({ length: Math.floor(next() * 4) }, (_, i) => [
+                `k${i}${text()}`,
+                value(depth + 1),
+            ]),
+        );
     };
     return { next, text, value };
 }
@@ -56,12 +65,26 @@ function randomGeminiBody(seed: number): Record<string, unknown> {
     const body: Record<string, unknown> = {
         contents: Array.from({ length: 1 + Math.floor(r.next() * 4) }, (_, i) => ({
             role: i % 2 ? "model" : "user",
-            parts: [{ text: r.text() }, ...(r.next() < 0.3 ? [{ functionCall: { name: "f", args: r.value(1) } }] : [])],
+            parts: [
+                { text: r.text() },
+                ...(r.next() < 0.3 ? [{ functionCall: { name: "f", args: r.value(1) } }] : []),
+            ],
         })),
         systemInstruction: { parts: [{ text: r.text() }] },
-        generationConfig: { temperature: r.next(), maxOutputTokens: Math.floor(r.next() * 9000), thinkingConfig: r.value(2) },
+        generationConfig: {
+            temperature: r.next(),
+            maxOutputTokens: Math.floor(r.next() * 9000),
+            thinkingConfig: r.value(2),
+        },
     };
-    if (r.next() < 0.6) body.tools = [{ functionDeclarations: [{ name: "f", description: r.text(), parameters: r.value(1) }] }];
+    if (r.next() < 0.6)
+        body.tools = [
+            {
+                functionDeclarations: [
+                    { name: "f", description: r.text(), parameters: r.value(1) },
+                ],
+            },
+        ];
     if (r.next() < 0.5) body.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
     if (r.next() < 0.5) body[`extra${r.text()}`] = r.value(0);
     return body;
@@ -96,10 +119,17 @@ describe("Cloud Code relay", () => {
 
     test("unwraps each streamed `response` event and the non-streamed reply", async () => {
         const streamed = await (await send(randomGeminiBody(7))).text();
-        const event = JSON.parse(streamed.split("\n").find((line) => line.startsWith("data:"))?.slice(5) ?? "{}");
+        const event = JSON.parse(
+            streamed
+                .split("\n")
+                .find((line) => line.startsWith("data:"))
+                ?.slice(5) ?? "{}",
+        );
         expect(event.candidates?.[0]?.content?.parts?.[0]?.text).toBe("ok");
         expect(event.response).toBeUndefined();
-        const whole = (await (await send(randomGeminiBody(8), relay.hostKey, "generateContent")).json()) as { candidates?: { finishReason?: string }[] };
+        const whole = (await (
+            await send(randomGeminiBody(8), relay.hostKey, "generateContent")
+        ).json()) as { candidates?: { finishReason?: string }[] };
         expect(whole.candidates?.[0]?.finishReason).toBe("STOP");
         expect(unwrapCloudCodeEvent(" [DONE]")).toBe(" [DONE]");
     });
@@ -114,12 +144,30 @@ describe("Cloud Code relay", () => {
         const log = JSON.stringify(relay.log);
         expect(log).not.toContain(expectations.cloudCodeToken);
         expect(log).not.toContain(relay.hostKey);
-        expect(Object.keys(relay.log[0] ?? {}).sort()).toEqual(["bytesIn", "bytesOut", "durationMs", "inputTokens", "method", "outputTokens", "path", "route", "status"]);
+        expect(Object.keys(relay.log[0] ?? {}).sort()).toEqual([
+            "bytesIn",
+            "bytesOut",
+            "durationMs",
+            "inputTokens",
+            "method",
+            "outputTokens",
+            "path",
+            "route",
+            "status",
+        ]);
     });
 
     test("an upstream 401 latches the rejection and stops forwarding", async () => {
         const rejecting = startRelay({
-            routes: [{ kind: "cloud-code", prefix: "/gemini/v1beta", upstream: stub.origin, token: () => "not-the-token", project: expectations.cloudCodeProject }],
+            routes: [
+                {
+                    kind: "cloud-code",
+                    prefix: "/gemini/v1beta",
+                    upstream: stub.origin,
+                    token: () => "not-the-token",
+                    project: expectations.cloudCodeProject,
+                },
+            ],
         });
         try {
             const call = () =>

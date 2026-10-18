@@ -60,8 +60,13 @@ describe("orderingScore", () => {
 
 describe("event ordering with the equivalence judge", () => {
     test("each answer line takes the first unused reference item judged the same", async () => {
-        const same = async (reference: string, system: string) => system.toLowerCase().includes(reference.toLowerCase());
-        const aligned = await alignWithJudge(["setup", "auth", "deploy"], ["1) auth work", "2) setup again", "3) setup", "4) misc"], same);
+        const same = async (reference: string, system: string) =>
+            system.toLowerCase().includes(reference.toLowerCase());
+        const aligned = await alignWithJudge(
+            ["setup", "auth", "deploy"],
+            ["1) auth work", "2) setup again", "3) setup", "4) misc"],
+            same,
+        );
         expect(aligned).toEqual(["auth", "setup", "3) setup", "4) misc"]);
     });
 
@@ -78,7 +83,11 @@ describe("event ordering with the equivalence judge", () => {
             prompts,
         );
         // Aligned order [Deployment, Core, Error] against [Core, Error, Deployment]: tau-b = -1/3.
-        expect(result.ordering?.aligned).toEqual(["Deployment", "Core functionality", "Error handling"]);
+        expect(result.ordering?.aligned).toEqual([
+            "Deployment",
+            "Core functionality",
+            "Error handling",
+        ]);
         expect(result.score).toBeCloseTo(1 / 3, 12);
     });
 });
@@ -110,7 +119,8 @@ describe("nugget scoring", () => {
             "Q?",
             "A",
             ["one", "two"],
-            async (messages) => (messages[0]?.content.includes(": one\n") ? '{"score": 1}' : "I cannot decide"),
+            async (messages) =>
+                messages[0]?.content.includes(": one\n") ? '{"score": 1}' : "I cannot decide",
             prompts,
         );
         expect(result.score).toBe(0.5);
@@ -118,18 +128,32 @@ describe("nugget scoring", () => {
     });
 
     test("parseJudgeJson keeps an off-scale value in 0..1 but flags it, and rejects anything outside", () => {
-        expect(parseJudgeJson('{"score": "0.5"}')).toEqual({ score: 0.5, reason: "", offScale: false });
-        expect(parseJudgeJson('{"score": 0.75, "reason": "r"}')).toEqual({ score: 0.75, reason: "r", offScale: true });
+        expect(parseJudgeJson('{"score": "0.5"}')).toEqual({
+            score: 0.5,
+            reason: "",
+            offScale: false,
+        });
+        expect(parseJudgeJson('{"score": 0.75, "reason": "r"}')).toEqual({
+            score: 0.75,
+            reason: "r",
+            offScale: true,
+        });
         expect(() => parseJudgeJson('{"score": 2}')).toThrow();
     });
 });
 
 describe("prompt rendering (released code at the pinned commit)", () => {
     test("the judge gets the nugget and the response as one user message, with `$` kept literal", async () => {
-        const messages = await prompts.nuggetJudge({ question: "unused", nugget: "should state: $1", response: "It is $& here" });
+        const messages = await prompts.nuggetJudge({
+            question: "unused",
+            nugget: "should state: $1",
+            response: "It is $& here",
+        });
         expect(messages).toHaveLength(1);
         expect(messages[0]?.role).toBe("user");
-        expect(messages[0]?.content).toContain("- RUBRIC CRITERION (what to check): should state: $1");
+        expect(messages[0]?.content).toContain(
+            "- RUBRIC CRITERION (what to check): should state: $1",
+        );
         expect(messages[0]?.content).toContain("- RESPONSE TO EVALUATE: It is $& here");
         expect(messages[0]?.content).not.toMatch(/<rubric_item>|<llm_response>/);
     });
@@ -158,7 +182,10 @@ describe("summaries", () => {
             { category: "a", score: 0.5 },
         ]);
         expect(summary.mean).toBeCloseTo(0.5, 12);
-        expect(summary.byCategory).toEqual({ a: { questions: 2, mean: 0.25 }, b: { questions: 1, mean: 1 } });
+        expect(summary.byCategory).toEqual({
+            a: { questions: 2, mean: 0.25 },
+            b: { questions: 1, mean: 1 },
+        });
         expect(mean([])).toBe(0);
     });
 });

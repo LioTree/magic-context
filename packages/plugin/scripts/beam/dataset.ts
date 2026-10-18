@@ -117,7 +117,9 @@ export function parseBeamDate(value: string | null | undefined): number | null {
 
 function sessionDates(chat: BeamTurn[][], conversation: string): number[] {
     const hour = 3_600_000;
-    const dates = chat.map((session) => parseBeamDate(session.find((turn) => turn.time_anchor)?.time_anchor));
+    const dates = chat.map((session) =>
+        parseBeamDate(session.find((turn) => turn.time_anchor)?.time_anchor),
+    );
     return dates.map((date, index) => {
         if (date !== null) return date;
         for (let previous = index - 1; previous >= 0; previous--) {
@@ -142,7 +144,9 @@ export function buildTurns(row: BeamRow): Turn[] {
                 .trim()
                 .toLowerCase();
             if (role !== "user" && role !== "assistant") {
-                throw new Error(`BEAM conversation ${row.conversation_id} has a turn with role ${role}`);
+                throw new Error(
+                    `BEAM conversation ${row.conversation_id} has a turn with role ${role}`,
+                );
             }
             const ordinal = turns.length;
             const day = days[sessionIndex] ?? 0;
@@ -156,12 +160,15 @@ export function buildTurns(row: BeamRow): Turn[] {
             });
         }
     });
-    if (turns.length === 0) throw new Error(`BEAM conversation ${row.conversation_id} has no turns`);
+    if (turns.length === 0)
+        throw new Error(`BEAM conversation ${row.conversation_id} has no turns`);
     return turns;
 }
 
 /** BEAM stores a row's questions as a JSON or Python-literal string keyed by category. */
-export function parseProbingQuestions(value: BeamRow["probing_questions"]): Record<string, unknown[]> {
+export function parseProbingQuestions(
+    value: BeamRow["probing_questions"],
+): Record<string, unknown[]> {
     if (typeof value !== "string") return value;
     try {
         return JSON.parse(value) as Record<string, unknown[]>;
@@ -187,15 +194,26 @@ export function pythonLiteralToJson(source: string): string {
             while (i < source.length && source[i] !== quote) {
                 if (source[i] === "\\") {
                     const next = source[i + 1] ?? "";
-                    const simple: Record<string, string> = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"' };
+                    const simple: Record<string, string> = {
+                        n: "\n",
+                        t: "\t",
+                        r: "\r",
+                        "\\": "\\",
+                        "'": "'",
+                        '"': '"',
+                    };
                     if (next in simple) {
                         text += simple[next];
                         i += 2;
                     } else if (next === "x") {
-                        text += String.fromCharCode(Number.parseInt(source.slice(i + 2, i + 4), 16));
+                        text += String.fromCharCode(
+                            Number.parseInt(source.slice(i + 2, i + 4), 16),
+                        );
                         i += 4;
                     } else if (next === "u") {
-                        text += String.fromCharCode(Number.parseInt(source.slice(i + 2, i + 6), 16));
+                        text += String.fromCharCode(
+                            Number.parseInt(source.slice(i + 2, i + 6), 16),
+                        );
                         i += 6;
                     } else {
                         text += next;
@@ -231,7 +249,11 @@ export function buildQuestions(row: BeamRow): Question[] {
             const item = raw as { question?: unknown; rubric?: unknown };
             const text = typeof item.question === "string" ? item.question : "";
             if (!text) return;
-            const rubric = Array.isArray(item.rubric) ? item.rubric.map(String) : item.rubric ? [String(item.rubric)] : [];
+            const rubric = Array.isArray(item.rubric)
+                ? item.rubric.map(String)
+                : item.rubric
+                  ? [String(item.rubric)]
+                  : [];
             questions.push({
                 id: `${row.conversation_id}_${category}_${index}`,
                 conversationId: row.conversation_id,
@@ -265,6 +287,7 @@ export async function loadRows(path: string): Promise<BeamRow[]> {
 /** A digest of the conversation's turns, so a saved ingest can prove which data it holds. */
 export function conversationDigest(conversation: Conversation): string {
     const hash = createHash("sha256");
-    for (const turn of conversation.turns) hash.update(`${turn.role}\u0000${turn.timestampMicros}\u0000${turn.content}\u0001`);
+    for (const turn of conversation.turns)
+        hash.update(`${turn.role}\u0000${turn.timestampMicros}\u0000${turn.content}\u0001`);
     return hash.digest("hex");
 }
