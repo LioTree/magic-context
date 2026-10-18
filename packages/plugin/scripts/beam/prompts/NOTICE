@@ -1,0 +1,16 @@
+Listings 20, 21, and 44 from:
+Beyond a Million Tokens: Benchmarking and Enhancing Long-Term Memory in LLMs
+https://arxiv.org/abs/2510.27246 (version 2)
+
+Copyright the paper's authors. Paper material is reproduced under CC BY 4.0:
+https://creativecommons.org/licenses/by/4.0/
+
+The prompts are verbatim UTF-8 text from the arXiv v2 TeX source archive.
+The v2 HTML currently contains empty figures for these three listings, so the
+TeX source is authoritative for this extraction. See provenance.json for the
+source URL, source member paths, and SHA-256 of each unmodified prompt.
+Only runtime placeholder substitution is performed; see ../README.md.
+
+Dataset licensing is separate: Mohammadta/BEAM is CC BY-SA 4.0.
+The pastdotdev/benchmarks dataset parser was consulted as an MIT-licensed
+reference. No ExaBase prompts are included or used.

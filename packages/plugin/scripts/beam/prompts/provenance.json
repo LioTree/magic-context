@@ -1,0 +1,15 @@
+{
+  "source": "https://arxiv.org/src/2510.27246v2",
+  "html": "https://arxiv.org/html/2510.27246v2",
+  "extraction": "verbatim UTF-8 tar members (HTML figures are empty)",
+  "members": {
+    "20": "Prompts/llm_as_a_judge_prompt.tex",
+    "21": "Prompts/llm_equivalence_detector.tex",
+    "44": "Prompts/baseline/rag_answer_generation.tex"
+  },
+  "sha256": {
+    "20": "92f59d403e7a697ab2a240b74b5a30e42f0b5c929c89adb63461ca1e7e07bb2e",
+    "21": "6c3588beece7006dfb7dce941c5e083942c1a7ecc4d6f5603d5eb72bded2a407",
+    "44": "6dfac230619fc7f21293193d8bcb852ca4a906d03797a16bcad60b1b163633ce"
+  }
+}
