@@ -226,8 +226,6 @@ import {
 	peekNoteNudgeText,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
 import {
-	CompanionPairingRequired,
-	editOutsideCompanionTransaction,
 	pairedThinkingEdit,
 	snapshotSessionFlag,
 	snapshotSessionValue,
@@ -8438,37 +8436,35 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// Most passes cannot need a companion strip: a pass that keeps current-turn
 	// signed thinking holds every edit before it (and keeps the system-prompt
 	// record), and a pass whose messages carry no thinking has nothing to strip.
-	// Those run without the write transaction, as an unpaired pass did. The
-	// pipeline confirms the prediction itself and aborts the attempt before
-	// any write that would need a strip; the pass then reruns paired below.
-	if (piPassMayNeedNoCompanion(args)) {
-		const attempt = editOutsideCompanionTransaction({
-			messages: args.messages as unknown[],
-			state: args.sessionMeta,
-			// Writes outside the transaction were not rolled back, so the
-			// observations that re-record them after a rollback must not run.
-			onRollback: () => {
-				resetSessionState();
-				rollbackObservations.length = 0;
-			},
-			edit: (requirePairing) =>
-				runSynchronousPipeline(args, rollbackObservations, requirePairing),
+	// Those run without the write transaction, as an unpaired pass did, and
+	// without any snapshot for a rerun. The only edits that can still need a
+	// strip on such a pass are prefix rewrites, so a pass whose state can trigger
+	// one goes straight to the paired transaction instead. Reaching a rewrite on
+	// any other pass is a defect: the pipeline refuses the pass at that point,
+	// before writing the omissions.
+	if (piPassMayNeedNoCompanion(args) && !piPassMayRewritePrefix(args)) {
+		const result = runSynchronousPipeline(args, rollbackObservations, () => {
+			throw new DegradedPassRefusalError(UNPAIRED_PREFIX_REWRITE_SITE, {
+				cause: new Error(
+					"A pass with no rewrite cause reached a signed-prefix rewrite",
+				),
+			});
 		});
-		if (attempt) {
-			const { result } = attempt;
-			// Unreachable when the pipeline's checks hold; refusing here keeps an
-			// edit from being served without the strip its thinking needs.
-			if (
-				needsCompanion(result) &&
-				(result.messages as unknown[]).some(piMessageHasThinking)
-			)
-				throw new Error(
+		// Unreachable when the pipeline's checks hold; refusing here keeps an edit
+		// from being served without the strip its thinking needs.
+		if (
+			needsCompanion(result) &&
+			(result.messages as unknown[]).some(piMessageHasThinking)
+		)
+			throw degradedPassError(
+				"pi-unpaired-companion",
+				new Error(
 					"A pass run outside the companion transaction needed thinking omissions",
-				);
-			if (!result.strictThinkingKept)
-				clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
-			return result;
-		}
+				),
+			);
+		if (!result.strictThinkingKept)
+			clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
+		return result;
 	}
 	const result = pairedThinkingEdit({
 		db: args.db,
@@ -8504,6 +8500,25 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (!result.strictThinkingKept)
 		clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
 	return result;
+}
+
+/** The refusal of a pass outside the companion transaction that reached a rewrite. */
+const UNPAIRED_PREFIX_REWRITE_SITE = "pi-unpaired-prefix-rewrite";
+
+/**
+ * Whether this pass's state can lead the pipeline into a signed-prefix rewrite,
+ * which omits every signed block and so must commit inside the companion
+ * transaction. These are the pipeline's rewrite causes known before it runs: a
+ * recovery or fit rebuild, a carried tag-identity repair, and, with the hold
+ * off, a first render without a cached pair or the 95% wall.
+ */
+function piPassMayRewritePrefix(args: RunPipelineArgs): boolean {
+	if (args.recoveryRebuildReason || args.forceSignedRebuildForFit) return true;
+	if (readPiIdentityRebuilds(args.db, args.sessionId).length > 0) return true;
+	if (args.signedThinkingHold === "on") return false;
+	if (args.contextUsage.percentage >= 95) return true;
+	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
+	return !meta.cachedM0Bytes || !meta.cachedM1Bytes;
 }
 
 /** A cheap guess, confirmed inside the pipeline, that this pass needs no companion strip. */
@@ -8590,10 +8605,10 @@ function runSynchronousPipeline(
 	let rewritingSignedPrefix = false;
 	let workingForRewrite: unknown[] | undefined;
 	const stripForPrefixRewrite = () => {
-		// Omitting every signed block is a companion write: it must commit with
-		// the rewrite that needs it.
-		requirePairing?.();
 		const messages = workingForRewrite ?? args.messages;
+		// Omitting every signed block is a companion write: it must commit with
+		// the rewrite that needs it. With no thinking there is nothing to omit.
+		if ((messages as unknown[]).some(piMessageHasThinking)) requirePairing?.();
 		const result = applyPiProactiveThinkingStrip({
 			db: args.db,
 			sessionId: args.sessionId,
@@ -8979,7 +8994,11 @@ function runSynchronousPipeline(
 				);
 			}
 		} catch (error) {
-			if (error instanceof CompanionPairingRequired) throw error;
+			if (
+				error instanceof DegradedPassRefusalError &&
+				error.site === UNPAIRED_PREFIX_REWRITE_SITE
+			)
+				throw error;
 			piM0State.preparedPrefix = cachedPrefixBeforePreflight;
 			prefixPreflightContended = true;
 			sessionLog(

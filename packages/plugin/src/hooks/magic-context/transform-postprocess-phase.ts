@@ -554,9 +554,11 @@ export async function applyTodoSynthesis(args: {
         // last_todo_state, so a real todowrite between passes cannot change bytes.
         return replay();
     };
-    if (!args.persistCompanion) return apply();
-    // A pass that only replays the saved pair writes nothing, so it takes no
-    // write lock; one that changes the pair reruns paired with its strip.
+    // Only a busting pass can change the pair; any other pass replays it and
+    // writes nothing, so it needs neither a transaction nor a rerun snapshot.
+    if (!args.persistCompanion || !args.isCacheBustingPass) return apply();
+    // A busting pass that only replays writes nothing either; one that changes
+    // the pair reruns paired with its strip.
     const replayed = editOutsideCompanionTransaction({ messages: args.messages, edit: apply });
     if (replayed) return replayed.result;
     return pairedThinkingEdit({

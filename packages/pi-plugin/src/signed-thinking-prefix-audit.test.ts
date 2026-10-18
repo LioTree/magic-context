@@ -57,6 +57,7 @@ import {
 	signalPiPendingMaterialization,
 	signalPiSystemHashChange,
 } from "./context-handler";
+import * as identityRepair from "./pi-tag-identity-repair";
 import { queuePiIdentityRebuild } from "./pi-tag-identity-repair";
 import { processSystemPromptForCache } from "./system-prompt";
 import {
@@ -862,6 +863,64 @@ it(
 			expect(thinkingOmissions().length).toBeGreaterThan(before.length);
 		},
 		"forced-rewrite",
+	),
+);
+
+// A held pass with no rewrite cause in its state runs outside the companion
+// transaction and takes no snapshot. If it still reaches a rewrite (here a
+// tag-identity repair that the pre-pass check did not see), the pass is refused
+// at that point: no omission is written, no tag number is spent, and the next
+// pass, which sees the repair, rewrites inside the transaction and numbers its
+// tags without a gap.
+it(
+	"Pi/OMP: an unpredicted rewrite on a held pass is refused before any omission or tag",
+	withFixture(
+		false,
+		"ctx_reduce drop (full removal)",
+		async (f) => {
+			const thinkingOmissions = await forceHeldRewrite(f);
+			const before = thinkingOmissions();
+			const tagNumbers = () =>
+				getTagsBySession(f.db, f.sessionId)
+					.map((tag) => tag.tagNumber)
+					.sort((a, b) => a - b);
+			const tagsBefore = tagNumbers();
+			// A new tool step whose result needs a new tag.
+			f.respond(
+				(n) => [read(`call-${n}`, `/project/src/file-${n}.ts`)],
+				(n) => [[`call-${n}`, `export const v${n} = ${n};\n`.repeat(400)]],
+			);
+			const readRepairs = identityRepair.readPiIdentityRebuilds;
+			const hidden = spyOn(
+				identityRepair,
+				"readPiIdentityRebuilds",
+			).mockImplementation((db, sessionId) =>
+				new Error().stack?.includes("piPassMayRewritePrefix")
+					? []
+					: readRepairs(db, sessionId),
+			);
+			const lastGood = wire(f.served);
+			let refused: Wire | "refused";
+			try {
+				// The refusal reaches the messages wrapper, which serves the last
+				// good request when it can and otherwise refuses the turn.
+				refused = wire((await f.pass()).messages);
+			} catch {
+				refused = "refused";
+			} finally {
+				hidden.mockRestore();
+			}
+			if (refused !== "refused") expect(refused).toEqual(lastGood);
+			expect(thinkingOmissions()).toEqual(before);
+			expect(tagNumbers()).toEqual(tagsBefore);
+			const served = wire((await f.pass()).messages);
+			expect(thinkingBlocks(served)).toBe("[]");
+			expect(thinkingOmissions().length).toBeGreaterThan(before.length);
+			const after = tagNumbers();
+			expect(after.length).toBeGreaterThan(tagsBefore.length);
+			expect(after).toEqual(after.map((_, index) => index + 1));
+		},
+		"unpredicted-rewrite",
 	),
 );
 
