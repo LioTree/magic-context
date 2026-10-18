@@ -144,6 +144,7 @@ import {
 	registerCtxStatusLifecycleSignal,
 	resolveSessionId,
 } from "./commands/pi-command-utils";
+import { composePiSystemPrompt } from "./compose-system-prompt-pi";
 import { loadPiConfig, loadPiConfigDetailed } from "./config";
 import {
 	abortInFlightHistorians,
@@ -239,12 +240,7 @@ import {
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
 	PiSubagentRunner,
 } from "./subagent-runner";
-import {
-	buildMagicContextBlock,
-	clearPiSystemPromptSession,
-	composeMagicContextSystemPrompt,
-	processSystemPromptForCache,
-} from "./system-prompt";
+import { clearPiSystemPromptSession } from "./system-prompt";
 import {
 	acknowledgePiPendingSystemPromptResponses,
 	acknowledgePiSystemPromptResponse,
@@ -2504,173 +2500,23 @@ async function startPiMagicContextRuntime(
 				}
 			}
 
-			// Use effectiveConfig (re-resolved from the CURRENT checkout's cwd on
-			// a project switch) for every system-prompt decision below — a
-			// switched-into project may carry its own .cortexkit/magic-context.jsonc
-			// (memory/docs/key-files/injection toggles). Reusing boot `config`
-			// would render the launch project's adjuncts in the new checkout.
-			if (effectiveConfig.system_prompt_injection?.enabled === false) {
-				return;
-			}
-			const skipSigs =
-				effectiveConfig.system_prompt_injection?.skip_signatures ?? [];
-			if (
-				skipSigs.some(
-					(sig) => sig.length > 0 && event.systemPrompt.includes(sig),
-				)
-			) {
-				return;
-			}
-
-			// PEEK the system-prompt refresh signal. Set by:
-			//   - `/ctx-flush`
-			//   - dreamer publication of new ARCHITECTURE.md / STRUCTURE.md
-			//   - user-memory promotion (dreamer)
-			//   - hash-change detection on the previous turn (signaled below)
-			//
-			// When set, we re-read disk-backed adjuncts on this turn. When
-			// not set, cached values are reused.
-			//
-			// PEEK-then-drain-on-success (Oracle audit Round 8 #6): we
-			// only `clearSystemPromptRefresh(...)` AFTER the rebuild
-			// (`buildMagicContextBlock` + `processSystemPromptForCache`)
-			// completes successfully. If either throws, the flag survives
-			// so the next prompt retries the rebuild.
-			const isCacheBusting = sessionId
-				? hasSystemPromptRefresh(sessionId)
-				: true; // first-pass-no-session: act as cache-busting (force fresh read)
-
-			const promptSurfaceModel = (
-				ctx as { model?: { provider?: unknown; id?: unknown } }
-			).model;
-			const promptSurfaceModelKey =
-				typeof promptSurfaceModel?.provider === "string" &&
-				promptSurfaceModel.provider.length > 0 &&
-				typeof promptSurfaceModel.id === "string" &&
-				promptSurfaceModel.id.length > 0
-					? canonicalPiModelKey(
-							promptSurfaceModel.provider,
-							promptSurfaceModel.id,
-						)
-					: undefined;
-			const promptSurface = sessionId
-				? promptSurfaceGuidanceEpochs.resolve(
-						sessionId,
-						effectiveConfig.prompt_surface,
-						promptSurfaceModelKey,
-					)
-				: promptSurfaceRuntime.resolveGuidance(
-						effectiveConfig.prompt_surface,
-						promptSurfaceModelKey,
-					);
-
-			const block = buildMagicContextBlock({
+			const result = composePiSystemPrompt({
 				db,
 				cwd: currentProject.projectDir,
 				sessionId,
-				memoryEnabled: effectiveConfig.memory.enabled,
-				includeGuidance: true,
-				protectedTags: effectiveConfig.protected_tags,
+				systemPrompt: event.systemPrompt,
+				systemPromptOptions: event.systemPromptOptions,
+				config: effectiveConfig,
+				model: ctx.model,
+				runtime: promptSurfaceRuntime,
 				ctxReduceCallable: !compactionOff,
 				dreamerEnabled: effectiveProjectDeps.dreamerEnabled,
 				smartNotesEnabled: config.smart_notes.enabled,
-				temporalAwarenessEnabled: effectiveConfig.temporal_awareness ?? false,
-				cavemanTextCompressionEnabled:
-					effectiveConfig.caveman_text_compression?.enabled === true,
-				language: effectiveConfig.language,
-				promptSurfacePreset: promptSurface.preset,
-				primaryGuidanceOverride: promptSurface.primaryOverride,
-				// Stable user memories rendered as <user-profile> — dreamer
-				// promotes recurring observations into this set, then the
-				// system prompt surfaces them across all sessions in the
-				// project. Gated on dreamer.user_memories.enabled.
-				userMemoriesEnabled: userMemoryCollectionEnabled(
-					effectiveConfig.dreamer,
-				),
-				isCacheBusting,
-				existingSystemPrompt: event.systemPrompt,
+				hasSystemPromptRefresh,
+				clearSystemPromptRefresh,
+				signalHashChange: signalPiSystemHashChange,
 			});
-
-			// Compose the reference system prompt (base prompt from Pi +
-			// our magic-context block) for hash detection. We always run
-			// hash detection on the composed string so even sessions with
-			// no data block (e.g. memories disabled, no docs, no key
-			// files) still get hash-change tracking.
-			const composedPrompt = composeMagicContextSystemPrompt(
-				event.systemPrompt,
-				block,
-			);
-
-			// Inject through the host's structured sections API when it has
-			// one. On Pi, returning `systemPrompt` from before_agent_start
-			// makes the host replace the WHOLE prompt with opaque text:
-			// sections set by later-registered extensions are then still
-			// recorded in the transcript but never sent to the provider
-			// (Pi renders forceSystemPrompt instead of the structured
-			// sections), so any extension registered after us silently
-			// loses its system-prompt section. Oh My Pi's before_agent_start
-			// event has no systemPromptOptions at all, and Pi releases
-			// before 0.87 have no `sections` field, so the forced prompt
-			// return below remains the only injection path on those hosts.
-			// The plugin compiles against Pi 0.83 types, which predate
-			// `sections`; the widened type below describes newer hosts
-			// without claiming the field always exists.
-			const promptOptions:
-				| (NonNullable<typeof event.systemPromptOptions> & {
-						sections?: Record<string, string>;
-				  })
-				| undefined = event.systemPromptOptions;
-			const hostSections = promptOptions?.sections;
-			if (block && hostSections) {
-				hostSections.magic_context = block;
-			}
-
-			if (!sessionId) {
-				// No session id yet — inject without cache logic. The
-				// next turn (with a session id) will compute the first
-				// hash and set sticky date.
-				if (block && !hostSections) return { systemPrompt: composedPrompt };
-				return;
-			}
-
-			const result = processSystemPromptForCache({
-				db,
-				sessionId,
-				systemPrompt: composedPrompt,
-				isCacheBusting,
-				promptSurfacePreset: promptSurface.preset,
-			});
-
-			if (result.hashChanged) {
-				// Real prompt-content or preset change. Signal all three
-				// independent refresh sets so the next pi.on("context") event
-				// rebuilds <session-history> + lets queued ops
-				// materialize, AND the next before_agent_start refreshes
-				// adjuncts (since this turn's adjunct read used the
-				// cached values that are now potentially stale).
-				signalPiSystemHashChange(sessionId, result.currentHash);
-			}
-
-			// PEEK-then-drain-on-success (Oracle audit Round 8 #6):
-			// drain only if the start-of-pass peek was true. Using the
-			// CAPTURED boolean (not a re-read of the set) so that a
-			// signal added later in the same pass — e.g. `result.hashChanged`
-			// just above — survives to the next prompt for retry.
-			if (isCacheBusting) {
-				clearSystemPromptRefresh(sessionId);
-			}
-
-			// On hosts with a sections API (Pi) the block already went
-			// out as a structured section above; returning a forced
-			// prompt here would hide later extensions' sections from the
-			// provider. Only hosts without that API
-			// (Oh My Pi) still need the forced return. Pi's prompt has
-			// no `Today's date:` line for processSystemPromptForCache
-			// to freeze, so dropping the force there loses nothing.
-			if (hostSections) {
-				return;
-			}
-			return { systemPrompt: result.systemPrompt };
+			if (result.force) return { systemPrompt: result.systemPrompt };
 		} catch (error) {
 			warn("failed to build magic-context block:", error);
 			return;

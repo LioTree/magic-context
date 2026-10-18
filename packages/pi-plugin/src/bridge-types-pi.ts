@@ -7,6 +7,17 @@ import type {
 import type { FallbackInputs } from "@magic-context/core/hooks/magic-context/host-runner/fallback-admissibility";
 import type { PiBridgeEntry } from "./bridge-codec-pi";
 import type { PiBridgeMarkerDeps } from "./bridge-marker-pi";
+import type { PiPromptOptions } from "./compose-system-prompt-pi";
+
+export interface PiBridgeSystemPromptInput {
+	sessionId: string;
+	systemPrompt: string;
+	systemPromptOptions?: PiPromptOptions;
+	model: { provider: string; id: string };
+	/** Required with sections: return Pi's live event.systemPrompt getter after
+	 * magic_context is inserted. Appending text cannot reproduce Pi's XML wrappers. */
+	renderSystemPrompt?: () => string;
+}
 
 export interface PiBridgeAdapterOptions {
 	projectRoot: string;
