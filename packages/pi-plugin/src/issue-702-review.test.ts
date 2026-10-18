@@ -29,23 +29,42 @@ function stateFor(sessionId: string) {
 	};
 }
 
-test("issue 702 differential: Pi randomized in-order serialized arrays", () => {
+// The 128 samples draw from one seeded stream in a fixed order (boundary,
+// row text, then the window filter), so they are generated up front and the
+// work is split in two tests that each fit the per-test timeout under CI load.
+// The printed digest covers all 128 samples in the original order.
+const ISSUE_702_PI_SAMPLES = (() => {
 	let seed = 702;
 	const random = () => {
 		seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
 		return seed / 0x100000000;
 	};
-	const hash = createHash("sha256");
-	let cases = 0;
-	for (let sample = 0; sample < 128; sample++) {
-		const db = createTestDb();
-		const sessionId = `issue-702-pi-differential-${sample}`;
+	return Array.from({ length: 128 }, (_, sample) => {
 		const boundaryIndex = 1 + Math.floor(random() * 24);
 		const partial = sample % 3 === 0;
 		const source = Array.from({ length: 32 }, (_, index) => ({
 			id: `entry-${index}`,
 			message: userMessage(`row ${index} ${random()} §`, index + 1),
 		}));
+		const window = source.filter(
+			(_, index) => index === boundaryIndex || random() > 0.3,
+		);
+		return { sample, boundaryIndex, partial, source, window };
+	});
+})();
+const issue702PiHash = createHash("sha256");
+let issue702PiCases = 0;
+
+function runIssue702PiSamples(from: number, to: number): void {
+	for (const {
+		sample,
+		boundaryIndex,
+		partial,
+		source,
+		window,
+	} of ISSUE_702_PI_SAMPLES.slice(from, to)) {
+		const db = createTestDb();
+		const sessionId = `issue-702-pi-differential-${sample}`;
 		const state = stateFor(sessionId);
 		try {
 			appendCompartments(db, sessionId, [
@@ -62,9 +81,6 @@ test("issue 702 differential: Pi randomized in-order serialized arrays", () => {
 				},
 			]);
 			materializeM0Pi(state, db);
-			const window = source.filter(
-				(_, index) => index === boundaryIndex || random() > 0.3,
-			);
 			for (const rebuild of [true, false]) {
 				const messages = structuredClone(window.map((entry) => entry.message));
 				const result = injectM0M1Pi(
@@ -78,15 +94,24 @@ test("issue 702 differential: Pi randomized in-order serialized arrays", () => {
 					.filter((entry) => partial || source.indexOf(entry) > boundaryIndex)
 					.map((entry) => entry.message);
 				expect(messages.slice(result.injected ? 2 : 0)).toEqual(expected);
-				hash.update(JSON.stringify(messages));
-				cases++;
+				issue702PiHash.update(JSON.stringify(messages));
+				issue702PiCases++;
 			}
 		} finally {
 			closeQuietly(db);
 		}
 	}
+}
+
+test("issue 702 differential: Pi randomized in-order serialized arrays (samples 0-63)", () => {
+	runIssue702PiSamples(0, 64);
+}, 30000);
+
+test("issue 702 differential: Pi randomized in-order serialized arrays (samples 64-127)", () => {
+	runIssue702PiSamples(64, 128);
+	expect(issue702PiCases).toBe(256);
 	console.log(
-		`ISSUE_702_DIFFERENTIAL pi cases=${cases} sha256=${hash.digest("hex")}`,
+		`ISSUE_702_DIFFERENTIAL pi cases=${issue702PiCases} sha256=${issue702PiHash.digest("hex")}`,
 	);
 }, 30000);
 
