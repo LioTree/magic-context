@@ -426,6 +426,36 @@ test("Pi tool-result reference proof permits reduction without a delivery waterm
 				contextWindow: 1,
 			}).admissible,
 		).toBe(false);
+		// Direct usage reports derive the envelope reading only for a successful
+		// response whose material is given, as provider_response facts do.
+		const material = {
+			system: [host.system],
+			tools: [],
+			unobserved_tools: ["read"],
+		};
+		const withMaterial = { ...inputs, material };
+		const report = (outcome?: "success" | "failed") =>
+			f.adapter.recordProviderUsage("pi-tools", {
+				messages: view.messages,
+				inputTokens: 500,
+				model: inputs.model,
+				envelope: inputs.envelope,
+				material,
+				...(outcome ? { outcome } : {}),
+			});
+		for (const outcome of [undefined, "failed"] as const) {
+			report(outcome);
+			expect(
+				f.adapter.isFallbackAdmissible("pi-tools", withMaterial),
+			).toMatchObject({
+				admissible: false,
+				detail: expect.stringContaining("native-marker-evidence-unavailable"),
+			});
+		}
+		report("success");
+		expect(
+			f.adapter.isFallbackAdmissible("pi-tools", withMaterial).admissible,
+		).toBe(true);
 		const tag = JSON.stringify(view.messages.find((m) => m.id === "r1")).match(
 			/§(\d+)§/,
 		);
@@ -546,6 +576,183 @@ test("Pi adapter defers a native cut when the fresh pass has no covering applied
 		expect(f.adapter.isFallbackAdmissible("pi-native", inputs).admissible).toBe(
 			true,
 		);
+	} finally {
+		db.close();
+		await f.close();
+	}
+}, 180_000);
+
+test("Pi bridge session with unobserved tools waits for a matching provider usage reading, then advances the native marker", async () => {
+	const first = entry("u1", "user", "covered first"),
+		tail = entry("u2", "user", "retained tail"),
+		last = entry("u3", "user", "latest turn");
+	const journal: unknown[] = [first, tail, last];
+	let appends = 0;
+	const f = await realBridge("pi-unobserved", () => ({
+		readBranchEntries: () => journal,
+		appendCompaction: (summary, firstKeptEntryId, tokensBefore) => {
+			journal.push({
+				type: "compaction",
+				id: "native-cut",
+				firstKeptEntryId,
+				summary,
+				tokensBefore,
+			});
+			appends++;
+			return "native-cut";
+		},
+	}));
+	const db = new Database(join(f.options.storageDir, "context.db"));
+	const session = "pi-unobserved";
+	const run = (messages: PiBridgeEntry[], system = host.system) =>
+		f.adapter.run({
+			sessionId: session,
+			messages,
+			host: { ...host, system },
+			kind: "model",
+		});
+	const clean = (requestId: string) =>
+		f.adapter.completeRequest(session, requestId, {
+			status: 200,
+			cleanEnd: true,
+		});
+	try {
+		// The same pass sequence as the relay-pi-v1 vectors, whose compacted view
+		// carries the coverage a native cut needs.
+		await run([first]);
+		await run([first, tail]);
+		await run([first, tail]);
+		f.timeout();
+		const frozen = await run([first, tail, last]);
+		f.resume();
+		clean(frozen.receipt.request_id);
+		appendCompartments(db, session, [
+			{
+				sequence: 0,
+				startMessage: 1,
+				endMessage: 1,
+				startMessageId: "u1",
+				endMessageId: "u1",
+				title: "Covered history",
+				content: "Summary of the first message.",
+			},
+		]);
+		setPendingPiCompactionMarkerState(db, session, {
+			firstKeptEntryId: "u2",
+			endMessageId: "u1",
+			ordinal: 1,
+			tokensBefore: 10,
+			summary: "Covered history",
+			publishedAt: 1,
+		});
+		const compacted = await run(
+			[first, tail, last],
+			"A natural system change.",
+		);
+		const receipt = clean(compacted.receipt.request_id);
+		expect(receipt?.coverage).toEqual({ end_mid: "u1", ordinal: 1 });
+		// Pi's built-in tools: the host sees their names but not their final schemas.
+		const material = {
+			system: ["A natural system change."],
+			tools: [
+				{
+					name: "ctx_search",
+					description: "Search",
+					inputSchema: { type: "object" },
+				},
+			],
+			unobserved_tools: ["bash", "read"],
+		};
+		const inputs = {
+			messages: [first, tail, last],
+			model: "fixture/model",
+			envelope: "system+tools",
+			contextWindow: 100_000,
+			material,
+		};
+		const evidenceMissing = {
+			admissible: false,
+			reason: "fit_unproven",
+			detail: expect.stringContaining("native-marker-evidence-unavailable"),
+		};
+		const waits = () => {
+			expect(f.adapter.isFallbackAdmissible(session, inputs)).toMatchObject(
+				evidenceMissing,
+			);
+			expect(
+				f.adapter.advanceNativeMarker(session, receipt!, inputs),
+			).toMatchObject({ kind: "deferred", reason: "fit-unproven" });
+			expect(appends).toBe(0);
+		};
+		// No usage reading at all: nothing bounds the unobserved tool schemas, so
+		// the native marker waits.
+		waits();
+		let observedAt = Date.now();
+		const respond = async (
+			served: typeof material,
+			usage = { input: 900, cacheRead: 5000, cacheWrite: 100, output: 50 },
+			outcome: "success" | "failed" = "success",
+		) =>
+			await f.adapter.recordHostFact({
+				kind: "provider_response",
+				sessionId: session,
+				lineageId: receipt!.lineage_id,
+				requestId: receipt!.request_id,
+				model: { providerID: "fixture", modelID: "model" },
+				observedAt: ++observedAt,
+				completedAt: observedAt - 1,
+				finishReason: "stop",
+				outcome,
+				contextWindow: 100_000,
+				material: served,
+				usage,
+			});
+		// A total input of 0 is ignored rather than recorded as a reading.
+		expect(
+			await respond(material, {
+				input: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				output: 9,
+			}),
+		).toEqual({ accepted: true });
+		waits();
+		// Readings taken with another system prompt or another tool set do not qualify.
+		for (const served of [
+			{ ...material, system: ["Earlier system"] },
+			{ ...material, unobserved_tools: ["bash"] },
+			{
+				...material,
+				tools: [
+					{ ...material.tools[0]!, inputSchema: { type: "object", v: 2 } },
+				],
+			},
+		]) {
+			expect(await respond(served)).toEqual({ accepted: true });
+			waits();
+		}
+		// A failed response may report only partial input usage, so it does not
+		// derive an envelope reading.
+		expect(await respond(material, undefined, "failed")).toEqual({
+			accepted: true,
+		});
+		waits();
+		expect(await respond(material)).toEqual({ accepted: true });
+		expect(f.adapter.isFallbackAdmissible(session, inputs).admissible).toBe(
+			true,
+		);
+		// The usage-derived envelope (6000 total input minus served text) must still fit.
+		expect(
+			f.adapter.advanceNativeMarker(session, receipt!, {
+				...inputs,
+				contextWindow: 6000,
+			}).kind,
+		).toBe("deferred");
+		expect(appends).toBe(0);
+		expect(f.adapter.advanceNativeMarker(session, receipt!, inputs).kind).toBe(
+			"applied",
+		);
+		expect(appends).toBe(1);
 	} finally {
 		db.close();
 		await f.close();

@@ -1,5 +1,6 @@
 import type { ProviderCodec } from "@magic-context/core/hooks/magic-context/host-runner/provider-codec";
 import type { HookAnswer } from "@magic-context/core/hooks/magic-context/host-runner/record";
+import type { MarkerSentText } from "@magic-context/core/hooks/magic-context/marker-envelope";
 import type { MessageLike } from "@magic-context/core/hooks/magic-context/transform-operations";
 
 export interface PiBridgeEntry {
@@ -100,6 +101,39 @@ export function nativePiEntry(projected: MessageLike): PiBridgeEntry {
 		},
 	};
 }
+
+const COMPLETED_ASSISTANT_STOPS = new Set(["stop", "length", "toolUse"]);
+// Lone UTF-16 surrogates, which pi-ai's provider serializers delete before sending.
+const LONE_SURROGATE =
+	/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * Which text of a served, projected Pi message certainly reaches the provider.
+ * pi-ai's transformMessages drops every assistant message whose stopReason is
+ * "error" or "aborted", so an assistant message counts only when it ended with a
+ * known completed stop reason. Only user and assistant text blocks count; tool
+ * results, custom and summary messages, and native compaction entries count
+ * nothing. Text is read from the projected parts, which carry Magic Context's
+ * edits, because nativePiEntry rebuilds the sent entry from them.
+ */
+export const piSentText: MarkerSentText = (message) => {
+	const entry = (message.info as unknown as { piEntry?: PiBridgeEntry })
+		.piEntry;
+	const m = entry?.message;
+	if (!m || entry.type === "compaction") return [];
+	if (
+		m.role !== "user" &&
+		(m.role !== "assistant" ||
+			!COMPLETED_ASSISTANT_STOPS.has(String(m.stopReason)))
+	)
+		return [];
+	return message.parts.flatMap((p) => {
+		const part = object(p);
+		return part.type === "text" && typeof part.text === "string"
+			? [part.text.replace(LONE_SURROGATE, "")]
+			: [];
+	});
+};
 
 function apply(
 	message: MessageLike,
