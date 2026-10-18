@@ -66,9 +66,7 @@ impl TailBody {
             (Self::Native(body), Some(reference)) if &body.reference == reference => {
                 Ok(body.baseline)
             }
-            _ => Err(CodecError::Serde(
-                "native tail section and small-row marker disagree".into(),
-            )),
+            _ => Err(CodecError::NativeReferenceMismatch),
         }
     }
 }

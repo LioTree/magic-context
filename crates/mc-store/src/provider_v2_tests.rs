@@ -529,6 +529,17 @@ fn native_certificate_crosses_frozen_baseline_length_and_validates_its_cut() {
     use cache_codec::NativeSnapshotRejection;
     let (_dir, store, key) = rig();
     let namespace = "engine-s";
+    let mut prefix = provider_log::ProviderNativePrefix {
+        cut_id: 0,
+        through: 0,
+        parts: 1,
+    };
+    assert!(matches!(
+        store.load_native_transform_snapshot(namespace, &prefix, &[]),
+        Err(McStoreError::NativeSnapshotUnavailable(
+            NativeSnapshotRejection::MissingReference
+        ))
+    ));
     let (mut meta, policy) = native_cache_inputs();
     let measurement = meta
         .tail_hygiene_baseline
@@ -538,11 +549,6 @@ fn native_certificate_crosses_frozen_baseline_length_and_validates_its_cut() {
         .pop()
         .unwrap();
     cache_policy_commit(&store, namespace, &meta, &policy).unwrap();
-    let mut prefix = provider_log::ProviderNativePrefix {
-        cut_id: 0,
-        through: 0,
-        parts: 1,
-    };
     assert!(matches!(
         store.load_native_transform_snapshot(namespace, &prefix, &[]),
         Err(McStoreError::NativeSnapshotUnavailable(

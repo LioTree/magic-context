@@ -251,7 +251,8 @@ async fn certificate_boundary_matches_full_rebuild(harness: &str) {
         let mut request = step(session, vec![message], Some(ordinal));
         request["harness"] = json!(harness);
         request["request_id"] = json!(format!("certificate-{ordinal}"));
-        request["now"] = json!(ordinal * 1000);
+        // Hold time constant while the frozen baseline crosses eligibility.
+        request["now"] = json!(1000);
         if cc {
             request["served_through_ordinal"] = json!(ordinal);
         }

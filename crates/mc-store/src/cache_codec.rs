@@ -165,6 +165,8 @@ pub enum CodecError {
     MovedKeyInSmallBlob { key: &'static str },
     /// A small blob is not valid JSON of its type.
     Serde(String),
+    /// The native section and the small row certify different frozen prefixes.
+    NativeReferenceMismatch,
 }
 
 impl std::fmt::Display for CodecError {
@@ -175,6 +177,9 @@ impl std::fmt::Display for CodecError {
                 "cache state small blob carries `{key}`, which is stored in its own rows"
             ),
             CodecError::Serde(detail) => write!(f, "cache state blob: {detail}"),
+            CodecError::NativeReferenceMismatch => {
+                f.write_str("native tail section and small-row marker disagree")
+            }
         }
     }
 }
@@ -622,7 +627,12 @@ impl From<rusqlite::Error> for NativeSnapshotError {
 
 impl From<CodecError> for NativeSnapshotError {
     fn from(error: CodecError) -> Self {
-        Self::Sqlite(error.into())
+        match error {
+            CodecError::NativeReferenceMismatch => {
+                Self::Unavailable(NativeSnapshotRejection::ReferenceMismatch)
+            }
+            error => Self::Sqlite(error.into()),
+        }
     }
 }
 
