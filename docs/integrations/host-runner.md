@@ -278,12 +278,23 @@ stable `code` and `reason` fields:
 | `bridge_rollback` | `rollback`: a previously rolled-back provider record cannot complete re-entry |
 | `bridge_provider_disabled` | `provider_disabled`: defensive low-level reason; unreachable with the bridge's fixed provider lane |
 | `bridge_raw_history_provider_missing` | `raw_history_provider_missing`: OpenCode 2 session has no registered raw-history provider |
+| `bridge_served_bytes_changed` | `served_bytes_changed`: the new view changes a message the bridge already returned, outside a rebuild, or a rebuild puts such a message back to the host's raw text (tags or other hook edits stripped); `retryable: true` |
 
 No handoff refusal authorizes sending raw history. The caller may ask
 `isFallbackAdmissible` and send **only** its returned admissible view, or refuse the
 step. Other native failures (durability, store-ahead, transport and explicit
 provider refusal) retain their native error codes; they are not disguised as a
 full-request handoff.
+
+**Served bytes.** Within one lineage, every admitted message the bridge returned in
+its last view comes back byte for byte unless the step rebuilds history (the step
+is classified `rebuild`, or the module applies a new view). Even a rebuild may not
+put such a message back to the host's raw text. ck-mc rebuilds history from hook
+answers whose delivery the host confirmed; while delivery stays pending
+(`served_through_ordinal` 0), a rebuild would render those messages raw, so `run()`
+refuses it with `bridge_served_bytes_changed` (`retryable: true`; nothing is
+committed). After `completeRequest` confirms a clean delivery, the same step renders
+the confirmed tags and is served.
 
 ### OpenCode 1 measured usage is not an automatic bridge witness
 
