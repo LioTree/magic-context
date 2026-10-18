@@ -1,0 +1,26 @@
+{"seq": 1, "at": "system", "s": "S0", "main": false, "sys0": "You are opencode, an interacti"}
+{"seq": 2, "at": "messages", "s": "S0", "n": 1, "last": "[\"MC_RELAY_BOOTSTRAP\"]"}
+{"seq": 3, "at": "params", "s": "S0", "agent": "build"}
+{"seq": 4, "at": "system", "s": "S0", "main": true, "sys0": "You are opencode, an interacti"}
+{"seq": 5, "at": "messages", "s": "S0", "n": 3, "last": "[\"MC_RELAY_ORDINARY\"]"}
+{"seq": 6, "at": "params", "s": "S0", "agent": "build"}
+{"seq": 7, "at": "system", "s": "S0", "main": true, "sys0": "You are opencode, an interacti"}
+{"seq": 8, "at": "messages", "s": "S0", "n": 5, "last": "[\"MC_RELAY_FROZEN\"]"}
+{"seq": 9, "at": "params", "s": "S0", "agent": "build"}
+{"seq": 10, "at": "system", "s": "S0", "main": true, "sys0": "You are opencode, an interacti"}
+{"seq": 11, "at": "messages", "s": "S0", "n": 7, "last": "[\"MC_RELAY_DEADLINE\"]"}
+{"probe": "recover-start", "mode": "deadline"}
+{"seq": 12, "at": "system", "s": "S0", "main": false, "sys0": "You are opencode, an interacti"}
+{"seq": 13, "at": "messages", "s": "S0", "n": 9, "last": "[\"MC_RELAY_RECOVER_DEADLINE\"]"}
+{"seq": 14, "at": "system", "s": "S0", "main": false, "sys0": "You are opencode, an interacti"}
+{"seq": 15, "at": "messages", "s": "S0", "n": 11, "last": "[\"MC_RELAY_ABORT\"]"}
+{"probe": "recover-start", "mode": "abort"}
+{"seq": 16, "at": "system", "s": "S0", "main": false, "sys0": "You are opencode, an interacti"}
+{"seq": 17, "at": "messages", "s": "S0", "n": 13, "last": "[\"MC_RELAY_RECOVER_ABORT\"]"}
+{"seq": 18, "at": "params", "s": "S0", "agent": "build"}
+{"seq": 1, "at": "system", "s": "S1", "main": false, "sys0": "You are opencode, an interacti"}
+{"seq": 2, "at": "messages", "s": "S1", "n": 1, "last": "[\"HIDDEN_HISTORIAN_LIVE_PROMPT\"]"}
+{"seq": 3, "at": "params", "s": "S1", "agent": "thalamus-historian"}
+{"seq": 1, "at": "system", "s": "S2", "main": false, "sys0": "You are opencode, an interacti"}
+{"seq": 2, "at": "messages", "s": "S2", "n": 1, "last": "[\"HIDDEN_DREAMER_LIVE_PROMPT\"]"}
+{"seq": 3, "at": "params", "s": "S2", "agent": "thalamus-dreamer"}

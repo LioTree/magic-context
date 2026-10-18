@@ -665,3 +665,72 @@ describe("plugin entry wiring", () => {
         }
     });
 });
+
+test("THALAMUS trace stands down through deadline and abort recovery without inferring enrollment from main", async () => {
+    enroll("S0", "S1", "S2");
+    const recorder = makeRecorder();
+    const hooks = standDownForBridgedSessions(recorder.hooks);
+    const trace = readFileSync(
+        new URL("../hooks/magic-context/fixtures/thalamus-hook-order.jsonl", import.meta.url),
+        "utf8",
+    )
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+    const recovery: string[] = [];
+    const calls: string[] = [];
+    for (const event of trace) {
+        if (event.probe) {
+            recovery.push(event.mode);
+            continue;
+        }
+        calls.push(`${event.s}:${event.at}`);
+        if (event.at === "system") {
+            const output = { system: [event.sys0] };
+            await hooks["experimental.chat.system.transform"]!(
+                { sessionID: event.s } as never,
+                output,
+            );
+            expect(output).toEqual({ system: [event.sys0] });
+        } else if (event.at === "messages") {
+            const output = {
+                messages: [{ info: { sessionID: event.s }, parts: [{ text: event.last }] }],
+            };
+            const before = structuredClone(output);
+            await hooks["experimental.chat.messages.transform"]!({}, output as never);
+            expect(output).toEqual(before);
+        } else {
+            const output = {};
+            await hooks["chat.params"]!({ sessionID: event.s } as never, output as never);
+            expect(output).toEqual({});
+        }
+    }
+    expect(recovery).toEqual(["deadline", "abort"]);
+    expect(calls).toEqual([
+        "S0:system",
+        "S0:messages",
+        "S0:params",
+        "S0:system",
+        "S0:messages",
+        "S0:params",
+        "S0:system",
+        "S0:messages",
+        "S0:params",
+        "S0:system",
+        "S0:messages",
+        "S0:system",
+        "S0:messages",
+        "S0:system",
+        "S0:messages",
+        "S0:system",
+        "S0:messages",
+        "S0:params",
+        "S1:system",
+        "S1:messages",
+        "S1:params",
+        "S2:system",
+        "S2:messages",
+        "S2:params",
+    ]);
+    expect(recorder.log).toEqual([]);
+});

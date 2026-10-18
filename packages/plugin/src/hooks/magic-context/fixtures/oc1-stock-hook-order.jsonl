@@ -1,0 +1,20 @@
+{"seq":1,"at":"messages","s":"S0","n":1,"last":"BOOTSTRAP","request":"main-1"}
+{"seq":2,"at":"system","s":"S0","sys0":"You are a title generator. You"}
+{"seq":3,"at":"params","s":"S0","agent":"title","last":"BOOTSTRAP"}
+{"seq":4,"at":"system","s":"S0","sys0":"You are opencode, an interacti","request":"main-1"}
+{"seq":5,"at":"params","s":"S0","agent":"build","last":"BOOTSTRAP","request":"main-1"}
+{"seq":6,"at":"messages","s":"S0","n":3,"last":"ORDINARY","request":"main-2"}
+{"seq":7,"at":"system","s":"S0","sys0":"You are opencode, an interacti","request":"main-2"}
+{"seq":8,"at":"params","s":"S0","agent":"build","last":"ORDINARY","request":"main-2"}
+{"seq":9,"at":"messages","s":"S0","n":5,"last":"TOOL_LOOP","request":"main-3"}
+{"seq":10,"at":"system","s":"S0","sys0":"You are opencode, an interacti","request":"main-3"}
+{"seq":11,"at":"params","s":"S0","agent":"build","last":"TOOL_LOOP","request":"main-3"}
+{"seq":12,"at":"messages","s":"S0","n":6,"last":"TOOL_LOOP","request":"main-4"}
+{"seq":13,"at":"system","s":"S0","sys0":"You are opencode, an interacti","request":"main-4"}
+{"seq":14,"at":"params","s":"S0","agent":"build","last":"TOOL_LOOP","request":"main-4"}
+{"seq":15,"at":"messages","s":"S0","n":7,"last":"TOOL_LOOP","request":"main-5"}
+{"seq":16,"at":"system","s":"S0","sys0":"You are opencode, an interacti","request":"main-5"}
+{"seq":17,"at":"params","s":"S0","agent":"build","last":"TOOL_LOOP","request":"main-5"}
+{"seq":18,"at":"messages","s":"S1","n":1,"last":"CHILD","request":"child-1"}
+{"seq":19,"at":"system","s":"S1","sys0":"You are opencode, an interacti","request":"child-1"}
+{"seq":20,"at":"params","s":"S1","agent":"build","last":"CHILD","request":"child-1"}
