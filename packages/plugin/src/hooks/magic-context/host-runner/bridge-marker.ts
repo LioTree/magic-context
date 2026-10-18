@@ -70,12 +70,6 @@ export function createBridgeReceiptStore(db: Database, sessionId: string, harnes
         current(): BridgeReceipt | undefined {
             return read()?.receipt;
         },
-        /** Highest relay ordinal of the last view returned to the host for this lineage.
-         * Those bytes may have reached the provider even while delivery stays pending. */
-        publishedThrough(lineageId: string): number {
-            const saved = read();
-            return saved?.receipt.lineage_id === lineageId ? saved.through : 0;
-        },
         publish(
             receipt: BridgeReceipt,
             messages: readonly MessageLike[],

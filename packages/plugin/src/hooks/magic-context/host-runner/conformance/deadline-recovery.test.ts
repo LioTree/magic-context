@@ -9,8 +9,8 @@
  *   the pass is refused. OpenCode then stores an errored, empty assistant row for
  *   that turn, and RECOVER_DEADLINE is the next prompt.
  *
- * Like that host, the test records the system_prompt fact before each run() and
- * never confirms delivery, so every receipt stays pending
+ * Like that host, the test records each request's system_prompt fact after its
+ * run(), as OpenCode 1 orders them, and never confirms delivery, so every receipt stays pending
  * (served_through_ordinal 0). The session is enrolled as bridged, so the
  * OpenCode 1 plugin's own hooks stand down and only the bridge view reaches the
  * provider.
@@ -25,6 +25,7 @@ import { initializeDatabase } from "../../../../features/magic-context/storage-d
 import { standDownForBridgedSessions } from "../../../../plugin/bridged-session-guard";
 import { BRIDGED_SESSIONS_KEY } from "../../../../shared/bridged-sessions";
 import { Database } from "../../../../shared/sqlite";
+import { stableStringify } from "../../../../shared/stable-json";
 import { cleanupTestTempDir, createTestTempDirFromPath } from "../../../../shared/test-temp-dir";
 import { setRawMessageProvider } from "../../read-session-chunk";
 import type { MessageLike } from "../../transform-operations";
@@ -191,22 +192,14 @@ async function relay() {
         },
     } as Hooks);
 
-    /** One OpenCode prompt: system fact, bridge view, then the plugin's stood-down hooks. */
-    async function prompt(options: { fact?: boolean } = {}) {
-        let system = [HOST_SYSTEM];
-        const prior = adapter.receipt(SESSION);
-        if (prior && options.fact !== false) {
-            const result = await adapter.recordHostFact({
-                kind: "system_prompt",
-                sessionId: SESSION,
-                lineageId: prior.lineage_id,
-                model,
-                observedAt: Date.now(),
-                system,
-            });
-            expect(result.accepted).toBe(true);
-            system = result.system!;
-        }
+    /**
+     * One OpenCode 1 turn in the host's real order: the messages transform calls run(),
+     * then request preparation runs the system transform, which records the
+     * system_prompt fact for that same request. With `send: false` the host refuses the
+     * request after preparing it (THALAMUS_MODEL_SEND_REFUSED): nothing reaches the
+     * provider and no response is reported.
+     */
+    async function prompt(options: { send?: boolean; system?: string } = {}) {
         const view = await adapter.run({
             sessionId: SESSION,
             messages: rows.slice(),
@@ -214,29 +207,42 @@ async function relay() {
         });
         const output = { messages: view.messages };
         await plugin["experimental.chat.messages.transform"]!({}, output as never);
-        const systemOutput = { system: [...system] };
+        const systemOutput = { system: [options.system ?? HOST_SYSTEM] };
         await plugin["experimental.chat.system.transform"]!(
             { sessionID: SESSION, model } as never,
             systemOutput,
         );
-        const now = Date.now();
-        await adapter.recordHostFact({
-            kind: "provider_response",
+        const fact = await adapter.recordHostFact({
+            kind: "system_prompt",
             sessionId: SESSION,
             lineageId: view.receipt.lineage_id,
-            requestId: view.receipt.request_id,
             model,
-            observedAt: now,
-            completedAt: now,
-            finishReason: "stop",
-            outcome: "success",
-            usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 },
-            contextWindow: 31744,
+            observedAt: Date.now(),
+            system: systemOutput.system,
         });
-        return { view, messages: output.messages, system: systemOutput.system };
+        if (options.send !== false) {
+            const now = Date.now();
+            await adapter.recordHostFact({
+                kind: "provider_response",
+                sessionId: SESSION,
+                lineageId: view.receipt.lineage_id,
+                requestId: view.receipt.request_id,
+                model,
+                observedAt: now,
+                completedAt: now,
+                finishReason: "stop",
+                outcome: "success",
+                usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 },
+                contextWindow: 31744,
+            });
+        }
+        return { view, messages: output.messages, fact };
     }
 
-    /** BOOTSTRAP, ORDINARY and FROZEN served; DEADLINE refused at the relay deadline. */
+    /**
+     * BOOTSTRAP, ORDINARY and FROZEN served; DEADLINE refused inside run(), so OpenCode
+     * never prepares that request and records no system_prompt fact for it.
+     */
     async function throughDeadline() {
         rows.push(user(1, "MC_RELAY_BOOTSTRAP"));
         await prompt();
@@ -255,6 +261,9 @@ async function relay() {
     return {
         prompt,
         throughDeadline,
+        rows,
+        complete: (requestId: string) =>
+            adapter.completeRequest(SESSION, requestId, { status: 200, cleanEnd: true }),
         pluginCalls: () => pluginCalls,
         async dispose() {
             await adapter.dispose();
@@ -267,50 +276,106 @@ async function relay() {
     };
 }
 
-test("OC1 bridge: a deadline then recovery keeps every served tag and the guidance on the stand-down path", async () => {
+const guided = (fact: { accepted: boolean; system?: string[] }) => {
+    expect(fact.accepted).toBe(true);
+    expect(fact.system?.[0]).toContain(HOST_SYSTEM);
+    expect(fact.system?.[0]).toContain(GUIDANCE_HEADING);
+    return fact.system!;
+};
+
+/** Run one turn and return its refusal; fails the test if the turn was served. */
+async function refusedTurn(lane: Awaited<ReturnType<typeof relay>>) {
+    const refusal = await lane.prompt().then(
+        () => undefined,
+        (error: unknown) => error,
+    );
+    expect(refusal).toBeInstanceOf(BridgeRefusalError);
+    expect(refusal).toMatchObject({
+        code: "bridge_served_bytes_changed",
+        reason: "served_bytes_changed",
+        retryable: true,
+    });
+}
+
+test("OC1 bridge: recovery after a deadline never sends stripped history and keeps every tag and the guidance once served", async () => {
     const lane = await relay();
     try {
         const frozen = await lane.throughDeadline();
         const served = tags(frozen.messages);
         expect(served).toEqual(["§1§", "§2§", "§3§", "§4§"]);
-        expect(frozen.system[0]).toContain(GUIDANCE_HEADING);
+        const frozenSystem = guided(frozen.fact);
+        // RECOVER carries the errored assistant row of the refused turn, and ck-mc
+        // applies a rebuild that renders unconfirmed tags raw. The bridge refuses
+        // it instead of returning stripped history.
+        await refusedTurn(lane);
+        // Nothing was committed. Once the host confirms the last delivered request,
+        // the same step is served with every served tag in place.
+        lane.complete(frozen.view.receipt.request_id);
         const recovered = await lane.prompt();
-        // Every message already served comes back byte for byte, tags included.
-        const byId = new Map(recovered.messages.map((m) => [m.info.id, JSON.stringify(m)]));
+        // The module serializes object keys in sorted order, so compare content
+        // with keys sorted; text and parts must be identical.
+        const byId = new Map(recovered.messages.map((m) => [m.info.id, stableStringify(m)]));
         for (const message of frozen.messages.filter((m) => m.info.id))
-            expect(byId.get(message.info.id)).toBe(JSON.stringify(message));
+            expect(byId.get(message.info.id)).toBe(stableStringify(message));
         expect(tags(recovered.messages).slice(0, served.length)).toEqual(served);
-        expect(recovered.system).toEqual(frozen.system);
+        // RECOVER's own system_prompt fact, recorded after its run() as OpenCode 1
+        // does, returns the managed prompt with the guidance.
+        expect(guided(recovered.fact)).toEqual(frozenSystem);
         expect(lane.pluginCalls()).toBe(0);
     } finally {
         await lane.dispose();
     }
 }, 120_000);
 
-test("OC1 bridge: a recovery run with no system_prompt fact is refused, then served once the fact is recorded", async () => {
+test("OC1 bridge: the turn after a host refused to send never drops that turn's tags", async () => {
     const lane = await relay();
     try {
-        const frozen = await lane.throughDeadline();
-        expect(frozen.system[0]!.length).toBeGreaterThan(HOST_SYSTEM.length);
-        // No fact is recorded between the refused DEADLINE pass and RECOVER. Served,
-        // this run would send the host's raw system prompt without the guidance
-        // that every earlier request carried.
-        const refusal = await lane.prompt({ fact: false }).then(
-            () => undefined,
-            (error: unknown) => error,
-        );
-        expect(refusal).toBeInstanceOf(BridgeRefusalError);
-        expect(refusal).toMatchObject({
-            code: "bridge_system_prompt_unmanaged",
-            reason: "system_prompt_unmanaged",
-            retryable: true,
-        });
-        expect(String((refusal as Error).message)).toContain("Record the system_prompt fact");
-        // The refusal does not stick: the same step with a fresh fact is served.
-        const recovered = await lane.prompt();
-        expect(recovered.system).toEqual(frozen.system);
-        expect(recovered.system[0]).toContain(GUIDANCE_HEADING);
-        expect(tags(recovered.messages).slice(0, 4)).toEqual(["§1§", "§2§", "§3§", "§4§"]);
+        lane.rows.push(user(1, "MC_RELAY_BOOTSTRAP"));
+        await lane.prompt();
+        lane.rows.push(assistant(2), user(3, "MC_RELAY_ORDINARY"));
+        await lane.prompt();
+        lane.rows.push(assistant(4), user(5, "MC_RELAY_REFUSED_SEND"));
+        // run() applies and freezes this turn's answers; the host then refuses to
+        // send the request (THALAMUS_MODEL_SEND_REFUSED) and OpenCode stores an
+        // errored assistant row for the turn.
+        const refused = await lane.prompt({ send: false });
+        expect(tags(refused.messages)).toEqual(["§1§", "§2§", "§3§", "§4§"]);
+        lane.rows.push(assistant(6, true), user(7, "MC_RELAY_AFTER_REFUSED_SEND"));
+        // The next turn's rebuild would render those unconfirmed answers raw; the
+        // bridge refuses it rather than send history without them.
+        await refusedTurn(lane);
+    } finally {
+        await lane.dispose();
+    }
+}, 120_000);
+
+test("OC1 bridge: a rebuild that would strip served tags under pending delivery refuses, then serves once delivery is confirmed", async () => {
+    const lane = await relay();
+    try {
+        lane.rows.push(user(1, "MC_RELAY_BOOTSTRAP"));
+        await lane.prompt();
+        lane.rows.push(assistant(2), user(3, "MC_RELAY_ORDINARY"));
+        await lane.prompt();
+        lane.rows.push(assistant(4), user(5, "MC_RELAY_FROZEN"));
+        // The host prompt changes in this request's preparation, so the next run
+        // declares a rebuild. Delivery is never confirmed, so ck-mc rebuilds from
+        // confirmed answers only and would render every message raw.
+        const frozen = await lane.prompt({ system: `${HOST_SYSTEM}\nToday changed.` });
+        expect(tags(frozen.messages)).toEqual(["§1§", "§2§", "§3§", "§4§"]);
+        lane.rows.push(assistant(6, true), user(7, "MC_RELAY_REBUILD"));
+        await refusedTurn(lane);
+        // The refusal committed nothing. Once the host confirms that the last
+        // request was delivered, the same step renders the confirmed tags.
+        expect(
+            lane.complete(frozen.view.receipt.request_id)?.served_through_ordinal,
+        ).toBeGreaterThan(0);
+        const served = await lane.prompt();
+        expect(served.view.kind).toBe("rebuild");
+        // The module serializes object keys in sorted order, so compare content
+        // with keys sorted; text and parts must be identical.
+        const byId = new Map(served.messages.map((m) => [m.info.id, stableStringify(m)]));
+        for (const message of frozen.messages.filter((m) => m.info.id))
+            expect(byId.get(message.info.id)).toBe(stableStringify(message));
     } finally {
         await lane.dispose();
     }

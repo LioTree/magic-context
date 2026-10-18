@@ -160,13 +160,6 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                     return 0;
                 }
             },
-            publishedThrough: (id, lineage) => {
-                try {
-                    return createBridgeReceiptStore(db, id, harness).publishedThrough(lineage);
-                } catch {
-                    return 0;
-                }
-            },
             onOutcome: async (...args) => {
                 const observing = Promise.all(
                     [...listeners].map(async (listener) => {
@@ -206,9 +199,6 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
     const published = new Map<string, { requestId: string; messages: BridgeView["messages"] }>();
     /** Per session: the frozen messages of the last view returned, keyed by message id. */
     const served = new Map<string, ServedView>();
-    /** Per session: whether a system_prompt fact was accepted since the last run() attempt,
-     * and whether the last published view's request carried Magic Context's system bytes. */
-    const systemPrompts = new Map<string, { sinceAttempt: boolean; lastPublished: boolean }>();
     function assertOpen() {
         if (disposed) throw new Error("Bridge adapter is disposed");
     }
@@ -234,13 +224,6 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             observations.add(observing);
             try {
                 const result = await pending;
-                if (result.accepted && fact.kind === "system_prompt") {
-                    const prompt = systemPrompts.get(fact.sessionId);
-                    systemPrompts.set(fact.sessionId, {
-                        sinceAttempt: true,
-                        lastPublished: prompt?.lastPublished ?? false,
-                    });
-                }
                 if (
                     result.accepted &&
                     fact.kind === "provider_response" &&
@@ -291,17 +274,6 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             if (v2 && !hasRawMessageProvider(id))
                 throw new BridgeRefusalError("raw_history_provider_missing");
             if (activeSessions.has(id)) throw new Error("Bridge pass already in flight");
-            // Ordering contract: a host that sends Magic Context's system prompt records
-            // the system_prompt fact before every run(), recovery runs included, and sends
-            // the strings that fact returns. The bridge never sees the system bytes the host
-            // sends, so a run with no fresh fact after a request that carried Magic
-            // Context's system prompt would go out with the host's raw prompt. Refuse it;
-            // recording the fact and calling run() again serves the step.
-            const prompt = systemPrompts.get(id);
-            if (prompt?.lastPublished && !prompt.sinceAttempt)
-                throw new BridgeRefusalError("system_prompt_unmanaged");
-            const managedSystem = prompt?.sinceAttempt === true;
-            if (prompt) prompt.sinceAttempt = false;
             const nativeStore = createBridgeReceiptStore(db, id, harness);
             const nativeCut = nativeStore.appliedCut();
             if (
@@ -375,7 +347,6 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                         provider.throughOrdinal(id),
                     ),
                 );
-                systemPrompts.set(id, { sinceAttempt: false, lastPublished: managedSystem });
                 return {
                     messages: output.messages as BridgeView["messages"],
                     kind: stepKind,
@@ -574,7 +545,6 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                     observerFailures.clear();
                     published.clear();
                     served.clear();
-                    systemPrompts.clear();
                     try {
                         transport.close();
                     } finally {
