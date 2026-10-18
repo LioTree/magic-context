@@ -1,75 +1,75 @@
 {
-  "version": "0.20.2",
+  "version": "0.20.3",
   "notes": "",
-  "pub_date": "2026-10-18T01:03:48.558Z",
+  "pub_date": "2026-10-18T02:54:08.444Z",
   "platforms": {
-    "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVRJY0tHWHBWLzFEMjJlWHN4eGFWV0R4TllmbFc1UllLM0VUWW5qUW1td1hicmxWcG9oa2VCZmd5ZTJUc29yYUo1LzRTdWQ3b3YvbkJvVWJ3S2hieHcwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MTU1CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQuYXBwLnRhci5negpuRXZmNzZyeGtoek9tTkt1R0ZwYlRqb1ZtVGY1QkpNTVRsNVF2dkxrMmp5NmVtcDVSYlE4Y2VGR1JYQUtYMmxTNTVlMUx2NENDS1Y3VjB6SERhOGxDUT09Cg==",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-darwin-arm64.app.tar.gz"
-    },
-    "darwin-aarch64-app": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVRJY0tHWHBWLzFEMjJlWHN4eGFWV0R4TllmbFc1UllLM0VUWW5qUW1td1hicmxWcG9oa2VCZmd5ZTJUc29yYUo1LzRTdWQ3b3YvbkJvVWJ3S2hieHcwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MTU1CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQuYXBwLnRhci5negpuRXZmNzZyeGtoek9tTkt1R0ZwYlRqb1ZtVGY1QkpNTVRsNVF2dkxrMmp5NmVtcDVSYlE4Y2VGR1JYQUtYMmxTNTVlMUx2NENDS1Y3VjB6SERhOGxDUT09Cg==",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-darwin-arm64.app.tar.gz"
-    },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWVTYjlVWWdlQzdCNllySGNZN3dBcTFodXk2a0tsWVM2dTl1R0k2WTFYNE5zSENaMVZFYWRHYXc2L2pFb0RvaUQ2WVpUTGxHR3M0cXYrQVVTVzJVQ0FFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MTg0CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQuYXBwLnRhci5nego4VERSa0lGcFAyWS9RVDZsUkc5aWdEb21WVk13WTFBc3MxWXlvWjdKczJFcWtDRUdOMmJqRGV0SmFCK01WaCtXMWwzbzVGWDVLUkc1ek0xS3ZvYlBEZz09Cg==",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-darwin-x64.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWVYcFlZTktyUWk3TEVOaTV2OUZiUENFdkJZaGlCQWtMbGI4UU13ajZJdXZvbHZyMXBNQ0F0UEFaTHdQa2xmTWtwTDBERTE1MVBhK0crUmtoSjRpcUFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxNjMyCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQuYXBwLnRhci5negpQUWlsTktlS1BKYVNMRFhGbkk4NGdnVUJEUlJrZ2JSMjR0TWt3ZlovaGZHZG1PSEpFb3VWV0dCQ2V0ZkN2THJrQjFaU1VqVGZNekZSc3dwRVZVWEVDZz09Cg==",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-darwin-x64.app.tar.gz"
     },
     "darwin-x86_64-app": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWVTYjlVWWdlQzdCNllySGNZN3dBcTFodXk2a0tsWVM2dTl1R0k2WTFYNE5zSENaMVZFYWRHYXc2L2pFb0RvaUQ2WVpUTGxHR3M0cXYrQVVTVzJVQ0FFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MTg0CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQuYXBwLnRhci5nego4VERSa0lGcFAyWS9RVDZsUkc5aWdEb21WVk13WTFBc3MxWXlvWjdKczJFcWtDRUdOMmJqRGV0SmFCK01WaCtXMWwzbzVGWDVLUkc1ek0xS3ZvYlBEZz09Cg==",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-darwin-x64.app.tar.gz"
-    },
-    "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWNDS0sxMVFIdnlmSmxBWGwvbFF3eTNzaUtVT1AwUVN1RXVDY2hpSjE2YkdXVGNiMXlKRVlPNzAzbkJOUGdDMERhb3lzZHZjYTdEQWxwQnJqZHNlQ0FFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MjA4CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX2FtZDY0LkFwcEltYWdlCnJTWGNycklCSGRVbUV0dUwweWZYejV1TUxyZHRXalhDTlBFaVFOWVVQOGZwUnlEaUFnNHRHVFl4M2RCQnJLdXdXUlBPQ1lzVjlzSjZaOG1WZkYzRURnPT0K",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-linux-x64.AppImage"
-    },
-    "linux-x86_64-appimage": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWNDS0sxMVFIdnlmSmxBWGwvbFF3eTNzaUtVT1AwUVN1RXVDY2hpSjE2YkdXVGNiMXlKRVlPNzAzbkJOUGdDMERhb3lzZHZjYTdEQWxwQnJqZHNlQ0FFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MjA4CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX2FtZDY0LkFwcEltYWdlCnJTWGNycklCSGRVbUV0dUwweWZYejV1TUxyZHRXalhDTlBFaVFOWVVQOGZwUnlEaUFnNHRHVFl4M2RCQnJLdXdXUlBPQ1lzVjlzSjZaOG1WZkYzRURnPT0K",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-linux-x64.AppImage"
-    },
-    "linux-x86_64-deb": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVJWVzFVYjdnSWI2czIrNFYwdHJ3S1ljSjl1ZFAvRW1LbnlINm5FZ3JmblNrNnRGRlgxcmFCMWVYOW8weDJxc1paVkJJRzBDcUo3Zmc0SEdtSXgvcWdJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MTk5CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX2FtZDY0LmRlYgpUM0V6NEV4cTdiQko1WkJSaTRtbkY0a1hYNWhna2U1amM2QkNNMElOVmxkSys2TThrUmRaRTAzYjlVcFplc1FxVTdoQ0FrakZoYkZMay9lSTl4RW1DUT09Cg==",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-linux-x64.deb"
-    },
-    "linux-x86_64-rpm": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVlRL20yN1VsczZqNUMvSWRyUXlreDROVktnVVA5WnNQSDF5QXV1U2lMYW5KWHgvOEMrVWdpQUV2YUZIZkZZSW1NSDVvZUpQSUY4SE5TV1pMR2lqc2dBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MTk5CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQtMC4yMC4yLTEueDg2XzY0LnJwbQp2OWFNTzhZQmF6eGVITm1IRi9qK21CRklMZ1JNVlhQdnFqK0ZzY3UyandaSSt0clNDL0p0RE1udlhUUWpCai9VdFlpakhuWTNWMml2RFMyRWd4S29BQT09Cg==",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-linux-x64.rpm"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWVYcFlZTktyUWk3TEVOaTV2OUZiUENFdkJZaGlCQWtMbGI4UU13ajZJdXZvbHZyMXBNQ0F0UEFaTHdQa2xmTWtwTDBERTE1MVBhK0crUmtoSjRpcUFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxNjMyCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQuYXBwLnRhci5negpQUWlsTktlS1BKYVNMRFhGbkk4NGdnVUJEUlJrZ2JSMjR0TWt3ZlovaGZHZG1PSEpFb3VWV0dCQ2V0ZkN2THJrQjFaU1VqVGZNekZSc3dwRVZVWEVDZz09Cg==",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-darwin-x64.app.tar.gz"
     },
     "linux-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVJjajZodnRDaXdKanBwNXpDVXhQSEMyTEIyVGtpZ0d4OHZuQk0rckltbVpYTW53Ukh5NmF5eXpMczBPY05MaW9tdm1kcjJmc3VQakswemdvZkNYK2dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MjcxCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX2FhcmNoNjQuQXBwSW1hZ2UKbkVKS2NyWU01OWN6MEUyODRFYWxxZ2QxOWxXSWlha0N2QUdkR0VQYkdSQjYrV0l2ZzBrU1hrd1FRZ3NZOThDWEx0aXhad1R4S0ZWU3RQWWlYSnpMQVE9PQo=",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-linux-arm64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWR0NFpYalFCb2lPWlNVY1J4MHEyMmFFeU9lUURpVVpLNWFwTmVWdmJmenUvMDRSNURCSGYzZStJM1dJNmx6UVNtVGxvSHUzeE8rWFVVZE1iWmhrUUFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxODA1CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX2FhcmNoNjQuQXBwSW1hZ2UKODA3NDZGSldiY1p6VDd4MlhNSDRIcjBZZXhQVVBVTzZtYTgrZkcrTmpjc2gyMXE1V3JvS3BPRDFaRk54SE1lcEZ5cUs5ZGFBZ0xUS3JsTkxQb2VxQmc9PQo=",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-linux-arm64.AppImage"
     },
     "linux-aarch64-appimage": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVJjajZodnRDaXdKanBwNXpDVXhQSEMyTEIyVGtpZ0d4OHZuQk0rckltbVpYTW53Ukh5NmF5eXpMczBPY05MaW9tdm1kcjJmc3VQakswemdvZkNYK2dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MjcxCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX2FhcmNoNjQuQXBwSW1hZ2UKbkVKS2NyWU01OWN6MEUyODRFYWxxZ2QxOWxXSWlha0N2QUdkR0VQYkdSQjYrV0l2ZzBrU1hrd1FRZ3NZOThDWEx0aXhad1R4S0ZWU3RQWWlYSnpMQVE9PQo=",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-linux-arm64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWR0NFpYalFCb2lPWlNVY1J4MHEyMmFFeU9lUURpVVpLNWFwTmVWdmJmenUvMDRSNURCSGYzZStJM1dJNmx6UVNtVGxvSHUzeE8rWFVVZE1iWmhrUUFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxODA1CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX2FhcmNoNjQuQXBwSW1hZ2UKODA3NDZGSldiY1p6VDd4MlhNSDRIcjBZZXhQVVBVTzZtYTgrZkcrTmpjc2gyMXE1V3JvS3BPRDFaRk54SE1lcEZ5cUs5ZGFBZ0xUS3JsTkxQb2VxQmc9PQo=",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-linux-arm64.AppImage"
     },
     "linux-aarch64-deb": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVYwNXUyY1ZCdnpIM1dBMCthd25GV2ZEMTJCaVNBVlBIMWgzSjNCbk5ram1jTUpHdEs2TWpHSFV6dkRmWG8yWkdIZ2FtOHhibzJMNCtMazJwTnorVkFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MjYzCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX2FybTY0LmRlYgorYnBzdTdiRlRYRFVXVGlBYWt0KzhXZTd0ZGcrdFNUTXhzTEtuUUg0WEp6SU1lNjZBOTNNcHB3UzRQM3RkR0h5NXFRU0xqR1E2VDV6YlRpWTRwUU9EZz09Cg==",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-linux-arm64.deb"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVllaVNweUpSQUVIQm1SMlNuL1J4TTl0R0wrUlFodVU4dy93ZHRHSEFuc2Z2Sm9BVWliQ0pyc2FXVFRMVC9rWmRNc1lwdU5YcFNYTERydzRSMDhJendnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxNzk3CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX2FybTY0LmRlYgpTR2tTZDVLSmtVV2JhNGdRZER0cnNjZEQ1QzQybFlsMklPYVd2UUFIbEFCcU5TeVcvbVpHWis1VWUzTFZJN0IwUlVtclRRWEJ2V3FuUEpyR2U3enZCZz09Cg==",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-linux-arm64.deb"
     },
     "linux-aarch64-rpm": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVVSMjdCU2VVdVF2cldESFgvVzFUR0hqcXczMUkzb1U2NkVrb0dabHdBOXRmSGFvbkRGT2NDNWRxNUhCYUdUczZGVVBKL0lla0w3UXZYZ1NjNzZFSUFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1MjYzCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQtMC4yMC4yLTEuYWFyY2g2NC5ycG0KTkpCdmlJdmZzT0U3aXAzMWdGaklEc1FPVGlDbG4xV0xBT3hwN3RONmZBalhhZ3Zqb0JyVnZVRDY3WWJqVkxCSFpBWTRrc2dpZ3ZCL2ZsTE4vMXVtRGc9PQo=",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-linux-arm64.rpm"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVRTMmVHU3YzMHVCTUgxWjZJTktKT2pIV1lTR2oyK3AvaU1CNWYzSTM3V3k2eFp1ZEl1WGVLbm9NcFZGakZQTThFZUx3K3F4NUk5ZEZLWWtSa0FkU1FjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxNzk3CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQtMC4yMC4zLTEuYWFyY2g2NC5ycG0KYjl5M3JNekpURVp0Vy83NjI4VXNBQ055eXFsdGwxdHhiVzNBNUx2VEcrdnhoTjFSa3c0R21RZGVoc0RrV0JHM2FURldhS2UwRGowNVVPTVl3Rkl4QVE9PQo=",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-linux-arm64.rpm"
     },
-    "windows-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVNVa2ZzdURRM1h0eWRMWU9aM3NGbmtHL1FzekNwNGRhR3JqOUJkQzMweDJ2OUgrUkxaOGU1OHE0b1FxT3dxeFo1cWdaNDdkejVlUCsvOGpBMm15andrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1NDA4CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX2FybTY0LXNldHVwLmV4ZQpZdnB3bXJXbjNlTjlZeWhTN3hVVzlqQ0RrZU9rUVlUelVpK2pPWHhlOEo3RXV2R1diRERBL2JzVlBUbGZJSjFFQWF0ajVDR2FzOUZuQTBKK3F4WHpBZz09Cg==",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-windows-arm64.exe"
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWFsN3pBMFc1akllS0xQMzhVYXVGeVFyczFQdkFldHNsNGtQS2JaTzl2d1YxWTZ3RmRUamJKS2xkRmtPRnl4bUcxdGhEVW9halhWWnVLeW9NSUZqaEFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxODI0CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQuYXBwLnRhci5negpzcksvcEhyWE5HMkJ3SzR2UTE3QjNsbTAvYUh4TFlqQjlvR3BqUnIyVSthQkpIUGZJVi92eTJGODl0L0taYVNRMC8ySDcwUW9PZ2VTZlNjcGpCakdEdz09Cg==",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-darwin-arm64.app.tar.gz"
     },
-    "windows-aarch64-nsis": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVNVa2ZzdURRM1h0eWRMWU9aM3NGbmtHL1FzekNwNGRhR3JqOUJkQzMweDJ2OUgrUkxaOGU1OHE0b1FxT3dxeFo1cWdaNDdkejVlUCsvOGpBMm15andrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1NDA4CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX2FybTY0LXNldHVwLmV4ZQpZdnB3bXJXbjNlTjlZeWhTN3hVVzlqQ0RrZU9rUVlUelVpK2pPWHhlOEo3RXV2R1diRERBL2JzVlBUbGZJSjFFQWF0ajVDR2FzOUZuQTBKK3F4WHpBZz09Cg==",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-windows-arm64.exe"
+    "darwin-aarch64-app": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWFsN3pBMFc1akllS0xQMzhVYXVGeVFyczFQdkFldHNsNGtQS2JaTzl2d1YxWTZ3RmRUamJKS2xkRmtPRnl4bUcxdGhEVW9halhWWnVLeW9NSUZqaEFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxODI0CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQuYXBwLnRhci5negpzcksvcEhyWE5HMkJ3SzR2UTE3QjNsbTAvYUh4TFlqQjlvR3BqUnIyVSthQkpIUGZJVi92eTJGODl0L0taYVNRMC8ySDcwUW9PZ2VTZlNjcGpCakdEdz09Cg==",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-darwin-arm64.app.tar.gz"
+    },
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWFSS1NVeDFGamJxZDJWdWhGR1FIV1dZbnFaT3U1Q3RTTHEzQi9RTWIyUGRsTUJTdlc5RnJ3dnFjcGpMKzZuODh3bzVMMy9tWFpJSmFOM3plamU3L2djPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxOTE2CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX2FtZDY0LkFwcEltYWdlCjRzTFpiR0k4aVFzMUVreG9mZG5Ha2ZVMU1iZlJ0RVhJWmhHa3E2eEpjN1B1MzltVU9GZFcvditXODJUU3BuT283dmtRanFMaGtSOGNXUjdRdjF0RUJBPT0K",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-linux-x64.AppImage"
+    },
+    "linux-x86_64-appimage": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWFSS1NVeDFGamJxZDJWdWhGR1FIV1dZbnFaT3U1Q3RTTHEzQi9RTWIyUGRsTUJTdlc5RnJ3dnFjcGpMKzZuODh3bzVMMy9tWFpJSmFOM3plamU3L2djPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxOTE2CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX2FtZDY0LkFwcEltYWdlCjRzTFpiR0k4aVFzMUVreG9mZG5Ha2ZVMU1iZlJ0RVhJWmhHa3E2eEpjN1B1MzltVU9GZFcvditXODJUU3BuT283dmtRanFMaGtSOGNXUjdRdjF0RUJBPT0K",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-linux-x64.AppImage"
+    },
+    "linux-x86_64-deb": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVJPS1FJSkE5Uk9uUDNQVTA1MGU3ZEhrdlBzM3UwQmcydlNGUDE4SDZpVmcxZ2tYa2xSbEM2NERrK0VRRXExMDlsY2RZZ2ZGei9iWElwRkxvanhnZ0FvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxOTAyCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX2FtZDY0LmRlYgpoSThuaDdrcHlTOER6TVA4ZjRYZjZrWlhVZ2dqR0V3MG1GandNWEwzb013QWNNK080WVFiVWU1SkpiWVJFckhZVE9ZU3BscjQ1aklubGR6Umh1ZW1CZz09Cg==",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-linux-x64.deb"
+    },
+    "linux-x86_64-rpm": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVk5NWd1VDFJMGRGWCtiYndQdjZEOHA4Tnc2c0h4SEVoQ2EzUWhWOE53U0xmSms5T2pTQ1M5RHJhQXQ5andtK2lvNGptS3lHTDR1Qkp6ZGJQQTErMkFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkxOTAyCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmQtMC4yMC4zLTEueDg2XzY0LnJwbQpRNzFkbjBpZmt2ajZWRGptNVZzTFNraVFTcWRyWlZlWVFNOUtTanlreE9Tc3lScnBqN0wxZmFYSTB4OW04QlcwRHdXdGpESTlGTlBVbDJ1cldJTXdBUT09Cg==",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-linux-x64.rpm"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWQyRldqNDU2SEZlNnBuVVh3cGR6Y210NThIN3M4TXpjdE8vTnZ0dnVLMXBkcFlTMFdkSFdwRktqUkZqNEpYZHdIdFZRbUZKWU4yN0Vwdis0NnZuVVFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1NDI0CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX3g2NC1zZXR1cC5leGUKUUlwUG92V24zZklMQjV4djBSWkNUQUVzNEFuMFM0akJkYUVpSzE3WXpwQUZyRjlOR1dyOUZQajZEWmd0dk9EcmRZWTdIZnR4L1Jla3FSZHV4OFI5Q0E9PQo=",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-windows-x64.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWIwcFc5ZElMOWpmWm1FempuZ3pQUWUrNlRkeHFwcUt1NWFmdGhjWk1taFduQ1BmbWQzL2FLdjJWTVc0N1JhcmlnVWZiT2cvdTVYbjlwN3NsbXlzWFF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkyMDEzCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX3g2NC1zZXR1cC5leGUKU2JoQmttdERSM3MyeVJ4aE52Ym1RUXJSNi9iL2dISTdDY2VIUnpJK01JS0hMeDg4b1Y4SERtZW5iaTB3UjhNZ05KNk54SUpSZ3J4Wkw0UkRFWEZsQUE9PQo=",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-windows-x64.exe"
     },
     "windows-x86_64-nsis": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWQyRldqNDU2SEZlNnBuVVh3cGR6Y210NThIN3M4TXpjdE8vTnZ0dnVLMXBkcFlTMFdkSFdwRktqUkZqNEpYZHdIdFZRbUZKWU4yN0Vwdis0NnZuVVFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1NDI0CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX3g2NC1zZXR1cC5leGUKUUlwUG92V24zZklMQjV4djBSWkNUQUVzNEFuMFM0akJkYUVpSzE3WXpwQUZyRjlOR1dyOUZQajZEWmd0dk9EcmRZWTdIZnR4L1Jla3FSZHV4OFI5Q0E9PQo=",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-windows-x64.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWIwcFc5ZElMOWpmWm1FempuZ3pQUWUrNlRkeHFwcUt1NWFmdGhjWk1taFduQ1BmbWQzL2FLdjJWTVc0N1JhcmlnVWZiT2cvdTVYbjlwN3NsbXlzWFF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkyMDEzCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX3g2NC1zZXR1cC5leGUKU2JoQmttdERSM3MyeVJ4aE52Ym1RUXJSNi9iL2dISTdDY2VIUnpJK01JS0hMeDg4b1Y4SERtZW5iaTB3UjhNZ05KNk54SUpSZ3J4Wkw0UkRFWEZsQUE9PQo=",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-windows-x64.exe"
     },
     "windows-x86_64-msi": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYWF3a0htcGpudTVLUGwyQzdVbFN2akNlOWZZcGRrZEhVT2tBY1FIczBKZDRSVjFnbjZDUFZuQVVLbHBsYk1KeGFGaUdSTnVsWUZzUWJNbS8yY00vS2dBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjg1NDI0CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4yX3g2NF9lbi1VUy5tc2kKYWp6YVN3elRhK2xUMEJ1alFYc2wyaU1scTdmbmhnd1VsajFwMHEzSG9ZTm9iaHZtbE4xeVE0bGRCTWlhcGxNZGQ0cEJ6Y3ZybkUxS3k0MlNpK2RSREE9PQo=",
-      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.2/magic-context-dashboard-windows-x64.msi"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVhFWnZsY0RzOTRzaEt2Um5TbU1BTUMzcXZOSlpuZ3IwZk5hNGZOZStsWHZGK2J0YmFXK0IzMEN0Nms0UnhrNFpHQUJOTENDQ0FUWmJCTlBlZXVjQmdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkyMDEzCWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX3g2NF9lbi1VUy5tc2kKUm45aDd0RkNuSTJqdlg0N1dwSGRFOGlZUzAyalNTWUYwdjFVdFlLUUt5WTBWdEhCb2NlblZ3cW52R29qOXQ0R0w1c3RveUlKZ0E3TzIvTGVmZDVCQlE9PQo=",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-windows-x64.msi"
+    },
+    "windows-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVpsT3FuL05CL3VGdks0d1l4UzlWTlRqR01BYnJ3REZEZktXaUhtNWZZRUphMURqelVLTytVaFYwUUhXd3NkY0U1OHdvVDRoL1dkTUxWdjZVSGxjclFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkyMDQ2CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX2FybTY0LXNldHVwLmV4ZQpYYlFvUUxFSGRadXdQQ1pZelpqQUg3RDZyVXl2SjZrdXBmZUJOMGR5WktqQW1wY1g0REFRSDBMMGFHVFNxZzdvcUV6eWhVUHNWV0pmOWJlMGJCUzBBdz09Cg==",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-windows-arm64.exe"
+    },
+    "windows-aarch64-nsis": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRdnhoQmxJYUFjYVpsT3FuL05CL3VGdks0d1l4UzlWTlRqR01BYnJ3REZEZktXaUhtNWZZRUphMURqelVLTytVaFYwUUhXd3NkY0U1OHdvVDRoL1dkTUxWdjZVSGxjclFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjkyMDQ2CWZpbGU6TWFnaWMgQ29udGV4dCBEYXNoYm9hcmRfMC4yMC4zX2FybTY0LXNldHVwLmV4ZQpYYlFvUUxFSGRadXdQQ1pZelpqQUg3RDZyVXl2SjZrdXBmZUJOMGR5WktqQW1wY1g0REFRSDBMMGFHVFNxZzdvcUV6eWhVUHNWV0pmOWJlMGJCUzBBdz09Cg==",
+      "url": "https://github.com/cortexkit/magic-context/releases/download/dashboard-v0.20.3/magic-context-dashboard-windows-arm64.exe"
     }
   }
 }
