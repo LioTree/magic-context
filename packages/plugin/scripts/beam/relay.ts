@@ -6,17 +6,17 @@
  *
  *   POST {baseURL}/models/{model}:streamGenerateContent?alt=sse   body = GenerateContentRequest
  *
- * Cloud Code Assist takes the same request wrapped in an envelope:
+ * Cloud Code Assist's native CLI uses a streaming request wrapped in an envelope:
  *
  *   POST {upstream}/v1internal:streamGenerateContent?alt=sse
- *   body = { model, project, request: GenerateContentRequest, requestType, userAgent, requestId }
+ *   body = { project, requestId, request: GenerateContentRequest, model, userAgent, requestType }
  *
- * and answers each SSE event (or the whole JSON reply) wrapped as `{ response: ... }`.
+ * and wraps each SSE event as `{ response: ... }`.
  *
- * The relay does exactly that and nothing else:
+ * The relay adapts only transport metadata and generation controls:
  *
- * - the host's body becomes `request` unchanged (`contents`, `systemInstruction`, `tools`,
- *   `toolConfig`, `generationConfig` and any other field pass through as equal JSON);
+ * - `contents`, `systemInstruction` and `tools` are unchanged; the allowlist in cloud-code.ts
+ *   names every added or overridden request field;
  * - each upstream `{ response: X }` event is sent back as `X`, other events unchanged;
  * - the host must present the per-run random key it was configured with; the real upstream token is
  *   held only in this process's memory and is sent only to the upstream;
@@ -26,7 +26,16 @@
  * The route table is keyed by path prefix, so a second upstream (for example the ChatGPT Codex
  * backend) can be added as another route under the same rules.
  */
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
+import {
+    BEAM_SESSION_HEADER,
+    BEAM_WORKSPACE_HEADER,
+    type HistorianSession,
+    type HistorianVariant,
+    newHistorianSession,
+    wrapCloudCodeRequest,
+} from "./cloud-code";
+import { cloudCodeFetch } from "./cloud-code-http";
 import { CredentialError, scrub } from "./credentials";
 
 export interface RelayLogEntry {
@@ -48,8 +57,9 @@ export interface CloudCodeRoute {
     kind: "cloud-code";
     /** Host-facing path prefix, e.g. `/gemini/v1beta`. */
     prefix: string;
-    /** Upstream origin, e.g. `https://cloudcode-pa.googleapis.com`. */
+    /** Upstream origin; the real route uses `https://daily-cloudcode-pa.googleapis.com`. */
     upstream: string;
+    variant?: HistorianVariant;
     /** Returns the current upstream bearer; called per request so the token never sits in config. */
     token: () => string | Promise<string>;
     project: string;
@@ -78,22 +88,6 @@ export interface Relay {
 
 const GEMINI_METHOD = /\/models\/([^/:]+):(streamGenerateContent|generateContent)$/;
 
-/** The Cloud Code Assist envelope around one Gemini request. */
-export function wrapCloudCodeRequest(
-    model: string,
-    project: string,
-    request: unknown,
-): Record<string, unknown> {
-    return {
-        model,
-        project,
-        request,
-        requestType: "agent",
-        userAgent: "antigravity",
-        requestId: `agent-${randomUUID()}`,
-    };
-}
-
 /** One upstream SSE `data:` payload as the host expects it: the `response` field when present. */
 export function unwrapCloudCodeEvent(data: string): string {
     const trimmed = data.trim();
@@ -106,6 +100,49 @@ export function unwrapCloudCodeEvent(data: string): string {
         // Not JSON: pass it through untouched.
     }
     return data;
+}
+
+/** Non-streaming host calls still use upstream SSE; retain all text deltas and final usage. */
+export function collectCloudCodeStream(text: string): string {
+    type Candidate = {
+        index?: number;
+        content?: { role?: string; parts?: Record<string, unknown>[] };
+        [key: string]: unknown;
+    };
+    let result: Record<string, unknown> = {};
+    const candidates = new Map<number, Candidate>();
+    let events = 0;
+    for (const line of text.split(/\r?\n/)) {
+        if (!line.startsWith("data:")) continue;
+        const data = unwrapCloudCodeEvent(line.slice(5)).trim();
+        if (!data || data === "[DONE]") continue;
+        const event = JSON.parse(data) as Record<string, unknown> & { candidates?: Candidate[] };
+        events++;
+        result = { ...result, ...event };
+        for (const [position, candidate] of (event.candidates ?? []).entries()) {
+            const index = candidate.index ?? position;
+            const previous = candidates.get(index);
+            candidates.set(index, {
+                ...previous,
+                ...candidate,
+                ...(previous?.content || candidate.content
+                    ? {
+                          content: {
+                              ...previous?.content,
+                              ...candidate.content,
+                              parts: [
+                                  ...(previous?.content?.parts ?? []),
+                                  ...(candidate.content?.parts ?? []),
+                              ],
+                          },
+                      }
+                    : {}),
+            });
+        }
+    }
+    if (events === 0) throw new Error("Cloud Code returned no SSE response events");
+    if (candidates.size > 0) result.candidates = [...candidates.values()];
+    return JSON.stringify(result);
 }
 
 /** Copy the token counts out of one unwrapped Gemini reply, if it carries them. */
@@ -168,6 +205,7 @@ function unwrapSseStream(
 
 export function startRelay(options: RelayOptions): Relay {
     const hostKey = randomBytes(32).toString("hex");
+    const sessions = new Map<string, HistorianSession>();
     const log: RelayLogEntry[] = [];
     const relay: Relay = {
         origin: "",
@@ -220,11 +258,43 @@ export function startRelay(options: RelayOptions): Relay {
             const method = GEMINI_METHOD.exec(url.pathname.slice(route.prefix.length));
             if (request.method !== "POST" || !method)
                 return finish(new Response("unsupported", { status: 404 }));
-            const [, model, action] = method as unknown as [string, string, string];
+            const [, , action] = method as unknown as [string, string, string];
             const text = await request.text();
             entry.bytesIn = Buffer.byteLength(text);
-            const hostBody = JSON.parse(text) as unknown;
-            const upstreamUrl = `${route.upstream}/v1internal:${action}${action === "streamGenerateContent" ? "?alt=sse" : ""}`;
+            const workspaceUri = request.headers.get(BEAM_WORKSPACE_HEADER);
+            const childSession = request.headers.get(BEAM_SESSION_HEADER);
+            if (!workspaceUri?.startsWith("file://") || !childSession) {
+                return finish(
+                    new Response("missing historian child-session metadata", { status: 400 }),
+                );
+            }
+            const sessionKey = JSON.stringify([workspaceUri, childSession]);
+            let session = sessions.get(sessionKey);
+            if (!session) {
+                session = newHistorianSession(workspaceUri);
+                sessions.set(sessionKey, session);
+            }
+            let body: string;
+            try {
+                body = JSON.stringify(
+                    wrapCloudCodeRequest(
+                        route.variant ?? "medium",
+                        route.project,
+                        JSON.parse(text) as Record<string, unknown>,
+                        session,
+                    ),
+                );
+            } catch {
+                return finish(
+                    new Response(
+                        "unsupported historian request; refusing to change prompt content",
+                        { status: 400 },
+                    ),
+                );
+            }
+            const upstreamUrl = new URL(
+                `${route.upstream}/v1internal:streamGenerateContent?alt=sse`,
+            );
             let token: string;
             try {
                 token = await route.token();
@@ -233,16 +303,7 @@ export function startRelay(options: RelayOptions): Relay {
                 relay.credentialError = error;
                 return finish(new Response("credential refresh refused", { status: 403 }));
             }
-            const upstream = await fetch(upstreamUrl, {
-                method: "POST",
-                headers: {
-                    "content-type": "application/json",
-                    authorization: `Bearer ${token}`,
-                    ...(action === "streamGenerateContent" ? { accept: "text/event-stream" } : {}),
-                },
-                body: JSON.stringify(wrapCloudCodeRequest(model, route.project, hostBody)),
-                signal: request.signal,
-            });
+            const upstream = await cloudCodeFetch(upstreamUrl, body, token, request.signal);
             if (upstream.status === 401 || upstream.status === 403) {
                 relay.authRejected = { route: route.kind, status: upstream.status };
                 options.onAuthRejected?.(route.kind, upstream.status);
@@ -265,10 +326,15 @@ export function startRelay(options: RelayOptions): Relay {
                 const stream = unwrapSseStream(upstream.body, entry);
                 return finish(new Response(stream, { status: upstream.status, headers }));
             }
-            const unwrapped = unwrapCloudCodeEvent(await upstream.text());
+            const unwrapped = collectCloudCodeStream(await upstream.text());
             readUsage(unwrapped, entry);
             entry.bytesOut = Buffer.byteLength(unwrapped);
-            return finish(new Response(unwrapped, { status: upstream.status, headers }));
+            return finish(
+                new Response(unwrapped, {
+                    status: upstream.status,
+                    headers: { "content-type": "application/json" },
+                }),
+            );
         },
     });
     relay.origin = `http://127.0.0.1:${server.port}`;

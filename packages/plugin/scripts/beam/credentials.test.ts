@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { BEAM_SESSION_HEADER, BEAM_WORKSPACE_HEADER } from "./cloud-code";
 import {
     type ClaustrumClientLike,
     CredentialError,
@@ -241,7 +242,12 @@ describe("BEAM scoped credential refresh", () => {
         const send = () =>
             fetch(`${relay.origin}/gemini/v1beta/models/gemini:generateContent`, {
                 method: "POST",
-                headers: { "x-goog-api-key": relay.hostKey, "content-type": "application/json" },
+                headers: {
+                    [BEAM_SESSION_HEADER]: "refresh-test-child",
+                    [BEAM_WORKSPACE_HEADER]: "file:///tmp/beam-refresh-fixture",
+                    "x-goog-api-key": relay.hostKey,
+                    "content-type": "application/json",
+                },
                 body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "ok" }] }] }),
             });
         try {

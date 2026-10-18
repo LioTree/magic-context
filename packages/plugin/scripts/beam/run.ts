@@ -9,7 +9,7 @@
  * vanilla, mc, summary.
  */
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
     existsSync,
     mkdirSync,
@@ -20,8 +20,15 @@ import {
     writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import type { BoundaryProbeResult } from "./boundary-probe";
+import {
+    BEAM_SESSION_HEADER,
+    BEAM_WORKSPACE_HEADER,
+    HISTORIAN_VARIANTS,
+    type HistorianVariant,
+} from "./cloud-code";
 import {
     CredentialError,
     type Credentials,
@@ -73,7 +80,7 @@ export const DATASET = "Mohammadta/BEAM";
 export const DATASET_REVISION = "3205395e897e7318c7b094ef4e6047b9b82dbb03";
 const UPSTREAMS = {
     codex: "https://chatgpt.com/backend-api/codex",
-    cloudCode: "https://cloudcode-pa.googleapis.com",
+    cloudCode: "https://daily-cloudcode-pa.googleapis.com",
     voyage: "https://api.voyageai.com/v1",
 };
 
@@ -88,6 +95,7 @@ interface Settings {
     conversations: string[];
     answerModel: string;
     historianModel: string;
+    historianVariant: HistorianVariant;
     reasoningEffort?: string;
     temperature?: number;
     answerContextLimit: number;
@@ -164,7 +172,8 @@ export function parseBeamArgs(args?: string[]) {
             stub: { type: "boolean" },
             opencode: { type: "string" },
             "answer-model": { type: "string", default: "gpt-6-luna" },
-            "historian-model": { type: "string", default: "gemini-3.8-flash" },
+            "historian-model": { type: "string" },
+            "historian-variant": { type: "string", default: "medium" },
             "reasoning-effort": { type: "string", default: "none" },
             temperature: { type: "string", default: "omit" },
             "answer-context-limit": { type: "string", default: "272000" },
@@ -233,6 +242,16 @@ async function buildSettings(): Promise<Settings> {
     if (!run || !/^[\w.-]+$/.test(run))
         throw new Error("--run <name> is required (letters, digits, . _ -)");
     const temperatureText = flags.temperature as string;
+    const historianVariant = flags["historian-variant"] as HistorianVariant;
+    if (!Object.hasOwn(HISTORIAN_VARIANTS, historianVariant)) {
+        throw new Error("--historian-variant must be low, medium or high");
+    }
+    const historianModel = HISTORIAN_VARIANTS[historianVariant].model;
+    if (flags["historian-model"] && flags["historian-model"] !== historianModel) {
+        throw new Error(
+            "--historian-model must match --historian-variant; the bare flash model is not available",
+        );
+    }
     return {
         run,
         mode: flags.stub ? "stub" : "vault",
@@ -243,7 +262,8 @@ async function buildSettings(): Promise<Settings> {
             .map((id) => id.trim())
             .filter(Boolean),
         answerModel: flags["answer-model"] as string,
-        historianModel: flags["historian-model"] as string,
+        historianModel,
+        historianVariant,
         reasoningEffort: (flags["reasoning-effort"] as string) || undefined,
         temperature: temperatureText === "omit" ? undefined : Number(temperatureText),
         answerContextLimit: numberFlag("answer-context-limit"),
@@ -315,6 +335,7 @@ async function openUpstreams(settings: Settings): Promise<Upstreams> {
                 kind: "cloud-code",
                 prefix: "/gemini/v1beta",
                 upstream: stub ? stub.origin : UPSTREAMS.cloudCode,
+                variant: settings.historianVariant,
                 token: async () => (await credentials.cloudCode()).token,
                 project: (await credentials.cloudCode()).project,
             },
@@ -1047,6 +1068,17 @@ export function summarizeRun(settings: Settings): Record<string, unknown> {
     const out: Record<string, unknown> = {
         run: settings.run,
         settings,
+        cloudCode: {
+            upstream: UPSTREAMS.cloudCode,
+            transport: "node:https HTTP/1.1 (node:http for loopback stub)",
+            historianVariant: settings.historianVariant,
+            model: HISTORIAN_VARIANTS[settings.historianVariant].model,
+            thinkingConfig: {
+                thinkingBudget: HISTORIAN_VARIANTS[settings.historianVariant].thinkingBudget,
+                includeThoughts: true,
+            },
+            maxOutputTokens: 65536,
+        },
         sampling: {
             answerTemperature: settings.temperature ?? null,
             judgeTemperature: settings.temperature ?? null,
@@ -1167,6 +1199,9 @@ export async function smokeTransport(settings: Settings, upstreams: Upstreams): 
             headers: {
                 "content-type": "application/json",
                 "x-goog-api-key": upstreams.relay.hostKey,
+                [BEAM_SESSION_HEADER]: `smoke-${randomUUID()}`,
+                [BEAM_WORKSPACE_HEADER]: pathToFileURL(join(runDir(settings), "smoke-workspace"))
+                    .href,
             },
             body: JSON.stringify({
                 contents: [{ role: "user", parts: [{ text: "Reply with the single word: ok" }] }],

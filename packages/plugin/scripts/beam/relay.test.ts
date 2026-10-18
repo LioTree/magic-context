@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { startRelay, unwrapCloudCodeEvent } from "./relay";
+import { BEAM_SESSION_HEADER, BEAM_WORKSPACE_HEADER } from "./cloud-code";
+import { collectCloudCodeStream, startRelay, unwrapCloudCodeEvent } from "./relay";
 import { startStub } from "./stub";
 
 const expectations = {
@@ -9,6 +10,11 @@ const expectations = {
     cloudCodeProject: "fake-project-123",
     voyageKey: "fake-voyage-key",
 };
+const sessionMetadata = {
+    [BEAM_SESSION_HEADER]: "child-session-fixture",
+    [BEAM_WORKSPACE_HEADER]: "file:///tmp/beam-fixture",
+};
+const userBody = { contents: [{ role: "user", parts: [{ text: "ok" }] }] };
 const stub = startStub(expectations);
 const relay = startRelay({
     routes: [
@@ -85,21 +91,22 @@ function randomGeminiBody(seed: number): Record<string, unknown> {
                 ],
             },
         ];
-    if (r.next() < 0.5) body.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
-    if (r.next() < 0.5) body[`extra${r.text()}`] = r.value(0);
+    if (body.tools && r.next() < 0.5) body.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
+    const last = (body.contents as { role: string }[]).at(-1);
+    if (last) last.role = "user";
     return body;
 }
 
 async function send(body: unknown, key = relay.hostKey, action = "streamGenerateContent") {
     return fetch(`${relay.origin}/gemini/v1beta/models/gemini-3.8-flash:${action}?alt=sse`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-goog-api-key": key },
+        headers: { ...sessionMetadata, "content-type": "application/json", "x-goog-api-key": key },
         body: JSON.stringify(body),
     });
 }
 
 describe("Cloud Code relay", () => {
-    test("passes 200 randomized request bodies through as equal JSON inside the envelope", async () => {
+    test("preserves prompt-bearing fields in 200 randomized native envelopes", async () => {
         for (let seed = 1; seed <= 200; seed++) {
             const body = randomGeminiBody(seed);
             const before = stub.records.length;
@@ -109,9 +116,12 @@ describe("Cloud Code relay", () => {
             const record = stub.records[before];
             expect(record?.route).toBe("cloud-code");
             const envelope = record?.body as Record<string, unknown>;
-            expect(envelope.request).toEqual(body);
-            expect(JSON.stringify(envelope.request)).toBe(JSON.stringify(body));
-            expect(envelope.model).toBe("gemini-3.8-flash");
+            const adapted = envelope.request as Record<string, unknown>;
+            for (const field of ["contents", "systemInstruction", "tools"]) {
+                expect(JSON.stringify(adapted[field])).toBe(JSON.stringify(body[field]));
+            }
+            expect(envelope.model).toBe("gemini-3.8-flash-medium");
+            expect(record?.path).toBe("/v1internal:streamGenerateContent?alt=sse");
             expect(envelope.project).toBe(expectations.cloudCodeProject);
             expect(record?.credentialHeaders.authorization).toBe("present-matches");
         }
@@ -132,6 +142,77 @@ describe("Cloud Code relay", () => {
         ).json()) as { candidates?: { finishReason?: string }[] };
         expect(whole.candidates?.[0]?.finishReason).toBe("STOP");
         expect(unwrapCloudCodeEvent(" [DONE]")).toBe(" [DONE]");
+    });
+
+    test("aggregates every SSE delta for a non-streaming host call", () => {
+        const text = [
+            {
+                response: {
+                    candidates: [
+                        { index: 0, content: { role: "model", parts: [{ text: "one" }] } },
+                    ],
+                },
+            },
+            {
+                response: {
+                    candidates: [
+                        { index: 0, content: { parts: [{ text: "two" }] }, finishReason: "STOP" },
+                    ],
+                    usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2 },
+                },
+            },
+        ]
+            .map((event) => `data: ${JSON.stringify(event)}\r\n\r\n`)
+            .join("");
+        const response = JSON.parse(collectCloudCodeStream(`${text}data: [DONE]\n`));
+        expect(response.candidates[0].content.parts).toEqual([{ text: "one" }, { text: "two" }]);
+        expect(response.candidates[0].finishReason).toBe("STOP");
+        expect(response.usageMetadata).toEqual({ promptTokenCount: 5, candidatesTokenCount: 2 });
+    });
+
+    test("UUIDs are stable per child session and workspace, not per host or request", async () => {
+        const call = async (child: string, workspace: string) => {
+            const before = stub.records.length;
+            const response = await fetch(
+                `${relay.origin}/gemini/v1beta/models/gemini-3.8-flash-medium:generateContent`,
+                {
+                    method: "POST",
+                    headers: {
+                        "x-goog-api-key": relay.hostKey,
+                        [BEAM_SESSION_HEADER]: child,
+                        [BEAM_WORKSPACE_HEADER]: workspace,
+                    },
+                    body: JSON.stringify(userBody),
+                },
+            );
+            expect(response.status).toBe(200);
+            await response.text();
+            return stub.records[before]?.body as {
+                requestId: string;
+                request: { sessionId: string };
+            };
+        };
+        const first = await call("child-a", "file:///tmp/beam-a");
+        const repeat = await call("child-a", "file:///tmp/beam-a");
+        const otherChild = await call("child-b", "file:///tmp/beam-a");
+        const otherWorkspace = await call("child-a", "file:///tmp/beam-b");
+        const ids = (id: string) => [id.split("/")[1], id.split("/")[3]];
+        expect(ids(first.requestId)).toEqual(ids(repeat.requestId));
+        expect(ids(first.requestId)).not.toEqual(ids(otherChild.requestId));
+        expect(ids(first.requestId)).not.toEqual(ids(otherWorkspace.requestId));
+        expect(first.request.sessionId).toBe(otherChild.request.sessionId);
+        expect(first.request.sessionId).not.toBe(otherWorkspace.request.sessionId);
+    });
+
+    test("missing child-session metadata refuses forwarding instead of sharing a trajectory", async () => {
+        const before = stub.records.length;
+        const response = await fetch(`${relay.origin}/gemini/v1beta/models/m:generateContent`, {
+            method: "POST",
+            headers: { "x-goog-api-key": relay.hostKey },
+            body: JSON.stringify(userBody),
+        });
+        expect(response.status).toBe(400);
+        expect(stub.records.length).toBe(before);
     });
 
     test("refuses a caller without the per-run key before anything reaches the upstream", async () => {
@@ -196,8 +277,8 @@ describe("Cloud Code relay", () => {
                 `${diagnostic.origin}/gemini/v1beta/models/m:generateContent`,
                 {
                     method: "POST",
-                    headers: { "x-goog-api-key": diagnostic.hostKey },
-                    body: "{}",
+                    headers: { ...sessionMetadata, "x-goog-api-key": diagnostic.hostKey },
+                    body: JSON.stringify(userBody),
                 },
             );
             const expected = JSON.stringify({
@@ -244,8 +325,8 @@ describe("Cloud Code relay", () => {
                     `${diagnostic.origin}/gemini/v1beta/models/m:generateContent`,
                     {
                         method: "POST",
-                        headers: { "x-goog-api-key": diagnostic.hostKey },
-                        body: "{}",
+                        headers: { ...sessionMetadata, "x-goog-api-key": diagnostic.hostKey },
+                        body: JSON.stringify(userBody),
                     },
                 );
                 expect(await response.text()).toBe(text);
@@ -273,8 +354,8 @@ describe("Cloud Code relay", () => {
             const call = () =>
                 fetch(`${rejecting.origin}/gemini/v1beta/models/m:generateContent`, {
                     method: "POST",
-                    headers: { "x-goog-api-key": rejecting.hostKey },
-                    body: "{}",
+                    headers: { ...sessionMetadata, "x-goog-api-key": rejecting.hostKey },
+                    body: JSON.stringify(userBody),
                 });
             expect((await call()).status).toBe(401);
             expect(rejecting.authRejected).toEqual({ route: "cloud-code", status: 401 });

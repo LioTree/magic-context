@@ -84,18 +84,45 @@ How the throwaway host reaches each upstream without any OpenCode auth plugin or
   `developer` input item; the transport smoke test shows whether the backend accepts that.
 - **Cloud Code Assist (historian)**: OpenCode's `google` provider pointed at the loopback relay
   (`relay.ts`). The relay listens on `127.0.0.1` on a random port and accepts only the per-run
-  random key the host was configured with. For each `POST .../models/{model}:streamGenerateContent`
-  (or `:generateContent`) it sends
-  `POST https://cloudcode-pa.googleapis.com/v1internal:{action}` with
-  `{ model, project, request, requestType: "agent", userAgent: "antigravity", requestId }`, where
-  `request` is the host's body **unchanged** (`relay.test.ts` proves equality on 200 randomized
-  bodies), with `Authorization: Bearer <antigravity token>`. Each streamed `{ "response": X }`
-  event (and the non-streamed reply) is returned as `X`. It changes no content. Its log records
-   method, path, status, time to headers, byte counts and the upstream's token counts. Failed
-   upstream responses also record their complete, secret-scrubbed body in `errorBody`; successful
-   response bodies, request bodies and headers are never logged. Error bodies are scrubbed before
-   being returned to the host too. The route table is keyed by path prefix so a Codex route can be
-   added later under the same rules.
+  random key. Both host `:streamGenerateContent` and `:generateContent` use the upstream's
+  streaming-only `POST https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse`.
+  There is no fallback to the production endpoint. Streaming host calls receive unwrapped SSE;
+  non-streaming calls receive JSON with all text deltas collected and final usage retained.
+
+  The route uses **`node:https` over HTTP/1.1**, not `fetch`, to preserve the native agy CLI 1.3.5
+  header order: `Host`, `User-Agent`, `Content-Length`, `Authorization`, `Content-Type`,
+  `Accept-Encoding`. The user agent is
+  `antigravity/cli/1.3.5 (aidev_client; os_type=<darwin|linux|windows>; arch=<arm64|amd64>; cl=998863838; auth_method=consumer)`;
+  encoding is `gzip`. No `X-Goog-Api-Client` or `Client-Metadata` is sent. Loopback tests use
+  `node:http` and assert the actual HTTP version and raw header order, not a preflight proxy.
+
+  The ordered envelope is `{ project, requestId, request, model, userAgent: "antigravity", requestType: "agent" }`.
+  The request's ordered keys are `contents`, `systemInstruction`, `tools`, `toolConfig`, `labels`,
+  `generationConfig`, `sessionId` (optional host fields are omitted when absent). `contents`,
+  `systemInstruction` and `tools` remain byte-equal JSON. Every override/addition is named in
+  `CLOUD_CODE_FIELD_ALLOWLIST`: validated tool calling mode, labels, thinking configuration,
+  maximum output tokens, and session id. Unknown host fields or a final non-user turn are refused,
+  not dropped/rewritten to make the payload fit. The historian sends no tools.
+
+  `--historian-variant low|medium|high` selects `gemini-3.8-flash-{variant}`, a thinking budget of
+  1000/4000/-1 and model enum M320/M319/M318 respectively; default **medium**. All variants set
+  `includeThoughts: true`, `maxOutputTokens: 65536`. `summary.json` records the exact model,
+  variant and controls. `--historian-model`, if given, must match the variant.
+
+  A harness-only `chat.headers` hook forwards the actual OpenCode child session id and workspace
+  URI **only to the loopback relay**; neither header is forwarded upstream. The relay keeps a
+  conversation/trajectory UUID pair per child session and workspace. The request id is
+  `agent/<conversationUuid>/<timestampMs>/<trajectoryUuid>/<last_step_index+1>`. Labels are the
+  native string-valued `last_step_index`, `model_enum`, `trajectory_id`, `used_claude`,
+  `used_claude_conservative`, `used_non_gemini_model` (the last three are always `"false"`).
+  Steps count history content turns, not parts (one user turn has index `"0"`). No execution or
+  cascade ids are invented. `sessionId` is the signed-decimal FNV-1a 64 hash of the workspace's
+  `file://` URI and is shared by child sessions in the same workspace, not by different workspaces.
+
+  The log records method, path, status, time to headers, byte counts and token counts. Failed
+  upstream responses include their complete secret-scrubbed body in `errorBody`; successful
+  bodies, request bodies and headers are never logged. Error bodies returned to the host are
+  scrubbed too.
 - **Voyage**: Magic Context's `openai-compatible` embedding provider, `voyage-4`,
   `input_type: document`, `query_input_type: query`, `max_input_tokens: 8192`.
 
@@ -110,7 +137,7 @@ How the throwaway host reaches each upstream without any OpenCode auth plugin or
 | Event ordering | answer split on `\n`; each line aligned to the first unused reference nugget the equivalence prompt calls the same (`"yes"` anywhere in the reply); Kendall tau-b over union ranks; reported score `(tau_b + 1) / 2` | `compute_metrics.py:align_with_llm`, `event_ordering_score`, `report_results.py` |
 | Headline | mean over questions; per-ability means beside it | §2.4 |
 | Answer and judge model | GPT-6 Luna (`gpt-6-luna`) on the ChatGPT subscription, reasoning effort `none`, temperature **not set** | operator choice; the Codex backend rejects `temperature`. This deviates from the paper's temperature 0; the paper's judge was `gpt-4.1-mini` (`src/llm.py`) |
-| Historian | Gemini 3.8 Flash on Cloud Code Assist, with the generation settings Magic Context sends | operator choice |
+| Historian | Gemini 3.8 Flash medium on Cloud Code Assist; native CLI thinking budget 4000, includeThoughts true, maxOutputTokens 65536; other generation settings unchanged | operator-provided AGAUTH native CLI 1.3.5 wire contract |
 | Dreamer | off | brief |
 
 `prompts/released/` holds the strings the harness sends, extracted as Python runtime values from
@@ -168,7 +195,8 @@ resumable: rerun the same command with the same `--run`; finished questions are 
 answered but unjudged question is only judged, and an unfinished ingest starts over. A run's
 settings are pinned in `runs/<run>/settings.json` and a resumed run with different settings is
 refused. Useful flags: `--conversations 1,2,3,4,5`, `--questions <ids>`, `--split`,
-`--reasoning-effort`, `--temperature <n|omit>` (default `omit`; use `--stub --temperature 0` to
+`--reasoning-effort`, `--historian-variant low|medium|high` (default medium),
+`--temperature <n|omit>` (default `omit`; use `--stub --temperature 0` to
 exercise an explicit zero without the subscription backend), `--answer-context-limit` (default 272000),
 `--max-input-tokens` (per arm, default 30,000,000; the run also stops when the projection for
 the remaining questions crosses it), `--opencode <binary>`.

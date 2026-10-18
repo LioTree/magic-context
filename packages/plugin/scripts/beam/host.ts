@@ -204,7 +204,10 @@ export function writeHostConfig(
     if (models.answerReasoningEffort) answerOptions.reasoningEffort = models.answerReasoningEffort;
     const config = {
         $schema: "https://opencode.ai/config.json",
-        plugin: [pathToFileURL(PLUGIN_ENTRY).href],
+        plugin: [
+            pathToFileURL(PLUGIN_ENTRY).href,
+            pathToFileURL(join(import.meta.dir, "session-headers.ts")).href,
+        ],
         provider: {
             [ANSWER_PROVIDER]: {
                 options: {

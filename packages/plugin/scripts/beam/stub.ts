@@ -350,9 +350,8 @@ export function startStub(expect: StubExpectations): Stub {
                 );
             }
 
-            const cloud = /^\/v1internal:(streamGenerateContent|generateContent)$/.exec(
-                url.pathname,
-            );
+            const cloud =
+                url.pathname === "/v1internal:streamGenerateContent" && url.search === "?alt=sse";
             if (cloud) {
                 record.route = "cloud-code";
                 const bearer = credentialHeader(auth, `Bearer ${expect.cloudCodeToken}`);
@@ -397,7 +396,6 @@ export function startStub(expect: StubExpectations): Stub {
                     },
                     modelVersion: String(body.model),
                 };
-                if (cloud[1] === "generateContent") return reply(Response.json({ response }));
                 return reply(
                     new Response(`data: ${JSON.stringify({ response })}\r\n\r\n`, {
                         status: 200,

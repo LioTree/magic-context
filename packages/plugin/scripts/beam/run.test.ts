@@ -16,7 +16,8 @@ const settings: Parameters<typeof summarizeRun>[0] = {
     datasetRevision: "fixture",
     conversations: [],
     answerModel: "gpt-6-luna",
-    historianModel: "gemini-3.8-flash",
+    historianModel: "gemini-3.8-flash-medium",
+    historianVariant: "medium",
     reasoningEffort: "none",
     answerContextLimit: 272000,
     answerOutputLimit: 32000,
@@ -55,6 +56,12 @@ describe("Codex sampling", () => {
             const summary = JSON.parse(
                 readFileSync(join(root, "runs", settings.run, "summary.json"), "utf8"),
             );
+            expect(summary.cloudCode).toMatchObject({
+                historianVariant: "medium",
+                model: "gemini-3.8-flash-medium",
+                thinkingConfig: { thinkingBudget: 4000, includeThoughts: true },
+                maxOutputTokens: 65536,
+            });
             expect(summary.sampling).toEqual({
                 answerTemperature: null,
                 judgeTemperature: null,
@@ -81,6 +88,8 @@ describe("Codex sampling", () => {
 });
 
 test("--smoke-transport is an alias for the transport smoke command", () => {
+    expect(parseBeamArgs([]).values["historian-variant"]).toBe("medium");
+    expect(parseBeamArgs(["--historian-variant", "low"]).values["historian-variant"]).toBe("low");
     expect(parseBeamArgs(["--smoke-transport", "--run", "smoke"]).values["smoke-transport"]).toBe(
         true,
     );
