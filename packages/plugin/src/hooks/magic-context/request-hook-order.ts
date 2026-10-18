@@ -1,33 +1,29 @@
 /**
- * Whether a messages transform ran for this session since the system hook last
- * looked, or since a newer assistant reply completed.
+ * Whether this request's messages are already final when its system hook runs.
  *
- * OpenCode 1 builds every provider request in the same order: the prompt loop runs
+ * Stock OpenCode 1 builds every provider request in the same order: the prompt loop runs
  * `experimental.chat.messages.transform`, converts the messages, re-reads AGENTS.md
  * and configured instruction files, and only then runs
  * `experimental.chat.system.transform` inside the LLM request builder. So when the
  * system hook sees a changed system prompt, the messages of that same request are
  * already final, and the new system text is already going to the provider. That
  * request rewrites the provider's prompt cache from the system block onward.
- * Scheduling a Magic Context rebuild for the following request would make the
- * provider rewrite its cache a second time one request later.
+ * Rebuilding Magic Context's frozen message prefix on the following request would
+ * invalidate the provider's cached input a second time instead of sharing this
+ * request's system-prompt cache invalidation.
  *
- * Valid only where the messages transform runs before the system hook for every
- * main request, as on stock OpenCode 1. There each messages pass sets the marker
- * and its own system hook consumes it, so no completion event is needed to tell
- * which request the marker belongs to.
+ * Some private OpenCode 1 hosts run system before messages instead. Learn the
+ * session's order from its first non-skipped hook and retain it until session
+ * cleanup. On a messages-first host each messages pass sets a marker for its own
+ * later system hook. On a system-first host no system hook may consume a previous
+ * request's marker as evidence that its own messages are final, even if that
+ * previous request aborted without a completion event.
  *
- * The marker is keyed by session only. It carries no request identity, so it means
- * "a messages pass ran since the last consumption or newer completion", NOT "the
- * messages pass of this request ran". On a host that runs the system hook first, an
- * earlier request that ends without a completed-assistant event, or whose event has
- * not arrived yet, leaves its marker behind. The next request's system hook then
- * reads true before that request's messages transform has run. The request-hook-order
- * unit test that pins this limitation names the failing sequence. Do not wire this
- * helper into a system-first host without a seam that ties the system hook and the
- * messages transform to the same request. OpenCode 2 (its context hook runs the
- * system stage before the transform) and Pi (`processSystemPromptForCache` in
- * `before_agent_start`) deliberately do not use it.
+ * This is order detection, not a request id: it requires a consistent hook order
+ * and serialized requests within each session. Skipped internal-agent system
+ * calls must not enter the tracker. Hosts that switch order or overlap requests
+ * within one session need an explicit request identity shared by both hooks.
+ * OpenCode 2 and Pi deliberately do not use this helper.
  *
  * A completion clears the marker only for a reply newer than every assistant
  * message the messages pass saw, so a late event for an earlier reply cannot clear
@@ -42,10 +38,9 @@ export interface RequestHookOrder {
     /** An assistant message finished (served, failed or aborted). */
     assistantCompleted(sessionId: string, messageId: string | undefined): void;
     /**
-     * Called by the system hook. True when a messages pass ran since the last
-     * consumption or newer completion. On a messages-first host (stock OpenCode 1)
-     * that pass belongs to this request, so its messages can no longer change.
-     * Consumes the marker.
+     * Called by a non-skipped system hook. Returns true only if a messages pass
+     * ran since the last consumption or newer completion, and the session was
+     * observed to run messages before system. Consumes that pass's marker.
      */
     consumeMessagesPrepared(sessionId: string): boolean;
     clearSession(sessionId: string): void;
@@ -54,8 +49,10 @@ export interface RequestHookOrder {
 export function createRequestHookOrder(): RequestHookOrder {
     // Value: the newest assistant message id the messages pass saw ("" when none).
     const prepared = new Map<string, string>();
+    const messagesFirst = new Map<string, boolean>();
     return {
         messagesPrepared(sessionId, messages) {
+            if (!messagesFirst.has(sessionId)) messagesFirst.set(sessionId, true);
             let newestAssistant = "";
             for (const message of messages) {
                 const id = message.info?.id;
@@ -72,12 +69,14 @@ export function createRequestHookOrder(): RequestHookOrder {
             if (messageId === undefined || messageId > newestSeen) prepared.delete(sessionId);
         },
         consumeMessagesPrepared(sessionId) {
-            const had = prepared.has(sessionId);
+            if (!messagesFirst.has(sessionId)) messagesFirst.set(sessionId, false);
+            const had = messagesFirst.get(sessionId) === true && prepared.has(sessionId);
             prepared.delete(sessionId);
             return had;
         },
         clearSession(sessionId) {
             prepared.delete(sessionId);
+            messagesFirst.delete(sessionId);
         },
     };
 }
