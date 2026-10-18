@@ -706,7 +706,11 @@ export function shouldRunPiProactiveThinkingStrip(args: {
 	return !args.compactionOff && args.bindingStripOrder === "end";
 }
 
-/** A mandatory prefix rebuild cannot omit active-turn thinking without its host identity. */
+/**
+ * Rebuilding the cached prefix must record which messages lose thinking so a
+ * retry renders the same bytes. The current assistant turn needs Pi's entry ID;
+ * completed turns can instead use their transcript content identity.
+ */
 export function assertPiThinkingEntryIds(
 	messages: readonly unknown[],
 	entryIds: readonly (string | undefined | null)[],

@@ -172,20 +172,56 @@ it("runs the proactive strip for subagents as for primaries, never under compact
 	}
 });
 
-it("withholds the whole companion plan when an older entry lacks an id", () => {
+it("persists and replays completed-turn omissions when an older entry lacks a host id", () => {
 	const db = new Database(":memory:");
 	initializeDatabase(db);
 	try {
 		const messages = input();
-		const before = structuredClone(messages);
 		const args = {
 			db,
-			sessionId: "companion-missing-id",
+			sessionId: "companion-completed-missing-id",
 			messages,
 			entryIds: ["assistant-1", "result-1", undefined, "next-user"],
 			provider: "anthropic",
 			model: "claude-opus-5-5",
 			cacheBustingPass: true,
+			requirePersistence: true,
+		};
+		const applied = applyPiProactiveThinkingStrip(args);
+		expect(applied?.entryIds).toHaveLength(2);
+		expect(applied?.entryIds).toContain("assistant-1");
+		expect(messages[0].content).toEqual([toolCall()]);
+		expect(messages[1]).toEqual(toolResult());
+		expect(messages[2].content).toEqual([]);
+		const replay = input();
+		applyPiThinkingBindingRecovery({ ...args, messages: replay });
+		expect(replay).toEqual(messages);
+	} finally {
+		db.close();
+	}
+});
+
+it("withholds the whole companion plan when active-turn thinking lacks a host id", () => {
+	const db = new Database(":memory:");
+	initializeDatabase(db);
+	try {
+		const transcript = input();
+		const messages = [
+			transcript[0],
+			transcript[1],
+			transcript[3],
+			transcript[2],
+		];
+		const before = structuredClone(messages);
+		const args = {
+			db,
+			sessionId: "companion-missing-id",
+			messages,
+			entryIds: ["assistant-1", "result-1", "next-user", undefined],
+			provider: "anthropic",
+			model: "claude-opus-5-5",
+			cacheBustingPass: true,
+			stripActiveTurn: true,
 		};
 		expect(applyPiProactiveThinkingStrip(args)).toBeNull();
 		expect(messages).toEqual(before);
