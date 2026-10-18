@@ -228,6 +228,7 @@ import {
 	peekNoteNudgeText,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
 import {
+	editOutsideCompanionTransaction,
 	pairedThinkingEdit,
 	snapshotSessionFlag,
 	snapshotSessionValue,
@@ -342,6 +343,7 @@ import {
 	type PiM0M1InjectionResult as PiInjectionResult,
 	type PiM0M1PassSnapshot,
 	type PiM0M1State,
+	piTrimMayRemoveEntries,
 	prepareCachedM0M1PiReplay,
 	trimPiMessagesToCachedBoundary,
 } from "./inject-compartments-pi";
@@ -457,6 +459,7 @@ import {
 	hasUnfrozenPiThinking,
 	piMessageHasThinking,
 	planPiProactiveThinkingStrip,
+	preparePiThinkingStripWrite,
 	resolvePiBindingStripOrder,
 } from "./provider-error-recovery-pi";
 import {
@@ -8646,6 +8649,73 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
 		return result;
 	}
+	if (!piPassMayRewritePrefix(args) && !piPassMayTrimCompanion(args)) {
+		// Resolve identities and the companion before any lane starts writing. The
+		// transcript may clone or splice messages later, but these input identities
+		// still name the same completed thinking blocks on replay.
+		const entryIds = piCompanionEntryIds(args);
+		const plan = planPiProactiveThinkingStrip({
+			db: args.db,
+			sessionId: args.sessionId,
+			messages: args.messages as unknown[],
+			entryIds,
+		});
+		const persistCompanion = preparePiThinkingStripWrite(
+			args.db,
+			args.sessionId,
+			plan,
+		);
+		let companionCommitted = plan?.entryIds.length === 0;
+		const pair: PiEditPair = (edit, needs) => {
+			if (companionCommitted) return edit();
+			let persisted = false;
+			const value = pairedThinkingEdit({
+				db: args.db,
+				// The enclosing render snapshot owns restoration; a lane must not
+				// copy the entire session merely to persist a few rows.
+				messages: [],
+				edit,
+				needsCompanion: needs,
+				persistCompanion: () => {
+					try {
+						persistCompanion();
+					} catch (error) {
+						throw new PiCompanionFailure(error);
+					}
+					persisted = true;
+				},
+			});
+			companionCommitted ||= persisted;
+			return value;
+		};
+		const attempt = editOutsideCompanionTransaction({
+			messages: args.messages as unknown[],
+			state: args.sessionMeta,
+			onRollback: () => {
+				resetSessionState();
+				args.tagger.cleanup(args.sessionId);
+				for (const observation of rollbackObservations) observation();
+			},
+			edit: () => {
+				if (systemPromptEdited)
+					pair(
+						() => true,
+						() => true,
+					);
+				return runSynchronousPipeline(
+					args,
+					rollbackObservations,
+					undefined,
+					true,
+					pair,
+				);
+			},
+		});
+		if (!attempt) throw new Error("A lane-paired pipeline cannot rerun");
+		if (!attempt.result.strictThinkingKept)
+			clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
+		return attempt.result;
+	}
 	const result = pairedThinkingEdit({
 		db: args.db,
 		messages: args.messages as unknown[],
@@ -8740,6 +8810,66 @@ function piPassMayNeedNoCompanion(args: RunPipelineArgs): boolean {
 	);
 }
 
+type PiEditPair = <T>(edit: () => T, needs: (result: T) => boolean) => T;
+
+function piCompanionEntryIds(args: RunPipelineArgs): (string | undefined)[] {
+	// LKG replay can prove a retained entry's identity even when the current
+	// host branch cannot resolve it. Use the same precedence as final output.
+	return args.messages.map(
+		(message, index) =>
+			args.lkgEntryIds?.[index] ??
+			resolvePiStableId(
+				message,
+				index,
+				args.entryIds,
+				args.entryIdByRef ?? undefined,
+			),
+	);
+}
+
+function piPassMayTrimCompanion(args: RunPipelineArgs): boolean {
+	if (!args.injection) return false;
+	const snapshot =
+		args.injectionPassSnapshot ??
+		createPiM0M1PassSnapshot({
+			db: args.db,
+			sessionId: args.sessionId,
+			compactionOff: false,
+		});
+	if (
+		!snapshot.compartments.length &&
+		!snapshot.cachedRow?.cached_m0_last_baseline_end_message_id
+	)
+		return false;
+	const entryIds = piCompanionEntryIds(args);
+	const plan = planPiProactiveThinkingStrip({
+		db: args.db,
+		sessionId: args.sessionId,
+		messages: args.messages as unknown[],
+		entryIds,
+	});
+	if (!plan) return true;
+	const candidates = new Set(plan.entryIds);
+	// A hidden block may return if a later compartment rewrite changes the cut.
+	// Preserve the final-output planner for that case instead of recording an
+	// omission of input thinking that this request never actually served.
+	return piTrimMayRemoveEntries({
+		sessionId: args.sessionId,
+		messages: args.messages as Parameters<typeof injectM0M1Pi>[2],
+		entryIds,
+		snapshot,
+		isCandidate: (message, index) =>
+			candidates.has(entryIds[index] ?? "") ||
+			(!args.entryIds?.[index] && piMessageHasThinking(message)),
+	});
+}
+
+class PiCompanionFailure extends DegradedPassRefusalError {
+	constructor(cause: unknown) {
+		super("proactive-thinking-strip-persistence-failure", { cause });
+	}
+}
+
 function runSynchronousPipeline(
 	args: RunPipelineArgs,
 	rollbackObservations?: (() => void)[],
@@ -8752,7 +8882,9 @@ function runSynchronousPipeline(
 	 * skips them.
 	 */
 	companionPossible = true,
+	pairEdit?: PiEditPair,
 ): RunPipelineResult {
+	const pair: PiEditPair = pairEdit ?? ((edit) => edit());
 	args.assertCurrentPass?.();
 	const prefixTagStart =
 		companionPossible &&
@@ -8846,8 +8978,15 @@ function runSynchronousPipeline(
 		if (
 			isCacheBustingPass &&
 			(messages as unknown[]).some(piMessageHasThinking)
-		)
+		) {
+			if (pairEdit)
+				throw new DegradedPassRefusalError(UNPAIRED_PREFIX_REWRITE_SITE, {
+					cause: new Error(
+						"A lane-paired pass reached an unpredicted signed-prefix rewrite",
+					),
+				});
 			requirePairing?.();
+		}
 		const result = applyPiProactiveThinkingStrip({
 			db: args.db,
 			sessionId: args.sessionId,
@@ -8922,6 +9061,63 @@ function runSynchronousPipeline(
 		realStableId(msg, index) ??
 		passFallbackIds[index] ??
 		resolvePiStableId(msg, index);
+	const sourceOrder = new Map<string, number>();
+	const toolResultOrder = new Map<string, number>();
+	let lastKeptThinking = -1;
+	let lastKeptThinkingPart = -1;
+	if (pairEdit) {
+		const frozen = frozenBindingEntryIds(args.db, args.sessionId);
+		const owners = new Map<string, string>();
+		for (const [index, message] of args.messages.entries()) {
+			const id = stableIdResolver(message, index);
+			if (id) sourceOrder.set(id, index);
+			const native = message as PiAgentMessage;
+			if (native?.role === "assistant" && Array.isArray(native.content)) {
+				for (const part of native.content)
+					if (part.type === "toolCall" && id) owners.set(part.id, id);
+			} else if (native?.role === "toolResult") {
+				const owner = owners.get(native.toolCallId);
+				if (owner) {
+					const key = `${owner}\0${native.toolCallId}`;
+					toolResultOrder.set(
+						key,
+						Math.min(toolResultOrder.get(key) ?? Infinity, index),
+					);
+				}
+			}
+			if (piMessageHasThinking(message) && (!id || !frozen.has(id))) {
+				lastKeptThinking = index;
+				const content = (message as { content: { type?: string }[] }).content;
+				for (const [partIndex, part] of content.entries())
+					if (
+						["thinking", "redactedThinking", "redacted_thinking"].includes(
+							part.type ?? "",
+						)
+					)
+						lastKeptThinkingPart = partIndex;
+			}
+		}
+	}
+	const idPrecedesThinking = (id: string): boolean =>
+		(sourceOrder.get(id) ?? -1) < lastKeptThinking;
+	const partPrecedesThinking = (id: string, part: number): boolean =>
+		idPrecedesThinking(id) ||
+		(sourceOrder.get(id) === lastKeptThinking && part <= lastKeptThinkingPart);
+	const textTagPrecedesThinking = (id: string, contentId: string): boolean => {
+		if (sourceOrder.get(id) !== lastKeptThinking) return idPrecedesThinking(id);
+		const ordinal = /^:p(\d+)$/.exec(contentId.slice(id.length));
+		const content = (
+			args.messages[lastKeptThinking] as
+				| { content?: { type?: string }[] | string }
+				| undefined
+		)?.content;
+		if (!ordinal || !Array.isArray(content)) return true;
+		let textIndex = 0;
+		for (const [partIndex, part] of content.entries())
+			if (part.type === "text" && textIndex++ === Number(ordinal[1]))
+				return partPrecedesThinking(id, partIndex);
+		return true;
+	};
 	let foldingSystemState: PiEffectiveSystemState | null = null;
 	try {
 		// Capture the provider-visible system state before transforming the served
@@ -8957,6 +9153,12 @@ function runSynchronousPipeline(
 	// the rewrite backward into thinking whose preceding bytes did not change.
 	let firstEditSourceOrder: Map<string, number> | undefined;
 	const firstEditParts = new Map<string, number>();
+	const firstEditPrecedesThinking = (): boolean =>
+		prefixEditBesidesReasoningTrim ||
+		[...firstEditParts].some(([id, part]) => partPrecedesThinking(id, part)) ||
+		droppedTokenReductions.some(
+			(reduction) => tagEditBeforeThinking.get(reduction.tagNumber) ?? true,
+		);
 	const recordFirstApplicationAt = (
 		message: unknown,
 		index: number,
@@ -9137,6 +9339,30 @@ function runSynchronousPipeline(
 		persistedM0BeforeFold.cachedM0Bytes === null
 			? -1
 			: persistedM0BeforeFold.cachedM0MaxCompartmentSeq;
+	const injectPrefix = (inject: () => ReturnType<typeof injectM0M1Pi>) => {
+		if (!pairEdit) return inject();
+		const before = getOrCreateSessionMeta(args.db, args.sessionId);
+		return pair(inject, (result) => {
+			const after = getOrCreateSessionMeta(args.db, args.sessionId);
+			return (
+				before.cachedM1Bytes?.toString() !== after.cachedM1Bytes?.toString() ||
+				(result.m0Materialized === true &&
+					foldInvalidatesThinking(
+						result.m0Reason ?? null,
+						{
+							m0Bytes: before.cachedM0Bytes,
+							m1Bytes: before.cachedM1Bytes,
+							muralDataUrl: before.cachedM0MuralDataUrl,
+						},
+						{
+							m0Bytes: after.cachedM0Bytes,
+							m1Bytes: after.cachedM1Bytes,
+							muralDataUrl: after.cachedM0MuralDataUrl,
+						},
+					))
+			);
+		});
+	};
 	if (protectedSignedPrefix && !firstRenderBust && piM0State) {
 		piM0State.preparedPrefix = prepareCachedM0M1PiReplay(
 			piM0State,
@@ -9153,13 +9379,15 @@ function runSynchronousPipeline(
 			// Persist the fold before opening mutation gates. The shadow array keeps
 			// this pre-execution off the outgoing wire; the normal injection below
 			// replays the persisted pair into the real message array.
-			preFoldInjectionResult = injectM0M1PiForRun(
-				piM0State,
-				args.db,
-				[],
-				undefined,
-				softRefreshOpportunity,
-				injectionPassSnapshot,
+			preFoldInjectionResult = injectPrefix(() =>
+				injectM0M1PiForRun(
+					piM0State,
+					args.db,
+					[],
+					undefined,
+					softRefreshOpportunity,
+					injectionPassSnapshot,
+				),
 			);
 			if (protectedSignedPrefix && firstRenderBust) {
 				const candidate = getOrCreateSessionMeta(args.db, args.sessionId);
@@ -9246,6 +9474,7 @@ function runSynchronousPipeline(
 				);
 			}
 		} catch (error) {
+			if (error instanceof PiCompanionFailure) throw error;
 			if (
 				error instanceof DegradedPassRefusalError &&
 				error.site === UNPAIRED_PREFIX_REWRITE_SITE
@@ -9750,10 +9979,68 @@ function runSynchronousPipeline(
 		() => args.tagger.cleanup(args.sessionId),
 		() => {
 			args.assertCurrentPass?.();
+			const laneTagger: Tagger = !pairEdit
+				? args.tagger
+				: {
+						...args.tagger,
+						assignTag: (...values) => {
+							const [sessionId, contentId, type] = values;
+							if (args.tagger.getTag(sessionId, contentId, type) !== undefined)
+								return args.tagger.assignTag(...values);
+							let id: string | undefined;
+							for (const candidate of sourceOrder.keys())
+								if (
+									contentId.startsWith(`${candidate}:`) &&
+									(!id || candidate.length > id.length)
+								)
+									id = candidate;
+							if (
+								!isCacheBustingPass ||
+								protectedSignedPrefix ||
+								(id && !textTagPrecedesThinking(id, contentId))
+							)
+								return args.tagger.assignTag(...values);
+							const counts = values[9]?.();
+							if (counts) values[9] = () => counts;
+							return pair(
+								() => args.tagger.assignTag(...values),
+								(number) =>
+									number > prefixTagStart &&
+									isCacheBustingPass &&
+									!protectedSignedPrefix &&
+									(!id || textTagPrecedesThinking(id, contentId)),
+							);
+						},
+						assignToolTag: (...values) => {
+							const [sessionId, callId, ownerId] = values;
+							if (
+								args.tagger.getToolTag(sessionId, callId, ownerId) !== undefined
+							)
+								return args.tagger.assignToolTag(...values);
+							const resultIndex = toolResultOrder.get(`${ownerId}\0${callId}`);
+							if (
+								!isCacheBustingPass ||
+								protectedSignedPrefix ||
+								resultIndex === undefined ||
+								resultIndex >= lastKeptThinking
+							)
+								return args.tagger.assignToolTag(...values);
+							const counts = values[8]?.();
+							if (counts) values[8] = () => counts;
+							return pair(
+								() => args.tagger.assignToolTag(...values),
+								(number) =>
+									number > prefixTagStart &&
+									isCacheBustingPass &&
+									!protectedSignedPrefix &&
+									idPrecedesThinking(ownerId),
+							);
+						},
+					};
 			return tagTranscript(
 				args.sessionId,
 				{ ...transcript, messages: taggingView },
-				args.tagger,
+				laneTagger,
 				args.db,
 				{
 					skipPrefixInjection: !ctxReduceCallable,
@@ -10033,7 +10320,10 @@ function runSynchronousPipeline(
 		});
 		temporalDecisions = new Map([
 			...temporalDecisions,
-			...freezeTemporalDecisions(args.db, args.sessionId, admitted),
+			...pair(
+				() => freezeTemporalDecisions(args.db, args.sessionId, admitted),
+				() => [...admitted.keys()].some(idPrecedesThinking),
+			),
 		]);
 		injectPiTemporalMarkers(
 			workingMessages,
@@ -10092,27 +10382,31 @@ function runSynchronousPipeline(
 	if (foldBustsServedPrefixThisPass) {
 		try {
 			let converted = 0;
-			args.db
-				.transaction(() => {
-					converted = convertLegacyToolSkeletons(
-						args.db,
-						args.sessionId,
-						targets,
-						{
-							// A full drop whose arc removal is recorded was removed, not
-							// served as a marker. Keep it full even when this pass's model
-							// must keep tool pairs, so passes that can remove it still do
-							// and the placeholder strip never sees its call come back.
-							// Unreadable removal records keep every full drop as it is.
-							keepFullDrop: (callId) =>
-								nativeRemovalInputs === undefined ||
-								(callId !== null &&
-									nativeRemovalInputs.get(callId) ===
-										NATIVE_TOOL_REMOVAL_MARKER),
-						},
-					).size;
-				})
-				.immediate();
+			pair(
+				() =>
+					args.db
+						.transaction(() => {
+							converted = convertLegacyToolSkeletons(
+								args.db,
+								args.sessionId,
+								targets,
+								{
+									// NATIVE_TOOL_REMOVAL_MARKER records removal of both the call
+									// and its result, rather than replacement with a text marker.
+									// Preserve that full-removal mode across model switches. If
+									// nativeRemovalInputs could not be read, retain every existing
+									// full-removal decision instead of guessing a new representation.
+									keepFullDrop: (callId) =>
+										nativeRemovalInputs === undefined ||
+										(callId !== null &&
+											nativeRemovalInputs.get(callId) ===
+												NATIVE_TOOL_REMOVAL_MARKER),
+								},
+							).size;
+						})
+						.immediate(),
+				() => converted > 0,
+			);
 			if (converted > 0) {
 				sessionLog(
 					args.sessionId,
@@ -10120,6 +10414,7 @@ function runSynchronousPipeline(
 				);
 			}
 		} catch (error) {
+			if (error instanceof PiCompanionFailure) throw error;
 			sessionLog(
 				args.sessionId,
 				`pi legacy dropped-tool skeleton conversion failed (kept legacy bytes): ${error instanceof Error ? error.message : String(error)}`,
@@ -10265,22 +10560,26 @@ function runSynchronousPipeline(
 		pendingDecisionLogObserverForTests?.(pendingDecisionLog);
 		try {
 			const tApplyPending = performance.now();
-			pendingOpsDidMutate = applyPendingOperations(
-				args.sessionId,
-				args.db,
-				newTargets,
-				new Set([
-					...(args.contextUsage.percentage >= 95
-						? []
-						: protectedTagNumbersForPass),
-					...protectedToolTags,
-					...identityAdoption.protectedTagNumbers,
-				]),
-				pendingOperationTags,
-				pendingOps,
-				[],
-				new Set(),
-				(reduction) => droppedTokenReductions.push(reduction),
+			pendingOpsDidMutate = pair(
+				() =>
+					applyPendingOperations(
+						args.sessionId,
+						args.db,
+						newTargets,
+						new Set([
+							...(args.contextUsage.percentage >= 95
+								? []
+								: protectedTagNumbersForPass),
+							...protectedToolTags,
+							...identityAdoption.protectedTagNumbers,
+						]),
+						pendingOperationTags,
+						pendingOps,
+						[],
+						new Set(),
+						(reduction) => droppedTokenReductions.push(reduction),
+					),
+				firstEditPrecedesThinking,
 			);
 			if (pendingOpsDidMutate) {
 				droppedCount += pendingOps.length;
@@ -10538,65 +10837,83 @@ function runSynchronousPipeline(
 				hasPendingMaterializeSignal ||
 				deferredMaterialize ||
 				independentMutationBeforeHeuristics;
-			heuristicsResult = applyPiHeuristicCleanup(
-				args.sessionId,
-				args.db,
-				newTargets,
-				args.messages,
-				{
-					protectedTags: args.protectedTags,
-					signedThinkingHold: args.signedThinkingHold,
-					prepareToolRemovalMeasurements:
-						transcript.prepareToolRemovalMeasurements,
-					protectedToolTags,
-					protectedCutoff: usesTokenProtection
-						? protectionWindowForPass.cutoff
-						: undefined,
-					routine: routineCleanupApplied,
-					staleReduceStripEnabled: true,
-					onStaleReduceEdit: recordStaleReduceEdit,
-					// Tiered emergency drop fires only at the derived force band AND when the
-					// ceiling is known. forceMaterialization already incorporates
-					// the derived force-band / emergency condition for Pi (primary-equivalent).
-					emergency:
-						args.forceMaterialization === true &&
-						args.emergencyCeilingTokens !== undefined &&
-						args.emergencyCeilingTokens > 0
-							? {
-									currentTotalInputTokens: args.contextUsage.inputTokens,
-									ceilingTokens: args.emergencyCeilingTokens,
-									usagePercentage: args.contextUsage.percentage,
-									passAlreadyPriced: independentMutationBeforeHeuristics,
-								}
-							: undefined,
-					caveman: args.isSubagent ? undefined : args.heuristics.caveman,
-				},
-				activeTags,
-				stableIdResolver,
+			heuristicsResult = pair(
+				() =>
+					applyPiHeuristicCleanup(
+						args.sessionId,
+						args.db,
+						newTargets,
+						args.messages,
+						{
+							protectedTags: args.protectedTags,
+							signedThinkingHold: args.signedThinkingHold,
+							prepareToolRemovalMeasurements:
+								transcript.prepareToolRemovalMeasurements,
+							protectedToolTags,
+							protectedCutoff: usesTokenProtection
+								? protectionWindowForPass.cutoff
+								: undefined,
+							routine: routineCleanupApplied,
+							staleReduceStripEnabled: true,
+							onStaleReduceEdit: recordStaleReduceEdit,
+							// Tiered emergency drop fires only at the derived force band AND when the
+							// ceiling is known. forceMaterialization already incorporates
+							// the derived force-band / emergency condition for Pi (primary-equivalent).
+							emergency:
+								args.forceMaterialization === true &&
+								args.emergencyCeilingTokens !== undefined &&
+								args.emergencyCeilingTokens > 0
+									? {
+											currentTotalInputTokens: args.contextUsage.inputTokens,
+											ceilingTokens: args.emergencyCeilingTokens,
+											usagePercentage: args.contextUsage.percentage,
+											passAlreadyPriced: independentMutationBeforeHeuristics,
+										}
+									: undefined,
+							caveman: args.isSubagent ? undefined : args.heuristics?.caveman,
+						},
+						activeTags,
+						stableIdResolver,
+					),
+				(result) =>
+					firstEditPrecedesThinking() ||
+					result.droppedTokenReductions.some(
+						(reduction) =>
+							tagEditBeforeThinking.get(reduction.tagNumber) ?? true,
+					),
 			);
 			if (
 				!routineCleanupApplied &&
 				heuristicsResult.emergencyDroppedTools > 0
 			) {
-				const ridingCleanup = applyPiHeuristicCleanup(
-					args.sessionId,
-					args.db,
-					newTargets,
-					args.messages,
-					{
-						protectedTags: args.protectedTags,
-						signedThinkingHold: args.signedThinkingHold,
-						protectedToolTags,
-						protectedCutoff: usesTokenProtection
-							? protectionWindowForPass.cutoff
-							: undefined,
-						routine: true,
-						staleReduceStripEnabled: true,
-						onStaleReduceEdit: recordStaleReduceEdit,
-						caveman: args.isSubagent ? undefined : args.heuristics.caveman,
-					},
-					getActiveTagsBySession(args.db, args.sessionId),
-					stableIdResolver,
+				const ridingCleanup = pair(
+					() =>
+						applyPiHeuristicCleanup(
+							args.sessionId,
+							args.db,
+							newTargets,
+							args.messages,
+							{
+								protectedTags: args.protectedTags,
+								signedThinkingHold: args.signedThinkingHold,
+								protectedToolTags,
+								protectedCutoff: usesTokenProtection
+									? protectionWindowForPass.cutoff
+									: undefined,
+								routine: true,
+								staleReduceStripEnabled: true,
+								onStaleReduceEdit: recordStaleReduceEdit,
+								caveman: args.isSubagent ? undefined : args.heuristics?.caveman,
+							},
+							getActiveTagsBySession(args.db, args.sessionId),
+							stableIdResolver,
+						),
+					(result) =>
+						firstEditPrecedesThinking() ||
+						result.droppedTokenReductions.some(
+							(reduction) =>
+								tagEditBeforeThinking.get(reduction.tagNumber) ?? true,
+						),
 				);
 				heuristicsResult = {
 					droppedTools:
@@ -10669,6 +10986,7 @@ function runSynchronousPipeline(
 				`droppedTools=${heuristicsResult.droppedTools} deduplicatedTools=${heuristicsResult.deduplicatedTools} droppedInjections=${heuristicsResult.droppedInjections} staleReduce=${heuristicsResult.droppedStaleReduceCalls} compressedTextTags=${heuristicsResult.compressedTextTags} mutatedTextTags=${heuristicsResult.mutatedTextTags}`,
 			);
 		} catch (err) {
+			if (err instanceof PiCompanionFailure) throw err;
 			sessionLog(
 				args.sessionId,
 				`heuristic cleanup failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
@@ -10903,16 +11221,20 @@ function runSynchronousPipeline(
 		}
 		autoReclaimTargetCount = syntheticPendingOps.length;
 		if (syntheticPendingOps.length > 0) {
-			autoReclaimDidMutate = applyPendingOperations(
-				args.sessionId,
-				args.db,
-				newTargets,
-				protectedTagNumbersForPass,
-				undefined,
-				[],
-				syntheticPendingOps,
-				editMarkerTagIds,
-				(reduction) => droppedTokenReductions.push(reduction),
+			autoReclaimDidMutate = pair(
+				() =>
+					applyPendingOperations(
+						args.sessionId,
+						args.db,
+						newTargets,
+						protectedTagNumbersForPass,
+						undefined,
+						[],
+						syntheticPendingOps,
+						editMarkerTagIds,
+						(reduction) => droppedTokenReductions.push(reduction),
+					),
+				firstEditPrecedesThinking,
 			);
 			if (autoReclaimDidMutate) {
 				droppedCount += syntheticPendingOps.length;
@@ -10989,32 +11311,37 @@ function runSynchronousPipeline(
 							: tag.messageId,
 					),
 			);
-			const imageResult = stripPiProcessedImages({
-				db: args.db,
-				sessionId: args.sessionId,
-				messages: workingMessages,
-				detect: isCacheBustingPass && (holdEnabled || !protectedSignedPrefix),
-				watermark: getMaxDroppedTagNumber(args.db, args.sessionId),
-				messageIdToMaxTag: imagePositionTags,
-				protectedCutoff: usesTokenProtection
-					? protectionWindowForPass.cutoff
-					: protectedTagNumbersForPass.size > 0
-						? Math.min(...protectedTagNumbersForPass)
-						: null,
-				usagePercentage: args.contextUsage.percentage,
-				protectedToolKeys: protectedImageToolKeys,
-				stableId: stableIdResolver,
-				admitFirstApplication: holdEnabled
-					? (message, index, block) => {
-							const id = stableIdResolver(message, index);
-							if (editAdmission.admit({ kind: "message", id, block }))
-								return true;
-							heldImageCoords.push(`${id ?? "<no id>"}:${block}`);
-							return false;
-						}
-					: undefined,
-				onFirstApplication: recordFirstApplicationAt,
-			});
+			const imageResult = pair(
+				() =>
+					stripPiProcessedImages({
+						db: args.db,
+						sessionId: args.sessionId,
+						messages: workingMessages,
+						detect:
+							isCacheBustingPass && (holdEnabled || !protectedSignedPrefix),
+						watermark: getMaxDroppedTagNumber(args.db, args.sessionId),
+						messageIdToMaxTag: imagePositionTags,
+						protectedCutoff: usesTokenProtection
+							? protectionWindowForPass.cutoff
+							: protectedTagNumbersForPass.size > 0
+								? Math.min(...protectedTagNumbersForPass)
+								: null,
+						usagePercentage: args.contextUsage.percentage,
+						protectedToolKeys: protectedImageToolKeys,
+						stableId: stableIdResolver,
+						admitFirstApplication: holdEnabled
+							? (message, index, block) => {
+									const id = stableIdResolver(message, index);
+									if (editAdmission.admit({ kind: "message", id, block }))
+										return true;
+									heldImageCoords.push(`${id ?? "<no id>"}:${block}`);
+									return false;
+								}
+							: undefined,
+						onFirstApplication: recordFirstApplicationAt,
+					}),
+				firstEditPrecedesThinking,
+			);
 			if (
 				heldImageCoords.length > 0 &&
 				editAdmission.frame.kind === "boundary"
@@ -11028,6 +11355,7 @@ function runSynchronousPipeline(
 				droppedCount += imageResult.stripped;
 			}
 		} catch (err) {
+			if (err instanceof PiCompanionFailure) throw err;
 			sessionLog(
 				args.sessionId,
 				`processed-image strip failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
@@ -11081,31 +11409,41 @@ function runSynchronousPipeline(
 		);
 	}
 	if (nativeInputs !== undefined && nativeReasoningIds !== undefined) {
-		const nativeInputsApplied = applyNativeToolInputReplayPi(
-			{
-				db: args.db,
-				sessionId: args.sessionId,
-				messages: args.messages,
-				changes: transcript.getToolInputChanges(),
-				canApply: isCacheBustingPass,
-			},
-			nativeInputs,
-		);
-		const nativeReasoningApplied = args.reasoningClearing
-			? applyNativeReasoningReplayPi(
+		const nativeInputsApplied = pair(
+			() =>
+				applyNativeToolInputReplayPi(
 					{
 						db: args.db,
 						sessionId: args.sessionId,
 						messages: args.messages,
-						messageIdToMaxTag,
-						stableId: stableIdResolver,
-						localWatermark: args.sessionMeta.clearedReasoningThroughTag ?? 0,
-						budgetCutoff: reasoningBudgetCutoffThisPass,
-						omissionAllowed: args.reasoningClearing.nativeReasoningMayClear,
-						canApply: isCacheBustingPass && !reasoningPersistenceFailed,
-						detectAged: shouldRunHeuristics && routineCleanupApplied,
+						changes: transcript.getToolInputChanges(),
+						canApply: isCacheBustingPass,
 					},
-					nativeReasoningIds,
+					nativeInputs,
+				),
+			(count) => count > 0,
+		);
+		const nativeReasoningApplied = args.reasoningClearing
+			? pair(
+					() =>
+						applyNativeReasoningReplayPi(
+							{
+								db: args.db,
+								sessionId: args.sessionId,
+								messages: args.messages,
+								messageIdToMaxTag,
+								stableId: stableIdResolver,
+								localWatermark:
+									args.sessionMeta.clearedReasoningThroughTag ?? 0,
+								budgetCutoff: reasoningBudgetCutoffThisPass,
+								omissionAllowed:
+									args.reasoningClearing?.nativeReasoningMayClear === true,
+								canApply: isCacheBustingPass && !reasoningPersistenceFailed,
+								detectAged: shouldRunHeuristics && routineCleanupApplied,
+							},
+							nativeReasoningIds,
+						),
+					(count) => count > 0,
 				)
 			: 0;
 		if (nativeInputsApplied > 0 || nativeReasoningApplied > 0) {
@@ -11215,20 +11553,18 @@ function runSynchronousPipeline(
 			if (!piM0State) {
 				throw new Error("Pi m[0] state must exist before wire injection");
 			}
-			const wireInjectionResult = injectM0M1PiForRun(
-				piM0State,
-				args.db,
-				args.messages as Parameters<typeof injectM0M1Pi>[2],
-				args.entryIds,
-				// recomputeM1ThisPass: recompute m[1] (vs byte-identical replay) on any
-				// cache-busting pass — history refresh (new compartment published),
-				// deferred history refresh, OR executed work (drops/heuristics). A
-				// history-refresh-only pass has executedWorkThisPass=false but MUST
-				// re-render m[1] so the new compartment surfaces; gating on work alone
-				// (the prior behavior, masked by the now-removed cache clear) would
-				// replay stale m[1]. Mirrors OpenCode's isCacheBustingPass gate.
-				isCacheBustingPass,
-				injectionPassSnapshot,
+			const wireInjectionResult = injectPrefix(() =>
+				injectM0M1PiForRun(
+					piM0State,
+					args.db,
+					args.messages as Parameters<typeof injectM0M1Pi>[2],
+					args.entryIds,
+					// History-only refreshes can change m[1] without executing cleanup or
+					// materializing m[0]. Refresh the delta on every cache-busting pass;
+					// replay-only passes must keep the cached m[1] bytes unchanged.
+					isCacheBustingPass,
+					injectionPassSnapshot,
+				),
 			);
 			injectionResult = preFoldInjectionResult?.m0Materialized
 				? {
@@ -11283,6 +11619,7 @@ function runSynchronousPipeline(
 			);
 			logTransformTiming(args.sessionId, "compartmentPhase", tInjection);
 		} catch (err) {
+			if (err instanceof PiCompanionFailure) throw err;
 			sessionLog(
 				args.sessionId,
 				`compartment injection failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
@@ -11293,61 +11630,65 @@ function runSynchronousPipeline(
 	transcript.finalizeToolRemovals();
 	const tDroppedPlaceholders = performance.now();
 	const heldPlaceholderIds: string[] = [];
-	stripPiDroppedPlaceholderMessages({
-		db: args.db,
-		sessionId: args.sessionId,
-		messages: args.messages,
-		// Pi splices placeholder-only messages rather than neutralizing them in
-		// place. Subagent execute alone must not discover new splices that collapse
-		// a freshly dropped turn: tiny shells wait for a history refresh (or the
-		// stable-id cutover below). Frozen discoveries still replay every pass.
-		isCacheBusting: historyRefreshPermitted && prefixMutationAllowed,
-		stableIdByRef: postCommitStableIdByRef,
-		// A stable-ID migration rekeys previously omitted placeholders even without
-		// a history refresh. Only a saved old-ID omission proves this is replay;
-		// other discoveries are new removals and always need the migration safety check.
-		forceDiscovery: args.stableIdSchemeCutover === true,
-		legacyIdByRef: legacyStableIdByRef,
-		// Frozen ids whose message owns a tool call are forgotten only on a pass
-		// that already changes the served prefix, so the stored set never changes
-		// on a pass meant to replay the previous bytes.
-		canFirstApply: isCacheBustingPass,
-		onLegacyReplay: (previous, next) => {
-			const id = postCommitStableIdByRef.get(previous);
-			if (id) postCommitStableIdByRef.set(next, id);
-		},
-		// Oh My Pi converts a tool result whose call is absent into a
-		// <stale-tool-result> user message (pi-ai providers/transform-messages.ts,
-		// 18.10.4:1395-1449, 18.11.0:1391-1445). Responses/Anthropic request
-		// validation rejects that role change, so remove dropped results first.
-		// Chat validation accepts the exact placeholder note; defer its removal
-		// until another change already invalidates the provider's cached prefix.
-		retireOrphansBeforeRefusal: [
-			"openai-responses",
-			"openai-codex-responses",
-			"azure-openai-responses",
-			"anthropic-messages",
-		].includes(args.providerApi ?? ""),
-		onFirstApplication: (message, index) =>
-			recordFirstApplicationAt(message, index, 0, (item) =>
-				item && typeof item === "object"
-					? postCommitStableIdByRef.get(item)
-					: undefined,
-			),
-		admit: (message) => {
-			const id =
-				message && typeof message === "object"
-					? postCommitStableIdByRef.get(message)
-					: undefined;
-			if (
-				!editAdmission ||
-				editAdmission.admit({ kind: "message", id, block: "whole" })
-			)
-				return true;
-			heldPlaceholderIds.push(id ?? "<no id>");
-			return false;
-		},
-	});
+	pair(
+		() =>
+			stripPiDroppedPlaceholderMessages({
+				db: args.db,
+				sessionId: args.sessionId,
+				messages: args.messages,
+				// Pi removes placeholder-only messages from the array. Newly discovered
+				// removals wait for a history refresh (or the stable-ID migration below),
+				// rather than collapsing a just-dropped turn on subagent execute alone.
+				// Previously persisted placeholder removals still replay on every request.
+				isCacheBusting: historyRefreshPermitted && prefixMutationAllowed,
+				stableIdByRef: postCommitStableIdByRef,
+				// A stable-ID migration rekeys previously omitted placeholders even without
+				// a history refresh. Only a saved old-ID omission proves this is replay;
+				// other discoveries are new removals and always need the migration safety check.
+				forceDiscovery: args.stableIdSchemeCutover === true,
+				legacyIdByRef: legacyStableIdByRef,
+				// canFirstApply permits the placeholder-removal ledger to forget a stored
+				// ID whose message now owns a tool call, but only when isCacheBustingPass
+				// already permits changing previously served bytes.
+				canFirstApply: isCacheBustingPass,
+				onLegacyReplay: (previous, next) => {
+					const id = postCommitStableIdByRef.get(previous);
+					if (id) postCommitStableIdByRef.set(next, id);
+				},
+				// Oh My Pi converts a tool result whose call is absent into a
+				// <stale-tool-result> user message (pi-ai providers/transform-messages.ts,
+				// 18.10.4:1395-1449, 18.11.0:1391-1445). Responses/Anthropic request
+				// validation rejects that role change, so remove dropped results first.
+				// Chat validation accepts the exact placeholder note; defer its removal
+				// until another change already invalidates the provider's cached prefix.
+				retireOrphansBeforeRefusal: [
+					"openai-responses",
+					"openai-codex-responses",
+					"azure-openai-responses",
+					"anthropic-messages",
+				].includes(args.providerApi ?? ""),
+				onFirstApplication: (message, index) =>
+					recordFirstApplicationAt(message, index, 0, (item) =>
+						item && typeof item === "object"
+							? postCommitStableIdByRef.get(item)
+							: undefined,
+					),
+				admit: (message) => {
+					const id =
+						message && typeof message === "object"
+							? postCommitStableIdByRef.get(message)
+							: undefined;
+					if (
+						!editAdmission ||
+						editAdmission.admit({ kind: "message", id, block: "whole" })
+					)
+						return true;
+					heldPlaceholderIds.push(id ?? "<no id>");
+					return false;
+				},
+			}),
+		firstEditPrecedesThinking,
+	);
 	if (
 		heldPlaceholderIds.length > 0 &&
 		editAdmission?.frame.kind === "boundary"
