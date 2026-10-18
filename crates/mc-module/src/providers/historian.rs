@@ -760,8 +760,9 @@ impl McHandler {
             .cloned()
             .unwrap_or_else(|| json!(binding.model_key));
         match configured {
-            // The counter is never cleared, so a conversation found without a host
-            // chain before the lock may only have gained one since; that one wins.
+            // A `state_sync` with a chain may have arrived while the config was read.
+            // The host-chain marker is never cleared, so recheck it on the locked
+            // copy: when a host chain arrived meanwhile, it is used instead.
             Some(configured) if !host_sent_chain(&conversation, &counters) => {
                 for (name, value) in configured.request_fields() {
                     // Settings a host synchronized with the pass still win over the

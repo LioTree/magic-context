@@ -19,7 +19,9 @@ use crate::config_parity::{ConfigResolveRequest, CoreConfigResolver};
 use crate::historian::HistorianModelLimits;
 use mc_store::parity_schema_manifest::{CapabilityResult, Generation};
 
-/// `DEFAULT_HISTORIAN_TIMEOUT_MS` in packages/plugin/src/config/schema/magic-context.ts:20.
+/// The per-attempt historian timeout when the config sets none. It must equal the
+/// plugin's default, `DEFAULT_HISTORIAN_TIMEOUT_MS` in
+/// packages/plugin/src/config/schema/magic-context.ts:20.
 const DEFAULT_HISTORIAN_TIMEOUT_MS: u64 = 600_000;
 
 /// Counter recorded on a provider conversation once a host has sent a historian chain
@@ -75,8 +77,9 @@ impl ConfiguredHistorian {
     }
 }
 
-/// `readString` in packages/plugin/src/shared/model-resolution.ts:20-24: a string,
-/// trimmed, and only when something is left.
+/// The value as a trimmed string, or `None` when it is not a string or is blank; the
+/// plugin reads every model and qualifier this way (`readString`,
+/// packages/plugin/src/shared/model-resolution.ts:20-24).
 fn text(value: Option<&Value>) -> Option<String> {
     value?
         .as_str()
@@ -85,7 +88,8 @@ fn text(value: Option<&Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `asRecord` (model-resolution.ts:14-18): only a JSON object counts; an array does not.
+/// The value when it is a JSON object; an array or scalar counts as absent, as in the
+/// plugin's `asRecord` (packages/plugin/src/shared/model-resolution.ts:14-18).
 fn record(value: Option<&Value>) -> Option<&Map<String, Value>> {
     value?.as_object()
 }
@@ -97,7 +101,10 @@ struct Attempt {
     qualifier: Option<String>,
 }
 
-/// `normalizeModelEntry` (model-resolution.ts:43-61).
+/// One configured model entry: either a `provider/model` string, or an object with a
+/// `model` string and an optional qualifier under `qualifier_key`. Anything else, or
+/// a blank model, is no entry (`normalizeModelEntry`,
+/// packages/plugin/src/shared/model-resolution.ts:43-61).
 fn normalize(entry: &Value, qualifier_key: &str) -> Option<Attempt> {
     if entry.is_string() {
         return text(Some(entry)).map(|model| Attempt {
@@ -112,20 +119,21 @@ fn normalize(entry: &Value, qualifier_key: &str) -> Option<Attempt> {
     })
 }
 
-/// `isValidModelReference` (model-resolution.ts:63-66): a slash with text on both
-/// sides of the first one. Only fallbacks are checked; the primary is not.
+/// Whether a model reads as `provider/model`: text on both sides of the first slash
+/// (`isValidModelReference`, packages/plugin/src/shared/model-resolution.ts:63-66).
+/// The plugin checks only fallbacks this way; a malformed primary is kept.
 fn valid_reference(model: &str) -> bool {
     model
         .find('/')
         .is_some_and(|slash| slash > 0 && slash < model.len() - 1)
 }
 
-/// The primary and fallback attempts of `resolveHistorianModel`
-/// (model-resolution.ts:112-128) for one harness block.
+/// The primary and fallback attempts configured under `historian.<harness>`, resolved
+/// as `resolveHistorianModel` does (packages/plugin/src/shared/model-resolution.ts:112-128).
 fn attempts(settings: &Value, harness: &str) -> (Option<Attempt>, Vec<Attempt>) {
     let historian = record(settings.get("historian"));
-    // `resolveHarnessBlock` (model-resolution.ts:30-36): OMP falls back to the Pi
-    // block when its own is absent (`??`, so null counts as absent).
+    // OMP falls back to the Pi block when its own is absent or null, as
+    // `resolveHarnessBlock` does (packages/plugin/src/shared/model-resolution.ts:30-36).
     let selected = match harness {
         "omp" => historian
             .and_then(|h| h.get("omp"))
@@ -141,8 +149,8 @@ fn attempts(settings: &Value, harness: &str) -> (Option<Attempt>, Vec<Attempt>) 
     } else {
         "thinking_level"
     };
-    // `resolvePrimaryEntry` (model-resolution.ts:92-101): the entry's own qualifier,
-    // else the block's.
+    // The primary's qualifier is its own, else the one written beside it in the block
+    // (`resolvePrimaryEntry`, packages/plugin/src/shared/model-resolution.ts:92-101).
     let primary = block
         .get("model")
         .and_then(|entry| normalize(entry, qualifier_key))
@@ -152,8 +160,10 @@ fn attempts(settings: &Value, harness: &str) -> (Option<Attempt>, Vec<Attempt>) 
                 .or_else(|| text(block.get(qualifier_key)));
             attempt
         });
-    // `resolveFallbackEntries` (model-resolution.ts:77-90): one value or a list, in
-    // declaration order, deduplicated by model plus qualifier.
+    // Fallbacks are one value or a list, kept in declaration order, without malformed
+    // references, and deduplicated by model plus qualifier, so one model with two
+    // qualifiers stays two attempts (`resolveFallbackEntries`,
+    // packages/plugin/src/shared/model-resolution.ts:77-90).
     let mut fallbacks: Vec<Attempt> = Vec::new();
     if let Some(value) = block.get("fallback_models") {
         let values = value
@@ -174,14 +184,23 @@ fn attempts(settings: &Value, harness: &str) -> (Option<Attempt>, Vec<Attempt>) 
 /// Resolve the historian settings for a conversation of `harness` from trusted
 /// effective settings (the shape [`trusted_settings`] returns).
 ///
-/// The chain is the primary followed by the fallbacks, each model once, as the
-/// bridge pushed it (opencode-adapter.ts:737-743,764) and as
-/// `rustWrapupHistorianFields` builds it (module-session-kernel.ts:111-118). A
-/// model's variant is the qualifier of its first attempt (:119-127). The plugin
-/// reads per-model limits from the host's model catalog (:128-156); ck-mc has no
-/// catalog, so every chain model gets an empty entry, which is what the plugin
-/// sends for a model its catalog does not know. Model limits then come from the
-/// trusted `historian.context_limit_tokens` the module already applies.
+/// `settings` is the validated config object: `historian.<harness>.model`,
+/// `historian.<harness>.fallback_models`, the OpenCode `variant` or Pi/OMP
+/// `thinking_level`, `historian.maxTokens` and `historian_timeout_ms`.
+///
+/// The chain is the primary followed by the fallbacks, each model once in its first
+/// position. That is the chain the OpenCode bridge sent with `state_sync`
+/// (packages/plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts:737-743,764)
+/// and the one `rustWrapupHistorianFields` builds
+/// (packages/plugin/src/hooks/magic-context/module-session-kernel.ts:111-118). A
+/// model's variant is the qualifier of its first attempt, so a qualifier written only
+/// on a later attempt of the same model is dropped (same file, :119-127).
+///
+/// The plugin looks up per-model context and output limits in the host's model
+/// catalog (same file, :128-156). ck-mc has no catalog, so every chain model gets an
+/// empty entry, which is what the plugin sends for a model its catalog does not
+/// know. The historian window then comes from the user-tier
+/// `historian.context_limit_tokens` the module already applies to every firing.
 pub(crate) fn resolve(settings: &Value, harness: &str) -> ConfiguredHistorian {
     // Both OpenCode hosts read the `opencode` block, as the dreamer's model
     // resolution does (dream_runner.rs `resolve_task_models`).
@@ -192,14 +211,15 @@ pub(crate) fn resolve(settings: &Value, harness: &str) -> ConfiguredHistorian {
     };
     let (primary, fallbacks) = attempts(settings, harness);
     let mut resolved = ConfiguredHistorian {
-        // `config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS`
-        // (hooks/magic-context/hook.ts:323).
+        // The configured timeout, else the plugin's default, as the plugin's historian
+        // sampler reads it (packages/plugin/src/hooks/magic-context/hook.ts:323).
         timeout_ms: settings
             .get("historian_timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_HISTORIAN_TIMEOUT_MS),
-        // `historian.maxTokens`, unset when not configured
-        // (host-runner/bridge-deps.ts:42; hook.ts:318-320).
+        // `historian.maxTokens` caps the output; unset stays unset and the module
+        // applies its own default, as the plugin passes it
+        // (packages/plugin/src/hooks/magic-context/host-runner/bridge-deps.ts:42).
         max_output_tokens: settings
             .pointer("/historian/maxTokens")
             .and_then(Value::as_u64)

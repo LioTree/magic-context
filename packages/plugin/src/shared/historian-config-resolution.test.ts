@@ -9,9 +9,10 @@ import { clearModelsDevCache } from "./models-dev-cache";
 /**
  * Drift check for the historian settings ck-mc resolves from its own config.
  *
- * In mode 3 no TypeScript sends ck-mc the historian model chain, so ck-mc reads
- * the user's config and resolves the chain, variants, per-model limits, timeout
- * and output cap itself (crates/mc-module/src/providers/historian_config.rs). The
+ * When a harness runs Magic Context through ck-mc without this plugin's bridge,
+ * nothing sends ck-mc the historian model chain, so ck-mc reads the user's config
+ * and resolves the chain, variants, per-model limits, timeout and output cap
+ * itself (crates/mc-module/src/providers/historian_config.rs). The
  * committed fixture records what this plugin resolves for the same config matrix,
  * and the Rust test compares against it. This test fails whenever the TypeScript
  * resolution changes without the fixture being regenerated:
