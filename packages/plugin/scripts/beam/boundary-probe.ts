@@ -10,6 +10,12 @@
  * with the usage the first question turn would report: every raw message, tokenized by the same
  * index the boundary walks, over the answer model's context limit. Output is one JSON line.
  *
+ * The session is passed the protected-tail metadata of a session that grew under Magic Context
+ * from its first message (policy version 3, prior boundary 1). Without it, the boundary code treats
+ * the offline-written session as one that predates that policy and floors the tail at the legacy
+ * "last five user turns", which no session that grew under Magic Context ever carries. The
+ * metadata is only an input; no production code is changed.
+ *
  *   bun boundary-probe.ts <sessionId> <contextLimit> <executeThresholdPercentage>
  */
 import { openDatabase } from "../../src/features/magic-context/storage-db";
@@ -56,6 +62,7 @@ if (import.meta.main) {
         executeThresholdPercentage,
         usage: { percentage: usagePercentage, inputTokens: sessionTokens },
         usageSource: "live",
+        protectedTailMeta: { priorBoundaryOrdinal: 1, protectedTailPolicyVersion: 3 },
     });
     const result: BoundaryProbeResult = {
         rawMessageCount: snapshot.rawMessageCountAtTrigger,
