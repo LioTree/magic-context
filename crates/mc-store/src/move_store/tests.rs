@@ -1310,6 +1310,7 @@ fn review_module_move_preserves_populated_projection_and_fragment_references() {
         m0_sha256: "opaque-baseline-binding".into(),
         fragment_watermark: 40,
         committed: vec![crate::memory_projection::CommittedFragment {
+            dashboard_log_id: None,
             id: 42,
             form: "marker".into(),
             overflow_ids: Vec::new(),

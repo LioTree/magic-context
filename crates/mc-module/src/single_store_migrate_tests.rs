@@ -618,7 +618,7 @@ fn every_cache_row_is_marked_for_one_hard_with_store_ids_zeroed() {
         )
         .unwrap();
     let meta: Value = serde_json::from_str(&meta).unwrap();
-    assert_eq!(meta["project_memory_epoch_pending"], true);
+    assert_eq!(meta["bootstrap_seed_fold_pending"], true);
     assert_eq!(meta["max_memory_id"], 0);
     assert_eq!(meta["memory_mutation_cursor"], 0);
     assert_eq!(meta["m1_revision"], 0);

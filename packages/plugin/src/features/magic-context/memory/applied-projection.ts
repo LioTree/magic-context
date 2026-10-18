@@ -26,6 +26,8 @@ export type AppliedRepresentation = "text" | "delta" | "cue";
 
 /** One agent fragment as it was committed to this session's m[1]. */
 export interface CommittedFragment {
+    /** Mutation-log cursor for an admitted dashboard operation; agent ids stay independent. */
+    dashboardLogId?: number;
     id: number;
     /**
      * `full` shows the operation's lines; `marker` shows only a stale-memory marker;

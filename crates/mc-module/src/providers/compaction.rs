@@ -481,7 +481,6 @@ fn can_skip_host_step(
         emergency: usage >= 95.0 || meta.emergency_drain_active,
         forced_work: !meta.initialized
             || meta.soft_refresh_pending
-            || meta.project_memory_epoch_pending
             || meta.pending_rewrite.is_some()
             || meta.bootstrap_seed_fold_pending
             || meta.deferred_execute_state.is_some()
@@ -4050,7 +4049,8 @@ mod host_tests {
         let row_version = s.load_meta("s").unwrap().row_version;
         let full_decodes = mc_store::cache_codec::full_decode_count();
         assert!(
-            !can_skip_host_step(&s, &work, "s", model, &status, false).unwrap(),
+            can_skip_host_step(&s, &work, "s", model, &status, false).unwrap()
+                == (cause == "memory_epoch"),
             "preflight skipped a concrete {cause} trigger"
         );
         assert_eq!(
@@ -4146,7 +4146,7 @@ mod host_tests {
     }
     #[test]
     fn real_state_trigger_project_memory_epoch() {
-        real_state_trigger_comparison("memory_epoch", "HARD");
+        real_state_trigger_comparison("memory_epoch", "SOFT+");
     }
     #[test]
     fn real_state_trigger_protection_snapshot_survives_preflight() {

@@ -189,6 +189,13 @@ fn assert_automated_memory_change(operation: &str) {
         s.get_memory_full(id).unwrap().unwrap().content,
         "cache_ttl is 5 minutes in config.ts."
     );
+    let held_restore = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(serde_json::to_vec(held_restore.messages()).unwrap(), serde_json::to_vec(hard.messages()).unwrap());
+    s.arm_soft_refresh("ses").unwrap();
+    let delta_restore = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(delta_restore.action, "SOFT");
+    assert!(serde_json::to_string(delta_restore.messages()).unwrap().contains("cache_ttl is 5 minutes"));
+    request.render_config = "cfg-restored-natural-rebuild".into();
     let epoch_hard = transform(&s, &request, &ctx).unwrap();
     assert_eq!(epoch_hard.action, "HARD");
     assert!(
@@ -303,6 +310,7 @@ fn review_fragment_failure_rolls_back_canonical_edit_and_history() {
 fn review_shown_full_and_marker_lines_survive_budget_collapse() {
     let mut projection = AppliedProjection::default();
     let fragment = |id: i64, text: &str| AgentFragment {
+        dashboard_log_id: None,
         id,
         operation_key: format!("op-{id}"),
         memory_ids: vec![id],
@@ -1059,7 +1067,7 @@ fn module_verification_direct_update_freezes_served_m0_m1_and_mural_until_natura
 }
 
 #[test]
-fn module_dashboard_pin_admits_revision_even_when_prefix_bytes_are_identical() {
+fn module_dashboard_pin_waits_for_natural_hard_even_when_prefix_bytes_are_identical() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path());
     s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -1082,6 +1090,13 @@ fn module_dashboard_pin_admits_revision_even_when_prefix_bytes_are_identical() {
     let original = transform(&s, &request, &ctx).unwrap();
     let receipt = s.memory_history_rpc("memory.edit", &json!({ "projectPath":"git:proj", "operationId":"pin", "expectedRevisions":[{"memoryId":id,"revision":1}], "changes":[{"memoryId":id,"status":"permanent"}] }), 1).unwrap();
     assert_eq!(receipt["state"], "applied");
+    let held = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(serde_json::to_vec(held.messages()).unwrap(), serde_json::to_vec(original.messages()).unwrap());
+    s.arm_soft_refresh("ses").unwrap();
+    let delta = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(delta.action, "SOFT");
+    assert!(serde_json::to_string(delta.messages()).unwrap().contains("<memory-updates>"));
+    request.render_config = "cfg-natural-pin".into();
     let hard = transform(&s, &request, &ctx).unwrap();
     assert_eq!(hard.action, "HARD");
     assert_eq!(m0_bytes(&hard), m0_bytes(&original));
@@ -1146,7 +1161,7 @@ fn independent_review_randomized_base_served_requests() {
         rng
     };
     let mut counts = [0usize; 3];
-    for step in 0..120 {
+    for step in 0..240 {
         let random_kind = next() % 3;
         let kind = if !dashboard && random_kind == 2 {
             1
@@ -1165,10 +1180,6 @@ fn independent_review_randomized_base_served_requests() {
             1 => noprop_automated(&s, 0, step),
             _ => {
                 let status = if step % 2 == 0 { "permanent" } else { "active" };
-                // Conditional compilation lets the same witness exercise each
-                // revision's real dashboard effects without a compatibility API.
-                #[cfg(mc_memory_history_review_tip)]
-                {
                     let revision = s
                         .with_context_conn_for_test(|conn| {
                             conn.query_row("SELECT revision FROM memories WHERE id=3", [], |row| {
@@ -1178,16 +1189,7 @@ fn independent_review_randomized_base_served_requests() {
                         .unwrap();
                     let receipt = s.memory_history_rpc("memory.edit", &json!({"projectPath":"git:proj", "operationId":format!("review-dashboard:{step}"), "expectedRevisions":[{"memoryId":3,"revision":revision}], "changes":[{"memoryId":3,"status":status}]}), 2).unwrap();
                     assert!(receipt["state"] == "applied" || receipt["reason"] == "no_change");
-                }
-                #[cfg(not(mc_memory_history_review_tip))]
-                s.with_context_conn_for_test(|conn| {
-                    let current: String = conn.query_row("SELECT status FROM memories WHERE id=3", [], |row| row.get(0))?;
-                    if current != status {
-                        conn.execute("UPDATE memories SET status=?1 WHERE id=3", [status])?;
-                        conn.execute("INSERT INTO project_state(project_path,project_memory_epoch,updated_at) VALUES('git:proj',1,2) ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch=project_memory_epoch+1", [])?;
-                    }
-                    Ok(())
-                }).unwrap();
+
             }
         }
         let pass = next() % 3;
@@ -1199,7 +1201,7 @@ fn independent_review_randomized_base_served_requests() {
         }
         let served = transform(&s, &request, &ctx).unwrap();
         records.push(
-            json!({"step":step, "kind":kind, "action":served.action, "messages":served.messages()}),
+            json!({"step":step, "kind":kind, "action":served.action, "bust":pass != 0, "natural":pass == 2, "messages":served.messages()}),
         );
     }
     std::fs::write(
@@ -1208,4 +1210,154 @@ fn independent_review_randomized_base_served_requests() {
     )
     .unwrap();
     println!("independent base differential: {} serialized Rust requests; requested defer/SOFT/natural HARD={counts:?}", records.len());
+}
+
+#[test]
+fn dashboard_delta_holds_admits_freezes_and_folds_across_240_randomized_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")]).unwrap();
+    let id = s.insert_memory(memory_input("git:proj", "CONSTRAINTS", "Initial dashboard rule.", 0)).unwrap();
+    let agent = s.insert_memory(memory_input("git:proj", "CONSTRAINTS", "Initial agent rule.", 0)).unwrap();
+    let mut request = req("ses", "cfg0", vec![item("a", 1, "raw"), item("tail", 2, "tail")]);
+    request.auto_search_enabled = false;
+    let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    ctx.memory_budget_tokens = 10000.0;
+    ctx.history_budget_tokens = 10000.0;
+    let bytes = |r: &TransformResponse| serde_json::to_vec(r.messages()).unwrap();
+    let initial = transform(&s, &request, &ctx).unwrap();
+    let dashboard = |step: usize| {
+        let revision: i64 = s.with_context_conn_for_test(|conn| conn.query_row("SELECT revision FROM memories WHERE id=?1", [id], |row| row.get(0))).unwrap();
+        let receipt = s.memory_history_rpc("memory.edit", &json!({"projectPath":"git:proj", "operationId":format!("dashboard-proof:{step}"), "expectedRevisions":[{"memoryId":id,"revision":revision}],"changes":[{"memoryId":id,"content":format!("Dashboard correction {step}.")}]}), 2).unwrap();
+        assert_eq!(receipt["state"], "applied");
+    };
+    dashboard(999);
+    let held = transform(&s, &request, &ctx).unwrap();
+    assert_ne!(held.action, "HARD");
+    assert_eq!(bytes(&held), bytes(&initial));
+    s.arm_soft_refresh("ses").unwrap();
+    let admitted = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(admitted.action, "SOFT");
+    assert!(String::from_utf8(bytes(&admitted)).unwrap().contains("Dashboard correction 999."));
+    s.with_context_conn_for_test(|conn| conn.execute("UPDATE memories SET content='Later automated text',revision=revision+1 WHERE id=?1", [id])).unwrap();
+    for _ in 0..12 {
+        s.arm_soft_refresh("ses").unwrap();
+        let replay = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(replay.action, "SOFT");
+        assert_eq!(bytes(&replay), bytes(&admitted));
+    }
+    request.render_config = "cfg-natural".into();
+    let folded = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(folded.action, "HARD");
+    assert!(m0_bytes(&folded).contains("Later automated text"));
+    let mut previous = bytes(&folded);
+    let mut previous_m0 = m0_bytes(&folded).to_string();
+    let mut rng = 0x49b13cdu32;
+    let mut counts = [0usize; 3];
+    for step in 0..240 {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        let kind = rng % 3;
+        counts[kind as usize] += 1;
+        if kind == 0 { dashboard(step); }
+        else if kind == 1 { edit(&s, "ses", agent, &format!("Agent correction {step}."), &format!("proof-agent:{step}")).unwrap(); }
+        let natural = step % 19 == 18;
+        let bust = natural || (rng >> 8) % 3 == 0;
+        if natural { request.render_config = format!("cfg-natural:{step}"); }
+        else if bust { s.arm_soft_refresh("ses").unwrap(); }
+        let current = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(current.action == "HARD", natural, "step {step}");
+        if !bust { assert_eq!(bytes(&current), previous, "held step {step}"); }
+        if !natural { assert_eq!(m0_bytes(&current), previous_m0, "m0 step {step}"); }
+        previous = bytes(&current);
+        previous_m0 = m0_bytes(&current).to_string();
+    }
+    println!("Rust dashboard proof: 240 randomized passes dashboard/agent/normal={counts:?}");
+}
+
+#[test]
+fn dashboard_workspace_join_and_removal_hold_and_unseen_foreign_ids_wait_for_hard() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let foreign = s.insert_memory(memory_input("git:joined", "CONSTRAINTS", "Unseen workspace rule.", 0)).unwrap();
+    let own = s.insert_memory(memory_input("git:proj", "CONSTRAINTS", "Own archived rule.", 0)).unwrap();
+    let mut request = req("ses", "cfg", vec![item("tail", 1, "tail")]);
+    request.auto_search_enabled = false;
+    let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    let bytes = |r: &TransformResponse| serde_json::to_vec(r.messages()).unwrap();
+    let initial = transform(&s, &request, &ctx).unwrap();
+    s.with_context_conn_for_test(|conn| {
+        conn.execute_batch("INSERT INTO workspaces(id,name,share_categories,created_at,updated_at) VALUES(919,'proof','[\"CONSTRAINTS\"]',1,1); INSERT INTO workspace_members(workspace_id,project_path,display_name,display_path,added_at) VALUES(919,'git:proj','Own','/own',1),(919,'git:joined','Joined','/joined',1);")?;
+        conn.execute("UPDATE memories SET shareable=1 WHERE id=?1", [foreign])
+    }).unwrap();
+    s.arm_soft_refresh("ses").unwrap();
+    let joined = transform(&s, &request, &ctx).unwrap();
+    assert_ne!(joined.action, "HARD", "join reason {:?}", joined.materialize_reason);
+    assert_eq!(bytes(&joined), bytes(&initial));
+    let edit = s.memory_history_rpc("memory.edit", &json!({"projectPath":"git:joined","operationId":"unseen","expectedRevisions":[{"memoryId":foreign,"revision":1}],"changes":[{"memoryId":foreign,"content":"Unseen joined correction."}]}), 2).unwrap();
+    assert_eq!(edit["state"], "applied");
+    s.arm_soft_refresh("ses").unwrap();
+    assert_eq!(bytes(&transform(&s, &request, &ctx).unwrap()), bytes(&joined));
+    s.with_context_conn_for_test(|conn| conn.execute("UPDATE memories SET shareable=1 WHERE id=?1", [foreign])).unwrap();
+    request.render_config = "cfg-natural-join".into();
+    let hard = transform(&s, &request, &ctx).unwrap();
+    assert!(m0_bytes(&hard).contains("Unseen joined correction."));
+    s.with_context_conn_for_test(|conn| conn.execute("DELETE FROM workspace_members WHERE project_path='git:joined'", [])).unwrap();
+    s.arm_soft_refresh("ses").unwrap();
+    let removed = transform(&s, &request, &ctx).unwrap();
+    assert_ne!(removed.action, "HARD");
+    assert_eq!(bytes(&removed), bytes(&hard));
+    request.render_config = "cfg-natural-remove".into();
+    let hard = transform(&s, &request, &ctx).unwrap();
+    assert!(!m0_bytes(&hard).contains("Unseen joined correction."));
+    let archive = s.memory_history_rpc("memory.edit", &json!({"projectPath":"git:proj","operationId":"archive","expectedRevisions":[{"memoryId":own,"revision":1}],"changes":[{"memoryId":own,"status":"archived"}]}), 3).unwrap();
+    assert_eq!(archive["state"], "applied");
+    assert_eq!(bytes(&transform(&s, &request, &ctx).unwrap()), bytes(&hard));
+    s.arm_soft_refresh("ses").unwrap();
+    let delta = transform(&s, &request, &ctx).unwrap();
+    assert_eq!(m0_bytes(&delta), m0_bytes(&hard));
+    assert!(m1_bytes(&delta).contains(&format!("<removed id=\"{own}\"/>")));
+    request.render_config = "cfg-natural-archive".into();
+    assert!(!m0_bytes(&transform(&s, &request, &ctx).unwrap()).contains("Own archived rule."));
+}
+
+#[test]
+fn single_store_id_reset_hard_precedes_dashboard_delta_refresh() {
+    for compaction in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let id = s.insert_memory(memory_input("git:proj", "CONSTRAINTS", "Canonical memory before reset.", 0)).unwrap();
+        let mut request = req("ses", "cfg", vec![item("tail", 1, "tail")]);
+        request.auto_search_enabled = false;
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.compaction_enabled = compaction;
+        transform(&s, &request, &ctx).unwrap();
+        let mut old = s.load("ses").unwrap();
+        let old_m0 = old.core.frozen_units.iter_mut().find(|unit| unit.key == "m0").unwrap();
+        old_m0.frozen_payload = old_m0.frozen_payload.replace("Canonical memory before reset.", "OLD_ID_TEXT from the former id space.");
+        let stale_bytes = old_m0.frozen_payload.clone();
+        old.meta.rendered_memory_ids = vec![9001];
+        old.meta.max_memory_id = 9001;
+        old.meta.memory_mutation_cursor = 9001;
+        if let Some(projection) = old.meta.memory_projection.as_mut() { projection.bind_m0(&stale_bytes); }
+        s.commit("ses", old.row_version, &old.core, &old.meta).unwrap();
+        let edit = s.memory_history_rpc("memory.edit", &json!({"projectPath":"git:proj","operationId":"reset-dashboard","expectedRevisions":[{"memoryId":id,"revision":1}],"changes":[{"memoryId":id,"content":"Current canonical id text."}]}), 2).unwrap();
+        assert_eq!(edit["state"], "applied");
+        let conn = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+        assert_eq!(mc_store::single_store_schema::reset_cache_state_for_single_store(&conn).unwrap(), 1);
+        drop(conn);
+        let reset = s.load("ses").unwrap().meta;
+        assert_eq!(reset.max_memory_id, 0);
+        assert_eq!(reset.memory_mutation_cursor, 0);
+        assert!(reset.rendered_memory_ids.is_empty());
+        s.arm_soft_refresh("ses").unwrap();
+        let first = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(first.action, "HARD", "compaction={compaction}: no delta may render against reset ids");
+        assert!(m0_bytes(&first).contains("Current canonical id text."));
+        assert!(!m0_bytes(&first).contains("OLD_ID_TEXT"));
+        assert!(!m1_bytes(&first).contains("<memory-updates>"));
+        assert!(!s.load("ses").unwrap().meta.bootstrap_seed_fold_pending);
+        let replay = transform(&s, &request, &ctx).unwrap();
+        assert_ne!(replay.action, "HARD");
+        assert_eq!(serde_json::to_vec(replay.messages()).unwrap(), serde_json::to_vec(first.messages()).unwrap());
+    }
 }

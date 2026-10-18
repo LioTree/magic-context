@@ -93,6 +93,8 @@ pub struct VisibleText {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommittedFragment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_log_id: Option<i64>,
     pub id: i64,
     pub form: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -168,6 +170,8 @@ impl AppliedProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentFragment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_log_id: Option<i64>,
     pub id: i64,
     pub operation_key: String,
     pub memory_ids: Vec<i64>,
@@ -177,6 +181,47 @@ pub struct AgentFragment {
 }
 
 impl McStore {
+    /// Admit dashboard log payloads without observing later automated row edits.
+    /// Cross-project corrections are limited to ids already in the frozen prefix.
+    pub fn load_dashboard_fragments(
+        &self,
+        project: &str,
+        after: i64,
+        baseline: &[i64],
+        max_id: i64,
+    ) -> Result<Vec<AgentFragment>, McStoreError> {
+        self.context_read(|conn| {
+            let mut stmt = conn.prepare("SELECT id,target_memory_id,mutation_type,superseded_by_id,category,new_content,project_path,operation_id FROM memory_mutation_log WHERE id>?1 AND operation_id LIKE 'dashboard:%' AND (project_path=?2 OR target_memory_id IN (SELECT value FROM json_each(?3))) ORDER BY id")?;
+            let rows = stmt.query_map(params![after,project,serde_json::to_string(baseline).unwrap()], |row| {
+                let log_id: i64 = row.get(0)?;
+                let id: i64 = row.get(1)?;
+                let kind: String = row.get(2)?;
+                let successor: Option<i64> = row.get(3)?;
+                let category: Option<String> = row.get(4)?;
+                let text: Option<String> = row.get(5)?;
+                let text = text.unwrap_or_default();
+                let changed_project: String = row.get(6)?;
+                let removed = changed_project != project || kind == "archive" || kind == "delete";
+                let line = if removed { format!("  <removed id=\"{id}\"/>") }
+                else if kind == "superseded" {
+                    successor.map(|next| format!("  <superseded id=\"{id}\" by=\"{next}\"/>")).unwrap_or_else(|| format!("  <removed id=\"{id}\"/>"))
+                } else { text_line(if baseline.contains(&id) && id <= max_id { "updated" } else { "added" }, id, category.as_deref().unwrap_or(""), &text) };
+                Ok(AgentFragment { id: 0, dashboard_log_id: Some(log_id), operation_key: row.get(7)?, memory_ids: vec![id], current_id: if removed { None } else { Some(id) }, lines: vec![line], visible_texts: if removed || kind == "superseded" { vec![] } else { vec![VisibleText { id, text }] } })
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut grouped: Vec<AgentFragment> = Vec::new();
+            for fragment in rows {
+                if let Some(prior) = grouped.iter_mut().find(|prior| prior.operation_key == fragment.operation_key) {
+                    prior.dashboard_log_id = fragment.dashboard_log_id;
+                    prior.memory_ids.extend(fragment.memory_ids);
+                    prior.lines.extend(fragment.lines);
+                    prior.visible_texts.extend(fragment.visible_texts);
+                    prior.current_id = fragment.current_id;
+                } else { grouped.push(fragment); }
+            }
+            Ok(grouped)
+        })
+    }
+
     /// Read immutable session-operation fragments. Do not load canonical memory
     /// rows, the mutation log, or either table's maximum ID here.
     pub fn load_agent_fragments(
@@ -189,6 +234,7 @@ impl McStore {
             let rows = statement.query_map(params![session_id,after], |row| {
                 let parse = |json: String| serde_json::from_str(&json).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)));
                 Ok(AgentFragment {
+                    dashboard_log_id: None,
                     id: row.get(0)?, operation_key: row.get(1)?,
                     memory_ids: parse(row.get(2)?)?, current_id: row.get(3)?,
                     lines: row.get::<_, String>(4)?.split('\n').map(str::to_string).collect(),

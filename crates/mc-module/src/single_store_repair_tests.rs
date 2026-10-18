@@ -456,7 +456,7 @@ fn apply_restores_the_backup_history_with_its_ids_and_dependents() {
         )
         .unwrap();
     assert!(
-        meta.contains("\"project_memory_epoch_pending\":true"),
+        meta.contains("\"bootstrap_seed_fold_pending\":true"),
         "{meta}"
     );
     assert!(fixture.root.join("repair-backup/MANIFEST.tsv").exists());
@@ -600,7 +600,7 @@ fn repair_discards_typescript_memory_ids_with_the_cached_pair() {
         )
         .unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(&meta).unwrap()["project_memory_epoch_pending"],
+        serde_json::from_str::<Value>(&meta).unwrap()["bootstrap_seed_fold_pending"],
         true
     );
 }
