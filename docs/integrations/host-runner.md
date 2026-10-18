@@ -286,7 +286,7 @@ step. Other native failures (durability, store-ahead, transport and explicit
 provider refusal) retain their native error codes; they are not disguised as a
 full-request handoff.
 
-**Served bytes.** Within one lineage, every admitted message the bridge returned in
+**Served bytes.** Across all lineages of a session, every admitted message the bridge returned in
 its last view comes back byte for byte unless the step rebuilds history (the step
 is classified `rebuild`, or the module applies a new view). Even a rebuild may not
 put such a message back to the host's raw text. ck-mc rebuilds history from hook
@@ -294,7 +294,11 @@ answers whose delivery the host confirmed; while delivery stays pending
 (`served_through_ordinal` 0), a rebuild would render those messages raw, so `run()`
 refuses it with `bridge_served_bytes_changed` (`retryable: true`; nothing is
 committed). After `completeRequest` confirms a clean delivery, the same step renders
-the confirmed tags and is served.
+the confirmed tags and is served. Messages no longer in the host's history are not
+compared. The bridge saves the last served baseline atomically with its pending
+receipt in the existing store, so restarting an adapter does not clear this guard.
+Receipts written by older versions have no such snapshot; their baseline becomes
+durable on the first successful publication with the new adapter.
 
 ### OpenCode 1 measured usage is not an automatic bridge witness
 

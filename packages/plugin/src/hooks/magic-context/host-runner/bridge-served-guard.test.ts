@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { MessageLike } from "../transform-operations";
-import { checkServedBytes, servedView } from "./bridge-adapter";
 import type { BridgeReceipt } from "./bridge-receipt";
+import { checkServedBytes, servedView } from "./bridge-served-view";
 
 const receipt = (version: number, lineage = "L"): BridgeReceipt => ({
     request_id: "r",
@@ -72,7 +72,22 @@ describe("bridge served-bytes guard", () => {
         expect(run("rebuild", 7, dropped)).toBeUndefined();
     });
 
-    test("a new lineage is not compared with the old one", () => {
-        expect(run("ordinary", 3, [text("a2", "done")], "L2")).toBeUndefined();
+    test("a new lineage still refuses raw text and undeclared edits", () => {
+        expect(run("ordinary", 3, [text("a2", "done")], "L2")).toMatchObject(refused);
+        expect(run("ordinary", 3, [text("a2", "§1§ edited")], "L2")).toMatchObject(refused);
+        expect(run("rebuild", 9, [text("a2", "done")], "L2")).toMatchObject(refused);
+        expect(run("rebuild", 9, [text("a2", "[dropped §1§]")], "L2")).toBeUndefined();
+    });
+
+    test("messages absent from host history are not compared", () => {
+        expect(() =>
+            checkServedBytes(
+                previous,
+                receipt(3, "L2"),
+                "ordinary",
+                [text("a2", "done")],
+                [host[0]],
+            ),
+        ).not.toThrow();
     });
 });

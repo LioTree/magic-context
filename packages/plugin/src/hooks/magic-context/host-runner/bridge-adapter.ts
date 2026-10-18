@@ -24,13 +24,13 @@ import { SubcModuleTransport } from "../module-transport";
 import { hasRawMessageProvider } from "../read-session-chunk";
 import { createRustModeTransform } from "../rust-mode-transform";
 import type { TransformDeps } from "../transform";
-import type { MessageLike } from "../transform-operations";
 import { createBridgeDeps } from "./bridge-deps";
 import { createBridgeHostFacts } from "./bridge-host-facts";
 import { type BridgeMarkerOutcome, createBridgeReceiptStore } from "./bridge-marker";
 import { openCodeCutProblem, openCodeCutSources } from "./bridge-native-cut";
 import { providerUsageFromHostFact } from "./bridge-provider-usage";
 import type { BridgeReceipt, BridgeRequestCompletion } from "./bridge-receipt";
+import { checkServedBytes, type ServedView, servedView } from "./bridge-served-view";
 import { BridgeStep } from "./bridge-step";
 import {
     type BridgeAdapterOptions,
@@ -40,7 +40,6 @@ import {
     type BridgeOutcomeListener,
     BridgeRefusalError,
     type BridgeRunInput,
-    type BridgeStepKind,
     type BridgeView,
 } from "./bridge-types";
 import type { ProviderUsageInput } from "./fallback-admissibility";
@@ -49,65 +48,7 @@ import {
     createOpenCodeProviderTransform,
     isMagicContextHead,
     providerIncoming,
-    providerRevertsToRaw,
 } from "./opencode-adapter";
-
-/** The frozen messages of one returned view, keyed by message id: admitted host
- * messages only, not heads or still-running passthrough rows. The host may already
- * have sent these bytes to the provider. */
-export interface ServedView {
-    lineageId: string;
-    viewVersion?: number;
-    messages: Map<string, { bytes: string; message: MessageLike }>;
-}
-
-export function servedView(
-    receipt: BridgeReceipt,
-    messages: readonly MessageLike[],
-    ordinals: ReadonlyMap<string, number> | undefined,
-    through: number,
-): ServedView {
-    const frozen = new Map<string, { bytes: string; message: MessageLike }>();
-    for (const message of messages) {
-        const id = message.info?.id;
-        const ordinal = id ? ordinals?.get(id) : undefined;
-        if (!id || ordinal === undefined || ordinal > through) continue;
-        frozen.set(id, { bytes: JSON.stringify(message), message: structuredClone(message) });
-    }
-    return {
-        lineageId: receipt.lineage_id,
-        viewVersion: receipt.last_applied?.version,
-        messages: frozen,
-    };
-}
-
-/**
- * Fail closed before a view that rewrites already-served bytes reaches the host.
- * Within one lineage, a message the bridge returned before must come back byte for
- * byte, unless this step rebuilds history: the step was classified as a rebuild or
- * the module applied a new view. Even a rebuild may not put a message back to the
- * host's raw text after Magic Context had served it with tags or other hook edits;
- * that would send unmanaged history. Messages a compaction removed are not compared.
- */
-export function checkServedBytes(
-    previous: ServedView | undefined,
-    receipt: BridgeReceipt,
-    kind: BridgeStepKind,
-    next: readonly MessageLike[],
-    host: readonly MessageLike[],
-): void {
-    if (!previous || previous.lineageId !== receipt.lineage_id) return;
-    const rebuilt = kind === "rebuild" || receipt.last_applied?.version !== previous.viewVersion;
-    for (const message of next) {
-        const id = message.info?.id;
-        const before = id ? previous.messages.get(id) : undefined;
-        if (!before || before.bytes === JSON.stringify(message)) continue;
-        if (!rebuilt) throw new BridgeRefusalError("served_bytes_changed");
-        const raw = host.find((candidate) => candidate.info?.id === id);
-        if (raw && providerRevertsToRaw(before.message, message, providerIncoming(raw).read()))
-            throw new BridgeRefusalError("served_bytes_changed");
-    }
-}
 
 /** Own only the bridge's handles; importing the public subpath never loads this runtime. */
 export function createBridgeAdapter(options: BridgeAdapterOptions) {
@@ -272,32 +213,41 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             const pass = new BridgeStep(stepKind, startedAt);
             const output = { messages: [] as unknown[] };
             activeSessions.add(id);
+            let publication: { receipt: BridgeReceipt; snapshot: ServedView } | undefined;
             const running = observingSession.run(id, () =>
-                provider.runBudgeted(id, messages, output, meta, pass, () =>
+                provider.runBudgeted(id, messages, output, meta, pass, () => {
+                    const applied = provider.receipt(id);
                     checkServedBytes(
-                        served.get(id),
-                        provider.receipt(id),
+                        served.get(id) ?? nativeStore.served(),
+                        applied,
                         stepKind,
                         output.messages as BridgeView["messages"],
                         messages,
-                    ),
-                ),
+                    );
+                    const snapshot = servedView(
+                        applied,
+                        output.messages as BridgeView["messages"],
+                        provider.ordinals(id),
+                        provider.throughOrdinal(id),
+                    );
+                    // Persist the safety baseline with the view's staged writes. A
+                    // receipt-only or failed publication cannot protect a restart.
+                    pass.write(() => {
+                        const receipt = nativeStore.publish(
+                            applied,
+                            output.messages as BridgeView["messages"],
+                            provider.throughOrdinal(id),
+                            snapshot,
+                        );
+                        publication = { receipt, snapshot };
+                    });
+                }),
             );
             runs.add(running);
             try {
                 await running;
-                let receipt = provider.receipt(id);
-                try {
-                    receipt = createBridgeReceiptStore(db, id, harness).publish(
-                        receipt,
-                        output.messages as BridgeView["messages"],
-                        provider.throughOrdinal(id),
-                    );
-                } catch (error) {
-                    // The view is already durable and servable. An unpersisted pending
-                    // receipt cannot authorize a native cut or acknowledge delivery.
-                    sessionLog(id, "bridge receipt persistence deferred", error);
-                }
+                if (!publication) throw new Error("Bridge view was not durably published");
+                const { receipt, snapshot } = publication;
                 try {
                     published.set(id, {
                         requestId: receipt.request_id,
@@ -309,15 +259,7 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                     // Optional usage attribution must never reject a published view.
                     published.delete(id);
                 }
-                served.set(
-                    id,
-                    servedView(
-                        receipt,
-                        output.messages as BridgeView["messages"],
-                        provider.ordinals(id),
-                        provider.throughOrdinal(id),
-                    ),
-                );
+                served.set(id, snapshot);
                 return {
                     messages: output.messages as BridgeView["messages"],
                     kind: stepKind,

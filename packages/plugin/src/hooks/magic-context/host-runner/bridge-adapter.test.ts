@@ -1184,6 +1184,48 @@ describe("supported bridge constructor", () => {
         await ignoresAmbient.dispose();
         expect(process.env.MAGIC_CONTEXT_CONFIG_PATH).toBe("invalid-relative-path");
     });
+    test("failed served-baseline persistence refuses and rolls back the staged view and observers", async () => {
+        const options = fixture();
+        fakeModule();
+        const rows = [message("first")];
+        canonicalRows(rows);
+        const adapter = await createBridgeAdapter(options);
+        cleanups.push(() => adapter.dispose());
+        const first = await adapter.run({
+            sessionId: "session",
+            messages: rows.slice(),
+            kind: "model",
+        });
+        const db = new Database(options.dbPath);
+        cleanups.push(() => db.close());
+        const store = createBridgeReceiptStore(db, "session", "opencode");
+        expect([...store.served()!.messages.keys()]).toEqual(["first"]);
+        const originalRecord = runnerStorage.loadHostRunnerRecord(db, {
+            session_id: "session",
+            harness: "opencode",
+        })!;
+        db.exec(`CREATE TRIGGER refuse_served_snapshot BEFORE UPDATE ON host_runner_state
+            WHEN NEW.harness = 'bridge-receipt:opencode'
+            BEGIN SELECT RAISE(ABORT, 'served snapshot unavailable'); END`);
+        const observer = mock(() => {});
+        adapter.onOutcome(observer);
+        rows.push(message("second"));
+        await expect(
+            adapter.run({ sessionId: "session", messages: rows.slice(), kind: "model" }),
+        ).rejects.toThrow("served snapshot unavailable");
+        expect(store.current()).toEqual(first.receipt);
+        expect([...store.served()!.messages.keys()]).toEqual(["first"]);
+        const after = runnerStorage.loadHostRunnerRecord(db, {
+            session_id: "session",
+            harness: "opencode",
+        })!;
+        expect(after.entries).toEqual(originalRecord.entries);
+        expect(after.ids).toEqual(originalRecord.ids);
+        expect(after.state.next_ordinal).toBe(originalRecord.state.next_ordinal);
+        expect(observer).not.toHaveBeenCalled();
+        db.exec("DROP TRIGGER refuse_served_snapshot");
+    });
+
     test("full fake ck-mc run publishes the same view as the in-tree provider path and observes committed outcomes", async () => {
         const options = fixture();
         fakeModule();

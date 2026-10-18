@@ -226,7 +226,14 @@ export function providerIncoming(message: MessageLike): Incoming<MessageLike> {
             // LSP diagnostics are host UI data, not model input. Reuse replay's
             // model projection, plus the answer markers needed to prevent removal
             // of user answers, before the context module stores rows or views.
-            const visible = providerNativeMessage(message);
+            let visible = providerNativeMessage(message);
+            if (visible.info.role === "user" && "summary" in visible.info) {
+                // OpenCode fills user diff statistics asynchronously, even after
+                // a refused send. They are UI data, not a change to model input;
+                // retaining them makes a module-ahead retry conflict with itself.
+                const { summary: _summary, ...info } = visible.info;
+                visible = { ...visible, info };
+            }
             // Persist the projected identity in ingest as well as the hook. The
             // module can address the same part after a rebuild changes part order.
             let changed = false;

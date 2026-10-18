@@ -6,6 +6,7 @@ import {
     type BridgeRequestCompletion,
     completeBridgeReceipt,
 } from "./bridge-receipt";
+import type { ServedView } from "./bridge-served-view";
 import { sourceDigest } from "./record";
 
 export interface BridgeNativeTarget {
@@ -34,6 +35,9 @@ interface Saved {
     receipt: BridgeReceipt;
     through: number;
     digest: string;
+    served?: Omit<ServedView, "messages"> & {
+        messages: [string, { bytes: string; message: MessageLike }][];
+    };
     cut?: { target: BridgeNativeTarget; state: "unknown" | "applied"; native?: BridgeNativeCut };
 }
 
@@ -70,10 +74,15 @@ export function createBridgeReceiptStore(db: Database, sessionId: string, harnes
         current(): BridgeReceipt | undefined {
             return read()?.receipt;
         },
+        served(): ServedView | undefined {
+            const snapshot = read()?.served;
+            return snapshot ? { ...snapshot, messages: new Map(snapshot.messages) } : undefined;
+        },
         publish(
             receipt: BridgeReceipt,
             messages: readonly MessageLike[],
             through: number,
+            served?: ServedView,
         ): BridgeReceipt {
             return db
                 .transaction(() => {
@@ -91,6 +100,7 @@ export function createBridgeReceiptStore(db: Database, sessionId: string, harnes
                         receipt: pending,
                         through,
                         digest: sourceDigest(JSON.stringify(messages)),
+                        served: served ? { ...served, messages: [...served.messages] } : undefined,
                         cut: previous?.cut,
                     });
                     return pending;
