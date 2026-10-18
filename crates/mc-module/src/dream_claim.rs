@@ -30,16 +30,26 @@ impl McHandler {
         self.dream_children.clone()
     }
 
-    /// The bound route and its project key, once the route passed the checks every
-    /// dream route applies: a plugin route, or a principal-bearing route that
-    /// `providers` admits as the attested harness module.
+    /// Resolve the bound project after checking the v1 envelope and admitting
+    /// either a principal-less plugin route or a daemon-attested harness route.
     fn dream_lane(
         &self,
         channel: u16,
         request: &Value,
         method: &str,
     ) -> Result<(SessionBinding, String), HandlerOutcome> {
-        let binding = self.historian_lane_binding(channel, request, method)?;
+        if request.get("v").and_then(Value::as_u64) != Some(1) {
+            return Err(HandlerOutcome::Error {
+                code: "bad_request".into(),
+                message: format!("{method} requires v=1"),
+            });
+        }
+        let binding = self
+            .facade_binding(channel)
+            .map_err(|_| HandlerOutcome::Error {
+                code: "route_unbound".into(),
+                message: format!("{method} on a channel with no session binding"),
+            })?;
         if binding.principal.is_some() {
             providers::admit_host_lane(&binding)
                 .and_then(|()| providers::admit_harness_module(&binding))?;

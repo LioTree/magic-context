@@ -1138,38 +1138,21 @@ describe("magic-context hook", () => {
         }
     });
 
-    // The message-triggered scheduled path reads ck-mc's published list when the
-    // switch is on, and leaves exactly the published task to Rust.
-    for (const owned of [true, false]) {
-        it(`scheduled dreaming ${owned ? "leaves" : "runs"} classify ${owned ? "to" : "without"} ck-mc`, async () => {
+    // This hook has no module client. The background switch alone cannot exclude
+    // TS tasks; the shared dream-domain lease still arbitrates with a Rust host.
+    for (const enabled of [true, false]) {
+        it(`scheduled dreaming runs classify without a module client when Rust background is ${enabled ? "on" : "off"}`, async () => {
             process.env.XDG_DATA_HOME = makeTempDir("hook-classify-ownership-scheduled-");
             const promptMocks = createPromptMocks();
             const deps = createMockDeps(promptMocks);
             deps.directory = "/repo/ownership";
             deps.config = {
                 ...deps.config,
-                transform_mode: "rust",
-                rust_background_enabled: true,
+                rust_background_enabled: enabled,
                 dreamer: {
                     tasks: {
                         "classify-memories": { schedule: "0 3 * * *", timeout_minutes: 10 },
                     },
-                },
-            } as never;
-            const methods: string[] = [];
-            deps.rustModeModuleClient = {
-                authorityStatus: async () => ({ authority: { state: "MODULE", generation: 4 } }),
-                call: async (args: { method: string }) => {
-                    methods.push(args.method);
-                    if (args.method === "dream.ownership") {
-                        return {
-                            ok: true,
-                            v: 1,
-                            activated: true,
-                            published: owned ? ["classify-memories"] : [],
-                        };
-                    }
-                    throw new Error(`unexpected module call ${args.method}`);
                 },
             } as never;
             const originalDateNow = Date.now;
@@ -1177,7 +1160,6 @@ describe("magic-context hook", () => {
             try {
                 const hook = requireHook(createMagicContextHook(deps));
                 const db = openDatabase();
-                ensureContextStoreUuid(db);
                 const projectPath = resolveProjectIdentity("/repo/ownership");
                 const due = Date.now() - 1000;
                 insertMemory(db, {
@@ -1218,20 +1200,12 @@ describe("magic-context hook", () => {
                         .get(projectPath) as { next_due_at: number; last_status: string | null };
                 for (
                     let attempt = 0;
-                    attempt < 400 && (owned ? methods.length === 0 : row().last_status === null);
+                    attempt < 400 && row().last_status === null;
                     attempt += 1
                 ) {
                     await new Promise((resolve) => setTimeout(resolve, 5));
                 }
-                // Let the owned pass finish whatever it would still do.
-                await new Promise((resolve) => setTimeout(resolve, 20));
-                expect(methods[0]).toBe("dream.ownership");
-                if (owned) {
-                    expect(methods).toEqual(["dream.ownership"]);
-                    expect(row()).toEqual({ next_due_at: due, last_status: null });
-                } else {
-                    expect(row().last_status).not.toBeNull();
-                }
+                expect(row().last_status).not.toBeNull();
             } finally {
                 Date.now = originalDateNow;
             }

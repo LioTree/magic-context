@@ -91,16 +91,14 @@ impl McStore {
         self.commit_dream_verify(project, batch, VerifyBatchKind::Expiry, now_ms, check_commit_fence, |tx, accepted| {
             for row in accepted {
                 let id = row.memory.id;
-                let before = snapshot_json(tx, id)?;
                 let result = crate::with_automated_memory_mutation_tx(tx, |writer| writer.expire_memories(project, &[id], now_ms))
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error))))?;
                 if result.accepted != [id] { return Err(rusqlite::Error::InvalidQuery); }
-                let after = snapshot_json(tx, id)?;
-                let key = format!("expired:{id}:{}", row.revision);
-                tx.execute("UPDATE memory_history SET before_json=?1,after_json=?2 WHERE decision_key=?3 AND memory_id=?4", params![before, after, key, id])?;
+                // The shared automated writer already records the versioned undo
+                // decision and journal. Add only the replay receipt and queue effect.
+                let key = format!("expire:{id}:{}", row.revision);
                 let receipt = serde_json::json!({"state":"applied","reason":"expired","memoryId":id,"adoptionClass":"deferred"}).to_string();
                 tx.execute("INSERT INTO memory_decision_receipts(decision_key,project_path,receipt_json,resolved_at) VALUES(?1,?2,?3,?4)", params![key, project, receipt, now_ms])?;
-                tx.execute("INSERT INTO memory_journal(project_path,decision_key,operation,receipt_json,before_json,after_json,applied_at) VALUES(?1,?2,'expire',?3,?4,?5,?6)", params![project, key, receipt, format!("[{before}]"), format!("[{after}]"), now_ms])?;
                 let memory = load_memory_full_tx(tx, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
                 enqueue(tx, &memory)?;
             }
@@ -165,27 +163,4 @@ impl McStore {
             },
         )
     }
-}
-
-// Preserve every persisted memory column in undo units, including columns not
-// represented by StoredMemoryFull, rather than reconstructing a partial row.
-fn snapshot_json(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<String> {
-    let statement = conn.prepare("SELECT * FROM memories LIMIT 0")?;
-    let fields = statement
-        .column_names()
-        .iter()
-        .map(|name| {
-            format!(
-                "'{}',\"{}\"",
-                name.replace('\'', "''"),
-                name.replace('"', "\"\"")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    conn.query_row(
-        &format!("SELECT json_object({fields}) FROM memories WHERE id=?1"),
-        [id],
-        |row| row.get(0),
-    )
 }

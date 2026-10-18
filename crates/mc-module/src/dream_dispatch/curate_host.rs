@@ -324,9 +324,6 @@ impl TaskToolRouter for CurateRouter {
         // Every edit commits with its memory_history row and revision bump, the same
         // rows the TypeScript dreamer writes (see
         // curate_update_merge_archive_history_matches_the_typescript_dreamer).
-        // Integration debt: when parity-w3 merges into the train, add a test that
-        // undoes a Rust curate edit (update, merge, archive) through the train's
-        // audited undo.
         let applied = self.store.commit_dream_curate(&ctx.scope.project.0, &key, &expected, |tx| self.check_commit_fence(tx), |tx| {
             let replay: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM memory_decision_receipts WHERE decision_key=?1)", [&key], |r| r.get(0))?;
             let reply = state.actions.execute_tx(tx, &EmbeddingQueue, &MemoryActionContext {
@@ -383,6 +380,7 @@ impl TaskToolRouter for CurateRouter {
 
 #[cfg(test)]
 mod tests {
+    mod undo;
     use super::*;
     use crate::dream_dispatch::context::{
         Cancellation, CapturedConfig, ChildEvent, Clock, TaskControl,
@@ -655,10 +653,10 @@ mod tests {
         assert_eq!(requests[0].allowed_tools, ["ctx_memory"]);
         assert!(requests[0].prompt.contains("Architecture entry 1"));
         assert!(!requests[0].prompt.contains("Architecture entry 7"));
-        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_history WHERE before_json IS NOT NULL AND after_json IS NOT NULL"), 5);
-        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_history WHERE json_extract(before_json,'$.revision')=1 AND json_extract(after_json,'$.revision')=2 AND json_extract(before_json,'$.content')=previous_text AND json_extract(after_json,'$.content')=after_text"), 5);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_history WHERE before_json IS NOT NULL AND after_json IS NOT NULL"), 6);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_history WHERE json_extract(before_json,'$.snapshot.revision')=1 AND json_extract(after_json,'$.snapshot.revision')=2 AND json_extract(before_json,'$.snapshot.content')=previous_text AND json_extract(after_json,'$.snapshot.content')=after_text"), 5);
         assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_journal"), 3);
-        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_journal WHERE operation='curate_merge' AND json_array_length(before_json)=3 AND json_type(before_json,'$[2]')='null' AND json_array_length(after_json)=3"), 1);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_journal WHERE operation='curate_merge' AND json_array_length(before_json,'$.rows')=3 AND json_type(before_json,'$.rows[2].before')='null' AND json_array_length(after_json,'$.rows')=3"), 1);
         assert_eq!(
             f.scalar("SELECT COUNT(*) FROM memories WHERE status='archived'"),
             4
@@ -716,7 +714,7 @@ mod tests {
             f.scalar("SELECT COUNT(*) FROM memory_history WHERE memory_id=1"),
             0
         );
-        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_history"), 4);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_history"), 5);
     }
 
     #[tokio::test]
@@ -841,7 +839,7 @@ mod tests {
             .unwrap();
         let (mut replay, _) = f.host(Fixture::operations(), None);
         replay.run().await.unwrap();
-        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_history"), 5);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_history"), 6);
         assert_eq!(f.scalar("SELECT revision FROM memories WHERE id=1"), 2);
         assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_journal"), 3);
         assert_eq!(f.state(), json!({"curate":{"cursor":2}}));
@@ -883,7 +881,7 @@ mod tests {
             ),
             2
         );
-        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_history WHERE json_extract(before_json,'$.future_assessment')='critical' AND json_extract(after_json,'$.future_assessment')='critical'"), 2);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_history WHERE json_extract(before_json,'$.snapshot.future_assessment')='critical' AND json_extract(after_json,'$.snapshot.future_assessment')='critical'"), 2);
         assert_eq!(f.scalar("SELECT COUNT(*) FROM memories WHERE id=2 AND status='active' AND future_assessment='critical'"), 1);
     }
 

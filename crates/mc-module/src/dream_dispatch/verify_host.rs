@@ -693,7 +693,7 @@ mod tests {
             store.with_context_conn_for_test(|tx| {
                 for id in 1..=4 {
                     let content = format!("Memory {id} describes implementation in lib.rs");
-                    tx.execute("INSERT INTO memories(id,project_path,category,content,normalized_hash,source_session_id,first_seen_at,created_at,updated_at,last_seen_at) VALUES(?1,?2,'PROJECT',?3,?4,'source',1,1,1,1)", params![id, if id==4 {"foreign"} else {"project"}, content, mc_store::compute_normalized_memory_hash(&content)])?;
+                    tx.execute("INSERT INTO memories(id,project_path,category,content,normalized_hash,source_session_id,first_seen_at,created_at,updated_at,last_seen_at) VALUES(?1,?2,'PROJECT_RULES',?3,?4,'source',1,1,1,1)", params![id, if id==4 {"foreign"} else {"project"}, content, mc_store::compute_normalized_memory_hash(&content)])?;
                     tx.execute("INSERT INTO memory_verifications(memory_id,file_path,verified_at,mapped_at,mapping_origin) VALUES(?1,'lib.rs',0,1,'mapper')", [id])?;
                     tx.execute("INSERT INTO memory_embeddings(memory_id,embedding,model_id) VALUES(?1,?2,'model')", params![id,vec![0_u8;8]])?;
                 }
@@ -832,12 +832,13 @@ mod tests {
             2
         );
         fixture.store.with_context_read(|db| {
-            let (before_json, after_json): (String, String) = db.query_row("SELECT before_json,after_json FROM memory_journal WHERE decision_key='expired:1:1'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let (before_json, after_json): (String, String) = db.query_row("SELECT before_json,after_json FROM memory_journal WHERE decision_key='expire:1:1'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
             let saved_before: serde_json::Value = serde_json::from_str(&before_json).unwrap();
             let saved_after: serde_json::Value = serde_json::from_str(&after_json).unwrap();
-            assert_eq!(saved_before, json!([before]));
+            assert_eq!(saved_before["rows"][0]["before"], mc_store::memory_history::normalize_snapshot(&before, Some(1)).unwrap());
             let after = memory_row(db, 1);
-            assert_eq!(saved_after, json!([after]));
+            assert_eq!(saved_after, saved_before);
+            assert_eq!(saved_after["rows"][0]["after"], mc_store::memory_history::normalize_snapshot(&after, Some(2)).unwrap());
             assert_eq!(after["status"], "archived");
             assert_eq!(after["revision"], 2);
             assert_eq!(after["content"], before["content"]);

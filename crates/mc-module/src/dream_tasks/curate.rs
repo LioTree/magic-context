@@ -933,7 +933,7 @@ mod tests {
         );
         assert_eq!(
             rows(&carrier.conn, "SELECT COUNT(*) AS n FROM memory_history"),
-            json!([{"n":4}])
+            json!([{"n":5}])
         );
         assert_eq!(
             rows(
@@ -1243,10 +1243,6 @@ mod tests {
     /// memory revisions, status and successor links, and history rows carrying the
     /// before/after snapshots an undo restores from. The golden comes from the
     /// TypeScript tool (`gen/gen-curate-history-golden.ts`).
-    ///
-    /// Integration debt: when parity-w3 merges into the train, add a test that
-    /// undoes a Rust curate edit (update, merge, archive) through the train's
-    /// audited undo; this branch has no memory undo API.
     #[test]
     fn curate_update_merge_archive_history_matches_the_typescript_dreamer() {
         let vectors: Vec<Value> = serde_json::from_str(include_str!(
@@ -1423,13 +1419,13 @@ mod tests {
             .unwrap();
         let after = rows(&conn, "SELECT * FROM memories ORDER BY id");
         let history = rows(&conn, "SELECT * FROM memory_history ORDER BY id");
-        assert_eq!(history.as_array().unwrap().len(), 4);
+        assert_eq!(history.as_array().unwrap().len(), 5);
         for (index, id, old, new, reason) in [
             (0, 1, "Limit is 12.", "Limit is 16.", "measured limit"),
             (1, 1, "Limit is 16.", "Limit is 16.", "duplicate facts"),
             (2, 2, "Limit is 24.", "Limit is 24.", "duplicate facts"),
             (
-                3,
+                4,
                 3,
                 "Limit is 48.",
                 "Limit is 48.",
@@ -1443,6 +1439,10 @@ mod tests {
             assert_eq!(row["reason"], reason);
             let prior: Value = serde_json::from_str(row["before_json"].as_str().unwrap()).unwrap();
             let next: Value = serde_json::from_str(row["after_json"].as_str().unwrap()).unwrap();
+            assert_eq!(prior["version"], 1);
+            assert_eq!(next["version"], 1);
+            let prior = &prior["snapshot"];
+            let next = &next["snapshot"];
             assert_eq!(prior["id"], id);
             assert_eq!(next["id"], id);
             assert_eq!(prior["content"], old);
@@ -1459,16 +1459,28 @@ mod tests {
         let merge_after: Value =
             serde_json::from_str(journal[1]["after_json"].as_str().unwrap()).unwrap();
         assert_eq!(journal[1]["operation"], "curate_merge");
-        assert_eq!(merge_before.as_array().unwrap().len(), 3);
-        assert_eq!(merge_before[0]["content"], "Limit is 16.");
-        assert_eq!(merge_before[1], before[1]);
+        assert_eq!(merge_before["rows"].as_array().unwrap().len(), 3);
+        assert_eq!(merge_before["rows"][0]["before"]["content"], "Limit is 16.");
+        assert_eq!(
+            merge_before["rows"][1]["before"],
+            mc_store::memory_history::normalize_snapshot(&before[1], None).unwrap()
+        );
         assert!(
-            merge_before[2].is_null(),
+            merge_before["rows"][2]["before"].is_null(),
             "the new survivor did not exist before this unit"
         );
-        assert_eq!(merge_after[0], after[0]);
-        assert_eq!(merge_after[1], after[1]);
-        assert_eq!(merge_after[2], after[3]);
+        assert_eq!(merge_after, merge_before);
+        for (index, row) in [0, 1, 3].into_iter().enumerate() {
+            assert_eq!(
+                merge_after["rows"][index]["after"],
+                mc_store::memory_history::normalize_snapshot(&after[row], None).unwrap()
+            );
+        }
+        assert_eq!(history[3]["memory_id"], 4);
+        assert_eq!(history[3]["revision"], 0);
+        let survivor_before: Value =
+            serde_json::from_str(history[3]["before_json"].as_str().unwrap()).unwrap();
+        assert!(survivor_before["snapshot"].is_null());
         let effects = rows(&conn, "SELECT effect_json FROM test_embedding_queue");
         assert_eq!(effects.as_array().unwrap().len(), 5);
         let effect_kinds: Vec<_> = effects

@@ -101,8 +101,9 @@ fn manifest_before_participant(
         crate::prompt_surface::disable_smart_notes_in_tools(&mut tools, PromptSurfacePreset::Full);
     }
     // Reproduce the pre-agent-data manifest, which registered only the model
-    // tools and provider roles (source revision 47486760). Pin its route list
-    // independently so an extra disabled route cannot change both manifests.
+    // tools and provider roles. Synapse is consumed by non-served retrieval,
+    // independently of agent-data activation. Pin the route list independently
+    // so a disabled agent-data route cannot change both manifests.
     let mut targets = vec!["thalamus".to_string()];
     for id in [
         config.runner_module_id(),
@@ -115,6 +116,7 @@ fn manifest_before_participant(
             targets.push(id.to_string());
         }
     }
+    targets.push("synapse".into());
     ModuleManifest::builder(
         DEFAULT_MODULE_ID.to_string(),
         env!("CARGO_PKG_VERSION").to_string(),

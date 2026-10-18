@@ -475,7 +475,7 @@ async fn a_curate_edit_runs_through_the_task_router_with_history_and_revisions()
     );
     // The audited history row holds everything needed to restore the prior text.
     assert_eq!(
-        p.scalar("SELECT COUNT(*) FROM memory_history WHERE memory_id=1 AND revision=1 AND previous_text='ARCHITECTURE entry 1 describes one durable fact.' AND json_extract(before_json,'$.content')=previous_text AND json_extract(after_json,'$.revision')=2"),
+        p.scalar("SELECT COUNT(*) FROM memory_history WHERE memory_id=1 AND revision=1 AND previous_text='ARCHITECTURE entry 1 describes one durable fact.' AND json_extract(before_json,'$.snapshot.content')=previous_text AND json_extract(after_json,'$.snapshot.revision')=2"),
         1
     );
     assert_eq!(p.scalar("SELECT COUNT(*) FROM memory_journal"), 1);

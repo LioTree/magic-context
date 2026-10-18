@@ -42,23 +42,27 @@ fn set(tx: &Transaction<'_>, key: &str, value: &str) -> rusqlite::Result<()> {
 
 /// An older memory action cannot decide how a future assessment combines across
 /// sources. Refuse a merge rather than silently dropping opaque source data from
-/// its canonical row. The action's full snapshots also cover columns unknown to
-/// this binary; no memory rows are reconstructed or updated by this check.
-fn require_lossless_merge_tx(tx: &Transaction<'_>, decision: &str) -> rusqlite::Result<()> {
-    let journal = tx.query_row("SELECT before_json,after_json,receipt_json FROM memory_journal WHERE decision_key=?1 AND operation='curate_merge'", [decision], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))).optional()?;
-    let Some((before, after, receipt)) = journal else {
+/// its canonical row. Capture full rows separately from the versioned canonical
+/// undo snapshots, so this check still covers columns unknown to this binary.
+fn require_lossless_merge_tx(
+    tx: &Transaction<'_>,
+    decision: &str,
+    before: &[Value],
+) -> rusqlite::Result<()> {
+    let journal = tx.query_row("SELECT receipt_json FROM memory_journal WHERE decision_key=?1 AND operation='curate_merge'", [decision], |r| r.get::<_, String>(0)).optional()?;
+    let Some(receipt) = journal else {
         return Ok(());
     };
     let parse =
         |raw: &str| serde_json::from_str::<Value>(raw).map_err(|_| rusqlite::Error::InvalidQuery);
-    let before = parse(&before)?;
-    let after = parse(&after)?;
     let receipt = parse(&receipt)?;
-    let canonical = after
-        .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["id"] == receipt["memoryId"]))
-        .and_then(Value::as_object)
-        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let canonical = full_snapshot(
+        tx,
+        receipt["memoryId"]
+            .as_i64()
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+    )?;
+    let canonical = canonical.as_object().ok_or(rusqlite::Error::InvalidQuery)?;
     let known = serde_json::to_value(StoredMemoryFull::default())
         .map_err(|_| rusqlite::Error::InvalidQuery)?;
     let compatible_metadata = |source: &Value, target: &Value| {
@@ -80,12 +84,7 @@ fn require_lossless_merge_tx(tx: &Transaction<'_>, decision: &str) -> rusqlite::
             _ => source == target,
         }
     };
-    for source in before
-        .as_array()
-        .ok_or(rusqlite::Error::InvalidQuery)?
-        .iter()
-        .filter_map(Value::as_object)
-    {
+    for source in before.iter().filter_map(Value::as_object) {
         for (column, value) in source {
             let understood = known.get(column).is_some()
                 || matches!(
@@ -108,6 +107,32 @@ fn require_lossless_merge_tx(tx: &Transaction<'_>, decision: &str) -> rusqlite::
         }
     }
     Ok(())
+}
+
+fn full_snapshot(tx: &Transaction<'_>, id: i64) -> rusqlite::Result<Value> {
+    let statement = tx.prepare("SELECT * FROM memories LIMIT 0")?;
+    let fields = statement
+        .column_names()
+        .iter()
+        .map(|name| {
+            format!(
+                "'{}',\"{}\"",
+                name.replace('\'', "''"),
+                name.replace('"', "\"\"")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let raw: Option<String> = tx
+        .query_row(
+            &format!("SELECT json_object({fields}) FROM memories WHERE id=?1"),
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    raw.map(|s| serde_json::from_str(&s).map_err(|_| rusqlite::Error::InvalidQuery))
+        .transpose()
+        .map(|v| v.unwrap_or(Value::Null))
 }
 
 impl McStore {
@@ -178,8 +203,9 @@ impl McStore {
                 }
                 if !stale.is_empty() { return Ok(CurateEdit::Stale(stale)); }
             }
+            let before = expected.iter().map(|(id, _)| full_snapshot(tx, *id)).collect::<rusqlite::Result<Vec<_>>>()?;
             let result = apply(tx)?;
-            require_lossless_merge_tx(tx, decision_key)?;
+            if !replay { require_lossless_merge_tx(tx, decision_key, &before)?; }
             Ok(CurateEdit::Applied(result))
         })
     }

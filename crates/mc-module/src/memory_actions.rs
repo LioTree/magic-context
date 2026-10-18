@@ -87,6 +87,16 @@ pub struct MemoryActionArgs {
     pub superseded_by: Option<i64>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppliedMutationReceipt<'a> {
+    state: &'a str,
+    reason: &'a str,
+    memory_id: i64,
+    adoption_class: &'a str,
+    superseded_ids: &'a [i64],
+}
+
 /// Counts curate safety refusals separately for each session, so a reply's running
 /// refusal count never includes another session's rejected edits.
 #[derive(Default)]
@@ -168,28 +178,29 @@ fn load(conn: &Connection, id: i64) -> rusqlite::Result<Option<Value>> {
     })
     .optional()
 }
-// History records must retain byte-compatible before/after snapshots with the
-// TypeScript writer, whose SELECT * snapshots use schema order rather than the
-// sorted field order of a serde_json object.
-fn snapshot_json(conn: &Connection, id: i64) -> rusqlite::Result<String> {
-    let stmt = conn.prepare("SELECT * FROM memories LIMIT 0")?;
-    let fields = stmt
-        .column_names()
-        .iter()
-        .map(|name| {
-            format!(
-                "'{}',\"{}\"",
-                name.replace('\'', "''"),
-                name.replace('"', "\"\"")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    conn.query_row(
-        &format!("SELECT json_object({fields}) FROM memories WHERE id=?1"),
-        [id],
-        |r| r.get(0),
-    )
+fn history_error(error: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+}
+
+fn history_snapshot(conn: &Connection, id: i64) -> rusqlite::Result<Option<Value>> {
+    let mut snapshot = mc_store::memory_history::snapshot(conn, id).map_err(history_error)?;
+    // The audited schema has a fixed canonical core. Retain future opaque columns
+    // too, without changing the core fields the shared restore planner understands.
+    if let (Some(snapshot), Some(row)) = (snapshot.as_mut(), load(conn, id)?) {
+        let known =
+            serde_json::to_value(mc_store::StoredMemoryFull::default()).map_err(json_error)?;
+        for (column, value) in row.as_object().ok_or(rusqlite::Error::InvalidQuery)? {
+            if known.get(column).is_none()
+                && !matches!(
+                    column.as_str(),
+                    "revision" | "verify_result" | "verify_files_json" | "verify_commit"
+                )
+            {
+                snapshot[column] = value.clone();
+            }
+        }
+    }
+    Ok(snapshot)
 }
 fn visible(row: &Value, ctx: &MemoryActionContext<'_>) -> bool {
     row["project_path"] == ctx.project_path
@@ -508,9 +519,9 @@ impl MemoryActions {
         }
         // Every source is validated before the first write. BEGIN IMMEDIATE keeps
         // the revisions stable until all history and queue rows are committed.
-        let before_json = ids
+        let mut before = ids
             .iter()
-            .map(|id| snapshot_json(tx, *id))
+            .map(|id| history_snapshot(tx, *id))
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for row in &sources {
             tx.execute(
@@ -635,23 +646,34 @@ impl MemoryActions {
             }
             _ => unreachable!(),
         }
-        let mut after_json = Vec::new();
-        for (index, source) in sources.iter().enumerate() {
+        let mut after = Vec::new();
+        for source in &sources {
             let id = number(source, "id");
-            let row = load(tx, id)?.unwrap();
-            let raw = snapshot_json(tx, id)?;
-            let reason = args.reason.clone().unwrap_or_else(|| {
-                format!("{}_{action}", if dreamer { "curate" } else { "ctx_memory" })
-            });
-            tx.execute("INSERT INTO memory_history(memory_id,revision,previous_text,after_text,before_json,after_json,applied_at,reason,evidence_json,source_ids_json,decision_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'[]',?9,?10)",
-                params![id,number(source,"revision"),text(source,"content"),text(&row,"content"),before_json[index],raw,ctx.now_ms,reason,json!(ids).to_string(),ctx.decision_key])?;
-            after_json.push(raw);
+            after.push(history_snapshot(tx, id)?.ok_or(rusqlite::Error::InvalidQuery)?);
         }
-        let mut before_json = before_json;
         if let Some(id) = canonical.filter(|id| !ids.contains(id)) {
-            before_json.push("null".into());
-            after_json.push(snapshot_json(tx, id)?);
+            before.push(None);
+            after.push(history_snapshot(tx, id)?.ok_or(rusqlite::Error::InvalidQuery)?);
         }
+        let writer = if dreamer { "curate" } else { "ctx_memory" };
+        let reason = args
+            .reason
+            .clone()
+            .unwrap_or_else(|| format!("{writer}_{action}"));
+        let decision = mc_store::memory_history::decision(
+            ctx.decision_key,
+            ctx.project_path,
+            writer,
+            action,
+            &reason,
+            ctx.now_ms,
+            &before,
+            &after,
+            &ids,
+            if action == "merge" { canonical } else { None },
+            json!([]),
+        );
+        mc_store::memory_history::record_decision(tx, &decision).map_err(history_error)?;
         let reply = match action {
             "update" => format!("Updated memory [ID: {}] in {category}.",ids[0]),
             "merge" => format!("Merged memories [{}] into canonical memory [ID: {}] in {category}; superseded [{}].",ids_text(&ids),canonical.unwrap(),ids_text(&superseded)),
@@ -673,9 +695,21 @@ impl MemoryActions {
                 content,
             )?;
         }
-        let receipt = json!({"state":"applied","reason":action,"memoryId":canonical.unwrap_or(ids[0]),"adoptionClass":if dreamer {"deferred"} else {"live"},"supersededIds":superseded});
-        save_receipt(tx, ctx, args, receipt.clone(), &reply)?;
-        tx.execute("INSERT INTO memory_journal(project_path,decision_key,operation,receipt_json,before_json,after_json,applied_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![ctx.project_path,ctx.decision_key,format!("{}_{action}",if dreamer {"curate"} else {"ctx_memory"}),receipt.to_string(),format!("[{}]",before_json.join(",")),format!("[{}]",after_json.join(",")),ctx.now_ms])?;
+        let receipt = AppliedMutationReceipt {
+            state: "applied",
+            reason: action,
+            memory_id: canonical.unwrap_or(ids[0]),
+            adoption_class: if dreamer { "deferred" } else { "live" },
+            superseded_ids: &superseded,
+        };
+        save_receipt(
+            tx,
+            ctx,
+            args,
+            serde_json::to_value(&receipt).map_err(json_error)?,
+            &reply,
+        )?;
+        tx.execute("INSERT INTO memory_journal(project_path,decision_key,operation,receipt_json,before_json,after_json,applied_at) VALUES(?1,?2,?3,?4,?5,?5,?6)",params![ctx.project_path,ctx.decision_key,format!("{writer}_{action}"),serde_json::to_string(&receipt).map_err(json_error)?,mc_store::memory_history::canonical_json(&decision),ctx.now_ms])?;
         Ok(reply)
     }
 
