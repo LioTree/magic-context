@@ -506,6 +506,55 @@ export function planPiProactiveThinkingStrip(args: {
 	return { entryIds };
 }
 
+/** Prepare the ledger merge before BEGIN; the lane only executes its CAS write. */
+export function preparePiThinkingStripWrite(
+	db: ContextDatabase,
+	sessionId: string,
+	plan: { entryIds: readonly string[] } | null,
+): () => void {
+	if (!plan)
+		return () => {
+			throw new Error(
+				"Cannot persist thinking omission without a stable entry id",
+			);
+		};
+	const row = db
+		.prepare(
+			"SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?",
+		)
+		.get(sessionId) as
+		| { merged_reasoning_stripped_ids: string | null }
+		| undefined;
+	const raw = row?.merged_reasoning_stripped_ids ?? null;
+	let stored: unknown;
+	try {
+		stored = raw ? JSON.parse(raw) : [];
+	} catch {
+		stored = [];
+	}
+	const ids = new Set<string>(
+		Array.isArray(stored)
+			? stored.filter((id): id is string => typeof id === "string")
+			: [],
+	);
+	for (const id of plan.entryIds) ids.add(thinkingBindingRecoveryFrozenId(id));
+	for (const id of plan.entryIds) ids.add(piThinkingOmissionOrderId(id, "end"));
+	const next = JSON.stringify([...ids]);
+	return () => {
+		const result = db
+			.prepare(
+				"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ? AND merged_reasoning_stripped_ids IS ?",
+			)
+			.run(next, sessionId, raw);
+		// A peer changed the ledger after planning. Refuse this lane rather than
+		// overwrite the peer's choices or rerun a pipeline that allocated tags.
+		if (!(result.changes > 0))
+			throw new Error(
+				"Thinking omission plan changed before its edit committed",
+			);
+	};
+}
+
 /**
  * Refuse an omission set that would leave a kept thinking block before an
  * omitted one. On its own the provider accepts removing thinking only from the

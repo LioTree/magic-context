@@ -2245,6 +2245,14 @@ export async function runPostTransformPhase(
             .filter((id) => id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX))
             .map((id) => id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length)),
     );
+    // Existing binding omissions never need another companion decision. Keep
+    // their session-wide scan outside every lane's write transaction.
+    const companionCandidates = args.messages.filter(
+        (message) =>
+            message.info.role === "assistant" &&
+            (!message.info.id || !savedBindings.has(message.info.id)) &&
+            !protectedThinkingMessages.has(message),
+    );
     const companionPreview = companionEnabled
         ? args.messages.map((message) => ({ ...message, parts: [...message.parts] }))
         : [];
@@ -2264,6 +2272,7 @@ export async function runPostTransformPhase(
         (companionEnabled ? args.messages : []).map((message, index) => [message, index]),
     );
     let companionBoundary: { message: number; part: number } | undefined;
+    const companionTargets = new Set<string | undefined>();
     for (const [index, message] of (companionEnabled ? args.messages : []).entries()) {
         if (protectedThinkingMessages.has(message) || message.info.role !== "assistant") continue;
         for (const [partIndex, part] of message.parts.entries())
@@ -2272,8 +2281,10 @@ export async function runPostTransformPhase(
                 isRecord(part) &&
                 part.ignored !== true &&
                 ["reasoning", "thinking", "redacted_thinking"].includes(String(part.type))
-            )
+            ) {
                 companionBoundary = { message: index, part: partIndex };
+                companionTargets.add(message.info.id);
+            }
     }
     const precedesCompanionThinking = (message: MessageLike, part: number): boolean => {
         const index = companionOrder.get(message);
@@ -2294,7 +2305,7 @@ export async function runPostTransformPhase(
         const outcome = freezeReasoningOnBustingPass({
             db: args.db,
             sessionId: args.sessionId,
-            messages: args.messages,
+            messages: companionCandidates,
             protectedMessages: protectedThinkingMessages,
             alreadyFrozen,
         });
@@ -3150,6 +3161,16 @@ export async function runPostTransformPhase(
         needs: (result: T) => boolean = firstEditPrecedesThinking,
     ): T => {
         if (!prefixBoundModel || activeThinkingPrefixHold) return edit();
+        // Earlier lanes may already have committed every required omission.
+        // Their edit remains durable if a later lane fails, so replay and final
+        // representation need no companion writer of their own in that case.
+        const committed = getMergedReasoningStrippedIds(args.db, args.sessionId);
+        if (
+            [...companionTargets].every(
+                (id) => id && committed.has(thinkingBindingRecoveryFrozenId(id)),
+            )
+        )
+            return edit();
         const restore = [
             snapshotPendingMaterialization(args.pendingMaterializationSessions, args.sessionId),
             snapshotPendingMaterialization(args.deferredMaterializationSessions, args.sessionId),
@@ -3224,6 +3245,25 @@ export async function runPostTransformPhase(
         clearSystemPromptEdit(args.pendingMaterializationSessions, args.sessionId);
     }
     try {
+        const applyPending = () =>
+            applyPendingOperations(
+                args.sessionId,
+                args.db,
+                newTargets,
+                new Set([
+                    ...(args.contextUsage.percentage >= 95 ? [] : args.protectedTagIds),
+                    ...protectedToolTags,
+                ]),
+                undefined,
+                pendingOps,
+                [],
+                new Set(),
+                (reduction) => droppedTokenReductions.push(reduction),
+            );
+        // Commit queued edits with their omissions before session-wide heuristic
+        // discovery; the latter must not extend the queued edit's write hold.
+        const preparedPending =
+            shouldApplyPendingOps && pendingOps.length > 0 ? pair(applyPending) : undefined;
         pair(() => {
             if (shouldApplyPendingOps) {
                 const applyReason = isExplicitFlush
@@ -3244,20 +3284,7 @@ export async function runPostTransformPhase(
                 // upstream `args.tags` is active-only. It loads just those rows
                 // and the newest-tool skeleton window inside its own write
                 // transaction, so the reads and the mutations see one snapshot.
-                pendingOpsDidMutate = applyPendingOperations(
-                    args.sessionId,
-                    args.db,
-                    newTargets,
-                    new Set([
-                        ...(args.contextUsage.percentage >= 95 ? [] : args.protectedTagIds),
-                        ...protectedToolTags,
-                    ]),
-                    undefined,
-                    pendingOps,
-                    [],
-                    new Set(),
-                    (reduction) => droppedTokenReductions.push(reduction),
-                );
+                pendingOpsDidMutate = preparedPending ?? applyPending();
                 if (pendingOpsDidMutate) {
                     droppedCount += pendingOps.length;
                     for (const pendingOp of pendingOps) {

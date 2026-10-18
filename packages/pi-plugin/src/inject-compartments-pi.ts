@@ -955,6 +955,46 @@ export function trimPiMessagesToCachedBoundary(
 	);
 }
 
+/** Whether a cached or newly rendered history cut can hide a companion entry. */
+export function piTrimMayRemoveEntries(args: {
+	sessionId: string;
+	messages: PiAgentMessage[];
+	entryIds: (string | undefined)[];
+	snapshot: PiM0M1PassSnapshot;
+	isCandidate: (message: PiAgentMessage, index: number) => boolean;
+}): boolean {
+	const boundaries = new Set([
+		args.snapshot.cachedRow?.cached_m0_last_baseline_end_message_id,
+		lastBaselineEndMessageId(args.snapshot.compartments),
+	]);
+	for (const boundary of boundaries) {
+		if (!boundary) continue;
+		const projected = [...args.messages];
+		// Projection must not retire durable decisions or splice the caller's IDs.
+		trimPiMessagesToBoundary(
+			projected,
+			[...args.entryIds],
+			boundary,
+			false,
+			args.sessionId,
+			args.snapshot.compartments.some(
+				(compartment) =>
+					compartment.endMessageId === boundary &&
+					compartment.endBlockIndex != null,
+			),
+		);
+		const kept = new Set(projected);
+		if (
+			args.messages.some(
+				(message, index) =>
+					!kept.has(message) && args.isCandidate(message, index),
+			)
+		)
+			return true;
+	}
+	return false;
+}
+
 function setCachedBoundary(
 	db: ContextDatabase,
 	sessionId: string,
