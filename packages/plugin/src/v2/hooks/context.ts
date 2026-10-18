@@ -866,8 +866,14 @@ export async function registerContext(context: V2Context) {
             smartNotesEnabled: config.smart_notes.enabled,
             sample: () => {
                 const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
-                return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
+                return {
+                    config: current.dreamer ?? dreamerAtBoot,
+                    mural: current.mural,
+                    rustBackgroundEnabled: current.rust_background_enabled === true,
+                };
             },
+            // OpenCode 2 is never attached to ck-mc, so it passes no module client
+            // and skips no dream task whatever the switch says.
             executor: cappedExecutor,
             projectIdentity: () =>
                 resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
@@ -2316,6 +2322,9 @@ export async function registerContext(context: V2Context) {
             mural: config.mural,
             executor: runExecutor,
             sessionId,
+            rustBackgroundEnabled:
+                dreamerRunConfig(config, liveConfigReader.poll().effective)
+                    .rust_background_enabled === true,
             ...(requested.task !== undefined ? { task: requested.task } : {}),
         })
             .then(({ summary, unsupportedTasks }) => {

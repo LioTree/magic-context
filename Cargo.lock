@@ -225,7 +225,7 @@ name = "cortexkit-role-compaction-provider"
 version = "0.2.0"
 source = "git+https://github.com/cortexkit/commons?rev=77f10f0fcfe465e6cab567dcf1a1bf8901c54547#77f10f0fcfe465e6cab567dcf1a1bf8901c54547"
 dependencies = [
- "cortexkit-role-llm-runner 0.2.1 (git+https://github.com/cortexkit/commons?rev=77f10f0fcfe465e6cab567dcf1a1bf8901c54547)",
+ "cortexkit-role-llm-runner 0.2.1",
  "cortexkit-role-step-transform-provider",
  "serde",
  "serde_json",
@@ -252,8 +252,7 @@ dependencies = [
 [[package]]
 name = "cortexkit-role-llm-runner"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "415ccda371804d949f2274bd4ea425b5cc0bfb415ddc63d2490fa153424854b9"
+source = "git+https://github.com/cortexkit/commons?rev=77f10f0fcfe465e6cab567dcf1a1bf8901c54547#77f10f0fcfe465e6cab567dcf1a1bf8901c54547"
 dependencies = [
  "serde",
  "serde_json",
@@ -262,8 +261,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.2.1"
-source = "git+https://github.com/cortexkit/commons?rev=77f10f0fcfe465e6cab567dcf1a1bf8901c54547#77f10f0fcfe465e6cab567dcf1a1bf8901c54547"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7333245cf6e702a34b8d4411d307423c757a64145557122233bbdbc7f9a9aefa"
 dependencies = [
  "serde",
  "serde_json",
@@ -278,7 +278,7 @@ dependencies = [
  "async-trait",
  "cortexkit-role-compaction-provider",
  "cortexkit-role-harness 0.1.0 (git+https://github.com/cortexkit/commons?rev=77f10f0fcfe465e6cab567dcf1a1bf8901c54547)",
- "cortexkit-role-llm-runner 0.2.1 (git+https://github.com/cortexkit/commons?rev=77f10f0fcfe465e6cab567dcf1a1bf8901c54547)",
+ "cortexkit-role-llm-runner 0.2.1",
  "futures-util",
  "serde",
  "serde_json",
@@ -291,7 +291,7 @@ name = "cortexkit-role-step-transform-provider"
 version = "0.2.0"
 source = "git+https://github.com/cortexkit/commons?rev=77f10f0fcfe465e6cab567dcf1a1bf8901c54547#77f10f0fcfe465e6cab567dcf1a1bf8901c54547"
 dependencies = [
- "cortexkit-role-llm-runner 0.2.1 (git+https://github.com/cortexkit/commons?rev=77f10f0fcfe465e6cab567dcf1a1bf8901c54547)",
+ "cortexkit-role-llm-runner 0.2.1",
  "serde",
  "serde_json",
 ]
@@ -755,7 +755,7 @@ dependencies = [
  "cortexkit-log",
  "cortexkit-role-agent-data",
  "cortexkit-role-compaction-provider",
- "cortexkit-role-llm-runner 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cortexkit-role-llm-runner 0.2.4",
  "cortexkit-role-llm-runner-conformance",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",

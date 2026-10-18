@@ -14,15 +14,24 @@
 #![forbid(unsafe_code)]
 
 pub mod cache_codec;
+pub mod command_ledger;
 pub use cache_codec::{
     DiscardReason, FrozenBase, HashBase, SectionState, SectionsBase, FROZEN_CHUNK_UNITS,
 };
 pub mod context_boundaries;
 pub use context_boundaries::ResolvedContextBoundary;
 pub mod archive_index;
+pub mod background_state;
 pub mod context_schema;
 pub mod context_writes;
+pub mod dream_curate;
+pub mod dream_domain;
+pub mod dream_memory;
+pub mod dream_primer;
+pub mod dream_retrospective;
+pub mod dream_schedule_bridge;
 pub mod dream_scheduler;
+pub mod dream_verify;
 pub mod git_archive;
 mod historian_claim;
 #[cfg(feature = "test-support")]
@@ -61,10 +70,27 @@ pub use provider_resident_read::CompartmentSourceRevision;
 #[cfg(any(test, feature = "test-support"))]
 pub use provider_resident_read::ProviderResidentAuthority;
 pub mod provider_records;
+pub mod recomp_staging;
 pub mod retrieval_vectors;
 #[cfg(test)]
 #[path = "../tests/support/upgrade_rehearsal.rs"]
 mod upgrade_rehearsal;
+
+/// Reserved embedding-effect queue API for transactional memory writers and
+/// off-thread drains. This names the shared interface; it does not implement a
+/// queue or change storage. The retrieval-vector backfill lease is not a durable
+/// mutation-effect queue and cannot replace enqueueing in the memory transaction.
+///
+/// The queue implementation belongs in `mc_store::embedding_queue`:
+/// - `enqueue_tx`: insert/invalidate an effect in the source mutation's transaction;
+/// - `claim_batch`: claim a bounded batch after activation is captured by the caller;
+/// - `complete_batch`: acknowledge only the claimed effects after guarded vector publication;
+/// - `release_batch`: retain failed effects for a later retry.
+///
+/// Writers do no embedding RPC inside their transaction. Drains reuse
+/// `retrieval_vectors` for generation/hash-guarded publication, do network work
+/// outside the store lock, and never read module configuration.
+pub const EMBEDDING_QUEUE_API: &str = "mc_store::embedding_queue";
 pub use provider_records::ProviderSessionKey;
 pub mod score_projection;
 pub mod single_store_domain;
@@ -4263,6 +4289,9 @@ pub struct TruncateOutcome {
 }
 
 pub struct HistorianPublishRequest<'a> {
+    /// The historian task or stored-report publisher captures this at its start;
+    /// the store never reads configuration or changes it during publication.
+    pub rust_background_enabled: bool,
     /// Optional durable publication identity for the historian lifecycle lane. With
     /// no identity, publication preserves the legacy writes exactly.
     pub lifecycle_publication_id: Option<&'a str>,
@@ -4287,11 +4316,124 @@ pub struct HistorianPublishRequest<'a> {
     pub raw_chunk_messages: Option<&'a str>,
 }
 
+const HISTORIAN_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
+
+#[cfg(test)]
+type HistorianFoldTestHook = Box<dyn FnOnce(&McStore)>;
+
+#[cfg(test)]
+thread_local! {
+    static HISTORIAN_FOLD_TEST_HOOK: std::cell::RefCell<Option<HistorianFoldTestHook>> = const { std::cell::RefCell::new(None) };
+}
+
+struct HistorianLease<'a> {
+    store: &'a McStore,
+    session_id: String,
+    holder_id: String,
+}
+
+impl Drop for HistorianLease<'_> {
+    fn drop(&mut self) {
+        // A failed release is bounded by the TypeScript publishers' five-minute TTL.
+        let _ = self
+            .store
+            .context_write(&["compartment_state_lease"], |tx| {
+                tx.execute(
+                    "DELETE FROM compartment_state_lease WHERE session_id = ?1 AND holder_id = ?2",
+                    params![self.session_id, self.holder_id],
+                )?;
+                Ok(())
+            });
+    }
+}
+
+fn historian_owner_dead(pid: i64) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // Signal zero probes existence without signalling the process. Only ESRCH
+        // proves death; permission failures must not steal a live owner's lease.
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .env("LC_ALL", "C")
+            .output()
+            .is_ok_and(|output| {
+                !output.status.success()
+                    && String::from_utf8_lossy(&output.stderr).contains("No such process")
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn historian_lease_held(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    holder_id: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM compartment_state_lease WHERE session_id = ?1 AND holder_id = ?2 AND expires_at > ?3)", params![session_id, holder_id, current_time_ms()], |row| row.get(0))
+}
+
+fn historian_wrapup_active(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> rusqlite::Result<bool> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT wrapup_in_progress_state FROM session_meta WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(state) = raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    else {
+        return Ok(false);
+    };
+    let holder_valid = state
+        .get("holderId")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    let numbers_valid = [
+        "acquiredAt",
+        "expiresAt",
+        "messagesToKeep",
+        "anchorRawMessageCount",
+        "targetEligibleEndOrdinal",
+        "lastCompartmentEnd",
+        "chunkIndex",
+        "expectedChunks",
+        "updatedAt",
+    ]
+    .iter()
+    .all(|field| {
+        state
+            .get(field)
+            .and_then(|v| v.as_f64())
+            .is_some_and(f64::is_finite)
+    });
+    Ok(holder_valid
+        && numbers_valid
+        && state["expiresAt"].as_f64().unwrap_or(0.0) > current_time_ms() as f64)
+}
+
 /// Typed publish failures. CAS and state mismatches are deliberately separate so a
 /// caller can tell "another writer already committed" from "this producer is stale."
 #[derive(Debug)]
 pub enum HistorianPublishError {
     Store(McStoreError),
+    /// Shared TS publication ownership is busy; keep a stored report for retry.
+    Deferred {
+        reason: String,
+    },
     CasConflict {
         expected: Option<u64>,
         found: u64,
@@ -4326,6 +4468,7 @@ impl std::fmt::Display for HistorianPublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HistorianPublishError::Store(e) => write!(f, "store: {e}"),
+            HistorianPublishError::Deferred { reason } => write!(f, "publication deferred: {reason}"),
             HistorianPublishError::FenceRejected { reason } => {
                 write!(f, "publication fence rejected: {reason}")
             }
@@ -8034,6 +8177,36 @@ impl McStore {
             })
     }
 
+    /// Run a snapshot callback with SQLite's query-only enforcement enabled.
+    /// Callers must not change connection settings or re-enter the serialized read domain.
+    /// Retrieval uses this boundary without opening another database connection.
+    pub fn with_context_read<T>(
+        &self,
+        read: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, McStoreError> {
+        self.context_read(|conn| {
+            struct RestoreQueryOnly<'a> {
+                conn: &'a rusqlite::Connection,
+                previous: i64,
+            }
+            impl Drop for RestoreQueryOnly<'_> {
+                fn drop(&mut self) {
+                    let _ = self.conn.pragma_update(None, "query_only", self.previous);
+                }
+            }
+            let previous = conn.pragma_query_value(None, "query_only", |row| row.get(0))?;
+            let _restore = RestoreQueryOnly { conn, previous };
+            conn.pragma_update(None, "query_only", true)?;
+            read(conn)
+        })
+    }
+
+    /// The directory holding this store's `store.db`, which is the module's data
+    /// root; `None` for a store not backed by a SQLite file.
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.move_path.as_deref().and_then(std::path::Path::parent)
+    }
+
     /// Run `read` against `context.db` in one read snapshot.
     fn context_read<T>(
         &self,
@@ -11440,6 +11613,8 @@ impl McStore {
                 return Ok(CommitOutcome::FrozenClearRefused(stored_units));
             }
 
+            let flush_progress = command_ledger::prepare_flush_progress_tx(tx, session_id)?;
+
             // The grow-mostly parts of the meta are rows, so a pass writes only the entries
             // that differ instead of re-serializing the whole history to append one. Finding
             // WHICH entries differ means reading every stored row, so a pass that changed
@@ -11767,6 +11942,10 @@ impl McStore {
                     params![session_id, drop_id],
                 )?;
             }
+
+            command_ledger::finish_flush_progress_tx(
+                tx, session_id, flush_progress, meta.soft_refresh_pending, divergence_at_ms,
+            )?;
 
             Ok(CommitOutcome::Committed(accepted_version))
         })?;
@@ -14236,13 +14415,37 @@ impl McStore {
         let session_id = request.session_id;
         let expected_row_version = request.expected_row_version;
         let predicate = request.predicate;
-        // A fold whose context.db half an earlier publish left pending lands first, so the
-        // compartment set this publish is checked against is the complete one.
+        if request.rust_background_enabled && request.compartments.is_empty() {
+            return Err(HistorianPublishError::FenceRejected {
+                reason: "activated historian fold has no compartments".into(),
+            });
+        }
         self.resume_pending_context_write(session_id)?;
-        // The compartment set lives in context.db. It is read before the store.db
-        // transaction (never inside a write lock on the other file); the module is the only
-        // writer of a session's compartments, and every such write goes through here or
-        // resumes before it, so the set cannot move between this read and the commit.
+        static NEXT_HOLDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let holder_id = format!(
+            "rust-historian:{}:{}:{}",
+            std::process::id(),
+            current_time_ms(),
+            NEXT_HOLDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let _lease = if request.rust_background_enabled {
+            let lease = self
+                .acquire_historian_lease(session_id, &holder_id)?
+                .ok_or_else(|| HistorianPublishError::Deferred {
+                    reason: "compartment lease busy".into(),
+                })?;
+            if self.context_read(|conn| historian_wrapup_active(conn, session_id))? {
+                return Err(HistorianPublishError::Deferred {
+                    reason: "wrapup in progress".into(),
+                });
+            }
+            Some(lease)
+        } else {
+            None
+        };
+        // Legacy publication reads compartment-set generation before the store.db
+        // transaction. With rust_background_enabled, the context.db append transaction
+        // checks it again under the shared publication lease.
         let (current_compartment_set_generation, existing_ranges) = self.context_read(|conn| {
             let generation = conn.query_row(
                 "SELECT COALESCE(MAX(sequence), 0), COUNT(*)
@@ -14286,7 +14489,22 @@ impl McStore {
             .unwrap_or_else(current_time_ms);
         // Side channels are best effort: a test can make one fail, and the fold's
         // compartments must still land.
+        let prior_publication_floor_ordinal = if request.rust_background_enabled {
+            self.load_meta(session_id)?.meta.publication_floor_ordinal
+        } else {
+            None
+        };
         let fold = context_writes::FoldWrite {
+            fence: request
+                .rust_background_enabled
+                .then(|| context_writes::HistorianFoldFence {
+                    firing_seq: predicate.firing_seq,
+                    prior_publication_floor_ordinal,
+                    producer_run_id: predicate.producer_run_id.clone(),
+                    holder_id: holder_id.clone(),
+                    generation: predicate.compartment_set_generation,
+                    revert_epoch: request.expected_revert_epoch,
+                }),
             lifecycle_publication_id: request.lifecycle_publication_id.map(str::to_owned),
             project_path: request.project_path.to_string(),
             harness: request.harness.map(str::to_string),
@@ -14366,7 +14584,8 @@ impl McStore {
                 && meta.historian.chunk_fingerprint == predicate.chunk_fingerprint
                 && meta.historian.selected_range_identities == predicate.selected_range_identities
                 && meta.historian.compartment_set_generation
-                    == predicate.compartment_set_generation;
+                    == predicate.compartment_set_generation
+                && (!request.rust_background_enabled || meta.historian.expected_revert_epoch == request.expected_revert_epoch);
             if !predicate_matches {
                 return Ok(PublishTxnOutcome::StateMismatch(Box::new(meta.historian)));
             }
@@ -14475,7 +14694,25 @@ impl McStore {
 
         match outcome {
             PublishTxnOutcome::Committed(mut result) => {
-                result.promoted_refs = self.finish_context_write(session_id, &write);
+                if request.rust_background_enabled {
+                    let context_writes::PendingContextWrite::Fold(fold) = &write else {
+                        unreachable!()
+                    };
+                    let recorded = serde_json::to_string(&write)
+                        .map_err(|e| HistorianPublishError::Serde(e.to_string()))?;
+                    result.promoted_refs =
+                        match self.complete_activated_fold(session_id, fold, &recorded)? {
+                            context_writes::ActivatedFoldOutcome::Applied(promoted) => promoted,
+                            context_writes::ActivatedFoldOutcome::Deferred(reason) => {
+                                return Err(HistorianPublishError::Deferred { reason })
+                            }
+                            context_writes::ActivatedFoldOutcome::Discarded(reason) => {
+                                return Err(HistorianPublishError::FenceRejected { reason })
+                            }
+                        };
+                } else {
+                    result.promoted_refs = self.finish_context_write(session_id, &write);
+                }
                 Ok(result)
             }
             PublishTxnOutcome::CasConflict { found, reason } => {
@@ -14506,6 +14743,31 @@ impl McStore {
             }
             PublishTxnOutcome::Serde(e) => Err(HistorianPublishError::Serde(e)),
         }
+    }
+
+    fn acquire_historian_lease<'a>(
+        &'a self,
+        session_id: &str,
+        holder_id: &str,
+    ) -> Result<Option<HistorianLease<'a>>, McStoreError> {
+        // As in compartment-lease.ts, reclaim a dead owner's row only while its
+        // session, holder, PID, acquisition time and expiry still match. The upsert
+        // admits only the same holder or an expired row.
+        let acquired = self.context_write(&["compartment_state_lease"], |tx| {
+            let now = current_time_ms();
+            let blocker = tx.query_row("SELECT holder_id, owner_pid, acquired_at, expires_at FROM compartment_state_lease WHERE session_id = ?1 AND expires_at > ?2", params![session_id, now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?))).optional()?;
+            if let Some((holder, Some(pid), acquired, expires)) = blocker {
+                if historian_owner_dead(pid) {
+                    tx.execute("DELETE FROM compartment_state_lease WHERE session_id = ?1 AND holder_id = ?2 AND owner_pid = ?3 AND acquired_at = ?4 AND expires_at = ?5", params![session_id, holder, pid, acquired, expires])?;
+                }
+            }
+            Ok(tx.execute("INSERT INTO compartment_state_lease (session_id, holder_id, owner_pid, acquired_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(session_id) DO UPDATE SET holder_id=excluded.holder_id, owner_pid=excluded.owner_pid, acquired_at=excluded.acquired_at, expires_at=excluded.expires_at WHERE compartment_state_lease.holder_id=excluded.holder_id OR compartment_state_lease.expires_at <= ?4", params![session_id, holder_id, std::process::id() as i64, now, now + HISTORIAN_LEASE_TTL_MS])? == 1)
+        })?;
+        Ok(acquired.then(|| HistorianLease {
+            store: self,
+            session_id: session_id.into(),
+            holder_id: holder_id.into(),
+        }))
     }
 
     fn take_historian_side_channel_fault_for_test(&self, kind: &str) -> bool {
@@ -18556,6 +18818,109 @@ fn capped_trace_error(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_read_guard_rejects_insert_and_temp_schema_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .context_read(|conn| {
+                conn.execute_batch("CREATE TEMP TABLE read_guard_probe(value INTEGER)")
+            })
+            .unwrap();
+        for sql in [
+            "INSERT INTO read_guard_probe VALUES (1)",
+            "CREATE TEMP TABLE forbidden_read_guard(value INTEGER)",
+        ] {
+            store
+                .with_context_read(|conn| {
+                    let error = conn
+                        .execute_batch(sql)
+                        .expect_err("the snapshot must reject writes");
+                    assert_eq!(
+                        error.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::ReadOnly)
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let (rows, tables) = store
+            .context_read(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM read_guard_probe", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_temp_master WHERE name='forbidden_read_guard'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((rows, tables), (0, 0));
+    }
+
+    #[test]
+    fn context_read_guard_restores_query_only_after_success_error_and_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .context_read(|conn| {
+                conn.execute_batch("CREATE TEMP TABLE read_guard_probe(value INTEGER)")
+            })
+            .unwrap();
+        store.with_context_read(|_| Ok(())).unwrap();
+        let write = || {
+            store
+                .context_read(|conn| {
+                    assert_eq!(
+                        conn.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?,
+                        0
+                    );
+                    conn.execute("INSERT INTO read_guard_probe VALUES (1)", [])
+                })
+                .unwrap()
+        };
+        assert_eq!(write(), 1);
+        assert!(store
+            .with_context_read::<()>(|_| Err(rusqlite::Error::InvalidQuery))
+            .is_err());
+        assert_eq!(write(), 1);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_context_read::<()>(|_| panic!("read callback panic"))
+        }));
+        assert!(panic.is_err());
+        assert_eq!(write(), 1);
+    }
+
+    #[test]
+    fn context_read_guard_preserves_preexisting_query_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .context_read(|conn| conn.pragma_update(None, "query_only", true))
+            .unwrap();
+        store
+            .with_context_read(|conn| {
+                assert_eq!(
+                    conn.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+        store
+            .context_read(|conn| {
+                assert_eq!(
+                    conn.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?,
+                    1
+                );
+                conn.pragma_update(None, "query_only", false)
+            })
+            .unwrap();
+    }
+
     #[test]
     fn projection_replay_constructor_matches_serde_for_validated_shells() {
         let cases = [
@@ -24884,6 +25249,7 @@ mod tests {
 
         let first = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -24918,6 +25284,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -24975,6 +25342,7 @@ mod tests {
 
         let error = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25044,6 +25412,7 @@ mod tests {
 
             store
                 .publish_historian_chunk(HistorianPublishRequest {
+                    rust_background_enabled: false,
                     lifecycle_publication_id: None,
                     harness: None,
                     session_id: "ses",
@@ -25124,6 +25493,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25173,6 +25543,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25214,6 +25585,7 @@ mod tests {
         };
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25264,6 +25636,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25308,6 +25681,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25363,6 +25737,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25702,6 +26077,7 @@ mod tests {
 
         let error = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25755,6 +26131,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25797,6 +26174,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25918,6 +26296,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25968,8 +26347,17 @@ mod tests {
         store: &McStore,
         session_id: &str,
     ) -> Result<HistorianPublishResult, HistorianPublishError> {
+        publish_with_activation(store, session_id, false)
+    }
+
+    fn publish_with_activation(
+        store: &McStore,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<HistorianPublishResult, HistorianPublishError> {
         let expected = store.load(session_id).unwrap().row_version;
         store.publish_historian_chunk(HistorianPublishRequest {
+            rust_background_enabled: enabled,
             lifecycle_publication_id: None,
             harness: None,
             session_id,
@@ -25987,6 +26375,332 @@ mod tests {
             chunk_transcript: None,
             raw_chunk_messages: None,
         })
+    }
+
+    fn i4_seed(store: &McStore) {
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+    }
+
+    fn i4_ts_lease(store: &McStore, holder: &str, pid: Option<i64>, expires: i64) {
+        store.context_write(&["compartment_state_lease"], |tx| {
+            tx.execute("INSERT OR REPLACE INTO compartment_state_lease (session_id, holder_id, owner_pid, acquired_at, expires_at) VALUES ('ses', ?1, ?2, ?3, ?4)", params![holder, pid, current_time_ms(), expires])?;
+            Ok(())
+        }).unwrap();
+    }
+
+    fn i4_marker(store: &McStore, expires: i64) {
+        let marker = serde_json::json!({"holderId":"wrapup", "acquiredAt":1, "expiresAt":expires, "messagesToKeep":1, "anchorRawMessageCount":30, "targetEligibleEndOrdinal":20, "lastCompartmentEnd":0, "chunkIndex":0, "expectedChunks":1, "updatedAt":1}).to_string();
+        store.context_write(&["session_meta"], |tx| {
+            tx.execute("INSERT INTO session_meta(session_id, wrapup_in_progress_state) VALUES ('ses', ?1) ON CONFLICT(session_id) DO UPDATE SET wrapup_in_progress_state=excluded.wrapup_in_progress_state", params![marker])?;
+            Ok(())
+        }).unwrap();
+    }
+
+    fn i4_ts_append(store: &McStore, compartment: &StoredCompartment) {
+        store
+            .context_write(context_writes::HISTORY_TABLES, |tx| {
+                insert_compartment_tx(tx, "ses", compartment.sequence, compartment, "opencode")?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn i4_publish_holder_matrix_defers_without_writes() {
+        for holder in ["ts-wrapup", "ts-recomp", "ts-incremental"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+            i4_seed(&store);
+            let before = store.load_meta("ses").unwrap().row_version;
+            i4_ts_lease(
+                &store,
+                holder,
+                Some(std::process::id() as i64),
+                current_time_ms() + HISTORIAN_LEASE_TTL_MS,
+            );
+            assert!(
+                matches!(
+                    publish_with_activation(&store, "ses", true),
+                    Err(HistorianPublishError::Deferred { .. })
+                ),
+                "{holder}"
+            );
+            assert!(store.load_compartments("ses").unwrap().is_empty());
+            assert_eq!(store.load_meta("ses").unwrap().row_version, before);
+            assert!(!store.has_pending_context_write("ses").unwrap());
+        }
+    }
+
+    #[test]
+    fn i4_publish_off_takes_no_lease_and_ignores_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        i4_ts_lease(
+            &store,
+            "ts-wrapup",
+            Some(std::process::id() as i64),
+            current_time_ms() + HISTORIAN_LEASE_TTL_MS,
+        );
+        i4_marker(&store, current_time_ms() + HISTORIAN_LEASE_TTL_MS);
+        publish_with_activation(&store, "ses", false).unwrap();
+        assert!(store
+            .context_read(|conn| historian_lease_held(conn, "ses", "ts-wrapup"))
+            .unwrap());
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn i4_publish_reclaims_expired_and_dead_pid_but_not_unknown_owner() {
+        for (pid, expires, expected) in [
+            (Some(std::process::id() as i64), 1, true),
+            (
+                Some(i32::MAX as i64),
+                current_time_ms() + HISTORIAN_LEASE_TTL_MS,
+                true,
+            ),
+            (None, current_time_ms() + HISTORIAN_LEASE_TTL_MS, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+            i4_seed(&store);
+            i4_ts_lease(&store, "old", pid, expires);
+            assert_eq!(
+                publish_with_activation(&store, "ses", true).is_ok(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn i4_publish_marker_respects_ts_expiry() {
+        for active in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+            i4_seed(&store);
+            let before = store.load_meta("ses").unwrap().row_version;
+            i4_marker(
+                &store,
+                if active {
+                    current_time_ms() + HISTORIAN_LEASE_TTL_MS
+                } else {
+                    1
+                },
+            );
+            assert_eq!(
+                publish_with_activation(&store, "ses", true).is_ok(),
+                !active
+            );
+            if active {
+                assert_eq!(store.load_meta("ses").unwrap().row_version, before);
+                assert!(!store.has_pending_context_write("ses").unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn i4_publish_rechecks_ownership_inside_append_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|store| {
+                i4_ts_lease(
+                    store,
+                    "ts-recomp",
+                    Some(std::process::id() as i64),
+                    current_time_ms() + HISTORIAN_LEASE_TTL_MS,
+                )
+            }))
+        });
+        assert!(
+            matches!(publish_with_activation(&store, "ses", true), Err(HistorianPublishError::Deferred { reason }) if reason.contains("ownership"))
+        );
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        assert!(store.has_pending_context_write("ses").unwrap());
+    }
+
+    #[test]
+    fn i4_publish_rechecks_marker_inside_append_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|store| {
+                i4_marker(store, current_time_ms() + HISTORIAN_LEASE_TTL_MS)
+            }))
+        });
+        assert!(
+            matches!(publish_with_activation(&store, "ses", true), Err(HistorianPublishError::Deferred { reason }) if reason.contains("wrapup"))
+        );
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+    }
+
+    #[test]
+    fn i4_publish_rechecks_generation_inside_append_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|store| {
+                let mut ts = publish_compartment();
+                ts.sequence = 1;
+                ts.start_message = 50;
+                ts.end_message = 60;
+                ts.title = "TS append".into();
+                i4_ts_append(store, &ts);
+            }))
+        });
+        assert!(
+            matches!(publish_with_activation(&store, "ses", true), Err(HistorianPublishError::FenceRejected { reason }) if reason.contains("compartment set"))
+        );
+        assert_eq!(
+            store.load_compartments("ses").unwrap()[0].title,
+            "TS append"
+        );
+        assert_eq!(
+            store
+                .load_meta("ses")
+                .unwrap()
+                .meta
+                .publication_floor_ordinal,
+            None
+        );
+        assert!(!store.has_pending_context_write("ses").unwrap());
+    }
+
+    #[test]
+    fn i4_publish_rechecks_epoch_inside_append_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|store| {
+                let mut loaded = store.load_meta("ses").unwrap();
+                loaded.meta.revert_epoch += 1;
+                store
+                    .commit_meta("ses", loaded.row_version, &loaded.meta)
+                    .unwrap();
+            }))
+        });
+        assert!(
+            matches!(publish_with_activation(&store, "ses", true), Err(HistorianPublishError::FenceRejected { reason }) if reason.contains("epoch"))
+        );
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+    }
+
+    #[test]
+    fn i4_crash_replay_discards_after_ts_publish_and_applies_once_otherwise() {
+        for ts_publish in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+            i4_seed(&store);
+            HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|_| {
+                    panic!("simulated crash before context commit")
+                }))
+            });
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                publish_with_activation(&store, "ses", true)
+            }))
+            .is_err());
+            assert!(store.has_pending_context_write("ses").unwrap());
+            assert!(store.load_compartments("ses").unwrap().is_empty());
+            if ts_publish {
+                let mut ts = publish_compartment();
+                ts.sequence = 1;
+                ts.title = "TS won".into();
+                i4_ts_append(&store, &ts);
+            }
+            drop(store);
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+            store.resume_pending_context_write("ses").unwrap();
+            assert!(!store.resume_pending_context_write("ses").unwrap());
+            let rows = store.load_compartments("ses").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].title == "TS won", ts_publish);
+            assert_eq!(
+                store
+                    .load_meta("ses")
+                    .unwrap()
+                    .meta
+                    .publication_floor_ordinal,
+                if ts_publish { None } else { Some(21) }
+            );
+        }
+    }
+
+    fn i4_run_ts_probe(context_path: &std::path::Path, blocked: bool) {
+        let output = std::process::Command::new("bun")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/testdata/i4-ts-lease-probe.ts"
+            ))
+            .arg(context_path)
+            .arg(if blocked { "blocked" } else { "free" })
+            .output()
+            .expect("i4_rust_hold_refuses_frozen_ts_recomp_and_bounded_wrapup requires Bun");
+        assert!(
+            output.status.success(),
+            "frozen TS refusal probe: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn i4_rust_hold_refuses_frozen_ts_recomp_and_bounded_wrapup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        let context_path = dir.path().join("context.db");
+        let held_path = context_path.clone();
+        HISTORIAN_FOLD_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(move |store| {
+            i4_run_ts_probe(&held_path, true);
+            let (holder, pid, ttl): (String, i64, i64) = store.context_read(|conn| conn.query_row("SELECT holder_id, owner_pid, expires_at - acquired_at FROM compartment_state_lease WHERE session_id='ses'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))).unwrap();
+            assert!(holder.starts_with("rust-historian:"));
+            assert_eq!(pid, std::process::id() as i64);
+            assert_eq!(ttl, 300_000);
+        })));
+        publish_with_activation(&store, "ses", true).unwrap();
+        i4_run_ts_probe(&context_path, false);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn i4_startup_defers_busy_pending_fold_then_replays_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        HISTORIAN_FOLD_TEST_HOOK
+            .with(|hook| *hook.borrow_mut() = Some(Box::new(|_| panic!("simulated crash"))));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || publish_with_activation(&store, "ses", true)
+        ))
+        .is_err());
+        let recorded: String = store.inner.with_conn(|conn| conn.query_row("SELECT publish_json FROM mc_single_store_pending_publish WHERE session_id='ses'", [], |row| row.get(0))).unwrap();
+        i4_ts_lease(
+            &store,
+            "ts-wrapup",
+            Some(std::process::id() as i64),
+            current_time_ms() + HISTORIAN_LEASE_TTL_MS,
+        );
+        drop(store);
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        assert_eq!(store.resume_all_pending_context_writes().unwrap(), 0);
+        assert!(store.has_pending_context_write("ses").unwrap());
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        i4_ts_lease(&store, "ts-wrapup", None, 1);
+        assert_eq!(store.resume_all_pending_context_writes().unwrap(), 1);
+        store.inner.with_conn_fenced(|tx| {
+            tx.execute("INSERT INTO mc_single_store_pending_publish (session_id, publish_json, created_at) VALUES ('ses', ?1, 1)", params![recorded])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(store.resume_all_pending_context_writes().unwrap(), 1);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        assert!(!store.has_pending_context_write("ses").unwrap());
     }
 
     #[test]

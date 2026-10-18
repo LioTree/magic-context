@@ -113,16 +113,18 @@ pub(crate) enum RegisteredRoute {
     HistorianRunner,
     ProviderRunner,
     EntorhinalResolve,
+    SynapseRerank,
 }
 
 impl RegisteredRoute {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::SessionResolve,
         Self::HistorianRunner,
         Self::ProviderRunner,
         Self::EngramDoor,
         Self::EntorhinalSessionRef,
         Self::EntorhinalResolve,
+        Self::SynapseRerank,
     ];
 
     fn module_id(self, config: &RouteTargetConfig) -> Option<&str> {
@@ -133,6 +135,7 @@ impl RegisteredRoute {
             Self::HistorianRunner => config.runner_module_id(),
             Self::ProviderRunner => Some(config.provider_runner_module_id()),
             Self::EntorhinalResolve => Some("entorhinal"),
+            Self::SynapseRerank => Some("synapse"),
         }
     }
 
@@ -149,6 +152,9 @@ impl RegisteredRoute {
             // Callbacks and transcript reads spend no provider quota. Declaring this target
             // does not open a connection or require the runner to be registered at startup.
             Self::ProviderRunner => Vec::new(),
+            // Explicit mc.retrieval searches may call Synapse. Declaring this target
+            // neither connects to Synapse nor starts automatic retrieval work.
+            Self::SynapseRerank => Vec::new(),
             // The background runner route carries every model call this module makes, so both
             // callers of it spend the user's provider quota.
             Self::HistorianRunner => vec![
@@ -230,9 +236,9 @@ pub(crate) fn catalog_provider_target_for_test() -> RouteTarget {
 #[cfg(test)]
 pub(crate) fn expected_routes_for_tests(runner: &str) -> Vec<String> {
     #[cfg(feature = "agent-data")]
-    let routes = vec!["thalamus", runner, "engram", "entorhinal"];
+    let routes = vec!["thalamus", runner, "engram", "entorhinal", "synapse"];
     #[cfg(not(feature = "agent-data"))]
-    let routes = vec!["thalamus", runner, "entorhinal"];
+    let routes = vec!["thalamus", runner, "entorhinal", "synapse"];
     routes.into_iter().map(str::to_owned).collect()
 }
 

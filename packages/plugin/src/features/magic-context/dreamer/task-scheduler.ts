@@ -16,6 +16,7 @@ import {
     releaseLease,
 } from "./lease";
 import { withDreamerModelCooldown } from "./provider-output-failure";
+import type { RunRustOwnedDreamTask } from "./rust-ownership";
 import { getDreamState } from "./storage-dream-state";
 import {
     getTaskScheduleState,
@@ -102,6 +103,12 @@ export interface RunDueTasksDeps {
     projectIdentity: string;
     tasks: readonly DreamTaskRuntimeConfig[];
     executor: TaskExecutor;
+    /**
+     * Tasks the ck-mc module published as its own, read once per run (see
+     * rust-ownership.ts). Exactly these are skipped: they are neither planned,
+     * seeded, advanced nor executed here. Absent or empty runs every task.
+     */
+    rustOwnedTasks?: ReadonlySet<DreamTaskName>;
     now?: number;
     /**
      * The host's `memory.enabled` for this project. `false` means this caller
@@ -370,6 +377,11 @@ interface DomainGroupCallbacks {
     /** Manual single-task run ignores the post-lease activity gate re-check. */
     forceGate?: boolean;
     /**
+     * Manual runs ignore the schedule, so they skip the post-lease check that
+     * the planned slot is still due.
+     */
+    ignoreSchedule?: boolean;
+    /**
      * How long a manual run may wait for a busy domain lease before giving
      * up. Scheduled ticks leave this unset (the next tick retries anyway).
      */
@@ -437,6 +449,22 @@ async function runDomainGroupWithCooldown(
             }
 
             acquisition = { acquiredAt: Date.now(), generation: acquisition.generation };
+
+            // Re-read the slot now that we hold the lease. Another runtime sharing
+            // this store (another host process, or ck-mc's Rust dreamer, which may
+            // own the task without this host knowing) can run the planned slot
+            // between planning and taking the lease; it moves next_due_at past the
+            // slot before it releases the lease, so a later next_due_at means the
+            // slot is already done. Leave the row as that runtime wrote it.
+            if (!cb?.ignoreSchedule) {
+                const current = getTaskScheduleState(db, projectIdentity, due.config.task);
+                if (current?.nextDueAt != null && current.nextDueAt > due.scheduledAt) {
+                    log(
+                        `[dreamer] ${due.config.task} slot already run by another dreamer — skipping`,
+                    );
+                    continue;
+                }
+            }
 
             // Re-evaluate the gate now that we hold the lease: a sibling/other
             // process may have just consumed the work (critical for the global
@@ -560,8 +588,16 @@ export interface ManualRunResult {
  * Still advances next_due_at on completion so the manual run resets the cadence.
  */
 export async function runManualDream(
-    deps: Omit<RunDueTasksDeps, "now"> & { task?: DreamTaskName },
+    deps: Omit<RunDueTasksDeps, "now"> & {
+        task?: DreamTaskName;
+        /**
+         * Present only when this host is attached to ck-mc: asks ck-mc to run a
+         * task it owns now. Without it an owned task is reported as run by ck-mc.
+         */
+        runRustOwnedTask?: RunRustOwnedDreamTask;
+    },
 ): Promise<ManualRunResult> {
+    const rustOwned = deps.rustOwnedTasks;
     const now = Date.now();
     const result: ManualRunResult = {
         ran: [],
@@ -590,6 +626,27 @@ export async function runManualDream(
     // available. A forced memory task must still honor the project's memory opt-out.
     if (!isProjectMemoryEnabled(deps.projectMemoryEnabled))
         selected = selected.filter((config) => config.task === "evaluate-smart-notes");
+    if (rustOwned && rustOwned.size > 0) {
+        // Rust runs these on its own schedule. A host attached to ck-mc asks it
+        // to run them now; otherwise reporting them keeps a manual run from
+        // looking as if the task were silently dropped.
+        for (const config of selected) {
+            if (!rustOwned.has(config.task)) continue;
+            if (!deps.runRustOwnedTask) {
+                (result.skipped ??= []).push(`${config.task}: run by ck-mc`);
+                continue;
+            }
+            const outcome = await deps.runRustOwnedTask(config.task);
+            if (outcome.started) {
+                (result.details ??= []).push(`${config.task}: started in ck-mc`);
+            } else {
+                (result.skipped ??= []).push(
+                    `${config.task}: ck-mc did not start it (${outcome.reason})`,
+                );
+            }
+        }
+        selected = selected.filter((config) => !rustOwned.has(config.task));
+    }
     if (selected.length === 0) return result;
 
     const selectedTaskNames = selected.map((config) => config.task);
@@ -649,8 +706,9 @@ export async function runManualDream(
 
     await Promise.all(
         [...groups.values()].map((group) =>
-            runDomainGroup({ ...deps, executor: deps.executor }, group, {
+            runDomainGroup(deps, group, {
                 forceGate,
+                ignoreSchedule: true,
                 leaseWaitMs: MANUAL_RUN_LEASE_WAIT_MS,
                 onRan: (t, detail, backlog) => {
                     result.ran.push(t);
@@ -692,7 +750,16 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
     // rows to the daily idle prune instead.
     if (!isProjectMemoryEnabled(deps.projectMemoryEnabled)) return 0;
     const now = deps.now ?? Date.now();
-    const due = planDueTasks(deps.db, deps.projectIdentity, deps.tasks, now);
+    // Filter before planning: even a gated task would seed or advance its row.
+    const owned = deps.rustOwnedTasks;
+    const tasks =
+        owned && owned.size > 0
+            ? deps.tasks.filter((config) => !owned.has(config.task))
+            : deps.tasks;
+    // Rust owns every configured task: this pass has nothing of its own to plan,
+    // and planning would still write this store's schedule maintenance rows.
+    if (tasks.length === 0 && deps.tasks.length > 0) return 0;
+    const due = planDueTasks(deps.db, deps.projectIdentity, tasks, now);
     if (due.length === 0) return 0;
 
     // Pre-lease gate: cheap filter so we don't even acquire a lease for a task

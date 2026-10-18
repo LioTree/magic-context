@@ -35521,6 +35521,7 @@ pub(crate) mod tests {
             if !interleaved.replace(true) {
                 store
                     .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                        rust_background_enabled: false,
                         lifecycle_publication_id: None,
                         harness: None,
                         session_id: "astro-publish-race",
@@ -35629,6 +35630,7 @@ pub(crate) mod tests {
             hook_ran_for_publish.store(true, Ordering::SeqCst);
             store
                 .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                    rust_background_enabled: false,
                     lifecycle_publication_id: None,
                     harness: None,
                     session_id: "astro-torn-read",

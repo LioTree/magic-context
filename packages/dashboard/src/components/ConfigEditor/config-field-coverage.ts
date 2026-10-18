@@ -146,6 +146,8 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
     "deprecated and ignored; the in-tree Rust provider pipeline is no longer selectable and old configs remain loadable",
   rust_provider_preparation:
     "experimental user-only switch for prepared provider policy in the Rust provider pipeline; off by default and editable in Raw JSONC",
+  rust_background_enabled:
+    "experimental user-only switch letting ck-mc run the dream tasks it publishes; off by default and editable in Raw JSONC",
   signed_thinking_hold:
     "experimental user-only signed-thinking trigger parking; off by default and editable in Raw JSONC",
   fail_closed_blocking:

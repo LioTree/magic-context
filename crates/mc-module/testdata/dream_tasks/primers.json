@@ -1,0 +1,231 @@
+{
+  "now": 1728000000,
+  "candidates": [
+    {
+      "id": 1,
+      "project_path": "project",
+      "session_id": "source-1",
+      "question": "How does routing work",
+      "normalized_question": "how does routing work",
+      "message_id": "m1",
+      "source_message_time": 1036800000
+    },
+    {
+      "id": 2,
+      "project_path": "project",
+      "session_id": "source-2",
+      "question": "How does routing work",
+      "normalized_question": "how does routing work",
+      "message_id": "m2",
+      "source_message_time": 1382400000
+    },
+    {
+      "id": 3,
+      "project_path": "project",
+      "session_id": "source-3",
+      "question": "How does routing work",
+      "normalized_question": "how does routing work",
+      "message_id": "m3",
+      "source_message_time": 1728000000
+    },
+    {
+      "id": 4,
+      "project_path": "project",
+      "session_id": "source-4",
+      "question": "Second subsystem",
+      "normalized_question": "second subsystem",
+      "message_id": "m4",
+      "source_message_time": 1036800000
+    },
+    {
+      "id": 5,
+      "project_path": "project",
+      "session_id": "source-5",
+      "question": "Second subsystem",
+      "normalized_question": "second subsystem",
+      "message_id": "m5",
+      "source_message_time": 1382400000
+    },
+    {
+      "id": 6,
+      "project_path": "project",
+      "session_id": "source-6",
+      "question": "Second subsystem",
+      "normalized_question": "second subsystem",
+      "message_id": "m6",
+      "source_message_time": 1728000000
+    },
+    {
+      "id": 7,
+      "project_path": "foreign",
+      "session_id": "source-7",
+      "question": "How does routing work",
+      "normalized_question": "how does routing work",
+      "message_id": "m7",
+      "source_message_time": 1036800000
+    },
+    {
+      "id": 8,
+      "project_path": "project",
+      "session_id": "source-8",
+      "question": "Expired question",
+      "normalized_question": "expired question",
+      "message_id": "m8",
+      "source_message_time": -6912000000
+    }
+  ],
+  "steps": [
+    {
+      "step": "promote",
+      "result": {
+        "promoted": 2,
+        "updated": 0,
+        "candidates": 6,
+        "pruned": 1
+      },
+      "primers": [
+        {
+          "id": 1,
+          "project_path": "project",
+          "question": "How does routing work?",
+          "answer": "",
+          "status": "active",
+          "total_support": 3,
+          "last_observed_at": 1728000000,
+          "answer_refreshed_at": null,
+          "source_candidate_ids": "[1,2,3]",
+          "source_candidate_provenance": "[{\"candidate_id\":1,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-1\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m1\",\"source_end_message_id\":\"m1\"},{\"candidate_id\":2,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-2\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m2\",\"source_end_message_id\":\"m2\"},{\"candidate_id\":3,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-3\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m3\",\"source_end_message_id\":\"m3\"}]",
+          "no_embedding": 1,
+          "created_at": 1728000000,
+          "updated_at": 1728000000
+        },
+        {
+          "id": 2,
+          "project_path": "project",
+          "question": "Second subsystem?",
+          "answer": "",
+          "status": "active",
+          "total_support": 3,
+          "last_observed_at": 1728000000,
+          "answer_refreshed_at": null,
+          "source_candidate_ids": "[4,5,6]",
+          "source_candidate_provenance": "[{\"candidate_id\":4,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-4\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m4\",\"source_end_message_id\":\"m4\"},{\"candidate_id\":5,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-5\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m5\",\"source_end_message_id\":\"m5\"},{\"candidate_id\":6,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-6\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m6\",\"source_end_message_id\":\"m6\"}]",
+          "no_embedding": 1,
+          "created_at": 1728000000,
+          "updated_at": 1728000000
+        }
+      ],
+      "candidateIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "step": "refresh_without_tools",
+      "tools": false,
+      "answer": "{\"answer\":\"Routing is dispatched by lib.rs.\"}",
+      "modelCalls": 2,
+      "result": {
+        "refreshed": 0,
+        "skipped": 2
+      },
+      "primers": [
+        {
+          "id": 1,
+          "project_path": "project",
+          "question": "How does routing work?",
+          "answer": "",
+          "status": "active",
+          "total_support": 3,
+          "last_observed_at": 1728000000,
+          "answer_refreshed_at": null,
+          "source_candidate_ids": "[1,2,3]",
+          "source_candidate_provenance": "[{\"candidate_id\":1,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-1\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m1\",\"source_end_message_id\":\"m1\"},{\"candidate_id\":2,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-2\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m2\",\"source_end_message_id\":\"m2\"},{\"candidate_id\":3,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-3\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m3\",\"source_end_message_id\":\"m3\"}]",
+          "no_embedding": 1,
+          "created_at": 1728000000,
+          "updated_at": 1728000000
+        },
+        {
+          "id": 2,
+          "project_path": "project",
+          "question": "Second subsystem?",
+          "answer": "",
+          "status": "active",
+          "total_support": 3,
+          "last_observed_at": 1728000000,
+          "answer_refreshed_at": null,
+          "source_candidate_ids": "[4,5,6]",
+          "source_candidate_provenance": "[{\"candidate_id\":4,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-4\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m4\",\"source_end_message_id\":\"m4\"},{\"candidate_id\":5,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-5\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m5\",\"source_end_message_id\":\"m5\"},{\"candidate_id\":6,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-6\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m6\",\"source_end_message_id\":\"m6\"}]",
+          "no_embedding": 1,
+          "created_at": 1728000000,
+          "updated_at": 1728000000
+        }
+      ],
+      "candidateIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "step": "refresh_with_tools",
+      "tools": true,
+      "answer": "{\"answer\":\"Routing is dispatched by lib.rs.\"}",
+      "modelCalls": 2,
+      "result": {
+        "refreshed": 2,
+        "skipped": 0
+      },
+      "primers": [
+        {
+          "id": 1,
+          "project_path": "project",
+          "question": "How does routing work?",
+          "answer": "Routing is dispatched by lib.rs.",
+          "status": "active",
+          "total_support": 3,
+          "last_observed_at": 1728000000,
+          "answer_refreshed_at": 1728000000,
+          "source_candidate_ids": "[1,2,3]",
+          "source_candidate_provenance": "[{\"candidate_id\":1,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-1\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m1\",\"source_end_message_id\":\"m1\"},{\"candidate_id\":2,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-2\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m2\",\"source_end_message_id\":\"m2\"},{\"candidate_id\":3,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-3\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m3\",\"source_end_message_id\":\"m3\"}]",
+          "no_embedding": 1,
+          "created_at": 1728000000,
+          "updated_at": 1728000000
+        },
+        {
+          "id": 2,
+          "project_path": "project",
+          "question": "Second subsystem?",
+          "answer": "Routing is dispatched by lib.rs.",
+          "status": "active",
+          "total_support": 3,
+          "last_observed_at": 1728000000,
+          "answer_refreshed_at": 1728000000,
+          "source_candidate_ids": "[4,5,6]",
+          "source_candidate_provenance": "[{\"candidate_id\":4,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-4\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m4\",\"source_end_message_id\":\"m4\"},{\"candidate_id\":5,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-5\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m5\",\"source_end_message_id\":\"m5\"},{\"candidate_id\":6,\"project_path\":\"project\",\"harness\":\"opencode\",\"session_id\":\"source-6\",\"source_compartment_start\":1,\"source_compartment_end\":3,\"source_start_message_id\":\"m6\",\"source_end_message_id\":\"m6\"}]",
+          "no_embedding": 1,
+          "created_at": 1728000000,
+          "updated_at": 1728000000
+        }
+      ],
+      "candidateIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    }
+  ]
+}

@@ -44,6 +44,98 @@ pub mod classify;
 pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
+mod dream_claim;
+pub mod dream_dispatch;
+pub mod dream_tasks;
+mod memory_actions;
+
+/// Names reserved for scoped, non-tool management requests. These are not facade
+/// tools: adding them to the model-visible catalog would invalidate cached prefixes.
+pub mod non_served_contract {
+    pub const UI_METHODS: &[&str] = &[
+        "mc.ui_capabilities",
+        "mc.read_sidebar",
+        "mc.read_status",
+        "mc.read_embed",
+        "mc.read_compartment_count",
+        "mc.read_todos",
+        "mc.recomp_preview",
+        "mc.recomp_start",
+        "mc.rescore",
+        "mc.wrapup",
+        "mc.flush",
+        "mc.dream",
+        "mc.embed",
+        "mc.job_read",
+        "mc.job_cancel",
+        "mc.ui_events",
+        "mc.notice_currentness",
+    ];
+    pub const RETRIEVAL_METHOD: &str = "mc.retrieval";
+    pub const MEMORY_METHOD: &str = "mc.memory";
+
+    /// Resolve the project from the session attached to the admitted channel,
+    /// using `route_project_identity`, never from request project/directory fields.
+    /// All other reserved methods are restricted to that channel's session.
+    pub const PROJECT_METHODS: &[&str] = &[
+        "mc.ui_capabilities",
+        "mc.read_sidebar",
+        "mc.read_status",
+        "mc.read_embed",
+        "mc.rescore",
+        "mc.dream",
+        "mc.embed",
+        RETRIEVAL_METHOD,
+        MEMORY_METHOD,
+    ];
+    pub const UI_READ_METHODS: &[&str] = &[
+        "mc.ui_capabilities",
+        "mc.read_sidebar",
+        "mc.read_status",
+        "mc.read_embed",
+        "mc.read_compartment_count",
+        "mc.read_todos",
+    ];
+
+    /// `HandlerOutcome::Error` has two wire fields. Its `message` is the exact
+    /// refused method name, not prose, so clients can identify the unsupported route.
+    pub const ROUTE_REFUSAL_CODE: &str = "route_not_ported";
+    pub const ROUTE_NAME_FIELD: &str = "message";
+    /// Keys are Rust `RetrievalSource` ids. In particular `raw_message` and
+    /// `compartment` are separate keys, unlike the TS request source `message`.
+    pub const RETRIEVAL_AVAILABILITY_FIELD: &str = "source_availability";
+
+    /// Selectors for comparing the existing transform paths: the legacy Rust
+    /// adapter, a complete message-array request, and the fast provider protocol.
+    /// `full_request` selects the adapter but may still send only changed messages
+    /// via `tail_delta`. For a complete array, omit that field and supply `messages`.
+    /// The provider protocol also needs compaction enabled and an available module
+    /// client, just like today's Rust adapter.
+    /// See the plugin's config/schema/magic-context.ts and rust-mode-transform.ts.
+    pub const SERVED_LANE_SELECTORS: &[(&str, &str)] = &[
+        (
+            "current_rust",
+            "transform_mode=rust; rust_pipeline=full_request",
+        ),
+        (
+            "full_array",
+            "transform_mode=rust; rust_pipeline=full_request; request.messages; tail_delta absent",
+        ),
+        (
+            "fast_rust_provider",
+            "transform_mode=rust; rust_pipeline=provider; compaction.enabled=true",
+        ),
+    ];
+
+    /// Missing handles and busy/locked reads share this unknown-state envelope.
+    /// Unknown values must never be displayed as successful, authoritative zeros.
+    pub fn partial_state_body() -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ok": false, "state": "partial", "reason": "store_unavailable",
+            "authority": "unknown", "data": null,
+        })
+    }
+}
 pub mod config_parity;
 mod content_language;
 pub mod decay_render;
@@ -51,10 +143,186 @@ pub mod decision_calibration;
 mod digest;
 pub mod divergence;
 pub mod entorhinal_resolve;
+mod dream_runner;
+/// Explicit background entries. None is called by a served transform or tool.
+/// Config resolution and all adapter work happen on the worker, not its caller.
+pub mod background {
+    use crate::config_parity::{ConfigResolveRequest, CoreConfig, CoreConfigResolver};
+    pub use crate::dream_runner::{
+        CarrierError, ChildRequest, Completion, DreamCarrier, DreamRequest, DreamRole, RunResult,
+    };
+    pub use crate::historian_numerical_drain::{
+        DrainMeta, DrainReservation, DrainReserveResult, DrainStore, ReserveRequest,
+    };
+    use mc_store::parity_schema_manifest::CapabilityResult;
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+
+    pub struct ConfigInput {
+        pub resolver: Arc<dyn CoreConfigResolver>,
+        pub request: ConfigResolveRequest,
+    }
+
+    /// Only an off-thread entry can construct a unit containing resolved config
+    /// and activation. Nested operations keep that activation value across toggles.
+    pub struct Unit {
+        config: CoreConfig,
+        activated: bool,
+    }
+
+    fn spawn<T: Send + 'static>(
+        name: &str,
+        input: ConfigInput,
+        work: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let config = match input.resolver.resolve(&input.request) {
+                    CapabilityResult::Available { value } => value,
+                    CapabilityResult::Degraded { reason, .. }
+                    | CapabilityResult::Unavailable { reason } => return Err(reason.code),
+                };
+                let activated = config.effective.rust_background_enabled();
+                if !activated {
+                    return Ok(None);
+                }
+                Ok(Some(work(Unit { config, activated })))
+            })
+    }
+
+    // The orchestration callback is trusted engine code or a hermetic fixture,
+    // never an RPC payload. Each tick and manual run captures config independently;
+    // no serving path calls these entries.
+    pub fn dreamer_tick<T: Send + 'static>(
+        input: ConfigInput,
+        dispatch: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-dreamer-tick", input, dispatch)
+    }
+
+    pub fn manual_dream<T: Send + 'static>(
+        input: ConfigInput,
+        dispatch: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-manual-dream", input, dispatch)
+    }
+
+    pub fn historian_drain<T: Send + 'static>(
+        input: ConfigInput,
+        drain: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-historian-drain", input, drain)
+    }
+
+    pub fn embedding_drain<T: Send + 'static>(
+        input: ConfigInput,
+        drain: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-embedding-drain", input, drain)
+    }
+
+    impl Unit {
+        pub fn captured_dream_config(
+            &self,
+            harness: String,
+            directory: std::path::PathBuf,
+        ) -> Arc<crate::dream_dispatch::context::CapturedConfig> {
+            Arc::new(crate::dream_dispatch::context::CapturedConfig {
+                activated: self.activated,
+                route: self.config.effective.clone(),
+                effective: self.config.settings.clone(),
+                harness,
+                directory,
+            })
+        }
+
+        pub fn run_dream_task<T>(
+            &self,
+            request: &DreamRequest<'_>,
+            carrier: &mut impl DreamCarrier,
+            validate: impl FnMut(&Completion) -> Result<T, String>,
+        ) -> RunResult<T> {
+            // Each worker owns its runtime; no model future blocks the serving runtime.
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("background runtime")
+                .block_on(crate::dream_runner::run_dream_task(
+                    self.activated,
+                    &self.config.effective,
+                    &self.config.settings,
+                    request,
+                    carrier,
+                    validate,
+                ))
+        }
+
+        pub fn reserve_historian<S: DrainStore>(
+            &self,
+            store: &S,
+            request: ReserveRequest<'_>,
+        ) -> Result<Option<DrainReserveResult>, S::Error> {
+            crate::historian_numerical_drain::reserve_protected_tail_drain_tokens(
+                store,
+                self.activated,
+                request,
+            )
+        }
+
+        pub fn refund_historian<S: DrainStore>(
+            &self,
+            store: &S,
+            reservation: &DrainReservation,
+        ) -> Result<(), S::Error> {
+            crate::historian_numerical_drain::rollback_protected_tail_drain_reservation(
+                store,
+                self.activated,
+                Some(reservation),
+            )
+        }
+
+        pub fn publish_historian(
+            &self,
+            store: &mc_store::McStore,
+            mut request: mc_store::HistorianPublishRequest<'_>,
+        ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
+            request.rust_background_enabled = self.activated;
+            store.publish_historian_chunk(request)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn drain_embeddings(
+            &self,
+            db: &mut rusqlite::Connection,
+            chunks: &dyn mc_store::retrieval_vectors::store::ChunkCatalog,
+            provider: &mut dyn mc_store::retrieval_vectors::drain::EmbeddingProvider,
+            registration: &mc_store::retrieval_vectors::drain::Registration,
+            limit: usize,
+            now: i64,
+            completed_at: impl FnOnce() -> i64,
+        ) -> Result<
+            Option<mc_store::retrieval_vectors::drain::FinishOutcome>,
+            mc_store::retrieval_vectors::drain::DrainError,
+        > {
+            mc_store::retrieval_vectors::queue::drain_once(
+                self.activated,
+                db,
+                chunks,
+                provider,
+                registration,
+                limit,
+                now,
+                completed_at,
+            )
+        }
+    }
+}
 pub mod healing;
 pub mod historian;
 pub mod historian_chunk;
 pub mod historian_host;
+mod historian_numerical_drain;
 pub mod historian_producer;
 pub mod historian_prompt;
 pub mod historian_recovery;
@@ -70,6 +338,7 @@ pub mod m1_compose;
 pub mod memory_render;
 pub mod memory_tool;
 mod memory_verification;
+mod ops_facade;
 pub mod parity_contract;
 pub mod project_docs;
 pub mod project_identity;
@@ -78,9 +347,11 @@ pub mod protection_window;
 #[cfg(test)]
 pub(crate) mod provider_transport_tests;
 mod providers;
+mod recomp_staging;
 mod reply_pages;
 mod retained_size;
 pub mod retrieval;
+mod retrieval_store;
 mod transport_admission;
 mod transport_handler;
 pub use transport_handler::McTransportHandler;
@@ -3877,11 +4148,22 @@ pub struct McHandler {
     store_open: Arc<StoreOpenCoordinator>,
     producer_factory: Arc<dyn HistorianProducerFactory>,
     session_resolver: Arc<dyn SessionResolver>,
+    retrieval_reranker: Option<Arc<dyn retrieval::hybrid::RerankClient>>,
     config: Arc<Mutex<ConfigCache>>,
     historian_runner_refusals: Arc<HistorianRunnerRefusalCache>,
     /// Runs queued for a claimant that a firing task in this process is still
     /// waiting on. Empty under the in-module runner.
     host_runs: Arc<HostRunLedger>,
+    dream_children: Arc<dream_dispatch::host_carrier::DreamQueue>,
+    /// Live Broca dream children, keyed by the Broca session each one runs in.
+    /// A memory tool the runner dispatches on such a session reaches the task's
+    /// router only through this record, never the foreground facade.
+    broca_dream_tools: Arc<dream_dispatch::broca_carrier::BrocaToolRoute>,
+    /// What each plugin claimant last declared it can carry. Dream ownership is
+    /// published from these declarations; see `dream_dispatch::ownership`.
+    dream_claimants: Arc<dream_dispatch::ownership::ClaimantRegistry>,
+    /// The Rust dreamer's projects, timer and transports; see `dream_dispatch::tick`.
+    dream_runs: Arc<dream_dispatch::tick::DreamRuns>,
     /// Which runner each session's most recent historian and dreamer completion
     /// used in this process, and why. Read by the status and health surfaces.
     runner_choices: Arc<Mutex<runner_choices::RunnerChoiceLog>>,
@@ -3900,6 +4182,12 @@ pub struct McHandler {
     resolve_project_identity_for_test: AtomicBool,
     #[cfg(test)]
     fixed_config: Option<McModuleConfig>,
+    #[cfg(test)]
+    fixed_dream_settings: Option<Value>,
+    /// Replaces the production executor wiring in fixtures, so publication can be
+    /// exercised for tasks this build does not yet run.
+    #[cfg(test)]
+    dream_wiring: Option<dream_dispatch::ownership::Wiring>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
     live_historian_sessions: Arc<Mutex<HashMap<String, LiveHistorianSession>>>,
     wrapup_sessions: Arc<Mutex<HashMap<String, LiveWrapupSession>>>,
@@ -4251,6 +4539,8 @@ fn historian_trigger_rule(reason: boundary::TriggerReason) -> &'static str {
 }
 
 struct HistorianPrepareContext<'a> {
+    /// A drain/provider supplies its start-time value; ordinary callers capture here.
+    rust_background_enabled: Option<bool>,
     now: i64,
     // Provider runs compare selected message fingerprints and lineage cuts
     // against the database. They have no full-request cache generation to check,
@@ -4265,6 +4555,7 @@ struct HistorianPrepareContext<'a> {
 }
 
 struct ReattachPublicationGuards {
+    rust_background_enabled: bool,
     snapshot_generation: Option<u64>,
     log_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
 }
@@ -4558,6 +4849,7 @@ impl historian::HistorianPublicationFence for ReattachSnapshotPublicationFence {
 }
 
 struct HistorianFiringTask {
+    rust_background_enabled: bool,
     store: Arc<McStore>,
     session_id: String,
     /// The route's harness label, stamped on rows the single-store writers produce.
@@ -4595,6 +4887,120 @@ impl HistorianProducerFactory for MissingProducerFactory {
     }
 }
 
+fn retrieval_values<T: Default>(
+    result: parity_contract::CapabilityResult<T>,
+    source: &str,
+    availability: &mut std::collections::BTreeMap<String, parity_contract::Availability>,
+) -> T {
+    use parity_contract::{Availability, CapabilityResult};
+    let status = result.availability();
+    if !availability
+        .get(source)
+        .is_some_and(|s| matches!(s, Availability::Unavailable { .. }))
+    {
+        availability.insert(source.into(), status);
+    }
+    match result {
+        CapabilityResult::Available { value } | CapabilityResult::Degraded { value, .. } => value,
+        CapabilityResult::Unavailable { .. } => T::default(),
+    }
+}
+
+fn retrieval_key(candidate: &retrieval::hybrid::SearchCandidate) -> String {
+    format!("{:?}:{}", candidate.hit.source, candidate.hit.source_id)
+}
+
+fn retrieval_candidate(
+    source: parity_contract::RetrievalSource,
+    source_id: String,
+    ordinal: Option<u64>,
+    text: String,
+    score: f64,
+    scope: &parity_contract::StoreScope,
+) -> retrieval::hybrid::SearchCandidate {
+    use parity_contract::*;
+    retrieval::hybrid::SearchCandidate {
+        hit: RetrievalHit {
+            source,
+            source_id: source_id.clone(),
+            provenance: Provenance {
+                origin: InputOrigin::Core,
+                source_id,
+                source_revision: "snapshot".into(),
+                content_hash: ContentHash(format!(
+                    "{:x}",
+                    <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())
+                )),
+                generation: scope.generation,
+                observed_at_ms: 0,
+            },
+            ordinal: ordinal.map(|value| MessageOrdinal {
+                value,
+                base: OrdinalBase::One,
+            }),
+            score,
+            text,
+        },
+        compartment_range: None,
+    }
+}
+
+/// Combine message and compartment ranks using reciprocal-rank fusion.
+/// Covered messages add evidence to their compartment instead of appearing twice.
+/// This produces fallback search results, not the larger pool sent to the reranker.
+fn retrieval_merge_messages(
+    messages: Vec<retrieval::hybrid::SearchCandidate>,
+    compartments: Vec<retrieval::hybrid::SearchCandidate>,
+    limit: usize,
+) -> Vec<retrieval::hybrid::SearchCandidate> {
+    if compartments.is_empty() {
+        return messages;
+    }
+    if messages.is_empty() {
+        return compartments;
+    }
+    let mut fused = compartments
+        .iter()
+        .enumerate()
+        .map(|(rank, c)| (c.clone(), 1.0 / (60 + rank) as f64))
+        .collect::<Vec<_>>();
+    for (rank, message) in messages.into_iter().enumerate() {
+        let containing = message.hit.ordinal.and_then(|o| {
+            compartments.iter().find(|c| {
+                c.compartment_range
+                    .is_some_and(|(start, end)| o.value >= start && o.value <= end)
+            })
+        });
+        let candidate = containing.unwrap_or(&message);
+        if let Some(row) = fused
+            .iter_mut()
+            .find(|(c, _)| retrieval_key(c) == retrieval_key(candidate))
+        {
+            row.1 += 1.0 / (60 + rank) as f64;
+        } else {
+            fused.push((candidate.clone(), 1.0 / (60 + rank) as f64));
+        }
+    }
+    fused.sort_by(|(a, sa), (b, sb)| {
+        sb.total_cmp(sa).then(
+            a.hit
+                .ordinal
+                .map(|o| o.value)
+                .cmp(&b.hit.ordinal.map(|o| o.value)),
+        )
+    });
+    fused.truncate(limit);
+    let count = fused.len();
+    fused
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (mut c, _))| {
+            c.hit.score = 1.0 - rank as f64 / count as f64;
+            c
+        })
+        .collect()
+}
+
 impl McHandler {
     pub fn new() -> Self {
         Self::new_with_connection_file(None)
@@ -4623,6 +5029,18 @@ impl McHandler {
         route_targets: RouteTargetConfig,
         module_id: String,
     ) -> Self {
+        let dream_runs = Arc::new(dream_dispatch::tick::DreamRuns::new(
+            connection_file.clone(),
+            &route_targets,
+        ));
+        let retrieval_reranker = connection_file.as_ref().map(|path| {
+            Arc::new(retrieval_store::RerankTransport {
+                connection_file: path.clone(),
+                target: route_targets
+                    .target(route_targets::RegisteredRoute::SynapseRerank)
+                    .expect("rerank route is registered"),
+            }) as Arc<dyn retrieval::hybrid::RerankClient>
+        });
         let producer_factory: Arc<dyn HistorianProducerFactory> = match connection_file.clone() {
             Some(path) => Arc::new(RealHistorianProducerFactory {
                 connection_file: path,
@@ -4664,9 +5082,14 @@ impl McHandler {
             store_open: Arc::new(StoreOpenCoordinator::new()),
             producer_factory,
             session_resolver,
+            retrieval_reranker,
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
+            dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
+            broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
+            dream_claimants: Arc::new(dream_dispatch::ownership::ClaimantRegistry::default()),
+            dream_runs,
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             entorhinal,
@@ -4677,6 +5100,10 @@ impl McHandler {
             resolve_project_identity_for_test: AtomicBool::new(false),
             #[cfg(test)]
             fixed_config: None,
+            #[cfg(test)]
+            fixed_dream_settings: None,
+            #[cfg(test)]
+            dream_wiring: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -5039,6 +5466,7 @@ impl McHandler {
         Self::with_producer_factory_and_config(
             factory,
             McModuleConfig {
+                rust_background_enabled: false,
                 cache_ttl_by_model: std::collections::BTreeMap::new(),
                 catalog: crate::config::CatalogConfigInputs::default(),
                 historian_temperature: None,
@@ -5112,9 +5540,17 @@ impl McHandler {
             store_open: Arc::new(StoreOpenCoordinator::new()),
             producer_factory: factory,
             session_resolver,
+            retrieval_reranker: None,
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
+            dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
+            broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
+            dream_claimants: Arc::new(dream_dispatch::ownership::ClaimantRegistry::default()),
+            dream_runs: Arc::new(dream_dispatch::tick::DreamRuns::new(
+                None,
+                &RouteTargetConfig::default(),
+            )),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             entorhinal: entorhinal_resolve::EntorhinalResolver::new(None),
@@ -5124,6 +5560,8 @@ impl McHandler {
             #[cfg(test)]
             resolve_project_identity_for_test: AtomicBool::new(false),
             fixed_config: Some(config),
+            fixed_dream_settings: None,
+            dream_wiring: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -6304,6 +6742,7 @@ impl McHandler {
         now: i64,
     ) -> Option<&'static str> {
         let ReattachPublicationGuards {
+            rust_background_enabled,
             snapshot_generation,
             log_fence: log_publication_fence,
         } = guards;
@@ -6464,6 +6903,7 @@ impl McHandler {
                 let _guard = guard;
                 let outcome =
                     historian::adopt_historian_run_on_host(historian::HistorianReattachRequest {
+                        rust_background_enabled,
                         store: &store,
                         session_id: &session_id,
                         project_path: &project_path,
@@ -6604,6 +7044,7 @@ impl McHandler {
                         reattach_historian_producer(
                             &mut *producer,
                             historian::HistorianReattachRequest {
+                                rust_background_enabled,
                                 store: &store,
                                 session_id: &session_id,
                                 project_path: &project_path,
@@ -6684,6 +7125,7 @@ impl McHandler {
     ) -> PreparedHistorianAction {
         profile_start!(_perf_trigger, "trigger_ms");
         let HistorianPrepareContext {
+            rust_background_enabled,
             now,
             snapshot_generation,
             publication_fence,
@@ -6764,12 +7206,15 @@ impl McHandler {
             };
         }
         let cfg = self.effective_config(&binding.project_root);
+        let rust_background_enabled =
+            rust_background_enabled.unwrap_or_else(|| cfg.rust_background_enabled());
         if loaded.meta.historian.state != HistorianPhase::Idle {
             let no_fire = self
                 .maybe_spawn_reattach(
                     Arc::clone(&store),
                     parsed,
                     ReattachPublicationGuards {
+                        rust_background_enabled,
                         snapshot_generation,
                         log_fence: publication_fence.clone(),
                     },
@@ -7296,6 +7741,7 @@ impl McHandler {
         PreparedHistorianAction::FireReady(Box::new(PreparedHistorianFiring {
             diagnostics,
             task: HistorianFiringTask {
+                rust_background_enabled,
                 store,
                 session_id: parsed.session_id.clone(),
                 harness: binding.harness.clone(),
@@ -7457,6 +7903,7 @@ impl McHandler {
             }
         };
         PreparedWrapupAction::FireReady(Box::new(HistorianFiringTask {
+            rust_background_enabled: binding.config.rust_background_enabled(),
             store,
             session_id: parsed.session_id.clone(),
             harness: binding.harness.clone(),
@@ -7567,6 +8014,7 @@ impl McHandler {
         task: HistorianFiringTask,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
         let HistorianFiringTask {
+            rust_background_enabled,
             store,
             session_id,
             harness,
@@ -7611,6 +8059,7 @@ impl McHandler {
                 language.as_deref(),
             );
             request.temperature = historian_temperature;
+            request.rust_background_enabled = rust_background_enabled;
             request.publication_fence = publication_fence.as_deref();
             // The claimant walks the same model chain a Broca firing would, each
             // attempt under the host's own per-attempt timeout, so this waits for the
@@ -7643,6 +8092,7 @@ impl McHandler {
                     language.as_deref(),
                 );
                 request.temperature = historian_temperature;
+                request.rust_background_enabled = rust_background_enabled;
                 request.await_timeout = historian_await_timeout;
                 request.publication_fence = publication_fence.as_deref();
                 run_historian_firing_with_model_cache(
@@ -8360,6 +8810,634 @@ impl McHandler {
             }
         };
         Ok((session_id.to_string(), binding))
+    }
+
+    async fn handle_retrieval(&self, channel: u16, envelope: &Value) -> HandlerOutcome {
+        use parity_contract::*;
+        use retrieval::hybrid::*;
+        let (_, binding) =
+            match self.management_binding(channel, envelope, non_served_contract::RETRIEVAL_METHOD)
+            {
+                Ok(value) => value,
+                Err(outcome) => return outcome,
+            };
+        let Some(store) = self.store.get() else {
+            return HandlerOutcome::Error {
+                code: "store_refusal".into(),
+                message: "mc.retrieval requires a store".into(),
+            };
+        };
+        let project = match self.route_project_identity(store, &binding) {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
+        };
+        let scope = StoreScope {
+            project: ProjectId(project),
+            session: SessionId(binding.session.clone()),
+            generation: Generation(0),
+        };
+        let bad_request = |message: &str| HandlerOutcome::Error {
+            code: "bad_request".into(),
+            message: message.into(),
+        };
+        let op = envelope
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("search");
+        if op == "expand" {
+            use retrieval::hybrid::expand;
+            let Ok(source) = serde_json::from_value::<RetrievalSource>(envelope["source"].clone())
+            else {
+                return bad_request("mc.retrieval expand requires a Rust source id");
+            };
+            if !matches!(
+                source,
+                RetrievalSource::RawMessage | RetrievalSource::Compartment
+            ) {
+                return HandlerOutcome::Error {
+                    code: "expand_unsupported_source".into(),
+                    message: envelope["source"].as_str().unwrap_or_default().into(),
+                };
+            }
+            // Keep recorded object-key order: parsing tool inputs through Value would
+            // sort their keys and change the TypeScript recovery text.
+            let Some(pages_json) = envelope["pages_json"].as_str() else {
+                return bad_request("mc.retrieval expand requires pages_json");
+            };
+            let Ok(pages) = serde_json::from_str::<Vec<Vec<expand::RawMessage>>>(pages_json) else {
+                return bad_request("mc.retrieval expand requires recorded raw-message pages");
+            };
+            if source == RetrievalSource::RawMessage {
+                let Some(ordinal) = envelope["ordinal"].as_i64() else {
+                    return bad_request("expand requires ordinal");
+                };
+                return respond(
+                    json!({"v":1,"text":expand::render_message_by_ordinal(&pages, ordinal)}),
+                );
+            }
+            let (Some(start), Some(end), Some(budget)) = (
+                envelope["start"].as_i64(),
+                envelope["end"].as_i64(),
+                envelope["token_budget"].as_u64(),
+            ) else {
+                return bad_request("compartment expand requires start, end and token_budget");
+            };
+            let overrides = match envelope.get("overrides") {
+                Some(value) => {
+                    match serde_json::from_value::<expand::ToolExpansionMap>(value.clone()) {
+                        Ok(value) => value,
+                        Err(_) => return bad_request("invalid expand preview overrides"),
+                    }
+                }
+                None => Default::default(),
+            };
+            let rendered = expand::render_verbose_range(
+                &pages,
+                start,
+                end,
+                budget.min(usize::MAX as u64) as usize,
+                &overrides,
+            );
+            return respond(
+                json!({"v":1,"text":rendered.text,"lastOrdinal":rendered.last_ordinal,"truncated":rendered.truncated}),
+            );
+        }
+        if !matches!(op, "search" | "auto_hint") {
+            return bad_request("unknown mc.retrieval operation");
+        }
+        let Ok(mut request) =
+            serde_json::from_value::<RetrievalRequest>(envelope["request"].clone())
+        else {
+            return bad_request("mc.retrieval requires a RetrievalRequest");
+        };
+        let Ok(sources) =
+            serde_json::from_value::<Vec<RetrievalSource>>(envelope["sources"].clone())
+        else {
+            return bad_request("mc.retrieval requires Rust source ids");
+        };
+        if request
+            .ordinal_cutoff
+            .is_some_and(|o| o.base != OrdinalBase::One || o.value > i64::MAX as u64)
+            || matches!((request.start_at_ms, request.end_at_ms_inclusive), (Some(a), Some(b)) if a > b)
+        {
+            return bad_request("invalid retrieval bounds");
+        }
+        if op == "auto_hint" {
+            request.intent = RetrievalIntent::Auto;
+        }
+        request.query = trim_query(&request.query).to_owned();
+        let limit = request.limit.clamp(1, 25) as usize;
+        let tier_limit = (limit * 3).max(10);
+        let dates = DateBounds {
+            from_ms: request.start_at_ms,
+            to_ms: request.end_at_ms_inclusive,
+        };
+        let cutoff = request
+            .ordinal_cutoff
+            .map(|o| o.value as i64)
+            .unwrap_or(i64::MAX);
+        let adapter = retrieval_store::RetrievalStore {
+            store,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let mut availability = std::collections::BTreeMap::new();
+        let mut lanes = SearchLanes::default();
+        let mut bodies = HashMap::<String, String>::new();
+        let mut memory_hits = Vec::new();
+        let mut raw_hits = Vec::new();
+        let mut compartment_hits = Vec::new();
+        let mut other_hits = Vec::new();
+        let vector = serde_json::from_value::<Vec<f32>>(envelope["query_vector"].clone()).ok();
+        let query_vector = request
+            .embedding
+            .as_ref()
+            .zip(vector.as_deref())
+            .filter(|(id, v)| {
+                !matches!(id.provider.as_str(), "local" | "transformers")
+                    && id.model != "off"
+                    && id.dimensions > 0
+                    && v.len() == id.dimensions as usize
+                    && v.iter().all(|v| v.is_finite())
+            });
+        let probes = literal_probes(request.intent, &request.query);
+        let has = |source| sources.contains(&source);
+        if has(RetrievalSource::Memory) {
+            let memories = retrieval_values(
+                adapter.read_search_memories(&scope, dates),
+                "memory",
+                &mut availability,
+            );
+            let fts = retrieval_values(
+                adapter.search_memory_fts(&scope, &request.query, dates, FTS_CANDIDATE_LIMIT),
+                "memory",
+                &mut availability,
+            );
+            let visible = retrieval_values(
+                adapter.read_visible_memory_ids(&scope),
+                "memory",
+                &mut availability,
+            )
+            .into_iter()
+            .chain(request.visible_memory_ids.iter().map(|v| *v as i64))
+            .collect();
+            let vectors = query_vector
+                .map(|(id, _)| {
+                    retrieval_values(
+                        adapter.read_memory_vectors(
+                            &scope,
+                            &memories.iter().map(|m| m.id).collect::<Vec<_>>(),
+                            id,
+                        ),
+                        "memory",
+                        &mut availability,
+                    )
+                })
+                .unwrap_or_default();
+            let (ranked, _) = rank_memories(
+                &memories,
+                &fts,
+                &vectors,
+                query_vector,
+                &visible,
+                dates,
+                tier_limit.max(25),
+            );
+            for hit in ranked {
+                let memory = memories
+                    .iter()
+                    .find(|m| m.id == hit.memory_id)
+                    .expect("ranked memory belongs to snapshot");
+                let candidate = retrieval_candidate(
+                    RetrievalSource::Memory,
+                    hit.memory_id.to_string(),
+                    None,
+                    hit.content,
+                    hit.score,
+                    &scope,
+                );
+                bodies.insert(
+                    retrieval_key(&candidate),
+                    candidate_text(
+                        &format!("memory {} {}", hit.memory_id, scope.project.0),
+                        memory.content.lines().next().unwrap_or_default(),
+                        &memory.content,
+                    ),
+                );
+                memory_hits.push(candidate);
+            }
+            let convert = |hit: MemoryHit| {
+                retrieval_candidate(
+                    RetrievalSource::Memory,
+                    hit.memory_id.to_string(),
+                    None,
+                    hit.content,
+                    hit.score,
+                    &scope,
+                )
+            };
+            lanes.memory_fts = rank_memories(&memories, &fts, &[], None, &visible, dates, 25)
+                .0
+                .into_iter()
+                .map(convert)
+                .collect();
+            lanes.memory_vector =
+                rank_memories(&memories, &[], &vectors, query_vector, &visible, dates, 25)
+                    .0
+                    .into_iter()
+                    .map(convert)
+                    .collect();
+            for candidate in lanes.memory_fts.iter().chain(&lanes.memory_vector) {
+                if let Some(memory) = memories
+                    .iter()
+                    .find(|m| m.id.to_string() == candidate.hit.source_id)
+                {
+                    bodies.insert(
+                        retrieval_key(candidate),
+                        candidate_text(
+                            &format!("memory {} {}", memory.id, scope.project.0),
+                            memory.content.lines().next().unwrap_or_default(),
+                            &memory.content,
+                        ),
+                    );
+                }
+            }
+            memory_hits.truncate(tier_limit);
+        }
+        if has(RetrievalSource::RawMessage) {
+            let rows = retrieval_values(
+                adapter.raw_messages(
+                    &scope,
+                    &request.query,
+                    dates,
+                    cutoff,
+                    75,
+                    request.intent == RetrievalIntent::Explicit,
+                ),
+                "raw_message",
+                &mut availability,
+            );
+            for (rank, row) in rows.iter().enumerate() {
+                let candidate = retrieval_candidate(
+                    RetrievalSource::RawMessage,
+                    row.id.clone(),
+                    Some(row.ordinal as u64),
+                    row.content.clone(),
+                    1.0 - rank as f64 / rows.len() as f64,
+                    &scope,
+                );
+                bodies.insert(
+                    retrieval_key(&candidate),
+                    candidate_text(
+                        &format!("message {} {} @{}", row.id, scope.session.0, row.ordinal),
+                        &format!(
+                            "{}: {}",
+                            row.role,
+                            row.content.lines().next().unwrap_or_default()
+                        ),
+                        &row.content,
+                    ),
+                );
+                raw_hits.push(candidate);
+            }
+            if !probes.is_empty() {
+                let corpus = retrieval_values(
+                    adapter.corpus_size(&scope, cutoff),
+                    "raw_message",
+                    &mut availability,
+                );
+                let matches = probes
+                    .iter()
+                    .map(|probe| {
+                        let rows = retrieval_values(
+                            adapter.raw_messages(&scope, probe, dates, cutoff, 75, true),
+                            "raw_message",
+                            &mut availability,
+                        );
+                        let hits = rows
+                            .iter()
+                            .map(|row| {
+                                let c = retrieval_candidate(
+                                    RetrievalSource::RawMessage,
+                                    row.id.clone(),
+                                    Some(row.ordinal as u64),
+                                    row.content.clone(),
+                                    0.0,
+                                    &scope,
+                                );
+                                bodies.insert(
+                                    retrieval_key(&c),
+                                    candidate_text(
+                                        &format!(
+                                            "message {} {} @{}",
+                                            row.id, scope.session.0, row.ordinal
+                                        ),
+                                        &format!(
+                                            "{}: {}",
+                                            row.role,
+                                            row.content.lines().next().unwrap_or_default()
+                                        ),
+                                        &row.content,
+                                    ),
+                                );
+                                c.hit
+                            })
+                            .collect();
+                        ProbeMatches {
+                            probe: probe.clone(),
+                            document_frequency: retrieval_values(
+                                adapter.probe_frequency(&scope, probe, dates, cutoff),
+                                "raw_message",
+                                &mut availability,
+                            ),
+                            hits,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                raw_hits = rank_message_probes(
+                    &raw_hits.iter().map(|c| c.hit.clone()).collect::<Vec<_>>(),
+                    &matches,
+                    corpus,
+                    75,
+                    tier_limit.max(25),
+                )
+                .into_iter()
+                .map(|hit| SearchCandidate {
+                    hit,
+                    compartment_range: None,
+                })
+                .collect();
+            }
+            lanes.message_fts = raw_hits
+                .iter()
+                .take(25)
+                .cloned()
+                .map(|mut c| {
+                    c.hit.text = preview(&c.hit.text);
+                    c
+                })
+                .collect();
+            raw_hits.truncate(tier_limit);
+            let count = raw_hits.len();
+            for (rank, candidate) in raw_hits.iter_mut().enumerate() {
+                candidate.hit.text = preview(&candidate.hit.text);
+                candidate.hit.score = 1.0 - rank as f64 / count as f64;
+            }
+        }
+        if has(RetrievalSource::Compartment) {
+            if let Some((identity, vector)) = query_vector {
+                let chunks = retrieval_values(
+                    adapter.read_compartment_chunks(&scope, dates, identity),
+                    "compartment",
+                    &mut availability,
+                );
+                for hit in retrieval::compartments::rank_compartments(
+                    &chunks,
+                    &scope,
+                    identity,
+                    vector,
+                    dates,
+                    Some(cutoff),
+                    tier_limit.max(25),
+                ) {
+                    let mut candidate = retrieval_candidate(
+                        RetrievalSource::Compartment,
+                        hit.compartment_id.to_string(),
+                        Some(hit.start_ordinal as u64),
+                        hit.content,
+                        hit.score,
+                        &scope,
+                    );
+                    candidate.compartment_range =
+                        Some((hit.start_ordinal as u64, hit.end_ordinal as u64));
+                    let body = adapter.compartment_text(&scope, hit.start_ordinal, hit.end_ordinal);
+                    if let CapabilityResult::Available { value: body }
+                    | CapabilityResult::Degraded { value: body, .. } = body
+                    {
+                        bodies.insert(
+                            retrieval_key(&candidate),
+                            candidate_text(
+                                &format!(
+                                    "compartment {} {} @{}-{}",
+                                    hit.compartment_id,
+                                    scope.session.0,
+                                    hit.start_ordinal,
+                                    hit.end_ordinal
+                                ),
+                                &hit.title,
+                                &body,
+                            ),
+                        );
+                    }
+                    compartment_hits.push(candidate);
+                }
+                lanes.chunk_vector = compartment_hits.iter().take(25).cloned().collect();
+                compartment_hits.truncate(tier_limit);
+            } else {
+                availability.insert(
+                    "compartment".into(),
+                    mc_store::parity_schema_manifest::unavailable("retrieval_lane"),
+                );
+            }
+        }
+        if has(RetrievalSource::GitCommit) {
+            let result = retrieval_values(
+                adapter.git_commits(&scope, &request, query_vector, tier_limit),
+                "git_commit",
+                &mut availability,
+            );
+            let convert = |hit: &mc_store::git_archive::GitCommitSearchHit| {
+                retrieval_candidate(
+                    RetrievalSource::GitCommit,
+                    hit.commit.sha.clone(),
+                    None,
+                    preview(&hit.commit.message),
+                    hit.score,
+                    &scope,
+                )
+            };
+            for hit in result.hits.iter().chain(&result.fts).chain(&result.vector) {
+                let candidate = convert(hit);
+                bodies.insert(
+                    retrieval_key(&candidate),
+                    candidate_text(
+                        &format!("git_commit {} {}", hit.commit.sha, scope.project.0),
+                        &format!(
+                            "{} {}",
+                            hit.commit.short_sha,
+                            hit.commit.message.lines().next().unwrap_or_default()
+                        ),
+                        &hit.commit.message,
+                    ),
+                );
+            }
+            lanes.git_fts = result.fts.iter().map(convert).collect();
+            lanes.git_vector = result.vector.iter().map(convert).collect();
+            other_hits.extend(result.hits.iter().map(convert));
+        }
+        if has(RetrievalSource::Note) {
+            let (hits, rows) = retrieval_values(
+                adapter.notes(&scope, &request, &probes, tier_limit.max(25)),
+                "note",
+                &mut availability,
+            );
+            for hit in hits {
+                let candidate = retrieval_candidate(
+                    RetrievalSource::Note,
+                    hit.note_id.to_string(),
+                    hit.anchor_ordinal.and_then(|o| u64::try_from(o).ok()),
+                    hit.content,
+                    hit.score,
+                    &scope,
+                );
+                if let Some(row) = rows.iter().find(|r| r.id == hit.note_id) {
+                    let body = format!(
+                        "{}{}",
+                        row.content,
+                        row.ready_reason
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!("\nReason: {s}"))
+                            .unwrap_or_default()
+                    );
+                    bodies.insert(
+                        retrieval_key(&candidate),
+                        candidate_text(
+                            &format!("note {} {}", hit.note_id, scope.project.0),
+                            body.lines().next().unwrap_or_default(),
+                            &body,
+                        ),
+                    );
+                }
+                lanes.notes.push(candidate.clone());
+                other_hits.push(candidate);
+            }
+            lanes.notes.truncate(25);
+        }
+        if has(RetrievalSource::Primer) {
+            availability.insert(
+                "primer".into(),
+                mc_store::parity_schema_manifest::unavailable("retrieval_lane"),
+            );
+        }
+        let mut baseline = memory_hits;
+        baseline.extend(retrieval_merge_messages(
+            raw_hits,
+            compartment_hits,
+            tier_limit,
+        ));
+        baseline.extend(other_hits);
+        baseline.sort_by(|a, b| {
+            let boost = |c: &SearchCandidate| match c.hit.source {
+                RetrievalSource::Memory => 1.3,
+                RetrievalSource::RawMessage | RetrievalSource::Compartment => 1.275,
+                RetrievalSource::GitCommit => 1.2,
+                RetrievalSource::Primer => 1.25,
+                RetrievalSource::Note => 1.0,
+            };
+            (b.hit.score * boost(b))
+                .total_cmp(&(a.hit.score * boost(a)))
+                .then_with(|| {
+                    if a.hit.source != b.hit.source {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    match a.hit.source {
+                        RetrievalSource::Memory => a
+                            .hit
+                            .source_id
+                            .parse::<i64>()
+                            .unwrap_or_default()
+                            .cmp(&b.hit.source_id.parse::<i64>().unwrap_or_default()),
+                        RetrievalSource::RawMessage | RetrievalSource::Compartment => a
+                            .hit
+                            .ordinal
+                            .map(|o| o.value)
+                            .cmp(&b.hit.ordinal.map(|o| o.value)),
+                        _ => std::cmp::Ordering::Equal,
+                    }
+                })
+        });
+        baseline.truncate(limit);
+        if request.query.is_empty() {
+            baseline.clear();
+        }
+        let identity = RerankIdentity::new(
+            binding.project_root.to_string_lossy().into_owned(),
+            binding.session.clone(),
+        );
+        let pinned = prepare_reranker(
+            request.intent,
+            &request.query,
+            self.retrieval_reranker.as_deref(),
+            &identity,
+        )
+        .await;
+        let session = pinned
+            .zip(self.retrieval_reranker.as_deref())
+            .map(|(lane, client)| RerankSession {
+                client,
+                lane,
+                identity,
+            });
+        let pool = fuse_search_lanes(&lanes);
+        let texts = pool
+            .iter()
+            .map(|c| bodies.get(&retrieval_key(c)).cloned())
+            .collect::<Option<Vec<_>>>();
+        let hits = if let Some(texts) = texts {
+            rerank_search_results(
+                request.intent,
+                session.as_ref(),
+                &request.query,
+                &baseline,
+                &pool,
+                &texts,
+                limit,
+            )
+            .await
+        } else {
+            baseline
+        };
+        let mut body = json!({"v":1,"hits":hits.into_iter().map(|c| c.hit).collect::<Vec<_>>(),"source_availability":availability,"literal_probes":probes});
+        if envelope["capture_lanes"] == true {
+            body["lanes"] = json!({"git_fts":lanes.git_fts.iter().map(|c|&c.hit).collect::<Vec<_>>(),"git_vector":lanes.git_vector.iter().map(|c|&c.hit).collect::<Vec<_>>()});
+        }
+        respond(body)
+    }
+
+    fn handle_non_served_method(
+        &self,
+        channel: u16,
+        request: &Value,
+        method: &str,
+    ) -> HandlerOutcome {
+        if non_served_contract::UI_METHODS.contains(&method) {
+            return self.handle_ops_facade(channel, request, method);
+        }
+        let (_, binding) = match self.management_binding(channel, request, method) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let store = self.store.get();
+        if non_served_contract::UI_READ_METHODS.contains(&method) && store.is_none() {
+            return respond(non_served_contract::partial_state_body());
+        }
+        if non_served_contract::PROJECT_METHODS.contains(&method) {
+            if let Some(store) = store {
+                if let Err(outcome) = self.route_project_identity(store, &binding) {
+                    return outcome;
+                }
+            }
+        }
+        if method == "mc.dream" {
+            return self.dream_control_entry(&binding, request);
+        }
+        non_served_route_refusal(method)
+    }
+
+    // The manual dream controller is deliberately separate from dreamer.run_task.
+    // Until a scheduler owns this entry, it starts no host or Rust work.
+    fn dream_control_entry(&self, _binding: &SessionBinding, _request: &Value) -> HandlerOutcome {
+        non_served_route_refusal("mc.dream")
     }
 
     fn handle_todo_state_set_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -11236,6 +12314,7 @@ impl McHandler {
                 &project_path,
                 &result.projection,
                 HistorianPrepareContext {
+                    rust_background_enabled: None,
                     now: pass_now,
                     snapshot_generation: Some(snapshot_generation),
                     publication_fence: None,
@@ -11269,6 +12348,7 @@ impl McHandler {
                             &project_path,
                             &result.projection,
                             HistorianPrepareContext {
+                                rust_background_enabled: None,
                                 now: pass_now,
                                 snapshot_generation: Some(snapshot_generation),
                                 publication_fence: None,
@@ -11343,6 +12423,7 @@ impl McHandler {
                 &project_path,
                 &result.projection,
                 HistorianPrepareContext {
+                    rust_background_enabled: None,
                     now: pass_now,
                     snapshot_generation: Some(snapshot_generation),
                     publication_fence: None,
@@ -12674,6 +13755,29 @@ impl McHandler {
             .contains(session_id)
     }
 
+    fn dream_task_settings(&self, project_root: &Path) -> Result<Value, HandlerOutcome> {
+        #[cfg(test)]
+        if let Some(settings) = &self.fixed_dream_settings {
+            return Ok(settings.clone());
+        }
+        use config_parity::CoreConfigResolver;
+        use mc_store::parity_schema_manifest::CapabilityResult;
+        match config_parity::TrustedConfigResolver::from_environment().resolve(
+            &config_parity::ConfigResolveRequest {
+                user_config_path: String::new(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                generation: mc_store::parity_schema_manifest::Generation(0),
+            },
+        ) {
+            CapabilityResult::Available { value } => Ok(value.settings),
+            CapabilityResult::Degraded { reason, .. }
+            | CapabilityResult::Unavailable { reason } => Err(HandlerOutcome::Error {
+                code: "unavailable_capability".into(),
+                message: format!("dreamer config unavailable: {}", reason.code),
+            }),
+        }
+    }
+
     async fn handle_dreamer_run_task(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let (ledger_session, binding) =
             match self.management_binding(channel, request, "dreamer.run_task") {
@@ -12692,6 +13796,49 @@ impl McHandler {
         let Some(task) = request.get("task").and_then(Value::as_str) else {
             return invalid_params_error("dreamer.run_task requires task");
         };
+        let config = self.effective_config(&binding.project_root);
+        let activated = config.rust_background_enabled();
+        let canonical = mc_store::dream_scheduler::schedules::CANONICAL_TASKS
+            .into_iter()
+            .find(|name| name.as_str() == task);
+        // A plugin route still runs every task Rust has not published, exactly as
+        // with the switch off; only a published task belongs to the Rust scheduler.
+        if activated && dream_claim::plugin_lane(&binding) {
+            if canonical.is_some_and(|name| self.dream_task_published(&binding, name)) {
+                return HandlerOutcome::Error {
+                    code: "rust_scheduler_owns_task".into(),
+                    message: format!("Rust scheduler owns dreamer task {task:?}"),
+                };
+            }
+        } else if activated {
+            let available = canonical.is_some()
+                && (config.smart_notes_enabled || task != "evaluate-smart-notes");
+            if !available {
+                return invalid_params_error(format!("unknown dreamer task {task:?}"));
+            }
+            let settings = match self.dream_task_settings(&binding.project_root) {
+                Ok(settings) => settings,
+                Err(outcome) => return outcome,
+            };
+            let enabled = settings["dreamer"]["tasks"][task]["schedule"]
+                .as_str()
+                .is_some_and(|schedule| !schedule.trim().is_empty());
+            if !enabled {
+                return invalid_params_error(format!("unknown dreamer task {task:?}"));
+            }
+            // Ownership comes only from the published list; request fields and
+            // config alone cannot claim a task for Rust.
+            if canonical.is_some_and(|name| self.dream_task_published(&binding, name)) {
+                return HandlerOutcome::Error {
+                    code: "rust_scheduler_owns_task".into(),
+                    message: format!("Rust scheduler owns dreamer task {task:?}"),
+                };
+            }
+            return HandlerOutcome::Error {
+                code: "unavailable_capability".into(),
+                message: format!("Rust implementation unavailable for dreamer task {task:?}"),
+            };
+        }
         if task != CLASSIFY_TASK {
             // Enumerating the task here is a capability boundary: callers cannot use this
             // route to select an arbitrary system prompt, model, or tool-enabled run.
@@ -15523,6 +16670,75 @@ impl McHandler {
             Ok(pass) => pass,
             Err(refusal) => return refusal,
         };
+        // Authenticate these non-tool routes before store-open or provider checks.
+        // Their executors will replace the named refusals without retargeting served paths.
+        match method {
+            Some("mc.ui_capabilities") => {
+                return self.handle_non_served_method(channel, &request, "mc.ui_capabilities")
+            }
+            Some("mc.read_sidebar") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_sidebar")
+            }
+            Some("mc.read_status") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_status")
+            }
+            Some("mc.read_embed") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_embed")
+            }
+            Some("mc.read_compartment_count") => {
+                return self.handle_non_served_method(
+                    channel,
+                    &request,
+                    "mc.read_compartment_count",
+                )
+            }
+            Some("mc.read_todos") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_todos")
+            }
+            Some("mc.recomp_preview") => {
+                return self.handle_non_served_method(channel, &request, "mc.recomp_preview")
+            }
+            Some("mc.recomp_start") => {
+                return self.handle_non_served_method(channel, &request, "mc.recomp_start")
+            }
+            Some("mc.rescore") => {
+                return self.handle_non_served_method(channel, &request, "mc.rescore")
+            }
+            Some("mc.wrapup") => {
+                return self.handle_non_served_method(channel, &request, "mc.wrapup")
+            }
+            Some("mc.flush") => {
+                return self.handle_non_served_method(channel, &request, "mc.flush")
+            }
+            Some("mc.dream") => {
+                return self.handle_non_served_method(channel, &request, "mc.dream")
+            }
+            Some("mc.embed") => {
+                return self.handle_non_served_method(channel, &request, "mc.embed")
+            }
+            Some("mc.job_read") => {
+                return self.handle_non_served_method(channel, &request, "mc.job_read")
+            }
+            Some("mc.job_cancel") => {
+                return self.handle_non_served_method(channel, &request, "mc.job_cancel")
+            }
+            Some("mc.ui_events") => {
+                return self.handle_non_served_method(channel, &request, "mc.ui_events")
+            }
+            Some("mc.notice_currentness") => {
+                return self.handle_non_served_method(channel, &request, "mc.notice_currentness")
+            }
+            Some("mc.retrieval") => return self.handle_retrieval(channel, &request).await,
+            Some("mc.memory") => {
+                return self.handle_non_served_method(channel, &request, "mc.memory")
+            }
+            _ => {}
+        }
+        // A route bound to a Broca dream child's session serves only that child's
+        // admitted task tools (plus read-only discovery), whatever the request says.
+        if let Some(outcome) = self.broca_dream_route(channel, method, &request) {
+            return outcome;
+        }
         let provider_operation = if method == Some("tools/call") {
             request.pointer("/params/name").and_then(Value::as_str)
         } else {
@@ -15600,6 +16816,16 @@ impl McHandler {
                 "state_import" => self.handle_state_import_value(channel, request),
                 "agent_drops.append" => self.handle_agent_drops_value(channel, request),
                 "note.evaluate" => self.handle_note_evaluation_value(channel, &request).await,
+                "dream.child.pending"
+                | "dream.child.claim"
+                | "dream.child.heartbeat"
+                | "dream.child.opened"
+                | "dream.child.event"
+                | "dream.child.tool"
+                | "dream.child.cleanup"
+                | "dream.child.unavailable" => self.handle_dream_child(channel, method, &request),
+                "dream.ownership" => self.handle_dream_ownership(channel, &request),
+                "dream.run" => self.handle_dream_run(channel, &request),
                 "historian.pending" => self.handle_historian_pending_value(channel, &request),
                 "historian.claim" => self.handle_historian_claim_value(channel, &request),
                 "historian.heartbeat" => self.handle_historian_heartbeat_value(channel, &request),
@@ -15644,6 +16870,13 @@ fn redact_unserved_tag_text(text: &str, numbers: &BTreeSet<i64>) -> String {
         }
     })
     .into_owned()
+}
+
+fn non_served_route_refusal(method: &str) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: non_served_contract::ROUTE_REFUSAL_CODE.to_string(),
+        message: method.to_string(),
+    }
 }
 
 fn has_transform_page_fields(request: &Value) -> bool {
@@ -20335,6 +21568,996 @@ mod tests {
     mod tool_catalog_conformance;
     // The per-harness default runner, driven through real passes.
     mod default_runner;
+    mod retrieval_parity;
+
+    mod i4_roots {
+        use super::*;
+        use crate::background::{self, ConfigInput, DreamCarrier, DreamRequest, DreamRole};
+        use crate::config_parity::{
+            ConfigResolveRequest, CoreConfig, CoreConfigResolver, ProtectedTokenTiers, TrustFlags,
+        };
+        use mc_store::dream_scheduler::schedules::CANONICAL_TASKS;
+        use mc_store::parity_schema_manifest::{Availability, CapabilityResult, Generation};
+
+        struct ConfigFixture {
+            on: AtomicBool,
+            reads: AtomicUsize,
+        }
+
+        impl CoreConfigResolver for ConfigFixture {
+            fn availability(&self) -> Availability {
+                Availability::Available
+            }
+
+            fn resolve(&self, _: &ConfigResolveRequest) -> CapabilityResult<CoreConfig> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                let mut effective = default_test_config();
+                effective.rust_background_enabled = self.on.load(Ordering::SeqCst);
+                effective.historian_runner = Some(HistorianRunnerKind::Host);
+                effective.dreamer_runner = Some(HistorianRunnerKind::Broca);
+                CapabilityResult::Available {
+                    value: CoreConfig {
+                        effective,
+                        generation: Generation(1),
+                        settings: json!({"dreamer":{"opencode":{"model":"fixture/primary",
+                            "fallback_models":["fixture/fallback"]}}}),
+                        warnings: Vec::new(),
+                        trust: TrustFlags::default(),
+                        protected_token_tiers: ProtectedTokenTiers::default(),
+                    },
+                }
+            }
+        }
+
+        fn input(on: bool) -> (Arc<ConfigFixture>, ConfigInput) {
+            let resolver = Arc::new(ConfigFixture {
+                on: AtomicBool::new(on),
+                reads: AtomicUsize::new(0),
+            });
+            let input = ConfigInput {
+                resolver: resolver.clone(),
+                request: ConfigResolveRequest {
+                    user_config_path: String::new(),
+                    project_root: "/recorded/project".into(),
+                    generation: Generation(1),
+                },
+            };
+            (resolver, input)
+        }
+
+        #[test]
+        fn off_roots_do_not_start_any_work() {
+            for root in [
+                background::dreamer_tick,
+                background::manual_dream,
+                background::historian_drain,
+                background::embedding_drain,
+            ] {
+                let (config, input) = input(false);
+                let result = root(input, |_: background::Unit| -> () {
+                    panic!("disabled background root started work")
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+                assert_eq!(result, None);
+                assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[derive(Default)]
+        struct Carrier {
+            calls: Vec<&'static str>,
+            models: Vec<String>,
+        }
+
+        impl DreamCarrier for Carrier {
+            async fn open(
+                &mut self,
+                request: &background::ChildRequest,
+            ) -> Result<String, background::CarrierError> {
+                self.calls.push("open");
+                assert_eq!(request.runner.kind, HistorianRunnerKind::Broca);
+                assert_eq!(request.temperature, None);
+                assert_eq!(request.directory, Path::new("/recorded/project"));
+                self.models
+                    .push(request.model.as_ref().unwrap().model.clone());
+                Ok(format!("child-{}", self.models.len()))
+            }
+
+            async fn complete(
+                &mut self,
+                _: &str,
+                _: &background::ChildRequest,
+            ) -> Result<background::Completion, background::CarrierError> {
+                self.calls.push("complete");
+                Ok(background::Completion {
+                    text: if self.models.len() == 1 {
+                        "bad"
+                    } else {
+                        "accepted"
+                    }
+                    .into(),
+                    ..Default::default()
+                })
+            }
+
+            async fn close(
+                &mut self,
+                _: &str,
+                settled: bool,
+            ) -> Result<(), background::CarrierError> {
+                self.calls.push(if settled { "settled" } else { "aborted" });
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn dream_roots_capture_once_and_resolve_every_role_off_thread() {
+            let caller = std::thread::current().id();
+            for manual in [false, true] {
+                let (config, input) = input(true);
+                let toggle = config.clone();
+                let run = move |unit: background::Unit| {
+                    assert_ne!(std::thread::current().id(), caller);
+                    toggle.on.store(false, Ordering::SeqCst);
+                    for role in [
+                        DreamRole::Classifier,
+                        DreamRole::MemoryMapper,
+                        DreamRole::Curate,
+                        DreamRole::Docs,
+                        DreamRole::Reviewer,
+                        DreamRole::PrimerInvestigator,
+                        DreamRole::Retrospective,
+                    ] {
+                        let mut carrier = Carrier::default();
+                        let result = unit.run_dream_task(
+                            &DreamRequest {
+                                task: "classify-memories",
+                                role,
+                                harness: "opencode",
+                                parent_session_id: "ses",
+                                directory: Path::new("/recorded/project"),
+                                system: "recorded system",
+                                prompt: "recorded input",
+                                timeout: Duration::from_secs(1),
+                                token_budget: Some(100),
+                                allow_empty: false,
+                            },
+                            &mut carrier,
+                            |output| {
+                                (output.text == "accepted")
+                                    .then_some(output.text.clone())
+                                    .ok_or_else(|| "invalid draft".into())
+                            },
+                        );
+                        assert_eq!(result.result.unwrap(), "accepted");
+                        assert_eq!(carrier.models, ["fixture/primary", "fixture/fallback"]);
+                        assert_eq!(
+                            carrier.calls,
+                            ["open", "complete", "aborted", "open", "complete", "settled"]
+                        );
+                    }
+                };
+                let job = if manual {
+                    background::manual_dream(input, run)
+                } else {
+                    background::dreamer_tick(input, run)
+                };
+                assert_eq!(job.unwrap().join().unwrap().unwrap(), Some(()));
+                assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[test]
+        fn runner_routes_use_the_canonical_host_set_and_dreamer_precedence() {
+            let mut config = default_test_config();
+            config.historian_runner = None;
+            config.dreamer_runner = None;
+            for harness in crate::historian_runner::HOST_RUNNER_HARNESSES {
+                assert_eq!(
+                    config.dreamer_runner_for(harness).kind,
+                    HistorianRunnerKind::Host
+                );
+            }
+            for harness in ["", "unknown", "broca"] {
+                assert_eq!(
+                    config.dreamer_runner_for(harness).kind,
+                    HistorianRunnerKind::Broca
+                );
+            }
+            config.historian_runner = Some(HistorianRunnerKind::Host);
+            assert_eq!(
+                config.dreamer_runner_for("").kind,
+                HistorianRunnerKind::Host
+            );
+            config.dreamer_runner = Some(HistorianRunnerKind::Broca);
+            assert_eq!(
+                config.dreamer_runner_for("pi").kind,
+                HistorianRunnerKind::Broca
+            );
+            config.historian_runner = None;
+            assert_eq!(
+                config.dreamer_runner_for("pi").kind,
+                HistorianRunnerKind::Broca
+            );
+        }
+
+        fn code(outcome: HandlerOutcome) -> String {
+            match outcome {
+                HandlerOutcome::Error { code, .. } => code,
+                other => panic!("expected refusal, got {other:?}"),
+            }
+        }
+
+        struct VectorQueue;
+        impl crate::memory_actions::MemoryEmbeddingQueue for VectorQueue {
+            fn enqueue_tx(
+                &self,
+                tx: &rusqlite::Transaction<'_>,
+                effect: &crate::memory_actions::EmbeddingEffect,
+            ) -> rusqlite::Result<()> {
+                let record = serde_json::from_value(serde_json::to_value(effect).unwrap()).unwrap();
+                mc_store::retrieval_vectors::queue::enqueue_tx(tx, &record)
+            }
+        }
+
+        fn memory_write(tx: &rusqlite::Transaction<'_>, project: &str) -> rusqlite::Result<String> {
+            use crate::memory_actions::*;
+            MemoryActions::default().execute_tx(
+                tx,
+                &VectorQueue,
+                &MemoryActionContext {
+                    project_path: project,
+                    session_id: "ses",
+                    harness: "opencode",
+                    role: MemoryRole::Dreamer,
+                    workspace_members: &[],
+                    shared_categories: &[],
+                    curate_category: Some("CONSTRAINTS"),
+                    memory_enabled: true,
+                    now_ms: 100,
+                    decision_key: "recorded-memory-task",
+                },
+                &serde_json::from_value(json!({"action":"write", "content":"Background memory fact", "category":"CONSTRAINTS"})).unwrap(),
+            )
+        }
+
+        fn scalar(db: &rusqlite::Connection, sql: &str) -> i64 {
+            db.query_row(sql, [], |row| row.get(0)).unwrap()
+        }
+
+        struct NoChunks;
+        impl mc_store::retrieval_vectors::store::ChunkCatalog for NoChunks {
+            fn pending(
+                &self,
+                _: &rusqlite::Connection,
+                _: &str,
+                _: &str,
+                _: usize,
+            ) -> rusqlite::Result<Vec<mc_store::retrieval_vectors::store::Passage>> {
+                Ok(Vec::new())
+            }
+            fn current(
+                &self,
+                _: &rusqlite::Connection,
+                _: &mc_store::retrieval_vectors::store::Passage,
+            ) -> rusqlite::Result<bool> {
+                panic!("memory-only drain requested chunks")
+            }
+        }
+
+        struct Embedder(Arc<AtomicUsize>);
+        impl mc_store::retrieval_vectors::drain::EmbeddingProvider for Embedder {
+            fn embed(
+                &mut self,
+                _: &mc_store::retrieval_vectors::drain::Registration,
+                passages: &[mc_store::retrieval_vectors::store::Passage],
+            ) -> Result<Vec<Vec<f32>>, String> {
+                self.0.fetch_add(passages.len(), Ordering::SeqCst);
+                Ok(vec![vec![0.25, 0.75]; passages.len()])
+            }
+        }
+
+        #[test]
+        fn embedding_root_drains_a_real_memory_action_only_when_on() {
+            use mc_store::retrieval_vectors::drain::{FinishOutcome, Registration};
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fixture.db");
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch(
+                &include_str!("../../mc-store/testdata/context_schema/schema.sql")
+                    .replace(":applied_at", "1"),
+            )
+            .unwrap();
+            let (_, task_input) = input(true);
+            let task_path = path.clone();
+            background::manual_dream(task_input, move |unit| {
+                let mut carrier = Carrier::default();
+                unit.run_dream_task(
+                    &DreamRequest {
+                        task: "curate",
+                        role: DreamRole::Curate,
+                        harness: "opencode",
+                        parent_session_id: "ses",
+                        directory: Path::new("/recorded/project"),
+                        system: "recorded memory-task system",
+                        prompt: "recorded memory-task input",
+                        timeout: Duration::from_secs(1),
+                        token_budget: Some(100),
+                        allow_empty: false,
+                    },
+                    &mut carrier,
+                    |output| {
+                        (output.text == "accepted")
+                            .then_some(())
+                            .ok_or_else(|| "invalid result".into())
+                    },
+                )
+                .result
+                .unwrap();
+                let mut db = rusqlite::Connection::open(task_path).unwrap();
+                let tx = db.transaction().unwrap();
+                assert_eq!(
+                    memory_write(&tx, "git:identity").unwrap(),
+                    "Saved memory [ID: 1] in CONSTRAINTS."
+                );
+                tx.commit().unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            // Exercise the TS entry points against the same memory-task database.
+            // Any executor entry would be a second writer, including turn two.
+            let ts_reference_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/i4-roots-ts-executor-exclusion.json");
+            let ts_reference = std::fs::read(&ts_reference_path).unwrap_or_else(|error| {
+                panic!(
+                    "unable to read TS executor exclusion reference {}: {error}",
+                    ts_reference_path.display()
+                )
+            });
+            let ts: serde_json::Value =
+                serde_json::from_slice(&ts_reference).unwrap_or_else(|error| {
+                    panic!(
+                        "invalid TS executor exclusion reference {}: {error}",
+                        ts_reference_path.display()
+                    )
+                });
+            assert!(
+                ts["success"]
+                    .as_bool()
+                    .expect("reference success field must be boolean"),
+                "{}",
+                ts["stderr"]
+                    .as_str()
+                    .expect("reference stderr field must be text")
+            );
+            assert!(ts["stdout"]
+                .as_str()
+                .expect("reference stdout field must be text")
+                .contains("TS_EXECUTORS tasks=0 memory_rows=1"));
+            let registration = Registration {
+                project: "git:identity".into(),
+                model_id: "fixture".into(),
+                chunk_model_id: "fixture:raw".into(),
+                fingerprint: "fixture-fingerprint".into(),
+                table_epoch: 1,
+                dimensions: 2,
+                generation: 1,
+            };
+            db.execute("INSERT INTO embedding_registrations(project_path,model_id,chunk_model_id,fingerprint,table_epoch,dims,generation) VALUES(?1,?2,?3,?4,1,2,1)", rusqlite::params![registration.project,registration.model_id,registration.chunk_model_id,registration.fingerprint]).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            for on in [false, true] {
+                let (config, input) = input(on);
+                let toggle = config.clone();
+                let path = path.clone();
+                let registration = registration.clone();
+                let mut provider = Embedder(calls.clone());
+                let result = background::embedding_drain(input, move |unit| {
+                    toggle.on.store(false, Ordering::SeqCst);
+                    let mut db = rusqlite::Connection::open(path).unwrap();
+                    unit.drain_embeddings(
+                        &mut db,
+                        &NoChunks,
+                        &mut provider,
+                        &registration,
+                        1,
+                        100,
+                        || 101,
+                    )
+                    .unwrap()
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+                if on {
+                    assert!(matches!(
+                        result,
+                        Some(Some(FinishOutcome::Published { accepted: 1, .. }))
+                    ));
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_embeddings"), 1);
+                } else {
+                    assert_eq!(result, None);
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_embeddings"), 0);
+                }
+                assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memories"), 1);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_journal"), 1);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_history"), 0);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM authority_managed"), 0);
+                assert_eq!(
+                    scalar(&db, "SELECT COUNT(*) FROM authority_repair_pending"),
+                    0
+                );
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_pending_facts WHERE reason='authority_elsewhere'"), 0);
+            }
+        }
+
+        #[derive(Default)]
+        struct DrainAccounting(Mutex<background::DrainMeta>);
+        impl background::DrainStore for DrainAccounting {
+            type Error = ();
+            fn with_immediate_transaction<T>(
+                &self,
+                _: &str,
+                apply: impl FnOnce(&mut background::DrainMeta) -> T,
+            ) -> Result<T, ()> {
+                Ok(apply(&mut self.0.lock().unwrap()))
+            }
+        }
+
+        #[test]
+        fn historian_root_keeps_reservation_and_refund_under_its_capture() {
+            let (config, input) = input(true);
+            let toggle = config.clone();
+            let result = background::historian_drain(input, move |unit| {
+                toggle.on.store(false, Ordering::SeqCst);
+                let accounting = DrainAccounting::default();
+                let reserved = unit
+                    .reserve_historian(
+                        &accounting,
+                        background::ReserveRequest {
+                            session_id: "ses",
+                            run_id: "run",
+                            true_raw_tokens: 30.0,
+                            usage_percentage: 70.0,
+                            usable: 100_000.0,
+                            per_run_cap: 50_000.0,
+                            execute_threshold_percentage: 65.0,
+                            now: 100,
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reserved.reserved_tokens, 30.0);
+                assert_eq!(
+                    accounting.0.lock().unwrap().protected_tail_drain_tokens,
+                    30.0
+                );
+                unit.refund_historian(&accounting, reserved.reservation.as_ref().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    accounting.0.lock().unwrap().protected_tail_drain_tokens,
+                    0.0
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+            assert_eq!(result, Some(()));
+            assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn enabled_background_results_wait_for_natural_rebuild_even_after_restart() {
+            let producer = Arc::new(ProducerState::default());
+            let mut config = default_test_config();
+            config.rust_background_enabled = true;
+            config.inject_docs = false;
+            config.temporal_awareness = false;
+            config.cache_ttl = "never".into();
+            let (handler, store, _dir, project) =
+                handler_with_store(producer.clone(), config.clone());
+            store.set_route_identity_for_test(project.to_str().unwrap(), "git:identity");
+            // Start with an already folded prefix. Legacy whole-array transforms
+            // deliberately materialize the first-ever compartment immediately.
+            store.with_context_conn_for_test(|tx| tx.execute_batch("INSERT INTO compartments(session_id,sequence,start_message,end_message,end_message_id,title,content,p1,created_at) VALUES('ses',1,1,1,'m1#0','Initial','Initial history','Initial history',1)")).unwrap();
+            let mut body = request_with_usage(
+                vec![
+                    ck("m1", 1, "hello"),
+                    ck("m2", 2, "new history"),
+                    ck("m3", 3, "keep raw tail"),
+                ],
+                1_000,
+                50_000,
+            );
+            body["memory_enabled"] = json!(true);
+            body["cache_ttl"] = json!("5m");
+            body["prev_response_completed_at_ms"] = json!(now_ms());
+            let first = call_transform_request(&handler, body.clone()).await;
+            assert_eq!(first["status"], "ok");
+            let stable = call_transform_request(&handler, body.clone()).await;
+            let before = store.load("ses").unwrap();
+            let (resolver, input) = input(true);
+            let toggle = resolver.clone();
+            let work_store = store.clone();
+            background::historian_drain(input, move |unit| {
+                let mut loaded = work_store.load("ses").unwrap();
+                let selected = vec![mc_store::HistorianSelectedMessageIdentity {
+                    mid: "m2".into(),
+                    block_identities: loaded.meta.block_identity_by_mid["m2"].clone(),
+                }];
+                let predicate = mc_store::HistorianPublishPredicate {
+                    firing_seq: 7,
+                    producer_run_id: "recorded-run".into(),
+                    producer_attempt: 0,
+                    chunk_fingerprint: "recorded-chunk".into(),
+                    selected_range_identities: selected.clone(),
+                    compartment_set_generation: mc_store::CompartmentSetGeneration {
+                        max_sequence: 1,
+                        count: 1,
+                    },
+                };
+                loaded.meta.historian = HistorianDurableState {
+                    state: HistorianPhase::Publishing,
+                    firing_seq: 7,
+                    producer_run_id: Some("recorded-run".into()),
+                    chunk_fingerprint: "recorded-chunk".into(),
+                    selected_range_identities: selected,
+                    compartment_set_generation: predicate.compartment_set_generation,
+                    ..Default::default()
+                };
+                let version = work_store
+                    .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                    .unwrap();
+                toggle.on.store(false, Ordering::SeqCst);
+                let publish = || unit.publish_historian(
+                    &work_store,
+                    mc_store::HistorianPublishRequest {
+                        rust_background_enabled: false,
+                        lifecycle_publication_id: None,
+                        harness: Some("opencode"),
+                        session_id: "ses",
+                        expected_row_version: Some(version),
+                        expected_revert_epoch: 0,
+                        predicate: &predicate,
+                        project_path: "git:identity",
+                        compartments: &[stored_comp(2, 2, 2, "m2", "Background historian summary")],
+                        facts: &[],
+                        promote_facts: false,
+                        events: &[],
+                        primer_candidates: &[],
+                        user_memory_candidates: &[],
+                        publication_floor_ordinal: 2,
+                        chunk_transcript: None,
+                        raw_chunk_messages: None,
+                    },
+                );
+                work_store.with_context_conn_for_test(|tx| {
+                    tx.execute("INSERT INTO compartment_state_lease(session_id,holder_id,acquired_at,expires_at) VALUES('ses','ts-wrapup',?1,?2)", rusqlite::params![now_ms(), now_ms()+60_000])?;
+                    Ok(())
+                }).unwrap();
+                assert!(matches!(publish(), Err(mc_store::HistorianPublishError::Deferred { reason }) if reason == "compartment lease busy"));
+                assert_eq!(work_store.load_compartments("ses").unwrap().len(), 1);
+                work_store.with_context_conn_for_test(|tx| tx.execute_batch("DELETE FROM compartment_state_lease WHERE session_id='ses'")).unwrap();
+                publish().unwrap();
+                work_store
+                    .with_context_conn_for_test(|tx| memory_write(tx, "git:identity"))
+                    .unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(resolver.reads.load(Ordering::SeqCst), 1);
+            let after = store.load("ses").unwrap();
+            assert_eq!(after.core, before.core);
+            assert_eq!(
+                after.meta.project_memory_epoch,
+                before.meta.project_memory_epoch
+            );
+            assert_eq!(
+                after.meta.project_memory_epoch_pending,
+                before.meta.project_memory_epoch_pending
+            );
+            assert_eq!(store.load_compartments("ses").unwrap().len(), 2);
+            let deferred = call_transform_request(&handler, body.clone()).await;
+            let restarted = McHandler::with_producer_factory_config_resolver(
+                Arc::new(TestProducerFactory {
+                    state: producer.clone(),
+                }),
+                config,
+                Arc::new(MissingSessionResolver),
+            );
+            restarted.store.set(store.clone()).ok().unwrap();
+            restarted.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+            let replay = call_transform_request(&restarted, body.clone()).await;
+            for response in [deferred, replay] {
+                assert_eq!(response["decision"], stable["decision"], "{response}");
+                assert_eq!(response["ck_messages"], stable["ck_messages"], "{response}");
+            }
+            body["model_key"] = json!("natural-model-change");
+            let rebuilt = call_transform_request(&restarted, body).await;
+            let text = serde_json::to_string(&rebuilt["ck_messages"]).unwrap();
+            assert!(text.contains("Background historian summary"), "{rebuilt}");
+            assert!(text.contains("Background memory fact"), "{rebuilt}");
+            assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn canonical_dream_task_matrix_preserves_off_and_refuses_enabled_tasks() {
+            let ts = include_str!(
+                "../../../packages/plugin/src/features/magic-context/dreamer/task-registry.ts"
+            );
+            let registry = ts
+                .split("export const CANONICAL_DREAM_TASKS = [")
+                .nth(1)
+                .unwrap()
+                .split("] as const")
+                .next()
+                .unwrap();
+            let ts_names: Vec<_> = registry
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix('"')?.split('"').next())
+                .collect();
+            assert_eq!(
+                CANONICAL_TASKS.map(|task| task.as_str()).as_slice(),
+                ts_names
+            );
+            let mut config = default_test_config();
+            config.rust_background_enabled = true;
+            config.smart_notes_enabled = true;
+            let producer = Arc::new(ProducerState::default());
+            // A Host-runner project with a declared harness claimant that can carry
+            // every role: publication then depends only on which tasks are wired.
+            config.dreamer_runner = Some(HistorianRunnerKind::Host);
+            let (mut handler, store, _dir, project) =
+                handler_with_store(producer.clone(), config.clone());
+            handler.fixed_config = Some(config.clone());
+            handler.dream_claimants.declare(
+                &lane_project_key(&store, &project),
+                "ses",
+                dream_dispatch::ownership::tests::claimant_carrying_every_role(now_ms())
+                    .on_route("ses", "mc-module-test"),
+            );
+            let mut settings = json!({"dreamer":{"tasks":{}}});
+            for task in CANONICAL_TASKS {
+                settings["dreamer"]["tasks"][task.as_str()] = json!({"schedule":"0 3 * * *"});
+            }
+            handler.fixed_dream_settings = Some(settings.clone());
+            for (channel, request, expected) in [
+                (
+                    7,
+                    json!({"session_id":"ses","task":"curate"}),
+                    "bad_request",
+                ),
+                (7, json!({"v":1,"task":"curate"}), "bad_request"),
+                (
+                    8,
+                    json!({"v":1,"session_id":"ses","task":"curate"}),
+                    "route_unbound",
+                ),
+                (
+                    7,
+                    json!({"v":1,"session_id":"foreign","task":"curate"}),
+                    "session_mismatch",
+                ),
+                (7, json!({"v":1,"session_id":"ses"}), "invalid_params"),
+                (
+                    7,
+                    json!({"v":1,"session_id":"ses","task":"unknown"}),
+                    "invalid_params",
+                ),
+            ] {
+                assert_eq!(
+                    code(handler.handle_dreamer_run_task(channel, &request).await),
+                    expected
+                );
+            }
+            // Ownership is the published list: a wired task with a Rust host and a
+            // capable claimant is owned; a task with no Rust host (compress-cues,
+            // maintain-docs, evaluate-smart-notes) never is, even when wired.
+            for implemented in [false, true] {
+                for task in CANONICAL_TASKS {
+                    handler.dream_wiring = Some(dream_dispatch::ownership::Wiring {
+                        tasks: if implemented { vec![task] } else { Vec::new() },
+                        broca: false,
+                        broca_file_read: false,
+                    });
+                    let request = json!({"v":1,"session_id":"ses","task":task.as_str(),
+                        "implemented":true,"model_chain":false,"payload":false,"command_id":false});
+                    assert_eq!(
+                        code(handler.handle_dreamer_run_task(7, &request).await),
+                        if implemented && dream_dispatch::ownership::task_roles(task).is_some() {
+                            "rust_scheduler_owns_task"
+                        } else {
+                            "unavailable_capability"
+                        },
+                        "{}",
+                        task.as_str()
+                    );
+                }
+            }
+            config.smart_notes_enabled = false;
+            handler.fixed_config = Some(config.clone());
+            handler.dream_wiring = Some(dream_dispatch::ownership::Wiring {
+                tasks: vec![mc_store::dream_scheduler::schedules::TaskName::EvaluateSmartNotes],
+                broca: false,
+                broca_file_read: false,
+            });
+            assert_eq!(
+                code(
+                    handler
+                        .handle_dreamer_run_task(
+                            7,
+                            &json!({"v":1,"session_id":"ses","task":"evaluate-smart-notes"})
+                        )
+                        .await
+                ),
+                "invalid_params"
+            );
+            handler.dream_wiring = None;
+            config.smart_notes_enabled = true;
+            handler.fixed_config = Some(config.clone());
+            for task in CANONICAL_TASKS {
+                let mut disabled = settings.clone();
+                disabled["dreamer"]["tasks"][task.as_str()]["schedule"] = json!("  ");
+                handler.fixed_dream_settings = Some(disabled);
+                assert_eq!(
+                    code(
+                        handler
+                            .handle_dreamer_run_task(
+                                7,
+                                &json!({"v":1,"session_id":"ses","task":task.as_str()})
+                            )
+                            .await
+                    ),
+                    "invalid_params"
+                );
+            }
+            handler.fixed_dream_settings = Some(settings);
+            config.rust_background_enabled = false;
+            handler.fixed_config = Some(config);
+            for task in CANONICAL_TASKS {
+                assert_eq!(
+                    code(
+                        handler
+                            .handle_dreamer_run_task(
+                                7,
+                                &json!({"v":1,"session_id":"ses","task":task.as_str(),
+                    "command_id":"matrix","payload":{"prompt_body":"recorded","items":[]}})
+                            )
+                            .await
+                    ),
+                    if task.as_str() == CLASSIFY_TASK {
+                        "model_chain_missing"
+                    } else {
+                        "invalid_params"
+                    }
+                );
+            }
+            assert!(store
+                .load_dream_task_command("ses", "matrix")
+                .unwrap()
+                .is_none());
+            assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    fn owner_prep_methods() -> impl Iterator<Item = &'static str> {
+        non_served_contract::UI_METHODS.iter().copied().chain([
+            non_served_contract::RETRIEVAL_METHOD,
+            non_served_contract::MEMORY_METHOD,
+        ])
+    }
+
+    #[tokio::test]
+    async fn owner_prep_each_arm_authorizes_before_read_write_replay_or_job_lookup() {
+        assert_eq!(owner_prep_methods().count(), 19);
+        assert_eq!(
+            owner_prep_methods()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            19
+        );
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        store.set_route_identity_for_test(project.to_str().unwrap(), "git:bound-project");
+        ops_facade::attest_ui_fixture(&handler, Some(&store), "git:bound-project");
+        store
+            .replace_compartments("ses", &[stored_comp(1, 1, 1, "m1", "owned")])
+            .unwrap();
+        store
+            .replace_compartments("foreign", &[stored_comp(2, 1, 1, "m2", "private")])
+            .unwrap();
+        let changes = || {
+            store
+                .with_context_conn_for_test(|tx| {
+                    tx.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                })
+                .unwrap()
+        };
+        let before = changes();
+        for method in owner_prep_methods() {
+            for (channel, request, expected) in [
+                (
+                    7,
+                    json!({"method":method,"session_id":"ses"}),
+                    "bad_request",
+                ),
+                (
+                    7,
+                    json!({"method":method,"v":2,"session_id":"ses"}),
+                    "bad_request",
+                ),
+                (7, json!({"method":method,"v":1}), "bad_request"),
+                (
+                    7,
+                    json!({"method":method,"v":1,"session_id":""}),
+                    "bad_request",
+                ),
+                (
+                    7,
+                    json!({"method":method,"v":1,"session_id":"  "}),
+                    "bad_request",
+                ),
+                (
+                    8,
+                    json!({"method":method,"v":1,"session_id":"ses"}),
+                    "route_unbound",
+                ),
+                (
+                    7,
+                    json!({"method":method,"v":1,"session_id":"foreign"}),
+                    "session_mismatch",
+                ),
+            ] {
+                match handler.dispatch_value(channel, request).await {
+                    HandlerOutcome::Error { code, .. } => assert_eq!(code, expected, "{method}"),
+                    _ => panic!("{method} must refuse {expected} without returning data"),
+                }
+            }
+        }
+        assert_eq!(
+            changes(),
+            before,
+            "refused arms must write nothing in any table"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_prep_authorized_arms_refuse_by_exact_route_without_effects() {
+        let recorded = [
+            "mc.ui_capabilities",
+            "mc.read_sidebar",
+            "mc.read_status",
+            "mc.read_embed",
+            "mc.read_compartment_count",
+            "mc.read_todos",
+            "mc.recomp_preview",
+            "mc.recomp_start",
+            "mc.rescore",
+            "mc.wrapup",
+            "mc.flush",
+            "mc.dream",
+            "mc.embed",
+            "mc.job_read",
+            "mc.job_cancel",
+            "mc.ui_events",
+            "mc.notice_currentness",
+            "mc.retrieval",
+            "mc.memory",
+        ];
+        assert_eq!(owner_prep_methods().collect::<Vec<_>>(), recorded);
+        let partition = ops_facade::IMPLEMENTED
+            .iter()
+            .chain(ops_facade::UNPORTED)
+            .copied()
+            .chain([
+                non_served_contract::RETRIEVAL_METHOD,
+                non_served_contract::MEMORY_METHOD,
+            ])
+            .collect::<Vec<_>>();
+        assert_eq!(partition.len(), recorded.len());
+        assert_eq!(
+            partition
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            recorded.into_iter().collect()
+        );
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        store.set_route_identity_for_test(project.to_str().unwrap(), "git:bound-project");
+        ops_facade::attest_ui_fixture(&handler, Some(&store), "git:bound-project");
+        let before = store.load("ses").unwrap().row_version;
+        for method in ops_facade::UNPORTED
+            .iter()
+            .copied()
+            .chain([non_served_contract::MEMORY_METHOD])
+        {
+            match handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method":method,"v":1,"session_id":"ses", "project":"git:foreign-project",
+                        "directory":"/foreign", "command_id":"same-command", "job_id":"foreign-job",
+                        "acked_position":0,
+                    }),
+                )
+                .await
+            {
+                HandlerOutcome::Error { code, message } => {
+                    assert_eq!(code, "route_not_ported", "{method}");
+                    assert_eq!(message, method);
+                }
+                _ => panic!("{method} must not claim an executor is implemented"),
+            }
+        }
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+        assert_eq!(non_served_contract::ROUTE_NAME_FIELD, "message");
+        assert_eq!(
+            non_served_contract::RETRIEVAL_AVAILABILITY_FIELD,
+            "source_availability"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_prep_store_absence_is_partial_only_after_authorization() {
+        let handler = McHandler::new();
+        let dir = tempfile::tempdir().unwrap();
+        handler.bind_route(7, binding(dir.path().to_str().unwrap(), "ses"));
+        ops_facade::attest_ui_fixture(&handler, None, "git:bound-project");
+        for method in non_served_contract::UI_READ_METHODS {
+            let request = json!({"method":method,"v":1,"session_id":"ses"});
+            assert_eq!(
+                error_code(handler.dispatch_value(8, request.clone()).await),
+                "route_unbound"
+            );
+            let body = call_dispatch_request(&handler, request).await;
+            assert_eq!(
+                body,
+                json!({
+                    "v":1,"ok":false,"state":"partial","reason":"store_unavailable",
+                    "authority":"unknown","data":null,
+                }),
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_prep_project_scope_uses_bound_identity_not_request_fields() {
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        ops_facade::attest_ui_fixture(&handler, None, "git:bound-project");
+        std::fs::write(project.join(".git"), "gitdir: /nonexistent/for/this/test\n").unwrap();
+        handler
+            .resolve_project_identity_for_test
+            .store(true, Ordering::Relaxed);
+        // The throwaway checkout has a broken Git identity. A caller-supplied
+        // project must not rescue it or authorize another project's rows.
+        for method in non_served_contract::PROJECT_METHODS {
+            let outcome = handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method":method,"v":1,"session_id":"ses",
+                        "project":"git:forged", "project_path":"git:forged", "directory":"/forged",
+                    }),
+                )
+                .await;
+            assert_eq!(error_code(outcome), "git_identity_unavailable", "{method}");
+        }
+    }
 
     #[test]
     fn search_date_bounds_are_utc_inclusive_and_reject_invalid_values() {
@@ -24195,6 +26418,7 @@ mod tests {
 
     fn default_test_config() -> McModuleConfig {
         McModuleConfig {
+            rust_background_enabled: false,
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             catalog: crate::config::CatalogConfigInputs::default(),
             historian_temperature: None,
@@ -29366,6 +31590,7 @@ mod tests {
                     let loaded = store.load("ses").unwrap();
                     store
                         .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                            rust_background_enabled: false,
                             lifecycle_publication_id: None,
                             harness: None,
                             session_id: "ses",
@@ -31555,6 +33780,7 @@ mod tests {
             .unwrap();
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -41371,6 +43597,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -43623,6 +45850,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id,
