@@ -85,6 +85,18 @@ pub(super) fn checked_inputs(value: &Value) -> Result<Value, HandlerOutcome> {
     Ok(inputs)
 }
 
+/// Whether a host has ever sent this conversation a historian chain with
+/// `state_sync`. A stored non-empty chain also counts, so a conversation synchronized
+/// before the counter existed keeps its host's chain.
+fn host_sent_chain(
+    conversation: &mc_store::provider_records::ProviderConversation,
+    counters: &Value,
+) -> bool {
+    counters[super::historian_config::CHAIN_SYNCED_COUNTER].as_bool() == Some(true)
+        || serde_json::from_str::<Vec<String>>(&conversation.historian_model_chain_json)
+            .map_or(true, |chain| !chain.is_empty())
+}
+
 pub(super) fn record_barrier(counters: &mut Value) {
     counters["historian_barrier_generation"] = json!(counters
         .get("historian_barrier_generation")
@@ -314,11 +326,33 @@ impl McHandler {
             #[cfg(test)]
             {
                 worker.fixed_config = self.fixed_config.clone();
+                worker.fixed_historian_settings = self.fixed_historian_settings.clone();
                 worker.provider_historian_scan_rows =
                     Arc::clone(&self.provider_historian_scan_rows);
             }
             Arc::new(worker)
         }))
+    }
+
+    /// Loads the user's trusted effective settings for a project root, to resolve the
+    /// historian from ck-mc's own config. Returned as a closure so the file reads can
+    /// run on a blocking thread.
+    #[cfg(not(test))]
+    fn historian_settings_loader(&self) -> Box<dyn FnOnce(&Path) -> Value + Send> {
+        let resolver = crate::config_parity::TrustedConfigResolver::from_environment();
+        Box::new(move |project_root| {
+            super::historian_config::trusted_settings(&resolver, project_root)
+        })
+    }
+
+    /// Tests never read the machine's config: they get the fixed settings, or none.
+    #[cfg(test)]
+    fn historian_settings_loader(&self) -> Box<dyn FnOnce(&Path) -> Value + Send> {
+        let settings = self
+            .fixed_historian_settings
+            .clone()
+            .unwrap_or_else(|| json!({}));
+        Box::new(move |_| settings)
     }
 
     pub(crate) fn schedule_provider_historian(&self, binding: SessionBinding, key: Key) {
@@ -657,6 +691,23 @@ impl McHandler {
         let Some(ingest) = ingest else {
             return Ok(None);
         };
+        // No host has sent this conversation a chain (a runner lane, or a host that
+        // does not use `state_sync`): resolve the historian from ck-mc's own config.
+        // The config files are read here, before the conversation lock is taken.
+        let configured = if host_sent_chain(&conversation, &counters) {
+            None
+        } else {
+            let load = self.historian_settings_loader();
+            let project_root = binding.project_root.clone();
+            let harness = key.harness.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    super::historian_config::resolve(&load(&project_root), &harness)
+                })
+                .await
+                .map_err(transient)?,
+            )
+        };
         let serial = self.provider_serial.lock_for(key).await;
         let Some(current) = store
             .load_provider_conversation(&key.store_key())
@@ -708,8 +759,24 @@ impl McHandler {
             .pointer("/pass_context/model_key")
             .cloned()
             .unwrap_or_else(|| json!(binding.model_key));
-        request["historian_model_chain"] =
-            serde_json::from_str(&conversation.historian_model_chain_json).map_err(transient)?;
+        match configured {
+            // The counter is never cleared, so a conversation found without a host
+            // chain before the lock may only have gained one since; that one wins.
+            Some(configured) if !host_sent_chain(&conversation, &counters) => {
+                for (name, value) in configured.request_fields() {
+                    // Settings a host synchronized with the pass still win over the
+                    // config for the same field; the chain always comes from config.
+                    if name == "historian_model_chain" || request.get(&name).is_none() {
+                        request[name] = value;
+                    }
+                }
+            }
+            _ => {
+                request["historian_model_chain"] =
+                    serde_json::from_str(&conversation.historian_model_chain_json)
+                        .map_err(transient)?;
+            }
+        }
         request["messages"] = json!([]);
         let mut parsed: TransformRequest = decode(&request)?;
         // Keep the codec's retained native representation, as the engine does;
@@ -1389,6 +1456,106 @@ mod tests {
             }
         }
         assert!(fires > 0, "the corpus must exercise a real fire");
+    }
+
+    /// A conversation that never receives `state_sync` (its messages and barriers
+    /// arrive only on hooks) resolves the historian from ck-mc's own config and fires
+    /// the chunk the trigger oracle selects, on the configured chain with its fallback.
+    #[tokio::test]
+    async fn trigger_oracle_matches_without_state_sync_on_configured_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = handler(dir.path());
+        h.fixed_historian_settings = Some(json!({
+            "historian_timeout_ms": 90_000,
+            "historian": {"maxTokens": 12_000, "opencode": {
+                "model": {"model": "test/model", "variant": "high"},
+                "fallback_models": ["test/fallback"]}}}));
+        declare(&h).await;
+        let baseline_dir = tempfile::tempdir().unwrap();
+        let baseline = handler(baseline_dir.path());
+        let entries = corpus();
+        let chain: Vec<String> = vec!["test/model".into(), "test/fallback".into()];
+        let mut fires = 0;
+        let mut previous = 0;
+        for length in [2, 40, 60, 80] {
+            for (index, entry) in entries[previous..length].iter().enumerate() {
+                let last = previous + index + 1 == length;
+                response(
+                    h.handle_provider_value(7, "transform.hook", &hook(entry, last))
+                        .await,
+                );
+            }
+            previous = length;
+            let actual = h
+                .provider_historian_worker()
+                .prepare_provider_historian(&binding(&h), &key(&h))
+                .await
+                .unwrap()
+                .expect("new user turn evaluated");
+            let expected = oracle(&baseline, &entries[..length], &chain, json!({}));
+            assert_eq!(signature(&actual), signature(&expected), "length {length}");
+            if let PreparedHistorianAction::FireReady(p) = &actual {
+                fires += 1;
+                assert_eq!(p.task.firing.model_chain, chain);
+                assert_eq!(
+                    p.task.historian_await_timeout,
+                    std::time::Duration::from_millis(90_000)
+                );
+                let protected_start = p
+                    .diagnostics
+                    .progress
+                    .as_ref()
+                    .unwrap()
+                    .protected_start_ordinal;
+                assert!(p.task.firing.to_ordinal < protected_start);
+            }
+        }
+        assert!(fires > 0, "the corpus must exercise a real fire");
+        let conversation = h
+            .store
+            .get()
+            .unwrap()
+            .load_provider_conversation(&key(&h).store_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            conversation.historian_model_chain_json, "[]",
+            "the configured chain is resolved per evaluation, never stored as a host chain"
+        );
+    }
+
+    /// A chain a host sent with `state_sync` keeps today's behaviour, even an empty
+    /// one, whatever ck-mc's own config names.
+    #[tokio::test]
+    async fn state_sync_chain_wins_over_configured_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = handler(dir.path());
+        h.fixed_historian_settings =
+            Some(json!({"historian": {"opencode": {"model": "config/model"}}}));
+        declare(&h).await;
+        let entries = corpus();
+        let inputs =
+            json!({"usage":{"current_total_input_tokens":45000,"context_limit_tokens":50000}});
+        sync(&h, &entries, &[], true, inputs);
+        let worker = h.provider_historian_worker();
+        let empty = worker
+            .prepare_provider_historian(&binding(&h), &key(&h))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!signature(&empty).0);
+        assert!(signature(&empty).2.unwrap().contains("no_models"));
+        let chain: Vec<String> = vec!["host/model".into()];
+        response(h.handle_state_sync_value(7,json!({"method":"state_sync","session_id":"s","historian_model_chain":chain,"pass_complete":true})));
+        let PreparedHistorianAction::FireReady(p) = worker
+            .prepare_provider_historian(&binding(&h), &key(&h))
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("the host chain must fire");
+        };
+        assert_eq!(p.task.firing.model_chain, chain);
     }
 
     #[tokio::test]

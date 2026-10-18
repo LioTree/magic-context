@@ -22,6 +22,7 @@ mod compaction;
 pub(crate) mod fold_prefix;
 mod fold_working;
 mod historian;
+mod historian_config;
 pub(crate) mod historian_budget;
 #[cfg(test)]
 pub(crate) mod hook_probe;

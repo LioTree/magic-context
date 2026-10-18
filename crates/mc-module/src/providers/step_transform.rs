@@ -705,6 +705,9 @@ impl McHandler {
             );
         }
         if let Some(chain) = chain {
+            // From now on this conversation uses the chain its host sends, never the
+            // one ck-mc would resolve from its own config.
+            counters[super::historian_config::CHAIN_SYNCED_COUNTER] = json!(true);
             let chain = serde_json::to_string(chain).map_err(invalid)?;
             if c.historian_model_chain_json != chain {
                 c.historian_model_chain_json = chain;
