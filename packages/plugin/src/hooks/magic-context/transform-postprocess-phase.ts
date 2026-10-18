@@ -3935,9 +3935,10 @@ export async function runPostTransformPhase(
     const m0M1Enabled = m0M1EnabledForFold;
     if (m0M1Enabled && args.m0M1) {
         // Replay saved history/knowledge messages and resume raw host history
-        // at its saved first-kept message. No new history was summarized, so
-        // neither marker movement nor a pending refresh can be consumed while
-        // the current turn still carries signed reasoning.
+        // at its saved first-kept message. Reusing the saved head summarizes no
+        // new history: leave the host's compaction-marker update and the pending
+        // history/knowledge refresh queued until signed thinking no longer
+        // binds the current turn's prefix.
         if (prefixRecordEnabled) {
             let recordProblem = prefixRecordProblem(
                 prefixRecord,
@@ -4478,7 +4479,9 @@ export async function runPostTransformPhase(
             prefixRecordProblem(prefixRecord, prefixProvenance, recordTurn, false) === null;
         // Raw host history need not contain the synthetic summary served last time.
         // Prefer that authoritative record over the current rebuilt array.
-        const markerBefore = prefixRecordEnabled ? markerWire(hasPreviousPrefix ? prefixRecord?.summary : undefined) : null;
+        const markerBefore = prefixRecordEnabled
+            ? markerWire(hasPreviousPrefix ? prefixRecord?.summary : undefined)
+            : null;
         const legacyMarkerRetires =
             !hasPreviousPrefix &&
             isCacheBustingPass &&

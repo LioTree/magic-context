@@ -20,6 +20,12 @@ export interface ServedPrefix<M> {
     cut_mode: { mode: "none" | "inclusive" | "partial"; id: string | null };
     turn: string | null;
     provenance: PrefixProvenance & { pass: number };
+    pending_user?: {
+        id: string;
+        digest: string;
+        branch_cursor: string | null;
+        branch_path: string[];
+    };
 }
 
 // The returned message bytes include tool-input key order; sorting fields
@@ -53,6 +59,17 @@ export function readServedPrefix<M>(db: Database, sessionId: string): ServedPref
             !Array.isArray(value.head) ||
             !(value.summary === null || isRecord(value.summary)) ||
             !(value.turn === null || typeof value.turn === "string") ||
+            !(
+                value.pending_user === undefined ||
+                (isRecord(value.pending_user) &&
+                    typeof value.pending_user.id === "string" &&
+                    typeof value.pending_user.digest === "string" &&
+                    /^(?:[0-9a-f]{64})$/.test(value.pending_user.digest) &&
+                    (value.pending_user.branch_cursor === null ||
+                        typeof value.pending_user.branch_cursor === "string") &&
+                    Array.isArray(value.pending_user.branch_path) &&
+                    value.pending_user.branch_path.every((id: unknown) => typeof id === "string"))
+            ) ||
             !isRecord(value.provenance) ||
             !isRecord(value.cut_mode) ||
             !["none", "inclusive", "partial"].includes(String(value.cut_mode.mode)) ||
@@ -96,7 +113,8 @@ export function prefixRecordProblem<M>(
         (record.summary !== null && !messageShape(record.summary))
     )
         return "invalid serialized prefix messages";
-    if (boundary && (!turn || record.turn !== turn)) return `turn mismatch (record=${record.turn ?? "<none>"}, current=${turn ?? "<none>"})`;
+    if (boundary && (!turn || record.turn !== turn))
+        return `turn mismatch (record=${record.turn ?? "<none>"}, current=${turn ?? "<none>"})`;
     if (boundary && !record.first_kept) return "first kept message is absent from record";
     return null;
 }
@@ -109,7 +127,11 @@ export function refuseServedPrefix(reason: string, sessionId: string): never {
     throw error;
 }
 
-/** Resume raw host history at the stored first_kept occurrence, not a background writer's newer compartment boundary. */
+/**
+ * Resume raw host history at the first message retained in the last served request.
+ * Retained reasoning signatures bind the preceding messages, so a newer background
+ * summary must not move that resume point while those signatures are still sent.
+ */
 export function replayServedPrefix<M>(args: {
     messages: M[];
     record: ServedPrefix<M>;
@@ -170,6 +192,7 @@ export function writeServedPrefix<M>(args: {
     turn: string | null;
     provenance: PrefixProvenance;
     cut?: ServedPrefix<M>["cut_mode"];
+    pendingUser?: ServedPrefix<M>["pending_user"];
 }): ServedPrefix<M> {
     const record: ServedPrefix<M> = {
         version: 1,
@@ -182,6 +205,7 @@ export function writeServedPrefix<M>(args: {
         cut_mode: args.cut ?? { mode: "none", id: null },
         turn: args.turn,
         provenance: { ...args.provenance, pass: Date.now() },
+        ...(args.pendingUser ? { pending_user: args.pendingUser } : {}),
     };
     const previous = readServedPrefix<M>(args.db, args.sessionId);
     if (

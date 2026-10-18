@@ -253,7 +253,10 @@ import {
 	modelAcceptsEmptyContent,
 	variantChangeBustsProviderCache,
 } from "@magic-context/core/hooks/magic-context/sentinel";
-import { prefixRecordProblem } from "@magic-context/core/hooks/magic-context/served-prefix";
+import {
+	prefixRecordProblem,
+	readServedPrefix,
+} from "@magic-context/core/hooks/magic-context/served-prefix";
 import { servedPrefixMatches } from "@magic-context/core/hooks/magic-context/strict-thinking-prefix";
 import {
 	buildEditSupersessionReclaim,
@@ -357,6 +360,10 @@ import {
 	preparePiToolRemovalMeasurements,
 } from "./native-replay-state-pi";
 import { hasVisibleNoteReadCallPi } from "./note-visibility-pi";
+import {
+	type PiPrefixBranch,
+	pendingUserAlias,
+} from "./pending-user-prefix-pi";
 import { PI_CONTEXT_BUDGET, PiContextDeadlineError } from "./pi-context-budget";
 import {
 	resolvePiUsableContextLimit,
@@ -490,7 +497,7 @@ import {
 	getPiServedTagNumbers,
 	PiServedIdentityError,
 } from "./served-array-ledger";
-import { PiPrefixPass } from "./served-prefix-pi";
+import { PiPendingUserRefusalError, PiPrefixPass } from "./served-prefix-pi";
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import {
@@ -4348,6 +4355,7 @@ export function registerPiContextHandler(
 		let lkgCompactionOff = baseOptions.compactionOff === true;
 		let lkgOptions = baseOptions;
 		let lkgEmergencyRecoveryArmed = false;
+		let pendingUserRecoveryUnproven = false;
 		const captureServedEvidence = (
 			...args: Parameters<typeof capturePiServedArray>
 		) => {
@@ -4428,6 +4436,35 @@ export function registerPiContextHandler(
 			budget.stage = "branch projection";
 			const tEntryBranch = performance.now();
 			const branchEntries = readPiBranchEntriesForContext(ctx, sessionId);
+			const prefixBranchCursor =
+				getHarness() === "omp" ? ctx.sessionManager.getLeafId?.() : undefined;
+			const prefixBranch =
+				branchEntries &&
+				(prefixBranchCursor === null || typeof prefixBranchCursor === "string")
+					? { entries: branchEntries, cursor: prefixBranchCursor }
+					: undefined;
+			// OMP assigns a new user's native id after its first provider request.
+			// Check that user's saved ancestry before history repair or error
+			// recovery can return a request without PiPrefixPass.finish's digest proof.
+			if (
+				getHarness() === "omp" &&
+				!options.compactionOff &&
+				options.injection &&
+				isPrefixBoundThinkingModel(ctx.model?.provider, ctx.model?.id) &&
+				hasActiveAnthropicThinkingTurn(
+					event.messages,
+					ctx.model?.provider,
+					ctx.model?.id,
+				)
+			) {
+				const prefix = readServedPrefix(options.db, sessionId);
+				if (prefix?.pending_user) {
+					pendingUserRecoveryUnproven = true;
+					const alias = pendingUserAlias(prefix, prefixBranch);
+					if (typeof alias === "string")
+						throw new PiPendingUserRefusalError(alias, sessionId);
+				}
+			}
 			assertCurrentPass();
 			if (!budget.sideTurn)
 				repairPiHistoryBoundary(options.db, sessionId, ctx, branchEntries);
@@ -5612,6 +5649,7 @@ export function registerPiContextHandler(
 				temporalAwareness: options.injection?.temporalAwareness === true,
 				appendCompaction: guardedPiAppendCompaction(ctx, assertCurrentPass),
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
+				prefixBranch,
 				isSubagent: sessionMeta.isSubagent,
 				compactionOff: options.compactionOff === true,
 				injectionPassSnapshot: piM0M1PassSnapshot,
@@ -6893,11 +6931,25 @@ export function registerPiContextHandler(
 			if (budget.isCancelled(err)) throw err;
 			budget.assertOutcome();
 			budget.stage = "recovery";
-			if (err instanceof PiServedIdentityError) {
-				// Identity safety errors outside optional publication retain their existing
-				// refusal policy. Post-commit mirror failures are handled at the successful-result boundary.
+			if (
+				err instanceof PiServedIdentityError ||
+				err instanceof PiPendingUserRefusalError ||
+				pendingUserRecoveryUnproven
+			) {
+				// A request with unproven message/branch identity must refuse, not
+				// replay a last-known-good array whose branch identity is also unproven.
+				// Optional post-commit mirror failures are handled at publication.
 				if (sessionIdForError) clearPiLkgSessionState(sessionIdForError);
-				throw new PiStorageBusyError({ cause: err });
+				throw new PiStorageBusyError({
+					cause:
+						err instanceof PiServedIdentityError ||
+						err instanceof PiPendingUserRefusalError
+							? err
+							: new PiPendingUserRefusalError(
+									"pending-user recovery cannot prove final message identity",
+									sessionIdForError ?? "unknown",
+								),
+				});
 			}
 			if (err instanceof PiLkgAdmissionReplay && sessionIdForError) {
 				budget.assertOutcome();
@@ -8247,6 +8299,7 @@ interface RunPipelineArgs {
 	 * SAME id for a message (the cross-path lookup invariant).
 	 */
 	entryIdByRef?: ReadonlyMap<object, string> | null;
+	prefixBranch?: PiPrefixBranch;
 	/** Real entry ids whose append-only Pi message objects were tagged previously. */
 	reusableMessageIds?: ReadonlySet<string>;
 	fallbackInputFields?: WeakMap<
@@ -9054,6 +9107,7 @@ function runSynchronousPipeline(
 					stableIdResolver,
 					protectedSignedPrefix,
 					false,
+					args.prefixBranch,
 				)
 			: undefined;
 	if (prefixPass && !protectedSignedPrefix) {
@@ -9072,10 +9126,7 @@ function runSynchronousPipeline(
 		if (
 			problem ||
 			!record?.first_kept ||
-			!args.messages.some(
-				(message, index) =>
-					stableIdResolver(message, index) === record.first_kept?.id,
-			)
+			!prefixPass.hasFirstKept(args.messages, stableIdResolver)
 		) {
 			const plan = planPiProactiveThinkingStrip({
 				db: args.db,

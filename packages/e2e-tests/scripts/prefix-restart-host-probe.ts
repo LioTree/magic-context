@@ -132,7 +132,7 @@ try {
         : kind === "opencode2" ? JSON.parse(readFileSync(join(realpathSync(OC2_CLI), "..", "..", "package.json"), "utf8")).version
         : JSON.parse(readFileSync(resolvePiPackageJson(kind === "omp" ? "omp" : "pi"), "utf8")).version;
     if (kind === "opencode") check(/^1\.18\./.test(String(report.version)), "OpenCode 1.18.x required");
-    if (kind === "omp") check(/^18\.8\./.test(String(report.version)), "OMP 18.8.x required");
+    if (kind === "omp") check(/^18\.(?:8|11)\./.test(String(report.version)), "OMP 18.8.x or 18.11.x required");
     if (kind === "opencode") {
         ownedOpenCodeEnv = createIsolatedEnv();
         // Give the throwaway project its own identity before plugin boot, rather

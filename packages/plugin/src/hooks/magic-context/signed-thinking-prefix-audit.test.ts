@@ -1433,8 +1433,9 @@ for (const generation of ["v1", "v2"] as const) {
                         const before = wire(f.served);
                         expect(f.mock.check(before)).toBeNull();
                         expect(landed(f, MARKER_LANE, before)).toBe(false);
-                        // The live wall supplies a real independent bust permission;
-                        // a parked flush alone could never exercise marker retirement.
+                        // Reaching 95% usage permits a cache bust independently of
+                        // the held flush, so this pass exercises summary-retirement
+                        // admission rather than merely lacking permission to bust.
                         if (isPrefixBoundThinkingModel(MODEL.providerID, MODEL.modelID))
                             f.setUsage(95);
                         f.pendingMaterialization.add(f.sessionId);

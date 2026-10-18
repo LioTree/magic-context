@@ -365,12 +365,29 @@ for (const generation of ["v1", "v2"] as const)
 it("replays a large retained history without a variadic argument limit", () => {
     const db = database();
     const raw = Array.from({ length: 200000 }, (_, index) => message(`raw-${index}`));
-    const first = raw[0]; const last = raw.at(-1);
+    const first = raw[0];
+    const last = raw.at(-1);
     const head = [message("head")];
-    const record = writeServedPrefix({ db, sessionId: "prefix", head, summary: null, firstKept: first, firstKeptId: "raw-0", turn: "raw-0", provenance });
-    expect(replayServedPrefix({ messages: raw, record, stableId: row => row.info.id, isHead: () => false })).toBeNull();
+    const record = writeServedPrefix({
+        db,
+        sessionId: "prefix",
+        head,
+        summary: null,
+        firstKept: first,
+        firstKeptId: "raw-0",
+        turn: "raw-0",
+        provenance,
+    });
+    expect(
+        replayServedPrefix({
+            messages: raw,
+            record,
+            stableId: (row) => row.info.id,
+            isHead: () => false,
+        }),
+    ).toBeNull();
     expect(raw).toHaveLength(200001);
     expect(raw[1]).toBe(first);
     expect(raw.at(-1)).toBe(last);
-    expect(validateServedPrefix(record, raw, row => row.info.id)).toBeNull();
+    expect(validateServedPrefix(record, raw, (row) => row.info.id)).toBeNull();
 });
