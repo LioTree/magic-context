@@ -39,6 +39,7 @@ import {
     getCurrentToolSetHash,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
+import { stageOpenCodeV2TransformDecision } from "../../features/magic-context/transform-decision-log";
 import {
     type HiddenCompletionExecutor,
     HiddenCompletionRefusal,
@@ -55,6 +56,7 @@ import {
     createDroppedInputGuard,
     recordToolParameters,
 } from "../../hooks/magic-context/dropped-input-guard";
+import { clearEmbedSessionState } from "../../hooks/magic-context/embed-session-state";
 import { EmergencyFailClosedError } from "../../hooks/magic-context/emergency-fail-closed";
 import { resolveContextLimit, resolveModelKey } from "../../hooks/magic-context/event-resolvers";
 import { estimateFinalWireInputTokens } from "../../hooks/magic-context/final-wire-token-estimate";
@@ -82,6 +84,7 @@ import {
     estimateTokens,
     preloadTokenizer,
 } from "../../hooks/magic-context/read-session-formatting";
+import { createM0RenderOptions } from "../../hooks/magic-context/render-options";
 import {
     STORAGE_BUSY_MESSAGE,
     StorageBusyRefusalError,
@@ -138,7 +141,7 @@ import {
     NativeFoldReplay,
     nativeRowID,
 } from "../fold/native-replay";
-import { FoldOwner, foldDigest } from "../fold/owner";
+import { FoldOwner } from "../fold/owner";
 import { HostFoldPolicy } from "../fold/policy";
 import { restoreRow } from "../fold/restore";
 import { seedV2ForkFromParent, sessionHasMagicContextState } from "../fork-inheritance";
@@ -187,6 +190,8 @@ import {
 } from "./store";
 import { bindV2SystemPromptResponse } from "./system-prompt-response";
 import { registerTools } from "./tools";
+import { bindV2TransformDecision } from "./transform-decision-binding";
+import { createV2AutoEmbedSession, createV2TransformFeatureDeps } from "./transform-features";
 import type { SessionContext, V2Context, V2Message } from "./types";
 import { persistV2UsageReading } from "./usage-persist";
 import { resolveUsageReading } from "./usage-reading";
@@ -863,23 +868,10 @@ export async function registerContext(context: V2Context) {
             projectMemoryEnabled: config.memory.enabled,
             language: config.language,
             mural: config.mural,
+            memoryInjectionBudgetTokens: config.memory.injection_budget_tokens,
+            retinaHandoff: config.smart_notes.retina_handoff,
         });
-        // The trigger runs due tasks after a session turn; the schedule timer runs
-        // them on their cron schedule when nobody is chatting.
-        const timer = registerV2DreamScheduleTimer({
-            directory,
-            projectIdentity,
-            config,
-            dreamer: dreamerAtBoot,
-            liveConfig: () => liveConfigReader.poll().effective,
-            executor: cappedExecutor,
-            openReader: openStoreReader,
-        });
-        return {
-            async dispose() {
-                await Promise.all([trigger.dispose(), timer.dispose()]);
-            },
-        };
+        return trigger;
     };
     // Both stay undefined after a refused start until recoverHiddenWork wires them.
     let hiddenCompletionExecutor: HiddenCompletionExecutor | undefined =
@@ -895,6 +887,30 @@ export async function registerContext(context: V2Context) {
     // start they hold this stand-in, which reaches the executor recoverHiddenWork
     // wires later.
     const lateHiddenExecutor = createLateHiddenExecutor(() => hiddenCompletionExecutor);
+    // Maintenance owns one process-wide timer, regardless of dreamer.disable.
+    // The shared timer samples the git indexing switch separately from dream tasks.
+    let maintenanceTimer: ReturnType<typeof registerV2DreamScheduleTimer> | undefined;
+    const startMaintenance = () => {
+        const timerProjectIdentity = resolveProjectIdentityForSession(
+            directory,
+            config.allow_home_project,
+        );
+        if (!timerProjectIdentity || maintenanceTimer) return;
+        maintenanceTimer = registerV2DreamScheduleTimer({
+            directory,
+            projectIdentity: timerProjectIdentity,
+            config,
+            dreamer: dreamerAtBoot,
+            liveConfig: () => liveConfigReader.poll().effective,
+            executor: withLiveDreamerOutputCap(
+                lateHiddenExecutor,
+                config,
+                () => liveConfigReader.poll().effective,
+            ),
+            openReader: openStoreReader,
+        });
+    };
+    if (db && isDatabasePersisted(db)) startMaintenance();
     let hiddenWorkRecovery: Promise<boolean> | undefined;
     /**
      * Wire the historian's executor and the dreamer on the first successful open
@@ -906,6 +922,7 @@ export async function registerContext(context: V2Context) {
             ? Promise.resolve(false)
             : (hiddenWorkRecovery ??= (async () => {
                   try {
+                      startMaintenance();
                       hiddenCompletionExecutor ??= await createHiddenExecutor(database);
                       dreamTrigger ??= startDreamer(hiddenCompletionExecutor);
                       return true;
@@ -945,6 +962,7 @@ export async function registerContext(context: V2Context) {
     registerSystemDateRefresh(historyRefreshSessions);
     const pendingMaterializationSessions = new Set<string>();
     const lastHeuristicsTurnId = new Map<string, string>();
+    const commitSeenLastPass = new Map<string, boolean>();
     const restoredRows = new RestoredRowCache();
     const rawProviders = new Map<string, () => void>();
     let passDuties: ReturnType<typeof createChatMessageHook> | undefined;
@@ -1076,6 +1094,7 @@ export async function registerContext(context: V2Context) {
     const latestLkgResponseIds = new BoundedSessionMap<string | undefined>(1000);
     const recordUsage = async (
         draft: Pick<SessionContext, "sessionID" | "model">,
+        passStarting = false,
     ): Promise<boolean> => {
         let unsafe = false;
         try {
@@ -1097,6 +1116,14 @@ export async function registerContext(context: V2Context) {
                         error,
                     );
                 }
+                // The previous pass's busting or system-change decision belongs to
+                // the reply its request produced. Best-effort; never refuses a turn.
+                bindV2TransformDecision({
+                    db,
+                    sessionId: draft.sessionID,
+                    reader,
+                    passStarting,
+                });
                 if (latest)
                     noteLkgProviderResponse({
                         sessionId: draft.sessionID,
@@ -1256,6 +1283,8 @@ export async function registerContext(context: V2Context) {
                     variants.delete(sessionID);
                     agents.delete(sessionID);
                     channel1.delete(sessionID);
+                    commitSeenLastPass.delete(sessionID);
+                    clearEmbedSessionState(sessionID);
                     historyRefreshSessions.delete(sessionID);
                     clearPendingMaterialization(pendingMaterializationSessions, sessionID);
                     lastHeuristicsTurnId.delete(sessionID);
@@ -1291,19 +1320,36 @@ export async function registerContext(context: V2Context) {
     const materialize = (draft: SessionContext) => {
         db = storage.require();
         const state = getOrCreateSessionMeta(db, draft.sessionID);
+        const modelKey = `${draft.model.providerID}/${draft.model.id}`;
+        const contextLimit =
+            resolveContextLimit(draft.model.providerID, draft.model.id, {
+                db,
+                sessionID: draft.sessionID,
+            }) ||
+            draft.model.limit?.context ||
+            (state.lastObservedModelKey === modelKey ? state.lastUsageContextLimit : undefined);
         return materializeM0({
+            ...createM0RenderOptions(
+                {
+                    ...createV2TransformFeatureDeps(config, compactionOff, directory),
+                    ...createV2ThresholdDeps(config),
+                },
+                usage.get(draft.sessionID)?.usage ?? { percentage: 0, inputTokens: 0 },
+                modelKey,
+                contextLimit,
+                resolveProjectIdentityForSession(directory, config.allow_home_project),
+            ),
             db,
             sessionId: draft.sessionID,
             state,
-            projectPath:
-                resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
             projectDirectory: directory,
-            memoryEnabled:
-                config.memory.enabled &&
-                !!resolveProjectIdentityForSession(directory, config.allow_home_project),
-            memoryInjectionBudgetTokens: config.memory.injection_budget_tokens,
             hardSignals: {
-                systemHash: foldDigest(JSON.stringify(draft.system)),
+                // Reuse the systemPromptHash saved by the system hook after it has
+                // resolved guidance, presets and the date. Hashing the raw compaction
+                // draft instead would make the next unchanged context pass rebuild the
+                // cached head. Compaction can run before the system hook, so an
+                // unknown identity stays empty for that hook to initialize.
+                systemHash: state.systemPromptHash ?? "",
                 toolSetHash: getCurrentToolSetHash(
                     draft.model.providerID,
                     draft.model.id,
@@ -1338,6 +1384,9 @@ export async function registerContext(context: V2Context) {
         if (nativeFoldReplay) rememberHostMedia(draft.messages);
         const reader = openStoreReader();
         try {
+            // Compaction may precede the first context callback. Wait for the pending
+            // database open instead of refusing while its asynchronous probe is running.
+            await storage.probe();
             const watermark = reader.latestSequenceForIds(
                 draft.sessionID,
                 draft.messages.flatMap((message) => (message.id ? [message.id] : [])),
@@ -1549,7 +1598,7 @@ export async function registerContext(context: V2Context) {
             // left to the transform below: its force band and emergency path are what
             // reduce an over-limit session, and refusing ahead of them would refuse
             // the same stored reading again on every later turn.
-            if ((await recordUsage(draft)) && !compactionOff) {
+            if ((await recordUsage(draft, true)) && !compactionOff) {
                 const storageReason = storage.current() ? null : storage.reason();
                 if (storageReason) {
                     noticeStorageRefusal(draft.sessionID, storageReason);
@@ -1662,6 +1711,7 @@ export async function registerContext(context: V2Context) {
             // registered until plugin disposal, rather than falling back to the v1 store.
             prepareHistorySession(draft.sessionID);
             transform ??= createTransform({
+                ...createV2TransformFeatureDeps(config, compactionOff, directory),
                 cacheTtlConfig: config.cache_ttl,
                 cacheTtlConfigured: config.cacheTtlConfigured,
                 sampleCacheTtlConfig: () => liveConfigReader.poll().effective,
@@ -1702,17 +1752,30 @@ export async function registerContext(context: V2Context) {
                 historyRefreshSessions,
                 pendingMaterializationSessions,
                 lastHeuristicsTurnId,
+                commitSeenLastPass,
                 variantBySession: variants,
                 keepReasoningTokens: config.keep_reasoning_tokens,
                 directory,
                 sessionDirectoryBySession: sessionDirectories,
-                projectPath: directory,
+                projectPath: resolveProjectIdentityForSession(directory, config.allow_home_project),
+                getHistorianChunkTokens: () => sampleHistorian().chunkTokens,
+                getFallbackModelId: (sessionID) => {
+                    const model = liveModels.get(sessionID);
+                    return model ? `${model.providerID}/${model.modelID}` : undefined;
+                },
+                maybeAutoEmbedSession: createV2AutoEmbedSession({
+                    db,
+                    resolveDirectory: (sessionID) => sessionDirectories.get(sessionID) ?? directory,
+                    allowHomeProject: config.allow_home_project,
+                    recompProgressBySession: new Map(),
+                }),
                 hiddenCompletionExecutor,
                 historianRunnable:
                     !compactionOff &&
                     hiddenCompletionExecutor !== undefined &&
                     config.historian?.disable !== true,
                 historianModel: historianModels.primary,
+                historianContextLimit: sampleHistorian().contextLimit,
                 fallbackModels: historianModels.fallbacks,
                 resolveHistorianRun: sampleHistorian,
                 historianTimeoutMs: config.historian_timeout_ms,
@@ -1739,6 +1802,7 @@ export async function registerContext(context: V2Context) {
                 ...createHostSeams(context, readAllForConversion, pagedRead, liveModels),
             });
             const admitted = new Set<string>();
+            let messageTimes: ReturnType<V2StoreReader["messageTimes"]> | undefined;
             const reader = openStoreReader();
             let checkpoint: SessionContext["messages"][number] | undefined;
             let submitted: string | undefined;
@@ -1910,6 +1974,11 @@ export async function registerContext(context: V2Context) {
                         ...draft.messages.filter((message) => message !== incoming),
                     );
                 }
+                if (config.temporal_awareness === true)
+                    messageTimes = reader.messageTimes(
+                        draft.sessionID,
+                        draft.messages.flatMap((message) => (message.id ? [message.id] : [])),
+                    );
             } finally {
                 reader.close();
             }
@@ -1921,7 +1990,7 @@ export async function registerContext(context: V2Context) {
                     nativeFoldReplay.invalidate(draft.sessionID, true);
                 }
             }
-            const mapped = adaptPayload(draft, admitted);
+            const mapped = adaptPayload(draft, admitted, messageTimes);
             bindSystemDateRequestIdentity(mapped, draft);
             beginV2LkgRequest(
                 draft.sessionID,
@@ -1944,6 +2013,13 @@ export async function registerContext(context: V2Context) {
                 >[1],
             );
             mapped.commit();
+            // Keep the transform decision this pass staged (if any) together with
+            // the store sequence captured before the request; the next pass binds it
+            // to the reply written after that sequence.
+            stageOpenCodeV2TransformDecision({
+                sessionId: draft.sessionID,
+                responseAfterSequence,
+            });
             if (db) {
                 await deliverPendingChannel2(
                     context,
@@ -2202,6 +2278,7 @@ export async function registerContext(context: V2Context) {
             db: runDb,
             dreamer: manualDreamer,
             smartNotesEnabled: config.smart_notes.enabled,
+            memoryEnabled: config.memory.enabled,
             projectIdentity:
                 resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
             directory,
@@ -2285,6 +2362,7 @@ export async function registerContext(context: V2Context) {
             await usageDone;
             deletedSessions.clear();
             await dreamTrigger?.dispose();
+            await maintenanceTimer?.dispose();
             for (const release of rawProviders.values()) release();
             rawProviders.clear();
             restoredRows.clear();

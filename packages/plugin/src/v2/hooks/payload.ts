@@ -262,7 +262,11 @@ function rebuildFileContent(value: Part[], output: string, attachments?: unknown
  * Only native tool parts allocate tags; feeding a bare tool_result can replay an
  * existing tag but cannot create one. The inverse projection preserves host metadata.
  */
-export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<string> = new Set()) {
+export function adaptPayload(
+    draft: SessionContext,
+    admittedIDs: ReadonlySet<string> = new Set(),
+    messageTimes: ReadonlyMap<string, MessageLike["info"]["time"]> = new Map(),
+) {
     const provider = getOpenCodeProviderProjection(draft.sessionID);
     const cache = provider ? providerCache(provider.owner) : undefined;
     const known = (message: V2Message) => !!message.id && provider?.ids.has(message.id) === true;
@@ -458,6 +462,9 @@ export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<str
                 id: message.id,
                 sessionID: draft.sessionID,
                 role: message.role,
+                // Internal observation only: commit() projects content, not info,
+                // back to the host's provider draft.
+                time: message.id ? messageTimes.get(message.id) : undefined,
                 // No `tools`: on this host `draft.tools` is the full definition of every
                 // tool, not the per-message on/off map an OpenCode 1 message carries, so
                 // no reader of `info.tools` can learn anything from it. Copied onto each

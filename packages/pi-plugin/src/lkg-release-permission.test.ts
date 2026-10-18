@@ -36,9 +36,11 @@ type Handler = (
 
 for (const failure of [
 	"drop batch",
+	"paired drop batch",
 	"admission",
 	"unchanged restart",
 	"frozen restart",
+	"idle materialization",
 ] as const) {
 	test(`Pi LKG ${failure}: release shares permission and defer replays all frozen decisions`, async () => {
 		const unchangedRecovery = failure.endsWith("restart");
@@ -94,7 +96,7 @@ for (const failure of [
 			]).flat(),
 			userMessage("latest turn", 20),
 		];
-		if (failure === "unchanged restart")
+		if (failure === "unchanged restart" || failure === "drop batch")
 			Object.assign(raw[1], {
 				content: [{ type: "text", text: "signed answer" }],
 			});
@@ -140,14 +142,34 @@ for (const failure of [
 			updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
 			await pass("seed", [userMessage("original head", 1)]);
 			await pass("baseline");
+			if (failure === "idle materialization") {
+				const before = JSON.stringify(served.baseline);
+				signalPiPendingMaterialization(sessionId);
+				const idle = await pass("idle", raw, 76);
+				expect(JSON.stringify(idle)).toBe(before);
+				expect(JSON.stringify(idle)).toContain("prefix bound thought");
+				return;
+			}
 			if (failure === "frozen restart") {
+				appendCompartments(db, sessionId, [
+					{
+						sequence: 0,
+						startMessage: 1,
+						endMessage: 1,
+						startMessageId: "entry-1",
+						endMessageId: "entry-1",
+						title: "Published head",
+						content: "U: original head",
+						p1: "U: original head",
+					},
+				]);
 				signalPiPendingMaterialization(sessionId);
 				await pass("baseline", raw, 76);
 				expect(JSON.stringify(served.baseline)).not.toContain(
 					"prefix bound thought",
 				);
 			}
-			if (failure === "drop batch") {
+			if (failure.endsWith("drop batch")) {
 				const tools = getTagsBySession(db, sessionId).filter(
 					(tag) => tag.type === "tool",
 				);
@@ -163,7 +185,13 @@ for (const failure of [
 					getTagsBySession(db, sessionId).filter(
 						(tag) => tag.type === "tool" && tag.status === "dropped",
 					),
-				).toHaveLength(1);
+				).toHaveLength(failure === "paired drop batch" ? 0 : 1);
+				if (failure === "paired drop batch") {
+					expect(served.replay).toEqual(served.baseline);
+					expect(JSON.stringify(served.replay)).toContain(
+						"prefix bound thought",
+					);
+				}
 				db.exec("DROP TRIGGER busy_drop");
 			} else {
 				db.exec("PRAGMA busy_timeout=0");
@@ -230,7 +258,7 @@ for (const failure of [
 			);
 			appendCompartments(db, sessionId, [
 				{
-					sequence: 0,
+					sequence: failure === "frozen restart" ? 1 : 0,
 					startMessage: 1,
 					endMessage: 2,
 					startMessageId: "entry-1",

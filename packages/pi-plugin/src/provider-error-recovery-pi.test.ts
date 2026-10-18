@@ -13,6 +13,8 @@ import { resolvePiUsableContextLimit } from "./pi-context-limit";
 import {
 	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
+	assertPiThinkingEntryIds,
+	frozenBindingEntryIds,
 	handlePiProviderFailure,
 	PiThinkingBindingRecoveryRefusal,
 } from "./provider-error-recovery-pi";
@@ -97,10 +99,104 @@ function multiAssistantCompletedMessages(): unknown[] {
 }
 
 describe("Pi provider failure recovery", () => {
-	it("refuses an incomplete strip identity set before leaving a signed middle gap", () => {
+	it("replays completed-turn content identities after an index shift at the recorded phase", () => {
+		const database = db();
+		const sessionId = "pi-proactive-unmapped-completed";
+		const original = fableMessages();
+		const messages = structuredClone(original);
+		expect(
+			applyPiProactiveThinkingStrip({
+				db: database,
+				sessionId,
+				messages,
+				entryIds: [],
+				provider: "anthropic",
+				model: "claude-fable-5-1",
+				cacheBustingPass: true,
+			}),
+		).not.toBeNull();
+		const moved = [
+			{ role: "user", content: "inserted earlier", timestamp: 0 },
+			...structuredClone(original),
+		];
+		const replay = (order: "start" | "end") =>
+			applyPiThinkingBindingRecovery({
+				db: database,
+				sessionId,
+				messages: moved,
+				entryIds: [],
+				provider: "anthropic",
+				model: "claude-fable-5-1",
+				replayOrder: order,
+			});
+		replay("start");
+		expect(JSON.stringify(moved)).toContain("bound bytes");
+		replay("end");
+		expect(moved.slice(1)).toEqual(messages);
+	});
+
+	it("refuses proactive active-turn omissions without a host identity before writing anything", () => {
+		const database = db();
+		const sessionId = "pi-proactive-unmapped-active";
+		const messages = fableMessages().slice(0, -1);
+		const original = structuredClone(messages);
+		expect(() =>
+			applyPiProactiveThinkingStrip({
+				db: database,
+				sessionId,
+				messages,
+				entryIds: [],
+				provider: "anthropic",
+				model: "claude-fable-5-1",
+				cacheBustingPass: true,
+				stripActiveTurn: true,
+				requirePersistence: true,
+			}),
+		).toThrow("Cannot persist thinking omission");
+		expect(messages).toEqual(original);
+		expect(frozenBindingEntryIds(database, sessionId).size).toBe(0);
+	});
+
+	it("strips every completed-turn block with an incomplete host identity set and replays it", () => {
 		const database = db();
 		const sessionId = "pi-binding-unmapped-strip";
 		const messages = multiAssistantCompletedMessages();
+		const original = structuredClone(messages);
+		handlePiProviderFailure({
+			db: database,
+			sessionId,
+			message: {
+				role: "assistant",
+				provider: "anthropic",
+				model: "claude-opus-5-5",
+				errorMessage: `400 ${JSON.stringify(LIVE_BINDING_400_BODY)}`,
+			},
+			report: () => {},
+		});
+		const apply = (messages: unknown[]) =>
+			applyPiThinkingBindingRecovery({
+				db: database,
+				sessionId,
+				messages,
+				entryIds: ["u1", "a1", "u2", undefined, "u3", "a3", "tr3", "u4"],
+				provider: "anthropic",
+				model: "claude-opus-5-5",
+			});
+		expect(apply(messages)).not.toBeNull();
+		expect(JSON.stringify(messages)).not.toContain('"type":"thinking"');
+		expect(frozenBindingEntryIds(database, sessionId).size).toBe(3);
+		const restored = structuredClone(original);
+		const target = getThinkingBindingRecoveryTarget(database, sessionId);
+		if (!target) throw new Error("Expected an armed binding recovery");
+		clearThinkingBindingRecoveryIf(database, sessionId, target);
+		apply(restored);
+		expect(restored).toEqual(messages);
+	});
+
+	it("refuses missing active-turn identities without partially stripping completed turns", () => {
+		const database = db();
+		const sessionId = "pi-binding-unmapped-active";
+		const messages = multiAssistantCompletedMessages().slice(0, -1);
 		const original = structuredClone(messages);
 		handlePiProviderFailure({
 			db: database,
@@ -118,13 +214,27 @@ describe("Pi provider failure recovery", () => {
 				db: database,
 				sessionId,
 				messages,
-				entryIds: ["u1", "a1", "u2", undefined, "u3", "a3", "tr3", "u4"],
+				entryIds: ["u1", "a1", "u2", "a2", "u3", undefined, "tr3"],
 				provider: "anthropic",
 				model: "claude-opus-5-5",
 			}),
 		).toThrow(PiThinkingBindingRecoveryRefusal);
 		expect(messages).toEqual(original);
-		expect(getMergedReasoningStrippedIds(database, sessionId).size).toBe(0);
+		expect(frozenBindingEntryIds(database, sessionId).size).toBe(0);
+		expect(() =>
+			assertPiThinkingEntryIds(messages, [
+				"u1",
+				"a1",
+				"u2",
+				"a2",
+				"u3",
+				undefined,
+				"tr3",
+			]),
+		).toThrow("Cannot persist thinking omission");
+		expect(() =>
+			assertPiThinkingEntryIds(multiAssistantCompletedMessages(), []),
+		).not.toThrow();
 	});
 
 	it("arms message_end binding recovery and re-serves stripped bytes after restart", () => {
@@ -453,7 +563,9 @@ describe("Pi proactive strip of thinking on busting passes", () => {
 				"binding_mismatch:a1",
 				"binding_mismatch:a2",
 				"binding_mismatch:a3",
-				"binding_mismatch_order:end",
+				"binding_mismatch_entry_order:end:a1",
+				"binding_mismatch_entry_order:end:a2",
+				"binding_mismatch_entry_order:end:a3",
 			]),
 		);
 

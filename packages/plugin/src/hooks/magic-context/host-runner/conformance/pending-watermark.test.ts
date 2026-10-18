@@ -9,6 +9,7 @@ import { cleanupTestTempDir, createTestTempDirFromPath } from "../../../../share
 import { setRawMessageProvider } from "../../read-session-chunk";
 import type { MessageLike } from "../../transform-operations";
 import { createBridgeAdapter } from "../bridge-adapter";
+import { BridgeRefusalError } from "../bridge-types";
 import { ProviderClient } from "../provider-client";
 import { oracleCommand } from "./oracle";
 
@@ -219,6 +220,7 @@ async function runSession(clean: boolean, root: string) {
                 const request = JSON.parse(Buffer.from(body).toString());
                 const started = performance.now();
                 const answer = await oracle.call(request);
+                if (answer.oracle_error) throw answer.oracle_error;
                 const hookMs =
                     Date.now() - (opts.deadlineMs - Number(request.params?.budget_ms ?? 0));
                 if (method === "transform.hook" && hookMs > 1500)
@@ -254,6 +256,10 @@ async function runSession(clean: boolean, root: string) {
     const receipts: any[] = [];
     const progress: any[] = [];
     const landings: any[] = [];
+    const refusals: any[] = [];
+    const servedTurns: number[] = [];
+    const servedTags = new Map<string, Set<string>>();
+    const strippedTags: any[] = [];
     let model = "gpt-5.6";
     try {
         for (let turn = 1; turn <= 160; turn++) {
@@ -275,7 +281,36 @@ async function runSession(clean: boolean, root: string) {
                 model = "fixture-force-band";
             }
             rows.push(message(turn, false, model));
-            const view = await adapter.run({ sessionId: SESSION, messages: rows, kind: "model" });
+            const before = adapter.receipt(SESSION)?.request_id;
+            let view: Awaited<ReturnType<typeof adapter.run>>;
+            try {
+                view = await adapter.run({ sessionId: SESSION, messages: rows, kind: "model" });
+            } catch (error) {
+                // Pending-delivery bridges can't compact until ck-mc renders unconfirmed
+                // answers: ck-mc rebuilds from confirmed answers only, so the rebuild
+                // would send served tagged messages raw, and the bridge refuses it.
+                if (clean || !(error instanceof BridgeRefusalError)) throw error;
+                refusals.push({
+                    turn,
+                    code: error.code,
+                    retryable: error.retryable,
+                    // No view was returned and nothing was published for this turn.
+                    published: adapter.receipt(SESSION)?.request_id !== before,
+                });
+                rows.push(message(turn, true, model));
+                continue;
+            }
+            servedTurns.push(turn);
+            // Every view served must keep each tag an earlier view served on the same
+            // message: the bytes sent never lose a served tag.
+            for (const message of view.messages) {
+                const id = message.info.id;
+                if (!id) continue;
+                const bytes = JSON.stringify(message);
+                for (const tag of servedTags.get(id) ?? [])
+                    if (!bytes.includes(tag)) strippedTags.push({ turn, id, tag });
+                servedTags.set(id, new Set(bytes.match(/§\d+§/g) ?? []));
+            }
             const receipt = adapter.completeRequest(SESSION, view.receipt.request_id, {
                 status: 200,
                 cleanEnd: clean,
@@ -359,6 +394,9 @@ async function runSession(clean: boolean, root: string) {
             receipts,
             intervals,
             exchanges,
+            refusals,
+            servedTurns,
+            strippedTags,
         };
     } catch (error) {
         console.error(
@@ -392,62 +430,86 @@ test("real bridge pending watermark versus clean control over 160 tool turns", a
         const clean = await runSession(true, join(root, "clean"));
         const output = { schema: "bridge-pending-watermark/v1", turns: 160, pending, clean };
         console.log(`WATERMARK_RESULT ${JSON.stringify(output)}`);
-        expect(pending.receipts.every((row) => row.receipt.served_through_ordinal === 0)).toBe(
-            true,
-        );
+        // The clean-delivery control is unchanged: confirmed answers render in every
+        // rebuild, so it compacts at turns 60, 120 and 150.
         expect(clean.receipts.at(-1).receipt.served_through_ordinal).toBe(319);
-        expect(pending.drops).toHaveLength(3);
         expect(clean.drops).toHaveLength(3);
-        expect(pending.drops.every((drop) => drop.result.isError === false)).toBe(true);
         expect(clean.drops.every((drop) => drop.result.isError === false)).toBe(true);
-        for (const run of [pending, clean]) {
-            expect(
-                run.exchanges.every(
-                    (row) =>
-                        row.request.estimate.request_tokens === 0 &&
-                        row.request.previous_usage === undefined,
-                ),
-            ).toBe(true);
-            expect(
-                run.exchanges
-                    .filter((row) => row.method === "compaction.step")
-                    .map((row) => row.pass),
-            ).toEqual([1, 60, 120, 150]);
-            expect(
-                run.receipts
-                    .filter((row) => row.turn === 60 || row.turn === 120)
-                    .map((row) => row.receipt.coverage.ordinal),
-            ).toEqual([80, 200]);
-            expect(
-                run.intervals.at(-1).status.pass_trace.scheduler_history.at(-1).scheduler_decision,
-            ).toBe("Force85");
-            expect(run.intervals.at(-1).snapshot.counts.mc_provider_hook_answers_v1).toBe(477);
-        }
-        for (const run of [pending, clean]) {
-            expect(run.progress.at(-1).state.queued).toEqual([]);
-            expect(run.progress.at(-1).state.consumed).toEqual([
-                { tag_number: 53 },
-                { tag_number: 203 },
-                { tag_number: 383 },
-            ]);
-            expect(
-                run.progress
-                    .filter(
-                        (row, i) =>
-                            row.state.consumed.length >
-                            (run.progress[i - 1]?.state.consumed.length ?? 0),
-                    )
-                    .map((row) => row.turn),
-            ).toEqual([60, 120, 150]);
-            expect(run.intervals.find((row) => row.turn === 30).status.pending_drop_count).toBe(1);
-            expect(run.intervals.at(-1).status.pending_drop_count).toBe(0);
-            expect(run.intervals.at(-1).status.provider_applied_drop_count).toBe(3);
-        }
-        expect(pending.intervals.at(-1).snapshot.answers).toEqual([{ state: "pending", n: 477 }]);
+        expect(
+            clean.exchanges.every(
+                (row) =>
+                    row.method !== "compaction.step" ||
+                    (row.request.estimate.request_tokens === 0 &&
+                        row.request.previous_usage === undefined),
+            ),
+        ).toBe(true);
+        expect(
+            clean.exchanges
+                .filter((row) => row.method === "compaction.step")
+                .map((row) => row.pass),
+        ).toEqual([1, 60, 120, 150]);
+        expect(
+            clean.receipts
+                .filter((row) => row.turn === 60 || row.turn === 120)
+                .map((row) => row.receipt.coverage.ordinal),
+        ).toEqual([80, 200]);
+        expect(
+            clean.intervals.at(-1).status.pass_trace.scheduler_history.at(-1).scheduler_decision,
+        ).toBe("Force85");
+        expect(clean.intervals.at(-1).snapshot.counts.mc_provider_hook_answers_v1).toBe(477);
+        expect(clean.progress.at(-1).state.queued).toEqual([]);
+        expect(clean.progress.at(-1).state.consumed).toEqual([
+            { tag_number: 53 },
+            { tag_number: 203 },
+            { tag_number: 383 },
+        ]);
+        expect(
+            clean.progress
+                .filter(
+                    (row, i) =>
+                        row.state.consumed.length >
+                        (clean.progress[i - 1]?.state.consumed.length ?? 0),
+                )
+                .map((row) => row.turn),
+        ).toEqual([60, 120, 150]);
+        expect(clean.intervals.find((row) => row.turn === 30).status.pending_drop_count).toBe(1);
+        expect(clean.intervals.at(-1).status.pending_drop_count).toBe(0);
+        expect(clean.intervals.at(-1).status.provider_applied_drop_count).toBe(3);
         expect(clean.intervals.at(-1).snapshot.answers).toEqual([
             { state: "live", n: 474 },
             { state: "pending", n: 3 },
         ]);
+        expect(clean.refusals).toEqual([]);
+        // Pending delivery (served_through_ordinal stays 0) is the limit this test
+        // pins: pending-delivery bridges can't compact until ck-mc renders
+        // unconfirmed answers. ck-mc rebuilds from confirmed answers only, so a
+        // rebuild would send every served tagged message raw; the bridge refuses
+        // it (retryable, nothing published) instead. Every later pass declares the
+        // same rebuild and is refused too, until a rebuild no longer touches a
+        // served message: the turn-120 publication covers everything served before
+        // turn 60, so turns 120-149 are served; the turn-150 pressure rebuild
+        // refuses again through the last turn.
+        const range = (from: number, to: number) =>
+            Array.from({ length: to - from + 1 }, (_, i) => from + i);
+        const refused = [...range(60, 119), ...range(150, 160)];
+        expect(pending.refusals.map((row) => row.turn)).toEqual(refused);
+        expect(
+            pending.refusals.every(
+                (row) =>
+                    row.code === "bridge_served_bytes_changed" &&
+                    row.retryable === true &&
+                    row.published === false,
+            ),
+        ).toBe(true);
+        expect(pending.servedTurns).toEqual([...range(1, 59), ...range(120, 149)]);
+        // No served view ever lost a tag an earlier view had served on the same message.
+        expect(pending.strippedTags).toEqual([]);
+        expect(pending.receipts.every((row) => row.receipt.served_through_ordinal === 0)).toBe(
+            true,
+        );
+        // The turn-70 drop is never issued because turn 70 is refused.
+        expect(pending.drops.map((drop) => drop.turn)).toEqual([20, 130]);
+        expect(pending.drops.every((drop) => drop.result.isError === false)).toBe(true);
     } finally {
         budget.mockRestore();
         if (oldConfig === undefined) delete process.env.MAGIC_CONTEXT_CONFIG_PATH;

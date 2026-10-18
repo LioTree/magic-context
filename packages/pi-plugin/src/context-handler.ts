@@ -119,7 +119,6 @@ import {
 	getEmergencyInputSample,
 	getHistorianFailureState,
 	getNoteNudgeAnchors,
-	getPersistedTodoSyntheticAnchor,
 	isProviderOverflowFailClosedProven,
 	type NoteNudgeAnchor,
 	type PendingPiCompactionMarker,
@@ -148,7 +147,9 @@ import {
 } from "@magic-context/core/features/magic-context/temporal-decisions";
 import {
 	findNewestPiAssistantEntryId,
+	hasPendingPiSystemPromptHashChange,
 	normalizeMaterializeReason,
+	notePiSystemPromptHashChange,
 	recordPendingPiTransformDecision,
 	schedulePiTransformDecisionResolve,
 } from "@magic-context/core/features/magic-context/transform-decision-log";
@@ -158,6 +159,7 @@ import {
 	applyPendingOperations,
 	convertLegacyToolSkeletons,
 	foldBustsServedPrefix,
+	foldInvalidatesThinking,
 	RECENT_TOOL_SKELETON_WINDOW,
 } from "@magic-context/core/hooks/magic-context/apply-operations";
 import {
@@ -176,7 +178,10 @@ import {
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { evaluateChannel2 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
-import { DegradedPassRefusalError } from "@magic-context/core/hooks/magic-context/degraded-pass-refusal";
+import {
+	DegradedPassRefusalError,
+	degradedPassError,
+} from "@magic-context/core/hooks/magic-context/degraded-pass-refusal";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import {
 	type DroppedTokenReduction,
@@ -222,6 +227,11 @@ import {
 	onNoteTrigger,
 	peekNoteNudgeText,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
+import {
+	pairedThinkingEdit,
+	snapshotSessionFlag,
+	snapshotSessionValue,
+} from "@magic-context/core/hooks/magic-context/paired-thinking-edit";
 import {
 	getRawHistoryEligibility,
 	hasRunnableCompartmentWindow,
@@ -441,10 +451,13 @@ import { loadPiToolWireSchema } from "./pi-tool-wire-schema";
 import {
 	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
+	assertPiOldestThinkingRun,
+	assertPiThinkingEntryIds,
 	frozenBindingEntryIds,
 	hasUnfrozenPiThinking,
+	piMessageHasThinking,
+	planPiProactiveThinkingStrip,
 	resolvePiBindingStripOrder,
-	shouldRunPiProactiveThinkingStrip,
 } from "./provider-error-recovery-pi";
 import {
 	convertEntriesToRawMessagePage,
@@ -826,10 +839,17 @@ export function signalPiSystemHashChange(
 		historyRefreshSessions,
 		pendingMaterializationSessions,
 	);
+	// The new system bytes are served from this turn on, so kept signed
+	// thinking needs its companion strip on the next pass without a boundary.
+	recordSystemPromptEdit(pendingMaterializationSessions, sessionId);
 	signalPiHistoryRefresh(sessionId);
 	signalPiSystemPromptRefresh(sessionId);
 	if (!pendingMaterializationSessions.has(sessionId))
 		signalPiPendingMaterialization(sessionId, "system_hash");
+	// The next main context pass serves the first request that carries the new
+	// system prompt. Record that the transform decision for that request must
+	// name system_hash, even when the pass keeps m[0]/m[1] unchanged.
+	notePiSystemPromptHashChange(sessionId);
 }
 
 function deferPiDeliveredSystemRefresh(
@@ -4621,17 +4641,16 @@ export function registerPiContextHandler(
 				entryIds: lkgEntryIds ?? [],
 				bustPermittedAtStart: hasPendingMaterialization(sessionId),
 			});
-			const startOfPassBindingRecovery =
-				bindingStripOrder === "start"
-					? applyPiThinkingBindingRecovery({
-							db: options.db,
-							sessionId,
-							messages: event.messages as unknown[],
-							entryIds: lkgEntryIds ?? [],
-							provider: lkgProviderKey ?? undefined,
-							model: ctx.model?.id,
-						})
-					: null;
+			const startOfPassBindingRecovery = applyPiThinkingBindingRecovery({
+				db: options.db,
+				sessionId,
+				messages: event.messages as unknown[],
+				entryIds: lkgEntryIds ?? [],
+				provider: lkgProviderKey ?? undefined,
+				model: ctx.model?.id,
+				replayOrder: "start",
+				freezeRecovery: bindingStripOrder === "start",
+			});
 			// Maps each input message object to its branch entry id, so the strip at
 			// the end of the pass can still identify messages the pipeline kept as
 			// the same object.
@@ -5647,6 +5666,12 @@ export function registerPiContextHandler(
 					);
 				},
 			};
+			if (
+				!options.compactionOff &&
+				recovery.rebuildReason &&
+				isPrefixBoundThinkingModel(ctx.model?.provider, ctx.model?.id)
+			)
+				assertPiThinkingEntryIds(event.messages, lkgEntryIds ?? []);
 			let result = await budget.waitMandatory(runPipeline(pipelineArgs));
 			const historyRefreshThisPass = result.historyRefreshPermitted;
 			observePipelineResultForTests(sessionId, result);
@@ -5666,9 +5691,10 @@ export function registerPiContextHandler(
 					branchEntries,
 				);
 			}
-			const piDecisionSnapshotNewestAssistant = result.bustedThisPass
-				? findNewestPiAssistantEntryId(branchEntries)
-				: undefined;
+			const piDecisionSnapshotNewestAssistant =
+				result.bustedThisPass || hasPendingPiSystemPromptHashChange(sessionId)
+					? findNewestPiAssistantEntryId(branchEntries)
+					: undefined;
 			const publishTransformDecision =
 				!budget.sideTurn && piDecisionSnapshotNewestAssistant !== undefined
 					? () => {
@@ -5794,15 +5820,6 @@ export function registerPiContextHandler(
 					return undefined;
 				}
 			})();
-			// Sticky reminders and the synthetic todo pair this pass adds or moves
-			// edit an earlier user or assistant message; the proactive thinking
-			// strip below needs to know.
-			const stickyBefore = postTransformSnapshot
-				? piStickyInjectionKeys(postTransformSnapshot)
-				: null;
-			const todoAnchorBefore = JSON.stringify(
-				getPersistedTodoSyntheticAnchor(options.db, sessionId),
-			);
 			const tNoteNudges = performance.now();
 			try {
 				if (!options.compactionOff) {
@@ -5922,12 +5939,39 @@ export function registerPiContextHandler(
 							editAdmission: result.editAdmission,
 							stableId: (message) => result.postCommitEntryIdByRef.get(message),
 							lastTodoState: sessionMetaForTodo.lastTodoState,
+							persistCompanion: isPrefixBoundThinkingModel(
+								ctx.model?.provider,
+								ctx.model?.id,
+							)
+								? (messages) => {
+										applyPiProactiveThinkingStrip({
+											db: options.db,
+											sessionId,
+											messages,
+											entryIds: resolvePiLkgOutputEntryIds(
+												messages,
+												result.syntheticLeadingCount,
+												(message) =>
+													result.postCommitEntryIdByRef.get(message) ??
+													result.lkgEntryIdByRef.get(message) ??
+													bindingEntryIdByRef.get(message),
+											).map((id) => id ?? undefined),
+											provider: lkgProviderKey ?? undefined,
+											model: ctx.model?.id,
+											cacheBustingPass: true,
+											persistOnly: true,
+											requirePersistence: true,
+										});
+									}
+								: undefined,
 							messages: outputMessages as unknown as Parameters<
 								typeof injectSyntheticTodowriteForPi
 							>[0]["messages"],
 						}) as unknown as typeof outputMessages;
 					}
 				} catch (err) {
+					if (isPrefixBoundThinkingModel(ctx.model?.provider, ctx.model?.id))
+						throw degradedPassError("pi-todo-companion", err);
 					sessionLog(
 						sessionId,
 						`synthetic todowrite injection failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -5947,23 +5991,6 @@ export function registerPiContextHandler(
 			// Sessions that still strip before the pipeline stages had their strips
 			// applied at the start of the pass and skip this step.
 			const tThinkingBinding = performance.now();
-			let hostEditBeforeNewestThinking = true;
-			try {
-				const stickyAfter = piStickyInjectionKeys(
-					loadPiPostTransformSnapshot(options.db, sessionId),
-				);
-				hostEditBeforeNewestThinking =
-					stickyBefore === null ||
-					[...stickyAfter].some((key) => !stickyBefore.has(key)) ||
-					JSON.stringify(
-						getPersistedTodoSyntheticAnchor(options.db, sessionId),
-					) !== todoAnchorBefore;
-			} catch {
-				// The reminder and todo state could not be read, so whether this
-				// pass edited an earlier message is unknown. Treat it as edited:
-				// stripping a still-valid block costs a cache rewrite, keeping an
-				// invalidated one costs a rejected request.
-			}
 			const outputEntryIds = resolvePiLkgOutputEntryIds(
 				outputMessages,
 				result.syntheticLeadingCount,
@@ -5973,58 +6000,19 @@ export function registerPiContextHandler(
 					bindingEntryIdByRef.get(message),
 			).map((entryId) => entryId ?? undefined);
 			const thinkingBindingRecoveryApplied =
-				bindingStripOrder === "end" &&
-				(!result.signedPrefixRewritten || !result.prefixBustPermitted)
-					? applyPiThinkingBindingRecovery({
-							db: options.db,
-							sessionId,
-							messages: outputMessages as unknown[],
-							entryIds: outputEntryIds,
-							provider: lkgProviderKey ?? undefined,
-							model: ctx.model?.id,
-							endOfPassOrder: true,
-						})
-					: startOfPassBindingRecovery;
-			if (
-				shouldRunPiProactiveThinkingStrip({
-					compactionOff: options.compactionOff === true,
-					bindingStripOrder,
-					isSubagent: sessionMeta.isSubagent === true,
-				})
-			) {
-				try {
-					applyPiProactiveThinkingStrip({
-						db: options.db,
-						sessionId,
-						messages: outputMessages as unknown[],
-						entryIds: outputEntryIds,
-						provider: lkgProviderKey ?? undefined,
-						model: ctx.model?.id,
-						// Host-side mutations share the pipeline's permission. A history
-						// refresh alone cannot authorize changes before kept thinking:
-						// signatures bind all preceding bytes. A permitted prefix rewrite
-						// omits every signed block, including those in the active turn.
-						cacheBustingPass:
-							result.prefixBustPermitted &&
-							!result.strictThinkingKept &&
-							(result.signedPrefixRewritten ||
-								isCacheBusting ||
-								result.prefixRebuildAlreadyPriced ||
-								(result.executedWorkThisPass &&
-									(result.prefixEditBesidesReasoningTrim ||
-										hostEditBeforeNewestThinking))),
-						stripActiveTurn: result.signedPrefixRewritten,
-						requirePersistence: !!recovery.rebuildReason,
-						report: (line) => sessionLog(sessionId, line),
-					});
-				} catch (err) {
-					if (recovery.rebuildReason) throw err;
-					sessionLog(
-						sessionId,
-						`proactive thinking strip failed: ${err instanceof Error ? err.message : String(err)}`,
-					);
-				}
-			}
+				applyPiThinkingBindingRecovery({
+					db: options.db,
+					sessionId,
+					messages: outputMessages as unknown[],
+					entryIds: outputEntryIds,
+					provider: lkgProviderKey ?? undefined,
+					model: ctx.model?.id,
+					endOfPassOrder: true,
+					replayOrder: "end",
+					freezeRecovery:
+						bindingStripOrder === "end" &&
+						(!result.signedPrefixRewritten || !result.prefixBustPermitted),
+				}) ?? startOfPassBindingRecovery;
 			logTransformTiming(sessionId, "thinkingBinding", tThinkingBinding);
 
 			// Restore previously sent recovery bytes before counting the returned
@@ -6380,15 +6368,15 @@ export function registerPiContextHandler(
 							result.lkgEntryIdByRef.get(message) ??
 							result.postCommitEntryIdByRef.get(message),
 					);
-					applyPiProactiveThinkingStrip({
+					applyPiThinkingBindingRecovery({
 						db: options.db,
 						sessionId,
 						messages: outputMessages,
 						entryIds: retryIds.map((id) => id ?? undefined),
 						provider: ctx.model?.provider,
 						model: ctx.model?.id,
-						cacheBustingPass: result.prefixBustPermitted,
-						stripActiveTurn: true,
+						replayOrder: "end",
+						freezeRecovery: false,
 					});
 					estimate = estimatePiOutgoingInputTokens(
 						outputMessages,
@@ -6590,7 +6578,7 @@ export function registerPiContextHandler(
 										reservation,
 									);
 								reclaimCompleted = true;
-								applyPiProactiveThinkingStrip({
+								applyPiThinkingBindingRecovery({
 									db: options.db,
 									sessionId,
 									messages: outputMessages,
@@ -6603,8 +6591,8 @@ export function registerPiContextHandler(
 									).map((id) => id ?? undefined),
 									provider: ctx.model?.provider,
 									model: ctx.model?.id,
-									cacheBustingPass: result.prefixBustPermitted,
-									stripActiveTurn: result.signedPrefixRewritten,
+									replayOrder: "end",
+									freezeRecovery: false,
 								});
 								estimate = estimatePiOutgoingInputTokens(
 									outputMessages,
@@ -8492,8 +8480,293 @@ async function runCompactionOffPipeline(
 }
 
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
-	args.assertCurrentPass?.();
 	if (args.compactionOff) return runCompactionOffPipeline(args);
+	if (
+		!isPrefixBoundThinkingModel(args.resolvedProviderID, args.resolvedModelID)
+	)
+		return runSynchronousPipeline(args, undefined, undefined, false);
+	// A host system-prompt change rewrote the bytes before every kept thinking
+	// block. The first prefix-bound pass without a current-turn boundary strips
+	// older thinking with it. Other passes keep the record: thinking signed
+	// before the change may be served again after a switch back to this model.
+	const systemPromptEdited = hasSystemPromptEdit(
+		pendingMaterializationSessions,
+		args.sessionId,
+	);
+	// All message-rewrite decisions here are synchronous: commit their database
+	// rows and corresponding thinking removals together. Network permission checks
+	// run before this function, outside the transaction.
+	const restore = [
+		snapshotPendingMaterialization(
+			pendingMaterializationSessions,
+			args.sessionId,
+		),
+		snapshotPendingMaterialization(
+			deferredMaterializationSessions,
+			args.sessionId,
+		),
+		snapshotSessionFlag(historyRefreshSessions, args.sessionId),
+		snapshotSessionFlag(deferredHistoryRefreshSessions, args.sessionId),
+		snapshotSessionValue(lastHeuristicsTurnIdBySession, args.sessionId),
+		snapshotSessionValue(routinePressureAppliedBySession, args.sessionId),
+	];
+	const rollbackObservations: (() => void)[] = [];
+	const resetSessionState = () => {
+		for (const reset of restore) reset();
+		parkedBustTriggersBySession.delete(args.sessionId);
+		clearPiInjectionTokenCountCache(args.sessionId);
+		clearPiMuralProcessCache(args.sessionId);
+	};
+	const needsCompanion = (result: RunPipelineResult) =>
+		!result.strictThinkingKept &&
+		(systemPromptEdited ||
+			(result.prefixBustPermitted && result.prefixEditBesidesReasoningTrim));
+	// Most passes cannot need a companion strip: a pass that keeps current-turn
+	// signed thinking holds every edit before it (and keeps the system-prompt
+	// record), and a pass whose messages carry no thinking has nothing to strip.
+	// Those run without the write transaction, as an unpaired pass did, and
+	// without any snapshot for a rerun. The only edits that can still need a
+	// strip on such a pass are prefix rewrites, so a pass whose state can trigger
+	// one goes straight to the paired transaction instead. Reaching a rewrite on
+	// any other pass is a defect: the pipeline refuses the pass at that point,
+	// before writing the omissions.
+	if (piPassMayNeedNoCompanion(args) && !piPassMayRewritePrefix(args)) {
+		const result = runSynchronousPipeline(
+			args,
+			rollbackObservations,
+			() => {
+				throw new DegradedPassRefusalError(UNPAIRED_PREFIX_REWRITE_SITE, {
+					cause: new Error(
+						"A pass with no rewrite cause reached a signed-prefix rewrite",
+					),
+				});
+			},
+			false,
+		);
+		// Unreachable when the pipeline's checks hold; refusing here keeps an edit
+		// from being served without the strip its thinking needs.
+		if (
+			needsCompanion(result) &&
+			(result.messages as unknown[]).some(piMessageHasThinking)
+		)
+			throw degradedPassError(
+				"pi-unpaired-companion",
+				new Error(
+					"A pass run outside the companion transaction needed thinking omissions",
+				),
+			);
+		if (!result.strictThinkingKept)
+			clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
+		return result;
+	}
+	// First render only: strip may commit before its edit; failure costs at most
+	// one rewrite. The session's first render tags every message, an edit before
+	// all of its kept thinking, so its strip is certain; pairing them would hold
+	// the write lock for the whole first pipeline run over the session. The strip
+	// of every older-turn block commits first in a short transaction, then the
+	// pipeline runs unpaired as before. If the pipeline then fails, the next pass
+	// still replays the committed omissions: a valid request, one wasted rewrite.
+	if (piSessionFirstRender(args)) {
+		const entryIds = args.messages.map((message, index) =>
+			resolvePiStableId(
+				message,
+				index,
+				args.entryIds,
+				args.entryIdByRef ?? undefined,
+			),
+		);
+		const plan = planPiProactiveThinkingStrip({
+			db: args.db,
+			sessionId: args.sessionId,
+			messages: args.messages as unknown[],
+			entryIds,
+		});
+		if (!plan)
+			throw new DegradedPassRefusalError("pi-first-render-strip-identity", {
+				cause: new Error(
+					"Cannot persist thinking omission without a stable entry id",
+				),
+			});
+		assertPiOldestThinkingRun(
+			args.messages as unknown[],
+			entryIds,
+			new Set([
+				...frozenBindingEntryIds(args.db, args.sessionId),
+				...plan.entryIds,
+			]),
+		);
+		if (plan.entryIds.length > 0) {
+			let heldFrom = 0;
+			args.db
+				.transaction(() => {
+					heldFrom = performance.now();
+					applyPiProactiveThinkingStrip({
+						db: args.db,
+						sessionId: args.sessionId,
+						messages: args.messages as unknown[],
+						entryIds,
+						provider: args.resolvedProviderID,
+						model: args.resolvedModelID,
+						cacheBustingPass: true,
+						persistOnly: true,
+						requirePersistence: true,
+					});
+				})
+				.immediate();
+			logSlowWriteTransaction("pi_first_render_strip", heldFrom);
+		}
+		const result = runSynchronousPipeline(args, rollbackObservations, () => {
+			throw new DegradedPassRefusalError(UNPAIRED_PREFIX_REWRITE_SITE, {
+				cause: new Error("A first render reached a signed-prefix rewrite"),
+			});
+		});
+		// The early strip covered every thinking block this pass could need to
+		// omit; one it did not cover must not be served with the edit.
+		if (needsCompanion(result)) {
+			const missed = planPiProactiveThinkingStrip({
+				db: args.db,
+				sessionId: args.sessionId,
+				messages: result.messages as unknown[],
+				entryIds: resolvePiLkgOutputEntryIds(
+					result.messages,
+					result.syntheticLeadingCount,
+					(message) =>
+						result.lkgEntryIdByRef.get(message) ??
+						result.postCommitEntryIdByRef.get(message),
+				).map((id) => id ?? undefined),
+			});
+			if (!missed || missed.entryIds.length > 0)
+				throw new DegradedPassRefusalError("pi-first-render-strip-incomplete", {
+					cause: new Error(
+						"A first render needed thinking omissions its early strip did not record",
+					),
+				});
+		}
+		if (!result.strictThinkingKept)
+			clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
+		return result;
+	}
+	const result = pairedThinkingEdit({
+		db: args.db,
+		messages: args.messages as unknown[],
+		state: args.sessionMeta,
+		onRollback: () => {
+			resetSessionState();
+			for (const observation of rollbackObservations) observation();
+		},
+		edit: () => runSynchronousPipeline(args, rollbackObservations),
+		needsCompanion,
+		persistCompanion: (result) => {
+			const messages = result.messages;
+			applyPiProactiveThinkingStrip({
+				db: args.db,
+				sessionId: args.sessionId,
+				messages,
+				entryIds: resolvePiLkgOutputEntryIds(
+					messages,
+					result.syntheticLeadingCount,
+					(message) =>
+						result.lkgEntryIdByRef.get(message) ??
+						result.postCommitEntryIdByRef.get(message),
+				).map((id) => id ?? undefined),
+				provider: args.resolvedProviderID,
+				model: args.resolvedModelID,
+				cacheBustingPass: true,
+				persistOnly: true,
+				requirePersistence: true,
+			});
+		},
+	});
+	if (!result.strictThinkingKept)
+		clearSystemPromptEdit(pendingMaterializationSessions, args.sessionId);
+	return result;
+}
+
+/**
+ * Whether this pass is the session's first render with thinking to omit: no
+ * message has a tag and no cached head exists yet, the injection that grants a
+ * first render its full-prefix rebuild is configured, and no current-turn
+ * thinking is kept (a pass that keeps it holds every edit instead).
+ */
+function piSessionFirstRender(args: RunPipelineArgs): boolean {
+	if (!args.injection) return false;
+	if (args.recoveryRebuildReason || args.forceSignedRebuildForFit) return false;
+	if (!(args.messages as unknown[]).some(piMessageHasThinking)) return false;
+	if (
+		hasActiveAnthropicThinkingTurn(
+			args.messages,
+			args.resolvedProviderID,
+			args.resolvedModelID,
+		)
+	)
+		return false;
+	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
+	if (meta.cachedM0Bytes || meta.cachedM1Bytes) return false;
+	return !args.db
+		.prepare("SELECT 1 FROM tags WHERE session_id = ? LIMIT 1")
+		.get(args.sessionId);
+}
+
+/** The refusal of a pass outside the companion transaction that reached a rewrite. */
+const UNPAIRED_PREFIX_REWRITE_SITE = "pi-unpaired-prefix-rewrite";
+
+/**
+ * Whether this pass's state can lead the pipeline into a signed-prefix rewrite,
+ * which omits every signed block and so must commit inside the companion
+ * transaction. These are the pipeline's rewrite causes known before it runs: a
+ * recovery or fit rebuild, a carried tag-identity repair, and, with the hold
+ * off, a first render without a cached pair or the 95% wall.
+ */
+function piPassMayRewritePrefix(args: RunPipelineArgs): boolean {
+	if (args.recoveryRebuildReason || args.forceSignedRebuildForFit) return true;
+	if (readPiIdentityRebuilds(args.db, args.sessionId).length > 0) return true;
+	if (args.signedThinkingHold === "on") return false;
+	if (args.contextUsage.percentage >= 95) return true;
+	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
+	return !meta.cachedM0Bytes || !meta.cachedM1Bytes;
+}
+
+/** A cheap guess, confirmed inside the pipeline, that this pass needs no companion strip. */
+function piPassMayNeedNoCompanion(args: RunPipelineArgs): boolean {
+	if (!(args.messages as unknown[]).some(piMessageHasThinking)) return true;
+	return (
+		args.reasoningClearing?.prefixBound === true &&
+		!args.recoveryRebuildReason &&
+		hasActiveAnthropicThinkingTurn(
+			args.messages,
+			args.resolvedProviderID,
+			args.resolvedModelID,
+		)
+	);
+}
+
+function runSynchronousPipeline(
+	args: RunPipelineArgs,
+	rollbackObservations?: (() => void)[],
+	requirePairing?: () => never,
+	/**
+	 * Whether this pass can need a companion strip. The scans that locate edits
+	 * relative to kept thinking only decide that, so a pass that cannot need one
+	 * (a model whose thinking is not prefix-bound, or a pass the caller runs
+	 * outside the companion transaction, where any path to needing one refuses)
+	 * skips them.
+	 */
+	companionPossible = true,
+): RunPipelineResult {
+	args.assertCurrentPass?.();
+	const prefixTagStart =
+		companionPossible &&
+		isPrefixBoundThinkingModel(args.resolvedProviderID, args.resolvedModelID)
+			? Number(
+					(
+						args.db
+							.prepare(
+								"SELECT COALESCE(MAX(tag_number), 0) AS value FROM tags WHERE session_id = ?",
+							)
+							.get(args.sessionId) as { value: number }
+					).value,
+				)
+			: Number.MAX_SAFE_INTEGER;
 	const thinkingRecovery = prepareLatestThinkingRecovery({
 		db: args.db,
 		sessionId: args.sessionId,
@@ -8565,11 +8838,16 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			}));
 	let workingForRewrite: unknown[] | undefined;
 	const stripForPrefixRewrite = (permitRewrite = true) => {
-		// Required prefix rewrites permit queued drops and cleanup on this request.
-		// Recovery that only replays stored decisions passes false instead, so it
-		// cannot introduce a fresh edit into an otherwise unchanged saved request.
+		// Replayed omissions do not authorize a fresh edit to the saved request.
 		isCacheBustingPass ||= permitRewrite;
 		const messages = workingForRewrite ?? args.messages;
+		// Omitting every signed block is a companion write: it must commit with
+		// the rewrite that needs it. With no thinking there is nothing to omit.
+		if (
+			isCacheBustingPass &&
+			(messages as unknown[]).some(piMessageHasThinking)
+		)
+			requirePairing?.();
 		const result = applyPiProactiveThinkingStrip({
 			db: args.db,
 			sessionId: args.sessionId,
@@ -8589,7 +8867,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			cacheBustingPass: isCacheBustingPass,
 			stripActiveTurn: true,
 			persistOnly: true,
-			requirePersistence: !!args.recoveryRebuildReason,
+			requirePersistence: true,
 		});
 		if (activeThinkingTurn && isCacheBustingPass && !result)
 			throw new Error(
@@ -8604,6 +8882,26 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		(!holdEnabled && args.forceSignedRebuildForFit && protectedSignedPrefix)
 	)
 		stripForPrefixRewrite(isCacheBustingPass);
+	// Outside the companion transaction, only a pass that keeps its current-turn
+	// signed thinking (every edit before it is held) or has no thinking left to
+	// omit (none at all, or all of it already omitted) may continue; anything
+	// else needs its edits paired with their strip.
+	if (requirePairing && !protectedSignedPrefix) {
+		const plan = planPiProactiveThinkingStrip({
+			db: args.db,
+			sessionId: args.sessionId,
+			messages: args.messages as unknown[],
+			entryIds: args.messages.map((message, index) =>
+				resolvePiStableId(
+					message,
+					index,
+					args.entryIds,
+					args.entryIdByRef ?? undefined,
+				),
+			),
+		});
+		if (!plan || plan.entryIds.length > 0) requirePairing();
+	}
 	// Messages without a real entry id get a position-independent fallback id
 	// computed once from this pass's input, before any stage edits content.
 	// Every stage below resolves by the index it was given into this same array
@@ -8818,6 +9116,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// lane that rides a fold consults it: legacy skeleton conversion, pending-op
 	// drains, heuristics, synthetic todo and sentinel first-application.
 	let foldBustsServedPrefixThisPass = false;
+	let foldInvalidatesThinkingThisPass = false;
 	let publishedM1RefreshedThisPass = false;
 	let prefixPreflightContended = false;
 	const softRefreshOpportunity = args.schedulerDecision === "execute";
@@ -8889,6 +9188,21 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			);
 			if (foldExecutedThisPass) {
 				const afterFold = getOrCreateSessionMeta(args.db, args.sessionId);
+				foldInvalidatesThinkingThisPass =
+					!protectedSignedPrefix &&
+					foldInvalidatesThinking(
+						foldDueDecision.reason,
+						{
+							m0Bytes: persistedM0BeforeFold.cachedM0Bytes ?? null,
+							m1Bytes: persistedM0BeforeFold.cachedM1Bytes ?? null,
+							muralDataUrl: persistedM0BeforeFold.cachedM0MuralDataUrl ?? null,
+						},
+						{
+							m0Bytes: afterFold.cachedM0Bytes ?? null,
+							m1Bytes: afterFold.cachedM1Bytes ?? null,
+							muralDataUrl: afterFold.cachedM0MuralDataUrl ?? null,
+						},
+					);
 				foldBustsServedPrefixThisPass =
 					!protectedSignedPrefix &&
 					foldBustsServedPrefix(
@@ -8932,6 +9246,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				);
 			}
 		} catch (error) {
+			if (
+				error instanceof DegradedPassRefusalError &&
+				error.site === UNPAIRED_PREFIX_REWRITE_SITE
+			)
+				throw error;
 			piM0State.preparedPrefix = cachedPrefixBeforePreflight;
 			prefixPreflightContended = true;
 			sessionLog(
@@ -9333,8 +9652,16 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					compactionOff: false,
 				});
 			} catch (error) {
-				if (claimPiIdentityRebuildFailure(args.db, args.sessionId) === "first")
+				if (
+					claimPiIdentityRebuildFailure(args.db, args.sessionId) === "first"
+				) {
+					// Retain the failed-attempt observation, not the aborted rewrite,
+					// so a persistent repair failure cannot refuse every later turn.
+					rollbackObservations?.push(() => {
+						claimPiIdentityRebuildFailure(args.db, args.sessionId);
+					});
 					throw error;
+				}
 				identityRebuild = false;
 				piM0State.preparedPrefix ??= prepareCachedM0M1PiReplay(
 					piM0State,
@@ -9384,6 +9711,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		...message,
 		parts: message.parts,
 	}));
+	const prefixTexts = new Map<unknown, string | undefined>();
+	if (
+		isCacheBustingPass &&
+		!protectedSignedPrefix &&
+		prefixTagStart !== Number.MAX_SAFE_INTEGER
+	)
+		for (const message of mutationView)
+			for (const part of message.parts) prefixTexts.set(part, part.getText());
 	// Storage recovery already sent these messages without §N§ reduction handles.
 	// Adding handles would invalidate the provider's cached bytes, so they wait
 	// for a prefix-busting fold or the declared tag-identity rebuild of that prefix.
@@ -9526,6 +9861,108 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				),
 		});
 	let editAdmission = makeEditAdmission();
+	// Where each tag's edit lies relative to the last kept thinking block; read
+	// only to decide whether this pass needs a companion strip.
+	const tagEditBeforeThinking = new Map<number, boolean>();
+	if (companionPossible) {
+		// Record original part positions before removing tool calls or results, so
+		// an edit after kept thinking is not mistaken for an earlier edit.
+		const sourceParts = new Map<unknown, { message: number; part: number }>();
+		let lastThinking: { message: number; part: number } | undefined;
+		const goneThinking = new Set(
+			frozenBindingEntryIds(args.db, args.sessionId),
+		);
+		try {
+			for (const id of getNativeReplayState(args.db, args.sessionId)
+				.reasoningIds)
+				goneThinking.add(id);
+		} catch {
+			// Unreadable native state is handled by the native lanes below. Here it
+			// only means fewer omissions are known, so more thinking counts as kept
+			// and an edit is more likely to require its companion strip.
+		}
+		const redacted = new Map<string, Set<number>>();
+		for (const [index, raw] of workingMessages.entries()) {
+			const id = stableIdResolver(raw, index);
+			if (
+				!id ||
+				goneThinking.has(id) ||
+				raw.role !== "assistant" ||
+				!Array.isArray(raw.content)
+			)
+				continue;
+			for (const [partIndex, part] of raw.content.entries())
+				if (
+					part &&
+					typeof part === "object" &&
+					["redactedThinking", "redacted_thinking"].includes(
+						String((part as { type?: string }).type),
+					)
+				) {
+					const indices = redacted.get(id) ?? new Set<number>();
+					indices.add(partIndex);
+					redacted.set(id, indices);
+				}
+		}
+		for (const [index, message] of mutationView.entries()) {
+			for (const [partIndex, part] of message.parts.entries()) {
+				const location = { message: index, part: partIndex };
+				sourceParts.set(part, location);
+				if (
+					message.info.role === "assistant" &&
+					!goneThinking.has(message.info.id ?? "") &&
+					((part.kind === "thinking" &&
+						part.getText() !== "" &&
+						part.getText() !== "[cleared]") ||
+						redacted.get(message.info.id ?? "")?.has(partIndex))
+				)
+					lastThinking = location;
+			}
+		}
+		for (const [tag, target] of targets) {
+			const parts =
+				target.mutationParts?.map(({ part }) => part) ??
+				target.message?.parts ??
+				[];
+			tagEditBeforeThinking.set(
+				tag,
+				parts.length === 0 ||
+					parts.some((part) => {
+						const location = sourceParts.get(part);
+						return (
+							!location ||
+							(!!lastThinking &&
+								(location.message < lastThinking.message ||
+									(location.message === lastThinking.message &&
+										location.part <= lastThinking.part)))
+						);
+					}),
+			);
+		}
+		// Reapplying a saved tag to raw history is replay. Only newly allocated
+		// prefixes that actually changed text before kept thinking require a strip.
+		for (const [tag, target] of targets) {
+			if (tag <= prefixTagStart) continue;
+			if (
+				target.mutationParts?.some(({ part }) => {
+					const location = sourceParts.get(part);
+					const text = (
+						part as { getText?: () => string | undefined }
+					).getText?.();
+					return (
+						prefixTexts.has(part) &&
+						prefixTexts.get(part) !== text &&
+						location &&
+						lastThinking &&
+						(location.message < lastThinking.message ||
+							(location.message === lastThinking.message &&
+								location.part <= lastThinking.part))
+					);
+				})
+			)
+				recordFirstApplicationWireEdit(true);
+		}
+	}
 	if (materializationHeld && rideSignals.explicitFlush)
 		sessionLog(
 			args.sessionId,
@@ -10193,12 +10630,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			) {
 				routinePressureAppliedBySession.set(args.sessionId, true);
 			}
-			const heuristicMutationCount =
-				heuristicsResult.droppedTools +
-				heuristicsResult.deduplicatedTools +
-				heuristicsResult.droppedInjections +
-				heuristicsResult.droppedStaleReduceCalls +
-				heuristicsResult.mutatedTextTags;
 			droppedCount +=
 				heuristicsResult.droppedTools +
 				heuristicsResult.deduplicatedTools +
@@ -10209,9 +10640,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			if (heuristicsResult.droppedTokenReductions.length > 0) {
 				droppedTokenReductions.push(...heuristicsResult.droppedTokenReductions);
 			}
-			if (heuristicMutationCount > heuristicsResult.droppedStaleReduceCalls) {
-				recordFirstApplicationWireEdit(true);
-			}
+			if (
+				heuristicsResult.droppedTools +
+					heuristicsResult.deduplicatedTools +
+					heuristicsResult.droppedInjections +
+					heuristicsResult.mutatedTextTags >
+				0
+			)
+				recordFirstApplicationWireEdit(false);
 			heuristicsExecuted = true;
 			executedWorkThisPass = true;
 			if (hasPendingMaterializeSignal) {
@@ -11204,7 +11640,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 
 	restoreOriginals?.(workingMessages);
 	const materialized = injectionResult?.m0Materialized === true;
+	for (const reduction of droppedTokenReductions)
+		recordFirstApplicationWireEdit(
+			tagEditBeforeThinking.get(reduction.tagNumber) ?? true,
+		);
 	if (
+		companionPossible &&
 		args.reasoningClearing?.prefixBound &&
 		firstEditSourceOrder &&
 		firstEditParts.size > 0 &&
@@ -11414,17 +11855,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		prefixEditBesidesReasoningTrim:
 			!!args.recoveryRebuildReason ||
 			prefixEditBesidesReasoningTrim ||
-			firstRenderBust ||
-			historyRefreshPermitted ||
-			((!holdEnabled || isCacheBustingPass) && hasPendingMaterializeSignal) ||
-			deferredMaterializationConsumedThisPass ||
-			foldBustsServedPrefixThisPass ||
+			foldInvalidatesThinkingThisPass ||
 			publishedM1RefreshedThisPass ||
-			materialized ||
-			historyWasConsumedThisPass ||
-			pendingOpsDidMutate ||
-			autoReclaimDidMutateThisPass ||
-			emergency,
+			(injectionResult?.m0Materialized === true &&
+				(injectionPassSnapshot?.sessionMeta.cachedM0MaxCompartmentSeq ?? -1) !==
+					m0CoverageBeforeFold),
 		targetCount: targets.size,
 		reasoningWatermark: args.sessionMeta.clearedReasoningThroughTag ?? 0,
 		activeTags,
@@ -11492,20 +11927,6 @@ function isAutoSearchHintDecision(
 		typeof row.reason === "string" &&
 		AUTO_SEARCH_NO_HINT_REASONS.has(row.reason as AutoSearchHintNoHintReason)
 	);
-}
-
-/** Keys of the sticky reminders a pass appends to user messages. */
-function piStickyInjectionKeys(snapshot: PiPostTransformSnapshot): Set<string> {
-	const keys = new Set<string>();
-	for (const anchor of snapshot.noteAnchors) {
-		keys.add(JSON.stringify(["note", anchor]));
-	}
-	for (const decision of snapshot.autoSearchDecisions) {
-		if (decision.decision === "hint") {
-			keys.add(JSON.stringify(["hint", decision]));
-		}
-	}
-	return keys;
 }
 
 function loadPiPostTransformSnapshot(
@@ -12085,8 +12506,12 @@ function runPersistedReplayStage<T>(
 import type { PendingMaterializationOrigin } from "@magic-context/core/hooks/magic-context/pending-materialization";
 import {
 	clearPendingMaterialization,
+	clearSystemPromptEdit,
+	hasSystemPromptEdit,
 	pendingMaterializationOrigin,
+	recordSystemPromptEdit,
 	requestPendingMaterialization,
+	snapshotPendingMaterialization,
 } from "@magic-context/core/hooks/magic-context/pending-materialization";
 import {
 	deferDeliveredSystemRefresh,

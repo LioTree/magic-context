@@ -57,8 +57,9 @@ function isolation(host: Harness) {
         check(!liveRoots.some(p => inside(canonical, p) || inside(path, p)), `Live path opened: ${path}`);
         if (/\.(?:db|sqlite)(?:-wal|-shm)?$/.test(path)) check(inside(canonical, realpathSync(root!)), `Database escaped: ${path}`);
     }
-    writeFileSync(join(root!, `${kind}-${mutation ? "mutation" : "clean"}-lsof.txt`), inventory);
-    return { pid, root: storeRoot };
+    const inventoryPath = join(root!, `${kind}-${mutation ? "mutation" : "clean"}-${pid}-lsof.txt`);
+    writeFileSync(inventoryPath, inventory);
+    return { pid, root: storeRoot, inventoryPath };
 }
 
 async function flush(host: Harness): Promise<void> {
@@ -87,6 +88,12 @@ function changePrefix(body: Record<string, unknown>): Record<string, unknown> {
         }
     }
     return copy;
+}
+
+function thinkingBlocks(body: Record<string, unknown>) {
+    return (body.messages as Array<{ content: unknown }>).flatMap(message =>
+        Array.isArray(message.content) ? message.content.filter(block => block.type === "thinking" || block.type === "redacted_thinking") : [],
+    );
 }
 
 try {
@@ -135,6 +142,7 @@ try {
         const tag = rows("SELECT tag_number FROM tags WHERE session_id = ? AND type = 'tool' ORDER BY tag_number LIMIT 1")[0];
         check(tag, "Warm turn produced no tagged tool arc");
         stage = "loop"; step = 0;
+        const loopRequestOffset = h.mock.requests().length;
         const turn = h.sendPrompt(session, "PREFIX-RESTART primary tool loop", { timeoutMs: 60_000 });
         void turn.catch(() => {});
         await h.waitFor(() => step >= 2, { timeoutMs: 20_000, label: "second signed tool-loop request" });
@@ -145,6 +153,18 @@ try {
         } finally { writer.close(); }
         await flush(h);
         await turn;
+        const loopRequests = h.mock.requests().slice(loopRequestOffset).filter(r => primary(r.body));
+        check(loopRequests.length >= 6, "Unengaged strip probe: missing loop requests");
+        const olderThinking = thinkingBlocks(loopRequests[0]!.body);
+        check(olderThinking.length > 0, "Unengaged strip probe: no completed-turn thinking");
+        for (const request of loopRequests) {
+            const kept = thinkingBlocks(request.body);
+            check(olderThinking.every(block => kept.some(candidate =>
+                candidate.type === block.type && candidate.signature === block.signature &&
+                candidate.thinking === block.thinking && candidate.data === block.data,
+            )), "Held pass stripped or changed completed-turn thinking");
+        }
+        report.heldThinking = { blocks: olderThinking.length, requests: loopRequests.length };
         check(meta(), "Held flush has no durable obligation");
         check(rows("SELECT tag_id FROM pending_ops WHERE session_id = ?").length > 0, "Queued drop was not held");
         report.heldRelease = meta();

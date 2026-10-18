@@ -745,7 +745,7 @@ test("unheld contended preflight replays todo and preserves sticky anchors and t
 			if (args[2].length > 0) return injectM0M1Pi(...args);
 			const exec = db.exec.bind(db);
 			const lock = spyOn(db, "exec").mockImplementation((sql) => {
-				if (sql === "BEGIN IMMEDIATE")
+				if (sql === "BEGIN IMMEDIATE" || /^SAVEPOINT pi_prefix_/.test(sql))
 					throw Object.assign(new Error("database is locked"), {
 						code: "SQLITE_BUSY",
 					});
@@ -1185,6 +1185,12 @@ test("Pi unheld idle expiry preserves queued work and completed thinking until a
 		expect(cold).toContain("old-complete");
 		updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() });
 		expect(JSON.stringify(await serve())).toBe(cold);
+		const oldUser = getTagsBySession(db, sessionId).find((tag) =>
+			tag.messageId.startsWith("old-user"),
+		)!;
+		// Rewriting the earlier user invalidates the kept signature. Dropping only
+		// the assistant text after its thinking would not require a companion strip.
+		queuePendingOp(db, sessionId, oldUser.tagNumber, "drop");
 		signalPiPendingMaterialization(sessionId);
 		const flushed = JSON.stringify(await serve());
 		expect(getPendingOps(db, sessionId)).toHaveLength(0);

@@ -341,6 +341,36 @@ export function providerReplacementValid(
     );
 }
 
+/** The model-visible text of each part: message text, or a tool's output or error.
+ * Hook answers (tags, notes) change exactly these strings. */
+function visibleText(message: MessageLike): string {
+    return JSON.stringify(
+        (Array.isArray(message?.parts) ? message.parts : []).map((value) => {
+            const p = part(value);
+            if (p.type === "text") return ["text", p.text ?? ""];
+            if (p.type !== "tool") return [String(p.type)];
+            const state = part(p.state);
+            return ["tool", state[toolTextField(state)] ?? ""];
+        }),
+    );
+}
+
+/**
+ * Whether `next` puts a message back to the host's raw text after Magic Context had
+ * served it with its own changes (`served`): a tag or other hook edit was removed and
+ * nothing replaced it. A drop or a different edit renders other text and is not a
+ * reversion. `raw` is the host's own copy of the same message.
+ */
+export function providerRevertsToRaw(
+    served: MessageLike,
+    next: MessageLike,
+    raw: MessageLike,
+): boolean {
+    const host = visibleText(raw);
+    const before = visibleText(served);
+    return before !== host && visibleText(next) === host;
+}
+
 /** Same strict TTL clock and self-consuming baseline as the full-request renderer. */
 export function providerCold(
     meta: Pick<SessionMeta, "cacheTtl" | "lastResponseTime" | "cachedM0MaterializedAt">,
@@ -1795,11 +1825,14 @@ export function createProviderTransform(
             output: { messages: unknown[] },
             meta: SessionMeta,
             pass: BridgeStep,
+            /** Runs after the pass and before its writes commit; a throw discards them. */
+            verify?: () => void,
         ): Promise<void> {
             await passContext.run(pass, async () => {
                 try {
                     await run(id, messages, output, meta);
                     pass.check();
+                    verify?.();
                     pass.commit(deps.db);
                 } catch (error) {
                     sessions.delete(id);

@@ -16,7 +16,6 @@ import type { PluginContext } from "../../../plugin/types";
 import { sessionLog } from "../../../shared/logger";
 import {
     boundMarkerEnvelope,
-    deriveMarkerEnvelopeReading,
     hasUnobservedTools,
     markerEnvelopeKey,
     qualifyingMarkerEnvelopeUpper,
@@ -25,10 +24,12 @@ import { SubcModuleTransport } from "../module-transport";
 import { hasRawMessageProvider } from "../read-session-chunk";
 import { createRustModeTransform } from "../rust-mode-transform";
 import type { TransformDeps } from "../transform";
+import type { MessageLike } from "../transform-operations";
 import { createBridgeDeps } from "./bridge-deps";
 import { createBridgeHostFacts } from "./bridge-host-facts";
 import { type BridgeMarkerOutcome, createBridgeReceiptStore } from "./bridge-marker";
 import { openCodeCutProblem, openCodeCutSources } from "./bridge-native-cut";
+import { providerUsageFromHostFact } from "./bridge-provider-usage";
 import type { BridgeReceipt, BridgeRequestCompletion } from "./bridge-receipt";
 import { BridgeStep } from "./bridge-step";
 import {
@@ -39,6 +40,7 @@ import {
     type BridgeOutcomeListener,
     BridgeRefusalError,
     type BridgeRunInput,
+    type BridgeStepKind,
     type BridgeView,
 } from "./bridge-types";
 import type { ProviderUsageInput } from "./fallback-admissibility";
@@ -47,7 +49,65 @@ import {
     createOpenCodeProviderTransform,
     isMagicContextHead,
     providerIncoming,
+    providerRevertsToRaw,
 } from "./opencode-adapter";
+
+/** The frozen messages of one returned view, keyed by message id: admitted host
+ * messages only, not heads or still-running passthrough rows. The host may already
+ * have sent these bytes to the provider. */
+export interface ServedView {
+    lineageId: string;
+    viewVersion?: number;
+    messages: Map<string, { bytes: string; message: MessageLike }>;
+}
+
+export function servedView(
+    receipt: BridgeReceipt,
+    messages: readonly MessageLike[],
+    ordinals: ReadonlyMap<string, number> | undefined,
+    through: number,
+): ServedView {
+    const frozen = new Map<string, { bytes: string; message: MessageLike }>();
+    for (const message of messages) {
+        const id = message.info?.id;
+        const ordinal = id ? ordinals?.get(id) : undefined;
+        if (!id || ordinal === undefined || ordinal > through) continue;
+        frozen.set(id, { bytes: JSON.stringify(message), message: structuredClone(message) });
+    }
+    return {
+        lineageId: receipt.lineage_id,
+        viewVersion: receipt.last_applied?.version,
+        messages: frozen,
+    };
+}
+
+/**
+ * Fail closed before a view that rewrites already-served bytes reaches the host.
+ * Within one lineage, a message the bridge returned before must come back byte for
+ * byte, unless this step rebuilds history: the step was classified as a rebuild or
+ * the module applied a new view. Even a rebuild may not put a message back to the
+ * host's raw text after Magic Context had served it with tags or other hook edits;
+ * that would send unmanaged history. Messages a compaction removed are not compared.
+ */
+export function checkServedBytes(
+    previous: ServedView | undefined,
+    receipt: BridgeReceipt,
+    kind: BridgeStepKind,
+    next: readonly MessageLike[],
+    host: readonly MessageLike[],
+): void {
+    if (!previous || previous.lineageId !== receipt.lineage_id) return;
+    const rebuilt = kind === "rebuild" || receipt.last_applied?.version !== previous.viewVersion;
+    for (const message of next) {
+        const id = message.info?.id;
+        const before = id ? previous.messages.get(id) : undefined;
+        if (!before || before.bytes === JSON.stringify(message)) continue;
+        if (!rebuilt) throw new BridgeRefusalError("served_bytes_changed");
+        const raw = host.find((candidate) => candidate.info?.id === id);
+        if (raw && providerRevertsToRaw(before.message, message, providerIncoming(raw).read()))
+            throw new BridgeRefusalError("served_bytes_changed");
+    }
+}
 
 /** Own only the bridge's handles; importing the public subpath never loads this runtime. */
 export function createBridgeAdapter(options: BridgeAdapterOptions) {
@@ -138,6 +198,8 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
     const runs = new Set<Promise<void>>();
     const activeSessions = new Set<string>();
     const published = new Map<string, { requestId: string; messages: BridgeView["messages"] }>();
+    /** Per session: the frozen messages of the last view returned, keyed by message id. */
+    const served = new Map<string, ServedView>();
     function assertOpen() {
         if (disposed) throw new Error("Bridge adapter is disposed");
     }
@@ -163,40 +225,10 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             observations.add(observing);
             try {
                 const result = await pending;
-                if (
-                    result.accepted &&
-                    fact.kind === "provider_response" &&
-                    fact.material &&
-                    fact.usage
-                ) {
-                    const sent = published.get(fact.sessionId);
-                    const model = `${fact.model.providerID}/${fact.model.modelID}`;
-                    const inputTokens =
-                        fact.usage.input + fact.usage.cacheRead + fact.usage.cacheWrite;
-                    if (
-                        sent?.requestId === fact.requestId &&
-                        inputTokens > 0 &&
-                        boundMarkerEnvelope(fact.material, model) !== undefined
-                    ) {
-                        provider.recordProviderUsage(fact.sessionId, {
-                            messages: sent.messages,
-                            model,
-                            envelope: markerEnvelopeKey(fact.material),
-                            inputTokens,
-                            // Only a successful response's usage bounds the envelope: an
-                            // aborted or failed request may report partial input usage.
-                            envelopeReading:
-                                fact.outcome === "success"
-                                    ? deriveMarkerEnvelopeReading({
-                                          material: fact.material,
-                                          messages: sent.messages,
-                                          totalInput: inputTokens,
-                                          model,
-                                      })
-                                    : undefined,
-                        });
-                    }
-                }
+                const usage = result.accepted
+                    ? providerUsageFromHostFact(fact, published.get(fact.sessionId))
+                    : undefined;
+                if (usage) provider.recordProviderUsage(fact.sessionId, usage);
                 return result;
             } finally {
                 activeSessions.delete(fact.sessionId);
@@ -241,7 +273,15 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             const output = { messages: [] as unknown[] };
             activeSessions.add(id);
             const running = observingSession.run(id, () =>
-                provider.runBudgeted(id, messages, output, meta, pass),
+                provider.runBudgeted(id, messages, output, meta, pass, () =>
+                    checkServedBytes(
+                        served.get(id),
+                        provider.receipt(id),
+                        stepKind,
+                        output.messages as BridgeView["messages"],
+                        messages,
+                    ),
+                ),
             );
             runs.add(running);
             try {
@@ -269,6 +309,15 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                     // Optional usage attribution must never reject a published view.
                     published.delete(id);
                 }
+                served.set(
+                    id,
+                    servedView(
+                        receipt,
+                        output.messages as BridgeView["messages"],
+                        provider.ordinals(id),
+                        provider.throughOrdinal(id),
+                    ),
+                );
                 return {
                     messages: output.messages as BridgeView["messages"],
                     kind: stepKind,
@@ -466,6 +515,7 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                     listeners.clear();
                     observerFailures.clear();
                     published.clear();
+                    served.clear();
                     try {
                         transport.close();
                     } finally {

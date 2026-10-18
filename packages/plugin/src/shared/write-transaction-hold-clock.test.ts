@@ -9,7 +9,15 @@ function visit(node: ts.Node, callback: (node: ts.Node) => void): void {
 }
 function acquires(statement: ts.Statement): boolean {
     const direct = (expression: ts.Expression): boolean => {
+        if (
+            ts.isBinaryExpression(expression) &&
+            expression.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        )
+            return direct(expression.right);
         if (!ts.isCallExpression(expression)) return false;
+        // Pi's prefix helper completes either an inline BEGIN or a savepoint
+        // under an already-admitted paired writer. Its clock starts afterwards.
+        if (expression.expression.getText() === "beginPrefixWrite") return true;
         if (
             ts.isPropertyAccessExpression(expression.expression) &&
             expression.expression.name.text === "exec"
@@ -35,6 +43,10 @@ function acquires(statement: ts.Statement): boolean {
         return false;
     };
     if (ts.isExpressionStatement(statement)) return direct(statement.expression);
+    if (ts.isVariableStatement(statement))
+        return statement.declarationList.declarations.some(
+            (declaration) => !!declaration.initializer && direct(declaration.initializer),
+        );
     if (ts.isTryStatement(statement)) {
         const last = statement.catchClause?.block.statements.at(-1);
         return (
@@ -110,6 +122,18 @@ function violations(text: string, path: string): string[] {
 }
 
 test("hold-clock fence distinguishes wait time from transaction callback time", () => {
+    expect(
+        violations(
+            'function f(db) { const writer=beginPrefixWrite(db,true); const clock=performance.now(); logSlowWriteTransaction("good",clock); }',
+            "fixture.ts",
+        ),
+    ).toEqual([]);
+    expect(
+        violations(
+            'function f(db) { const clock=performance.now(); const writer=beginPrefixWrite(db,true); logSlowWriteTransaction("bad",clock); }',
+            "fixture.ts",
+        ),
+    ).toHaveLength(1);
     expect(
         violations(
             'function f(db) { const clock=performance.now(); db.exec("BEGIN IMMEDIATE"); logSlowWriteTransaction("bad",clock); }',

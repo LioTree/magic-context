@@ -61,6 +61,8 @@ export function startDreamTrigger(
         projectMemoryEnabled?: boolean;
         language?: string;
         mural?: { enabled: boolean };
+        memoryInjectionBudgetTokens?: number;
+        retinaHandoff?: boolean;
         /** Native source boundary; injectable for scheduler-only tests. */
         openReader?: () => Pick<V2StoreReader, "rootSessionActivity" | "close">;
     },
@@ -123,6 +125,8 @@ export function startDreamTrigger(
                             retrospectiveRawProvider: (db) => new V2RetrospectiveRawProvider(db),
                             language: args.language,
                             mural: sampled?.mural ?? args.mural,
+                            memoryInjectionBudgetTokens: args.memoryInjectionBudgetTokens,
+                            retinaHandoff: args.retinaHandoff,
                             smartNotesEnabled: args.smartNotesEnabled,
                         }),
                     });

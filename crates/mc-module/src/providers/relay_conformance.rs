@@ -213,6 +213,12 @@ async fn pending_watermark_oracle() {
                     serde_json::to_string(&value).unwrap()
                 }
                 HandlerOutcome::Response(bytes) => String::from_utf8(bytes).unwrap(),
+                // A refused bridge pass commits nothing on the host, so the next state
+                // sync can meet a module error such as authority_seq_mismatch. Report
+                // module errors the same way the relay oracle does, so the bridge sees
+                // them as its transport would deliver them.
+                HandlerOutcome::Error { code, message } => json!({"oracle_error":{"source":"module","code":code,"message":message}}).to_string(),
+                HandlerOutcome::ErrorWithDetail { code, message, detail } => json!({"oracle_error":{"source":"module","code":code,"message":message,"detail":detail}}).to_string(),
                 other => panic!("pending watermark oracle request failed: {other:?}"),
             }
         };

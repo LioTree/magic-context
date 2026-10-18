@@ -10,6 +10,10 @@ import {
 } from "@magic-context/core/features/magic-context/storage-meta";
 import { createBridgeDeps } from "@magic-context/core/hooks/magic-context/host-runner/bridge-deps";
 import { createBridgeHostFacts } from "@magic-context/core/hooks/magic-context/host-runner/bridge-host-facts";
+import {
+	type BridgePublishedRequest,
+	providerUsageFromHostFact,
+} from "@magic-context/core/hooks/magic-context/host-runner/bridge-provider-usage";
 import type {
 	BridgeReceipt,
 	BridgeRequestCompletion,
@@ -22,6 +26,10 @@ import {
 } from "@magic-context/core/hooks/magic-context/host-runner/bridge-types";
 import { InjectedBridgeTransport } from "@magic-context/core/hooks/magic-context/host-runner/injected-transport";
 import { createProviderTransform } from "@magic-context/core/hooks/magic-context/host-runner/opencode-adapter";
+import {
+	deriveMarkerEnvelopeReading,
+	type MarkerEnvelope,
+} from "@magic-context/core/hooks/magic-context/marker-envelope";
 import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
 import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
@@ -29,6 +37,7 @@ import { createRustModeTransform } from "@magic-context/core/hooks/magic-context
 import {
 	nativePiEntry,
 	piProviderCodec,
+	piSentText,
 	projectPiEntry,
 } from "./bridge-codec-pi";
 import { createPiBridgeMarkerOwner } from "./bridge-marker-pi";
@@ -78,6 +87,9 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 	const active = new Set<string>();
 	const work = new Set<Promise<unknown>>();
 	const rawReaders = new Map<string, () => void>();
+	// The projected messages of each session's latest published view, so a
+	// provider_response fact's usage can be attributed to exactly what was served.
+	const published = new Map<string, BridgePublishedRequest>();
 	let disposed = false,
 		disposal: Promise<void> | undefined;
 	const assertOpen = () => {
@@ -230,6 +242,15 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 				} catch {
 					/* Keep serving the transformed messages, but never trim native history without a saved delivery receipt. */
 				}
+				try {
+					published.set(id, {
+						requestId: receipt.request_id,
+						messages: structuredClone(projected),
+					});
+				} catch {
+					// Optional usage attribution must never reject a published view.
+					published.delete(id);
+				}
 				return { kind, messages: projected.map(nativePiEntry), receipt };
 			} finally {
 				active.delete(id);
@@ -265,7 +286,16 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 			const pending = facts(fact);
 			work.add(pending);
 			try {
-				return await pending;
+				const result = await pending;
+				const usage = result.accepted
+					? providerUsageFromHostFact(
+							fact,
+							published.get(fact.sessionId),
+							piSentText,
+						)
+					: undefined;
+				if (usage) provider.recordProviderUsage(fact.sessionId, usage);
+				return result;
 			} finally {
 				work.delete(pending);
 				active.delete(fact.sessionId);
@@ -314,6 +344,12 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 				inputTokens: number;
 				model: string;
 				envelope: string;
+				/** System strings, visible tool definitions and unobserved tool names sent by
+				 * this request. With outcome "success", the usage also derives the envelope
+				 * reading that bounds unobserved tool schemas, as a provider_response fact does. */
+				material?: MarkerEnvelope;
+				/** Terminal outcome of the request; failed or aborted usage may be partial. */
+				outcome?: "success" | "failed" | "aborted";
 			},
 		) {
 			idle(id);
@@ -324,11 +360,24 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 					...(record?.entries.map((e) => e.served) ?? []),
 				].map((m) => [JSON.stringify(nativePiEntry(m)), m]),
 			);
+			const { material, outcome, ...measured } = usage;
+			const messages = usage.messages.map(
+				(m) => saved.get(JSON.stringify(m)) ?? projectPiEntry(m),
+			);
+			const envelopeReading =
+				material && outcome === "success"
+					? deriveMarkerEnvelopeReading({
+							material,
+							messages,
+							totalInput: usage.inputTokens,
+							model: usage.model,
+							sentText: piSentText,
+						})
+					: undefined;
 			provider.recordProviderUsage(id, {
-				...usage,
-				messages: usage.messages.map(
-					(m) => saved.get(JSON.stringify(m)) ?? projectPiEntry(m),
-				),
+				...measured,
+				messages,
+				...(envelopeReading ? { envelopeReading } : {}),
 			});
 		},
 		onOutcome(listener: BridgeOutcomeListener) {
@@ -348,6 +397,7 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 					legacy.dispose();
 				} finally {
 					listeners.clear();
+					published.clear();
 					for (const unregister of rawReaders.values()) unregister();
 					rawReaders.clear();
 					transport.close();

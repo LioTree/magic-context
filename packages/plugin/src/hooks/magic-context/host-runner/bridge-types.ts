@@ -133,18 +133,29 @@ export type BridgeMarkerInputs = Omit<
 export type BridgeRefusalReason =
     | NonNullable<Parameters<NonNullable<OpenCodeProviderOptions["fullRequest"]>>[5]>
     | "raw_history_provider_missing"
-    | "covered_range_changed";
+    | "covered_range_changed"
+    | "served_bytes_changed";
+
+const REFUSAL_MESSAGES: Partial<Record<BridgeRefusalReason, string>> = {
+    raw_history_provider_missing:
+        "OpenCode 2 bridge requires a registered per-session raw-history provider before run",
+    served_bytes_changed:
+        "Bridge refused the step: the new view would change Magic Context's bytes in messages already returned, or put them back to raw host text. Nothing was committed. Confirm delivery of requests that reached the provider (completeRequest with a clean end), then call run() again",
+};
 
 /** Refuse the native adapter's full-request execution path; callers must prove fallback admission before sending history. */
 export class BridgeRefusalError extends EmergencyFailClosedError {
+    /** True when the refused step committed nothing, so the host may call run() again
+     * after the fix the message names, without changing the session's history. */
+    readonly retryable: boolean;
     constructor(readonly reason: BridgeRefusalReason) {
         super(
-            reason === "raw_history_provider_missing"
-                ? "OpenCode 2 bridge requires a registered per-session raw-history provider before run"
-                : `Bridge provider handoff refused: ${reason}; check isFallbackAdmissible or refuse the step`,
+            REFUSAL_MESSAGES[reason] ??
+                `Bridge provider handoff refused: ${reason}; check isFallbackAdmissible or refuse the step`,
             { code: `bridge_${reason}` },
         );
         this.name = "BridgeRefusalError";
+        this.retryable = reason === "served_bytes_changed";
     }
 }
 
