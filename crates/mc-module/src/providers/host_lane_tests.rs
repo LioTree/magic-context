@@ -39,11 +39,12 @@ async fn bind(
     h.on_bind(&req).await;
 }
 
-const METHODS: [&str; 4] = [
+const METHODS: [&str; 5] = [
     "transform.declare",
     "transform.hook",
     "compaction.setup",
     "compaction.step",
+    "compaction.delete",
 ];
 
 async fn refusal(h: &McHandler, method: &str) -> String {

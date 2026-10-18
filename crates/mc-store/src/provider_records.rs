@@ -89,6 +89,77 @@ pub struct ProviderGeneration {
 }
 
 impl McStore {
+    /// Remove one provider conversation atomically. The caller holds its provider
+    /// serial lock; project memories and the normal session/engine data are not owned here.
+    pub fn delete_provider_conversation(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            let conv = key.conversation_key();
+            let namespace: Option<String> = tx.query_row(
+                "SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+                [&conv], |row| row.get(0),
+            ).optional()?;
+            let revision: Option<i64> = match &namespace {
+                Some(namespace) => tx.query_row("SELECT revision FROM mc_provider_policy_revisions_v1 WHERE engine_namespace=?1", [namespace], |row| row.get(0)).optional()?,
+                None => None,
+            };
+            // Remove the head first: child-delete triggers must not invalidate a
+            // different conversation's policy cache in a shared engine namespace.
+            tx.execute("DELETE FROM mc_provider_conversations_v2 WHERE conv_key=?1", [&conv])?;
+            for table in [
+                "mc_provider_view_overrides_v1",
+                "mc_provider_views_v2",
+                "mc_provider_policy_overrides_v1",
+                "mc_provider_policy_cuts_v1",
+                "mc_provider_policy_preparations_v1",
+                "mc_provider_policy_summaries_v1",
+                "mc_provider_policy_changes_v1",
+                "mc_provider_policy_parts_v1",
+                "mc_provider_hook_answers_v1",
+                "mc_provider_legacy_tags_v1",
+                "mc_provider_pending_drops_v1",
+                "mc_provider_messages_v1",
+                "mc_provider_lineages_v1",
+            ] {
+                tx.execute(&format!("DELETE FROM {table} WHERE conv_key=?1"), [&conv])?;
+            }
+            tx.execute(
+                "DELETE FROM mc_provider_sessions_v1 WHERE project_root=?1 AND session=?2 AND harness=?3",
+                params![key.project_root, key.session, key.harness],
+            )?;
+            // Catalogs predate harness selection. Keep one while any sibling
+            // conversation in that project/session can still depend on it.
+            tx.execute(
+                "DELETE FROM mc_provider_catalogs_v1 WHERE project_root=?1 AND session=?2
+                 AND NOT EXISTS (SELECT 1 FROM mc_provider_conversations_v2 WHERE project_root=?1 AND session=?2)",
+                params![key.project_root, key.session],
+            )?;
+            if let Some(namespace) = namespace {
+                // The head's BEFORE DELETE trigger bumps the namespace revision.
+                // Surviving conversations lost no policy inputs: preserve their
+                // cache token within this transaction, before any reader can see it.
+                if tx.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_conversations_v2 WHERE engine_namespace=?1)", [&namespace], |row| row.get::<_, bool>(0))? {
+                    if let Some(revision) = revision {
+                        tx.execute("UPDATE mc_provider_policy_revisions_v1 SET revision=?2 WHERE engine_namespace=?1", params![namespace, revision])?;
+                    } else {
+                        tx.execute("DELETE FROM mc_provider_policy_revisions_v1 WHERE engine_namespace=?1", [&namespace])?;
+                    }
+                }
+                for table in ["mc_provider_consumed_tags_v1", "mc_provider_policy_revisions_v1"] {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE engine_namespace=?1 AND NOT EXISTS
+                            (SELECT 1 FROM mc_provider_conversations_v2 WHERE engine_namespace=?1)"),
+                        [&namespace],
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Detect changes to a cached runner record using SQLite's external-write
     /// counter and a connection-local metadata revision. Compaction's policy counters are not
     /// included: a fold updates them without changing the runner's transcript.

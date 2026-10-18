@@ -825,6 +825,162 @@
                 "wire_sha256": "f0234a465251a12b4e0d1420ad8f5fc04ca46d595452f09a8c59ad1781920f76",
                 "kind": "bootstrap"
             }
+        },
+        {
+            "id": "session-delete-idempotent-and-terminal-step",
+            "steps": [
+                {
+                    "action": {
+                        "kind": "bind",
+                        "harness": "pi",
+                        "session": "relay-pi-deleted"
+                    },
+                    "exchanges": []
+                },
+                {
+                    "action": {
+                        "kind": "run",
+                        "session": "relay-pi-deleted",
+                        "system": "Pi conformance system.",
+                        "entries": [
+                            {
+                                "type": "message",
+                                "id": "pi-entry-001",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Covered user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            }
+                        ]
+                    },
+                    "exchanges": [
+                        {
+                            "method": "transform.declare",
+                            "request_bytes": "{\"method\":\"transform.declare\",\"params\":{\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"}}}",
+                            "answer_bytes": "{\"subscriptions\":[{\"hook\":\"pre_user\",\"ops\":[\"prepend\",\"append\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500},{\"hook\":\"post_tool\",\"ops\":[\"prepend\",\"append\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500},{\"hook\":\"post_assistant\",\"ops\":[\"prepend\",\"replace\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500}]}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "compaction.setup",
+                            "request_bytes": "{\"method\":\"compaction.setup\",\"params\":{\"model\":\"fixture/model\",\"step_id\":\"pi-entry-001\",\"step_kind\":\"model\",\"context_window\":100000,\"estimate\":{\"request_tokens\":0},\"composition\":{},\"session\":\"relay-pi-deleted\",\"harness\":\"pi\",\"request_id\":\"pi-request-0012\",\"lineage_id\":\"pi-lineage-0004\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"now\":1006}}",
+                            "answer_bytes": "{\"answer\":\"ready\",\"request_id\":\"pi-request-0012\",\"initial\":{\"compaction_id\":\"mc-45dd34a7d367c4c5ed522890e15c0f0dc592ade1287fc31177c7b3e82301246e\",\"version\":1,\"range\":{\"from\":0,\"to\":0},\"replacement\":[{\"content\":[{\"text\":\"<session-history></session-history>\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}],\"role\":\"user\"}]},\"stability\":[{\"index\":0,\"rank\":2},{\"index\":1,\"rank\":1}],\"call_when\":{\"default\":0.65}}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "state_sync",
+                            "request_bytes": "{\"method\":\"state_sync\",\"shadow_generation\":0,\"expected_shadow_seq\":0,\"seed_id\":\"pi-seed-0004\",\"seed_generation\":0,\"seed_batch_index\":0,\"seed_batch_total\":1,\"seed_complete\":true,\"resolved_compartment_boundaries\":[],\"pending_agent_drops\":[],\"note_nudge_anchors\":[],\"auto_search_hint_decisions\":[],\"seed_boundary_id\":null,\"last_todo_state\":\"\",\"acked_watermarks\":{\"compartment_sequence\":-1,\"memory_id\":0,\"m0_mutation_id\":0,\"memory_mutation_id\":0,\"last_todo_state_hash\":\"2114556b3e7818ffe1b246a56ad1604d20d7057f405e749ca5f4006b21870706\",\"project_memory_epoch\":0,\"project_user_profile_version\":0,\"workspace_fingerprint\":null,\"reasoning_cleared_through_tag\":0,\"note_evaluation_available\":true},\"note_evaluation_available\":true,\"todo_synthetic_anchor\":null,\"emergency_latches\":{\"last_input_sample\":0,\"has_prior_drop\":false,\"last_execute_ordinal\":0},\"pending_compaction_marker\":null,\"channel2_nudge_state\":\"\",\"reasoning_cleared_through_tag\":0,\"pass_complete\":true,\"historian_model_chain\":[],\"accept_reply_pages\":true}",
+                            "answer_bytes": "{\"auto_search_hint_skipped\":0,\"drop_seeds_skipped\":0,\"emergency_latches_seeded\":true,\"note_nudge_anchors_seeded\":0,\"ok\":true,\"pending_agent_drops_seeded\":0,\"pending_agent_drops_skipped\":0,\"row_version\":1,\"seeds_skipped_frozen_discarded\":0,\"shadow_generation\":0,\"shadow_seq\":1,\"strip_seeds_skipped\":0,\"todo_synthetic_anchor_seeded\":false,\"user_hint_seeds_seeded\":0}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "compaction.step",
+                            "request_bytes": "{\"method\":\"compaction.step\",\"params\":{\"model\":\"fixture/model\",\"step_id\":\"pi-entry-001\",\"step_kind\":\"model\",\"context_window\":100000,\"estimate\":{\"request_tokens\":0},\"newest\":{\"ordinal\":1,\"mid\":\"pi-entry-001\"},\"prefix_rebuilding\":{\"reason\":\"pipeline_switch\"},\"session\":\"relay-pi-deleted\",\"harness\":\"pi\",\"now\":1007,\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"last_applied\":{\"compaction_id\":\"mc-45dd34a7d367c4c5ed522890e15c0f0dc592ade1287fc31177c7b3e82301246e\",\"version\":1},\"lineage_id\":\"pi-lineage-0004\",\"served_through_ordinal\":0,\"after_ordinal\":0,\"request_id\":\"pi-request-0013\",\"messages\":[{\"ordinal\":1,\"mid\":\"pi-entry-001\",\"message\":{\"type\":\"message\",\"id\":\"pi-entry-001\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Covered user.\"}],\"timestamp\":1}}}]}}",
+                            "answer_bytes": "{\"answer\":\"compaction_message\",\"compaction\":{\"compaction_id\":\"mc-45dd34a7d367c4c5ed522890e15c0f0dc592ade1287fc31177c7b3e82301246e\",\"range\":{\"from\":1,\"to\":2},\"replacement\":[{\"content\":[{\"text\":\"<session-history></session-history>\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}],\"role\":\"user\"},{\"id\":\"pi-entry-001\",\"message\":{\"content\":[{\"text\":\"Covered user.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":1},\"parentId\":null,\"type\":\"message\"}],\"version\":3},\"request_id\":\"pi-request-0013\"}",
+                            "delivery": "answer"
+                        }
+                    ]
+                },
+                {
+                    "action": {
+                        "kind": "run",
+                        "session": "relay-pi-deleted",
+                        "system": "Pi conformance system.",
+                        "entries": [
+                            {
+                                "type": "message",
+                                "id": "pi-entry-001",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Covered user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            },
+                            {
+                                "type": "message",
+                                "id": "pi-entry-002",
+                                "parentId": null,
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Retained user."
+                                        }
+                                    ],
+                                    "timestamp": 1
+                                }
+                            }
+                        ]
+                    },
+                    "exchanges": [
+                        {
+                            "method": "transform.hook",
+                            "request_bytes": "{\"method\":\"transform.hook\",\"params\":{\"hook\":\"pre_user\",\"subject_mid\":\"pi-entry-002\",\"blocks\":[\"Retained user.\"],\"subject_ordinal\":2,\"session\":\"relay-pi-deleted\",\"harness\":\"pi\",\"lineage_id\":\"pi-lineage-0004\",\"request_id\":\"pi-request-0014\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"pi\",\"observation\":\"answer\"},\"served_through_ordinal\":0,\"pass_complete\":true,\"budget_ms\":1500,\"on_unavailable\":\"pass\",\"message\":{\"type\":\"message\",\"id\":\"pi-entry-002\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Retained user.\"}],\"timestamp\":1}}}}",
+                            "answer_bytes": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§1§ \"}]}",
+                            "delivery": "answer"
+                        }
+                    ]
+                },
+                {
+                    "action": {
+                        "kind": "delete",
+                        "session": "relay-pi-deleted"
+                    },
+                    "exchanges": [
+                        {
+                            "method": "compaction.delete",
+                            "request_bytes": "{\"method\":\"compaction.delete\",\"params\":{\"session\":\"relay-pi-deleted\",\"harness\":\"pi\"},\"accept_reply_pages\":true}",
+                            "answer_bytes": "{\"answer\":\"deleted\"}",
+                            "delivery": "answer"
+                        }
+                    ]
+                },
+                {
+                    "action": {
+                        "kind": "delete",
+                        "session": "relay-pi-deleted"
+                    },
+                    "exchanges": [
+                        {
+                            "method": "compaction.delete",
+                            "request_bytes": "{\"method\":\"compaction.delete\",\"params\":{\"session\":\"relay-pi-deleted\",\"harness\":\"pi\"},\"accept_reply_pages\":true}",
+                            "answer_bytes": "{\"answer\":\"deleted\"}",
+                            "delivery": "answer"
+                        }
+                    ]
+                },
+                {
+                    "action": {
+                        "kind": "step_deleted",
+                        "session": "relay-pi-deleted"
+                    },
+                    "exchanges": [
+                        {
+                            "method": "compaction.step",
+                            "request_bytes": "{\"method\":\"compaction.step\",\"params\":{\"session\":\"relay-pi-deleted\",\"harness\":\"pi\",\"request_id\":\"deleted-step\",\"lineage_id\":\"deleted-lineage\",\"step_id\":\"deleted-step\",\"step_kind\":\"user_turn\",\"model\":\"fixture\",\"context_window\":100000,\"estimate\":{\"request_tokens\":1},\"messages\":[],\"now\":1000}}",
+                            "answer_bytes": "{\"oracle_error\":{\"code\":\"provider_conversation_missing\",\"message\":\"provider conversation does not exist; declare it before use\",\"source\":\"module\"}}",
+                            "delivery": "answer"
+                        }
+                    ]
+                }
+            ],
+            "expected": {
+                "answer": "deleted",
+                "subsequent_step_error": "provider_conversation_missing"
+            }
         }
     ]
 }

@@ -7,6 +7,392 @@
     },
     "cases": [
         {
+            "id": "session-delete-idempotent-and-terminal-step",
+            "steps": [
+                {
+                    "action": {
+                        "kind": "bootstrap"
+                    },
+                    "exchanges": [
+                        {
+                            "method": "transform.declare",
+                            "request_bytes": "{\"method\":\"transform.declare\",\"params\":{\"preset\":\"head\",\"params\":{\"serializer_profile\":\"opencode-aisdk\",\"observation\":\"answer\"}}}",
+                            "answer_bytes": "{\"subscriptions\":[{\"hook\":\"pre_user\",\"ops\":[\"prepend\",\"append\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500},{\"hook\":\"post_tool\",\"ops\":[\"prepend\",\"append\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500},{\"hook\":\"post_assistant\",\"ops\":[\"prepend\",\"replace\"],\"on_unavailable\":\"pass\",\"budget_ms\":1500}]}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "compaction.setup",
+                            "request_bytes": "{\"method\":\"compaction.setup\",\"params\":{\"model\":\"fixture\",\"context_window\":100000,\"composition\":{},\"session\":\"relay-v1\",\"harness\":\"opencode\",\"request_id\":\"relay-0002\",\"lineage_id\":\"relay-lineage-v1\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"opencode-aisdk\",\"observation\":\"answer\"},\"now\":1000}}",
+                            "answer_bytes": "{\"answer\":\"ready\",\"request_id\":\"relay-0002\",\"initial\":{\"compaction_id\":\"mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab\",\"version\":1,\"range\":{\"from\":0,\"to\":0},\"replacement\":[{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history></session-history>\",\"type\":\"text\"}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}]}]},\"stability\":[{\"index\":0,\"rank\":2},{\"index\":1,\"rank\":1}],\"call_when\":{\"default\":0.65}}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "compaction.step",
+                            "request_bytes": "{\"method\":\"compaction.step\",\"params\":{\"step_id\":\"status-2\",\"step_kind\":\"user_turn\",\"model\":\"fixture\",\"context_window\":100000,\"estimate\":{\"request_tokens\":1000},\"prefix_rebuilding\":{\"reason\":\"pipeline_switch\"},\"session\":\"relay-v1\",\"harness\":\"opencode\",\"now\":1000,\"preset\":\"head\",\"params\":{\"serializer_profile\":\"opencode-aisdk\",\"observation\":\"answer\"},\"last_applied\":{\"compaction_id\":\"mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab\",\"version\":1},\"lineage_id\":\"relay-lineage-v1\",\"served_through_ordinal\":0,\"after_ordinal\":0,\"request_id\":\"relay-0003\",\"messages\":[]}}",
+                            "answer_bytes": "{\"answer\":\"noop\",\"request_id\":\"relay-0003\"}",
+                            "delivery": "answer"
+                        }
+                    ],
+                    "expected": {
+                        "receipt": {
+                            "request_id": "carrying-1",
+                            "delivery": "pending",
+                            "lineage_id": "relay-lineage-v1",
+                            "served_through_ordinal": 0,
+                            "unserved_subjects": [],
+                            "last_applied": {
+                                "compaction_id": "mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab",
+                                "version": 1,
+                                "range": {
+                                    "from": 0,
+                                    "to": 0
+                                }
+                            }
+                        },
+                        "served_bytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history></session-history>\",\"type\":\"text\"}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}]}]",
+                        "lineage_id": "relay-lineage-v1",
+                        "served_through_ordinal": 0,
+                        "after_ordinal": 0,
+                        "unserved_subjects": [],
+                        "last_applied": {
+                            "compaction_id": "mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab",
+                            "version": 1
+                        },
+                        "last_not_applied": null,
+                        "coverage": null,
+                        "entries": [],
+                        "aliases": []
+                    }
+                },
+                {
+                    "action": {
+                        "kind": "serve",
+                        "messages": [
+                            {
+                                "info": {
+                                    "id": "m1",
+                                    "role": "user",
+                                    "time": {
+                                        "created": 100
+                                    }
+                                },
+                                "parts": [
+                                    {
+                                        "id": "m1-text",
+                                        "type": "text",
+                                        "text": "Preserve Unicode: café § and CRLF\r\nexactly."
+                                    }
+                                ]
+                            },
+                            {
+                                "info": {
+                                    "id": "m2",
+                                    "role": "assistant",
+                                    "time": {
+                                        "created": 100
+                                    }
+                                },
+                                "parts": [
+                                    {
+                                        "id": "reasoning",
+                                        "type": "reasoning",
+                                        "text": "signed reasoning",
+                                        "signature": "opaque-signature"
+                                    },
+                                    {
+                                        "id": "m2-text",
+                                        "type": "text",
+                                        "text": "Read both files."
+                                    },
+                                    {
+                                        "id": "tool-a",
+                                        "type": "tool",
+                                        "callID": "call-a",
+                                        "tool": "read",
+                                        "state": {
+                                            "status": "completed",
+                                            "input": {
+                                                "z": 1,
+                                                "a": 2
+                                            },
+                                            "output": "file a\ncontents"
+                                        }
+                                    },
+                                    {
+                                        "id": "tool-b",
+                                        "type": "tool",
+                                        "callID": "call-b",
+                                        "tool": "read",
+                                        "state": {
+                                            "status": "completed",
+                                            "input": {
+                                                "z": 1,
+                                                "a": 2
+                                            },
+                                            "output": "file b\ncontents"
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    "exchanges": [
+                        {
+                            "method": "transform.hook",
+                            "request_bytes": "{\"method\":\"transform.hook\",\"params\":{\"hook\":\"pre_user\",\"subject_mid\":\"m1\",\"blocks\":[\"Preserve Unicode: café § and CRLF\\r\\nexactly.\"],\"subject_ordinal\":1,\"session\":\"relay-v1\",\"harness\":\"opencode\",\"lineage_id\":\"relay-lineage-v1\",\"request_id\":\"relay-0004\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"opencode-aisdk\",\"observation\":\"answer\"},\"served_through_ordinal\":0,\"budget_ms\":1500,\"on_unavailable\":\"pass\",\"message\":{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]}}}",
+                            "answer_bytes": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§1§ \"}]}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "transform.hook",
+                            "request_bytes": "{\"method\":\"transform.hook\",\"params\":{\"hook\":\"post_assistant\",\"subject_mid\":\"m2\",\"step_id\":\"m2\",\"blocks\":[\"Read both files.\"],\"subject_ordinal\":2,\"session\":\"relay-v1\",\"harness\":\"opencode\",\"lineage_id\":\"relay-lineage-v1\",\"request_id\":\"relay-0005\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"opencode-aisdk\",\"observation\":\"answer\"},\"served_through_ordinal\":0,\"budget_ms\":1500,\"on_unavailable\":\"pass\",\"message\":{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file b\\ncontents\"}}]}}}",
+                            "answer_bytes": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§2§ \"}]}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "transform.hook",
+                            "request_bytes": "{\"method\":\"transform.hook\",\"params\":{\"hook\":\"post_tool\",\"subject_mid\":\"m2\",\"subject_part\":\"tool-a\",\"step_id\":\"m2\",\"tool\":\"read\",\"tool_call_id\":\"call-a\",\"blocks\":[\"file a\\ncontents\"],\"is_error\":false,\"subject_ordinal\":2,\"session\":\"relay-v1\",\"harness\":\"opencode\",\"lineage_id\":\"relay-lineage-v1\",\"request_id\":\"relay-0006\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"opencode-aisdk\",\"observation\":\"answer\"},\"served_through_ordinal\":0,\"budget_ms\":1500,\"on_unavailable\":\"pass\",\"message\":{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file b\\ncontents\"}}]}}}",
+                            "answer_bytes": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§3§ \"}]}",
+                            "delivery": "answer"
+                        },
+                        {
+                            "method": "transform.hook",
+                            "request_bytes": "{\"method\":\"transform.hook\",\"params\":{\"hook\":\"post_tool\",\"subject_mid\":\"m2\",\"subject_part\":\"tool-b\",\"step_id\":\"m2\",\"tool\":\"read\",\"tool_call_id\":\"call-b\",\"blocks\":[\"file b\\ncontents\"],\"is_error\":false,\"subject_ordinal\":2,\"session\":\"relay-v1\",\"harness\":\"opencode\",\"lineage_id\":\"relay-lineage-v1\",\"request_id\":\"relay-0007\",\"preset\":\"head\",\"params\":{\"serializer_profile\":\"opencode-aisdk\",\"observation\":\"answer\"},\"served_through_ordinal\":0,\"budget_ms\":1500,\"on_unavailable\":\"pass\",\"message\":{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file b\\ncontents\"}}]}}}",
+                            "answer_bytes": "{\"answer\":\"ops\",\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§4§ \"}]}",
+                            "delivery": "answer"
+                        }
+                    ],
+                    "expected": {
+                        "receipt": {
+                            "request_id": "carrying-2",
+                            "delivery": "clean",
+                            "lineage_id": "relay-lineage-v1",
+                            "served_through_ordinal": 2,
+                            "unserved_subjects": [],
+                            "last_applied": {
+                                "compaction_id": "mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab",
+                                "version": 1,
+                                "range": {
+                                    "from": 0,
+                                    "to": 0
+                                }
+                            }
+                        },
+                        "served_bytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history></session-history>\",\"type\":\"text\"}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}]},{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"§1§ Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]},{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"§2§ Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§3§ file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§4§ file b\\ncontents\"}}]}]",
+                        "lineage_id": "relay-lineage-v1",
+                        "served_through_ordinal": 2,
+                        "after_ordinal": 2,
+                        "unserved_subjects": [],
+                        "last_applied": {
+                            "compaction_id": "mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab",
+                            "version": 1
+                        },
+                        "last_not_applied": null,
+                        "coverage": null,
+                        "entries": [
+                            {
+                                "mid": "m1",
+                                "ordinal": 1,
+                                "ingest_bytes": "{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]}",
+                                "served_bytes": "{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"§1§ Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]}",
+                                "op_version": 1,
+                                "answers_bytes": "[{\"subject\":{\"hook\":\"pre_user\",\"subject_mid\":\"m1\",\"blocks\":[\"Preserve Unicode: café § and CRLF\\r\\nexactly.\"]},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§1§ \"}],\"tags\":[]}]"
+                            },
+                            {
+                                "mid": "m2",
+                                "ordinal": 2,
+                                "ingest_bytes": "{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file b\\ncontents\"}}]}",
+                                "served_bytes": "{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"§2§ Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§3§ file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§4§ file b\\ncontents\"}}]}",
+                                "op_version": 1,
+                                "answers_bytes": "[{\"subject\":{\"hook\":\"post_assistant\",\"subject_mid\":\"m2\",\"step_id\":\"m2\",\"blocks\":[\"Read both files.\"]},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§2§ \"}],\"tags\":[]},{\"subject\":{\"hook\":\"post_tool\",\"subject_mid\":\"m2\",\"subject_part\":\"tool-a\",\"step_id\":\"m2\",\"tool\":\"read\",\"tool_call_id\":\"call-a\",\"blocks\":[\"file a\\ncontents\"],\"is_error\":false},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§3§ \"}],\"tags\":[]},{\"subject\":{\"hook\":\"post_tool\",\"subject_mid\":\"m2\",\"subject_part\":\"tool-b\",\"step_id\":\"m2\",\"tool\":\"read\",\"tool_call_id\":\"call-b\",\"blocks\":[\"file b\\ncontents\"],\"is_error\":false},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§4§ \"}],\"tags\":[]}]"
+                            }
+                        ],
+                        "aliases": []
+                    }
+                },
+                {
+                    "action": {
+                        "kind": "delete"
+                    },
+                    "exchanges": [
+                        {
+                            "method": "compaction.delete",
+                            "request_bytes": "{\"method\":\"compaction.delete\",\"params\":{\"session\":\"relay-v1\",\"harness\":\"opencode\"}}",
+                            "answer_bytes": "{\"answer\":\"deleted\"}",
+                            "delivery": "answer"
+                        }
+                    ],
+                    "expected": {
+                        "receipt": {
+                            "request_id": "carrying-2",
+                            "delivery": "clean",
+                            "lineage_id": "relay-lineage-v1",
+                            "served_through_ordinal": 2,
+                            "unserved_subjects": [],
+                            "last_applied": {
+                                "compaction_id": "mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab",
+                                "version": 1,
+                                "range": {
+                                    "from": 0,
+                                    "to": 0
+                                }
+                            }
+                        },
+                        "served_bytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history></session-history>\",\"type\":\"text\"}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}]},{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"§1§ Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]},{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"§2§ Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§3§ file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§4§ file b\\ncontents\"}}]}]",
+                        "lineage_id": "relay-lineage-v1",
+                        "served_through_ordinal": 2,
+                        "after_ordinal": 2,
+                        "unserved_subjects": [],
+                        "last_applied": {
+                            "compaction_id": "mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab",
+                            "version": 1
+                        },
+                        "last_not_applied": null,
+                        "coverage": null,
+                        "entries": [
+                            {
+                                "mid": "m1",
+                                "ordinal": 1,
+                                "ingest_bytes": "{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]}",
+                                "served_bytes": "{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"§1§ Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]}",
+                                "op_version": 1,
+                                "answers_bytes": "[{\"subject\":{\"hook\":\"pre_user\",\"subject_mid\":\"m1\",\"blocks\":[\"Preserve Unicode: café § and CRLF\\r\\nexactly.\"]},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§1§ \"}],\"tags\":[]}]"
+                            },
+                            {
+                                "mid": "m2",
+                                "ordinal": 2,
+                                "ingest_bytes": "{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file b\\ncontents\"}}]}",
+                                "served_bytes": "{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"§2§ Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§3§ file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§4§ file b\\ncontents\"}}]}",
+                                "op_version": 1,
+                                "answers_bytes": "[{\"subject\":{\"hook\":\"post_assistant\",\"subject_mid\":\"m2\",\"step_id\":\"m2\",\"blocks\":[\"Read both files.\"]},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§2§ \"}],\"tags\":[]},{\"subject\":{\"hook\":\"post_tool\",\"subject_mid\":\"m2\",\"subject_part\":\"tool-a\",\"step_id\":\"m2\",\"tool\":\"read\",\"tool_call_id\":\"call-a\",\"blocks\":[\"file a\\ncontents\"],\"is_error\":false},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§3§ \"}],\"tags\":[]},{\"subject\":{\"hook\":\"post_tool\",\"subject_mid\":\"m2\",\"subject_part\":\"tool-b\",\"step_id\":\"m2\",\"tool\":\"read\",\"tool_call_id\":\"call-b\",\"blocks\":[\"file b\\ncontents\"],\"is_error\":false},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§4§ \"}],\"tags\":[]}]"
+                            }
+                        ],
+                        "aliases": []
+                    }
+                },
+                {
+                    "action": {
+                        "kind": "delete"
+                    },
+                    "exchanges": [
+                        {
+                            "method": "compaction.delete",
+                            "request_bytes": "{\"method\":\"compaction.delete\",\"params\":{\"session\":\"relay-v1\",\"harness\":\"opencode\"}}",
+                            "answer_bytes": "{\"answer\":\"deleted\"}",
+                            "delivery": "answer"
+                        }
+                    ],
+                    "expected": {
+                        "receipt": {
+                            "request_id": "carrying-2",
+                            "delivery": "clean",
+                            "lineage_id": "relay-lineage-v1",
+                            "served_through_ordinal": 2,
+                            "unserved_subjects": [],
+                            "last_applied": {
+                                "compaction_id": "mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab",
+                                "version": 1,
+                                "range": {
+                                    "from": 0,
+                                    "to": 0
+                                }
+                            }
+                        },
+                        "served_bytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history></session-history>\",\"type\":\"text\"}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}]},{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"§1§ Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]},{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"§2§ Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§3§ file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§4§ file b\\ncontents\"}}]}]",
+                        "lineage_id": "relay-lineage-v1",
+                        "served_through_ordinal": 2,
+                        "after_ordinal": 2,
+                        "unserved_subjects": [],
+                        "last_applied": {
+                            "compaction_id": "mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab",
+                            "version": 1
+                        },
+                        "last_not_applied": null,
+                        "coverage": null,
+                        "entries": [
+                            {
+                                "mid": "m1",
+                                "ordinal": 1,
+                                "ingest_bytes": "{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]}",
+                                "served_bytes": "{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"§1§ Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]}",
+                                "op_version": 1,
+                                "answers_bytes": "[{\"subject\":{\"hook\":\"pre_user\",\"subject_mid\":\"m1\",\"blocks\":[\"Preserve Unicode: café § and CRLF\\r\\nexactly.\"]},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§1§ \"}],\"tags\":[]}]"
+                            },
+                            {
+                                "mid": "m2",
+                                "ordinal": 2,
+                                "ingest_bytes": "{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file b\\ncontents\"}}]}",
+                                "served_bytes": "{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"§2§ Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§3§ file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§4§ file b\\ncontents\"}}]}",
+                                "op_version": 1,
+                                "answers_bytes": "[{\"subject\":{\"hook\":\"post_assistant\",\"subject_mid\":\"m2\",\"step_id\":\"m2\",\"blocks\":[\"Read both files.\"]},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§2§ \"}],\"tags\":[]},{\"subject\":{\"hook\":\"post_tool\",\"subject_mid\":\"m2\",\"subject_part\":\"tool-a\",\"step_id\":\"m2\",\"tool\":\"read\",\"tool_call_id\":\"call-a\",\"blocks\":[\"file a\\ncontents\"],\"is_error\":false},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§3§ \"}],\"tags\":[]},{\"subject\":{\"hook\":\"post_tool\",\"subject_mid\":\"m2\",\"subject_part\":\"tool-b\",\"step_id\":\"m2\",\"tool\":\"read\",\"tool_call_id\":\"call-b\",\"blocks\":[\"file b\\ncontents\"],\"is_error\":false},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§4§ \"}],\"tags\":[]}]"
+                            }
+                        ],
+                        "aliases": []
+                    }
+                },
+                {
+                    "action": {
+                        "kind": "step_deleted"
+                    },
+                    "exchanges": [
+                        {
+                            "method": "compaction.step",
+                            "request_bytes": "{\"method\":\"compaction.step\",\"params\":{\"session\":\"relay-v1\",\"harness\":\"opencode\",\"request_id\":\"deleted-step\",\"lineage_id\":\"relay-lineage-v1\",\"step_id\":\"deleted-step\",\"step_kind\":\"user_turn\",\"model\":\"fixture\",\"context_window\":100000,\"estimate\":{\"request_tokens\":1},\"messages\":[],\"now\":1000}}",
+                            "answer_bytes": "{\"oracle_error\":{\"code\":\"provider_conversation_missing\",\"message\":\"provider conversation does not exist; declare it before use\",\"source\":\"module\"}}",
+                            "delivery": "answer"
+                        }
+                    ],
+                    "expected": {
+                        "receipt": {
+                            "request_id": "carrying-2",
+                            "delivery": "clean",
+                            "lineage_id": "relay-lineage-v1",
+                            "served_through_ordinal": 2,
+                            "unserved_subjects": [],
+                            "last_applied": {
+                                "compaction_id": "mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab",
+                                "version": 1,
+                                "range": {
+                                    "from": 0,
+                                    "to": 0
+                                }
+                            }
+                        },
+                        "served_bytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history></session-history>\",\"type\":\"text\"}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"relay-v1\"},\"parts\":[{\"synthetic\":true,\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"type\":\"text\"}]},{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"§1§ Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]},{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"§2§ Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§3§ file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§4§ file b\\ncontents\"}}]}]",
+                        "lineage_id": "relay-lineage-v1",
+                        "served_through_ordinal": 2,
+                        "after_ordinal": 2,
+                        "unserved_subjects": [],
+                        "last_applied": {
+                            "compaction_id": "mc-73185585285b9767b7fd2a5db8f86e622a36475eef787418a05ce8606ecbd6ab",
+                            "version": 1
+                        },
+                        "last_not_applied": null,
+                        "coverage": null,
+                        "entries": [
+                            {
+                                "mid": "m1",
+                                "ordinal": 1,
+                                "ingest_bytes": "{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]}",
+                                "served_bytes": "{\"info\":{\"id\":\"m1\",\"role\":\"user\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"m1-text\",\"type\":\"text\",\"text\":\"§1§ Preserve Unicode: café § and CRLF\\r\\nexactly.\"}]}",
+                                "op_version": 1,
+                                "answers_bytes": "[{\"subject\":{\"hook\":\"pre_user\",\"subject_mid\":\"m1\",\"blocks\":[\"Preserve Unicode: café § and CRLF\\r\\nexactly.\"]},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§1§ \"}],\"tags\":[]}]"
+                            },
+                            {
+                                "mid": "m2",
+                                "ordinal": 2,
+                                "ingest_bytes": "{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"file b\\ncontents\"}}]}",
+                                "served_bytes": "{\"info\":{\"id\":\"m2\",\"role\":\"assistant\",\"time\":{\"created\":100}},\"parts\":[{\"id\":\"reasoning\",\"type\":\"reasoning\",\"text\":\"signed reasoning\",\"signature\":\"opaque-signature\"},{\"id\":\"m2-text\",\"type\":\"text\",\"text\":\"§2§ Read both files.\"},{\"id\":\"tool-a\",\"type\":\"tool\",\"callID\":\"call-a\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§3§ file a\\ncontents\"}},{\"id\":\"tool-b\",\"type\":\"tool\",\"callID\":\"call-b\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"z\":1,\"a\":2},\"output\":\"§4§ file b\\ncontents\"}}]}",
+                                "op_version": 1,
+                                "answers_bytes": "[{\"subject\":{\"hook\":\"post_assistant\",\"subject_mid\":\"m2\",\"step_id\":\"m2\",\"blocks\":[\"Read both files.\"]},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§2§ \"}],\"tags\":[]},{\"subject\":{\"hook\":\"post_tool\",\"subject_mid\":\"m2\",\"subject_part\":\"tool-a\",\"step_id\":\"m2\",\"tool\":\"read\",\"tool_call_id\":\"call-a\",\"blocks\":[\"file a\\ncontents\"],\"is_error\":false},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§3§ \"}],\"tags\":[]},{\"subject\":{\"hook\":\"post_tool\",\"subject_mid\":\"m2\",\"subject_part\":\"tool-b\",\"step_id\":\"m2\",\"tool\":\"read\",\"tool_call_id\":\"call-b\",\"blocks\":[\"file b\\ncontents\"],\"is_error\":false},\"ops\":[{\"op\":\"prepend\",\"block\":0,\"text\":\"§4§ \"}],\"tags\":[]}]"
+                            }
+                        ],
+                        "aliases": []
+                    }
+                }
+            ]
+        },
+        {
             "id": "receipt-clean-stream-not-headers-or-failure",
             "steps": [
                 {

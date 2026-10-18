@@ -974,7 +974,7 @@ impl McHandler {
         let c = store
             .load_provider_conversation(&key.store_key())
             .map_err(transient)?
-            .ok_or_else(|| invalid_field("params", "host plan is not frozen"))?;
+            .ok_or_else(super::session_delete::conversation_missing)?;
         let plan: Value = serde_json::from_str(&c.params_json).map_err(transient)?;
         let declared = declaration(&json!({"preset":c.preset,"params":plan}))?;
         let subscription = declared
@@ -1465,12 +1465,7 @@ impl McHandler {
             }
             return Ok(());
         }
-        let held = held.ok_or_else(|| {
-            invalid_field(
-                "params",
-                "host lane requires a frozen transform.declare plan",
-            )
-        })?;
+        let held = held.ok_or_else(super::session_delete::conversation_missing)?;
         let plan: Value = serde_json::from_str(&held.params_json).map_err(transient)?;
         if !answer_observation(&plan) {
             return Err(invalid_field(

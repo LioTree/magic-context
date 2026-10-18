@@ -38,6 +38,8 @@ pub mod move_snapshot;
 pub mod move_store;
 pub mod parity_schema_manifest;
 pub mod private_permissions;
+#[cfg(test)]
+mod provider_delete_tests;
 mod provider_legacy;
 mod provider_log;
 mod provider_policy_overlay;

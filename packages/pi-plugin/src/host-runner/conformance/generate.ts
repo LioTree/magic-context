@@ -33,6 +33,7 @@ type PiFitAction = {
 /** One host-visible operation on the Pi adapter, or a control call to the MC oracle. */
 export type PiAction =
 	| { kind: "bind"; harness: "pi"; session: string }
+	| { kind: "delete" | "step_deleted"; session: string }
 	| {
 			kind: "run";
 			session: string;
@@ -546,6 +547,48 @@ export async function generatePiVectors(): Promise<PiVectorFile> {
 			receipt: fork.receipt,
 			wire_sha256: digest(fork.messages),
 			kind: fork.kind,
+		});
+		const deletedSession = "relay-pi-deleted";
+		await bind(deletedSession);
+		await run([u1], host.system, deletedSession);
+		await run([u1, u2], host.system, deletedSession);
+		for (let n = 0; n < 2; n++)
+			await step({ kind: "delete", session: deletedSession }, () =>
+				adapter.onSessionDeleted(deletedSession),
+			);
+		await step({ kind: "step_deleted", session: deletedSession }, async () => {
+			const request = {
+				method: "compaction.step",
+				params: {
+					session: deletedSession,
+					harness: "pi",
+					request_id: "deleted-step",
+					lineage_id: "deleted-lineage",
+					step_id: "deleted-step",
+					step_kind: "user_turn",
+					model: "fixture",
+					context_window: 100_000,
+					estimate: { request_tokens: 1 },
+					messages: [],
+					now: 1000,
+				},
+			};
+			const request_bytes = JSON.stringify(request);
+			const answer_bytes = await oracle.call(JSON.parse(request_bytes));
+			trace.push({
+				method: "compaction.step",
+				request_bytes,
+				answer_bytes,
+				delivery: "answer",
+			});
+			assert.equal(
+				JSON.parse(answer_bytes).oracle_error?.code,
+				"provider_conversation_missing",
+			);
+		});
+		snapshot("session-delete-idempotent-and-terminal-step", {
+			answer: "deleted",
+			subsequent_step_error: "provider_conversation_missing",
 		});
 		return {
 			schema: "mc-relay-pi/v1",

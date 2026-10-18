@@ -452,6 +452,28 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
                 listeners.delete(listener);
             };
         },
+        /** Drop only the module's provider state; normal session deletion owns host data. */
+        async onSessionDeleted(id: string): Promise<void> {
+            assertOpen();
+            const pending = transport.call({
+                sessionId: id,
+                projectRoot: options.projectRoot,
+                method: "compaction.delete",
+                body: { method: "compaction.delete", params: { session: id, harness } },
+            });
+            const observing = pending.then(
+                () => {},
+                () => {},
+            );
+            observations.add(observing);
+            try {
+                await pending;
+                published.delete(id);
+                observerFailures.delete(id);
+            } finally {
+                observations.delete(observing);
+            }
+        },
         /** Wait for active passes before closing the independent store and transport exactly once. */
         dispose(): Promise<void> {
             if (disposal) return disposal;

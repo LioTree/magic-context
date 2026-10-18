@@ -50,6 +50,16 @@ export function scenarios(): { id: string; actions: Action[] }[] {
     const serve: Action = { kind: "serve", messages: [user, assistant] };
     return [
         {
+            id: "session-delete-idempotent-and-terminal-step",
+            actions: [
+                bootstrap,
+                serve,
+                { kind: "delete" },
+                { kind: "delete" },
+                { kind: "step_deleted" },
+            ],
+        },
+        {
             id: "receipt-clean-stream-not-headers-or-failure",
             actions: [
                 bootstrap,

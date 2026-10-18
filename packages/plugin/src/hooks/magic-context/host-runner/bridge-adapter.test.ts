@@ -42,6 +42,35 @@ const cleanups: (() => void | Promise<void>)[] = [];
 afterEach(async () => {
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
+test("bridge session deletion sends one scoped op per call and propagates relay failures", async () => {
+    const options = fixture();
+    const calls: { method: string; bytes: string }[] = [];
+    let fail = true;
+    const adapter = await createBridgeAdapter({
+        ...options,
+        transport: {
+            async request(method, body) {
+                calls.push({ method, bytes: Buffer.from(body).toString() });
+                if (fail) throw { source: "relay", code: "relay_unavailable" };
+                return Buffer.from('{"answer":"deleted"}');
+            },
+        },
+    });
+    cleanups.push(() => adapter.dispose());
+    await expect(adapter.onSessionDeleted("deleted-session")).rejects.toEqual({
+        source: "relay",
+        code: "relay_unavailable",
+    });
+    fail = false;
+    await adapter.onSessionDeleted("deleted-session");
+    await adapter.onSessionDeleted("deleted-session");
+    expect(calls).toEqual(
+        Array.from({ length: 3 }, () => ({
+            method: "compaction.delete",
+            bytes: '{"method":"compaction.delete","params":{"session":"deleted-session","harness":"opencode"},"accept_reply_pages":true}',
+        })),
+    );
+});
 function message(id: string): MessageLike {
     return {
         info: {

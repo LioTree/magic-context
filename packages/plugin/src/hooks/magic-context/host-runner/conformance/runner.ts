@@ -261,6 +261,37 @@ class Relay {
     async step(action: Action): Promise<VectorStep> {
         this.trace = [];
         switch (action.kind) {
+            case "delete":
+            case "step_deleted": {
+                const method = action.kind === "delete" ? "compaction.delete" : "compaction.step";
+                const request = {
+                    method,
+                    params: {
+                        session: "relay-v1",
+                        harness: "opencode",
+                        ...(action.kind === "step_deleted"
+                            ? {
+                                  request_id: "deleted-step",
+                                  lineage_id: this.record.lineage_id,
+                                  step_id: "deleted-step",
+                                  step_kind: "user_turn",
+                                  model: "fixture",
+                                  context_window: 100_000,
+                                  estimate: { request_tokens: 1 },
+                                  messages: [],
+                                  now: this.clock,
+                              }
+                            : {}),
+                    },
+                };
+                const request_bytes = JSON.stringify(request);
+                const answer_bytes = await this.oracle(JSON.parse(request_bytes));
+                this.trace.push({ method, request_bytes, answer_bytes, delivery: "answer" });
+                const answer = JSON.parse(answer_bytes);
+                if (action.kind === "delete") assert.deepEqual(answer, { answer: "deleted" });
+                else assert.equal(answer.oracle_error?.code, "provider_conversation_missing");
+                break;
+            }
             case "bootstrap":
                 await this.bootstrap();
                 this.publishReceipt();

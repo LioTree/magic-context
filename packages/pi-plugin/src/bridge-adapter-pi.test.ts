@@ -72,6 +72,31 @@ const host = {
 	tools: [],
 };
 
+test("Pi session deletion sends exactly one scoped provider op per call", async () => {
+	const calls: string[] = [];
+	const adapter = await createPiBridgeAdapter({
+		...fixture(),
+		transport: {
+			async request(method, body) {
+				expect(method).toBe("compaction.delete");
+				calls.push(Buffer.from(body).toString());
+				return Buffer.from('{"answer":"deleted"}');
+			},
+		},
+	});
+	try {
+		await adapter.onSessionDeleted("pi-deleted");
+		await adapter.onSessionDeleted("pi-deleted");
+		expect(calls).toEqual(
+			Array(2).fill(
+				'{"method":"compaction.delete","params":{"session":"pi-deleted","harness":"pi"},"accept_reply_pages":true}',
+			),
+		);
+	} finally {
+		await adapter.dispose();
+	}
+});
+
 test("Pi projection round trips text, signatures, tool arguments and vendor extras", () => {
 	const e = entry("stable-id", "assistant", "café\r\n");
 	e.message.content = [
