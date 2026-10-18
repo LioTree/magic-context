@@ -8968,12 +8968,48 @@ const UNPAIRED_PREFIX_REWRITE_SITE = "pi-unpaired-prefix-rewrite";
  * Whether this pass's state can lead the pipeline into a signed-prefix rewrite,
  * which omits every signed block and so must commit inside the companion
  * transaction. These are the pipeline's rewrite causes known before it runs: a
- * recovery or fit rebuild, a carried tag-identity repair, and, with the hold
- * off, a first render without a cached pair or the 95% wall.
+ * recovery or fit rebuild, a carried tag-identity repair, a missing served-prefix
+ * anchor, and, with the hold off, a first render without a cached pair or the 95% wall.
  */
 function piPassMayRewritePrefix(args: RunPipelineArgs): boolean {
 	if (args.recoveryRebuildReason || args.forceSignedRebuildForFit) return true;
 	if (readPiIdentityRebuilds(args.db, args.sessionId).length > 0) return true;
+	if (
+		args.injection &&
+		args.reasoningClearing?.prefixBound === true &&
+		!hasActiveAnthropicThinkingTurn(
+			args.messages,
+			args.resolvedProviderID,
+			args.resolvedModelID,
+		) &&
+		(args.messages as unknown[]).some(piMessageHasThinking)
+	) {
+		// Repairing a missing record or first-kept identity omits signed thinking
+		// before rendering. Choose the whole-pass pair before any lane commits.
+		const entryIds = piCompanionEntryIds(args);
+		const stableId = (_message: unknown, index: number) => entryIds[index];
+		const prefix = new PiPrefixPass(
+			args.db,
+			args.sessionId,
+			args.messages,
+			stableId,
+			false,
+			false,
+			args.prefixBranch,
+		);
+		if (
+			prefix.needsRepair(args.messages, stableId) ||
+			!prefix.hasFirstKept(args.messages, stableId)
+		) {
+			const plan = planPiProactiveThinkingStrip({
+				db: args.db,
+				sessionId: args.sessionId,
+				messages: args.messages as unknown[],
+				entryIds,
+			});
+			if (!plan || plan.entryIds.length > 0) return true;
+		}
+	}
 	if (args.signedThinkingHold === "on") return false;
 	if (args.contextUsage.percentage >= 95) return true;
 	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
