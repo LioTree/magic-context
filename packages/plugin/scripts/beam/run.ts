@@ -492,8 +492,9 @@ function pidFile(settings: Settings): string {
 function killStaleHost(settings: Settings): void {
     const pid = Number(readIfExists(pidFile(settings)).trim());
     if (!pid) return;
-    const command = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", windowsHide: true }).stdout;
-    if (command.includes("opencode") && command.includes("serve")) {
+    // `ps` is not available inside the macOS sandbox; `pgrep` is.
+    const running = spawnSync("pgrep", ["-f", "opencode-.* serve"], { encoding: "utf8", windowsHide: true }).stdout;
+    if (running.split("\n").some((line) => Number(line.trim()) === pid)) {
         log(`stopping a host left by an earlier run (pid ${pid})`);
         try {
             process.kill(pid, "SIGKILL");
