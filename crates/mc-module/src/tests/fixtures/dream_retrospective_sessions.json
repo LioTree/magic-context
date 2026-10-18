@@ -1,0 +1,26 @@
+[
+  {
+    "projectPath": "project",
+    "sessionId": "source-session",
+    "updatedAt": 300,
+    "oldestPendingTs": 100,
+    "messages": [
+      {"sessionId":"source-session","ordinal":1,"role":"user","text":"You edited unrelated files again. I already asked you to stay within the requested scope.","ts":100},
+      {"sessionId":"source-session","ordinal":2,"role":"user","text":"Stop skipping the test run. This is the third time I have had to ask for verification.","ts":200},
+      {"sessionId":"source-session","ordinal":3,"role":"user","text":"Please explain the plan before making another broad change.","ts":300}
+    ],
+    "truncated": false,
+    "overlap": []
+  },
+  {
+    "projectPath": "foreign-project",
+    "sessionId": "foreign-session",
+    "updatedAt": 900,
+    "oldestPendingTs": 900,
+    "messages": [
+      {"sessionId":"foreign-session","ordinal":1,"role":"user","text":"FOREIGN SECRET must not enter this project's retrospective.","ts":900}
+    ],
+    "truncated": false,
+    "overlap": []
+  }
+]

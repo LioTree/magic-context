@@ -426,6 +426,9 @@ impl McHandler {
         key: &Key,
         retry_snapshot: &mut bool,
     ) -> Result<Option<PreparedHistorianAction>, HandlerOutcome> {
+        let rust_background_enabled = self
+            .effective_config(&binding.project_root)
+            .rust_background_enabled();
         let store = self
             .store
             .get()
@@ -749,6 +752,7 @@ impl McHandler {
                     &prepare_binding.project_root.to_string_lossy(),
                     &projection,
                     HistorianPrepareContext {
+                        rust_background_enabled: Some(rust_background_enabled),
                         now: now_ms(),
                         snapshot_generation: None,
                         publication_fence: Some(Arc::new(LogPublicationFence {
@@ -1329,6 +1333,7 @@ mod tests {
             &binding(h).project_root.to_string_lossy(),
             &projection,
             HistorianPrepareContext {
+                rust_background_enabled: None,
                 now: now_ms(),
                 snapshot_generation: None,
                 publication_fence: None,
@@ -1725,6 +1730,60 @@ mod tests {
             .unwrap();
         assert_eq!(before.len(), after.len());
         assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn i4_provider_task_overrides_builder_off_default_with_captured_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = handler(dir.path());
+        h.fixed_config.as_mut().unwrap().rust_background_enabled = true;
+        declare(&h).await;
+        let entries = corpus();
+        warm(&h, &entries[..3]).await;
+        let prepared = prepared_append(&h, &entries).await;
+        assert!(prepared.task.rust_background_enabled);
+        let (from, to) = (
+            prepared.task.firing.from_ordinal,
+            prepared.task.firing.to_ordinal,
+        );
+        h.fixed_config.as_mut().unwrap().rust_background_enabled = false;
+        let StorageBackend::Sqlite { path } =
+            dev_descriptor_at(dir.path().to_str().unwrap()).backend
+        else {
+            panic!("SQLite fixture required");
+        };
+        let conn =
+            rusqlite::Connection::open(Path::new(&path).parent().unwrap().join("context.db"))
+                .unwrap();
+        conn.execute("INSERT INTO compartment_state_lease(session_id, holder_id, owner_pid, acquired_at, expires_at) VALUES ('s', 'ts-wrapup', ?1, ?2, ?3)", rusqlite::params![std::process::id(), now_ms(), now_ms() + 300_000]).unwrap();
+        let worker = h.provider_historian_worker();
+        let task = tokio::spawn(McHandler::execute_historian_firing_task(
+            worker.producer_factory.clone(),
+            prepared.task,
+        ));
+        let run = pending(&h).await;
+        claim_and_report(&h, run, from, to).await;
+        let error = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::historian::HistorianDriveError::State(
+                crate::historian::HistorianStateError::Publish(
+                    mc_store::HistorianPublishError::Deferred { .. }
+                )
+            )
+        ));
+        let store = h.store.get().unwrap();
+        assert_eq!(store.load_compartments("s").unwrap().len(), 1);
+        assert!(store
+            .load_parked_historian_run("s")
+            .unwrap()
+            .unwrap()
+            .report
+            .is_some());
     }
 
     #[tokio::test]

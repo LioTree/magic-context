@@ -88,6 +88,11 @@ pub enum SignedThinkingHold {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct McModuleConfig {
+    /// User-only opt-in to Rust dream-task scheduling, incremental historian
+    /// publication and embedding drains, instead of the corresponding TS work.
+    /// The off-thread executors capture this through the accessor once per unit;
+    /// retrieval and UI reads do not consult it. Defining it starts no work.
+    pub rust_background_enabled: bool,
     /// User-only opt-in; existing signed-thinking byte protections are independent of this setting.
     pub signed_thinking_hold: SignedThinkingHold,
     /// Historian-only previews, with project entries overriding user entries.
@@ -184,6 +189,7 @@ pub struct CatalogConfigInputs {
 impl Default for McModuleConfig {
     fn default() -> Self {
         Self {
+            rust_background_enabled: false,
             signed_thinking_hold: SignedThinkingHold::Off,
             historian_temperature: None,
             historian_expand_tools: Default::default(),
@@ -278,6 +284,12 @@ fn resolve_threshold_config(
 }
 
 impl McModuleConfig {
+    /// Capture `rust_background_enabled` at the start of a background unit and pass
+    /// the value to nested calls so a config reload cannot split one run's ownership.
+    pub fn rust_background_enabled(&self) -> bool {
+        self.rust_background_enabled
+    }
+
     pub fn resolve_keep_reasoning_tokens(&self, model_key: Option<&str>) -> u64 {
         let Some(value) = &self.keep_reasoning_tokens else {
             return 10_000;
@@ -817,6 +829,10 @@ fn merge_tiers_with_warnings(
     }
 
     if let Some(user) = user {
+        cfg.rust_background_enabled = user
+            .get("rust_background_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if let Some(value) = user.get("signed_thinking_hold") {
             match value.as_str() {
                 Some("on") => cfg.signed_thinking_hold = SignedThinkingHold::On,
@@ -925,6 +941,7 @@ fn merge_tiers_with_warnings(
     }
 
     if let Some(project) = project {
+        warn_ignored_project_key(project, "/rust_background_enabled", &mut warnings);
         warn_ignored_project_key(project, "/signed_thinking_hold", &mut warnings);
         // Cache lifetime controls idle-expiry scheduling, not prompt text, so project config may
         // set it. Project entries replace user entries with the same key.
@@ -1483,6 +1500,41 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn owner_prep_activation_is_explicit_boolean_user_only_and_default_off() {
+        use super::{merge_tiers_with_warnings, McModuleConfig};
+        use serde_json::json;
+
+        assert!(!McModuleConfig::default().rust_background_enabled());
+        for user in [
+            json!({}),
+            json!({"rust_background_enabled": false}),
+            json!({"rust_background_enabled": "true"}),
+            json!({"rust_background_enabled": 1}),
+            json!({"rust_background_enabled": null}),
+        ] {
+            assert!(!merge_tiers_with_warnings(Some(&user), None)
+                .0
+                .rust_background_enabled());
+        }
+        assert!(!merge_tiers_with_warnings(None, None)
+            .0
+            .rust_background_enabled());
+        assert!(
+            !merge_tiers_with_warnings(None, Some(&json!({"rust_background_enabled": true})))
+                .0
+                .rust_background_enabled()
+        );
+        let (config, warnings) = merge_tiers_with_warnings(
+            Some(&json!({"rust_background_enabled": true})),
+            Some(&json!({"rust_background_enabled": false})),
+        );
+        assert!(config.rust_background_enabled());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("rust_background_enabled")));
+    }
+
     #[test]
     fn signed_thinking_hold_is_off_by_default_and_user_only() {
         use super::{merge_tiers_with_warnings, SignedThinkingHold};
