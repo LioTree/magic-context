@@ -7984,6 +7984,26 @@ impl McStore {
         })
     }
 
+    /// Whether this identity still awaits the single-store migration. Older layouts
+    /// without the authority table have no managed identities.
+    pub fn is_authority_managed(&self, project_identity: &str) -> Result<bool, McStoreError> {
+        self.context_read(|conn| {
+            let has_table: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'authority_managed')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_table {
+                return Ok(false);
+            }
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM authority_managed WHERE project_path = ?1)",
+                [project_identity],
+                |row| row.get(0),
+            )
+        })
+    }
+
     /// The installed `context.db` domain's status block, or null when none is installed.
     pub fn context_domain_status(&self) -> Value {
         self.context
@@ -18702,6 +18722,41 @@ mod tests {
                 path: dir.join("store.db").to_string_lossy().to_string(),
             },
         }
+    }
+
+    #[test]
+    fn authority_managed_reads_the_context_domain_and_tracks_row_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store.with_context_conn_for_test(|conn| {
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS authority_managed (project_path TEXT PRIMARY KEY, context_store_uuid TEXT NOT NULL, marked_at INTEGER NOT NULL);
+                INSERT INTO authority_managed VALUES ('git:managed', 'fixture', 1);")
+        }).unwrap();
+        assert!(store.is_authority_managed("git:managed").unwrap());
+        assert!(!store.is_authority_managed("git:other").unwrap());
+        store
+            .with_context_conn_for_test(|conn| conn.execute_batch("DELETE FROM authority_managed"))
+            .unwrap();
+        assert!(!store.is_authority_managed("git:managed").unwrap());
+        store
+            .with_context_conn_for_test(|conn| conn.execute_batch("DROP TABLE authority_managed"))
+            .unwrap();
+        assert!(!store.is_authority_managed("git:managed").unwrap());
+    }
+
+    #[test]
+    fn authority_managed_propagates_context_query_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .with_context_conn_for_test(|conn| {
+                conn.execute_batch(
+                    "DROP TABLE IF EXISTS authority_managed;
+                CREATE TABLE authority_managed (wrong_column TEXT);",
+                )
+            })
+            .unwrap();
+        assert!(store.is_authority_managed("git:managed").is_err());
     }
 
     fn commit_scheduler_observation(

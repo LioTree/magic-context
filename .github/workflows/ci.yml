@@ -238,6 +238,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Fetch pinned standalone differential base
+        run: git fetch --no-tags --depth=1 origin "$(grep -v '^#' .github/standalone-differential-base)"
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -693,6 +696,9 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@v5
+
+      - name: Fetch pinned standalone differential base
+        run: git fetch --no-tags --depth=1 origin "$(grep -v '^#' .github/standalone-differential-base)"
 
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -19,6 +19,15 @@ type KnownSlot = {
  * a negative cache cannot quietly become permanent.
  */
 const KNOWN_SLOTS: Record<string, KnownSlot> = {
+    "packages/plugin/src/features/magic-context/memory/project-pin-writer.ts:exitRegistered": {
+        classification: "PUBLICATION",
+        reason: "Records installation of the process-exit pin-writer drain, not a persistence outcome; failed and overflowed writes remain retryable.",
+    },
+    "packages/plugin/src/features/magic-context/memory/project-pin-writer.ts:workerUnavailableReported":
+        {
+            classification: "DIAGNOSTIC",
+            reason: "Suppresses duplicate worker-unavailable log messages only; in-process pin writes still run on every fallback attempt.",
+        },
     "packages/plugin/src/features/magic-context/compaction-marker-candidates.ts:exitRegistered": {
         classification: "PUBLICATION",
         reason: "Records that the process-exit handler stopping marker candidate workers is installed; it stores no candidate, absence or failure verdict.",

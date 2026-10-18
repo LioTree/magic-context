@@ -1,5 +1,8 @@
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
-import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
+import {
+    awaitSessionIdentityDecision,
+    forgetSessionIdentityDecision,
+} from "../../features/magic-context/memory/session-identity-decision";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
 import {
     detectLatestTurnThinkingMismatch,
@@ -136,6 +139,7 @@ export interface EventHandlerDeps {
     onSessionDeleted?: (sessionId: string) => Promise<void> | void;
     rustSessionCleanup?: boolean;
     allowHomeProject?: boolean;
+    subcConnectionFile?: string;
     config: {
         clear_reasoning_age?: unknown;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
@@ -344,7 +348,13 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     recordSessionProjectIdentity(
                         deps.db,
                         info.id,
-                        resolveProjectIdentityForSession(info.directory, deps.allowHomeProject),
+                        (
+                            await awaitSessionIdentityDecision(info.id, info.directory, {
+                                db: deps.db,
+                                allowHomeProject: deps.allowHomeProject,
+                                connectionFile: deps.subcConnectionFile,
+                            })
+                        ).identity,
                     );
                 }
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
@@ -1295,6 +1305,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
+            forgetSessionIdentityDecision(sessionId);
             dropSlot(sessionId, "session.deleted");
             clearLkgMeasuredRequest(sessionId);
             clearTrackedOpenCodeSession(sessionId);

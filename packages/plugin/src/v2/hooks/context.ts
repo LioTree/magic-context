@@ -20,6 +20,11 @@ import {
     resolveProjectIdentityForSession,
     setHomeProjectPermission,
 } from "../../features/magic-context/memory/project-identity";
+import {
+    awaitSessionIdentityDecision,
+    forgetSessionIdentityDecision,
+    readSessionIdentityDecision,
+} from "../../features/magic-context/memory/session-identity-decision";
 import { detectOverflow } from "../../features/magic-context/overflow-detection";
 import { createScheduler } from "../../features/magic-context/scheduler";
 import { backfillSessionActivity } from "../../features/magic-context/session-activity";
@@ -845,11 +850,12 @@ export async function registerContext(context: V2Context) {
     const dreamerDisabledNow = (): boolean =>
         dreamerRunConfig(config, liveConfigReader.poll().effective).dreamer?.disable === true;
     const startDreamer = (executor: HiddenCompletionExecutor) => {
+        if (!dreamerAtBoot || dreamerDisabledNow()) return undefined;
         const projectIdentity = resolveProjectIdentityForSession(
             directory,
             config.allow_home_project,
         );
-        if (!projectIdentity || !dreamerAtBoot || dreamerDisabledNow()) return undefined;
+        if (!projectIdentity) return undefined;
         const cappedExecutor = withLiveDreamerOutputCap(
             executor,
             config,
@@ -958,6 +964,20 @@ export async function registerContext(context: V2Context) {
     const variants = new Map<string, string | undefined>();
     const agents = new Map<string, string>();
     const sessionDirectories = new Map<string, string>();
+    const sessionProjectDirectory = (sessionID: string) =>
+        sessionDirectories.get(sessionID) ?? directory;
+    const prepareSessionIdentity = async (sessionID: string) => {
+        await cacheV2SessionDirectory(context.session, sessionID, sessionDirectories);
+        return awaitSessionIdentityDecision(sessionID, sessionProjectDirectory(sessionID), {
+            db,
+            allowHomeProject: config.allow_home_project,
+            connectionFile: config.subc?.connection_file,
+        });
+    };
+    const sessionProjectIdentity = (sessionID: string) =>
+        readSessionIdentityDecision(sessionID, sessionProjectDirectory(sessionID), {
+            allowHomeProject: config.allow_home_project,
+        })?.identity;
     const historyRefreshSessions = new Set<string>();
     registerSystemDateRefresh(historyRefreshSessions);
     const pendingMaterializationSessions = new Set<string>();
@@ -1267,6 +1287,7 @@ export async function registerContext(context: V2Context) {
                     continue;
                 }
                 if (event.type === "session.deleted") {
+                    forgetSessionIdentityDecision(sessionID);
                     clearLkgMeasuredRequest(sessionID);
                     deletedSessions.add(sessionID);
                     transform?.clearSessionLogState(sessionID);
@@ -1328,21 +1349,22 @@ export async function registerContext(context: V2Context) {
             }) ||
             draft.model.limit?.context ||
             (state.lastObservedModelKey === modelKey ? state.lastUsageContextLimit : undefined);
+        const projectIdentity = sessionProjectIdentity(draft.sessionID);
         return materializeM0({
             ...createM0RenderOptions(
                 {
-                    ...createV2TransformFeatureDeps(config, compactionOff, directory),
+                    ...createV2TransformFeatureDeps(config, compactionOff, sessionProjectDirectory(draft.sessionID)),
                     ...createV2ThresholdDeps(config),
                 },
                 usage.get(draft.sessionID)?.usage ?? { percentage: 0, inputTokens: 0 },
                 modelKey,
                 contextLimit,
-                resolveProjectIdentityForSession(directory, config.allow_home_project),
+                projectIdentity,
             ),
             db,
             sessionId: draft.sessionID,
             state,
-            projectDirectory: directory,
+            projectDirectory: sessionProjectDirectory(draft.sessionID),
             hardSignals: {
                 // Reuse the systemPromptHash saved by the system hook after it has
                 // resolved guidance, presets and the date. Hashing the raw compaction
@@ -1381,6 +1403,7 @@ export async function registerContext(context: V2Context) {
         // Leaving `result` unset hands the request back to the host, exactly as if
         // no hook were registered.
         if (compactionOff) return;
+        await prepareSessionIdentity(draft.sessionID);
         if (nativeFoldReplay) rememberHostMedia(draft.messages);
         const reader = openStoreReader();
         try {
@@ -1706,7 +1729,6 @@ export async function registerContext(context: V2Context) {
                 variant: draft.model.variant,
                 model: { providerID: draft.model.providerID, modelID: draft.model.id },
             });
-            await cacheV2SessionDirectory(context.session, draft.sessionID, sessionDirectories);
             // Background historian reads outlive the context callback. Keep its source
             // registered until plugin disposal, rather than falling back to the v1 store.
             prepareHistorySession(draft.sessionID);
@@ -2180,6 +2202,10 @@ export async function registerContext(context: V2Context) {
     };
     await context.session.hook("context", (draft) =>
         withSqliteTransformPass(async () => {
+            // Resumed sessions have no creation event. Settle their shared decision
+            // before any managed-context reader can render or bind a project.
+            if (!deletedSessions.has(draft.sessionID))
+                await prepareSessionIdentity(draft.sessionID);
             const anchor = generateReplayAnchor(draft.messages);
             await runManagedContext(draft);
             // The shared last-good-request slot is saved before m[0] is replaced
@@ -2274,14 +2300,14 @@ export async function registerContext(context: V2Context) {
         }
         const runDb = db;
         const runExecutor = hiddenCompletionExecutor;
+        await prepareSessionIdentity(sessionId);
         void runManualDreamNow({
             db: runDb,
             dreamer: manualDreamer,
             smartNotesEnabled: config.smart_notes.enabled,
             memoryEnabled: config.memory.enabled,
-            projectIdentity:
-                resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
-            directory,
+            projectIdentity: sessionProjectIdentity(sessionId) ?? "",
+            directory: sessionProjectDirectory(sessionId),
             language: config.language,
             mural: config.mural,
             executor: runExecutor,

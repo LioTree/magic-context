@@ -41,6 +41,10 @@ fn normalize_stored_project_path_preserves_identity_values() {
         normalize_stored_project_path("dir:deadbeef0000"),
         "dir:deadbeef0000"
     );
+    assert_eq!(
+        normalize_stored_project_path("pj-dashboard-editor").as_bytes(),
+        b"pj-dashboard-editor"
+    );
 }
 
 #[test]

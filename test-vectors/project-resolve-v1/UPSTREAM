@@ -1,0 +1,5 @@
+entorhinal abf7a13fe941e6fbde3a561a12f6e1e7fb5b70a7
+The revision above is the pinned upstream Git commit.
+Source: test-vectors/project-resolve-v1/
+README.md, SHA256SUMS, enumerate.json, resolve-project-id.json and resolve.json
+are copied byte for byte from the pinned upstream revision.

@@ -347,6 +347,10 @@ export async function getProjectCards(): Promise<import("./types").ProjectCard[]
   return invoke("get_project_cards");
 }
 
+export async function refreshProjectNames(): Promise<void> {
+  return invoke("refresh_project_names");
+}
+
 export async function enumerateMemoryProjects(): Promise<ProjectRow[]> {
   return invoke("enumerate_memory_projects");
 }

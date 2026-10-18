@@ -33,7 +33,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionContext,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import {
 	curateCategoryForMemoryCategory,
 	getActiveCurateCategory,
@@ -350,7 +353,10 @@ export interface CtxMemoryToolDeps {
 	memoryEnabled?: boolean;
 	embeddingEnabled?: boolean;
 	/** Resolve a directory's project identity, allowing home only when user-level configuration enables it. */
-	resolveProjectIdentity?: (directory: string) => string | undefined;
+	resolveProjectIdentity?: (
+		directory: string,
+		ctx: ExtensionContext,
+	) => string | undefined;
 	/** When true, Curate-only execution fields and guards are enabled. The separate
 	 *  ctx_memory_list registration uses this mode to reuse the list handler. */
 	allowDreamerActions?: boolean;
@@ -381,8 +387,10 @@ export function createCtxMemoryTool(
 			? receipt
 			: `Error: ${receipt.reason}; memory is unchanged.`;
 	};
-	const resolveProject =
-		deps.resolveProjectIdentity ?? resolveProjectIdentityForSession;
+	const resolveProject = (directory: string, ctx: ExtensionContext) =>
+		deps.resolveProjectIdentity
+			? deps.resolveProjectIdentity(directory, ctx)
+			: resolveProjectIdentityForSession(directory);
 	return {
 		name: "ctx_memory",
 		label: "Magic Context: Memory",
@@ -415,7 +423,7 @@ export function createCtxMemoryTool(
 				);
 			}
 
-			const projectIdentity = resolveProject(ctx.cwd);
+			const projectIdentity = resolveProject(ctx.cwd, ctx);
 			if (!projectIdentity) {
 				return err(
 					"Error: Could not resolve project identity for memory action.",

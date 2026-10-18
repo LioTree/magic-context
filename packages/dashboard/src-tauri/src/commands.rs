@@ -449,6 +449,13 @@ pub fn get_project_cards(state: State<'_, AppState>) -> Result<Vec<db::ProjectCa
     Ok(db::get_project_cards(&conn))
 }
 
+#[tauri::command]
+pub async fn refresh_project_names() {
+    crate::project_names::cache()
+        .refresh(&crate::project_names::connection_file())
+        .await;
+}
+
 #[tauri::command(async)]
 pub fn get_compartments(
     state: State<'_, AppState>,

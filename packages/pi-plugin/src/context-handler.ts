@@ -43,10 +43,11 @@ import {
 	renewCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
 import { isFailClosedBlockingError } from "@magic-context/core/features/magic-context/fail-closed-block";
+import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
-	isUsableProjectIdentity,
-	resolveProjectIdentityForSession,
-} from "@magic-context/core/features/magic-context/memory/project-identity";
+	awaitSessionIdentityDecision,
+	readSessionIdentityDecision,
+} from "@magic-context/core/features/magic-context/memory/session-identity-decision";
 import {
 	clearSessionTracking,
 	scheduleIncrementalIndex,
@@ -1721,6 +1722,7 @@ export interface PiContextHandlerOptions {
 	compactionOff?: boolean;
 	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
 	allowHomeProject?: boolean;
+	subcConnectionFile?: string;
 	maybeAutoEmbedSession?: (
 		sessionId: string,
 		projectDir: string,
@@ -4396,6 +4398,13 @@ export function registerPiContextHandler(
 			const options =
 				baseOptions.resolveForProject?.(projectDirectory) ?? baseOptions;
 			lkgOptions = options;
+			await guardAwait(
+				awaitSessionIdentityDecision(sessionId, projectDirectory, {
+					allowHomeProject: options.allowHomeProject,
+					connectionFile: options.subcConnectionFile,
+					db: options.db,
+				}),
+			);
 			const deliveryModelKey = resolvePiContextModelKey(ctx);
 			if (!budget.sideTurn && deliveryModelKey) {
 				const parentId = ctx.sessionManager.getLeafId?.();
@@ -4412,10 +4421,9 @@ export function registerPiContextHandler(
 			const scheduler = schedulerFor(options);
 			lkgCompactionOff = options.compactionOff === true;
 			const projectIdentity =
-				resolveProjectIdentityForSession(
-					projectDirectory,
-					options.allowHomeProject,
-				) ?? "";
+				readSessionIdentityDecision(sessionId, projectDirectory, {
+					allowHomeProject: options.allowHomeProject,
+				})?.identity ?? "";
 			logTransformTiming(
 				sessionId,
 				"findSessionId",

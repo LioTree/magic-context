@@ -69,6 +69,7 @@ fn main() {
             commands::enumerate_projects,
             commands::enumerate_memory_projects,
             commands::get_project_cards,
+            commands::refresh_project_names,
             commands::get_compartments,
             commands::get_session_facts,
             commands::get_session_notes,
@@ -126,6 +127,10 @@ fn main() {
             commands::apply_workspace_changes,
         ])
         .setup(|app| {
+            tauri::async_runtime::block_on(
+                magic_context_dashboard_lib::project_names::cache()
+                    .initialize(&magic_context_dashboard_lib::project_names::connection_file()),
+            );
             // ── macOS app menu bar ──
             let app_handle_for_menu = app.app_handle().clone();
             let check_updates_item =

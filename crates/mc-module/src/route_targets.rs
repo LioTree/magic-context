@@ -112,15 +112,17 @@ pub(crate) enum RegisteredRoute {
     SessionResolve,
     HistorianRunner,
     ProviderRunner,
+    EntorhinalResolve,
 }
 
 impl RegisteredRoute {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::SessionResolve,
         Self::HistorianRunner,
         Self::ProviderRunner,
         Self::EngramDoor,
         Self::EntorhinalSessionRef,
+        Self::EntorhinalResolve,
     ];
 
     fn module_id(self, config: &RouteTargetConfig) -> Option<&str> {
@@ -130,6 +132,7 @@ impl RegisteredRoute {
             Self::SessionResolve => Some(DEFAULT_THALAMUS_MODULE_ID),
             Self::HistorianRunner => config.runner_module_id(),
             Self::ProviderRunner => Some(config.provider_runner_module_id()),
+            Self::EntorhinalResolve => Some("entorhinal"),
         }
     }
 
@@ -141,6 +144,8 @@ impl RegisteredRoute {
             Self::EngramDoor | Self::EntorhinalSessionRef => Vec::new(),
             // A lookup on the session registry: it spends nothing and shapes no surface.
             Self::SessionResolve => Vec::new(),
+            // Project lookup is read-only and optional, not a startup dependency.
+            Self::EntorhinalResolve => Vec::new(),
             // Callbacks and transcript reads spend no provider quota. Declaring this target
             // does not open a connection or require the runner to be registered at startup.
             Self::ProviderRunner => Vec::new(),
@@ -227,7 +232,7 @@ pub(crate) fn expected_routes_for_tests(runner: &str) -> Vec<String> {
     #[cfg(feature = "agent-data")]
     let routes = vec!["thalamus", runner, "engram", "entorhinal"];
     #[cfg(not(feature = "agent-data"))]
-    let routes = vec!["thalamus", runner];
+    let routes = vec!["thalamus", runner, "entorhinal"];
     routes.into_iter().map(str::to_owned).collect()
 }
 
@@ -285,6 +290,23 @@ mod tests {
         );
         assert!(host.target(RegisteredRoute::HistorianRunner).is_none());
         assert!(self_signals(&host).is_empty());
+    }
+
+    #[test]
+    fn entorhinal_lookup_is_a_read_only_management_route() {
+        let config = RouteTargetConfig::host_runner();
+        assert_eq!(
+            config.target(RegisteredRoute::EntorhinalResolve),
+            Some(RouteTarget::ManagementSurface {
+                module_id: "entorhinal".to_string()
+            })
+        );
+        assert!(RegisteredRoute::EntorhinalResolve.self_signals().is_empty());
+        let manifest = crate::manifest_with_route_targets(crate::DEFAULT_MODULE_ID, &config);
+        assert!(manifest.capabilities.is_none());
+        assert!(manifest.consumes.iter().any(|role| matches!(role,
+            subc_protocol::manifest::ConsumerRole::ServiceClient { of } if of.iter().any(|module| module == "entorhinal")
+        )));
     }
 
     #[test]
@@ -458,7 +480,7 @@ mod tests {
     /// Run after building ck-mc and ck-subc from the workspace and Cargo.lock's subc revision
     /// into the workspace's debug target directory. No installed daemon or runner is used.
     /// ServiceClient declares possible route targets; unlike required capabilities, it
-    /// must not make startup, health, tools, or host completions depend on Broca.
+    /// must not make startup, health, tools, or host completions depend on Broca or Entorhinal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires the workspace's ck-mc and ck-subc debug binaries"]
     async fn a_host_runner_starts_and_serves_without_broca_through_real_subc() {
@@ -571,8 +593,14 @@ mod tests {
             .env("HOME", root.join("config"))
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("OPENCODE_DB", root.join("opencode.db"))
             .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
-            .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+            .env(
+                "MAGIC_CONTEXT_STORAGE_DIR",
+                root.join("data/cortexkit/magic-context"),
+            )
             .output()
             .unwrap();
         assert!(
@@ -587,10 +615,15 @@ mod tests {
                 .current_dir(workspace)
                 .env("XDG_CONFIG_HOME", root.join("config"))
                 .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_STATE_HOME", root.join("state"))
                 .env("XDG_RUNTIME_DIR", root.join("runtime"))
+                .env("OPENCODE_DB", root.join("opencode.db"))
                 .env("HOME", root.join("config"))
                 .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
-                .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+                .env(
+                    "MAGIC_CONTEXT_STORAGE_DIR",
+                    root.join("data/cortexkit/magic-context"),
+                )
                 .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
                 .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
                 .env_remove(subc_os::LAUNCH_NONCE_FD_ENV)
@@ -636,7 +669,7 @@ mod tests {
                 assert_eq!(
                     catalog.modules.len(),
                     1,
-                    "no runner or gateway may be registered"
+                    "no runner, gateway, or Entorhinal may be registered"
                 );
                 break module.clone();
             }
@@ -653,6 +686,13 @@ mod tests {
         assert!(registered.ready, "{registered:?}");
         assert!(registered.not_ready.is_none(), "{registered:?}");
         assert_eq!(registered.self_signals, Some(vec![]));
+        let declared = crate::manifest_with_route_targets(
+            crate::DEFAULT_MODULE_ID,
+            &RouteTargetConfig::host_runner(),
+        );
+        assert!(declared.consumes.iter().any(|role| matches!(role,
+            subc_protocol::manifest::ConsumerRole::ServiceClient { of } if of.iter().any(|module| module == "entorhinal")
+        )), "Entorhinal must be declared even while unavailable");
         assert!(
             registered.capabilities.is_none(),
             "no required runner capability"
@@ -766,8 +806,29 @@ mod tests {
         assert_eq!(consumer.catalog_list().await.unwrap().modules.len(), 1);
         assert!(
             module.0.try_wait().unwrap().is_none(),
-            "ck-mc must keep serving without Broca"
+            "ck-mc must keep serving without Broca or Entorhinal"
         );
+        let open_files = Command::new("lsof")
+            .args(["-p", &module.0.id().to_string()])
+            .output()
+            .expect("lsof is required to verify the isolated store paths");
+        assert!(open_files.status.success());
+        let listing = String::from_utf8(open_files.stdout).unwrap();
+        let databases: Vec<_> = listing
+            .lines()
+            .filter(|line| line.contains(".db"))
+            .collect();
+        assert!(
+            !databases.is_empty(),
+            "the module must have opened its fixture store"
+        );
+        for line in databases {
+            println!("isolated database: {line}");
+            assert!(
+                line.contains(root.to_str().unwrap()),
+                "database outside fixture: {line}"
+            );
+        }
         consumer.close().await;
     }
 
