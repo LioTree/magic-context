@@ -151,36 +151,42 @@ function log(message: string): void {
     console.log(`[beam ${new Date().toISOString().slice(11, 19)}] ${message}`);
 }
 
-const { values: flags, positionals } = parseArgs({
-    allowPositionals: true,
-    options: {
-        "verify-prompts": { type: "boolean" },
-        split: { type: "string", default: "100K" },
-        conversations: { type: "string", default: "1,2,3,4,5" },
-        run: { type: "string" },
-        stub: { type: "boolean" },
-        opencode: { type: "string" },
-        "answer-model": { type: "string", default: "gpt-6-luna" },
-        "historian-model": { type: "string", default: "gemini-3.8-flash" },
-        "reasoning-effort": { type: "string", default: "none" },
-        temperature: { type: "string", default: "0" },
-        "answer-context-limit": { type: "string", default: "272000" },
-        "answer-output-limit": { type: "string", default: "32000" },
-        "historian-context-limit": { type: "string", default: "1048576" },
-        "historian-output-limit": { type: "string", default: "65536" },
-        "execute-threshold": { type: "string", default: "65" },
-        "max-input-tokens": { type: "string", default: "30000000" },
-        "chatgpt-credential": { type: "string" },
-        "antigravity-credential": { type: "string", default: "antigravity:google" },
-        "voyage-key-file": {
-            type: "string",
-            default: join(process.env.HOME ?? "", ".config", "voyage.key"),
+export function parseBeamArgs(args?: string[]) {
+    return parseArgs({
+        args,
+        allowPositionals: true,
+        options: {
+            "verify-prompts": { type: "boolean" },
+            "smoke-transport": { type: "boolean" },
+            split: { type: "string", default: "100K" },
+            conversations: { type: "string", default: "1,2,3,4,5" },
+            run: { type: "string" },
+            stub: { type: "boolean" },
+            opencode: { type: "string" },
+            "answer-model": { type: "string", default: "gpt-6-luna" },
+            "historian-model": { type: "string", default: "gemini-3.8-flash" },
+            "reasoning-effort": { type: "string", default: "none" },
+            temperature: { type: "string", default: "omit" },
+            "answer-context-limit": { type: "string", default: "272000" },
+            "answer-output-limit": { type: "string", default: "32000" },
+            "historian-context-limit": { type: "string", default: "1048576" },
+            "historian-output-limit": { type: "string", default: "65536" },
+            "execute-threshold": { type: "string", default: "65" },
+            "max-input-tokens": { type: "string", default: "30000000" },
+            "chatgpt-credential": { type: "string" },
+            "antigravity-credential": { type: "string", default: "antigravity:google" },
+            "voyage-key-file": {
+                type: "string",
+                default: join(process.env.HOME ?? "", ".config", "voyage.key"),
+            },
+            questions: { type: "string" },
+            "stop-after": { type: "string" },
+            "reject-codex-after": { type: "string" },
         },
-        questions: { type: "string" },
-        "stop-after": { type: "string" },
-        "reject-codex-after": { type: "string" },
-    },
-});
+    });
+}
+
+const { values: flags, positionals } = parseBeamArgs(import.meta.main ? undefined : []);
 
 function numberFlag(name: keyof typeof flags): number {
     const value = Number(flags[name]);
@@ -303,6 +309,7 @@ async function openUpstreams(settings: Settings): Promise<Upstreams> {
             : null;
     const codexBase = stub ? `${stub.origin}/backend-api/codex` : UPSTREAMS.codex;
     const relay = startRelay({
+        secrets: credentials.secrets,
         routes: [
             {
                 kind: "cloud-code",
@@ -1036,8 +1043,27 @@ async function runMagicContext(
 /** The paper's Table 1 row for GPT-4.1-nano at 100K (Vanilla, RAG, LIGHT), for reference only. */
 export const PAPER_TABLE1_NANO_100K = { vanilla: 0.239, rag: 0.309, light: 0.345 };
 
-function summarizeRun(settings: Settings): Record<string, unknown> {
-    const out: Record<string, unknown> = { run: settings.run, settings };
+export function summarizeRun(settings: Settings): Record<string, unknown> {
+    const out: Record<string, unknown> = {
+        run: settings.run,
+        settings,
+        sampling: {
+            answerTemperature: settings.temperature ?? null,
+            judgeTemperature: settings.temperature ?? null,
+            temperatureSet: settings.temperature !== undefined,
+            paperTemperature: 0,
+        },
+        protocolDeviations:
+            settings.temperature === undefined
+                ? [
+                      "Answer and judge temperature was not set: the Codex subscription backend rejects temperature. The paper used temperature 0.",
+                  ]
+                : settings.temperature !== 0
+                  ? [
+                        `Answer and judge temperature ${settings.temperature} differs from the paper's temperature 0.`,
+                    ]
+                  : [],
+    };
     for (const arm of ["vanilla", "mc"]) {
         const states = loadStates(settings, arm).filter((state) => state.scoring);
         if (states.length === 0) continue;
@@ -1115,8 +1141,8 @@ function printSummary(summary: Record<string, unknown>): void {
     }
 }
 
-/** Send one tiny request through each transport path and print only status, model and token counts. */
-async function smokeTransport(settings: Settings, upstreams: Upstreams): Promise<number> {
+/** Send tiny transport requests, printing token counts on success and sanitized bodies on failure. */
+export async function smokeTransport(settings: Settings, upstreams: Upstreams): Promise<number> {
     let failures = 0;
     try {
         const result = await codexComplete(
@@ -1148,21 +1174,24 @@ async function smokeTransport(settings: Settings, upstreams: Upstreams): Promise
         },
     );
     const text = await response.text();
-    checkUpstreams(upstreams);
     let usage = "";
-    try {
-        const parsed = JSON.parse(text) as {
-            usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
-            modelVersion?: string;
-        };
-        usage = `model=${parsed.modelVersion ?? settings.historianModel} input=${parsed.usageMetadata?.promptTokenCount} output=${parsed.usageMetadata?.candidatesTokenCount}`;
-    } catch {
-        usage = scrub(text, upstreams.credentials.secrets()).slice(0, 400);
-    }
-    if (!response.ok) failures++;
+    if (!response.ok) {
+        usage = scrub(text, [...upstreams.credentials.secrets(), upstreams.relay.hostKey]);
+        failures++;
+    } else
+        try {
+            const parsed = JSON.parse(text) as {
+                usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+                modelVersion?: string;
+            };
+            usage = `model=${parsed.modelVersion ?? settings.historianModel} input=${parsed.usageMetadata?.promptTokenCount} output=${parsed.usageMetadata?.candidatesTokenCount}`;
+        } catch {
+            usage = scrub(text, upstreams.credentials.secrets()).slice(0, 400);
+        }
     console.log(
         `gemini via relay: ${response.ok ? "ok" : `FAILED HTTP ${response.status}`} ${usage}`,
     );
+    checkUpstreams(upstreams);
     const voyage = await fetch(`${upstreams.wiring.embeddingEndpoint}/embeddings`, {
         method: "POST",
         headers: {
@@ -1208,7 +1237,7 @@ async function main(): Promise<number> {
         for (const line of await verifyPrompts(dataDir())) console.log(line);
         return 0;
     }
-    const command = positionals[0];
+    const command = flags["smoke-transport"] ? "smoke-transport" : positionals[0];
     if (command === "prepare") {
         await prepare(flags.split as string);
         return 0;

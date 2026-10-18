@@ -91,9 +91,11 @@ How the throwaway host reaches each upstream without any OpenCode auth plugin or
   `request` is the host's body **unchanged** (`relay.test.ts` proves equality on 200 randomized
   bodies), with `Authorization: Bearer <antigravity token>`. Each streamed `{ "response": X }`
   event (and the non-streamed reply) is returned as `X`. It changes no content. Its log records
-  method, path, status, time to headers, byte counts and the upstream's token counts, never headers
-  or bodies. The route table is keyed by path prefix so a Codex route can be added later under the
-  same rules.
+   method, path, status, time to headers, byte counts and the upstream's token counts. Failed
+   upstream responses also record their complete, secret-scrubbed body in `errorBody`; successful
+   response bodies, request bodies and headers are never logged. Error bodies are scrubbed before
+   being returned to the host too. The route table is keyed by path prefix so a Codex route can be
+   added later under the same rules.
 - **Voyage**: Magic Context's `openai-compatible` embedding provider, `voyage-4`,
   `input_type: document`, `query_input_type: query`, `max_input_tokens: 8192`.
 
@@ -107,7 +109,7 @@ How the throwaway host reaches each upstream without any OpenCode auth plugin or
 | Nugget judge | `judge.txt` (the code's version of Listing 20; no question slot) as one user message, score per nugget, mean over nuggets | `prompts.py`, `compute_metrics.py` |
 | Event ordering | answer split on `\n`; each line aligned to the first unused reference nugget the equivalence prompt calls the same (`"yes"` anywhere in the reply); Kendall tau-b over union ranks; reported score `(tau_b + 1) / 2` | `compute_metrics.py:align_with_llm`, `event_ordering_score`, `report_results.py` |
 | Headline | mean over questions; per-ability means beside it | §2.4 |
-| Answer and judge model | GPT-6 Luna (`gpt-6-luna`) on the ChatGPT subscription, reasoning effort `none`, temperature 0 | operator choice; the paper's judge was `gpt-4.1-mini` at temperature 0 (`src/llm.py`) |
+| Answer and judge model | GPT-6 Luna (`gpt-6-luna`) on the ChatGPT subscription, reasoning effort `none`, temperature **not set** | operator choice; the Codex backend rejects `temperature`. This deviates from the paper's temperature 0; the paper's judge was `gpt-4.1-mini` (`src/llm.py`) |
 | Historian | Gemini 3.8 Flash on Cloud Code Assist, with the generation settings Magic Context sends | operator choice |
 | Dreamer | off | brief |
 
@@ -155,7 +157,7 @@ mkdir -p $B/.runs/host && cp ~/.opencode/bin/opencode-stock-1.18.30 $B/.runs/hos
 bun $B/run.ts prepare                       # dataset at the pinned revision, pyarrow venv
 bun $B/run.ts --verify-prompts              # every vendored prompt, byte for byte
 bun $B/run.ts list-credentials              # non-secret inventory of the mc-e2e grants
-bun $B/run.ts smoke-transport --run smoke --chatgpt-credential chatgpt:openai:NAME
+nice -n 10 bun $B/run.ts --smoke-transport --run smoke --chatgpt-credential chatgpt:openai:NAME
 nice -n 10 bun $B/run.ts vanilla --run spike-100k --chatgpt-credential chatgpt:openai:NAME
 nice -n 10 bun $B/run.ts mc      --run spike-100k --chatgpt-credential chatgpt:openai:NAME
 bun $B/run.ts summary --run spike-100k
@@ -166,7 +168,8 @@ resumable: rerun the same command with the same `--run`; finished questions are 
 answered but unjudged question is only judged, and an unfinished ingest starts over. A run's
 settings are pinned in `runs/<run>/settings.json` and a resumed run with different settings is
 refused. Useful flags: `--conversations 1,2,3,4,5`, `--questions <ids>`, `--split`,
-`--reasoning-effort`, `--temperature <n|omit>`, `--answer-context-limit` (default 272000),
+`--reasoning-effort`, `--temperature <n|omit>` (default `omit`; use `--stub --temperature 0` to
+exercise an explicit zero without the subscription backend), `--answer-context-limit` (default 272000),
 `--max-input-tokens` (per arm, default 30,000,000; the run also stops when the projection for
 the remaining questions crosses it), `--opencode <binary>`.
 
@@ -179,6 +182,15 @@ every judge verdict and equivalence check, and answer, judge and historian token
 records go to `runs/<run>/mc/ingest/`, host and Magic Context logs (secrets scrubbed) to
 `runs/<run>/mc/logs/`, and the summary to `runs/<run>/summary.json`. The command prints per-arm
 means by ability next to the paper's GPT-4.1-nano 100K row, and token totals.
+
+`summary.json` explicitly records `sampling.answerTemperature`, `sampling.judgeTemperature`
+(`null` when not set), `sampling.temperatureSet`, and `protocolDeviations`. Omitting temperature
+does not mean temperature 0. A run previously pinned with temperature 0 needs a new `--run` name
+to use the new default.
+
+`--smoke-transport` (also spelled as the `smoke-transport` subcommand) prints complete sanitized
+Cloud Code error bodies even when they are JSON, before the usual terminal 401/403 stop. The
+body is also saved in `runs/<run>/relay-log-smoke-transport-<pid>.json`. It starts no OpenCode host.
 
 ## Attribution
 

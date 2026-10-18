@@ -1,6 +1,6 @@
 /**
  * A loopback relay that lets the throwaway OpenCode host reach Cloud Code Assist (the Antigravity
- * subscription) without any OpenCode auth plugin or stored login.
+ * subscription) without an OpenCode auth plugin or a stored OpenCode login.
  *
  * OpenCode's `@ai-sdk/google` provider speaks the public Gemini API:
  *
@@ -20,14 +20,14 @@
  * - each upstream `{ response: X }` event is sent back as `X`, other events unchanged;
  * - the host must present the per-run random key it was configured with; the real upstream token is
  *   held only in this process's memory and is sent only to the upstream;
- * - the log records method, path, status, duration, byte counts and the upstream's token counts,
- *   never headers or bodies.
+ * - the log records method, path, status, duration, byte counts and the upstream's token counts;
+ *   only failed upstream responses include a body, with credentials scrubbed before logging.
  *
  * The route table is keyed by path prefix, so a second upstream (for example the ChatGPT Codex
  * backend) can be added as another route under the same rules.
  */
 import { randomBytes, randomUUID } from "node:crypto";
-import { CredentialError } from "./credentials";
+import { CredentialError, scrub } from "./credentials";
 
 export interface RelayLogEntry {
     route: string;
@@ -40,6 +40,8 @@ export interface RelayLogEntry {
     /** Token counts from the upstream's `usageMetadata` (the last one seen), for the budget. */
     inputTokens: number;
     outputTokens: number;
+    /** Sanitized upstream body for non-2xx responses; successful bodies are never logged. */
+    errorBody?: string;
 }
 
 export interface CloudCodeRoute {
@@ -55,6 +57,8 @@ export interface CloudCodeRoute {
 
 export interface RelayOptions {
     routes: CloudCodeRoute[];
+    /** All credential versions seen during the run, resolved when an error is logged. */
+    secrets?: () => string[];
     /** Called once when the upstream rejects the credential (HTTP 401 or 403). */
     onAuthRejected?: (route: string, status: number) => void;
 }
@@ -248,8 +252,14 @@ export function startRelay(options: RelayOptions): Relay {
             };
             if (!upstream.ok || !upstream.body) {
                 const errorText = await upstream.text();
-                entry.bytesOut = Buffer.byteLength(errorText);
-                return finish(new Response(errorText, { status: upstream.status, headers }));
+                const sanitized = scrub(errorText, [
+                    token,
+                    hostKey,
+                    ...(options.secrets?.() ?? []),
+                ]);
+                if (!upstream.ok) entry.errorBody = sanitized;
+                entry.bytesOut = Buffer.byteLength(sanitized);
+                return finish(new Response(sanitized, { status: upstream.status, headers }));
             }
             if (action === "streamGenerateContent") {
                 const stream = unwrapSseStream(upstream.body, entry);

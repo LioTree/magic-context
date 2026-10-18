@@ -157,6 +157,106 @@ describe("Cloud Code relay", () => {
         ]);
     });
 
+    test.each([
+        400, 403, 500,
+    ])("keeps the upstream HTTP %i body with every known secret scrubbed", async (status) => {
+        const previousToken = "previous-cloud-code-token";
+        const upstream = Bun.serve({
+            hostname: "127.0.0.1",
+            port: 0,
+            fetch(request) {
+                return Response.json(
+                    {
+                        error: {
+                            message: "Model is not allowed for this project",
+                            echoedToken: request.headers.get("authorization"),
+                            previousToken,
+                            voyage: expectations.voyageKey,
+                            hostKey: diagnostic.hostKey,
+                        },
+                    },
+                    { status },
+                );
+            },
+        });
+        const diagnostic = startRelay({
+            secrets: () => [previousToken, expectations.voyageKey],
+            routes: [
+                {
+                    kind: "cloud-code",
+                    prefix: "/gemini/v1beta",
+                    upstream: `http://127.0.0.1:${upstream.port}`,
+                    token: () => expectations.cloudCodeToken,
+                    project: expectations.cloudCodeProject,
+                },
+            ],
+        });
+        try {
+            const response = await fetch(
+                `${diagnostic.origin}/gemini/v1beta/models/m:generateContent`,
+                {
+                    method: "POST",
+                    headers: { "x-goog-api-key": diagnostic.hostKey },
+                    body: "{}",
+                },
+            );
+            const expected = JSON.stringify({
+                error: {
+                    message: "Model is not allowed for this project",
+                    echoedToken: "Bearer [REDACTED]",
+                    previousToken: "[REDACTED]",
+                    voyage: "[REDACTED]",
+                    hostKey: "[REDACTED]",
+                },
+            });
+            expect(response.status).toBe(status);
+            expect(await response.text()).toBe(expected);
+            expect(diagnostic.log[0]?.errorBody).toBe(expected);
+            expect(diagnostic.log[0]?.bytesOut).toBe(Buffer.byteLength(expected));
+        } finally {
+            diagnostic.stop();
+            upstream.stop(true);
+        }
+    });
+
+    test("keeps plain-text upstream errors, including an empty body", async () => {
+        let body = "Backend policy: model disabled";
+        const upstream = Bun.serve({
+            hostname: "127.0.0.1",
+            port: 0,
+            fetch: () => new Response(body, { status: 400 }),
+        });
+        const diagnostic = startRelay({
+            routes: [
+                {
+                    kind: "cloud-code",
+                    prefix: "/gemini/v1beta",
+                    upstream: `http://127.0.0.1:${upstream.port}`,
+                    token: () => expectations.cloudCodeToken,
+                    project: expectations.cloudCodeProject,
+                },
+            ],
+        });
+        try {
+            for (const text of [body, ""]) {
+                body = text;
+                const response = await fetch(
+                    `${diagnostic.origin}/gemini/v1beta/models/m:generateContent`,
+                    {
+                        method: "POST",
+                        headers: { "x-goog-api-key": diagnostic.hostKey },
+                        body: "{}",
+                    },
+                );
+                expect(await response.text()).toBe(text);
+                expect(diagnostic.log.at(-1)?.errorBody).toBe(text);
+            }
+        } finally {
+            diagnostic.stop();
+            upstream.stop(true);
+        }
+    });
+
     test("an upstream 401 latches the rejection and stops forwarding", async () => {
         const rejecting = startRelay({
             routes: [
