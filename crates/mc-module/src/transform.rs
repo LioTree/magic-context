@@ -37666,34 +37666,54 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn workspace_membership_change_is_a_render_config_hard() {
+    fn workspace_membership_change_is_held_until_a_natural_hard() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
             .unwrap();
-        run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        // a steady defer (no change)
-        let defer = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(defer.action, "SOFT+");
-
-        // joining a workspace changes the deterministic workspace_fingerprint → the folded
-        // render_config changes → a HARD (m0 is now composed over a different project set).
         s.seed_workspace_member("ws1", "git:proj", "[\"CONSTRAINTS\"]")
             .unwrap();
-        let r = run(
+        s.seed_memory(5, "git:joined", "CONSTRAINTS", "joined workspace rule", 70)
+            .unwrap();
+        s.with_context_conn_for_test(|conn| {
+            conn.execute(
+                "UPDATE memories SET shareable = 1, scope = 'project' WHERE id = 5",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let request = req("ses", "cfg0", vec![item("m1msg", 1, "raw")]);
+        let before = run(&s, &request, &spine());
+        assert_eq!(before.action, "HARD");
+        let served_pair = (m0_bytes(&before).to_owned(), m1_bytes(&before).to_owned());
+        assert!(!served_pair.0.contains("joined workspace rule"));
+        assert!(!served_pair.1.contains("joined workspace rule"));
+
+        s.seed_workspace_member("ws1", "git:joined", "[\"CONSTRAINTS\"]")
+            .unwrap();
+        let after_membership = run(&s, &request, &spine());
+        assert_ne!(
+            after_membership.action, "HARD",
+            "joining a workspace holds the served pair until an independently authorized HARD"
+        );
+        assert_eq!(
+            (m0_bytes(&after_membership), m1_bytes(&after_membership)),
+            (served_pair.0.as_str(), served_pair.1.as_str()),
+            "workspace membership alone must preserve both served heads byte-for-byte"
+        );
+
+        let natural_hard = run(
             &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &req("ses", "cfg1", vec![item("m1msg", 1, "raw")]),
             &spine(),
         );
-        assert_eq!(r.action, "HARD", "a membership change re-materializes m0");
+        assert_eq!(natural_hard.action, "HARD");
+        let rebuilt_pair = format!("{}{}", m0_bytes(&natural_hard), m1_bytes(&natural_hard));
+        assert!(
+            rebuilt_pair.contains("joined workspace rule"),
+            "an independently authorized HARD includes the joined member's content: {rebuilt_pair}"
+        );
     }
 
     #[test]
