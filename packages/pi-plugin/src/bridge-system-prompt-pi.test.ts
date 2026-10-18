@@ -167,7 +167,7 @@ test("bridge freezes dates while warm and adopts dates on content changes and ex
 		expect(
 			adapter.checkSystemPrompt({
 				sessionId,
-				systemPrompt: expired.systemPrompt,
+				systemBlocks: [expired.systemPrompt],
 			}).reason,
 		).toBe("system_prompt_not_prepared");
 		expect(
@@ -191,7 +191,7 @@ test("Pi bridge first-turn system prompt needs no receipt and checks actual byte
 		const sessionId = "first-turn";
 		expect(adapter.receipt(sessionId)).toBeUndefined();
 		expect(
-			adapter.checkSystemPrompt({ sessionId, systemPrompt: base }).reason,
+			adapter.checkSystemPrompt({ sessionId, systemBlocks: [base] }).reason,
 		).toBe("system_prompt_not_prepared");
 		const first = await adapter.systemPrompt({
 			sessionId,
@@ -208,19 +208,21 @@ test("Pi bridge first-turn system prompt needs no receipt and checks actual byte
 			createHash("sha256").update(first.systemPrompt).digest("hex"),
 		);
 		expect(
-			adapter.checkSystemPrompt({ sessionId, systemPrompt: first.systemPrompt })
-				.managed,
+			adapter.checkSystemPrompt({
+				sessionId,
+				systemBlocks: [first.systemPrompt],
+			}).managed,
 		).toBe(true);
 		expect(
 			adapter.checkSystemPrompt({
 				sessionId,
-				systemPrompt: `${first.systemPrompt} `,
+				systemBlocks: [`${first.systemPrompt} `],
 			}),
-		).toMatchObject({ managed: false, reason: "system_prompt_mismatch" });
+		).toMatchObject({ managed: false, reason: "system_prompt_modified" });
 		expect(
 			adapter.checkSystemPrompt({
 				sessionId: "other",
-				systemPrompt: first.systemPrompt,
+				systemBlocks: [first.systemPrompt],
 			}).managed,
 		).toBe(false);
 		expect(
@@ -240,6 +242,175 @@ test("Pi bridge first-turn system prompt needs no receipt and checks actual byte
 		await adapter.dispose();
 	}
 });
+
+// Pi 1.3.0 keeps the leading prompt whole. These fixtures project only text,
+// not Anthropic cache_control, Bedrock cachePoint, or Responses role metadata.
+const providerFormats = [
+	{
+		name: "Anthropic OAuth Messages",
+		blocks: (prompt: string) => {
+			const request = {
+				system: [
+					{
+						type: "text",
+						text: "You are Claude Code, Anthropic's official CLI for Claude.",
+					},
+					{ type: "text", text: prompt, cache_control: { type: "ephemeral" } },
+				],
+			};
+			return request.system.map((block) => block.text);
+		},
+	},
+	...["developer", "system"].map((role) => ({
+		name: `OpenAI Responses ${role}`,
+		blocks: (prompt: string) => {
+			const request = {
+				input: [
+					{ role, content: prompt },
+					{
+						role,
+						content:
+							'Updated system prompt section "style":\n\nUse concise prose.',
+					},
+				],
+			};
+			return request.input.map((item) => item.content);
+		},
+	})),
+	{
+		name: "OpenAI Codex Responses",
+		blocks: (prompt: string) => {
+			// Separate updates require supportsMidConvoSystemMessages in Codex.
+			const request = {
+				instructions: prompt,
+				input: [
+					{
+						role: "developer",
+						content:
+							'Updated system prompt section "style":\n\nUse concise prose.',
+					},
+				],
+			};
+			return [
+				request.instructions,
+				...request.input.map((item) => item.content),
+			];
+		},
+	},
+	{
+		name: "Bedrock Converse",
+		blocks: (prompt: string) => {
+			const request = {
+				system: [{ text: prompt }, { cachePoint: { type: "default" } }],
+			};
+			return request.system.flatMap((block) =>
+				block.text === undefined ? [] : [block.text],
+			);
+		},
+	},
+];
+
+for (const format of providerFormats) {
+	const sessionId = "provider-blocks";
+	async function prepared() {
+		const { adapter } = await fixture();
+		const { systemPrompt } = await adapter.systemPrompt({
+			sessionId,
+			systemPrompt: base,
+			model,
+		});
+		return {
+			adapter,
+			systemPrompt,
+			check: (systemBlocks: string[]) =>
+				adapter.checkSystemPrompt({ sessionId, systemBlocks }),
+		};
+	}
+	test(`${format.name}: accepts exact prepared block and provider-owned neighbors`, async () => {
+		const { adapter, systemPrompt, check } = await prepared();
+		try {
+			const blocks = format.blocks(systemPrompt);
+			expect(check(blocks)).toMatchObject({ managed: true, reason: undefined });
+			expect(check(blocks).blockDigests).toEqual(
+				blocks.map((block) => createHash("sha256").update(block).digest("hex")),
+			);
+			// Also admit host/provider-added text on either side; never allowlist it.
+			expect(
+				check(["Provider preface. 🧭", ...blocks, "Provider tail."]).managed,
+			).toBe(true);
+		} finally {
+			await adapter.dispose();
+		}
+	});
+	test(`${format.name}: refuses missing prepared block`, async () => {
+		const { adapter, systemPrompt, check } = await prepared();
+		try {
+			const blocks = format
+				.blocks(systemPrompt)
+				.filter((b) => b !== systemPrompt);
+			expect(check(blocks)).toMatchObject({
+				managed: false,
+				reason: "system_prompt_missing",
+			});
+		} finally {
+			await adapter.dispose();
+		}
+	});
+	test(`${format.name}: refuses modified prepared block`, async () => {
+		const { adapter, systemPrompt, check } = await prepared();
+		try {
+			for (const modified of [
+				`${systemPrompt} `,
+				systemPrompt.replace("Pi session.", "Changed session."),
+				systemPrompt.replace(/\n/g, "\r\n"),
+			])
+				expect(check(format.blocks(modified))).toMatchObject({
+					managed: false,
+					reason: "system_prompt_modified",
+				});
+			const split = systemPrompt.indexOf("## Magic Context");
+			expect(
+				check([systemPrompt.slice(0, split), systemPrompt.slice(split)]),
+			).toMatchObject({
+				managed: false,
+				reason: "system_prompt_modified",
+			});
+		} finally {
+			await adapter.dispose();
+		}
+	});
+	test(`${format.name}: refuses duplicated prepared or stale MC head`, async () => {
+		const { adapter, systemPrompt, check } = await prepared();
+		try {
+			for (const duplicate of [
+				systemPrompt,
+				`Wrapped ${systemPrompt} copy`,
+				"## Magic Context\nStale guidance.",
+				"<magic_context>Stale section</magic_context>",
+			])
+				expect(
+					check([...format.blocks(systemPrompt), duplicate]),
+				).toMatchObject({
+					managed: false,
+					reason: "system_prompt_duplicated",
+				});
+		} finally {
+			await adapter.dispose();
+		}
+	});
+	test(`${format.name}: refuses duplicated raw prompt alongside`, async () => {
+		const { adapter, systemPrompt, check } = await prepared();
+		try {
+			for (const raw of [base, `Wrapped ${base} copy`])
+				expect(check([...format.blocks(systemPrompt), raw])).toMatchObject({
+					managed: false,
+					reason: "system_prompt_unmanaged_alongside",
+				});
+		} finally {
+			await adapter.dispose();
+		}
+	});
+}
 
 test("standalone before_agent_start and bridge compose byte-identically on Pi and Oh My Pi", async () => {
 	const { root, adapter } = await fixture({
@@ -302,7 +473,7 @@ test("standalone before_agent_start and bridge compose byte-identically on Pi an
 					expect(
 						adapter.checkSystemPrompt({
 							sessionId,
-							systemPrompt: buildSystemPrompt(bridgeOptions),
+							systemBlocks: [buildSystemPrompt(bridgeOptions)],
 						}).managed,
 					).toBe(false);
 				}

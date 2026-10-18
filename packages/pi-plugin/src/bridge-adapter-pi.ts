@@ -41,6 +41,7 @@ import {
 	preloadTokenizer,
 } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { createRustModeTransform } from "@magic-context/core/hooks/magic-context/rust-mode-transform";
+import { sessionLog } from "@magic-context/core/shared/logger";
 import {
 	createPromptSurfaceGuidanceEpochCache,
 	createPromptSurfaceRuntime,
@@ -170,7 +171,10 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 	const facts = createBridgeHostFacts(deps, config);
 	const stickyDates = new Map<string, string>();
 	const systemRefresh = new Set<string>();
-	const managedSystems = new Map<string, string>();
+	const managedSystems = new Map<
+		string,
+		{ prompt: string; hostPrompt: string; digest: string }
+	>();
 	const systemDigest = (system: string) =>
 		createHash("sha256").update(system, "utf8").digest("hex");
 	const clearSystemPrompt = (id: string) => {
@@ -189,6 +193,7 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 		/** Install guidance before the first context pass; no delivery receipt exists yet. */
 		async systemPrompt(input: PiBridgeSystemPromptInput) {
 			idle(input.sessionId);
+			const hostPrompt = input.systemPrompt;
 			if (!input.sessionId || !input.model.provider || !input.model.id)
 				throw new Error("Pi systemPrompt requires a session and model");
 			if (input.systemPromptOptions?.sections && !input.renderSystemPrompt)
@@ -221,25 +226,72 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 				},
 			});
 			const digest = systemDigest(result.systemPrompt);
-			managedSystems.set(input.sessionId, digest);
+			managedSystems.set(input.sessionId, {
+				prompt: result.systemPrompt,
+				hostPrompt,
+				digest,
+			});
 			return { ...result, digest };
 		},
-		/** Compare actual host-built bytes; the caller owns request-refusal policy. */
-		checkSystemPrompt(input: { sessionId: string; systemPrompt: string }) {
+		/** Check ordered provider text blocks without joining or normalizing bytes. */
+		checkSystemPrompt(input: { sessionId: string; systemBlocks: string[] }) {
 			assertOpen();
-			const expectedDigest = managedSystems.get(input.sessionId);
-			const actualDigest = systemDigest(input.systemPrompt);
+			const expected = managedSystems.get(input.sessionId);
+			const blocks = input.systemBlocks.map((text, index) => ({
+				index,
+				length: Buffer.byteLength(text, "utf8"),
+				digest: systemDigest(text),
+				exact: expected !== undefined && text === expected.prompt,
+				prepared:
+					expected !== undefined &&
+					expected.prompt.length > 0 &&
+					text.includes(expected.prompt),
+				marker:
+					text.includes("## Magic Context") || text.includes("<magic_context>"),
+				raw:
+					expected !== undefined &&
+					expected.hostPrompt.length > 0 &&
+					text.includes(expected.hostPrompt),
+			}));
+			const exact = blocks.filter((block) => block.exact);
+			const alongside = blocks.filter((block) => !block.exact);
+			// Pi's providers keep the prepared text in one block, even with caching.
+			// A stale MC head beside it is a duplicate, not provider-owned guidance.
+			const reason = (() => {
+				if (!expected) return "system_prompt_not_prepared" as const;
+				if (
+					exact.length > 1 ||
+					(exact.length === 1 &&
+						alongside.some((block) => block.prepared || block.marker))
+				)
+					return "system_prompt_duplicated" as const;
+				if (exact.length === 1 && alongside.some((block) => block.raw))
+					return "system_prompt_unmanaged_alongside" as const;
+				if (exact.length === 0)
+					return blocks.some(
+						(block) => block.prepared || block.marker || block.raw,
+					)
+						? ("system_prompt_modified" as const)
+						: ("system_prompt_missing" as const);
+				return undefined;
+			})();
+			sessionLog(
+				input.sessionId,
+				"[pi-bridge] system prompt provider-owned blocks",
+				{
+					blocks: blocks
+						.filter(
+							(block) =>
+								!block.exact && !block.prepared && !block.marker && !block.raw,
+						)
+						.map(({ index, length, digest }) => ({ index, length, digest })),
+				},
+			);
 			return {
-				managed:
-					expectedDigest !== undefined && expectedDigest === actualDigest,
-				reason:
-					expectedDigest === undefined
-						? ("system_prompt_not_prepared" as const)
-						: expectedDigest !== actualDigest
-							? ("system_prompt_mismatch" as const)
-							: undefined,
-				expectedDigest,
-				actualDigest,
+				managed: reason === undefined,
+				reason,
+				expectedDigest: expected?.digest,
+				blockDigests: blocks.map((block) => block.digest),
 			};
 		},
 		/** Mirror standalone's outgoing-session cleanup on a confirmed host switch. */
