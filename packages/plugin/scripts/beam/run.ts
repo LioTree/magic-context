@@ -74,6 +74,7 @@ import { type Relay, type RelayLogEntry, startRelay } from "./relay";
 import { type JudgeCall, type QuestionScore, scoreQuestion, summarize } from "./scoring";
 import { credentialRowCounts, writeSessionTurns } from "./store-writer";
 import { type Stub, startStub } from "./stub";
+import { pruneVanillaHistory, textTokenCounts, VANILLA_TRIMMING } from "./vanilla";
 
 /** The dataset revision every result is pinned to (Hugging Face `Mohammadta/BEAM`). */
 export const DATASET = "Mohammadta/BEAM";
@@ -110,6 +111,7 @@ interface Settings {
     opencodeVersion: string;
     pluginDistSha256: string;
     maxInputTokensPerArm: number;
+    vanillaTrimming: string;
 }
 
 interface QuestionState {
@@ -278,6 +280,7 @@ async function buildSettings(): Promise<Settings> {
         opencodeVersion: EXPECTED_HOST_VERSION,
         pluginDistSha256: sha256File(PLUGIN_ENTRY),
         maxInputTokensPerArm: numberFlag("max-input-tokens"),
+        vanillaTrimming: VANILLA_TRIMMING,
     };
 }
 
@@ -510,8 +513,8 @@ async function scoreState(
 // --- Vanilla arm ---------------------------------------------------------------------------
 
 /**
- * The released code's long-context baseline: every turn as a chat message with its role and
- * content, then the question wrapper as one more user message, and no system message.
+ * BEAM's pinned long_term_memory_methods.py prunes history before appending the question wrapper;
+ * no system message is added. See vanilla.ts for the literal pruning port and README for sources.
  */
 async function runVanilla(
     settings: Settings,
@@ -524,10 +527,15 @@ async function runVanilla(
         0,
     );
     for (const conversation of conversations) {
-        const history: ChatMessage[] = conversation.turns.map((turn) => ({
+        const rawHistory: ChatMessage[] = conversation.turns.map((turn) => ({
             role: turn.role,
             content: turn.content,
         }));
+        const history = pruneVanillaHistory(
+            rawHistory,
+            textTokenCounts(rawHistory.map((message) => message.content)),
+            settings.answerContextLimit,
+        );
         for (const question of selectedQuestions(conversation)) {
             const path = questionFile(settings, arm, question.id);
             const state: QuestionState = readJson<QuestionState>(path) ?? {
@@ -1262,8 +1270,26 @@ async function prepare(split: string): Promise<void> {
         if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} failed`);
     };
     if (!existsSync(python)) run("python3", ["-m", "venv", venv]);
-    if (spawnSync(python, ["-c", "import pyarrow"], { windowsHide: true }).status !== 0)
-        run(python, ["-m", "pip", "install", "-q", "pyarrow"]);
+    if (
+        spawnSync(
+            python,
+            ["-c", 'import pyarrow, tiktoken; assert tiktoken.__version__ == "0.14.0"'],
+            { windowsHide: true },
+        ).status !== 0
+    )
+        run(python, ["-m", "pip", "install", "-q", "pyarrow", "tiktoken==0.14.0"]);
+    const cached = spawnSync(
+        python,
+        [
+            "-c",
+            'import tiktoken; tiktoken.get_encoding("cl100k_base"); tiktoken.get_encoding("o200k_base")',
+        ],
+        {
+            env: { ...process.env, TIKTOKEN_CACHE_DIR: join(dataDir(), "tiktoken-cache") },
+            stdio: "inherit",
+        },
+    );
+    if (cached.status !== 0) throw new Error("could not prepare offline BPE encodings");
     run(python, [join(import.meta.dir, "parquet_to_jsonl.py"), parquet, datasetFile(split)]);
 }
 

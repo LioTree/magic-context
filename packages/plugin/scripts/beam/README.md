@@ -9,8 +9,8 @@ behaviour) ever reaches the answer model.
 
 Two arms run on the same conversations, with the same answer model, question text and judge:
 
-- **vanilla**: the released long-context baseline. Every turn is sent as a chat message
-  (`role`, `content`), followed by the question wrapper; no system message.
+- **vanilla**: the released long-context baseline. Whole history messages are trimmed using the
+  released suffix algorithm below, followed by the question wrapper; no system message is added.
 - **mc**: Magic Context. One OpenCode project and one session per conversation; the history is
   compacted by Magic Context's own incremental historian; each question is asked from a fresh copy
   of the post-ingest stores through the real host, with `ctx_search` and `ctx_expand` available.
@@ -31,6 +31,8 @@ Two arms run on the same conversations, with the same answer model, question tex
 | `boundary-probe.ts` | Production protected-tail boundary, to size the raw tail kept by `/ctx-wrapup` |
 | `relay.ts` | Loopback relay from OpenCode's Gemini provider to Cloud Code Assist |
 | `stub.ts` | Local stand-in for Codex, Cloud Code Assist and Voyage, for credential-free runs |
+| `vanilla.ts`, `token_counts.py` | Released history-only pruning with offline tiktoken `cl100k_base` |
+| `estimate.ts` | Provider-free dataset/prompt counts and explicit pre-spend planning scenarios |
 
 ## Data and isolation
 
@@ -130,7 +132,7 @@ How the throwaway host reaches each upstream without any OpenCode auth plugin or
 
 | Item | Choice | Source |
 | --- | --- | --- |
-| Dataset | `Mohammadta/BEAM` revision `3205395e897e7318c7b094ef4e6047b9b82dbb03`, split `100K`, conversations 1-5 | Hugging Face |
+| Dataset | `Mohammadta/BEAM` revision `3205395e897e7318c7b094ef4e6047b9b82dbb03`; spike: `100K`, next: `500K`; conversations 1-5 in both | Hugging Face; fixed ordered IDs, not a random sample (no sampling seed) |
 | Turns | Every turn in order; noon UTC on the session's day plus one microsecond per turn (OpenCode stores milliseconds) | past.dev `dataset.py` |
 | Question turn | `long-context-question.txt` verbatim, whitespace included, as turn \|T\|+1 in both arms | `long_term_memory_methods.py:587-592` |
 | Nugget judge | `judge.txt` (the code's version of Listing 20; no question slot) as one user message, score per nugget, mean over nuggets | `prompts.py`, `compute_metrics.py` |
@@ -153,6 +155,36 @@ source, kept for comparison. `provenance.json` records each file's source and SH
   only `tau_norm` for them, so the harness skips that extra judging;
 - Listing 44 (the RAG answer prompt) is not used: the session itself is the context.
 
+### Released Vanilla truncation
+
+The authority is [`long_term_memory_methods.py` at the pinned commit](https://github.com/mohammadtavakoli78/BEAM/blob/b2da22eac88bb0874c64665f13457eb99835774a/src/answer_probing_questions/long_term_memory_methods.py#L206-L265),
+not an idealized hard-window crop:
+
+1. For a non-Gemini answer model the long-context branch selects `model_type="other"`
+   ([lines 576-585](https://github.com/mohammadtavakoli78/BEAM/blob/b2da22eac88bb0874c64665f13457eb99835774a/src/answer_probing_questions/long_term_memory_methods.py#L576-L585)),
+   hence **tiktoken `cl100k_base`**, even for GPT models (lines 206-229). We use the same encoding
+   through the private Python environment, with tiktoken pinned to 0.14.0: **no tokenizer substitution**.
+2. History cost is `2 + sum(4 + len(encode(content)))` (lines 232-242). For Luna, `M=272000`;
+   prune only if this cost is **strictly greater than 262000**.
+3. Walk whole messages newest-to-oldest, adding **`6 + len(encode(content))` per message** (the
+   helper's `+2` is repeated for each singleton). At the first total **strictly greater than
+   270000**, keep that suffix **including** its boundary-crossing message (lines 245-257).
+4. If the suffix has odd message count, drop its oldest message; roles are not inspected
+   (lines 258-260). If the scan never crosses 270000 after the trigger fires, return empty history.
+   Both quirks are preserved. There is no within-message token crop or final hard-cap check.
+5. Only then append the question as a user message (lines 587-594). It is not charged to the
+   pruning calculation. The branch adds no system prompt; a system message in stored history
+   would receive no special protection. The constants are not an enforced output reservation.
+
+`--answer-output-limit` is therefore **not** subtracted from Vanilla's window. The released
+algorithm can overshoot; do not silently repair it by cropping again. For the dataset's 500K-token
+split, `estimate.ts` reports the retained history in messages and tokens, and the number of questions.
+`settings.json` pins `vanillaTrimming` so an
+old untrimmed run cannot be resumed under the changed protocol. Changing the model's context
+from the paper's configured model to Luna's 272000 is the intended model-window adaptation;
+the pruning algorithm and encoding are unchanged. This encoding is not a claim about Luna's
+undocumented billing tokenizer.
+
 ### Magic Context ingest
 
 1. A live host creates the project (from a fresh git repository whose only commit is derived from
@@ -162,7 +194,10 @@ source, kept for comparison. `provenance.json` records each file's source and SH
 3. `boundary-probe.ts` runs the production `resolveOpenCodeProtectedTailBoundary` (trigger mode)
    on a scratch copy of the stores, with the usage the first question would report (all raw
    tokens over the answer model's context limit), and returns how many trailing messages the
-   protected tail keeps raw.
+   protected tail keeps raw. Before resolving the boundary, the offline probe waits for a worker
+   to initialize message-number checkpoints on the cached read-only OpenCode database connection,
+   as the production transform does. Without those checkpoints, sessions above the synchronous
+   512-message lookup limit fail before resolving a boundary.
 4. The host runs `/ctx-wrapup N` with that N: Magic Context's incremental historian (the one that
    runs under context pressure in production) compacts everything before the tail into
    compartments and promotes extracted facts to project memories. `/ctx-recomp` is not used: it is
@@ -215,6 +250,43 @@ means by ability next to the paper's GPT-4.1-nano 100K row, and token totals.
 (`null` when not set), `sampling.temperatureSet`, and `protocolDeviations`. Omitting temperature
 does not mean temperature 0. A run previously pinned with temperature 0 needs a new `--run` name
 to use the new default.
+
+### 500K preflight without credentials
+
+Use conversation IDs **1, 2, 3, 4, 5**, the same fixed selection as the initial 100K-token run;
+no random generator or seed was used. `prepare`
+installs pyarrow and tiktoken into the harness-private venv and caches BPE tables under the data
+root. Python must support venv/pip. After building the plugin and installing the stock host for
+the current OS, a credential-free preparation is:
+
+```sh
+B=packages/plugin/scripts/beam
+bun $B/run.ts prepare --split 500K
+# One question per conversation captures real host prompt/chunk shapes, not real model outputs.
+bun $B/run.ts mc --stub --split 500K --run preflight-500k \
+  --questions 1_abstention_0,2_abstention_0,3_abstention_0,4_abstention_0,5_abstention_0
+bun $B/estimate.ts --split 500K --stub-run preflight-500k
+# Kill/resume proof on all 20 questions in one conversation (the first command SIGKILLs itself).
+bun $B/run.ts vanilla --stub --split 500K --conversations 1 --run dry-500k --stop-after 1
+bun $B/run.ts vanilla --stub --split 500K --conversations 1 --run dry-500k
+bun $B/run.ts mc --stub --split 500K --conversations 1 --run dry-500k --stop-after 1
+bun $B/run.ts mc --stub --split 500K --conversations 1 --run dry-500k
+```
+
+`estimate.ts` starts no host and reads no credentials. It writes `estimates/500K-five.json` under
+the data root: exact released-metric Vanilla input, real question/rubric and host stub prompt
+counts, observed ingest chunk/call counts, plus an explicitly parameterized input/output
+planning scenario for both arms. It uses `o200k_base` only as an **uncalibrated planning proxy**
+for Luna and Gemini, not for pruning. Future summaries, tool results, answer lengths, the number
+of judge comparisons needed to match answer lines to reference events, hidden thinking and
+provider billing framing cannot be known before generation.
+Consequently an exact billed-input/output forecast is impossible without real calls; neither
+stub usage (`characters/4`) nor a local BPE count should be presented as such a forecast. Review
+the assumptions and the configured historian output ceiling with the credential owner before
+spend. Observed chunk counts can vary with runtime prompt fitting and estimator state; they are
+not a guaranteed real-run call count. The 1024-token answer and 16-line ordering assumptions are
+scenarios, not hard caps: the Codex backend drops `max_output_tokens`. Retries/repairs and
+additional tool calls add usage.
 
 `--smoke-transport` (also spelled as the `smoke-transport` subcommand) prints complete sanitized
 Cloud Code error bodies even when they are JSON, before the usual terminal 401/403 stop. The

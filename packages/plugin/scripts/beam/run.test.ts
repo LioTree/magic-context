@@ -31,6 +31,7 @@ const settings: Parameters<typeof summarizeRun>[0] = {
     opencodeVersion: "fixture",
     pluginDistSha256: "fixture",
     maxInputTokensPerArm: 30000000,
+    vanillaTrimming: "beam-released-cl100k-v1",
 };
 
 describe("Codex sampling", () => {

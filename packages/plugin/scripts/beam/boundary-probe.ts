@@ -20,7 +20,9 @@
  */
 import { openDatabase } from "../../src/features/magic-context/storage-db";
 import { resolveOpenCodeProtectedTailBoundary } from "../../src/hooks/magic-context/protected-tail-boundary";
+import { prewarmRawSessionOrdinalsForDb } from "../../src/hooks/magic-context/raw-ordinal-warmup";
 import { readRawSessionMessages } from "../../src/hooks/magic-context/read-session-chunk";
+import { withReadOnlySessionDb } from "../../src/hooks/magic-context/read-session-db";
 import { buildTrueRawTokenIndex } from "../../src/hooks/magic-context/read-session-true-raw-tokens";
 
 export interface BoundaryProbeResult {
@@ -47,6 +49,12 @@ if (import.meta.main) {
     const executeThresholdPercentage = Number(thresholdText);
     const db = openDatabase();
     if (!db) throw new Error("could not open the scratch context database");
+    // Large offline sessions need the same canonical ordinal preparation as a live transform.
+    const readiness = await withReadOnlySessionDb((rawDb) =>
+        prewarmRawSessionOrdinalsForDb(rawDb, sessionId),
+    );
+    if (readiness !== "warm")
+        throw new Error(`could not prepare scratch raw ordinals for ${sessionId}`);
     const messages = readRawSessionMessages(sessionId);
     const index = buildTrueRawTokenIndex(sessionId, messages, {
         providerShapeVersion: "opencode-v1",
