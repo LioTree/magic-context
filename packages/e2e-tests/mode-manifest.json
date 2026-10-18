@@ -157,14 +157,6 @@
             "behavior": true
         },
         {
-            "path": "tests/rust-plugin-stage-cache.test.ts",
-            "tier": "excluded",
-            "invocation": { "ts": false, "rust": false },
-            "rationale": "opt-in measurement (MC_RUST_STAGE_BASELINE): compares the pre-change Rust adapter bundle with the current one for byte-identical output and todo/mural stage cost through a hermetic module and isolated OpenCode 1.18; needs a preserved baseline bundle, so it runs by hand, outside the mode lanes",
-            "contract_refs": ["S2-MIGRATION"],
-            "hosts": ["opencode"]
-        },
-        {
             "path": "tests/system-prompt-change-order.test.ts",
             "tier": "excluded",
             "invocation": { "ts": false, "rust": false },
@@ -1943,21 +1935,6 @@
             ]
         },
         {
-            "path": "tests/rust-adapter-perf.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: rust adapter overhead profile (elapsed minus module handler_total) on a seeded 1,500-message session with an optional copied-state snapshot; wall-clock, so it asserts only under MC_PERF_GATE=1 and records timings otherwise",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
             "path": "tests/rust-classify-producer.test.ts",
             "tier": "excluded",
             "invocation": {
@@ -1968,21 +1945,6 @@
             "contract_refs": [
                 "RUST-E2E",
                 "CLASSIFY-PRODUCER"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-cold-seed-perf.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: cold-seed handler budget on an ASTRO-shaped 10k-message seed; wall-clock, so it asserts only under MC_PERF_GATE=1 and records timings otherwise",
-            "contract_refs": [
-                "RUST-E2E"
             ],
             "hosts": [
                 "opencode"
@@ -2115,57 +2077,6 @@
             ]
         },
         {
-            "path": "tests/rust-fm-oc-2.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: FM-OC-2 confirms the external module exited after SIGKILL, then pins the shipped failure threshold and park-transition token",
-            "contract_refs": [
-                "FM-OC-2",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-3.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: FM-OC-3 confirms the killed module exited before replacement, then pins bounded probe recovery and monotonic row versions",
-            "contract_refs": [
-                "FM-OC-3",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-4.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: FM-OC-4 confirms external-module exit before asserting typed fail-closed refusal at the provider-proven emergency limit",
-            "contract_refs": [
-                "FM-OC-4",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
             "path": "tests/rust-fm-oc-5.test.ts",
             "tier": "excluded",
             "invocation": {
@@ -2176,23 +2087,6 @@
             "contract_refs": [
                 "FM-OC-5",
                 "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-6.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: FM-OC-6 confirms external-module exit, then asserts emergency refusal before LKG admission",
-            "contract_refs": [
-                "FM-OC-6",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
             ],
             "hosts": [
                 "opencode"
@@ -2307,21 +2201,6 @@
                 "RUST-E2E",
                 "BOUNDARY-DIVERGENCE-RECUT",
                 "RUST-SYNTHETIC-TODO-ANCHOR-MIRROR-BACK"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-oversize-reply.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: hermetic daemon verifies opt-in bounded screenshot replies, byte-identical replay, legacy unary compatibility and responsive health during slow transforms",
-            "contract_refs": [
-                "RUST-E2E"
             ],
             "hosts": [
                 "opencode"
@@ -2986,14 +2865,6 @@
             "hosts": [
                 "opencode2"
             ]
-        },
-        {
-            "path": "tests/rust-full-sync-frame-cap.test.ts",
-            "tier": "excluded",
-            "invocation": { "ts": false, "rust": false },
-            "rationale": "manual real-module probe with prebuilt ck-mc and ck-subc (MC_E2E_CK_MC_PREBUILT_BIN, MC_E2E_CK_SUBC_BIN): a 9,268-message paged full-sync retry above 48 MiB in total is admitted frame by frame, while an oversized single tool frame stays refused",
-            "contract_refs": ["FOLD-UNDER-PRESSURE"],
-            "hosts": ["opencode"]
         },
         {
             "path": "tests/dreamer-mapper-step-cap-pi.test.ts",

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import type { RustModeModuleClient } from "../rust-mode-transform";
+import type { ModuleSessionClient } from "../module-session-kernel";
 import {
     decodeProviderAnswer,
     decodeProviderRequest,
@@ -234,7 +234,7 @@ const hook = {
     subject_ordinal: 1,
     blocks: ["hello"],
 };
-type CallArgs = Parameters<RustModeModuleClient["call"]>[0];
+type CallArgs = Parameters<ModuleSessionClient["call"]>[0];
 function harness(
     reply: (
         wire: { method: ProviderMethod; params: Record<string, unknown> },

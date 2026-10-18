@@ -31,7 +31,7 @@ import { createTestTempDir } from "../../../shared/test-temp-dir";
 import * as markerManager from "../compaction-marker-manager";
 import { SubcModuleTransport } from "../module-transport";
 import { setRawMessageProvider } from "../read-session-chunk";
-import { createRustModeTransform } from "../rust-mode-transform";
+import { createModuleSessionKernel } from "../module-session-kernel";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
 import { defaultCompactionMarkerStrategy } from "../transform-postprocess-phase";
@@ -1296,7 +1296,7 @@ describe("supported bridge constructor", () => {
             historianRunner: "broca",
             historianModel: { model: "openai/bridge-historian" },
         };
-        const legacy = createRustModeTransform(deps, {
+        const legacy = createModuleSessionKernel({
             moduleClient: transport,
             hostClient: deps.client,
             projectRoot: options.projectRoot,

@@ -21,11 +21,11 @@ const { getPendingOps, hasPendingDropOps: scalarDropProbe, queuePendingOp } = aw
 // probe existed; measure that checkout's original predicate in that case.
 const hasPendingDropOps = scalarDropProbe ?? ((db: Parameters<typeof getPendingOps>[0], sessionId: string) => getPendingOps(db, sessionId).length > 0);
 const { getOverflowState, setSessionWorkMetrics } = await import("../../src/features/magic-context/storage-meta-persisted");
-const { buildPagedModuleTransformPayloads, cloneModuleNativeOutput } = await import("../../src/hooks/magic-context/module-wire");
+const { cloneModuleNativeOutput } = await import("../../src/hooks/magic-context/module-wire");
 const { buildModuleStateSyncPayload, syncModuleState, loadModuleWatermarks } = await import("../../src/hooks/magic-context/module-state-sync");
 const { StateSyncTiming, timedStateSyncDatabase } = await import("../../src/hooks/magic-context/module-state-sync-timing");
-const { __rustModeTransformTest: rust } = await import("../../src/hooks/magic-context/rust-mode-transform");
-const { captureSlot, noteEntry, resetLkgSlotsForTest, messageContentSnapshot } = await import("../../src/hooks/magic-context/lkg-slot");
+const { createModuleSessionKernel } = await import("../../src/hooks/magic-context/module-session-kernel");
+const { captureSlot, noteEntry, resetLkgSlotsForTest } = await import("../../src/hooks/magic-context/lkg-slot");
 const { saveLkgSlotToDb, loadPersistedLkgSlot } = await import("../../src/hooks/magic-context/lkg-persist");
 const { computeM0BlockTokens } = await import("../../src/hooks/magic-context/m0-token-breakdown");
 const { todowritePermissionDenied } = await import("../../src/hooks/magic-context/ctx-reduce-availability");
@@ -86,20 +86,12 @@ try {
         resetLkgSlotsForTest();
         if (!captureSlot(sessionId, { ...slot, jsonPrefix: "[]" })) throw new Error("input metadata exceeds slot cap");
         const noteMs = measure(() => noteEntry(sessionId, messages));
-        const snapshots = messages.map(messageContentSnapshot);
-        const compareMs = measure(() => messages.every((m, i) => rust.messageMatchesContentSnapshot(m, snapshots[i] as NonNullable<typeof snapshots[number]>)));
-        const body = rust.buildTransformBody({ sessionId, input: [], nativeMessages: messages, passInputs: { mural: { png: "x".repeat(300_000), content_hash: "mural-hash" } }, usage: { percentage: 50 }, modelKey: "model", providerId: "provider", systemPromptHash: "", upgradeState: "none", channel2NudgeState: "idle", emergencyRecoveryArmed: false });
-        const pageMs = measure(() => {
-            const pages = buildPagedModuleTransformPayloads(body, undefined, true);
-            for (const { page } of pages) JSON.stringify({ ...page, accept_reply_pages: true });
-        }, 5);
-        const pages = buildPagedModuleTransformPayloads(body, undefined, true);
         const m0Text = `<project-docs>${"Architecture text αβ 😀.\n".repeat(Math.min(n, 10_000))}</project-docs><session-history>history</session-history>`;
         const m0Args = { m0Text, projectIdentity: undefined, injectionBudgetTokens: undefined, memoryBlockCount: 0 };
         const tokens = computeM0BlockTokens(db, sessionId, m0Args);
         const blob = Buffer.alloc(Math.min(n * 300, 24_000_000), 65);
         db.prepare("UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?").run(blob, sessionId);
-        rows.push({ n, jsonBytes: Buffer.byteLength(jsonPrefix), rb1StringifyMs: measure(() => JSON.stringify(messages)), rb1PersistMs: persistMs, rb1WritesPerCapture: (changesAfter - changesBefore) / 8, rb1PersistedHash: hash(loadPersistedLkgSlot(db, sessionId)), rb2PageAndTransportMs: pageMs, rb2WireHash: hash(pages.map(({ page }) => JSON.stringify({ ...page, accept_reply_pages: true }))), rb3NoteEntryMs: noteMs, rb4CloneMs: measure(() => cloneModuleNativeOutput(messages)), rb5PrefixGuardMs: compareMs, rb7DuplicateMuralBytes: 300_000, rb7MuralProbeMs: measure(() => JSON.stringify([body.pass_inputs])), rb8SelectAllMs: measure(() => db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(sessionId)), rb8BpeMs: measure(() => computeM0BlockTokens(db, sessionId, m0Args)), rb8TokenHash: hash(tokens) });
+        rows.push({ n, jsonBytes: Buffer.byteLength(jsonPrefix), rb1StringifyMs: measure(() => JSON.stringify(messages)), rb1PersistMs: persistMs, rb1WritesPerCapture: (changesAfter - changesBefore) / 8, rb1PersistedHash: hash(loadPersistedLkgSlot(db, sessionId)), rb3NoteEntryMs: noteMs, rb4CloneMs: measure(() => cloneModuleNativeOutput(messages)), rb8SelectAllMs: measure(() => db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(sessionId)), rb8BpeMs: measure(() => computeM0BlockTokens(db, sessionId, m0Args)), rb8TokenHash: hash(tokens) });
 
         db.transaction(() => { for (let i = 0; i < n; i++) queuePendingOp(db, sessionId, i, "drop", i); })();
         rows.push({ n, rb11PendingRowsMs: measure(() => getPendingOps(db, sessionId)), rb11ProbeMs: measure(() => hasPendingDropOps(db, sessionId)), rb11OverflowTwoReadsMs: measure(() => { getOverflowState(db, sessionId); getOverflowState(db, sessionId); }), rb11UnknownOperationPreserved: true });
@@ -136,10 +128,6 @@ try {
     const watermarks = loadModuleWatermarks({ db, sessionId });
     const unchangedState = { ...state, lastAckedWatermarks: watermarks };
     rows.push({ rb15NoChangeMs: await measureAsync(() => syncModuleState({ client: { call: async () => { throw new Error("no I/O expected"); } }, state: unchangedState, pass, force: false, projectRoot: root, options: { knownWatermarksUnchanged: true } }), 31), rb8UnchangedUpdateMs: measure(() => setSessionWorkMetrics(db, sessionId, 10, 20), 31) });
-    const large = Array.from({ length: 60_000 }, (_, i) => ({ info: { id: `big${i}`, role: "user" }, parts: [{ type: "text", text: "x".repeat(850) }] }));
-    const largeBody = { method: "transform", session_id: sessionId, native_messages: large };
-    const largePages = buildPagedModuleTransformPayloads(largeBody, undefined, true);
-    rows.push({ rb14Messages: large.length, rb14BodyBytes: Buffer.byteLength(JSON.stringify(largeBody)), rb14PackingMs: measure(() => buildPagedModuleTransformPayloads(largeBody, undefined, true), 3), rb14Pages: largePages.length, rb14WireHash: hash(largePages.map(({ page }) => JSON.stringify({ ...page, accept_reply_pages: true }))) });
     let interval: (() => void) | undefined;
     const nativeInterval = globalThis.setInterval;
     let release!: () => void;
@@ -179,12 +167,7 @@ try {
     } as unknown as Parameters<typeof todowritePermissionDenied>[0];
     const permissionMs = await measureAsync(() => todowritePermissionDenied(permissionClient, "permission-audit", "build"));
     rows.push({ rb10PermissionCpuMs: permissionMs, rb10SdkReads8Probes: permissionReads, rb10NetworkLatencyMeasured: false });
-    const adapter = rust.createRustModeTransform({
-        db, tagger: {} as never, scheduler: {} as never, contextUsageMap: new Map(),
-        protectedTokens: 4, clearReasoningAge: 50, historyRefreshSessions: new Set(),
-        pendingMaterializationSessions: new Set(), lastHeuristicsTurnId: new Map(),
-        directory: root, historianRunner: "broca",
-    }, { moduleClient: { call: async () => ({ ok: true }) }, projectRoot: root });
+    const adapter = createModuleSessionKernel({ moduleClient: { call: async () => ({ ok: true }) }, projectRoot: root });
     try {
         Bun.gc(true);
         const before = process.memoryUsage().heapUsed;

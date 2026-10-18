@@ -905,10 +905,6 @@ const server: Plugin = async (ctx) => {
             compactionOff: !isCompactionEnabled(pluginConfig),
             internalChildSessions: liveSessionState.internalChildSessions,
             tryReopenStorage,
-            // This instance builds no Rust adapter. Answering null, rather than
-            // omitting the option, keeps the wrapper from consulting the
-            // process-wide adapter registry.
-            rustReplayParticipant: () => null,
             onStorageBusyRefusal: async (sessionId, message) => {
                 const { sendStatusNotification } = await importPluginModule(
                     () => import("./hooks/magic-context/send-session-notification"),

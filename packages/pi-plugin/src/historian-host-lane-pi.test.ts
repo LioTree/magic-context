@@ -89,17 +89,17 @@ describe("standalone Pi and the historian host lane", () => {
 		});
 		expect(offenders).toEqual([]);
 
-		// Only createPiBridgeAdapter may call Rust transform APIs. The standalone
-		// index.ts import graph must not reach that adapter.
-		const rustModeCallers = piSourceFiles().filter((path) => {
+		// Only createPiBridgeAdapter may use the shared module-session kernel. The
+		// standalone index.ts import graph must not reach that adapter.
+		const kernelCallers = piSourceFiles().filter((path) => {
 			const source = readFileSync(path, "utf-8");
 			return (
-				source.includes("RustModeModuleClient") ||
-				source.includes("createRustModeTransform")
+				source.includes("ModuleSessionClient") ||
+				source.includes("createModuleSessionKernel")
 			);
 		});
 		const bridge = join(import.meta.dir, "bridge-adapter-pi.ts");
-		expect(rustModeCallers).toEqual([bridge]);
+		expect(kernelCallers).toEqual([bridge]);
 		const sources = new Set(piSourceFiles());
 		const reached = new Set<string>();
 		const scanner = new Bun.Transpiler({ loader: "ts" });

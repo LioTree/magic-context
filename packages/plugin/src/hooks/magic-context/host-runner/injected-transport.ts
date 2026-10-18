@@ -6,13 +6,13 @@ import { sessionLog } from "../../../shared/logger";
 import { isRecord } from "../../../shared/record-type-guard";
 import { moduleRequestBody, type SubcModuleTransport } from "../module-transport";
 import { assembleReplyPages } from "../reply-pages";
-import type { RustModeModuleClient } from "../rust-mode-transform";
+import type { ModuleSessionClient } from "../module-session-kernel";
 import { singleStoreMigrationRequiredFailure } from "../single-store-refusal";
 import { storeAheadOfBinaryFailure } from "../store-ahead-refusal";
 import type { BridgeTransport, BridgeTransportError } from "./bridge-types";
 
 /** Keep the relay opaque: each request carries one unchanged subc payload, including reply.page. */
-export class InjectedBridgeTransport implements RustModeModuleClient {
+export class InjectedBridgeTransport implements ModuleSessionClient {
     private closed = false;
     private capabilities: { state_sync_deltas?: boolean; state_sync_resume?: boolean } | undefined;
 

@@ -36,7 +36,7 @@ import { resolveOrdinalsForModule } from "../module-wire";
 import { providerNativeMessage } from "../provider-visible-parts";
 import { hasRawSessionMessageById } from "../read-session-chunk";
 import { isRawCompactionSummaryInfo } from "../read-session-raw";
-import type { createRustModeTransform, HistorianHostRunnerSeam } from "../rust-mode-transform";
+import type { createModuleSessionKernel, HistorianHostRunnerSeam } from "../module-session-kernel";
 import { storeAheadOfBinaryFailure } from "../store-ahead-refusal";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
@@ -96,7 +96,15 @@ export type {
 } from "./fallback-admissibility";
 export { isFallbackAdmissible, recordProviderUsage } from "./fallback-admissibility";
 
-type Legacy = ReturnType<typeof createRustModeTransform>;
+type SessionKernel = ReturnType<typeof createModuleSessionKernel>;
+export class TransformRouteRetiredError extends EmergencyFailClosedError {
+    readonly code = "transform_route_retired";
+
+    constructor() {
+        super("transform_route_retired: the full-request transform is retired; use the step contract");
+        this.name = "TransformRouteRetiredError";
+    }
+}
 type RecordState = RunnerRecord<MessageLike, FrozenProviderPlan>;
 type Admitted = Extract<Admission<MessageLike>, { entry: unknown }>;
 class StepOrdinalConflict extends Error {}
@@ -450,16 +458,16 @@ export const OPENCODE_PROVIDER_BOOTSTRAP_BUDGET_MS = 30_000;
 /** All provider state is session-scoped; a failed write never installs staged bytes. */
 export function createOpenCodeProviderTransform(
     deps: TransformDeps,
-    legacy: Legacy,
+    kernel: SessionKernel,
     options: OpenCodeProviderOptions = {},
 ) {
-    return createProviderTransform(deps, legacy, options);
+    return createProviderTransform(deps, kernel, options);
 }
 
 /** Share request-deadline checks, saved hook answers and database commits across host message formats. */
 export function createProviderTransform(
     deps: TransformDeps,
-    legacy: Legacy,
+    kernel: SessionKernel,
     options: OpenCodeProviderOptions = {},
     codec?: ProviderCodec,
 ) {
@@ -708,7 +716,7 @@ export function createProviderTransform(
             record,
             state: stored.state,
             metadata,
-            sync: legacy.getState(id),
+            sync: kernel.getState(id),
             client: undefined as unknown as ProviderClient,
         } as Session;
         s.client = client(id, s);
@@ -888,39 +896,8 @@ export function createProviderTransform(
                 s?.record.pipeline_exit?.reason ??
                     (deps.rustPipeline !== "provider" ? "provider_disabled" : "bootstrap_declined"),
             );
-        if (!namespace) return legacy.run(id, messages, output, meta);
-        // A race's runner ordinals cannot enter the canonical full-request namespace.
-        // Re-route all module calls, not host storage or the real OpenCode session id.
-        let fresh = reseeded.get(id);
-        if (!fresh) {
-            const { createRustModeTransform } = await import("../rust-mode-transform");
-            fresh = createRustModeTransform(deps, {
-                moduleClient: {
-                    ...moduleClient,
-                    call: (args) => {
-                        let body = args.body;
-                        if (!(body instanceof Uint8Array))
-                            body = {
-                                ...part(body),
-                                params: { ...part(part(body).params), session_id: namespace },
-                            };
-                        else {
-                            const wire = JSON.parse(new TextDecoder().decode(body));
-                            wire.params.session_id = namespace;
-                            body = new TextEncoder().encode(JSON.stringify(wire));
-                        }
-                        return moduleClient.call({ ...args, sessionId: namespace, body });
-                    },
-                },
-                projectRoot,
-                hostClient: deps.client,
-                onEngineReconnectRefusal: deps.onRustEngineReconnectRefusal,
-            });
-            reseeded.set(id, fresh);
-        }
-        await fresh.run(id, messages, output, meta);
+        throw new TransformRouteRetiredError();
     }
-    const reseeded = new Map<string, Legacy>();
     function recover(id: string, messages: MessageLike[]): void {
         const meters = currentProviderMeters();
         if (meters) meters.recovery_count++;
@@ -1187,7 +1164,7 @@ export function createProviderTransform(
             (m) => !isMagicContextHead(m) && incoming(m).classify() !== "marker",
         );
         if (!s || reentry) {
-            const memo = legacy.getState(id);
+            const memo = kernel.getState(id);
             const resolved = codec
                 ? {
                       ok: true as const,
@@ -1479,8 +1456,6 @@ export function createProviderTransform(
         conflictRetry = 0,
     ): Promise<void> {
         checkpoint();
-        // A legacy handoff preserves its original exception type. In particular,
-        // BUSY must still be eligible for the legacy wrapper's LKG recovery.
         const existing = hydrate(id);
         if (
             deps.rustPipeline !== "provider" ||
@@ -1922,7 +1897,6 @@ export function createProviderTransform(
                 if (projection.owner === projectionOwner) providerProjections.delete(id);
             }
             const stopped = historian?.stop();
-            for (const fresh of reseeded.values()) fresh.dispose();
             sessions.clear();
             projectionTokens.clear();
             return stopped ?? Promise.resolve();

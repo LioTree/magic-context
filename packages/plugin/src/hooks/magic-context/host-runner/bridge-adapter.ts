@@ -22,7 +22,7 @@ import {
 } from "../marker-envelope";
 import { SubcModuleTransport } from "../module-transport";
 import { hasRawMessageProvider } from "../read-session-chunk";
-import { createRustModeTransform } from "../rust-mode-transform";
+import { createModuleSessionKernel } from "../module-session-kernel";
 import type { TransformDeps } from "../transform";
 import { createBridgeDeps } from "./bridge-deps";
 import { createBridgeHostFacts } from "./bridge-host-facts";
@@ -67,7 +67,7 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
     const transport = options.transport
         ? new InjectedBridgeTransport(options.transport)
         : new SubcModuleTransport(options.connectionFile, undefined, undefined, "", harness);
-    let legacy: ReturnType<typeof createRustModeTransform> | undefined;
+    let legacy: ReturnType<typeof createModuleSessionKernel> | undefined;
     let provider: ReturnType<typeof createOpenCodeProviderTransform>;
     let deps: TransformDeps;
     const listeners = new Set<BridgeOutcomeListener>();
@@ -86,10 +86,9 @@ export function createBridgeAdapter(options: BridgeAdapterOptions) {
             },
             "opencode",
         );
-        // Reuse the Rust transform's message-id/ordinal cache for bootstrap, but refuse its full-request execution path.
-        legacy = createRustModeTransform(deps, {
+        // Bootstrap and state sync share session bookkeeping, not a full-request transform.
+        legacy = createModuleSessionKernel({
             moduleClient: transport,
-            hostClient: deps.client,
             projectRoot: options.projectRoot,
         });
         provider = createOpenCodeProviderTransform(deps, legacy, {

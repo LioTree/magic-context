@@ -64,8 +64,7 @@ if (lane === "pi") {
                 injectDocs: false,
             }),
         },
-        rustReplayParticipant: () => null,
-        onLkgReplay: () => {
+                onLkgReplay: () => {
             recoveryCount = (recoveryCount ?? 0) + 1;
         },
     });

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { sessionLog } from "../../../shared/logger";
-import type { RustModeModuleClient } from "../rust-mode-transform";
+import type { ModuleSessionClient } from "../module-session-kernel";
 import {
     checkAnswerFence,
     encodedBytes,
@@ -389,7 +389,7 @@ export type ProviderResult<A> =
           exit_reason?: "provider_message_too_large";
       };
 export interface ProviderClientOptions {
-    moduleClient: Pick<RustModeModuleClient, "call">;
+    moduleClient: Pick<ModuleSessionClient, "call">;
     sessionId: string;
     projectRoot: string;
     harness: "opencode" | "opencode2" | "pi";
@@ -561,7 +561,7 @@ export class ProviderClient {
                 this.options.moduleClient.call({
                     sessionId: this.options.sessionId,
                     projectRoot: this.options.projectRoot,
-                    method: method as Parameters<RustModeModuleClient["call"]>[0]["method"],
+                    method: method as Parameters<ModuleSessionClient["call"]>[0]["method"],
                     body: new TextEncoder().encode(encoded),
                     signal: abort.signal,
                     timeoutMs: remaining,

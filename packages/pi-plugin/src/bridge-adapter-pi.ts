@@ -40,7 +40,7 @@ import {
 	estimateTokens,
 	preloadTokenizer,
 } from "@magic-context/core/hooks/magic-context/read-session-formatting";
-import { createRustModeTransform } from "@magic-context/core/hooks/magic-context/rust-mode-transform";
+import { createModuleSessionKernel } from "@magic-context/core/hooks/magic-context/module-session-kernel";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import {
 	createPromptSurfaceGuidanceEpochCache,
@@ -124,7 +124,7 @@ export function createPiBridgeAdapter(options: PiBridgeAdapterOptions) {
 			{ db, reloadSession: () => options.reloadSession(id) },
 			id,
 		);
-	const legacy = createRustModeTransform(deps, {
+	const legacy = createModuleSessionKernel({
 		moduleClient: transport,
 		projectRoot: options.projectRoot,
 	});

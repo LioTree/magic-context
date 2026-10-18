@@ -20,7 +20,7 @@ import { adaptPayload, HEAD_IDS } from "../../../v2/hooks/payload";
 import type { SessionContext, V2Context } from "../../../v2/hooks/types";
 import { deliverSyntheticUserMessage } from "../channel2-delivery";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
-import type { createRustModeTransform } from "../rust-mode-transform";
+import type { createModuleSessionKernel } from "../module-session-kernel";
 import { StoreAheadOfBinaryError } from "../store-ahead-refusal";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
@@ -160,7 +160,7 @@ function fixture(host: "v1" | "v2", options: OpenCodeProviderOptions = {}) {
             fallbacks.push({ input: JSON.stringify(input) });
             out.messages = input;
         },
-    } as unknown as ReturnType<typeof createRustModeTransform>;
+    } as unknown as ReturnType<typeof createModuleSessionKernel>;
     const seams: OpenCodeProviderOptions = {
         resolveOrdinals: async (args) => {
             resolveCalls++;

@@ -22,7 +22,7 @@ describe("mode manifest validator", () => {
         // Bump this with the manifest whenever a tests/**/*.test.ts file is added or
         // removed. Moving a file between excluded and ts-only changes the invocation
         // counts and excluded list below, but not the total number of files.
-        expect(validation.files.length).toBe(196);
+        expect(validation.files.length).toBe(187);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -160,10 +160,8 @@ describe("mode manifest validator", () => {
             "tests/opencode2/v1-v2-reconversion.test.ts",
             "tests/pi-rust-degradation-arc-1.test.ts",
             "tests/pi-rust-degradation-arc-4.test.ts",
-            "tests/rust-adapter-perf.test.ts",
             "tests/rust-classify-host-runner.test.ts",
             "tests/rust-classify-producer.test.ts",
-            "tests/rust-cold-seed-perf.test.ts",
             "tests/rust-cold-seed-tag-surface.test.ts",
             "tests/rust-cold-start-drop-seed.test.ts",
             "tests/rust-compaction-marker-byte-identity.test.ts",
@@ -171,25 +169,18 @@ describe("mode manifest validator", () => {
             "tests/rust-dangling-boundary-seed.test.ts",
             "tests/rust-duplicate-tool-use-id.test.ts",
             "tests/rust-fm-oc-1.test.ts",
-            "tests/rust-fm-oc-2.test.ts",
-            "tests/rust-fm-oc-3.test.ts",
-            "tests/rust-fm-oc-4.test.ts",
             "tests/rust-fm-oc-5.test.ts",
-            "tests/rust-fm-oc-6.test.ts",
             "tests/rust-fold-under-pressure.test.ts",
             "tests/rust-frozen-restart-review-drill.test.ts",
-            "tests/rust-full-sync-frame-cap.test.ts",
             "tests/rust-historian-producer.test.ts",
             "tests/rust-host-runner-default.test.ts",
             "tests/rust-maintenance-contract.test.ts",
             "tests/rust-memory-off-parity.test.ts",
             "tests/rust-memory-update-reembed.test.ts",
             "tests/rust-multi-frame-delta-perf.test.ts",
-            "tests/rust-oversize-reply.test.ts",
             "tests/rust-paired-session-replay.test.ts",
             "tests/rust-park-self-heal.test.ts",
             "tests/rust-persisted-synthetic-prompt.test.ts",
-            "tests/rust-plugin-stage-cache.test.ts",
             "tests/rust-provider-pipeline-opencode1.test.ts",
             "tests/rust-provider-pipeline-opencode2.test.ts",
             "tests/rust-real-or-absent-drops.test.ts",

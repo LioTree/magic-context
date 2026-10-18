@@ -14,7 +14,7 @@ it("ordinary long repository texts retain exact whole-text BPE counts", () => {
         "crates/mc-core/testdata/decay-golden.json",
         "ARCHITECTURE.md",
         "CONFIGURATION.md",
-        "packages/plugin/src/hooks/magic-context/rust-mode-transform.ts",
+        "packages/plugin/src/hooks/magic-context/host-runner/opencode-adapter.ts",
         "packages/pi-plugin/src/context-handler.ts",
     ];
     for (const path of paths) {
