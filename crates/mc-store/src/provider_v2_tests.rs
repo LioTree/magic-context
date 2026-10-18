@@ -525,6 +525,92 @@ fn native_tail_failed_section_commit_rolls_back_cut_and_facts_with_cache() {
 }
 
 #[test]
+fn native_certificate_crosses_frozen_baseline_length_and_validates_its_cut() {
+    use cache_codec::NativeSnapshotRejection;
+    let (_dir, store, key) = rig();
+    let namespace = "engine-s";
+    let (mut meta, policy) = native_cache_inputs();
+    let measurement = meta
+        .tail_hygiene_baseline
+        .as_mut()
+        .unwrap()
+        .baseline_parts
+        .pop()
+        .unwrap();
+    cache_policy_commit(&store, namespace, &meta, &policy).unwrap();
+    let mut prefix = provider_log::ProviderNativePrefix {
+        cut_id: 0,
+        through: 0,
+        parts: 1,
+    };
+    assert!(matches!(
+        store.load_native_transform_snapshot(namespace, &prefix, &[]),
+        Err(McStoreError::NativeSnapshotUnavailable(
+            NativeSnapshotRejection::MissingReference
+        ))
+    ));
+    assert_eq!(
+        store.load(namespace).unwrap().meta.tail_hygiene_baseline,
+        meta.tail_hygiene_baseline
+    );
+
+    meta.tail_hygiene_baseline
+        .as_mut()
+        .unwrap()
+        .baseline_parts
+        .push(measurement);
+    cache_policy_commit(&store, namespace, &meta, &policy).unwrap();
+    prefix.cut_id = store.provider_fold_settings(&key).unwrap()["baseline_cut_id"]
+        .as_u64()
+        .unwrap();
+    let native = store
+        .load_native_transform_snapshot(namespace, &prefix, &[])
+        .unwrap();
+    assert!(native
+        .loaded
+        .meta
+        .tail_hygiene_baseline
+        .unwrap()
+        .baseline_parts
+        .is_empty());
+    prefix.parts += 1;
+    assert!(matches!(
+        store.load_native_transform_snapshot(namespace, &prefix, &[]),
+        Err(McStoreError::NativeSnapshotUnavailable(
+            NativeSnapshotRejection::ReferenceMismatch
+        ))
+    ));
+    prefix.parts -= 1;
+    prefix.through += 1;
+    assert!(matches!(
+        store.load_native_transform_snapshot(namespace, &prefix, &[]),
+        Err(McStoreError::NativeSnapshotUnavailable(
+            NativeSnapshotRejection::CoverageMismatch
+        ))
+    ));
+    assert_eq!(
+        store.native_snapshot_fallback_for_test(namespace),
+        Some(NativeSnapshotRejection::MissingReference)
+    );
+    prefix.through -= 1;
+    prefix.parts += 1;
+    store.inner.with_conn(|conn| {
+        conn.execute("UPDATE mc_cache_state SET meta=json_set(meta,'$.tail_hygiene_baseline.prefix_count',?2) WHERE session_id=?1",
+            params![namespace, prefix.parts])?;
+        Ok(())
+    }).unwrap();
+    assert!(
+        matches!(
+            store.load_native_transform_snapshot(namespace, &prefix, &[]),
+            Err(McStoreError::NativeSnapshotUnavailable(
+                NativeSnapshotRejection::ReferenceMismatch
+            ))
+        ),
+        "the small-row certificate must match the hashed section's certificate"
+    );
+}
+
+#[test]
 fn native_tail_control_does_not_change_generic_namespace_section_bytes() {
     let (_dir, store, key) = rig();
     let generic = ProviderSessionKey {

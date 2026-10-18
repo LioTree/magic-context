@@ -578,9 +578,19 @@ impl RunnerRecord<'_> {
             .iter()
             .map(|entry| entry.mid.as_str())
             .collect::<Vec<_>>();
-        let snapshot = store
-            .load_native_transform_snapshot(&key.engine_key(), &prefix.reference(), &mids)
-            .map_err(transient)?;
+        // Coverage alone does not prove that the encoder could omit the covered
+        // measurements. Only the certificate validated with the stored row does.
+        let snapshot = match store.load_native_transform_snapshot(
+            &key.engine_key(),
+            &prefix.reference(),
+            &mids,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(mc_store::McStoreError::NativeSnapshotUnavailable(_)) => {
+                return self.prepare(&status.lineage_id, template);
+            }
+            Err(error) => return Err(transient(error)),
+        };
         if !intact
             || !open.is_empty()
             || snapshot.loaded.core.reconcile_pending

@@ -551,22 +551,79 @@ pub(crate) fn read_native_decoded(
     conn: &rusqlite::Connection,
     session_id: &str,
     prefix: &crate::provider_log::ProviderNativePrefix,
-) -> rusqlite::Result<Option<DecodedRow>> {
+) -> Result<Option<DecodedRow>, NativeSnapshotError> {
     let Some(row) = read_small_row(conn, session_id)? else {
-        return Ok(None);
+        return Err(NativeSnapshotRejection::MissingReference.into());
     };
-    let reference = native_tail::reference(&row.meta)?.ok_or(rusqlite::Error::InvalidQuery)?;
+    let reference =
+        native_tail::reference(&row.meta)?.ok_or(NativeSnapshotRejection::MissingReference)?;
     if reference.cut_id != prefix.cut_id || reference.prefix_count != prefix.parts {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(NativeSnapshotRejection::ReferenceMismatch.into());
     }
     let through: Option<u64> = conn.query_row(
         "SELECT frozen_through_ordinal FROM mc_provider_policy_cuts_v1 WHERE cut_id=?1 AND conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE engine_namespace=?2)",
-        params![prefix.cut_id, session_id], |row| row.get(0))?;
+              params![prefix.cut_id, session_id], |row| row.get(0)).optional()?.flatten();
     if through != Some(prefix.through) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(NativeSnapshotRejection::CoverageMismatch.into());
     }
     let sections = read_sections(conn, session_id)?;
-    Ok(Some(decode_row(row, sections)?))
+    let decoded = decode_row(row, sections)?;
+    if decoded.sections.tail.discard_reason().is_some() {
+        return Err(NativeSnapshotRejection::ReferenceMismatch.into());
+    }
+    Ok(Some(decoded))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeSnapshotRejection {
+    MissingReference,
+    ReferenceMismatch,
+    CoverageMismatch,
+}
+
+impl NativeSnapshotRejection {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::MissingReference => "native_reference_missing",
+            Self::ReferenceMismatch => "native_reference_mismatch",
+            Self::CoverageMismatch => "native_coverage_mismatch",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeSnapshotError {
+    Unavailable(NativeSnapshotRejection),
+    Sqlite(rusqlite::Error),
+}
+
+impl std::fmt::Display for NativeSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(reason) => f.write_str(reason.reason()),
+            Self::Sqlite(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for NativeSnapshotError {}
+
+impl From<NativeSnapshotRejection> for NativeSnapshotError {
+    fn from(reason: NativeSnapshotRejection) -> Self {
+        Self::Unavailable(reason)
+    }
+}
+
+impl From<rusqlite::Error> for NativeSnapshotError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
+impl From<CodecError> for NativeSnapshotError {
+    fn from(error: CodecError) -> Self {
+        Self::Sqlite(error.into())
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
