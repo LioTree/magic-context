@@ -20,6 +20,8 @@ pub mod hygiene_memo;
 pub mod policy_summary;
 pub mod records;
 mod reduce;
+pub(crate) mod runner_todo;
+pub(crate) mod usage_policy;
 pub mod resident_bytes;
 pub mod view_recipe;
 

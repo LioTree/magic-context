@@ -448,7 +448,9 @@ fn todo_state_hash(state_json: &str) -> String {
     format!("{digest:x}")
 }
 
-fn todo_state_from_input(input: &serde_json::Value) -> Option<String> {
+/// Normalize the todo list a `todowrite` call carries, either as `{todos: [...]}`
+/// or as the bare array.
+pub(crate) fn todo_state_from_input(input: &serde_json::Value) -> Option<String> {
     let todos = input.get("todos").unwrap_or(input);
     let todos_json = serde_json::to_string(todos).ok()?;
     normalize_todo_state_json(&todos_json)

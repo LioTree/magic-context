@@ -39830,6 +39830,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn runner_transcript_todo_matches_the_todo_state_set_anchor() {
+        // A runner sends no todo_state.set; ck-mc reads the todowrite call and
+        // its result from the transcript. The stored state, and the synthetic
+        // todo pair built from it, must equal what todo_state.set produces.
+        let fixture: Value =
+            serde_json::from_str(include_str!("../testdata/runner-todo-transcript.json")).unwrap();
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let set = &fixture["todo_state_set"];
+        let request = json!({
+            "method": "todo_state.set",
+            "v": 1,
+            "session_id": "ses",
+            "state_json": serde_json::to_string(&set["todos"]).unwrap(),
+            "owner_message_id": set["owner_message_id"],
+        });
+        assert_eq!(
+            call_dispatch_request(&handler, request).await,
+            json!({ "ok": true })
+        );
+
+        let transcript: Vec<cortexkit_role_compaction_provider::status::StatusMessage> =
+            serde_json::from_value(fixture["transcript"].clone()).unwrap();
+        let mut scan = crate::providers::runner_todo::TodoScan::default();
+        let derived = crate::providers::runner_todo::scan_status_messages(
+            &mut scan,
+            fixture["lineage_id"].as_str().unwrap(),
+            &transcript,
+        )
+        .unwrap()
+        .expect("the transcript holds a successful todowrite");
+        store
+            .set_todo_state(
+                "ses-derived",
+                &derived.state_json,
+                &derived.owner_message_id,
+                &derived.state_hash,
+            )
+            .unwrap();
+
+        let reported = store.load("ses").unwrap().meta;
+        let derived_meta = store.load("ses-derived").unwrap().meta;
+        assert_eq!(
+            reported.last_todo_state.as_deref(),
+            fixture["expected_state_json"].as_str()
+        );
+        assert_eq!(derived_meta.last_todo_state, reported.last_todo_state);
+        assert_eq!(
+            derived_meta.last_todo_state_hash,
+            reported.last_todo_state_hash
+        );
+        assert_eq!(
+            derived_meta.last_todo_state_owner_message_id,
+            reported.last_todo_state_owner_message_id
+        );
+        let anchor =
+            |meta: &mc_store::ModuleMeta| match crate::injection::advance_injection_from_meta(
+                meta, None, true, None,
+            ) {
+                crate::injection::InjectionOutcome::Replace(pair) => {
+                    pair.freeze_at(meta.last_todo_state_owner_message_id.clone())
+                }
+                other => panic!("expected a synthetic todo pair, got {other:?}"),
+            };
+        assert_eq!(anchor(&derived_meta), anchor(&reported));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn management_todo_flush_and_recomp_contracts_are_replay_safe() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
