@@ -494,7 +494,7 @@ async fn ordinary_notice_write_set_does_not_grow_with_the_session() {
 }
 
 fn row(label: &str, size: u64, sample: &Sample) -> String {
-    format!(
+    let line = format!(
         "| {label} | {size} | {:.1} | {:.1} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {} |",
         sample.wall_ms,
         sample.process_cpu_ms,
@@ -505,7 +505,11 @@ fn row(label: &str, size: u64, sample: &Sample) -> String {
         sample.rows,
         sample.bytes,
         sample.wal_bytes
-    )
+    );
+    // Print as soon as measured, so a run stopped at a larger size keeps
+    // the rows it already produced.
+    eprintln!("{line}");
+    line
 }
 
 fn median(mut samples: Vec<Sample>) -> Sample {
@@ -583,11 +587,13 @@ async fn storage_scaling_benchmark() {
         }
         let (after_rows, after_bytes) = rig.views();
         let (after_record, _) = rig.record_bytes();
-        sizes_table.push(format!(
+        let line = format!(
             "| {size} | {transcript} | {record} (after ride+ack: {after_record}) | {entries} | {view_rows} | {view_bytes} | {} | {} |",
             after_rows as i64 - view_rows as i64,
             after_bytes as i64 - view_bytes as i64,
-        ));
+        );
+        eprintln!("{line}");
+        sizes_table.push(line);
         drop(rig);
     }
     println!("{}", table.join("\n"));
