@@ -6,6 +6,7 @@ import {
 import { queueM0Mutation } from "@magic-context/core/features/magic-context/storage-m0-mutation-log";
 import { DegradedPassRefusalError } from "@magic-context/core/hooks/magic-context/degraded-pass-refusal";
 import {
+	firstKeptDigest,
 	readServedPrefix,
 	writeServedPrefix,
 } from "@magic-context/core/hooks/magic-context/served-prefix";
@@ -17,6 +18,7 @@ import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
 } from "./context-handler";
+import { providerVisiblePiPart } from "./provider-visible-parts-pi";
 import { PiPrefixPass } from "./served-prefix-pi";
 import {
 	assistantMessage,
@@ -40,6 +42,67 @@ const thought = (sig: string) => ({
 	type: "thinking",
 	thinking: `Thought ${sig}`,
 	thinkingSignature: sig,
+});
+
+// The first-kept digest lives in core and cannot import this package's
+// provider-visible view, so this test keeps the two field lists from drifting:
+// every leaf the Pi view sends must also change the digest.
+it("Pi first-kept digest covers every field of the Pi provider-visible view", () => {
+	const message = {
+		role: "toolResult",
+		provider: "anthropic",
+		api: "anthropic-messages",
+		model: "opus",
+		stopReason: "toolUse",
+		toolCallId: "call",
+		toolName: "bash",
+		isError: false,
+		content: [
+			{ type: "text", text: "Answer", textSignature: "text-sig" },
+			{
+				type: "thinking",
+				thinking: "Thought",
+				thinkingSignature: "sig",
+				redacted: false,
+			},
+			{ type: "image", data: "AA==", mimeType: "image/png" },
+			{
+				type: "toolCall",
+				id: "call",
+				name: "bash",
+				arguments: { command: "pwd" },
+				thoughtSignature: "thought-sig",
+				namespace: "ns",
+			},
+		],
+	};
+	const provenance = {
+		host: "pi",
+		id_space: "pi",
+		generation: "pi",
+		projection: "messages",
+		model,
+	} as const;
+	const leaves = (value: unknown, path: string[] = []): string[][] =>
+		value !== null && typeof value === "object"
+			? Object.entries(value).flatMap(([key, child]) =>
+					leaves(child, [...path, key]),
+				)
+			: [path];
+	const paths = leaves(providerVisiblePiPart(message, model.api));
+	expect(paths.length).toBeGreaterThan(20);
+	for (const path of paths) {
+		const copy = structuredClone(message) as Record<string, any>;
+		let parent = copy;
+		for (const key of path.slice(0, -1)) parent = parent[key];
+		const key = path.at(-1)!;
+		parent[key] =
+			typeof parent[key] === "boolean" ? !parent[key] : `${parent[key]}-x`;
+		expect([path.join("."), firstKeptDigest(copy, provenance)]).not.toEqual([
+			path.join("."),
+			firstKeptDigest(message, provenance),
+		]);
+	}
 });
 
 function heldFixture() {
@@ -90,6 +153,7 @@ it("Pi host-only timestamps serve the fresh held request", async () => {
 	f.thinking();
 	const held = await f.pass();
 	const record = readServedPrefix(f.db, f.id);
+	expect(record?.first_kept?.id).toBe("turn");
 	Object.assign(f.raw[0], {
 		timestamp: 12345,
 		details: { summary: "UI only" },
@@ -108,28 +172,28 @@ it("Pi provider-visible text before kept thinking still refuses", async () => {
 	f.thinking();
 	await f.pass();
 	const record = readServedPrefix(f.db, f.id);
-	const ids = new Map<unknown, string>(
-		f.raw.map((row, index) => [row, f.ids[index]]),
-	);
-	const stable = (row: unknown) => ids.get(row);
-	const rows: unknown[] = [...f.raw];
-	const prefix = new PiPrefixPass(
-		f.db,
-		f.id,
-		rows,
-		stable,
-		true,
-		false,
-		undefined,
-		{ provider: model.provider, id: model.id, api: model.api },
-	);
-	const injection = prefix.replay(rows, stable)!;
-	expect(injection).not.toBeNull();
-	prefix.finish(rows, injection.syntheticLeadingCount, stable);
-	f.raw[0].content = "changed provider bytes";
-	expect(() =>
-		prefix.finish(rows, injection.syntheticLeadingCount, stable),
-	).toThrow("first kept digest mismatch");
+	expect(record?.first_kept?.id).toBe("turn");
+	(f.raw[0] as { content: unknown }).content = "changed provider bytes";
+	f.raw.push(assistantMessage("Fresh request, not last good", 3));
+	f.ids.push("fresh");
+	let failure: unknown;
+	try {
+		await f.pass();
+	} catch (error) {
+		failure = error;
+	}
+	// With no last-good request to fall back to, Pi reports the refusal as a
+	// storage-busy error whose cause chain carries the served-prefix refusal.
+	const chain = (error: unknown): unknown[] =>
+		error instanceof Error ? [error, ...chain(error.cause)] : [];
+	expect(
+		chain(failure).some(
+			(error) =>
+				error instanceof DegradedPassRefusalError &&
+				error.site === "served-prefix" &&
+				error.message.includes("first kept digest mismatch"),
+		),
+	).toBe(true);
 	expect(readServedPrefix(f.db, f.id)).toEqual(record);
 });
 

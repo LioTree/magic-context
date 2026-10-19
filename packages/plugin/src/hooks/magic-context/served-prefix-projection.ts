@@ -91,23 +91,46 @@ function openCodePart(value: unknown, v2: boolean, role: unknown): unknown {
     return undefined;
 }
 
+// Union of the content fields read by the supported pi-ai converters (0.83-0.87:
+// transform-messages.js, anthropic-messages.js, google-shared.js,
+// openai-responses-shared.js). It is a superset of the pi-plugin view in
+// provider-visible-parts-pi.ts, which a parity test checks. Signatures and tool
+// arguments affect replay; timestamps and UI details never reach a provider.
+const PI_PART_FIELDS: Readonly<Record<string, readonly string[]>> = {
+    text: ["type", "text", "textSignature"],
+    thinking: ["type", "thinking", "thinkingSignature", "redacted"],
+    image: ["type", "data", "mimeType"],
+    toolCall: ["type", "id", "name", "arguments", "thoughtSignature", "namespace"],
+};
+
 function piPart(value: unknown): unknown {
     if (!isRecord(value)) return value;
-    // pi-ai transform-messages.js:66-122 and anthropic-messages.js:838-947.
-    // Signatures and tool arguments affect replay; timestamps/details never do.
-    switch (value.type) {
-        case "text":
-            return pick(value, ["type", "text"]);
-        case "thinking":
-            return pick(value, ["type", "thinking", "thinkingSignature", "redacted"]);
-        case "image":
-            return pick(value, ["type", "data", "mimeType"]);
-        case "toolCall":
-            return pick(value, ["type", "id", "name", "arguments"]);
-        default:
-            return undefined;
-    }
+    const fields = typeof value.type === "string" ? PI_PART_FIELDS[value.type] : undefined;
+    // A content type this list does not know may be read by a newer converter,
+    // so it is digested whole: an unknown part can only cause a refusal, never
+    // let a provider-visible change through.
+    return fields ? pick(value, fields) : value;
 }
+
+// Message-level fields the same converters read. Assistant provider/api/model/
+// stopReason select same-model signature replay or error omission; tool results
+// carry call linkage and deferred tool loading (anthropic-messages.js, 0.83:810-835);
+// 0.87 adds the thinking level and system-message tool and section updates.
+const PI_MESSAGE_FIELDS = [
+    "role",
+    "provider",
+    "api",
+    "model",
+    "stopReason",
+    "toolCallId",
+    "toolName",
+    "isError",
+    "addedToolNames",
+    "providerThinkingLevel",
+    "sections",
+    "toolsAdded",
+    "toolsRemoved",
+] as const;
 
 /**
  * Hash inputs to the pinned host converters, not the mutable host envelope.
@@ -125,36 +148,27 @@ export function servedPrefixProjection(message: unknown, provenance: PrefixProve
     const info = isRecord(message.info) ? message.info : {};
     const role = pi ? message.role : info.role;
     return {
-        converter: pi
-            ? "pi-ai-0.83.0-anthropic"
-            : v2
-              ? "opencode2-payload-2.0.22"
-              : "opencode1-1.18.35",
+        converter: pi ? "pi-ai-0.83-0.87" : v2 ? "opencode2-payload-2.0.22" : "opencode1-1.18.35",
         model: provenance.model,
         role,
-        // These assistant fields select same-model reasoning replay or error omission.
+        // OpenCode 1 reads these assistant fields to select same-model reasoning
+        // replay and to omit errored turns.
         replay:
-            role === "assistant"
-                ? pi
-                    ? pick(message, ["provider", "api", "model", "stopReason"])
-                    : !v2
-                      ? {
-                            ...pick(info, ["providerID", "modelID"]),
-                            error: isRecord(info.error) ? info.error.name : undefined,
-                        }
-                      : undefined
+            !pi && !v2 && role === "assistant"
+                ? {
+                      ...pick(info, ["providerID", "modelID"]),
+                      error: isRecord(info.error) ? info.error.name : undefined,
+                  }
                 : undefined,
-        // Pi tool results can load deferred tool references (anthropic-messages.js:810-835).
-        result:
-            pi && role === "toolResult"
-                ? pick(message, ["toolCallId", "isError", "addedToolNames"])
-                : undefined,
+        message: pi ? pick(message, PI_MESSAGE_FIELDS) : undefined,
         content:
             pi && provenance.model?.api === "pi-messages"
-                ? message
+                ? // The native pi-messages API sends the raw message, so every
+                  // field of it is provider-visible.
+                  message
                 : pi
                   ? Array.isArray(message.content)
-                      ? message.content.map(piPart).filter((part) => part !== undefined)
+                      ? message.content.map(piPart)
                       : message.content
                   : Array.isArray(message.parts)
                     ? message.parts

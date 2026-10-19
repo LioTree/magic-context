@@ -209,15 +209,19 @@ const pi = {
     api: "anthropic-messages",
     model: "opus",
     stopReason: "toolUse",
+    providerThinkingLevel: "high",
     content: [
-        { type: "text", text: "Answer" },
+        { type: "text", text: "Answer", textSignature: "text-sig" },
         { type: "thinking", thinking: "Thought", thinkingSignature: "sig", redacted: false },
         {
             type: "toolCall",
             id: "call",
             name: "bash",
             arguments: { command: "pwd", metadata: "opaque" },
+            thoughtSignature: "thought-sig",
+            namespace: "ns",
         },
+        { type: "future-part", payload: "unknown to this projection" },
     ],
 };
 perturb("pi", { role: "user", content: "Task" }, ["content"]);
@@ -227,8 +231,10 @@ perturb("pi", pi, [
     "api",
     "model",
     "stopReason",
+    "providerThinkingLevel",
     "content.0.type",
     "content.0.text",
+    "content.0.textSignature",
     "content.1.thinking",
     "content.1.thinkingSignature",
     "content.1.redacted",
@@ -236,17 +242,39 @@ perturb("pi", pi, [
     "content.2.name",
     "content.2.arguments.command",
     "content.2.arguments.metadata",
+    "content.2.thoughtSignature",
+    "content.2.namespace",
+    "content.3.payload",
 ]);
+perturb(
+    "pi",
+    {
+        role: "system",
+        content: "Update",
+        sections: { rules: "Rules" },
+        toolsAdded: [{ name: "read" }],
+        toolsRemoved: [{ name: "write" }],
+    },
+    ["content", "sections.rules", "toolsAdded.0.name", "toolsRemoved.0.name"],
+);
 perturb(
     "pi",
     {
         role: "toolResult",
         toolCallId: "call",
+        toolName: "bash",
         isError: false,
         addedToolNames: ["read"],
         content: [{ type: "image", data: "AA==", mimeType: "image/png" }],
     },
-    ["toolCallId", "isError", "addedToolNames.0", "content.0.data", "content.0.mimeType"],
+    [
+        "toolCallId",
+        "toolName",
+        "isError",
+        "addedToolNames.0",
+        "content.0.data",
+        "content.0.mimeType",
+    ],
 );
 it("Pi host-only envelope and property order do not change first-kept identity", () => {
     expect(
@@ -259,6 +287,13 @@ it("Pi host-only envelope and property order do not change first-kept identity",
             { details: "other", usage: { input: 2 }, timestamp: 2, ...pi },
             provenance("pi"),
         ),
+    );
+});
+
+it("Pi native pi-messages digests the raw message because that API sends it whole", () => {
+    const native = { ...provenance("pi"), model: { ...model, api: "pi-messages" } };
+    expect(firstKeptDigest({ ...pi, timestamp: 1 }, native)).not.toBe(
+        firstKeptDigest({ ...pi, timestamp: 2 }, native),
     );
 });
 
